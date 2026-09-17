@@ -1,0 +1,33 @@
+[package]
+name    = "chain-forge-crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Crypto-agility layer for QCB Chain (Whitepaper Section 10).
+# Implements:
+#   - SignatureScheme trait: pluggable signature backend
+#   - ClassicalScheme: Ed25519 (current, placeholder bytes in Phase 0)
+#   - PqcScheme: ML-DSA / CRYSTALS-Dilithium (NIST standard, Phase 1+)
+#   - HybridScheme: classical + PQC combined signature (Section 10.3)
+#   - SchemeRegistry: which scheme is active, migration trigger conditions
+#   - MigrationTrigger: NIST guidance update / CRQC detection / calendar
+#   - SizeReport: honest accounting of PQC signature size cost (Section 10.3)
+#
+# Phase 0: all schemes produce/verify stub bytes. The trait interface is
+# real and tested; actual crypto primitives wire in Phase 1.
+# The constitutional guarantee (Section 7.3): the scheme CAN be replaced
+# without forking the chain. This crate is the enforcement of that guarantee.
+#
+# Whitepaper refs: Sections 7.3, 10.1-10.3, Q16.
+
+[dependencies]
+chain-forge-core = { path = "../chain-forge-core" }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
