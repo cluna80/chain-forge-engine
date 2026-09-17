@@ -1,0 +1,29 @@
+[package]
+name    = "chain-forge-tokenomics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Two-token supply enforcement (Whitepaper Sections 6.1-6.3, 6.7).
+# Implements:
+#   - SupplyRegistry: $QCB hard cap (210,000,000), mint/burn accounting
+#   - $CIRFI uncapped population-linked issuance tracking
+#   - Genesis allocation per Section 6.7 (70/15/7/5/3 within UBI-majority ceiling)
+#   - Staking module: bond, unbond, per-validator stakes, reward accounting
+#   - Personhood bounds link: stake determines participation, not influence (3.3)
+#
+# The constitutional two-token separation (Section 7.3) is enforced here:
+# $QCB mints past the cap are rejected at the protocol layer, and only
+# the protocol can mint $CIRFI (currency issuance reserved -- Section 7.2).
+
+[dependencies]
+chain-forge-core     = { path = "../chain-forge-core" }
+chain-forge-identity = { path = "../chain-forge-identity" }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+tracing              = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
