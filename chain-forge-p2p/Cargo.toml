@@ -18,8 +18,10 @@ tracing          = { workspace = true }
 tokio            = { workspace = true }
 async-trait      = { workspace = true }
 
-# libp2p — pinned feature set for Phase 0
-libp2p = { version = "0.54", features = [
+# libp2p — real P2P stack
+# Mock network (used in tests) compiles without libp2p features.
+# Real network (used in node binary) gates on the "real-network" feature.
+libp2p = { version = "0.54", optional = true, features = [
     "tokio",
     "tcp",
     "noise",
@@ -30,6 +32,11 @@ libp2p = { version = "0.54", features = [
     "ping",
     "macros",
 ] }
+
+[features]
+# Enable the real libp2p network backend.
+# Without this flag, only MockNetworkService is available (fast test compile).
+real-network = ["dep:libp2p"]
 
 [dev-dependencies]
 tokio = { workspace = true }
