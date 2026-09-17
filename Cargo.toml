@@ -8,6 +8,7 @@ members = [
     "chain-forge-execution",
     "chain-forge-identity",
     "chain-forge-cirfi",
+    "chain-forge-agents",
     "chain-forge-node",
 ]
 

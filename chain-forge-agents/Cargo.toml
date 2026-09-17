@@ -1,0 +1,32 @@
+[package]
+name    = "chain-forge-agents"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Charmed Agents: native first-class autonomous agent representation (Section 5.3).
+# Implements:
+#   - AgentCapability: what an agent is authorized to do
+#   - SpendingLimits: per-epoch and lifetime $CIRFI caps
+#   - AgentRecord: full on-chain state for one Charmed Agent
+#   - AgentStore: canonical registry of all agents
+#   - AgentLifecycle: register, authorize, suspend, revoke
+#   - SponsorID linkage: every agent is accountable to a verified human
+#   - AEI (Agent Economic Identity) spec: SponsorID + CapabilitySet + SpendingLimits + ParentAgentID
+#
+# Phase 0: agent registration, authorization checks, spending limit enforcement.
+# Phase 1+: agent-to-agent settlement in $CIRFI, external framework attestations.
+#
+# Whitepaper refs: Sections 4.6 (Phase B), 5.3, 7.2 (Sponsored Contracts subclass).
+
+[dependencies]
+chain-forge-core     = { path = "../chain-forge-core" }
+chain-forge-identity = { path = "../chain-forge-identity" }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+tracing              = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
