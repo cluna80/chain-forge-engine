@@ -441,6 +441,365 @@ pub fn apply_personhood_cap(
     validator_set
 }
 
+// -- FbaEngine (XRPL-inspired Federated Byzantine Agreement) -----------------
+
+/// XRPL-inspired Federated Byzantine Agreement engine.
+///
+/// FBA differs fundamentally from Tendermint and HotStuff:
+///
+///   Classical BFT: one global validator set, 2f+1 quorum
+///   FBA:           each node defines its own "UNL" (Unique Node List) —
+///                  a set of validators it personally trusts. Safety
+///                  emerges from UNL overlap between nodes, not from a
+///                  single global quorum rule.
+///
+/// XRPL's design:
+///   - No elected leader, no proposer rotation
+///   - Every validator independently proposes and votes
+///   - A transaction is committed when 80% of a node's UNL agrees
+///   - Safety requires ≥ 40% overlap between any two nodes' UNLs
+///
+/// QCB adaptation:
+///   - The UNL is the verified-human validator set (personhood-gated)
+///   - The 80% threshold is tunable via FbaConfig
+///   - Personhood cap still applies (Section 3.3)
+///   - In Phase 0 a single global UNL is used (equivalent to the
+///     Tendermint validator set); per-node UNLs are a Phase 1 feature
+///
+/// Why consider FBA for QCB?
+///   - No leader = no proposer rotation = simpler liveness under churn
+///   - Natural fit for open, permission-less participation
+///   - XRPL has proven the model at scale (millions of tx/day since 2012)
+///   - Tradeoff: safety depends on UNL configuration correctness;
+///     a badly configured UNL can silently fork the chain
+///
+/// Whitepaper ref: Section 3 / ConsensusVariant::XrplInspired.
+/// Open Question 2: which variant QCB ultimately uses.
+
+/// Configuration specific to the FBA engine.
+#[derive(Debug, Clone)]
+pub struct FbaConfig {
+    /// Fraction of UNL that must agree to commit (XRPL default: 0.80).
+    /// Must be > 0.5 for safety. XRPL recommends 0.80.
+    pub agreement_threshold: f64,
+    /// Minimum UNL size. Below this, the node refuses to participate.
+    pub min_unl_size: usize,
+}
+
+impl Default for FbaConfig {
+    fn default() -> Self {
+        Self {
+            agreement_threshold: 0.80,
+            min_unl_size:        3,
+        }
+    }
+}
+
+/// One round of FBA voting: each validator broadcasts its candidate,
+/// collects peer votes, and converges when threshold is met.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FbaPhase {
+    /// Waiting for proposal / open phase — collecting candidates.
+    Open,
+    /// Threshold reached for a candidate — committing.
+    Committed,
+}
+
+pub struct FbaEngine {
+    config:      ConsensusConfig,
+    fba:         FbaConfig,
+    validators:  ValidatorSet,
+    height:      BlockHeight,
+    round:       Round,
+    phase:       FbaPhase,
+    /// Votes received this round: block_hash -> (validator -> power).
+    votes:       BTreeMap<BlockHash, BTreeMap<ValidatorId, u64>>,
+    /// The pending proposal (most-recent received).
+    pending:     Option<BlockProposal>,
+}
+
+impl FbaEngine {
+    pub fn new() -> Self {
+        Self {
+            config:      ConsensusConfig {
+                variant:              ConsensusVariant::XrplInspired,
+                propose_timeout_ms:   4_000,
+                prevote_timeout_ms:   1_000,
+                precommit_timeout_ms: 1_000,
+                block_time_ms:        3_500, // XRPL ~3-5s block time
+                personhood:           None,
+            },
+            fba:         FbaConfig::default(),
+            validators:  ValidatorSet { height: 0, validators: vec![] },
+            height:      0,
+            round:       0,
+            phase:       FbaPhase::Open,
+            votes:       BTreeMap::new(),
+            pending:     None,
+        }
+    }
+
+    /// Minimum power needed to commit under the FBA threshold.
+    fn threshold_power(&self) -> u64 {
+        let total = self.validators.total_power() as f64;
+        (total * self.fba.agreement_threshold).ceil() as u64
+    }
+
+    /// Check whether any candidate has crossed the threshold.
+    fn find_committed(&self) -> Option<BlockHash> {
+        let threshold = self.threshold_power();
+        for (hash, vote_map) in &self.votes {
+            let power: u64 = vote_map.values().sum();
+            if power >= threshold {
+                return Some(hash.clone());
+            }
+        }
+        None
+    }
+
+    /// Record a vote for a block hash.
+    fn record_vote(&mut self, validator: &ValidatorId, power: u64, hash: &BlockHash) {
+        self.votes
+            .entry(hash.clone())
+            .or_default()
+            .entry(validator.clone())
+            .or_insert(power);
+    }
+
+    /// Build a CommitCertificate for a winning hash.
+    fn make_certificate(&self, hash: &BlockHash) -> CommitCertificate {
+        let precommits = self.votes.get(hash)
+            .map(|vm| vm.keys().map(|id| Vote {
+                vote_type:  VoteType::Precommit,
+                height:     self.height,
+                round:      self.round,
+                validator:  id.clone(),
+                block_hash: Some(hash.clone()),
+                signature:  vec![],
+            }).collect())
+            .unwrap_or_default();
+
+        CommitCertificate {
+            height:     self.height,
+            round:      self.round,
+            block_hash: hash.clone(),
+            precommits,
+        }
+    }
+}
+
+impl Default for FbaEngine {
+    fn default() -> Self { Self::new() }
+}
+
+#[async_trait::async_trait]
+impl ConsensusEngine for FbaEngine {
+    fn name(&self) -> &str {
+        "XRPL-inspired FBA (Phase 0 — global UNL, 80% threshold)"
+    }
+
+    fn variant(&self) -> ConsensusVariant { ConsensusVariant::XrplInspired }
+
+    async fn init(
+        &mut self,
+        config:     ConsensusConfig,
+        mut validators: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        if let Some(ref pc) = config.personhood {
+            validators = apply_personhood_cap(validators, pc);
+        }
+        if validators.validators.len() < self.fba.min_unl_size {
+            return Err(ConsensusError::InsufficientValidators {
+                needed: self.fba.min_unl_size,
+                have:   validators.validators.len(),
+            });
+        }
+        self.validators = validators;
+        self.config     = config;
+        self.phase      = FbaPhase::Open;
+        tracing::info!(
+            variant     = "XRPL-inspired FBA",
+            validators  = self.validators.validators.len(),
+            total_power = self.validators.total_power(),
+            threshold   = self.fba.agreement_threshold,
+            threshold_power = self.threshold_power(),
+            "FBA consensus engine initialised"
+        );
+        Ok(())
+    }
+
+    fn validator_set(&self) -> &ValidatorSet { &self.validators }
+    fn current_height(&self) -> BlockHeight  { self.height }
+    fn current_round(&self)  -> Round        { self.round }
+
+    async fn propose(
+        &mut self,
+        height:      BlockHeight,
+        round:       Round,
+        parent_hash: BlockHash,
+        tx_data:     Vec<u8>,
+    ) -> ConsensusResult<BlockProposal> {
+        // In FBA every validator proposes independently.
+        // Phase 0: the local node produces one canonical proposal.
+        let block_hash = BlockHash(format!(
+            "fba_h{height}_r{round}_{:08x}",
+            tx_data.len() as u32
+        ));
+        let proposal = BlockProposal {
+            height,
+            round,
+            proposer:   ValidatorId("self".into()),
+            block_hash,
+            parent_hash,
+            timestamp_ms: 0,
+            tx_data,
+            signature: vec![],
+        };
+        tracing::debug!(height, round, "FBA: proposal broadcast");
+        Ok(proposal)
+    }
+
+    async fn receive_proposal(
+        &mut self,
+        proposal: BlockProposal,
+    ) -> ConsensusResult<()> {
+        if proposal.height < self.height {
+            return Err(ConsensusError::StaleProposal(proposal.height, self.height));
+        }
+        self.pending = Some(proposal.clone());
+        self.phase   = FbaPhase::Open;
+        self.votes.clear();
+        tracing::debug!(
+            height = proposal.height,
+            hash   = %proposal.block_hash,
+            "FBA: candidate received, open phase"
+        );
+        Ok(())
+    }
+
+    async fn receive_vote(
+        &mut self,
+        vote: Vote,
+    ) -> ConsensusResult<Option<CommitCertificate>> {
+        let power = self.validators.power_of(&vote.validator);
+        if power == 0 {
+            return Err(ConsensusError::UnknownValidator(vote.validator));
+        }
+
+        let hash = match &vote.block_hash {
+            Some(h) => h.clone(),
+            None    => return Ok(None), // nil / timeout vote
+        };
+
+        if self.phase == FbaPhase::Committed {
+            return Ok(None);
+        }
+
+        self.record_vote(&vote.validator, power, &hash);
+
+        if let Some(winning_hash) = self.find_committed() {
+            self.phase = FbaPhase::Committed;
+            let cert = self.make_certificate(&winning_hash);
+            tracing::info!(
+                height = cert.height,
+                hash   = %cert.block_hash,
+                threshold = self.fba.agreement_threshold,
+                "FBA: threshold reached -- block committed"
+            );
+            return Ok(Some(cert));
+        }
+        Ok(None)
+    }
+
+    async fn on_timeout(
+        &mut self,
+        height: BlockHeight,
+        round:  Round,
+    ) -> ConsensusResult<Vote> {
+        tracing::warn!(height, round, "FBA: round timed out, advancing");
+        self.round  = round + 1;
+        self.phase  = FbaPhase::Open;
+        self.votes.clear();
+        self.pending = None;
+
+        Ok(Vote {
+            vote_type:  VoteType::Nil,
+            height,
+            round,
+            validator:  ValidatorId("self".into()),
+            block_hash: None,
+            signature:  vec![],
+        })
+    }
+
+    async fn on_commit(
+        &mut self,
+        certificate:       CommitCertificate,
+        new_validator_set: Option<ValidatorSet>,
+    ) -> ConsensusResult<()> {
+        self.height  = certificate.height + 1;
+        self.round   = 0;
+        self.phase   = FbaPhase::Open;
+        self.votes.clear();
+        self.pending = None;
+
+        if let Some(mut new_set) = new_validator_set {
+            if let Some(ref pc) = self.config.personhood.clone() {
+                new_set = apply_personhood_cap(new_set, pc);
+            }
+            if new_set.validators.len() >= self.fba.min_unl_size {
+                self.validators = new_set;
+            } else {
+                tracing::warn!(
+                    "FBA: new validator set too small for UNL ({} < {}); keeping current",
+                    new_set.validators.len(), self.fba.min_unl_size
+                );
+            }
+        }
+
+        tracing::info!(height = self.height, "FBA: committed, advancing");
+        Ok(())
+    }
+
+    fn verify_commit(
+        &self,
+        certificate:   &CommitCertificate,
+        validator_set: &ValidatorSet,
+    ) -> ConsensusResult<()> {
+        // Count voting power in the certificate
+        let power: u64 = certificate.precommits.iter()
+            .filter(|v| v.vote_type == VoteType::Precommit)
+            .map(|v| validator_set.power_of(&v.validator))
+            .sum();
+
+        let total   = validator_set.total_power() as f64;
+        let needed  = (total * self.fba.agreement_threshold).ceil() as u64;
+
+        if power < needed {
+            return Err(ConsensusError::InvalidVote {
+                validator:  ValidatorId("quorum".into()),
+                block_hash: certificate.block_hash.clone(),
+                reason:     format!(
+                    "FBA: insufficient threshold power: {power} < {needed}                      ({:.0}% of {total})",
+                    self.fba.agreement_threshold * 100.0
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Create a `FbaEngine` and initialise it in one call.
+pub async fn new_fba(
+    config:     ConsensusConfig,
+    validators: ValidatorSet,
+) -> ConsensusResult<FbaEngine> {
+    let mut engine = FbaEngine::new();
+    engine.init(config, validators).await?;
+    Ok(engine)
+}
+
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1618,6 +1977,231 @@ mod tests {
         assert_eq!(capped_power, 1, "personhood cap should be applied at init");
     }
 
+    // -- FbaEngine tests ------------------------------------------------------
+
+    fn fba_validators(n: u64) -> ValidatorSet {
+        ValidatorSet {
+            height: 0,
+            validators: (1..=n).map(|i| ValidatorInfo {
+                id:           ValidatorId(format!("fba_val_{i}")),
+                voting_power: 1,
+                pop_verified: true,
+            }).collect(),
+        }
+    }
+
+    fn fba_config() -> ConsensusConfig {
+        ConsensusConfig {
+            variant:              ConsensusVariant::XrplInspired,
+            propose_timeout_ms:   4_000,
+            prevote_timeout_ms:   1_000,
+            precommit_timeout_ms: 1_000,
+            block_time_ms:        3_500,
+            personhood:           None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fba_initialises_correctly() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(4)).await.unwrap();
+
+        assert_eq!(engine.variant(), ConsensusVariant::XrplInspired);
+        assert_eq!(engine.current_height(), 0);
+        assert_eq!(engine.current_round(), 0);
+        assert_eq!(engine.phase, FbaPhase::Open);
+        assert_eq!(engine.validator_set().validators.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fba_threshold_power_is_80_percent() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(5)).await.unwrap();
+        // 5 validators, total power 5, 80% threshold = ceil(4.0) = 4
+        assert_eq!(engine.threshold_power(), 4);
+    }
+
+    #[tokio::test]
+    async fn fba_commits_at_threshold() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(5)).await.unwrap();
+        // threshold = ceil(5 * 0.8) = 4 votes needed
+
+        let parent   = BlockHash("genesis".into());
+        let proposal = engine.propose(0, 0, parent, vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        // 3 votes -- not yet at threshold (need 4)
+        for i in 1..=3 {
+            let vote = Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0, round: 0,
+                validator:  ValidatorId(format!("fba_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            let result = engine.receive_vote(vote).await.unwrap();
+            assert!(result.is_none(), "no commit before 80% threshold");
+        }
+        assert_eq!(engine.phase, FbaPhase::Open);
+
+        // 4th vote crosses 80% threshold
+        let vote4 = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0, round: 0,
+            validator:  ValidatorId("fba_val_4".into()),
+            block_hash: Some(proposal.block_hash.clone()),
+            signature:  vec![],
+        };
+        let cert = engine.receive_vote(vote4).await.unwrap();
+        let cert = cert.expect("4th vote must trigger commit");
+        assert_eq!(cert.height, 0);
+        assert_eq!(cert.block_hash, proposal.block_hash);
+        assert_eq!(engine.phase, FbaPhase::Committed);
+    }
+
+    #[tokio::test]
+    async fn fba_does_not_commit_below_threshold() {
+        let mut engine = FbaEngine::new();
+        // 5 validators, threshold = 4
+        engine.init(fba_config(), fba_validators(5)).await.unwrap();
+
+        let proposal = engine.propose(0, 0, BlockHash("g".into()), vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        // Only 3 votes -- below 80%
+        for i in 1..=3 {
+            let vote = Vote {
+                vote_type:  VoteType::Precommit,
+                height: 0, round: 0,
+                validator:  ValidatorId(format!("fba_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            assert!(engine.receive_vote(vote).await.unwrap().is_none());
+        }
+        assert_eq!(engine.phase, FbaPhase::Open);
+    }
+
+    #[tokio::test]
+    async fn fba_timeout_advances_round() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(4)).await.unwrap();
+
+        let nil_vote = engine.on_timeout(0, 0).await.unwrap();
+        assert_eq!(nil_vote.vote_type, VoteType::Nil);
+        assert_eq!(engine.current_round(), 1);
+        assert_eq!(engine.phase, FbaPhase::Open);
+    }
+
+    #[tokio::test]
+    async fn fba_on_commit_advances_height() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(4)).await.unwrap();
+
+        let cert = CommitCertificate {
+            height: 0, round: 0,
+            block_hash: BlockHash("fba_h0_r0_00000000".into()),
+            precommits: vec![],
+        };
+        engine.on_commit(cert, None).await.unwrap();
+
+        assert_eq!(engine.current_height(), 1);
+        assert_eq!(engine.current_round(), 0);
+        assert_eq!(engine.phase, FbaPhase::Open);
+    }
+
+    #[tokio::test]
+    async fn fba_verify_commit_checks_threshold() {
+        let mut engine = FbaEngine::new();
+        let validators = fba_validators(5);
+        engine.init(fba_config(), validators.clone()).await.unwrap();
+
+        // Valid: 4 of 5 votes (80%)
+        let cert_ok = CommitCertificate {
+            height: 0, round: 0,
+            block_hash: BlockHash("test".into()),
+            precommits: (1..=4).map(|i| Vote {
+                vote_type:  VoteType::Precommit,
+                height: 0, round: 0,
+                validator:  ValidatorId(format!("fba_val_{i}")),
+                block_hash: Some(BlockHash("test".into())),
+                signature:  vec![],
+            }).collect(),
+        };
+        assert!(engine.verify_commit(&cert_ok, &validators).is_ok());
+
+        // Invalid: only 3 of 5 (60% < 80%)
+        let cert_bad = CommitCertificate {
+            height: 0, round: 0,
+            block_hash: BlockHash("test".into()),
+            precommits: (1..=3).map(|i| Vote {
+                vote_type:  VoteType::Precommit,
+                height: 0, round: 0,
+                validator:  ValidatorId(format!("fba_val_{i}")),
+                block_hash: Some(BlockHash("test".into())),
+                signature:  vec![],
+            }).collect(),
+        };
+        assert!(engine.verify_commit(&cert_bad, &validators).is_err());
+    }
+
+    #[tokio::test]
+    async fn fba_personhood_cap_applied_at_init() {
+        let mut engine = FbaEngine::new();
+        let mut config = fba_config();
+        config.personhood = Some(PersonhoodConfig {
+            power_cap:          1,
+            reject_expired_pop: false,
+            min_verified_pct:   67,
+        });
+
+        let validators = ValidatorSet {
+            height: 0,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("big".into()), voting_power: 10, pop_verified: true },
+                ValidatorInfo { id: ValidatorId("v2".into()),  voting_power: 1,  pop_verified: true },
+                ValidatorInfo { id: ValidatorId("v3".into()),  voting_power: 1,  pop_verified: true },
+            ],
+        };
+        engine.init(config, validators).await.unwrap();
+
+        let big = engine.validator_set().validators.iter()
+            .find(|v| v.id.0 == "big").unwrap();
+        assert_eq!(big.voting_power, 1, "FBA: personhood cap should clamp to 1");
+    }
+
+    #[tokio::test]
+    async fn fba_rejects_unl_too_small() {
+        let mut engine = FbaEngine::new();
+        // min_unl_size is 3, only provide 2 validators
+        let result = engine.init(fba_config(), fba_validators(2)).await;
+        assert!(result.is_err(), "FBA must reject UNL below minimum size");
+    }
+
+    #[tokio::test]
+    async fn fba_all_three_variants_share_trait() {
+        // Confirm all three engines satisfy the trait and report correct variant
+        let mut t = TendermintEngine::new();
+        let mut h = HotStuffEngine::new();
+        let mut f = FbaEngine::new();
+
+        let vs = fba_validators(4);
+        let cfg_t = ConsensusConfig { variant: ConsensusVariant::TendermintStyle,
+            propose_timeout_ms: 1000, prevote_timeout_ms: 1000,
+            precommit_timeout_ms: 1000, block_time_ms: 1000, personhood: None };
+        let cfg_h = ConsensusConfig { variant: ConsensusVariant::HotStuffStyle, ..cfg_t.clone() };
+        let cfg_f = ConsensusConfig { variant: ConsensusVariant::XrplInspired,  ..cfg_t.clone() };
+
+        t.init(cfg_t, vs.clone()).await.unwrap();
+        h.init(cfg_h, vs.clone()).await.unwrap();
+        f.init(cfg_f, vs.clone()).await.unwrap();
+
+        assert_eq!(t.variant(), ConsensusVariant::TendermintStyle);
+        assert_eq!(h.variant(), ConsensusVariant::HotStuffStyle);
+        assert_eq!(f.variant(), ConsensusVariant::XrplInspired);
+    }
+
     // -- HotStuffEngine tests -------------------------------------------------
 
     fn hotstuff_validators(n: u64) -> ValidatorSet {
@@ -1846,4 +2430,3 @@ mod tests {
 
 }
 }
-
