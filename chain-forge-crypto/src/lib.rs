@@ -223,13 +223,113 @@ pub trait SignatureScheme: Send + Sync {
 
 pub struct ClassicalScheme;
 
+// -- Real Ed25519 implementation (feature = "real-crypto") -------------------
+
+#[cfg(feature = "real-crypto")]
+impl SignatureScheme for ClassicalScheme {
+    fn scheme_id(&self) -> &SchemeId { &SchemeId::Classical }
+
+    /// Real Ed25519 signing via ed25519-dalek.
+    /// The private key bytes are the 32-byte Ed25519 seed.
+    fn sign(&self, message: &[u8], keypair: &KeyPair) -> CryptoResult<Signature> {
+        use ed25519_dalek::{SigningKey, Signer};
+
+        if keypair.private_key.len() < 32 {
+            return Err(CryptoError::KeyGenFailed(
+                format!("Ed25519 private key must be >= 32 bytes, got {}",
+                    keypair.private_key.len())
+            ));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&keypair.private_key[..32]);
+        let signing_key = SigningKey::from_bytes(&seed);
+        let sig = signing_key.sign(message);
+
+        Ok(Signature {
+            scheme: SchemeId::Classical,
+            bytes:  sig.to_bytes().to_vec(),
+        })
+    }
+
+    /// Real Ed25519 verification. A tampered message, signature, or key fails.
+    fn verify(&self, message: &[u8], signature: &Signature, public_key: &[u8]) -> CryptoResult<()> {
+        use ed25519_dalek::{VerifyingKey, Signature as DalekSig, Verifier};
+
+        if signature.scheme != SchemeId::Classical {
+            return Err(CryptoError::SchemeMismatch {
+                current:  signature.scheme.display_name().to_string(),
+                required: SchemeId::Classical.display_name().to_string(),
+            });
+        }
+        if public_key.len() < 32 {
+            return Err(CryptoError::VerificationFailed {
+                key_hint: hex_prefix(public_key),
+            });
+        }
+        if signature.bytes.len() != 64 {
+            return Err(CryptoError::VerificationFailed {
+                key_hint: hex_prefix(public_key),
+            });
+        }
+
+        let mut pk_bytes = [0u8; 32];
+        pk_bytes.copy_from_slice(&public_key[..32]);
+        let verifying_key = VerifyingKey::from_bytes(&pk_bytes)
+            .map_err(|_| CryptoError::VerificationFailed {
+                key_hint: hex_prefix(public_key),
+            })?;
+
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(&signature.bytes[..64]);
+        let dalek_sig = DalekSig::from_bytes(&sig_bytes);
+
+        verifying_key.verify(message, &dalek_sig)
+            .map_err(|_| CryptoError::VerificationFailed {
+                key_hint: hex_prefix(public_key),
+            })?;
+
+        tracing::debug!("Ed25519 verify: ok (real crypto)");
+        Ok(())
+    }
+
+    /// Generate a real Ed25519 keypair. The seed string is hashed to
+    /// produce deterministic keys for tests; production callers should
+    /// use generate_random() instead.
+    fn generate_keypair(&self, seed: &str) -> CryptoResult<KeyPair> {
+        use ed25519_dalek::SigningKey;
+        use sha2::{Sha256, Digest};
+
+        // Derive a deterministic 32-byte seed from the string
+        let mut hasher = Sha256::new();
+        hasher.update(seed.as_bytes());
+        let hash = hasher.finalize();
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes.copy_from_slice(&hash[..32]);
+
+        let signing_key  = SigningKey::from_bytes(&seed_bytes);
+        let verifying_key = signing_key.verifying_key();
+
+        Ok(KeyPair {
+            scheme:      SchemeId::Classical,
+            public_key:  verifying_key.to_bytes().to_vec(),
+            private_key: seed_bytes.to_vec(),
+        })
+    }
+
+    fn size_report(&self) -> SizeReport {
+        SizeReport::for_scheme(&SchemeId::Classical)
+    }
+}
+
+// -- Stub implementation (default, no real-crypto feature) -------------------
+
+#[cfg(not(feature = "real-crypto"))]
 impl SignatureScheme for ClassicalScheme {
     fn scheme_id(&self) -> &SchemeId { &SchemeId::Classical }
 
     fn sign(&self, message: &[u8], keypair: &KeyPair) -> CryptoResult<Signature> {
-        // Phase 0 stub: deterministic bytes from message + PUBLIC key, so
-        // verify() can recompute and compare (corruption is detectable).
-        // NOT real crypto -- real Ed25519 wires in Phase 1.
+        // Stub: deterministic bytes from message + PUBLIC key, so verify()
+        // can recompute and compare. NOT real crypto.
         Ok(Signature {
             scheme: SchemeId::Classical,
             bytes:  stub_sig_bytes(message, &keypair.public_key, 64),
@@ -237,21 +337,19 @@ impl SignatureScheme for ClassicalScheme {
     }
 
     fn verify(&self, message: &[u8], signature: &Signature, public_key: &[u8]) -> CryptoResult<()> {
-        // Phase 0 stub: verify the XOR relationship holds
         if signature.scheme != SchemeId::Classical {
             return Err(CryptoError::SchemeMismatch {
                 current:  signature.scheme.display_name().to_string(),
                 required: SchemeId::Classical.display_name().to_string(),
             });
         }
-        // Stub verification: recompute expected bytes and compare.
         let expected = stub_sig_bytes(message, public_key, 64);
         if signature.bytes != expected {
             return Err(CryptoError::VerificationFailed {
                 key_hint: hex_prefix(public_key),
             });
         }
-        tracing::debug!("classical stub verify: ok (Phase 0)");
+        tracing::debug!("classical stub verify: ok (no real-crypto feature)");
         Ok(())
     }
 
@@ -261,6 +359,33 @@ impl SignatureScheme for ClassicalScheme {
 
     fn size_report(&self) -> SizeReport {
         SizeReport::for_scheme(&SchemeId::Classical)
+    }
+}
+
+impl ClassicalScheme {
+    /// Generate a cryptographically random Ed25519 keypair.
+    /// Production key generation -- use this, not generate_keypair(seed).
+    #[cfg(feature = "real-crypto")]
+    pub fn generate_random(&self) -> CryptoResult<KeyPair> {
+        use ed25519_dalek::SigningKey;
+        use rand::RngCore;
+
+        let mut seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut seed);
+
+        let signing_key   = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+
+        Ok(KeyPair {
+            scheme:      SchemeId::Classical,
+            public_key:  verifying_key.to_bytes().to_vec(),
+            private_key: seed.to_vec(),
+        })
+    }
+
+    /// Whether this build uses real cryptography or stubs.
+    pub fn is_real_crypto(&self) -> bool {
+        cfg!(feature = "real-crypto")
     }
 }
 
@@ -335,16 +460,22 @@ impl SignatureScheme for HybridScheme {
     fn scheme_id(&self) -> &SchemeId { &SchemeId::HybridEd25519MlDsa }
 
     fn sign(&self, message: &[u8], keypair: &KeyPair) -> CryptoResult<Signature> {
-        // Split the keypair into classical and PQC halves
+        // Split the keypair: Ed25519 uses a 32-byte seed and 32-byte public key.
+        const ED25519_SK: usize = 32;
+        const ED25519_PK: usize = 32;
+
+        let pk_split = ED25519_PK.min(keypair.public_key.len());
+        let sk_split = ED25519_SK.min(keypair.private_key.len());
+
         let classical_kp = KeyPair {
             scheme:      SchemeId::Classical,
-            public_key:  keypair.public_key[..32.min(keypair.public_key.len())].to_vec(),
-            private_key: keypair.private_key[..64.min(keypair.private_key.len())].to_vec(),
+            public_key:  keypair.public_key[..pk_split].to_vec(),
+            private_key: keypair.private_key[..sk_split].to_vec(),
         };
         let pqc_kp = KeyPair {
             scheme:      SchemeId::MlDsa,
-            public_key:  keypair.public_key[32.min(keypair.public_key.len())..].to_vec(),
-            private_key: keypair.private_key[64.min(keypair.private_key.len())..].to_vec(),
+            public_key:  keypair.public_key[pk_split..].to_vec(),
+            private_key: keypair.private_key[sk_split..].to_vec(),
         };
 
         let classical_sig = self.classical.sign(message, &classical_kp)?;
@@ -379,8 +510,9 @@ impl SignatureScheme for HybridScheme {
         let classical_sig = Signature { scheme: SchemeId::Classical, bytes: classical_bytes.to_vec() };
         let pqc_sig       = Signature { scheme: SchemeId::MlDsa,     bytes: pqc_bytes.to_vec() };
 
-        let classical_pk = &public_key[..32.min(public_key.len())];
-        let pqc_pk       = &public_key[32.min(public_key.len())..];
+        let pk_split     = 32.min(public_key.len());
+        let classical_pk = &public_key[..pk_split];
+        let pqc_pk       = &public_key[pk_split..];
 
         // BOTH must verify -- that's the security guarantee
         self.classical.verify(message, &classical_sig, classical_pk)?;
@@ -390,8 +522,24 @@ impl SignatureScheme for HybridScheme {
         Ok(())
     }
 
+    /// Generate a hybrid keypair: real Ed25519 half + ML-DSA half.
+    /// Layout: public_key  = [ed25519_pk (32) | mldsa_pk (1952)]
+    ///         private_key = [ed25519_sk (32) | mldsa_sk (...)]
     fn generate_keypair(&self, seed: &str) -> CryptoResult<KeyPair> {
-        Ok(KeyPair::generate_stub(SchemeId::HybridEd25519MlDsa, seed))
+        let classical_kp = self.classical.generate_keypair(&format!("{seed}-ed25519"))?;
+        let pqc_kp       = self.pqc.generate_keypair(&format!("{seed}-mldsa"))?;
+
+        let mut public_key = classical_kp.public_key.clone();
+        public_key.extend_from_slice(&pqc_kp.public_key);
+
+        let mut private_key = classical_kp.private_key.clone();
+        private_key.extend_from_slice(&pqc_kp.private_key);
+
+        Ok(KeyPair {
+            scheme: SchemeId::HybridEd25519MlDsa,
+            public_key,
+            private_key,
+        })
     }
 
     fn size_report(&self) -> SizeReport {
@@ -903,4 +1051,122 @@ mod tests {
             SchemeId::HybridEd25519MlDsa.signature_size_bytes());
         assert!(report.is_quantum_resistant);
     }
+
+    // -- Real crypto tests (feature = "real-crypto") --------------------------
+
+    #[test]
+    fn reports_whether_real_crypto_is_active() {
+        let scheme = ClassicalScheme;
+        // Just confirms the flag is readable; value depends on build features
+        let _ = scheme.is_real_crypto();
+    }
+
+    #[cfg(feature = "real-crypto")]
+    mod real_crypto {
+        use super::*;
+
+        #[test]
+        fn ed25519_keypair_has_correct_sizes() {
+            let scheme = ClassicalScheme;
+            let kp = scheme.generate_keypair("alice").unwrap();
+            assert_eq!(kp.public_key.len(), 32, "Ed25519 public key is 32 bytes");
+            assert_eq!(kp.private_key.len(), 32, "Ed25519 seed is 32 bytes");
+        }
+
+        #[test]
+        fn ed25519_signature_is_64_bytes() {
+            let scheme = ClassicalScheme;
+            let kp = scheme.generate_keypair("alice").unwrap();
+            let sig = scheme.sign(b"transfer 1000 ucirfi", &kp).unwrap();
+            assert_eq!(sig.bytes.len(), 64, "Ed25519 signature is 64 bytes");
+        }
+
+        #[test]
+        fn ed25519_roundtrip_verifies() {
+            let scheme = ClassicalScheme;
+            let kp  = scheme.generate_keypair("validator-1").unwrap();
+            let msg = b"block_h42_precommit";
+            let sig = scheme.sign(msg, &kp).unwrap();
+            assert!(scheme.verify(msg, &sig, &kp.public_key).is_ok());
+        }
+
+        #[test]
+        fn ed25519_rejects_tampered_message() {
+            let scheme = ClassicalScheme;
+            let kp  = scheme.generate_keypair("alice").unwrap();
+            let sig = scheme.sign(b"send 100 to bob", &kp).unwrap();
+            // Different message must fail -- this is the property a stub cannot provide
+            assert!(scheme.verify(b"send 999 to mallory", &sig, &kp.public_key).is_err(),
+                "tampered message must fail Ed25519 verification");
+        }
+
+        #[test]
+        fn ed25519_rejects_tampered_signature() {
+            let scheme = ClassicalScheme;
+            let kp  = scheme.generate_keypair("alice").unwrap();
+            let msg = b"authorize agent";
+            let mut sig = scheme.sign(msg, &kp).unwrap();
+            sig.bytes[0] ^= 0xFF;
+            assert!(scheme.verify(msg, &sig, &kp.public_key).is_err(),
+                "tampered signature must fail");
+        }
+
+        #[test]
+        fn ed25519_rejects_wrong_public_key() {
+            let scheme = ClassicalScheme;
+            let alice = scheme.generate_keypair("alice").unwrap();
+            let bob   = scheme.generate_keypair("bob").unwrap();
+            let msg   = b"claim ubi";
+            let sig   = scheme.sign(msg, &alice).unwrap();
+            // Bob's key must not verify Alice's signature
+            assert!(scheme.verify(msg, &sig, &bob.public_key).is_err(),
+                "wrong public key must fail verification");
+        }
+
+        #[test]
+        fn ed25519_keygen_is_deterministic_from_seed() {
+            let scheme = ClassicalScheme;
+            let a = scheme.generate_keypair("same-seed").unwrap();
+            let b = scheme.generate_keypair("same-seed").unwrap();
+            assert_eq!(a.public_key, b.public_key,
+                "same seed must produce same key (needed for reproducible tests)");
+        }
+
+        #[test]
+        fn ed25519_different_seeds_give_different_keys() {
+            let scheme = ClassicalScheme;
+            let a = scheme.generate_keypair("alice").unwrap();
+            let b = scheme.generate_keypair("bob").unwrap();
+            assert_ne!(a.public_key, b.public_key);
+        }
+
+        #[test]
+        fn random_keygen_produces_unique_keys() {
+            let scheme = ClassicalScheme;
+            let a = scheme.generate_random().unwrap();
+            let b = scheme.generate_random().unwrap();
+            assert_ne!(a.public_key, b.public_key,
+                "random keygen must not repeat");
+        }
+
+        #[test]
+        fn hybrid_with_real_ed25519_roundtrips() {
+            let scheme = HybridScheme::new();
+            let kp  = scheme.generate_keypair("hybrid-validator").unwrap();
+            let msg = b"consensus vote h100";
+            let sig = scheme.sign(msg, &kp).unwrap();
+            assert!(scheme.verify(msg, &sig, &kp.public_key).is_ok(),
+                "hybrid must verify with real Ed25519 half");
+        }
+
+        #[test]
+        fn hybrid_rejects_tampered_message_via_ed25519_half() {
+            let scheme = HybridScheme::new();
+            let kp  = scheme.generate_keypair("hybrid-validator").unwrap();
+            let sig = scheme.sign(b"original message", &kp).unwrap();
+            assert!(scheme.verify(b"tampered message", &sig, &kp.public_key).is_err(),
+                "hybrid must reject tampered message");
+        }
+    }
+
 }

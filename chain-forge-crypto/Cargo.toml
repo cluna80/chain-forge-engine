@@ -15,8 +15,9 @@ license.workspace = true
 #   - MigrationTrigger: NIST guidance update / CRQC detection / calendar
 #   - SizeReport: honest accounting of PQC signature size cost (Section 10.3)
 #
-# Phase 0: all schemes produce/verify stub bytes. The trait interface is
-# real and tested; actual crypto primitives wire in Phase 1.
+# Phase 1: ClassicalScheme uses real ed25519-dalek behind the "real-crypto"
+# feature. ML-DSA remains a sized stub until the Rust PQC ecosystem
+# stabilises; the trait interface is identical either way.
 # The constitutional guarantee (Section 7.3): the scheme CAN be replaced
 # without forking the chain. This crate is the enforcement of that guarantee.
 #
@@ -28,6 +29,19 @@ serde             = { workspace = true }
 serde_json        = { workspace = true }
 thiserror         = { workspace = true }
 tracing           = { workspace = true }
+
+# Real Ed25519 signing (Phase 1). Behind the "real-crypto" feature so the
+# stub path stays available for fast tests and for environments without
+# the dependency tree.
+ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
+rand          = { version = "0.8", optional = true }
+sha2          = { version = "0.10", optional = true }
+
+[features]
+default = []
+# Enable real cryptographic signing (ed25519-dalek).
+# Without this flag, ClassicalScheme uses deterministic stub bytes.
+real-crypto = ["dep:ed25519-dalek", "dep:rand", "dep:sha2"]
 
 [dev-dependencies]
 tokio = { workspace = true }
