@@ -1,0 +1,21 @@
+[package]
+name    = "chain-forge-execution"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Execution layer: transaction types, validation, gas metering,
+# state transition application.
+# Bridges consensus (ordering) and state (storage).
+
+[dependencies]
+chain-forge-core  = { path = "../chain-forge-core" }
+chain-forge-state = { path = "../chain-forge-state" }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

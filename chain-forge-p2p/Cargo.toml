@@ -1,0 +1,35 @@
+[package]
+name    = "chain-forge-p2p"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# P2P networking layer: peer discovery, gossip, block/vote propagation.
+# Uses libp2p — same foundation as Substrate, IPFS, Filecoin.
+# Feature flags kept minimal to control compile time.
+
+[dependencies]
+chain-forge-core = { path = "../chain-forge-core" }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+tokio            = { workspace = true }
+async-trait      = { workspace = true }
+
+# libp2p — pinned feature set for Phase 0
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "mdns",
+    "identify",
+    "ping",
+    "macros",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }

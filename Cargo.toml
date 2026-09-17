@@ -1,0 +1,26 @@
+﻿[workspace]
+resolver = "2"
+members = [
+    "chain-forge-core",
+    "chain-forge-consensus",
+    "chain-forge-p2p",
+    "chain-forge-state",
+    "chain-forge-execution",
+    "chain-forge-node",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["cluna80"]
+license     = "MIT"
+repository  = "https://github.com/cluna80/chain-forge-engine"
+
+[workspace.dependencies]
+tokio       = { version = "1", features = ["full"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+sha3        = "0.10"
+thiserror   = "1"
+async-trait = "0.1"
+tracing     = "0.1"

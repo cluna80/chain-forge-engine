@@ -1,0 +1,27 @@
+[package]
+name    = "chain-forge-node"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chain-forge-node"
+path = "src/main.rs"
+
+[dependencies]
+chain-forge-core      = { path = "../chain-forge-core" }
+chain-forge-consensus = { path = "../chain-forge-consensus" }
+chain-forge-state     = { path = "../chain-forge-state" }
+chain-forge-execution = { path = "../chain-forge-execution" }
+chain-forge-p2p       = { path = "../chain-forge-p2p" }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
+tracing               = { workspace = true }
+tokio                 = { workspace = true }
+async-trait           = { workspace = true }
+tracing-subscriber    = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }

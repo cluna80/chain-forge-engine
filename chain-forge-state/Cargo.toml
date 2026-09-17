@@ -1,0 +1,21 @@
+[package]
+name    = "chain-forge-state"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# State layer: Merkle state tree, account balances, snapshots.
+# Reads genesis accounts from chain-forge-core and maintains the
+# canonical state root after every block commit.
+
+[dependencies]
+chain-forge-core = { path = "../chain-forge-core" }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+sha3             = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

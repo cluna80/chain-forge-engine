@@ -1,0 +1,4 @@
+﻿/target
+*.py
+qcb-genesis.json
+Cargo.lock
