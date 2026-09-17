@@ -1,0 +1,29 @@
+[package]
+name    = "chain-forge-identity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Protocol-level proof-of-personhood for QCB Chain.
+# Implements the identity layer described in Whitepaper Section 4:
+#   - VerificationTier: Provisional -> Verified -> Established
+#   - PopAttestation: the cryptographic proof a human is verified
+#   - IdentityRecord: full per-human state including liveness tracking
+#   - IdentityStore: the canonical registry of all verified humans
+#   - UBI epoch clock and claim gating (one claim per identity per epoch)
+#   - Liveness enforcement (Q24: participation maintains identity)
+#
+# Phase 0: web-of-trust and live-challenge ceremony are stubbed.
+# The data structures and enforcement logic are real; the actual
+# verification proof is a placeholder until the crypto layer is wired.
+
+[dependencies]
+chain-forge-core = { path = "../chain-forge-core" }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

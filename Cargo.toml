@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = [
     "chain-forge-core",
@@ -6,6 +6,8 @@ members = [
     "chain-forge-p2p",
     "chain-forge-state",
     "chain-forge-execution",
+    "chain-forge-identity",
+    "chain-forge-cirfi",
     "chain-forge-node",
 ]
 

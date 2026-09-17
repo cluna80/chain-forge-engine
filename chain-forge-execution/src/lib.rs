@@ -22,6 +22,8 @@
 use serde::{Deserialize, Serialize};
 use chain_forge_core::GenesisConfig;
 use chain_forge_state::{StateStore, StateError};
+use chain_forge_identity::IdentityStore;
+use chain_forge_cirfi::CirfiEngine;
 
 // -- Error --------------------------------------------------------------------
 
@@ -86,10 +88,14 @@ impl GasModel {
             Self::Fixed { fee_per_tx } => *fee_per_tx,
             Self::Dynamic { base_fee_per_byte, op_multiplier } => {
                 let op_cost = match &tx.body {
-                    TxBody::Transfer { .. } => op_multiplier * 2,
-                    TxBody::Burn    { .. } => op_multiplier * 3,
-                    TxBody::Stake   { .. } => op_multiplier * 5,
-                    TxBody::Custom  { .. } => op_multiplier * 10,
+                    TxBody::Transfer { .. }          => op_multiplier * 2,
+                    TxBody::Burn    { .. }           => op_multiplier * 3,
+                    TxBody::Stake   { .. }           => op_multiplier * 5,
+                    TxBody::Custom  { .. }           => op_multiplier * 10,
+                    TxBody::ClaimUbi { .. }          => op_multiplier * 3,
+                    TxBody::RedirectToUbiPool { .. } => op_multiplier * 3,
+                    TxBody::SponsorAgent { .. }      => op_multiplier * 4,
+                    TxBody::RevokeAgent  { .. }      => op_multiplier * 2,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -127,6 +133,26 @@ pub enum TxBody {
         module:  String,
         payload: Vec<u8>,
     },
+    /// Claim UBI for a verified identity (Section 6.2 / Charm Confinement 5.1).
+    /// Enforces: one claim per epoch, verified tier, liveness.
+    /// The sender must be the identity owner.
+    ClaimUbi {
+        identity_id: String,
+    },
+    /// Proactive redirect of $CIRFI balance to the UBI pool (Section 6.3 / Q25).
+    /// Triggers BME fee. Holder voluntarily sends balance to pool.
+    RedirectToUbiPool {
+        amount: u128,
+    },
+    /// Register a Charmed Agent under a verified human sponsor (Section 5.3).
+    /// Enforces: sponsor must be Verified tier.
+    SponsorAgent {
+        agent_address: String,
+    },
+    /// Revoke a previously sponsored agent.
+    RevokeAgent {
+        agent_address: String,
+    },
 }
 
 /// A fully-formed transaction ready for execution.
@@ -150,10 +176,14 @@ impl Transaction {
     /// Approximate serialised size in bytes (used for gas calculation).
     pub fn payload_size_bytes(&self) -> usize {
         let body_size = match &self.body {
-            TxBody::Transfer { to, denom, .. } => to.len() + denom.len() + 16,
-            TxBody::Burn     { denom, .. }      => denom.len() + 16,
-            TxBody::Stake    { validator, .. }  => validator.len() + 16,
-            TxBody::Custom   { module, payload } => module.len() + payload.len(),
+            TxBody::Transfer { to, denom, .. }       => to.len() + denom.len() + 16,
+            TxBody::Burn     { denom, .. }            => denom.len() + 16,
+            TxBody::Stake    { validator, .. }        => validator.len() + 16,
+            TxBody::Custom   { module, payload }      => module.len() + payload.len(),
+            TxBody::ClaimUbi { identity_id }          => identity_id.len() + 8,
+            TxBody::RedirectToUbiPool { .. }          => 16,
+            TxBody::SponsorAgent { agent_address }    => agent_address.len() + 8,
+            TxBody::RevokeAgent  { agent_address }    => agent_address.len() + 8,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -182,6 +212,42 @@ impl Transaction {
             nonce,
             body: TxBody::Burn { denom: denom.to_string(), amount },
             gas_limit: 100_000,
+            signature: vec![],
+        }
+    }
+
+    /// A UBI claim transaction (Charm Confinement: one per epoch).
+    pub fn claim_ubi(id: &str, sender: &str, identity_id: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::ClaimUbi { identity_id: identity_id.to_string() },
+            gas_limit: 50_000,
+            signature: vec![],
+        }
+    }
+
+    /// A UBI pool redirect transaction (Section 6.3 / Q25).
+    pub fn redirect_to_ubi_pool(id: &str, sender: &str, amount: u128, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::RedirectToUbiPool { amount },
+            gas_limit: 50_000,
+            signature: vec![],
+        }
+    }
+
+    /// A sponsor agent transaction (Section 5.3).
+    pub fn sponsor_agent(id: &str, sender: &str, agent_address: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::SponsorAgent { agent_address: agent_address.to_string() },
+            gas_limit: 50_000,
             signature: vec![],
         }
     }
@@ -263,6 +329,8 @@ impl ExecutionConfig {
 
 /// Applies transactions to a StateStore.
 /// The node creates one Executor per block and calls execute_block().
+/// Identity-aware: CharmConfinement enforcement happens here via
+/// optional IdentityStore and CirfiEngine references.
 pub struct Executor {
     config: ExecutionConfig,
 }
@@ -270,6 +338,150 @@ pub struct Executor {
 impl Executor {
     pub fn new(config: ExecutionConfig) -> Self {
         Self { config }
+    }
+
+    /// Execute a single transaction with CharmConfinement enforcement.
+    /// Requires identity store and CirFi engine for identity-gated tx types.
+    pub fn execute_tx_with_identity(
+        &self,
+        tx:       &Transaction,
+        state:    &mut StateStore,
+        identity: &mut IdentityStore,
+        cirfi:    &mut CirfiEngine,
+    ) -> TransactionResult {
+        let gas_required = self.config.gas_model.calculate_gas(tx);
+
+        if tx.gas_limit < gas_required {
+            return TransactionResult::err(
+                tx.id.clone(), gas_required, tx.gas_limit,
+                format!("gas limit {} below required {}", tx.gas_limit, gas_required),
+            );
+        }
+
+        let expected_nonce = state.get_account(&tx.sender)
+            .map(|a| a.nonce).unwrap_or(0);
+        if tx.nonce != expected_nonce {
+            return TransactionResult::err(
+                tx.id.clone(), gas_required, tx.gas_limit,
+                format!("nonce mismatch: expected {expected_nonce}, got {}", tx.nonce),
+            );
+        }
+
+        let mut events = Vec::new();
+        let result = match &tx.body {
+
+            // -- Standard tx types (same as execute_tx) ----------------------
+            TxBody::Transfer { to, denom, amount } => {
+                // Record spend for decay-exemption (Section 6.2)
+                let epoch = identity.clock.current_epoch;
+                if let Ok(sender_acct) = state.get_account_mut(&tx.sender) {
+                    sender_acct.record_spend_for_exemption(epoch);
+                }
+                state.transfer(&tx.sender, to, denom, *amount)
+                    .map(|_| events.push(format!("transfer: {} {} -> {}", amount, denom, to)))
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::Burn { denom, amount } => {
+                state.burn(&tx.sender, denom, *amount)
+                    .map(|_| events.push(format!("burn: {} {} (BME)", amount, denom)))
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::Stake { validator, amount } => {
+                state.transfer(&tx.sender, validator, &self.config.native_denom, *amount)
+                    .map(|_| events.push(format!("stake: {} -> {}", amount, validator)))
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::Custom { module, payload } => {
+                events.push(format!("custom: module={} bytes={}", module, payload.len()));
+                Ok(())
+            }
+
+            // -- CharmConfinement-enforced tx types --------------------------
+
+            TxBody::ClaimUbi { identity_id } => {
+                // Charm Confinement: one claim per epoch, verified tier, liveness
+                if state.get_account(&tx.sender).is_err() {
+                    let new_acct = chain_forge_state::AccountState::new(
+                        tx.sender.clone(), "user".to_string()
+                    );
+                    state.upsert_account(new_acct);
+                }
+                match state.get_account_mut(&tx.sender) {
+                    Ok(account) => {
+                        cirfi.distribute_ubi(identity_id, account, identity)
+                            .map(|amount| {
+                                events.push(format!(
+                                    "ubi_claim: {} ucirfi -> {} (identity: {})",
+                                    amount, tx.sender, identity_id
+                                ));
+                            })
+                            .map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+
+            TxBody::RedirectToUbiPool { amount } => {
+                // Proactive redirect: triggers BME fee (Section 6.3 / Q25)
+                let epoch = identity.clock.current_epoch;
+                match state.get_account_mut(&tx.sender) {
+                    Ok(account) => {
+                        account.record_spend_for_exemption(epoch);
+                        cirfi.redirect_to_ubi_pool(account, *amount)
+                            .map(|to_pool| {
+                                events.push(format!(
+                                    "ubi_redirect: {} ucirfi to pool (BME triggered)",
+                                    to_pool
+                                ));
+                            })
+                            .map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+
+            TxBody::SponsorAgent { agent_address } => {
+                // Charm Confinement: sponsor must be Verified tier
+                identity.sponsor_agent(&tx.sender, agent_address)
+                    .map(|_| {
+                        events.push(format!(
+                            "sponsor_agent: {} -> {} authorized",
+                            tx.sender, agent_address
+                        ));
+                        // Update account charm to reflect agent sponsorship
+                        if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                            acct.record_participation(identity.clock.current_epoch);
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::RevokeAgent { agent_address } => {
+                if let Ok(record) = identity.get(&tx.sender) {
+                    if record.has_sponsored(agent_address) {
+                        identity.get_mut(&tx.sender)
+                            .map(|r| r.revoke_agent(agent_address));
+                        events.push(format!(
+                            "revoke_agent: {} -> {} revoked",
+                            tx.sender, agent_address
+                        ));
+                        Ok(())
+                    } else {
+                        Err(format!("{} has not sponsored agent {}", tx.sender, agent_address))
+                    }
+                } else {
+                    Err(format!("identity {} not found", tx.sender))
+                }
+            }
+        };
+
+        match result {
+            Ok(_) => TransactionResult::ok(tx.id.clone(), gas_required, tx.gas_limit, events),
+            Err(e) => TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e),
+        }
     }
 
     /// Execute a single transaction against the state store.
@@ -354,6 +566,13 @@ impl Executor {
                 ));
                 Ok(())
             }
+            // Identity-gated tx types require execute_tx_with_identity().
+            TxBody::ClaimUbi { .. }
+            | TxBody::RedirectToUbiPool { .. }
+            | TxBody::SponsorAgent { .. }
+            | TxBody::RevokeAgent { .. } => {
+                Err("identity-gated transaction requires identity-aware executor".to_string())
+            }
         };
 
         match result {
@@ -433,6 +652,8 @@ mod tests {
     use super::*;
     use chain_forge_core::{GenesisConfig, HashWidth};
     use chain_forge_state::StateStore;
+    use chain_forge_identity::IdentityStore;
+    use chain_forge_cirfi::CirfiEngine;
 
     fn genesis_json() -> &'static str {
         r#"{
@@ -642,5 +863,114 @@ mod tests {
 
         let result = exec.execute_block(1, txs, &mut state, 1_000_000);
         assert!(result.fees_collected > 0, "fees should be collected");
+    }
+
+    // -- CharmConfinement enforcement tests -----------------------------------
+
+    fn setup_with_identity() -> (Executor, StateStore, IdentityStore, CirfiEngine) {
+        use chain_forge_identity::{IdentityStore, PopAttestation};
+        use chain_forge_cirfi::CirfiEngine;
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+
+        let mut identity = IdentityStore::new(0);
+        let att = PopAttestation::genesis("qcb1alice", 0);
+        identity.register("qcb1alice".into(), "qcb1alice".into(), att.clone()).unwrap();
+        identity.verify_identity("qcb1alice", att).unwrap();
+
+        let cirfi = CirfiEngine::new("ucirfi".into(), "uqcb".into());
+        (Executor::new(config), state, identity, cirfi)
+    }
+
+    #[test]
+    fn claim_ubi_credits_verified_human() {
+        use chain_forge_identity::DAILY_UBI_RATE_UCIRFI;
+
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        let tx = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+
+        assert!(result.success, "UBI claim should succeed: {:?}", result.error);
+        assert!(result.events.iter().any(|e| e.contains("ubi_claim")));
+        let balance = state.get_account("qcb1alice").unwrap().balance_of("ucirfi");
+        assert_eq!(balance, DAILY_UBI_RATE_UCIRFI,
+            "alice's ucirfi balance should equal one UBI claim (genesis balance is uqcb)");
+    }
+
+    #[test]
+    fn charm_confinement_blocks_double_ubi_claim() {
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        let tx1 = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
+        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut cirfi);
+        assert!(r1.success);
+
+        let tx2 = Transaction::claim_ubi("tx2", "qcb1alice", "qcb1alice", 1);
+        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut cirfi);
+        assert!(!r2.success, "second UBI claim in same epoch must fail");
+    }
+
+    #[test]
+    fn redirect_to_ubi_pool_triggers_bme() {
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        // Claim UBI first so alice has ucirfi to redirect
+        let claim = Transaction::claim_ubi("tx0", "qcb1alice", "qcb1alice", 0);
+        let r0 = exec.execute_tx_with_identity(&claim, &mut state, &mut identity, &mut cirfi);
+        assert!(r0.success, "{:?}", r0.error);
+
+        let tx = Transaction::redirect_to_ubi_pool("tx1", "qcb1alice", 1_000_000, 1);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.events.iter().any(|e| e.contains("ubi_redirect")));
+        assert!(cirfi.bme.total_fees_collected_ucirfi > 0, "BME should collect fee");
+    }
+
+    #[test]
+    fn sponsor_agent_requires_verified_identity() {
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        // Bob is not in identity store -- should fail
+        let tx = Transaction::sponsor_agent("tx1", "qcb1bob", "qcb1agent1", 0);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        assert!(!result.success, "unverified identity cannot sponsor agents");
+    }
+
+    #[test]
+    fn sponsor_agent_succeeds_for_verified_human() {
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        let tx = Transaction::sponsor_agent("tx1", "qcb1alice", "qcb1agent1", 0);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(identity.is_agent_authorized("qcb1agent1", "qcb1alice"),
+            "agent should be authorized after sponsor tx");
+    }
+
+    #[test]
+    fn spend_earns_decay_exemption() {
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        // Attach charm to alice's account first
+        let mut charm = chain_forge_identity::IntrinsicCharm::provisional(0);
+        charm.verify(0);
+        let mut alice = state.get_account("qcb1alice").unwrap().clone();
+        alice.attach_charm(charm);
+        state.upsert_account(alice);
+
+        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 0);
+
+        // Transfer triggers spend -> exemption credit
+        let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0);
+        exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+
+        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 1,
+            "spending should earn 1 day of decay exemption");
     }
 }

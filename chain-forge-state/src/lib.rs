@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use chain_forge_core::{ChainHash, GenesisConfig, HashWidth};
+use chain_forge_identity::IntrinsicCharm;
 
 // -- Error --------------------------------------------------------------------
 
@@ -53,7 +54,7 @@ pub type StateResult<T> = Result<T, StateError>;
 /// The on-chain state for a single account.
 /// Balances are stored as u128 to avoid overflow on large supplies.
 /// The denom is stored per-account so multi-token chains work naturally.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
     pub address: String,
     /// Balances keyed by token denom (e.g. "uqcb", "ucirfi").
@@ -63,6 +64,11 @@ pub struct AccountState {
     /// Account role from genesis (validator/treasury/faucet/user).
     /// Informational only -- enforcement is the governance layer's job.
     pub role: String,
+    /// IntrinsicCharm: verification tier, decay-exemption credits, liveness.
+    /// Whitepaper Section 5.2: "properties treated as inherent to a piece of
+    /// state or identity, traveling with it rather than being externally assigned."
+    /// None for non-human accounts (treasury, faucet, agent accounts).
+    pub charm: Option<IntrinsicCharm>,
 }
 
 impl AccountState {
@@ -72,6 +78,60 @@ impl AccountState {
             balances: BTreeMap::new(),
             nonce: 0,
             role,
+            charm: None,
+        }
+    }
+
+    /// Create a human account with IntrinsicCharm attached.
+    /// Used when a verified human account is created at genesis or
+    /// when an account is first linked to an identity (Section 5.2).
+    pub fn new_human(address: String, role: String, current_epoch: u64) -> Self {
+        Self {
+            address,
+            balances: BTreeMap::new(),
+            nonce: 0,
+            role,
+            charm: Some(IntrinsicCharm::provisional(current_epoch)),
+        }
+    }
+
+    /// Attach an IntrinsicCharm to an existing account.
+    /// Called when an account is linked to a verified identity.
+    pub fn attach_charm(&mut self, charm: IntrinsicCharm) {
+        self.charm = Some(charm);
+    }
+
+    /// Whether this account has a verified identity attached (Section 5.2).
+    pub fn is_human(&self) -> bool {
+        self.charm.as_ref()
+            .map(|c| c.tier.grants_full_ubi())
+            .unwrap_or(false)
+    }
+
+    /// Current verification tier. None for non-human accounts.
+    pub fn verification_tier(&self) -> Option<&chain_forge_identity::VerificationTier> {
+        self.charm.as_ref().map(|c| &c.tier)
+    }
+
+    /// Decay-exemption days remaining. 0 for non-human accounts.
+    pub fn exemption_days(&self) -> u32 {
+        self.charm.as_ref()
+            .map(|c| c.decay_exemption.days)
+            .unwrap_or(0)
+    }
+
+    /// Record a spend for decay-exemption tracking (Section 6.2).
+    /// Only applies to human accounts with charm attached.
+    pub fn record_spend_for_exemption(&mut self, epoch: u64) {
+        if let Some(charm) = &mut self.charm {
+            charm.decay_exemption.record_spend(epoch);
+        }
+    }
+
+    /// Record participation for liveness tracking (Q24).
+    pub fn record_participation(&mut self, epoch: u64) {
+        if let Some(charm) = &mut self.charm {
+            charm.record_participation(epoch);
         }
     }
 
@@ -105,12 +165,17 @@ impl AccountState {
     }
 
     /// Canonical byte serialisation for Merkle hashing.
-    /// Format: address|nonce|denom1=bal1|denom2=bal2|...
+    /// Format: address|nonce|tier|denom1=bal1|denom2=bal2|...
     /// BTreeMap iteration is sorted so this is deterministic.
+    /// IntrinsicCharm tier is included so identity changes affect state root.
     pub fn to_leaf_bytes(&self) -> Vec<u8> {
+        let tier_str = self.charm.as_ref()
+            .map(|c| c.tier.to_string())
+            .unwrap_or_else(|| "none".to_string());
         let mut parts = vec![
             self.address.clone(),
             self.nonce.to_string(),
+            tier_str,
         ];
         for (denom, bal) in &self.balances {
             parts.push(format!("{denom}={bal}"));
@@ -417,6 +482,11 @@ impl StateStore {
         tracing::info!(height = snapshot.height, "state restored from snapshot");
     }
 
+    /// Iterator over all accounts in the store.
+    pub fn all_accounts(&self) -> impl Iterator<Item = &AccountState> {
+        self.accounts.values()
+    }
+
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }
@@ -662,5 +732,100 @@ mod tests {
         assert_eq!(a.balance_of("uqcb"),   1_000_000);
         assert_eq!(a.balance_of("ucirfi"), 500_000);
         assert_eq!(a.balance_of("uother"), 0);
+    }
+
+    // -- IntrinsicCharm integration tests ------------------------------------
+
+    #[test]
+    fn new_account_has_no_charm() {
+        let acct = AccountState::new("qcb1plain".into(), "user".into());
+        assert!(acct.charm.is_none());
+        assert!(!acct.is_human());
+        assert_eq!(acct.exemption_days(), 0);
+        assert!(acct.verification_tier().is_none());
+    }
+
+    #[test]
+    fn human_account_has_charm() {
+        let acct = AccountState::new_human("qcb1human".into(), "user".into(), 0);
+        assert!(acct.charm.is_some());
+        assert!(!acct.is_human()); // Provisional -- not yet Verified
+        assert_eq!(acct.exemption_days(), 0);
+    }
+
+    #[test]
+    fn attach_charm_makes_account_human() {
+        use chain_forge_identity::IntrinsicCharm;
+        let mut acct = AccountState::new("qcb1acct".into(), "user".into());
+        assert!(!acct.is_human());
+
+        let mut charm = IntrinsicCharm::provisional(0);
+        charm.verify(1); // upgrade to Verified
+        acct.attach_charm(charm);
+
+        assert!(acct.is_human());
+        assert_eq!(
+            acct.verification_tier(),
+            Some(&chain_forge_identity::VerificationTier::Verified)
+        );
+    }
+
+    #[test]
+    fn spend_earns_exemption_credit() {
+        let mut acct = AccountState::new_human("qcb1human".into(), "user".into(), 0);
+        assert_eq!(acct.exemption_days(), 0);
+
+        acct.record_spend_for_exemption(1);
+        assert_eq!(acct.exemption_days(), 1);
+
+        acct.record_spend_for_exemption(2);
+        assert_eq!(acct.exemption_days(), 2);
+    }
+
+    #[test]
+    fn non_human_account_ignores_spend_exemption() {
+        let mut acct = AccountState::new("qcb1treasury".into(), "treasury".into());
+        acct.record_spend_for_exemption(1); // should be a no-op
+        assert_eq!(acct.exemption_days(), 0);
+    }
+
+    #[test]
+    fn charm_tier_included_in_merkle_leaf() {
+        use chain_forge_identity::IntrinsicCharm;
+
+        let acct_plain = AccountState::new("qcb1a".into(), "user".into());
+        let mut acct_human = AccountState::new("qcb1a".into(), "user".into());
+        let charm = IntrinsicCharm::provisional(0);
+        acct_human.attach_charm(charm);
+
+        // Same address + nonce + balances but different charm tier
+        // -> different leaf bytes -> different Merkle contribution
+        assert_ne!(
+            acct_plain.to_leaf_bytes(),
+            acct_human.to_leaf_bytes(),
+            "charm tier must affect Merkle leaf bytes"
+        );
+    }
+
+    #[test]
+    fn state_root_changes_on_verification() {
+        use chain_forge_identity::IntrinsicCharm;
+
+        let mut store = make_store();
+        let mut acct = AccountState::new_human("qcb1h1".into(), "user".into(), 0);
+        acct.credit("ucirfi", 1_000_000);
+        store.upsert_account(acct);
+        let root1 = store.commit(1, 1000, false).root_hash;
+
+        // Verify the identity -- upgrade charm tier then re-upsert
+        let mut charm = IntrinsicCharm::provisional(0);
+        charm.verify(1);
+        let mut updated = store.get_account("qcb1h1").unwrap().clone();
+        updated.charm = Some(charm);
+        store.upsert_account(updated);
+        let root2 = store.commit(2, 2000, false).root_hash;
+
+        assert_ne!(root1, root2,
+            "state root must change when identity tier changes");
     }
 }

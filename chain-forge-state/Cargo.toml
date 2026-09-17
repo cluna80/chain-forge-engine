@@ -10,12 +10,13 @@ license.workspace = true
 # canonical state root after every block commit.
 
 [dependencies]
-chain-forge-core = { path = "../chain-forge-core" }
-serde            = { workspace = true }
-serde_json       = { workspace = true }
-thiserror        = { workspace = true }
-tracing          = { workspace = true }
-sha3             = { workspace = true }
+chain-forge-core     = { path = "../chain-forge-core" }
+chain-forge-identity = { path = "../chain-forge-identity" }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+tracing              = { workspace = true }
+sha3                 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
