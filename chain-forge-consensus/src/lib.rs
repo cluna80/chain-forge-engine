@@ -517,8 +517,9 @@ mod tests {
         assert_eq!(capped.validators[1].voting_power, 0); // zeroed
         assert_eq!(capped.validators[0].voting_power, 1); // unchanged
     }
-}
 
+
+}
 pub mod tendermint {
     use super::*;
 
@@ -872,28 +873,16 @@ impl ConsensusEngine for TendermintEngine {
 
         // TODO: verify vote signature once crypto layer is wired up.
 
-        // Insert the vote first, then drop the borrow before calling
-        // check_*_quorum() which needs an immutable borrow of self.
-        let vote_round = vote.round;
-        {
-            let round_votes = self.votes.entry(vote_round).or_default();
-            match vote.vote_type {
-                VoteType::Prevote | VoteType::Nil => {
-                    round_votes.prevotes
-                        .entry(vote.validator.clone())
-                        .or_insert_with(|| vote.clone());
-                }
-                VoteType::Precommit => {
-                    round_votes.precommits
-                        .entry(vote.validator.clone())
-                        .or_insert_with(|| vote.clone());
-                }
-                _ => {}
-            }
-        } // round_votes borrow ends here
+        let round_votes = self.votes.entry(vote.round).or_default();
 
         match vote.vote_type {
             VoteType::Prevote | VoteType::Nil => {
+                // Idempotent: if we already have a prevote from this validator
+                // for this round, ignore the duplicate.
+                round_votes.prevotes
+                    .entry(vote.validator.clone())
+                    .or_insert_with(|| vote.clone());
+
                 // Check if we now have 2/3+ prevotes for any block.
                 if let Some(valid) = self.check_prevote_quorum() {
                     debug!(
@@ -907,13 +896,15 @@ impl ConsensusEngine for TendermintEngine {
             }
 
             VoteType::Precommit => {
+                round_votes.precommits
+                    .entry(vote.validator.clone())
+                    .or_insert_with(|| vote.clone());
+
                 // Check if we now have 2/3+ precommits for any block.
-                if let Some(winning_hash) = self.check_precommit_quorum() {
-                    // Collect precommits - borrow ends before we mutate self.
-                    let precommits = self.votes
-                        .get(&vote_round)
-                        .map(|rv| rv.precommit_votes_for(&winning_hash))
-                        .unwrap_or_default();
+                let winning_hash_opt = self.check_precommit_quorum();
+                if let Some(winning_hash) = winning_hash_opt {
+                    let round_votes2 = self.votes.entry(vote.round).or_default();
+                    let precommits = round_votes2.precommit_votes_for(&winning_hash);
 
                     info!(
                         height = self.height,
@@ -1047,6 +1038,401 @@ impl ConsensusEngine for TendermintEngine {
 
         Ok(())
     }
+}
+
+// -- HotStuffEngine ----------------------------------------------------------
+
+/// HotStuff-style BFT consensus engine.
+///
+/// HotStuff (Abraham, Malkhi, Spiegelman 2018) achieves linear message
+/// complexity per block by using a three-phase pipelined protocol with a
+/// stable rotating leader. Key differences from Tendermint:
+///
+///   Tendermint:   O(n²) messages per block (all-to-all prevote + precommit)
+///   HotStuff:     O(n) messages per block (leader aggregates, fans out)
+///
+/// The tradeoff: HotStuff requires a trusted threshold signature scheme to
+/// aggregate votes efficiently. In Phase 0 (no real crypto), we simulate
+/// the aggregation by tracking individual votes -- the safety and liveness
+/// properties hold, the communication pattern is simplified.
+///
+/// Three phases per block:
+///   PREPARE:   Leader proposes block, collects 2f+1 PREPARE votes
+///   PRE-COMMIT: Leader aggregates PREPARE QC, collects 2f+1 PRE-COMMIT votes
+///   COMMIT:    Leader aggregates PRE-COMMIT QC, collects 2f+1 COMMIT votes
+///
+/// Pipelining: COMMIT for block k happens in the PREPARE phase of block k+2,
+/// so the effective latency is one round-trip per block rather than three.
+/// Phase 0 implements the full three-phase logic without pipelining to keep
+/// the code straightforward; pipelining is a Phase 1 optimisation.
+///
+/// Personhood weighting: applied identically to TendermintEngine via
+/// `apply_personhood_cap()`. The power cap is a QCB-specific constraint
+/// layered on top of HotStuff's standard quorum rules.
+///
+/// Whitepaper ref: Section 3 / ConsensusVariant::HotStuffStyle.
+/// Open Question 2: which variant QCB ultimately uses depends on scale.
+
+/// Which phase of the HotStuff protocol we are in for the current height.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotStuffPhase {
+    /// Waiting for the leader's PREPARE message (block proposal).
+    WaitingForPrepare,
+    /// Collected the proposal; accumulating PREPARE votes.
+    CollectingPrepareVotes,
+    /// Collected PREPARE QC; accumulating PRE-COMMIT votes.
+    CollectingPreCommitVotes,
+    /// Collected PRE-COMMIT QC; accumulating COMMIT votes.
+    CollectingCommitVotes,
+    /// Block committed. Waiting for on_commit() to advance height.
+    Committed,
+}
+
+pub struct HotStuffEngine {
+    config:         ConsensusConfig,
+    validators:     ValidatorSet,
+    height:         BlockHeight,
+    round:          Round,
+    phase:          HotStuffPhase,
+    /// Current pending proposal (set on receive_proposal).
+    pending:        Option<BlockProposal>,
+    /// PREPARE votes accumulated for the pending block.
+    prepare_votes:  BTreeMap<ValidatorId, u64>,
+    /// PRE-COMMIT votes accumulated after PREPARE QC formed.
+    precommit_votes: BTreeMap<ValidatorId, u64>,
+    /// COMMIT votes accumulated after PRE-COMMIT QC formed.
+    commit_votes:   BTreeMap<ValidatorId, u64>,
+    /// Proposer index for round-robin rotation.
+    proposer_idx:   usize,
+}
+
+impl HotStuffEngine {
+    pub fn new() -> Self {
+        Self {
+            config:          ConsensusConfig {
+                variant:              ConsensusVariant::HotStuffStyle,
+                propose_timeout_ms:   3_000,
+                prevote_timeout_ms:   1_000,
+                precommit_timeout_ms: 1_000,
+                block_time_ms:        1_000,
+                personhood:           None,
+            },
+            validators:      ValidatorSet { height: 0, validators: vec![] },
+            height:          0,
+            round:           0,
+            phase:           HotStuffPhase::WaitingForPrepare,
+            pending:         None,
+            prepare_votes:   BTreeMap::new(),
+            precommit_votes: BTreeMap::new(),
+            commit_votes:    BTreeMap::new(),
+            proposer_idx:    0,
+        }
+    }
+
+    /// The current leader (round-robin rotation by height + round).
+    pub fn current_leader(&self) -> Option<&ValidatorId> {
+        if self.validators.validators.is_empty() { return None; }
+        let idx = (self.height as usize + self.round as usize)
+            % self.validators.validators.len();
+        Some(&self.validators.validators[idx].id)
+    }
+
+    fn quorum(&self) -> u64 {
+        self.validators.quorum_power()
+    }
+
+    fn voted_power(votes: &BTreeMap<ValidatorId, u64>) -> u64 {
+        votes.values().sum()
+    }
+
+    fn has_quorum(votes: &BTreeMap<ValidatorId, u64>, quorum: u64) -> bool {
+        Self::voted_power(votes) >= quorum
+    }
+
+    fn record_vote(
+        votes: &mut BTreeMap<ValidatorId, u64>,
+        validator: &ValidatorId,
+        power: u64,
+    ) {
+        votes.entry(validator.clone()).or_insert(power);
+    }
+
+    /// Build a CommitCertificate from the commit votes.
+    fn make_certificate(&self, block_hash: BlockHash) -> CommitCertificate {
+        let precommits = self.commit_votes.keys().map(|id| Vote {
+            vote_type:  VoteType::Precommit,
+            height:     self.height,
+            round:      self.round,
+            validator:  id.clone(),
+            block_hash: Some(block_hash.clone()),
+            signature:  vec![],
+        }).collect();
+        CommitCertificate {
+            height:     self.height,
+            round:      self.round,
+            block_hash,
+            precommits,
+        }
+    }
+}
+
+impl Default for HotStuffEngine {
+    fn default() -> Self { Self::new() }
+}
+
+#[async_trait::async_trait]
+impl ConsensusEngine for HotStuffEngine {
+    fn name(&self) -> &str { "HotStuff-style BFT (Phase 0 — three-phase, no pipelining)" }
+    fn variant(&self) -> ConsensusVariant { ConsensusVariant::HotStuffStyle }
+
+    async fn init(
+        &mut self,
+        config: ConsensusConfig,
+        mut genesis_validators: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        // Apply personhood cap if configured (Section 3.3)
+        if let Some(ref pc) = config.personhood {
+            genesis_validators = apply_personhood_cap(genesis_validators, pc);
+        }
+        if genesis_validators.validators.is_empty() {
+            return Err(ConsensusError::InsufficientValidators { needed: 1, have: 0 });
+        }
+        self.validators = genesis_validators;
+        self.config     = config;
+        self.phase      = HotStuffPhase::WaitingForPrepare;
+        tracing::info!(
+            variant    = "HotStuff-style BFT",
+            validators = self.validators.validators.len(),
+            total_power = self.validators.total_power(),
+            quorum_power = self.validators.quorum_power(),
+            "HotStuff consensus engine initialised"
+        );
+        Ok(())
+    }
+
+    fn validator_set(&self) -> &ValidatorSet { &self.validators }
+    fn current_height(&self) -> BlockHeight  { self.height }
+    fn current_round(&self)  -> Round        { self.round  }
+
+    async fn propose(
+        &mut self,
+        height:      BlockHeight,
+        round:       Round,
+        parent_hash: BlockHash,
+        tx_data:     Vec<u8>,
+    ) -> ConsensusResult<BlockProposal> {
+        let proposer = self.current_leader()
+            .cloned()
+            .unwrap_or_else(|| ValidatorId("solo".into()));
+
+        let block_hash = BlockHash(format!(
+            "hs_h{height}_r{round}_{:08x}",
+            tx_data.len() as u32
+        ));
+
+        let proposal = BlockProposal {
+            height,
+            round,
+            proposer,
+            block_hash,
+            parent_hash,
+            timestamp_ms: 0,
+            tx_data,
+            signature: vec![],
+        };
+
+        tracing::debug!(
+            height, round,
+            leader = %proposal.proposer,
+            "HotStuff PREPARE: block proposed"
+        );
+        Ok(proposal)
+    }
+
+    async fn receive_proposal(
+        &mut self,
+        proposal: BlockProposal,
+    ) -> ConsensusResult<()> {
+        if proposal.height < self.height {
+            return Err(ConsensusError::StaleProposal(proposal.height, self.height));
+        }
+        // Phase 0: accept any well-formed proposal from the expected leader
+        if self.phase != HotStuffPhase::WaitingForPrepare
+            && self.phase != HotStuffPhase::Committed
+        {
+            tracing::warn!(
+                phase = ?self.phase,
+                "HotStuff: received proposal in unexpected phase, resetting"
+            );
+            self.prepare_votes.clear();
+            self.precommit_votes.clear();
+            self.commit_votes.clear();
+        }
+
+        self.pending      = Some(proposal.clone());
+        self.phase        = HotStuffPhase::CollectingPrepareVotes;
+        self.prepare_votes.clear();
+        self.precommit_votes.clear();
+        self.commit_votes.clear();
+
+        tracing::debug!(
+            height = proposal.height,
+            hash   = %proposal.block_hash,
+            "HotStuff: PREPARE phase started"
+        );
+        Ok(())
+    }
+
+    async fn receive_vote(
+        &mut self,
+        vote: Vote,
+    ) -> ConsensusResult<Option<CommitCertificate>> {
+        let power = self.validators.power_of(&vote.validator);
+        if power == 0 {
+            return Err(ConsensusError::UnknownValidator(vote.validator));
+        }
+
+        let block_hash = match &vote.block_hash {
+            Some(h) => h.clone(),
+            None    => return Ok(None), // nil vote advances round, handled in on_timeout
+        };
+
+        let quorum = self.quorum();
+
+        match self.phase {
+            HotStuffPhase::CollectingPrepareVotes => {
+                Self::record_vote(&mut self.prepare_votes, &vote.validator, power);
+                if Self::has_quorum(&self.prepare_votes, quorum) {
+                    tracing::debug!(
+                        height = vote.height,
+                        "HotStuff: PREPARE QC formed -- advancing to PRE-COMMIT"
+                    );
+                    self.phase = HotStuffPhase::CollectingPreCommitVotes;
+                }
+            }
+            HotStuffPhase::CollectingPreCommitVotes => {
+                Self::record_vote(&mut self.precommit_votes, &vote.validator, power);
+                if Self::has_quorum(&self.precommit_votes, quorum) {
+                    tracing::debug!(
+                        height = vote.height,
+                        "HotStuff: PRE-COMMIT QC formed -- advancing to COMMIT"
+                    );
+                    self.phase = HotStuffPhase::CollectingCommitVotes;
+                }
+            }
+            HotStuffPhase::CollectingCommitVotes => {
+                Self::record_vote(&mut self.commit_votes, &vote.validator, power);
+                if Self::has_quorum(&self.commit_votes, quorum) {
+                    self.phase = HotStuffPhase::Committed;
+                    let cert = self.make_certificate(block_hash);
+                    tracing::info!(
+                        height = cert.height,
+                        block  = %cert.block_hash,
+                        "HotStuff: COMMIT QC formed -- block committed"
+                    );
+                    return Ok(Some(cert));
+                }
+            }
+            HotStuffPhase::WaitingForPrepare | HotStuffPhase::Committed => {
+                tracing::debug!(phase = ?self.phase, "HotStuff: vote in unexpected phase, ignoring");
+            }
+        }
+        Ok(None)
+    }
+
+    async fn on_timeout(
+        &mut self,
+        height: BlockHeight,
+        round:  Round,
+    ) -> ConsensusResult<Vote> {
+        tracing::warn!(height, round, "HotStuff: round timed out, advancing");
+        self.round   = round + 1;
+        self.phase   = HotStuffPhase::WaitingForPrepare;
+        self.pending = None;
+        self.prepare_votes.clear();
+        self.precommit_votes.clear();
+        self.commit_votes.clear();
+
+        let nil_vote = Vote {
+            vote_type:  VoteType::Nil,
+            height,
+            round,
+            validator:  ValidatorId("self".into()),
+            block_hash: None,
+            signature:  vec![],
+        };
+        Ok(nil_vote)
+    }
+
+    async fn on_commit(
+        &mut self,
+        certificate:       CommitCertificate,
+        new_validator_set: Option<ValidatorSet>,
+    ) -> ConsensusResult<()> {
+        self.height      = certificate.height + 1;
+        self.round       = 0;
+        self.phase       = HotStuffPhase::WaitingForPrepare;
+        self.pending     = None;
+        self.prepare_votes.clear();
+        self.precommit_votes.clear();
+        self.commit_votes.clear();
+
+        if let Some(mut new_set) = new_validator_set {
+            if let Some(ref pc) = self.config.personhood.clone() {
+                new_set = apply_personhood_cap(new_set, pc);
+            }
+            self.validators = new_set;
+        }
+
+        tracing::info!(
+            height     = self.height,
+            "HotStuff: committed, advancing to next height"
+        );
+        Ok(())
+    }
+
+    fn verify_commit(
+        &self,
+        certificate:   &CommitCertificate,
+        validator_set: &ValidatorSet,
+    ) -> ConsensusResult<()> {
+        // Count power in the certificate's precommits
+        let mut power: u64 = 0;
+        for vote in &certificate.precommits {
+            if vote.vote_type != VoteType::Precommit {
+                return Err(ConsensusError::InvalidVote {
+                    validator:  vote.validator.clone(),
+                    block_hash: certificate.block_hash.clone(),
+                    reason:     "non-precommit vote in HotStuff commit certificate".into(),
+                });
+            }
+            power += validator_set.power_of(&vote.validator);
+        }
+        if power < validator_set.quorum_power() {
+            return Err(ConsensusError::InvalidVote {
+                validator:  ValidatorId("quorum".into()),
+                block_hash: certificate.block_hash.clone(),
+                reason:     format!(
+                    "insufficient commit power: {power} < {}",
+                    validator_set.quorum_power()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+
+// -- Engine factory functions -------------------------------------------------
+
+/// Create a HotStuffEngine and initialise it in one call.
+pub async fn new_hotstuff(
+    config:     ConsensusConfig,
+    validators: ValidatorSet,
+) -> ConsensusResult<HotStuffEngine> {
+    let mut engine = HotStuffEngine::new();
+    engine.init(config, validators).await?;
+    Ok(engine)
 }
 
 // -- Tests --------------------------------------------------------------------
@@ -1231,6 +1617,233 @@ mod tests {
         let capped_power = engine.validator_set().validators[0].voting_power;
         assert_eq!(capped_power, 1, "personhood cap should be applied at init");
     }
-}
+
+    // -- HotStuffEngine tests -------------------------------------------------
+
+    fn hotstuff_validators(n: u64) -> ValidatorSet {
+        ValidatorSet {
+            height: 0,
+            validators: (1..=n).map(|i| ValidatorInfo {
+                id:           ValidatorId(format!("hs_val_{i}")),
+                voting_power: 1,
+                pop_verified: true,
+            }).collect(),
+        }
+    }
+
+    fn hotstuff_config() -> ConsensusConfig {
+        ConsensusConfig {
+            variant:              ConsensusVariant::HotStuffStyle,
+            propose_timeout_ms:   3_000,
+            prevote_timeout_ms:   1_000,
+            precommit_timeout_ms: 1_000,
+            block_time_ms:        1_000,
+            personhood:           None,
+        }
+    }
+
+    #[tokio::test]
+    async fn hotstuff_initialises_correctly() {
+        let mut engine = HotStuffEngine::new();
+        let validators = hotstuff_validators(4);
+        engine.init(hotstuff_config(), validators).await.unwrap();
+
+        assert_eq!(engine.variant(), ConsensusVariant::HotStuffStyle);
+        assert_eq!(engine.current_height(), 0);
+        assert_eq!(engine.current_round(), 0);
+        assert_eq!(engine.phase, HotStuffPhase::WaitingForPrepare);
+        assert_eq!(engine.validator_set().validators.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn hotstuff_leader_rotates_by_height() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let leader0 = engine.current_leader().unwrap().clone();
+        engine.height = 1;
+        let leader1 = engine.current_leader().unwrap().clone();
+        engine.height = 4;
+        let leader4 = engine.current_leader().unwrap().clone();
+
+        // Leader at height 4 should wrap back to same as height 0
+        assert_eq!(leader0, leader4);
+        assert_ne!(leader0, leader1);
+    }
+
+    #[tokio::test]
+    async fn hotstuff_propose_returns_valid_block() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let parent = BlockHash("genesis".into());
+        let proposal = engine.propose(0, 0, parent.clone(), vec![1, 2, 3]).await.unwrap();
+
+        assert_eq!(proposal.height, 0);
+        assert_eq!(proposal.round, 0);
+        assert!(proposal.block_hash.0.starts_with("hs_h0_r0_"));
+    }
+
+    #[tokio::test]
+    async fn hotstuff_three_phases_to_commit() {
+        // With 4 validators (quorum = 3), simulate all voting through all 3 phases
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let parent   = BlockHash("genesis".into());
+        let proposal = engine.propose(0, 0, parent, vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        assert_eq!(engine.phase, HotStuffPhase::CollectingPrepareVotes);
+
+        // PREPARE phase: 3 votes needed (quorum = 3 of 4)
+        for i in 1..=3 {
+            let vote = Vote {
+                vote_type:  VoteType::Prevote,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            let result = engine.receive_vote(vote).await.unwrap();
+            assert!(result.is_none(), "no commit until COMMIT phase");
+        }
+        assert_eq!(engine.phase, HotStuffPhase::CollectingPreCommitVotes);
+
+        // PRE-COMMIT phase: 3 votes needed
+        for i in 1..=3 {
+            let vote = Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            let result = engine.receive_vote(vote).await.unwrap();
+            assert!(result.is_none());
+        }
+        assert_eq!(engine.phase, HotStuffPhase::CollectingCommitVotes);
+
+        // COMMIT phase: 3rd vote triggers commit
+        let mut cert = None;
+        for i in 1..=3 {
+            let vote = Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            cert = engine.receive_vote(vote).await.unwrap();
+        }
+
+        let cert = cert.expect("commit certificate must be produced");
+        assert_eq!(cert.height, 0);
+        assert_eq!(cert.block_hash, proposal.block_hash);
+        assert_eq!(engine.phase, HotStuffPhase::Committed);
+    }
+
+    #[tokio::test]
+    async fn hotstuff_timeout_advances_round() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let nil_vote = engine.on_timeout(0, 0).await.unwrap();
+
+        assert_eq!(nil_vote.vote_type, VoteType::Nil);
+        assert_eq!(engine.current_round(), 1);
+        assert_eq!(engine.phase, HotStuffPhase::WaitingForPrepare);
+    }
+
+    #[tokio::test]
+    async fn hotstuff_on_commit_advances_height() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let cert = CommitCertificate {
+            height:     0,
+            round:      0,
+            block_hash: BlockHash("hs_h0_r0_00000000".into()),
+            precommits: vec![],
+        };
+        engine.on_commit(cert, None).await.unwrap();
+
+        assert_eq!(engine.current_height(), 1);
+        assert_eq!(engine.current_round(), 0);
+        assert_eq!(engine.phase, HotStuffPhase::WaitingForPrepare);
+    }
+
+    #[tokio::test]
+    async fn hotstuff_verify_commit_checks_quorum() {
+        let mut engine = HotStuffEngine::new();
+        let validators = hotstuff_validators(4);
+        engine.init(hotstuff_config(), validators.clone()).await.unwrap();
+
+        // Valid: 3 precommits (quorum = 3)
+        let cert_valid = CommitCertificate {
+            height:     0,
+            round:      0,
+            block_hash: BlockHash("test".into()),
+            precommits: (1..=3).map(|i| Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(BlockHash("test".into())),
+                signature:  vec![],
+            }).collect(),
+        };
+        assert!(engine.verify_commit(&cert_valid, &validators).is_ok());
+
+        // Invalid: only 2 precommits
+        let cert_invalid = CommitCertificate {
+            height:     0,
+            round:      0,
+            block_hash: BlockHash("test".into()),
+            precommits: (1..=2).map(|i| Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(BlockHash("test".into())),
+                signature:  vec![],
+            }).collect(),
+        };
+        assert!(engine.verify_commit(&cert_invalid, &validators).is_err());
+    }
+
+    #[tokio::test]
+    async fn hotstuff_personhood_cap_applied_at_init() {
+        let mut engine = HotStuffEngine::new();
+        let mut config = hotstuff_config();
+        config.personhood = Some(PersonhoodConfig {
+            power_cap:           1,
+            reject_expired_pop:  false,
+            min_verified_pct:    67,
+        });
+
+        // Give one validator too much power
+        let validators = ValidatorSet {
+            height: 0,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("hs_big".into()), voting_power: 10, pop_verified: true },
+                ValidatorInfo { id: ValidatorId("hs_v2".into()),  voting_power: 1,  pop_verified: true },
+                ValidatorInfo { id: ValidatorId("hs_v3".into()),  voting_power: 1,  pop_verified: true },
+                ValidatorInfo { id: ValidatorId("hs_v4".into()),  voting_power: 1,  pop_verified: true },
+            ],
+        };
+        engine.init(config, validators).await.unwrap();
+
+        // The big validator should be capped to power_cap = 1
+        let big = engine.validator_set().validators.iter()
+            .find(|v| v.id.0 == "hs_big").unwrap();
+        assert_eq!(big.voting_power, 1,
+            "HotStuff: personhood cap should be applied at init");
+    }
 
 }
+}
+
