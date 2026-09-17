@@ -31,6 +31,58 @@ pub struct NodeStatus {
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
 
+// -- Explorer state (shared with the API, Section 9.1) -------------------------
+
+/// One block's summary for the explorer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockSummary {
+    pub height:     u64,
+    pub state_root: String,
+    pub timestamp_ms: u64,
+    pub tx_count:   usize,
+    pub tx_ids:     Vec<String>,
+}
+
+/// One transaction's summary for the explorer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TxSummary {
+    pub id:      String,
+    pub height:  u64,
+    pub sender:  String,
+    pub kind:    String,
+    pub success: bool,
+    pub gas_used: u64,
+    pub events:  Vec<String>,
+    pub error:   Option<String>,
+}
+
+/// One account's snapshot for the explorer, including charm state (9.1).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountSummary {
+    pub address:  String,
+    pub role:     String,
+    pub nonce:    u64,
+    pub balances: std::collections::BTreeMap<String, u128>,
+    /// IntrinsicCharm surface: verification tier, or null for non-human.
+    pub tier:     Option<String>,
+    pub exemption_days: u32,
+}
+
+/// Explorer state, updated by the node on each committed block.
+#[derive(Debug, Default)]
+pub struct ExplorerState {
+    /// Most recent blocks, newest first. Capped at MAX_RECENT_BLOCKS.
+    pub blocks: std::collections::VecDeque<BlockSummary>,
+    /// tx id -> summary.
+    pub txs: std::collections::HashMap<String, TxSummary>,
+    /// address -> latest account snapshot.
+    pub accounts: std::collections::HashMap<String, AccountSummary>,
+}
+
+pub const MAX_RECENT_BLOCKS: usize = 100;
+
+pub type SharedExplorer = Arc<Mutex<ExplorerState>>;
+
 // -- Node error ---------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +106,7 @@ pub struct Node {
     executor:  Executor,
     network:   MockNetworkService,
     status:    SharedStatus,
+    explorer:  SharedExplorer,
     /// This node's validator identity. None = observer node (no voting).
     validator_id: Option<ValidatorId>,
     /// Pending transactions waiting to be proposed in the next block.
@@ -171,6 +224,7 @@ impl Node {
         }));
 
         let validator_id = validator_address.map(ValidatorId);
+        let explorer = Arc::new(Mutex::new(ExplorerState::default()));
 
         Ok(Self {
             genesis,
@@ -179,6 +233,7 @@ impl Node {
             executor,
             network,
             status,
+            explorer,
             validator_id,
             mempool: Vec::new(),
         })
@@ -194,6 +249,10 @@ impl Node {
 
     pub fn status(&self) -> SharedStatus {
         self.status.clone()
+    }
+
+    pub fn explorer(&self) -> SharedExplorer {
+        self.explorer.clone()
     }
 
     /// Add a transaction to the mempool.
@@ -428,6 +487,23 @@ impl Node {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        // Capture tx metadata for the explorer before txs are consumed.
+        let tx_meta: Vec<(String, String, String)> = txs.iter()
+            .map(|t| {
+                let kind = match &t.body {
+                    chain_forge_execution::TxBody::Transfer { .. }          => "transfer",
+                    chain_forge_execution::TxBody::Burn { .. }              => "burn",
+                    chain_forge_execution::TxBody::Stake { .. }             => "stake",
+                    chain_forge_execution::TxBody::Custom { .. }            => "custom",
+                    chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
+                    chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
+                    chain_forge_execution::TxBody::SponsorAgent { .. }      => "sponsor_agent",
+                    chain_forge_execution::TxBody::RevokeAgent { .. }       => "revoke_agent",
+                };
+                (t.id.clone(), t.sender.clone(), kind.to_string())
+            })
+            .collect();
+
         let exec_result = self.executor.execute_block(height, txs, &mut self.state, now_ms);
 
         info!(
@@ -447,7 +523,54 @@ impl Node {
         {
             let mut s = self.status.lock().unwrap();
             s.height     = exec_result.height;
-            s.state_root = Some(exec_result.state_root);
+            s.state_root = Some(exec_result.state_root.clone());
+        }
+
+        // Update explorer state (Section 9.1)
+        {
+            let mut ex = self.explorer.lock().unwrap();
+
+            let mut tx_ids = Vec::new();
+            for (i, r) in exec_result.tx_results.iter().enumerate() {
+                let (sender, kind) = tx_meta.get(i)
+                    .map(|(_, s, k)| (s.clone(), k.clone()))
+                    .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
+                tx_ids.push(r.tx_id.clone());
+                ex.txs.insert(r.tx_id.clone(), TxSummary {
+                    id:       r.tx_id.clone(),
+                    height:   exec_result.height,
+                    sender,
+                    kind,
+                    success:  r.success,
+                    gas_used: r.gas_used,
+                    events:   r.events.clone(),
+                    error:    r.error.clone(),
+                });
+            }
+
+            ex.blocks.push_front(BlockSummary {
+                height:       exec_result.height,
+                state_root:   exec_result.state_root.clone(),
+                timestamp_ms: now_ms,
+                tx_count:     tx_ids.len(),
+                tx_ids,
+            });
+            while ex.blocks.len() > MAX_RECENT_BLOCKS {
+                ex.blocks.pop_back();
+            }
+
+            // Refresh account snapshots (includes IntrinsicCharm surface)
+            ex.accounts.clear();
+            for a in self.state.all_accounts() {
+                ex.accounts.insert(a.address.clone(), AccountSummary {
+                    address:        a.address.clone(),
+                    role:           a.role.clone(),
+                    nonce:          a.nonce,
+                    balances:       a.balances.clone(),
+                    tier:           a.verification_tier().map(|t| t.to_string()),
+                    exemption_days: a.exemption_days(),
+                });
+            }
         }
 
         Ok(cert)
@@ -585,5 +708,65 @@ mod tests {
         // should still start in devnet mode.
         let node = Node::new(GENESIS, None).await;
         assert!(node.is_ok(), "node should start despite validation warnings");
+    }
+
+    // -- Explorer state tests (Priority 7 / Section 9.1) ----------------------
+
+    #[tokio::test]
+    async fn explorer_records_blocks_on_commit() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let h = chain_forge_consensus::BlockHash("g".into());
+        node.propose_block(h).await.unwrap();
+
+        let ex = node.explorer.lock().unwrap();
+        assert_eq!(ex.blocks.len(), 1, "one block should be recorded");
+        assert_eq!(ex.blocks[0].height, 0);
+        assert!(!ex.blocks[0].state_root.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explorer_indexes_transactions() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        node.submit_tx(Transaction::transfer(
+            "extx1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0,
+        ));
+        let h = chain_forge_consensus::BlockHash("g".into());
+        node.propose_block(h).await.unwrap();
+
+        let ex = node.explorer.lock().unwrap();
+        let t = ex.txs.get("extx1").expect("tx should be indexed");
+        assert_eq!(t.sender, "qcb1alice");
+        assert_eq!(t.kind, "transfer");
+        assert!(t.success);
+        assert_eq!(t.height, 0);
+    }
+
+    #[tokio::test]
+    async fn explorer_snapshots_accounts_with_charm_surface() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let h = chain_forge_consensus::BlockHash("g".into());
+        node.propose_block(h).await.unwrap();
+
+        let ex = node.explorer.lock().unwrap();
+        let alice = ex.accounts.get("qcb1alice").expect("alice snapshot");
+        assert_eq!(alice.role, "validator");
+        assert!(alice.balances.get("uqcb").copied().unwrap_or(0) > 0);
+        // Genesis accounts have no IntrinsicCharm attached in Phase 0
+        assert!(alice.tier.is_none());
+        assert_eq!(alice.exemption_days, 0);
+    }
+
+    #[tokio::test]
+    async fn explorer_caps_recent_blocks() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        for i in 0..(MAX_RECENT_BLOCKS + 5) {
+            let h = chain_forge_consensus::BlockHash(format!("h{i}"));
+            node.propose_block(h).await.unwrap();
+        }
+        let ex = node.explorer.lock().unwrap();
+        assert_eq!(ex.blocks.len(), MAX_RECENT_BLOCKS,
+            "recent blocks must be capped");
+        // Newest first
+        assert!(ex.blocks[0].height > ex.blocks[1].height);
     }
 }

@@ -8,13 +8,17 @@
 /// key management, and a WebSocket feed for the explorer.
 
 use std::sync::{Arc, Mutex};
-use super::node::NodeStatus;
+use super::node::{NodeStatus, ExplorerState};
 
 /// Serve the HTTP API on the given port.
 /// Phase 0 implementation: a minimal hand-rolled HTTP server that handles
 /// the two endpoints the wizard frontend needs, without pulling in a full
 /// web framework (saves ~50MB of compile-time dependencies for Phase 0).
-pub async fn serve(port: u16, status: Arc<Mutex<NodeStatus>>) {
+pub async fn serve(
+    port: u16,
+    status: Arc<Mutex<NodeStatus>>,
+    explorer: Arc<Mutex<ExplorerState>>,
+) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -34,6 +38,7 @@ pub async fn serve(port: u16, status: Arc<Mutex<NodeStatus>>) {
             Ok((mut stream, peer)) => {
                 tracing::debug!(peer = %peer, "HTTP connection");
                 let status = status.clone();
+                let explorer = explorer.clone();
 
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
@@ -84,6 +89,46 @@ pub async fn serve(port: u16, status: Arc<Mutex<NodeStatus>>) {
                                 http_400_json(&resp.to_string())
                             }
                         }
+                    } else if first_line.starts_with("GET /api/blocks/") {
+                        // GET /api/blocks/{height}
+                        let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                        let height: Option<u64> = path
+                            .trim_start_matches("/api/blocks/")
+                            .parse().ok();
+                        let ex = explorer.lock().unwrap();
+                        match height.and_then(|h| ex.blocks.iter().find(|b| b.height == h)) {
+                            Some(b) => http_200_json(&serde_json::to_string(b).unwrap_or_default()),
+                            None    => http_404(),
+                        }
+                    } else if first_line.starts_with("GET /api/blocks") {
+                        // GET /api/blocks — recent blocks, newest first
+                        let ex = explorer.lock().unwrap();
+                        let blocks: Vec<_> = ex.blocks.iter().collect();
+                        http_200_json(&serde_json::to_string(&blocks).unwrap_or_default())
+                    } else if first_line.starts_with("GET /api/tx/") {
+                        // GET /api/tx/{id}
+                        let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                        let id = path.trim_start_matches("/api/tx/");
+                        let ex = explorer.lock().unwrap();
+                        match ex.txs.get(id) {
+                            Some(t) => http_200_json(&serde_json::to_string(t).unwrap_or_default()),
+                            None    => http_404(),
+                        }
+                    } else if first_line.starts_with("GET /api/accounts/") {
+                        // GET /api/accounts/{address} — balance, nonce, charm state
+                        let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                        let address = path.trim_start_matches("/api/accounts/");
+                        let ex = explorer.lock().unwrap();
+                        match ex.accounts.get(address) {
+                            Some(a) => http_200_json(&serde_json::to_string(a).unwrap_or_default()),
+                            None    => http_404(),
+                        }
+                    } else if first_line.starts_with("GET /api/accounts") {
+                        // GET /api/accounts — all account snapshots
+                        let ex = explorer.lock().unwrap();
+                        let mut accounts: Vec<_> = ex.accounts.values().collect();
+                        accounts.sort_by(|a, b| a.address.cmp(&b.address));
+                        http_200_json(&serde_json::to_string(&accounts).unwrap_or_default())
                     } else if first_line.starts_with("OPTIONS") {
                         // CORS preflight for the React frontend
                         http_cors_preflight()

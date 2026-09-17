@@ -114,9 +114,10 @@ async fn main() {
 
     // Start HTTP API FIRST so it's available immediately.
     let status = node.status();
+    let explorer = node.explorer();
     let api_port = args.api_port;
     tokio::spawn(async move {
-        api::serve(api_port, status).await;
+        api::serve(api_port, status, explorer).await;
     });
 
     // Give the API a moment to bind before the event loop starts.
