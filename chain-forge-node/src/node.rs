@@ -83,6 +83,34 @@ pub const MAX_RECENT_BLOCKS: usize = 100;
 
 pub type SharedExplorer = Arc<Mutex<ExplorerState>>;
 
+// -- CirFi metrics (shared with the API, Section 9.1 / 5.4) -------------------
+
+/// Live snapshot of CirFi monetary engine metrics.
+/// Updated on every epoch boundary. Read by /api/cirfi.
+#[derive(Debug, Default, serde::Serialize, Clone)]
+pub struct CirfiMetrics {
+    /// Current UBI pool balance (ucirfi).
+    pub ubi_pool_balance_ucirfi:      u128,
+    /// Total ucirfi received into UBI pool from demurrage since genesis.
+    pub total_decayed_to_pool_ucirfi: u128,
+    /// Total ucirfi distributed as UBI since genesis.
+    pub total_ubi_distributed_ucirfi: u128,
+    /// Total BME fees collected (ucirfi) since genesis.
+    pub total_bme_fees_ucirfi:        u128,
+    /// Total $QCB burned via BME (uqcb) since genesis.
+    pub total_qcb_burned_uqcb:        u128,
+    /// BME fee rate in basis points (50 = 0.5%).
+    pub bme_fee_bps:                  u32,
+    /// Whether BME is live (Section 6.3 threshold met).
+    pub bme_is_live:                  bool,
+    /// Daily UBI rate per verified human (ucirfi).
+    pub daily_ubi_rate_ucirfi:        u128,
+    /// Epoch of most recent metrics update.
+    pub last_updated_epoch:           u64,
+}
+
+pub type SharedCirfiMetrics = Arc<Mutex<CirfiMetrics>>;
+
 // -- Node error ---------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -105,8 +133,9 @@ pub struct Node {
     state:     StateStore,
     executor:  Executor,
     network:   MockNetworkService,
-    status:    SharedStatus,
-    explorer:  SharedExplorer,
+    status:         SharedStatus,
+    explorer:       SharedExplorer,
+    cirfi_metrics:  SharedCirfiMetrics,
     /// This node's validator identity. None = observer node (no voting).
     validator_id: Option<ValidatorId>,
     /// Pending transactions waiting to be proposed in the next block.
@@ -224,7 +253,12 @@ impl Node {
         }));
 
         let validator_id = validator_address.map(ValidatorId);
-        let explorer = Arc::new(Mutex::new(ExplorerState::default()));
+        let explorer       = Arc::new(Mutex::new(ExplorerState::default()));
+        let cirfi_metrics  = Arc::new(Mutex::new(CirfiMetrics {
+            bme_fee_bps:          50,
+            daily_ubi_rate_ucirfi: chain_forge_identity::DAILY_UBI_RATE_UCIRFI,
+            ..Default::default()
+        }));
 
         Ok(Self {
             genesis,
@@ -234,6 +268,7 @@ impl Node {
             network,
             status,
             explorer,
+            cirfi_metrics,
             validator_id,
             mempool: Vec::new(),
         })
@@ -253,6 +288,10 @@ impl Node {
 
     pub fn explorer(&self) -> SharedExplorer {
         self.explorer.clone()
+    }
+
+    pub fn cirfi_metrics(&self) -> SharedCirfiMetrics {
+        self.cirfi_metrics.clone()
     }
 
     /// Add a transaction to the mempool.
@@ -570,6 +609,40 @@ impl Node {
                     tier:           a.verification_tier().map(|t| t.to_string()),
                     exemption_days: a.exemption_days(),
                 });
+            }
+        }
+
+        // Update CirFi metrics snapshot (Section 9.1 / 5.4)
+        // Phase 0: metrics come from the execution layer's CirFi engine.
+        // We update the daily UBI rate from identity constants; full per-epoch
+        // demurrage and BME stats wire in Phase 1 when CirFiEngine is plumbed
+        // through the execution pipeline end-to-end.
+        {
+            let mut cm = self.cirfi_metrics.lock().unwrap();
+            cm.last_updated_epoch     = exec_result.height;
+            cm.daily_ubi_rate_ucirfi  = chain_forge_identity::DAILY_UBI_RATE_UCIRFI;
+            // Count UBI claim events from this block's tx results
+            let ubi_claims = exec_result.tx_results.iter()
+                .filter(|r| r.success)
+                .flat_map(|r| r.events.iter())
+                .filter(|e| e.starts_with("ubi_claim:"))
+                .count();
+            if ubi_claims > 0 {
+                cm.total_ubi_distributed_ucirfi = cm.total_ubi_distributed_ucirfi
+                    .saturating_add(ubi_claims as u128
+                        * chain_forge_identity::DAILY_UBI_RATE_UCIRFI);
+            }
+            // Count BME redirect events
+            let redirects = exec_result.tx_results.iter()
+                .filter(|r| r.success)
+                .flat_map(|r| r.events.iter())
+                .filter(|e| e.starts_with("ubi_redirect:"))
+                .count();
+            if redirects > 0 {
+                // 0.5% BME fee on redirects (50bp)
+                cm.total_bme_fees_ucirfi = cm.total_bme_fees_ucirfi
+                    .saturating_add(redirects as u128 * 5_000); // approx 0.5% of 1M ucirfi
+                cm.bme_fee_bps = 50;
             }
         }
 

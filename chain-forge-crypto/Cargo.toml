@@ -33,15 +33,22 @@ tracing           = { workspace = true }
 # Real Ed25519 signing (Phase 1). Behind the "real-crypto" feature so the
 # stub path stays available for fast tests and for environments without
 # the dependency tree.
-ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
-rand          = { version = "0.8", optional = true }
-sha2          = { version = "0.10", optional = true }
+ed25519-dalek    = { version = "2", optional = true, features = ["rand_core"] }
+rand             = { version = "0.8", optional = true }
+sha2             = { version = "0.10", optional = true }
+# ML-DSA / CRYSTALS-Dilithium (NIST FIPS 204) — Phase 1 real PQC signing
+pqcrypto-dilithium = { version = "0.5", optional = true }
+pqcrypto-traits    = { version = "0.3", optional = true }
 
 [features]
 default = []
-# Enable real cryptographic signing (ed25519-dalek).
-# Without this flag, ClassicalScheme uses deterministic stub bytes.
+# Enable real Ed25519 signing (ed25519-dalek).
 real-crypto = ["dep:ed25519-dalek", "dep:rand", "dep:sha2"]
+# Enable real ML-DSA signing (pqcrypto-dilithium).
+# Separate flag: PQC compile is slower; enable independently.
+real-pqc    = ["dep:pqcrypto-dilithium", "dep:pqcrypto-traits", "dep:sha2"]
+# Both real crypto backends.
+real-all    = ["real-crypto", "real-pqc"]
 
 [dev-dependencies]
 tokio = { workspace = true }

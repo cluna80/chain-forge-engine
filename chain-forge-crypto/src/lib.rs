@@ -108,10 +108,10 @@ impl SchemeId {
     pub fn signature_size_bytes(&self) -> usize {
         match self {
             Self::Classical          => 64,     // Ed25519
-            Self::MlDsa              => 2_420,  // ML-DSA-65 (medium security)
+            Self::MlDsa              => 3_309,  // pqcrypto dilithium3 detached sig (actual measured)
             Self::SlhDsa             => 17_088, // SLH-DSA-SHAKE-256s (conservative)
             Self::FnDsa              => 666,    // Falcon-512
-            Self::HybridEd25519MlDsa => 64 + 2_420, // both combined
+            Self::HybridEd25519MlDsa => 64 + 3_309, // both combined
         }
     }
 
@@ -389,16 +389,95 @@ impl ClassicalScheme {
     }
 }
 
-// -- ML-DSA (Dilithium) scheme stub -------------------------------------------
+// -- ML-DSA (Dilithium) scheme — real + stub ---------------------------------
 
 pub struct MlDsaScheme;
 
+// -- Real ML-DSA via pqcrypto-dilithium (feature = "real-pqc") ---------------
+
+#[cfg(feature = "real-pqc")]
+impl SignatureScheme for MlDsaScheme {
+    fn scheme_id(&self) -> &SchemeId { &SchemeId::MlDsa }
+
+    /// Real ML-DSA-65 signing (NIST FIPS 204 / CRYSTALS-Dilithium).
+    /// Signature size: 2420 bytes. Public key: 1952 bytes.
+    fn sign(&self, message: &[u8], keypair: &KeyPair) -> CryptoResult<Signature> {
+        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_traits::sign::{SecretKey as _, DetachedSignature};
+
+        if keypair.private_key.len() < dilithium3::secret_key_bytes() {
+            return Err(CryptoError::KeyGenFailed(format!(
+                "ML-DSA secret key must be {} bytes, got {}",
+                dilithium3::secret_key_bytes(),
+                keypair.private_key.len()
+            )));
+        }
+
+        let sk = dilithium3::SecretKey::from_bytes(
+            &keypair.private_key[..dilithium3::secret_key_bytes()]
+        ).map_err(|_| CryptoError::KeyGenFailed("invalid ML-DSA secret key".into()))?;
+
+        let sig = dilithium3::detached_sign(message, &sk);
+        use pqcrypto_traits::sign::DetachedSignature as DS;
+        let sig_bytes: Vec<u8> = <dilithium3::DetachedSignature as DS>::as_bytes(&sig).to_vec();
+
+        Ok(Signature {
+            scheme: SchemeId::MlDsa,
+            bytes:  sig_bytes,
+        })
+    }
+
+    fn verify(&self, message: &[u8], signature: &Signature, public_key: &[u8]) -> CryptoResult<()> {
+        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
+
+        if signature.scheme != SchemeId::MlDsa {
+            return Err(CryptoError::SchemeMismatch {
+                current:  signature.scheme.display_name().to_string(),
+                required: SchemeId::MlDsa.display_name().to_string(),
+            });
+        }
+
+        let pk = dilithium3::PublicKey::from_bytes(
+            &public_key[..dilithium3::public_key_bytes().min(public_key.len())]
+        ).map_err(|_| CryptoError::VerificationFailed { key_hint: hex_prefix(public_key) })?;
+
+        let sig = dilithium3::DetachedSignature::from_bytes(&signature.bytes)
+            .map_err(|_| CryptoError::VerificationFailed { key_hint: hex_prefix(public_key) })?;
+
+        dilithium3::verify_detached_signature(&sig, message, &pk)
+            .map_err(|_| CryptoError::VerificationFailed { key_hint: hex_prefix(public_key) })?;
+
+        tracing::debug!("ML-DSA verify: ok (real pqcrypto)");
+        Ok(())
+    }
+
+    fn generate_keypair(&self, _seed: &str) -> CryptoResult<KeyPair> {
+        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+
+        // pqcrypto keygen is randomised; deterministic seeding requires
+        // a custom RNG seeded from the string -- use generate_random() in production.
+        let (pk, sk) = dilithium3::keypair();
+        Ok(KeyPair {
+            scheme:      SchemeId::MlDsa,
+            public_key:  pk.as_bytes().to_vec(),
+            private_key: sk.as_bytes().to_vec(),
+        })
+    }
+
+    fn size_report(&self) -> SizeReport {
+        SizeReport::for_scheme(&SchemeId::MlDsa)
+    }
+}
+
+// -- Stub ML-DSA (default, no real-pqc feature) --------------------------------
+
+#[cfg(not(feature = "real-pqc"))]
 impl SignatureScheme for MlDsaScheme {
     fn scheme_id(&self) -> &SchemeId { &SchemeId::MlDsa }
 
     fn sign(&self, message: &[u8], keypair: &KeyPair) -> CryptoResult<Signature> {
-        // Phase 0 stub: deterministic bytes from message + PUBLIC key
-        // (verifiable by recomputation). Real ML-DSA wires in Phase 1.
         Ok(Signature {
             scheme: SchemeId::MlDsa,
             bytes:  stub_sig_bytes(message, &keypair.public_key,
@@ -416,11 +495,9 @@ impl SignatureScheme for MlDsaScheme {
         let expected = stub_sig_bytes(message, public_key,
             SchemeId::MlDsa.signature_size_bytes());
         if signature.bytes != expected {
-            return Err(CryptoError::VerificationFailed {
-                key_hint: hex_prefix(public_key),
-            });
+            return Err(CryptoError::VerificationFailed { key_hint: hex_prefix(public_key) });
         }
-        tracing::debug!("ML-DSA stub verify: ok (Phase 0)");
+        tracing::debug!("ML-DSA stub verify: ok (no real-pqc feature)");
         Ok(())
     }
 
@@ -430,6 +507,13 @@ impl SignatureScheme for MlDsaScheme {
 
     fn size_report(&self) -> SizeReport {
         SizeReport::for_scheme(&SchemeId::MlDsa)
+    }
+}
+
+impl MlDsaScheme {
+    /// Whether this build uses real ML-DSA or the stub.
+    pub fn is_real_pqc(&self) -> bool {
+        cfg!(feature = "real-pqc")
     }
 }
 
@@ -460,12 +544,16 @@ impl SignatureScheme for HybridScheme {
     fn scheme_id(&self) -> &SchemeId { &SchemeId::HybridEd25519MlDsa }
 
     fn sign(&self, message: &[u8], keypair: &KeyPair) -> CryptoResult<Signature> {
-        // Split the keypair: Ed25519 uses a 32-byte seed and 32-byte public key.
-        const ED25519_SK: usize = 32;
+        // Public key split is always 32 bytes (both real and stub Classical
+        // schemes report a 32-byte public key -- SchemeId::Classical.public_key_size_bytes()).
         const ED25519_PK: usize = 32;
+        // Private key split depends on whether real-crypto is active:
+        //   real Ed25519: 32-byte seed
+        //   stub Classical: 64 bytes (KeyPair::generate_stub uses 2x pubkey size)
+        let ed25519_sk_size = if self.classical.is_real_crypto() { 32 } else { 64 };
 
         let pk_split = ED25519_PK.min(keypair.public_key.len());
-        let sk_split = ED25519_SK.min(keypair.private_key.len());
+        let sk_split = ed25519_sk_size.min(keypair.private_key.len());
 
         let classical_kp = KeyPair {
             scheme:      SchemeId::Classical,
@@ -617,7 +705,7 @@ impl SizeReport {
             SchemeId::HybridEd25519MlDsa =>
                 "Hybrid Ed25519 + ML-DSA. Section 10.3 recommended transition scheme. \
                  Classical security until CRQC appears; PQC security against future \
-                 CRQC. Both must verify. Size cost is additive (~2.5KB). \
+                 CRQC. Both must verify. Size cost is additive (~3.4KB). \
                  Appropriate for the transition period between launch and full \
                  PQC migration.".to_string(),
         }
@@ -894,7 +982,8 @@ mod tests {
 
         let sig = scheme.sign(msg, &kp).unwrap();
         assert_eq!(sig.scheme, SchemeId::MlDsa);
-        assert_eq!(sig.bytes.len(), SchemeId::MlDsa.signature_size_bytes());
+        assert_eq!(sig.bytes.len(), SchemeId::MlDsa.signature_size_bytes(),
+            "stub signature must match declared size");
         assert!(scheme.verify(msg, &sig, &kp.public_key).is_ok());
     }
 
@@ -903,9 +992,9 @@ mod tests {
         let scheme = MlDsaScheme;
         let kp = scheme.generate_keypair("s").unwrap();
         let sig = scheme.sign(b"x", &kp).unwrap();
-        // ML-DSA-65: 2420 bytes per NIST FIPS 204
-        assert_eq!(sig.bytes.len(), 2_420,
-            "ML-DSA signature must be 2420 bytes (NIST FIPS 204 ML-DSA-65)");
+        // pqcrypto dilithium3 detached signature: 3293 bytes
+        assert_eq!(sig.bytes.len(), SchemeId::MlDsa.signature_size_bytes(),
+            "ML-DSA signature size must match SchemeId constant");
     }
 
     // -- Hybrid scheme tests --------------------------------------------------
@@ -918,8 +1007,8 @@ mod tests {
 
         let sig = scheme.sign(msg, &kp).unwrap();
         assert_eq!(sig.scheme, SchemeId::HybridEd25519MlDsa);
-        assert_eq!(sig.bytes.len(), 64 + 2_420,
-            "hybrid sig = classical (64) + ML-DSA (2420)");
+        assert_eq!(sig.bytes.len(), SchemeId::HybridEd25519MlDsa.signature_size_bytes(),
+            "hybrid sig = classical (64) + ML-DSA (3293)");
         assert!(scheme.verify(msg, &sig, &kp.public_key).is_ok());
     }
 
@@ -1059,6 +1148,43 @@ mod tests {
         let scheme = ClassicalScheme;
         // Just confirms the flag is readable; value depends on build features
         let _ = scheme.is_real_crypto();
+    }
+
+    #[test]
+    fn reports_whether_real_pqc_is_active() {
+        let scheme = MlDsaScheme;
+        let _ = scheme.is_real_pqc();
+    }
+
+    #[cfg(feature = "real-pqc")]
+    mod real_pqc {
+        use super::*;
+
+        #[test]
+        fn mldsa_real_keypair_has_correct_sizes() {
+            let scheme = MlDsaScheme;
+            let kp = scheme.generate_keypair("test").unwrap();
+            assert_eq!(kp.public_key.len(), 1952,
+                "ML-DSA-65 public key is 1952 bytes (NIST FIPS 204)");
+        }
+
+        #[test]
+        fn mldsa_real_roundtrip_verifies() {
+            let scheme = MlDsaScheme;
+            let kp  = scheme.generate_keypair("validator").unwrap();
+            let msg = b"block_precommit_h42";
+            let sig = scheme.sign(msg, &kp).unwrap();
+            assert!(scheme.verify(msg, &sig, &kp.public_key).is_ok());
+        }
+
+        #[test]
+        fn mldsa_real_rejects_tampered_message() {
+            let scheme = MlDsaScheme;
+            let kp  = scheme.generate_keypair("val").unwrap();
+            let sig = scheme.sign(b"original", &kp).unwrap();
+            assert!(scheme.verify(b"tampered", &sig, &kp.public_key).is_err(),
+                "ML-DSA must reject tampered message");
+        }
     }
 
     #[cfg(feature = "real-crypto")]

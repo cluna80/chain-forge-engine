@@ -8,7 +8,7 @@
 /// key management, and a WebSocket feed for the explorer.
 
 use std::sync::{Arc, Mutex};
-use super::node::{NodeStatus, ExplorerState};
+use super::node::{NodeStatus, ExplorerState, CirfiMetrics};
 
 /// Serve the HTTP API on the given port.
 /// Phase 0 implementation: a minimal hand-rolled HTTP server that handles
@@ -16,8 +16,9 @@ use super::node::{NodeStatus, ExplorerState};
 /// web framework (saves ~50MB of compile-time dependencies for Phase 0).
 pub async fn serve(
     port: u16,
-    status: Arc<Mutex<NodeStatus>>,
-    explorer: Arc<Mutex<ExplorerState>>,
+    status:        Arc<Mutex<NodeStatus>>,
+    explorer:      Arc<Mutex<ExplorerState>>,
+    cirfi_metrics: Arc<Mutex<CirfiMetrics>>,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,8 +38,9 @@ pub async fn serve(
         match listener.accept().await {
             Ok((mut stream, peer)) => {
                 tracing::debug!(peer = %peer, "HTTP connection");
-                let status = status.clone();
-                let explorer = explorer.clone();
+                let status        = status.clone();
+                let explorer      = explorer.clone();
+                let cirfi_metrics = cirfi_metrics.clone();
 
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
@@ -129,6 +131,10 @@ pub async fn serve(
                         let mut accounts: Vec<_> = ex.accounts.values().collect();
                         accounts.sort_by(|a, b| a.address.cmp(&b.address));
                         http_200_json(&serde_json::to_string(&accounts).unwrap_or_default())
+                    } else if first_line.starts_with("GET /api/cirfi") {
+                        // GET /api/cirfi — CirFi monetary engine metrics (Section 9.1)
+                        let cm = cirfi_metrics.lock().unwrap();
+                        http_200_json(&serde_json::to_string(&*cm).unwrap_or_default())
                     } else if first_line.starts_with("OPTIONS") {
                         // CORS preflight for the React frontend
                         http_cors_preflight()
