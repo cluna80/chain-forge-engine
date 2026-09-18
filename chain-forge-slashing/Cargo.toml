@@ -1,0 +1,44 @@
+[package]
+name    = "chain-forge-slashing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Slashing module for QCB Chain (Whitepaper Q6, Q14).
+#
+# Two slashing conditions, both named in the whitepaper:
+#
+#   EQUIVOCATION (double-sign) — a validator signs two conflicting
+#   blocks at the same height and round. This is Byzantine behavior:
+#   the validator is actively trying to deceive. Penalty: tombstone
+#   (permanent removal) + stake slash at the equivocation rate.
+#
+#   LIVENESS (downtime) — a validator misses more than the liveness
+#   threshold fraction of blocks in a sliding window. This is passive
+#   failure (network, hardware). Penalty: jail (temporary removal) +
+#   small stake slash at the liveness rate.
+#
+# Slash proceeds are burned (reducing QCB supply via BME) rather than
+# redistributed, to avoid perverse incentives for accusers.
+#
+# The SlashingModule is the enforcement layer. Detection happens upstream
+# (consensus layer for equivocation, block production tracker for liveness).
+# The registry (chain-forge-validators) applies the status change;
+# this module computes and records the economic penalty.
+#
+# Whitepaper refs: Q6 (slashing conditions), Q14 (validator liveness),
+# Section 3.3 (personhood-weighted BFT security), Section 6.3 (burn).
+
+[dependencies]
+chain-forge-core       = { path = "../chain-forge-core" }
+chain-forge-validators = { path = "../chain-forge-validators" }
+chain-forge-consensus  = { path = "../chain-forge-consensus" }
+serde                  = { workspace = true }
+serde_json             = { workspace = true }
+thiserror              = { workspace = true }
+tracing                = { workspace = true }
+
+[dev-dependencies]
+tokio                 = { workspace = true }
+chain-forge-identity  = { path = "../chain-forge-identity" }

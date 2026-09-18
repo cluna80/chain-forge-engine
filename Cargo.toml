@@ -13,6 +13,7 @@ members = [
     "chain-forge-crypto",
     "chain-forge-validators",
     "chain-forge-governance",
+    "chain-forge-slashing",
     "chain-forge-node",
 ]
 
