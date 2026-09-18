@@ -12,6 +12,7 @@ members = [
     "chain-forge-tokenomics",
     "chain-forge-crypto",
     "chain-forge-validators",
+    "chain-forge-governance",
     "chain-forge-node",
 ]
 

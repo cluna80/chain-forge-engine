@@ -1,0 +1,40 @@
+[package]
+name    = "chain-forge-governance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# On-chain governance for QCB Chain (Whitepaper Section 6.6 / 7.3).
+#
+# Two tiers of governance, strictly separated:
+#
+#   ORDINARY — one-human-one-vote for $CIRFI parameters (decay rates,
+#   UBI rate, exemption thresholds). Simple majority, >3% quorum.
+#
+#   CONSTITUTIONAL — two-thirds supermajority for changes to the
+#   constitutional layer (two-token separation, sovereignty constraint,
+#   identity/crypto replacement mechanism). >6% quorum, mandatory
+#   waiting period before execution.
+#
+# Three-protection model (Section 6.6):
+#   1. Participation quorum (% of verified humans)
+#   2. Approval threshold (% of votes cast)
+#   3. Absolute minimum voter count (prevents thin-population attacks)
+#
+# The quorum floors are derived from the sybil-rate target (f=3%),
+# not picked arbitrarily. See GovernanceConfig::qcb_default().
+#
+# Whitepaper refs: Sections 6.6, 7.3, Q8, Q15, Q17.
+
+[dependencies]
+chain-forge-core      = { path = "../chain-forge-core" }
+chain-forge-identity  = { path = "../chain-forge-identity" }
+chain-forge-validators = { path = "../chain-forge-validators" }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
+tracing               = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
