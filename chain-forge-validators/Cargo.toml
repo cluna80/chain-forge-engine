@@ -1,0 +1,41 @@
+[package]
+name    = "chain-forge-validators"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Validator registration and key management for QCB Chain.
+#
+# This is the module that makes the whitepaper's central claim testable:
+# "validator power tied to verified human identity, not stake."
+#
+# Implements:
+#   - ValidatorRegistry: the authoritative set of registered validators
+#   - ValidatorRecord: full on-chain state (keys, stake, status, pop)
+#   - ValidatorStatus: lifecycle (Candidate -> Active -> Jailed -> Tombstoned)
+#   - KeyBundle: signing key + consensus key + optional PQC key
+#   - RegistrationRequest: what a candidate submits to join
+#   - StakeTier: minimum bond tiers (Section 3.3 / tokenomics staking)
+#   - Commission: validator commission rate with change delay
+#   - JailRecord: equivocation/liveness tracking (slashing prerequisite)
+#
+# The personhood gate (Section 3): a candidate without a verified PoP
+# identity can register but cannot enter the active set.  Their voting
+# power stays 0 until the identity layer confirms them as human.
+#
+# Whitepaper refs: Sections 3, 3.3, 6.3 (staking), Q6 (slashing), Q14.
+
+[dependencies]
+chain-forge-core      = { path = "../chain-forge-core" }
+chain-forge-consensus = { path = "../chain-forge-consensus" }
+chain-forge-identity  = { path = "../chain-forge-identity" }
+chain-forge-tokenomics = { path = "../chain-forge-tokenomics" }
+chain-forge-crypto    = { path = "../chain-forge-crypto" }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
+tracing               = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
