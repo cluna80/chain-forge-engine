@@ -6,7 +6,7 @@ use tracing::{debug, info, warn, error};
 use chain_forge_core::{GenesisConfig, HashWidth};
 use chain_forge_consensus::{
     ConsensusConfig, ConsensusVariant, PersonhoodConfig,
-    ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, Vote, VoteType,
+    ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, BlockProposal, Vote, VoteType,
     tendermint::TendermintEngine, ConsensusEngine,
 };
 use chain_forge_state::StateStore;
@@ -150,6 +150,12 @@ pub struct Node {
     validator_id: Option<ValidatorId>,
     /// Pending transactions waiting to be proposed in the next block.
     mempool:   Vec<Transaction>,
+    /// Proposals seen but not yet committed, keyed by (height, round).
+    /// Needed because a CommitCertificate carries only the block_hash, not
+    /// the transactions -- when quorum is reached (locally or via a gossiped
+    /// vote), this is how the node finds the tx_data to actually execute.
+    /// Entries at or below a committed height are pruned on commit.
+    pending_proposals: std::collections::HashMap<(u64, u32), chain_forge_consensus::BlockProposal>,
 }
 
 impl Node {
@@ -318,6 +324,7 @@ impl Node {
             peers,
             validator_id,
             mempool: Vec::new(),
+            pending_proposals: std::collections::HashMap::new(),
         })
     }
 
@@ -428,29 +435,48 @@ impl Node {
                     };
                     debug!(height, peer_count, "node heartbeat");
 
-                    // In devnet mode with no peers, auto-propose blocks so the
-                    // chain actually advances and the API shows live state.
-                    // With real peers connected, block production should come
-                    // from the leader-election path instead (not yet wired --
-                    // see the propose/vote/commit TODOs in handle_event).
-                    if self.genesis.environment.mode == "devnet" && peer_count == 0 {
-                        let parent = chain_forge_consensus::BlockHash(
-                            format!("genesis_h{height}")
-                        );
-                        match self.propose_block(parent).await {
-                            Ok(cert) => {
-                                info!(
-                                    height = cert.height,
-                                    block_hash = %cert.block_hash,
-                                    "devnet block committed"
-                                );
+                    if peer_count == 0 {
+                        // No real peers: solo devnet convenience path, unchanged
+                        // from Phase 0. The proposer synthesises every genesis
+                        // validator's vote itself and commits in one call, since
+                        // there is no one else to actually vote.
+                        if self.genesis.environment.mode == "devnet" {
+                            let parent = chain_forge_consensus::BlockHash(
+                                format!("genesis_h{height}")
+                            );
+                            match self.propose_block(parent).await {
+                                Ok(cert) => {
+                                    info!(
+                                        height = cert.height,
+                                        block_hash = %cert.block_hash,
+                                        "devnet block committed"
+                                    );
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "block proposal skipped");
+                                    running = false; // stop on unrecoverable error
+                                }
                             }
-                            Err(e) => {
-                                debug!(error = %e, "block proposal skipped");
-                                running = false; // stop on unrecoverable error
+                        }
+                    } else if let Some(my_id) = self.validator_id.clone() {
+                        // Real peers connected: only the deterministic proposer
+                        // for this (height, round) proposes. Everyone else just
+                        // waits for that proposal and the votes it triggers to
+                        // arrive over gossip (handled in handle_event).
+                        let round = self.consensus.current_round();
+                        let vs    = self.consensus.validator_set().clone();
+                        if Self::is_proposer_for(&vs, height, round, &my_id) {
+                            let parent = chain_forge_consensus::BlockHash(
+                                format!("genesis_h{height}")
+                            );
+                            if let Err(e) = self.propose_and_broadcast_multinode(parent).await {
+                                debug!(error = %e, "multi-node proposal failed");
                             }
                         }
                     }
+                    // peer_count > 0 and validator_id == None: this is an
+                    // observer node. It relays gossip and executes committed
+                    // blocks via handle_event, but never proposes or votes.
                 }
             }
         }
@@ -473,21 +499,114 @@ impl Node {
             NetworkEvent::Message(msg) => {
                 match msg.topic {
                     GossipTopic::BlockProposal => {
-                        // Deserialise and pass to consensus
-                        debug!(from = %msg.from, "received block proposal");
-                        // TODO: deserialise BlockProposal from msg.payload
-                        // and call self.consensus.receive_proposal(proposal).await
+                        let proposal: BlockProposal = match serde_json::from_slice(&msg.payload) {
+                            Ok(p)  => p,
+                            Err(e) => {
+                                warn!(from = %msg.from, error = %e, "malformed block proposal, ignoring");
+                                return Ok(());
+                            }
+                        };
+
+                        debug!(
+                            from = %msg.from,
+                            height = proposal.height,
+                            round  = proposal.round,
+                            block_hash = %proposal.block_hash,
+                            "received block proposal"
+                        );
+
+                        // A proposal we produced ourselves is already registered
+                        // with the consensus engine and cached locally; re-processing
+                        // a copy that bounced back over gossip is a harmless no-op,
+                        // but skip it so we don't cast a second, duplicate vote.
+                        let is_own = self.pending_proposals
+                            .get(&(proposal.height, proposal.round))
+                            .map(|p| p.block_hash == proposal.block_hash)
+                            .unwrap_or(false)
+                            && self.validator_id.as_ref() == Some(&proposal.proposer);
+                        if is_own {
+                            return Ok(());
+                        }
+
+                        if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
+                            debug!(error = %e, "proposal rejected (stale height, wrong proposer, or locked)");
+                            return Ok(());
+                        }
+
+                        self.pending_proposals.insert(
+                            (proposal.height, proposal.round), proposal.clone(),
+                        );
+
+                        match self.cast_and_broadcast_own_votes(&proposal).await {
+                            Ok(Some(cert)) => {
+                                if let Err(e) = self.commit_block(cert, &proposal).await {
+                                    error!(error = %e, "commit failed after reaching quorum via own vote");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(error = %e, "failed to cast own votes for received proposal"),
+                        }
                     }
 
                     GossipTopic::ConsensusVote => {
-                        debug!(from = %msg.from, "received consensus vote");
-                        // TODO: deserialise Vote and call self.consensus.receive_vote(vote).await
-                        // If receive_vote returns Some(CommitCertificate), execute the block.
+                        let vote: Vote = match serde_json::from_slice(&msg.payload) {
+                            Ok(v)  => v,
+                            Err(e) => {
+                                warn!(from = %msg.from, error = %e, "malformed vote, ignoring");
+                                return Ok(());
+                            }
+                        };
+
+                        debug!(
+                            from = %msg.from,
+                            height = vote.height,
+                            round  = vote.round,
+                            validator = %vote.validator,
+                            vote_type = ?vote.vote_type,
+                            "received consensus vote"
+                        );
+
+                        match self.consensus.receive_vote(vote.clone()).await {
+                            Ok(Some(cert)) => {
+                                let proposal = self.pending_proposals
+                                    .get(&(vote.height, vote.round))
+                                    .cloned();
+                                match proposal {
+                                    Some(p) => {
+                                        if let Err(e) = self.commit_block(cert, &p).await {
+                                            error!(error = %e, "commit failed after reaching quorum via peer vote");
+                                        }
+                                    }
+                                    None => {
+                                        // Quorum reached on a proposal we never received --
+                                        // possible if this vote arrived before the proposal
+                                        // gossip did. We cannot execute without the tx_data,
+                                        // so we log and wait; the proposal message, once it
+                                        // arrives, currently will not re-trigger this commit
+                                        // (a known gap -- see the deployment notes).
+                                        warn!(
+                                            height = vote.height,
+                                            round  = vote.round,
+                                            "quorum reached but proposal not yet seen; cannot execute block"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => debug!(error = %e, "vote rejected (stale height or unknown validator)"),
+                        }
                     }
 
                     GossipTopic::Transaction => {
-                        debug!(from = %msg.from, "received transaction");
-                        // TODO: deserialise Transaction and add to mempool
+                        match serde_json::from_slice::<Transaction>(&msg.payload) {
+                            Ok(tx) => {
+                                debug!(from = %msg.from, tx_id = %tx.id, "received transaction");
+                                self.submit_tx(tx);
+                            }
+                            Err(e) => {
+                                warn!(from = %msg.from, error = %e, "malformed transaction, ignoring");
+                            }
+                        }
                     }
 
                     GossipTopic::PeerAnnounce => {
@@ -529,6 +648,218 @@ impl Node {
             NetworkEvent::FatalError(e) => {
                 return Err(format!("fatal network error: {e}"));
             }
+        }
+
+        Ok(())
+    }
+
+    /// Deterministic round-robin proposer check, matching the same logic
+    /// TendermintEngine uses internally (sorted by ValidatorId, rotated by
+    /// height + round). Duplicated here rather than exposed from the trait
+    /// because it is only needed to decide *whether to call* propose() --
+    /// propose()/receive_proposal() re-derive and enforce the real answer
+    /// themselves, so a wrong guess here just means a wasted, safely-
+    /// rejected call, never a consensus-safety issue.
+    fn is_proposer_for(vs: &ValidatorSet, height: u64, round: u32, id: &ValidatorId) -> bool {
+        if vs.validators.is_empty() { return false; }
+        let mut sorted: Vec<_> = vs.validators.iter().collect();
+        sorted.sort_by_key(|v| &v.id);
+        let idx = ((height + round as u64) as usize) % sorted.len();
+        &sorted[idx].id == id
+    }
+
+    /// Cast this node's own prevote and precommit for a proposal, feeding
+    /// each into the local consensus engine and broadcasting it so peers
+    /// can count it toward their own quorum. Returns the commit certificate
+    /// if this node's own precommit was the one that reached quorum.
+    ///
+    /// Observer nodes (validator_id == None) have nothing to vote as and
+    /// return Ok(None) immediately -- they still receive and relay gossip
+    /// via libp2p's mesh, they just do not participate in voting.
+    async fn cast_and_broadcast_own_votes(
+        &mut self,
+        proposal: &BlockProposal,
+    ) -> Result<Option<chain_forge_consensus::CommitCertificate>, String> {
+        let Some(my_id) = self.validator_id.clone() else {
+            return Ok(None);
+        };
+
+        let prevote = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     proposal.height,
+            round:      proposal.round,
+            validator:  my_id.clone(),
+            block_hash: Some(proposal.block_hash.clone()),
+            signature:  vec![], // TODO: sign once the crypto layer is wired into consensus
+        };
+        if let Err(e) = self.consensus.receive_vote(prevote.clone()).await {
+            debug!(error = %e, "own prevote rejected locally");
+        }
+        let _ = self.network.publish(OutboundMessage {
+            topic:   GossipTopic::ConsensusVote,
+            payload: serde_json::to_vec(&prevote).unwrap_or_default(),
+        }).await;
+
+        let precommit = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     proposal.height,
+            round:      proposal.round,
+            validator:  my_id,
+            block_hash: Some(proposal.block_hash.clone()),
+            signature:  vec![],
+        };
+        let cert = self.consensus.receive_vote(precommit.clone()).await
+            .map_err(|e| e.to_string())?;
+        let _ = self.network.publish(OutboundMessage {
+            topic:   GossipTopic::ConsensusVote,
+            payload: serde_json::to_vec(&precommit).unwrap_or_default(),
+        }).await;
+
+        Ok(cert)
+    }
+
+    /// Execute and commit a block once a real (multi-node) quorum has been
+    /// reached -- either because this node's own precommit completed it, or
+    /// because a gossiped vote from a peer did. This is the follower-safe
+    /// counterpart to propose_block()'s inline commit tail: propose_block()
+    /// is unchanged and still used for the solo-devnet (no peers) path,
+    /// where the proposer synthesises every validator's vote itself.
+    async fn commit_block(
+        &mut self,
+        cert: chain_forge_consensus::CommitCertificate,
+        proposal: &BlockProposal,
+    ) -> Result<(), String> {
+        let txs: Vec<Transaction> = serde_json::from_slice(&proposal.tx_data)
+            .unwrap_or_default();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let tx_meta: Vec<(String, String, String)> = txs.iter()
+            .map(|t| {
+                let kind = match &t.body {
+                    chain_forge_execution::TxBody::Transfer { .. }          => "transfer",
+                    chain_forge_execution::TxBody::Burn { .. }              => "burn",
+                    chain_forge_execution::TxBody::Stake { .. }             => "stake",
+                    chain_forge_execution::TxBody::Custom { .. }            => "custom",
+                    chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
+                    chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
+                    chain_forge_execution::TxBody::SponsorAgent { .. }      => "sponsor_agent",
+                    chain_forge_execution::TxBody::RevokeAgent { .. }       => "revoke_agent",
+                };
+                (t.id.clone(), t.sender.clone(), kind.to_string())
+            })
+            .collect();
+
+        let exec_result = self.executor.execute_block(cert.height, txs, &mut self.state, now_ms);
+
+        info!(
+            height     = cert.height,
+            block_hash = %cert.block_hash,
+            txs_ok     = exec_result.success_count(),
+            txs_fail   = exec_result.failure_count(),
+            gas_used   = exec_result.gas_used,
+            state_root = %exec_result.state_root,
+            "block executed and committed (multi-node quorum)"
+        );
+
+        self.consensus.on_commit(cert.clone(), None).await
+            .map_err(|e| e.to_string())?;
+
+        {
+            let mut s = self.status.lock().unwrap();
+            s.height     = exec_result.height;
+            s.state_root = Some(exec_result.state_root.clone());
+        }
+
+        {
+            let mut ex = self.explorer.lock().unwrap();
+            let mut tx_ids = Vec::new();
+            for (i, r) in exec_result.tx_results.iter().enumerate() {
+                let (sender, kind) = tx_meta.get(i)
+                    .map(|(_, s, k)| (s.clone(), k.clone()))
+                    .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
+                tx_ids.push(r.tx_id.clone());
+                ex.txs.insert(r.tx_id.clone(), TxSummary {
+                    id:       r.tx_id.clone(),
+                    height:   exec_result.height,
+                    sender,
+                    kind,
+                    success:  r.success,
+                    gas_used: r.gas_used,
+                    events:   r.events.clone(),
+                    error:    r.error.clone(),
+                });
+            }
+            ex.blocks.push_front(BlockSummary {
+                height:       exec_result.height,
+                state_root:   exec_result.state_root.clone(),
+                timestamp_ms: now_ms,
+                tx_count:     tx_ids.len(),
+                tx_ids,
+            });
+            while ex.blocks.len() > MAX_RECENT_BLOCKS {
+                ex.blocks.pop_back();
+            }
+            ex.accounts.clear();
+            for a in self.state.all_accounts() {
+                ex.accounts.insert(a.address.clone(), AccountSummary {
+                    address:        a.address.clone(),
+                    role:           a.role.clone(),
+                    nonce:          a.nonce,
+                    balances:       a.balances.clone(),
+                    tier:           a.verification_tier().map(|t| t.to_string()),
+                    exemption_days: a.exemption_days(),
+                });
+            }
+        }
+
+        // Drop proposals at or below the height we just committed -- they
+        // can no longer be voted on and would otherwise accumulate forever.
+        let committed_height = cert.height;
+        self.pending_proposals.retain(|(h, _), _| *h > committed_height);
+
+        Ok(())
+    }
+
+    /// Propose a block on the real multi-node path: build it, broadcast it,
+    /// cast this node's own votes, and commit immediately if that alone
+    /// reached quorum (small validator sets can do this in one round-trip).
+    /// Otherwise the block commits later, from handle_event, once enough
+    /// peers' votes have arrived over gossip.
+    async fn propose_and_broadcast_multinode(
+        &mut self,
+        parent_hash: BlockHash,
+    ) -> Result<(), String> {
+        let height = self.consensus.current_height();
+        let round  = self.consensus.current_round();
+
+        let txs = std::mem::take(&mut self.mempool);
+        let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
+
+        let proposal = self.consensus
+            .propose(height, round, parent_hash, tx_bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        info!(
+            height, round,
+            block_hash = %proposal.block_hash,
+            txs = txs.len(),
+            "block proposed (multi-node)"
+        );
+
+        self.pending_proposals.insert((height, round), proposal.clone());
+
+        let _ = self.network.publish(OutboundMessage {
+            topic:   GossipTopic::BlockProposal,
+            payload: serde_json::to_vec(&proposal).unwrap_or_default(),
+        }).await;
+
+        if let Some(cert) = self.cast_and_broadcast_own_votes(&proposal).await? {
+            self.commit_block(cert, &proposal).await?;
         }
 
         Ok(())
@@ -931,5 +1262,145 @@ mod tests {
             "recent blocks must be capped");
         // Newest first
         assert!(ex.blocks[0].height > ex.blocks[1].height);
+    }
+
+    // -- Multi-node gossip-to-consensus wiring tests ---------------------------
+
+    fn make_proposal(height: u64, round: u32, proposer: &str, block_hash: &str) -> BlockProposal {
+        BlockProposal {
+            height,
+            round,
+            proposer:    ValidatorId(proposer.to_string()),
+            block_hash:  chain_forge_consensus::BlockHash(block_hash.to_string()),
+            parent_hash: chain_forge_consensus::BlockHash("genesis_h0".to_string()),
+            timestamp_ms: 0,
+            tx_data:     serde_json::to_vec(&Vec::<Transaction>::new()).unwrap(),
+            signature:   vec![],
+        }
+    }
+
+    fn gossip(topic: GossipTopic, payload: Vec<u8>) -> NetworkEvent {
+        NetworkEvent::Message(chain_forge_p2p::GossipMessage {
+            topic,
+            from: chain_forge_p2p::PeerId("test-peer".into()),
+            payload,
+            received_at_ms: 0,
+        })
+    }
+
+    #[test]
+    fn is_proposer_for_matches_expected_rotation() {
+        let vs = ValidatorSet {
+            height: 0,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("qcb1alice".into()), voting_power: 1, pop_verified: true },
+                ValidatorInfo { id: ValidatorId("qcb1bob".into()),   voting_power: 1, pop_verified: true },
+                ValidatorInfo { id: ValidatorId("qcb1carol".into()), voting_power: 1, pop_verified: true },
+                ValidatorInfo { id: ValidatorId("qcb1dave".into()),  voting_power: 1, pop_verified: true },
+            ],
+        };
+        // Sorted order: alice, bob, carol, dave -- rotates by (height+round) % 4.
+        assert!(Node::is_proposer_for(&vs, 0, 0, &ValidatorId("qcb1alice".into())));
+        assert!(Node::is_proposer_for(&vs, 1, 0, &ValidatorId("qcb1bob".into())));
+        assert!(Node::is_proposer_for(&vs, 2, 0, &ValidatorId("qcb1carol".into())));
+        assert!(Node::is_proposer_for(&vs, 3, 0, &ValidatorId("qcb1dave".into())));
+        assert!(Node::is_proposer_for(&vs, 4, 0, &ValidatorId("qcb1alice".into())));
+        assert!(!Node::is_proposer_for(&vs, 0, 0, &ValidatorId("qcb1bob".into())));
+    }
+
+    #[tokio::test]
+    async fn multinode_follower_commits_after_gossiped_votes_reach_quorum() {
+        // Bob is not the proposer at (0,0) -- alice is. Bob should accept
+        // alice's proposal via gossip, cast his own votes, and then commit
+        // once enough OTHER validators' precommits arrive over gossip too.
+        let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+
+        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_test");
+        let payload = serde_json::to_vec(&proposal).unwrap();
+        node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
+
+        // Bob voted (prevote + precommit) but that is only 1 of the 3
+        // precommits needed for quorum with 4 validators -- not committed yet.
+        assert_eq!(node.status.lock().unwrap().height, 0);
+        assert!(node.pending_proposals.contains_key(&(0, 0)));
+
+        // Carol's precommit arrives over gossip -- still only 2 of 3.
+        let carol_vote = Vote {
+            vote_type:  VoteType::Precommit,
+            height: 0, round: 0,
+            validator:  ValidatorId("qcb1carol".into()),
+            block_hash: Some(proposal.block_hash.clone()),
+            signature:  vec![],
+        };
+        node.handle_event(gossip(
+            GossipTopic::ConsensusVote,
+            serde_json::to_vec(&carol_vote).unwrap(),
+        )).await.unwrap();
+        assert_eq!(node.status.lock().unwrap().height, 0, "2 of 3 -- not yet committed");
+
+        // Dave's precommit is the 3rd -- quorum reached, block commits.
+        let dave_vote = Vote {
+            vote_type:  VoteType::Precommit,
+            height: 0, round: 0,
+            validator:  ValidatorId("qcb1dave".into()),
+            block_hash: Some(proposal.block_hash.clone()),
+            signature:  vec![],
+        };
+        node.handle_event(gossip(
+            GossipTopic::ConsensusVote,
+            serde_json::to_vec(&dave_vote).unwrap(),
+        )).await.unwrap();
+
+        // status.height reports the height of the last COMMITTED block (0,
+        // matching node_produces_first_block's established convention),
+        // while the consensus engine itself has already advanced to work
+        // on the next height (1) -- these are two different, correct facts.
+        assert_eq!(node.status.lock().unwrap().height, 0,
+            "3rd precommit must trigger commit of block 0");
+        assert_eq!(node.consensus.current_height(), 1,
+            "consensus engine must advance past the committed height");
+        assert!(!node.pending_proposals.contains_key(&(0, 0)),
+            "committed proposal must be pruned");
+        assert_eq!(node.explorer.lock().unwrap().blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_event_ignores_malformed_gossip_payload() {
+        let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+        let garbage = vec![0xFF, 0x00, 0x13, 0x37];
+
+        // Must not panic or error out the event loop -- just logged and dropped.
+        assert!(node.handle_event(gossip(GossipTopic::BlockProposal, garbage.clone())).await.is_ok());
+        assert!(node.handle_event(gossip(GossipTopic::ConsensusVote, garbage.clone())).await.is_ok());
+        assert!(node.handle_event(gossip(GossipTopic::Transaction, garbage)).await.is_ok());
+
+        assert_eq!(node.status.lock().unwrap().height, 0);
+        assert!(node.pending_proposals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_event_rejects_proposal_from_wrong_proposer() {
+        let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+
+        // Bob claims to be the proposer at (0,0), but alice is -- consensus
+        // must reject this and the node must not register or vote on it.
+        let bad_proposal = make_proposal(0, 0, "qcb1bob", "block_h0_r0_bad");
+        let payload = serde_json::to_vec(&bad_proposal).unwrap();
+        node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
+
+        assert!(node.pending_proposals.is_empty(),
+            "a proposal from the wrong proposer must not be accepted");
+        assert_eq!(node.status.lock().unwrap().height, 0);
+    }
+
+    #[tokio::test]
+    async fn handle_event_gossiped_transaction_enters_mempool() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let tx = Transaction::transfer("gossip-tx-1", "qcb1alice", "qcb1bob", "uqcb", 500, 0);
+        let payload = serde_json::to_vec(&tx).unwrap();
+
+        node.handle_event(gossip(GossipTopic::Transaction, payload)).await.unwrap();
+        assert_eq!(node.mempool.len(), 1);
+        assert_eq!(node.mempool[0].id, "gossip-tx-1");
     }
 }
