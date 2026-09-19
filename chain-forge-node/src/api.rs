@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 use super::node::{NodeStatus, ExplorerState, CirfiMetrics};
+use chain_forge_p2p::PeerInfo;
 
 /// Serve the HTTP API on the given port.
 /// Phase 0 implementation: a minimal hand-rolled HTTP server that handles
@@ -19,6 +20,7 @@ pub async fn serve(
     status:        Arc<Mutex<NodeStatus>>,
     explorer:      Arc<Mutex<ExplorerState>>,
     cirfi_metrics: Arc<Mutex<CirfiMetrics>>,
+    peers:         Arc<Mutex<Vec<PeerInfo>>>,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +43,7 @@ pub async fn serve(
                 let status        = status.clone();
                 let explorer      = explorer.clone();
                 let cirfi_metrics = cirfi_metrics.clone();
+                let peers         = peers.clone();
 
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
@@ -135,6 +138,10 @@ pub async fn serve(
                         // GET /api/cirfi — CirFi monetary engine metrics (Section 9.1)
                         let cm = cirfi_metrics.lock().unwrap();
                         http_200_json(&serde_json::to_string(&*cm).unwrap_or_default())
+                    } else if first_line.starts_with("GET /api/peers") {
+                        // GET /api/peers — connected peers (real network layer)
+                        let p = peers.lock().unwrap();
+                        http_200_json(&serde_json::to_string(&*p).unwrap_or_default())
                     } else if first_line.starts_with("OPTIONS") {
                         // CORS preflight for the React frontend
                         http_cors_preflight()

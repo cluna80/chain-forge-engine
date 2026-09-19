@@ -13,7 +13,7 @@ use chain_forge_state::StateStore;
 use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
 use chain_forge_p2p::{
     MockNetworkService, NetworkConfig, NetworkEvent, NetworkService,
-    GossipTopic, OutboundMessage,
+    GossipTopic, OutboundMessage, PeerInfo,
 };
 
 // -- Node status (shared with the API) ----------------------------------------
@@ -111,6 +111,10 @@ pub struct CirfiMetrics {
 
 pub type SharedCirfiMetrics = Arc<Mutex<CirfiMetrics>>;
 
+/// Connected peers, updated from real network events (Section 7.4 / P2P layer).
+/// Read by /api/peers.
+pub type SharedPeers = Arc<Mutex<Vec<PeerInfo>>>;
+
 // -- Node error ---------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -132,10 +136,16 @@ pub struct Node {
     consensus: Box<dyn ConsensusEngine>,
     state:     StateStore,
     executor:  Executor,
-    network:   MockNetworkService,
+    /// The P2P network backend. Mock in tests and default builds; real
+    /// libp2p when the node crate's own "real-network" feature is enabled.
+    /// Boxed as a trait object so both implementations are interchangeable
+    /// behind the same NetworkService interface.
+    network:   Box<dyn NetworkService>,
     status:         SharedStatus,
     explorer:       SharedExplorer,
     cirfi_metrics:  SharedCirfiMetrics,
+    /// Connected peers, maintained from PeerConnected/PeerDisconnected/PeerList events.
+    peers:          SharedPeers,
     /// This node's validator identity. None = observer node (no voting).
     validator_id: Option<ValidatorId>,
     /// Pending transactions waiting to be proposed in the next block.
@@ -147,6 +157,18 @@ impl Node {
     pub async fn new(
         genesis_json: &str,
         validator_address: Option<String>,
+    ) -> Result<Self, NodeError> {
+        Self::new_with_p2p_port(genesis_json, validator_address, None).await
+    }
+
+    /// Create a new node, optionally overriding the P2P port from genesis.
+    /// The override is what makes running multiple nodes on one machine
+    /// (local multi-node testnet) possible -- each instance needs its own
+    /// bind port even though they share one genesis file.
+    pub async fn new_with_p2p_port(
+        genesis_json: &str,
+        validator_address: Option<String>,
+        p2p_port_override: Option<u16>,
     ) -> Result<Self, NodeError> {
         // Parse and validate genesis
         let genesis = GenesisConfig::from_json(genesis_json)
@@ -235,11 +257,33 @@ impl Node {
         let exec_config = ExecutionConfig::from_genesis(&genesis);
         let executor = Executor::new(exec_config);
 
-        // Start mock network service (Phase 0 - no real libp2p)
-        let mut network = MockNetworkService::new();
-        let net_config = NetworkConfig::from_genesis(&genesis);
-        network.start(net_config).await
-            .map_err(|e| NodeError::Network(e.to_string()))?;
+        // Build network config from genesis, applying the CLI port
+        // override if one was given (needed to run multiple nodes locally).
+        let mut net_config = NetworkConfig::from_genesis(&genesis);
+        if let Some(port) = p2p_port_override {
+            net_config.p2p_port = port;
+        }
+
+        // Real libp2p when this crate's "real-network" feature is enabled;
+        // otherwise the in-memory mock (fast, deterministic, used by tests
+        // and by default builds). Both satisfy the same NetworkService
+        // trait, so nothing downstream of this block knows which one is live.
+        #[cfg(feature = "real-network")]
+        let network: Box<dyn NetworkService> = {
+            let (svc, local_addr) = chain_forge_p2p::real::Libp2pService::start(&net_config)
+                .await
+                .map_err(|e| NodeError::Network(e.to_string()))?;
+            info!(local_addr = %local_addr, "real libp2p network started");
+            Box::new(svc)
+        };
+
+        #[cfg(not(feature = "real-network"))]
+        let network: Box<dyn NetworkService> = {
+            let mut svc = MockNetworkService::new();
+            svc.start(net_config.clone()).await
+                .map_err(|e| NodeError::Network(e.to_string()))?;
+            Box::new(svc)
+        };
 
         // Initial shared status
         let status = Arc::new(Mutex::new(NodeStatus {
@@ -260,6 +304,8 @@ impl Node {
             ..Default::default()
         }));
 
+        let peers: SharedPeers = Arc::new(Mutex::new(Vec::new()));
+
         Ok(Self {
             genesis,
             consensus: Box::new(engine),
@@ -269,6 +315,7 @@ impl Node {
             status,
             explorer,
             cirfi_metrics,
+            peers,
             validator_id,
             mempool: Vec::new(),
         })
@@ -292,6 +339,10 @@ impl Node {
 
     pub fn cirfi_metrics(&self) -> SharedCirfiMetrics {
         self.cirfi_metrics.clone()
+    }
+
+    pub fn peers(&self) -> SharedPeers {
+        self.peers.clone()
     }
 
     /// Add a transaction to the mempool.
@@ -319,60 +370,86 @@ impl Node {
             s.is_running = true;
         }
 
-        // Drain any startup events from the mock network queue first.
-        loop {
-            match self.network.next_event().await {
-                Ok(event) => {
-                    if let Err(e) = self.handle_event(event).await {
-                        error!(error = %e, "error handling network event");
-                    }
-                }
-                Err(_) => {
-                    // Mock queue empty -- switch to ticker mode.
-                    break;
-                }
-            }
-        }
-
         info!(
             chain_id = %self.genesis.chain_id,
             height   = self.consensus.current_height(),
             "node ready -- waiting for transactions and blocks"
         );
 
-        // Keep the node alive with a heartbeat ticker.
-        // Phase 1: replace this with real libp2p event loop.
+        // Single loop, driven by whichever of (network event, heartbeat
+        // tick) is ready first.
+        //
+        // This replaces the old "drain the queue, then switch to ticker"
+        // structure, which only worked because the mock's next_event()
+        // fails immediately when its queue is empty. A real libp2p
+        // next_event() awaits a channel and only resolves when something
+        // actually happens -- against a real network, the old structure
+        // would block on that very first await and the ticker (and with
+        // it, block production and the API's live state) would never run.
+        // tokio::select! polls both futures every iteration, so network
+        // activity and the heartbeat both make progress regardless of
+        // which backend is in use.
         let block_time = self.genesis.consensus.block_time_ms;
         let mut interval = tokio::time::interval(
             tokio::time::Duration::from_millis(block_time)
         );
         let mut running = true;
         while running {
-            interval.tick().await;
-            let height = self.consensus.current_height();
-            let peer_count = {
-                let s = self.status.lock().unwrap();
-                s.peer_count
-            };
-            debug!(height, peer_count, "node heartbeat");
-
-            // In devnet mode with no peers, auto-propose blocks so the
-            // chain actually advances and the API shows live state.
-            if self.genesis.environment.mode == "devnet" && peer_count == 0 {
-                let parent = chain_forge_consensus::BlockHash(
-                    format!("genesis_h{height}")
-                );
-                match self.propose_block(parent).await {
-                    Ok(cert) => {
-                        info!(
-                            height = cert.height,
-                            block_hash = %cert.block_hash,
-                            "devnet block committed"
-                        );
+            tokio::select! {
+                event_result = self.network.next_event() => {
+                    match event_result {
+                        Ok(event) => {
+                            if let Err(e) = self.handle_event(event).await {
+                                error!(error = %e, "error handling network event");
+                            }
+                        }
+                        Err(e) => {
+                            // Mock: this fires on every poll while its queue is
+                            // empty, which is the normal steady state, not a
+                            // fault -- so we log quietly and yield briefly
+                            // rather than spinning the executor at 100% CPU
+                            // re-polling an instantly-failing future.
+                            // Real: this fires only if the event channel has
+                            // closed (the network task exited) -- also not
+                            // treated as fatal here; the heartbeat keeps the
+                            // node alive and a future revision can distinguish
+                            // "closed" from "idle" once P2pError carries that.
+                            debug!(error = %e, "no network event available");
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        }
                     }
-                    Err(e) => {
-                        debug!(error = %e, "block proposal skipped");
-                        running = false; // stop on unrecoverable error
+                }
+
+                _ = interval.tick() => {
+                    let height = self.consensus.current_height();
+                    let peer_count = {
+                        let s = self.status.lock().unwrap();
+                        s.peer_count
+                    };
+                    debug!(height, peer_count, "node heartbeat");
+
+                    // In devnet mode with no peers, auto-propose blocks so the
+                    // chain actually advances and the API shows live state.
+                    // With real peers connected, block production should come
+                    // from the leader-election path instead (not yet wired --
+                    // see the propose/vote/commit TODOs in handle_event).
+                    if self.genesis.environment.mode == "devnet" && peer_count == 0 {
+                        let parent = chain_forge_consensus::BlockHash(
+                            format!("genesis_h{height}")
+                        );
+                        match self.propose_block(parent).await {
+                            Ok(cert) => {
+                                info!(
+                                    height = cert.height,
+                                    block_hash = %cert.block_hash,
+                                    "devnet block committed"
+                                );
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "block proposal skipped");
+                                running = false; // stop on unrecoverable error
+                            }
+                        }
                     }
                 }
             }
@@ -421,19 +498,32 @@ impl Node {
 
             NetworkEvent::PeerConnected(peer) => {
                 info!(peer_id = %peer.peer_id, addr = %peer.addr, "peer connected");
-                let mut s = self.status.lock().unwrap();
-                s.peer_count += 1;
+                let mut list = self.peers.lock().unwrap();
+                // De-duplicate: a reconnect updates the existing entry
+                // rather than appending a second one for the same peer.
+                if let Some(existing) = list.iter_mut().find(|p| p.peer_id == peer.peer_id) {
+                    *existing = peer;
+                } else {
+                    list.push(peer);
+                }
+                let count = list.len();
+                drop(list);
+                self.status.lock().unwrap().peer_count = count;
             }
 
             NetworkEvent::PeerDisconnected(peer_id) => {
                 info!(peer_id = %peer_id, "peer disconnected");
-                let mut s = self.status.lock().unwrap();
-                s.peer_count = s.peer_count.saturating_sub(1);
+                let mut list = self.peers.lock().unwrap();
+                list.retain(|p| p.peer_id != peer_id);
+                let count = list.len();
+                drop(list);
+                self.status.lock().unwrap().peer_count = count;
             }
 
             NetworkEvent::PeerList(peers) => {
-                let mut s = self.status.lock().unwrap();
-                s.peer_count = peers.len();
+                let count = peers.len();
+                *self.peers.lock().unwrap() = peers;
+                self.status.lock().unwrap().peer_count = count;
             }
 
             NetworkEvent::FatalError(e) => {

@@ -26,5 +26,11 @@ tokio                 = { workspace = true }
 async-trait           = { workspace = true }
 tracing-subscriber    = "0.3"
 
+[features]
+# Use real libp2p networking instead of the in-memory mock.
+# Off by default so `cargo test` stays fast; enable for real deployments:
+#   cargo run --release --features real-network -- --genesis genesis.json
+real-network = []
+
 [dev-dependencies]
 tokio = { workspace = true }

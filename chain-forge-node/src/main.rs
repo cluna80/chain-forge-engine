@@ -32,6 +32,10 @@ struct Args {
     genesis_path: PathBuf,
     validator_address: Option<String>,
     api_port: u16,
+    /// Overrides the P2P bind port from genesis. Needed to run more than
+    /// one node locally on the same machine for a local multi-node testnet --
+    /// each instance must bind a distinct port even though they share genesis.
+    p2p_port: Option<u16>,
 }
 
 fn parse_args() -> Args {
@@ -39,6 +43,7 @@ fn parse_args() -> Args {
     let mut genesis_path = PathBuf::from("genesis.json");
     let mut validator_address = None;
     let mut api_port = 8080u16;
+    let mut p2p_port: Option<u16> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -57,11 +62,19 @@ fn parse_args() -> Args {
                     api_port = args[i].parse().unwrap_or(8080);
                 }
             }
+            "--p2p-port" | "-P" => {
+                i += 1;
+                if i < args.len() {
+                    p2p_port = args[i].parse().ok();
+                }
+            }
             "--help" | "-h" => {
                 println!("chain-forge-node");
                 println!("  --genesis <path>     Path to genesis.json (default: genesis.json)");
                 println!("  --validator <addr>   This node's validator address");
                 println!("  --api-port <port>    HTTP API port (default: 8080)");
+                println!("  --p2p-port <port>    Override P2P bind port from genesis");
+                println!("                       (needed to run multiple local nodes)");
                 std::process::exit(0);
             }
             _ => {}
@@ -69,7 +82,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { genesis_path, validator_address, api_port }
+    Args { genesis_path, validator_address, api_port, p2p_port }
 }
 
 #[tokio::main]
@@ -98,7 +111,9 @@ async fn main() {
     };
 
     // Build and run the node
-    let mut node = match node::Node::new(&genesis_json, args.validator_address).await {
+    let mut node = match node::Node::new_with_p2p_port(
+        &genesis_json, args.validator_address, args.p2p_port,
+    ).await {
         Ok(n) => n,
         Err(e) => {
             eprintln!("Error: failed to initialise node: {e}");
@@ -116,9 +131,10 @@ async fn main() {
     let status        = node.status();
     let explorer      = node.explorer();
     let cirfi_metrics = node.cirfi_metrics();
+    let peers         = node.peers();
     let api_port      = args.api_port;
     tokio::spawn(async move {
-        api::serve(api_port, status, explorer, cirfi_metrics).await;
+        api::serve(api_port, status, explorer, cirfi_metrics, peers).await;
     });
 
     // Give the API a moment to bind before the event loop starts.
