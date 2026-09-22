@@ -72,6 +72,13 @@ pub enum GossipTopic {
     Transaction,
     /// Peer capability announcements (supported protocols, chain ID).
     PeerAnnounce,
+    /// A node that has fallen behind asks the network for a specific
+    /// committed height it's missing.
+    SyncRequest,
+    /// A node that has the requested height responds with its commit
+    /// certificate and the original proposal (transactions included), so
+    /// the requester can verify and replay it locally.
+    SyncResponse,
 }
 
 impl GossipTopic {
@@ -81,6 +88,8 @@ impl GossipTopic {
             Self::ConsensusVote  => "chain-forge/consensus-vote/1.0.0",
             Self::Transaction    => "chain-forge/transaction/1.0.0",
             Self::PeerAnnounce   => "chain-forge/peer-announce/1.0.0",
+            Self::SyncRequest    => "chain-forge/sync-request/1.0.0",
+            Self::SyncResponse   => "chain-forge/sync-response/1.0.0",
         }
     }
 }
@@ -580,6 +589,8 @@ pub mod real {
                 "chain-forge/consensus-vote/1.0.0",
                 "chain-forge/transaction/1.0.0",
                 "chain-forge/peer-announce/1.0.0",
+                "chain-forge/sync-request/1.0.0",
+                "chain-forge/sync-response/1.0.0",
             ] {
                 let topic = gossipsub::IdentTopic::new(topic_str);
                 swarm.behaviour_mut().gossipsub.subscribe(&topic)
@@ -602,6 +613,10 @@ pub mod real {
             // Swarm event loop
             tokio::spawn(async move {
                 let mut peer_addrs: HashMap<String, String> = HashMap::new();
+                // Tracks how many simultaneous connections exist per peer_id, so a
+                // redundant-connection dedupe-close (see ConnectionClosed below)
+                // doesn't get misread as the peer fully disconnecting.
+                let mut peer_conn_count: HashMap<String, usize> = HashMap::new();
 
                 loop {
                     tokio::select! {
@@ -698,16 +713,67 @@ pub mod real {
                                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                     tracing::info!(peer = %peer_id, "connection established");
                                     let addr = endpoint.get_remote_address().to_string();
-                                    peer_addrs.insert(peer_id.to_string(), addr);
+                                    // A peer can briefly hold more than one simultaneous
+                                    // connection -- e.g. when both sides list each other in
+                                    // bootstrap_nodes and dial each other at the same time,
+                                    // libp2p ends up with two connections to the same peer_id
+                                    // and closes the redundant one shortly after. That close
+                                    // is normal and does NOT mean the peer is gone. So this
+                                    // tracks a connection COUNT per peer, not just presence,
+                                    // and only announces PeerConnected on the 0->1 transition.
+                                    let count = peer_conn_count.entry(peer_id.to_string())
+                                        .or_insert(0);
+                                    *count += 1;
+                                    let is_new_peer = *count == 1;
+                                    peer_addrs.insert(peer_id.to_string(), addr.clone());
                                     peer_count_clone.store(peer_addrs.len(),
                                         std::sync::atomic::Ordering::Relaxed);
+                                    if is_new_peer {
+                                        // This fires for EVERY first connection, not just
+                                        // mDNS-discovered ones -- bootstrap-dialed peers land
+                                        // here too. Previously only the mDNS Discovered handler
+                                        // sent PeerConnected, so a bootstrap-only connection
+                                        // (mDNS blocked/unavailable, e.g. across routers that
+                                        // drop multicast between wireless clients) updated this
+                                        // internal counter but never reached node.rs's peer
+                                        // tracking at all -- peer_count stayed 0 forever despite
+                                        // a real, live connection underneath.
+                                        let _ = event_tx.send(NetworkEvent::PeerConnected(
+                                            PeerInfo {
+                                                peer_id:   PeerId(peer_id.to_string()),
+                                                addr,
+                                                chain_id:  None,
+                                                connected: true,
+                                                score:     0,
+                                            }
+                                        ));
+                                    }
                                 }
 
                                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                     tracing::info!(peer = %peer_id, "connection closed");
+                                    let now_zero = match peer_conn_count.get_mut(&peer_id.to_string()) {
+                                        Some(count) if *count > 1 => { *count -= 1; false }
+                                        _ => { peer_conn_count.remove(&peer_id.to_string()); true }
+                                    };
+                                    if !now_zero {
+                                        // One of possibly several connections to this peer
+                                        // closed (see the dedupe note above), but at least one
+                                        // remains -- the peer is still genuinely connected, so
+                                        // peer_addrs/peer_count and node.rs's tracking must NOT
+                                        // change here.
+                                        continue;
+                                    }
                                     peer_addrs.remove(&peer_id.to_string());
                                     peer_count_clone.store(peer_addrs.len(),
                                         std::sync::atomic::Ordering::Relaxed);
+                                    // Same gap in the other direction -- a dropped connection
+                                    // must also reach node.rs, or a peer that disconnects stays
+                                    // "connected" forever from the node's point of view.
+
+                                    let _ = event_tx.send(NetworkEvent::PeerDisconnected(
+                                        PeerId(peer_id.to_string())
+                                    ));
                                 }
 
                                 _ => {}
@@ -783,6 +849,8 @@ pub mod real {
             GossipTopic::ConsensusVote  => "chain-forge/consensus-vote/1.0.0",
             GossipTopic::Transaction    => "chain-forge/transaction/1.0.0",
             GossipTopic::PeerAnnounce   => "chain-forge/peer-announce/1.0.0",
+            GossipTopic::SyncRequest    => "chain-forge/sync-request/1.0.0",
+            GossipTopic::SyncResponse   => "chain-forge/sync-response/1.0.0",
         }
     }
 
@@ -792,6 +860,8 @@ pub mod real {
             "chain-forge/consensus-vote/1.0.0" => Some(GossipTopic::ConsensusVote),
             "chain-forge/transaction/1.0.0"    => Some(GossipTopic::Transaction),
             "chain-forge/peer-announce/1.0.0"  => Some(GossipTopic::PeerAnnounce),
+            "chain-forge/sync-request/1.0.0"   => Some(GossipTopic::SyncRequest),
+            "chain-forge/sync-response/1.0.0"  => Some(GossipTopic::SyncResponse),
             _                                  => None,
         }
     }
@@ -897,6 +967,8 @@ mod tests {
             GossipTopic::ConsensusVote,
             GossipTopic::Transaction,
             GossipTopic::PeerAnnounce,
+            GossipTopic::SyncRequest,
+            GossipTopic::SyncResponse,
         ];
         let strings: HashSet<_> = topics.iter().map(|t| t.as_str()).collect();
         assert_eq!(strings.len(), topics.len(), "topic strings must be unique");
