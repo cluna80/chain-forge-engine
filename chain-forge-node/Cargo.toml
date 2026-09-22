@@ -24,7 +24,7 @@ thiserror             = { workspace = true }
 tracing               = { workspace = true }
 tokio                 = { workspace = true }
 async-trait           = { workspace = true }
-tracing-subscriber    = "0.3"
+tracing-subscriber    = { version = "0.3", features = ["env-filter"] }
 
 [features]
 # Use real libp2p networking instead of the in-memory mock.

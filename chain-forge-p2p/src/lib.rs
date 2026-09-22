@@ -528,6 +528,26 @@ pub mod real {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_secs(1))
                 .validation_mode(gossipsub::ValidationMode::Strict)
+                // Gossipsub's library defaults (mesh_n=6, mesh_n_low=5) are
+                // tuned for large, internet-scale networks with hundreds or
+                // thousands of potential peers. A small validator set -- 4
+                // nodes here, meaning at most 3 possible peers ever -- can
+                // never satisfy that, so gossipsub perpetually considers its
+                // mesh "too low," keeps searching for peers that don't exist,
+                // and on some heartbeats collapses the mesh to empty. With an
+                // empty mesh, messages fall back to slow, unreliable
+                // gossip-only propagation instead of direct mesh delivery --
+                // this was the actual root cause of the missed proposals and
+                // votes this session's round-skip and state-sync work had to
+                // route around. Sizing the mesh for what's actually possible
+                // fixes the cause directly. mesh_n=3 matches "every other
+                // validator" for a small set; mesh_n_low=1 means even a
+                // single connected peer is accepted as a valid mesh, so
+                // propagation never has to fall back to gossip-only.
+                .mesh_n_low(1)
+                .mesh_n(3)
+                .mesh_n_high(8)
+                .mesh_outbound_min(1)
                 .message_id_fn(|msg: &gossipsub::Message| {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};

@@ -87,10 +87,18 @@ fn parse_args() -> Args {
 
 #[tokio::main]
 async fn main() {
-    // Initialise structured logging
+    // Initialise structured logging. Without an explicit EnvFilter, the
+    // default subscriber does NOT read RUST_LOG at all -- setting
+    // $env:RUST_LOG="debug" silently had no effect, which is exactly why
+    // debug-level diagnostics (received gossip, sync requests, etc.) never
+    // showed up no matter what the env var was set to. Falls back to "info"
+    // when RUST_LOG isn't set, matching the previous default behavior.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_target(false)
         .with_level(true)
+        .with_env_filter(filter)
         .init();
 
     let args = parse_args();

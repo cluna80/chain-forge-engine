@@ -1336,6 +1336,19 @@ impl ConsensusEngine for TendermintEngine {
         self.current_proposal = None;
         self.valid_block      = None;
         self.votes.clear();
+        // locked_block was missing from this reset -- once set (on reaching
+        // precommit quorum for a block), it was never cleared anywhere,
+        // meaning a node that committed even one block would permanently
+        // reject every future height's proposal forever, since a proposal's
+        // block_hash is always specific to its own height and can never
+        // match a lock left over from an earlier one. This is what made a
+        // 4-node testnet reliably commit exactly ONE block and then stall
+        // at every height after that, regardless of peering, gossip, or
+        // round-timer behavior -- the lock check in receive_proposal (see
+        // "locked on X but proposal is for Y") was correctly doing its job;
+        // it just never got told the old lock was no longer relevant. A
+        // lock only has meaning within the height it was set in.
+        self.locked_block     = None;
 
         // Update validator set if the commit triggered an epoch change.
         if let Some(vs) = new_validator_set {
@@ -1873,6 +1886,59 @@ mod tests {
         let cert = cert.expect("quorum should produce a commit certificate");
         assert_eq!(cert.block_hash, block_hash);
         assert_eq!(cert.precommits.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn locked_block_is_cleared_on_commit_so_next_height_is_accepted() {
+        // Regression test for a real bug found live on a 4-node testnet:
+        // locked_block was set on reaching precommit quorum but never
+        // cleared anywhere, including on_commit. That meant a node which
+        // committed even one block would permanently reject every future
+        // height's proposal -- forever -- because a proposal's block_hash
+        // is always specific to its own height and can never match a lock
+        // left over from an earlier one. The network reliably committed
+        // exactly one block and then stalled at every height after that.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        // Reach precommit quorum at height 0 -- this is what sets locked_block.
+        let block_hash_0 = BlockHash("deadbeef_block_0".into());
+        let mut cert = None;
+        for i in 0..3usize {
+            let vote = Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("val_{i:02}")),
+                block_hash: Some(block_hash_0.clone()),
+                signature:  vec![],
+            };
+            cert = engine.receive_vote(vote).await.unwrap();
+        }
+        let cert = cert.expect("quorum should produce a commit certificate");
+
+        // Commit it -- this is where locked_block must be cleared.
+        engine.on_commit(cert, None).await.unwrap();
+        assert_eq!(engine.current_height(), 1);
+
+        // A fresh proposal for the NEW height, with a DIFFERENT block_hash,
+        // from height 1's correct deterministic proposer (val_01, since
+        // proposer_for rotates by height+round over ids sorted val_00..03).
+        let proposal_1 = BlockProposal {
+            height:       1,
+            round:        0,
+            proposer:     ValidatorId("val_01".into()),
+            block_hash:   BlockHash("deadbeef_block_1".into()),
+            parent_hash:  block_hash_0,
+            timestamp_ms: 0,
+            tx_data:      vec![],
+            signature:    vec![],
+        };
+
+        // Before the fix, this failed with:
+        //   "block proposal is malformed: locked on block_h0 but proposal is for block_h1"
+        engine.receive_proposal(proposal_1).await
+            .expect("height 1's proposal must be accepted -- the height-0 lock must not persist");
     }
 
     #[tokio::test]
