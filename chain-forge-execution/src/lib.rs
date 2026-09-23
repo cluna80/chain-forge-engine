@@ -96,6 +96,13 @@ impl GasModel {
                     TxBody::RedirectToUbiPool { .. } => op_multiplier * 3,
                     TxBody::SponsorAgent { .. }      => op_multiplier * 4,
                     TxBody::RevokeAgent  { .. }      => op_multiplier * 2,
+                    // Registration writes a new IdentityRecord + account --
+                    // comparable weight to the other identity-gated writes.
+                    TxBody::RegisterIdentity         => op_multiplier * 3,
+                    // A single vouch is lightweight; the occasional one that
+                    // crosses quorum and triggers a tier upgrade isn't
+                    // meaningfully heavier at Phase 0/1 gas-metering precision.
+                    TxBody::Attest { .. }            => op_multiplier * 2,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -132,6 +139,20 @@ pub enum TxBody {
     Custom {
         module:  String,
         payload: Vec<u8>,
+    },
+    /// Register a new Provisional identity (Whitepaper Section 4 / Identity
+    /// Pilot Design Phase 1). The sender registers themselves -- identity_id
+    /// and address are both the sender's account address. Starts the
+    /// web-of-trust process; the identity remains Provisional until it
+    /// accumulates ATTESTATION_QUORUM distinct attestations (see Attest).
+    RegisterIdentity,
+    /// Vouch that `claimant_id` is a unique human (Identity Pilot Design
+    /// Section 3.1). The sender is the attester and must already be
+    /// Verified or Established. Once the claimant reaches
+    /// ATTESTATION_QUORUM distinct attestations, they are upgraded to
+    /// Verified as a side effect of this transaction.
+    Attest {
+        claimant_id: String,
     },
     /// Claim UBI for a verified identity (Section 6.2 / Charm Confinement 5.1).
     /// Enforces: one claim per epoch, verified tier, liveness.
@@ -180,6 +201,8 @@ impl Transaction {
             TxBody::Burn     { denom, .. }            => denom.len() + 16,
             TxBody::Stake    { validator, .. }        => validator.len() + 16,
             TxBody::Custom   { module, payload }      => module.len() + payload.len(),
+            TxBody::RegisterIdentity                  => 8,
+            TxBody::Attest   { claimant_id }          => claimant_id.len() + 8,
             TxBody::ClaimUbi { identity_id }          => identity_id.len() + 8,
             TxBody::RedirectToUbiPool { .. }          => 16,
             TxBody::SponsorAgent { agent_address }    => agent_address.len() + 8,
@@ -223,6 +246,30 @@ impl Transaction {
             sender: sender.to_string(),
             nonce,
             body: TxBody::ClaimUbi { identity_id: identity_id.to_string() },
+            gas_limit: 50_000,
+            signature: vec![],
+        }
+    }
+
+    /// A self-registration transaction (Identity Pilot Design Phase 1).
+    pub fn register_identity(id: &str, sender: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::RegisterIdentity,
+            gas_limit: 50_000,
+            signature: vec![],
+        }
+    }
+
+    /// A web-of-trust attestation transaction: sender vouches for claimant_id.
+    pub fn attest(id: &str, sender: &str, claimant_id: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::Attest { claimant_id: claimant_id.to_string() },
             gas_limit: 50_000,
             signature: vec![],
         }
@@ -401,6 +448,75 @@ impl Executor {
 
             // -- CharmConfinement-enforced tx types --------------------------
 
+            TxBody::RegisterIdentity => {
+                let epoch = identity.clock.current_epoch;
+                let attestation = chain_forge_identity::PopAttestation {
+                    identity_id: tx.sender.clone(),
+                    attester:    tx.sender.clone(),
+                    epoch,
+                    proof:       vec![],
+                    note:        Some("self-registration".to_string()),
+                };
+                identity.register(tx.sender.clone(), tx.sender.clone(), attestation)
+                    .map(|_| {
+                        events.push(format!(
+                            "register_identity: {} registered as Provisional",
+                            tx.sender
+                        ));
+                        // Create the on-chain account if this is the sender's
+                        // first transaction, then sync the fresh Provisional
+                        // charm onto it so /api/accounts can actually show
+                        // tier progress -- without this, registering and
+                        // attesting would change IdentityStore but leave the
+                        // explorer's view of the account unchanged forever.
+                        if state.get_account(&tx.sender).is_err() {
+                            let new_acct = chain_forge_state::AccountState::new(
+                                tx.sender.clone(), "user".to_string()
+                            );
+                            state.upsert_account(new_acct);
+                        }
+                        if let (Ok(record), Ok(acct)) = (
+                            identity.get(&tx.sender),
+                            state.get_account_mut(&tx.sender),
+                        ) {
+                            acct.attach_charm(record.charm.clone());
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::Attest { claimant_id } => {
+                identity.attest(claimant_id, &tx.sender)
+                    .map(|outcome| {
+                        match &outcome {
+                            chain_forge_identity::AttestationOutcome::QuorumReachedVerified => {
+                                events.push(format!(
+                                    "attest: {} vouched for {} -- quorum reached, now Verified",
+                                    tx.sender, claimant_id
+                                ));
+                            }
+                            chain_forge_identity::AttestationOutcome::Recorded {
+                                attester_count, quorum
+                            } => {
+                                events.push(format!(
+                                    "attest: {} vouched for {} ({}/{} attestations)",
+                                    tx.sender, claimant_id, attester_count, quorum
+                                ));
+                            }
+                        }
+                        // Sync the claimant's (possibly just-upgraded) charm
+                        // onto their on-chain account, same reasoning as
+                        // RegisterIdentity above.
+                        if let (Ok(record), Ok(acct)) = (
+                            identity.get(claimant_id),
+                            state.get_account_mut(claimant_id),
+                        ) {
+                            acct.attach_charm(record.charm.clone());
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
             TxBody::ClaimUbi { identity_id } => {
                 // Charm Confinement: one claim per epoch, verified tier, liveness
                 if state.get_account(&tx.sender).is_err() {
@@ -567,7 +683,9 @@ impl Executor {
                 Ok(())
             }
             // Identity-gated tx types require execute_tx_with_identity().
-            TxBody::ClaimUbi { .. }
+            TxBody::RegisterIdentity
+            | TxBody::Attest { .. }
+            | TxBody::ClaimUbi { .. }
             | TxBody::RedirectToUbiPool { .. }
             | TxBody::SponsorAgent { .. }
             | TxBody::RevokeAgent { .. } => {
@@ -632,6 +750,74 @@ impl Executor {
             success  = results.iter().filter(|r| r.success).count(),
             gas_used = total_gas,
             "block executed"
+        );
+
+        BlockExecutionResult {
+            height,
+            tx_results:    results,
+            gas_used:      total_gas,
+            gas_limit:     limit,
+            state_root:    state_root.root_hash,
+            fees_collected,
+        }
+    }
+
+    /// Execute all transactions for one block, with identity- and
+    /// CirFi-gated transaction types (RegisterIdentity, Attest, ClaimUbi,
+    /// RedirectToUbiPool, SponsorAgent, RevokeAgent) actually processed
+    /// instead of rejected. This is what a live node needs to call for
+    /// those transaction types to work at all -- execute_block() above
+    /// always rejects them, by design, since it has no identity or CirFi
+    /// state to process them against.
+    pub fn execute_block_with_identity(
+        &self,
+        height:       u64,
+        transactions: Vec<Transaction>,
+        state:        &mut StateStore,
+        identity:     &mut IdentityStore,
+        cirfi:        &mut CirfiEngine,
+        timestamp_ms: u64,
+    ) -> BlockExecutionResult {
+        let mut results        = Vec::new();
+        let mut total_gas      = 0u64;
+        let mut fees_collected = 0u64;
+        let limit              = self.config.block_gas_limit;
+
+        for tx in &transactions {
+            let gas_required = self.config.gas_model.calculate_gas(tx);
+
+            if total_gas + gas_required > limit {
+                tracing::warn!(
+                    tx_id = %tx.id,
+                    gas_required,
+                    total_gas,
+                    limit,
+                    "tx skipped: would exceed block gas limit"
+                );
+                results.push(TransactionResult::err(
+                    tx.id.clone(),
+                    gas_required,
+                    tx.gas_limit,
+                    format!("block gas limit would be exceeded ({total_gas} + {gas_required} > {limit})"),
+                ));
+                continue;
+            }
+
+            let result = self.execute_tx_with_identity(tx, state, identity, cirfi);
+            total_gas      += result.gas_used;
+            fees_collected += result.gas_used;
+            results.push(result);
+        }
+
+        let take_snapshot = height % 100 == 0;
+        let state_root = state.commit(height, timestamp_ms, take_snapshot);
+
+        tracing::info!(
+            height,
+            txs      = transactions.len(),
+            success  = results.iter().filter(|r| r.success).count(),
+            gas_used = total_gas,
+            "block executed (identity-aware)"
         );
 
         BlockExecutionResult {
@@ -972,5 +1158,85 @@ mod tests {
 
         assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 1,
             "spending should earn 1 day of decay exemption");
+    }
+
+    // -- Identity pilot: RegisterIdentity + Attest transactions ---------------
+
+    #[test]
+    fn register_identity_tx_creates_provisional_account_with_charm() {
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        let tx = Transaction::register_identity("tx1", "qcb1newbie", 0);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+
+        assert!(result.success, "registration should succeed: {:?}", result.error);
+        assert!(result.events.iter().any(|e| e.contains("register_identity")));
+        assert_eq!(*identity.get("qcb1newbie").unwrap().tier(),
+            chain_forge_identity::VerificationTier::Provisional);
+
+        // The on-chain account must reflect the fresh Provisional charm --
+        // without the attach_charm sync, this would be None forever.
+        let acct = state.get_account("qcb1newbie").unwrap();
+        assert_eq!(acct.verification_tier(),
+            Some(&chain_forge_identity::VerificationTier::Provisional));
+    }
+
+    #[test]
+    fn attest_tx_reaches_quorum_and_upgrades_onchain_tier() {
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        // Bootstrap two more Verified attesters alongside alice (already
+        // Verified via setup_with_identity's genesis path).
+        for name in ["qcb1bob", "qcb1carol"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att).unwrap();
+        }
+
+        // Register the real claimant via the actual transaction path.
+        let reg_tx = Transaction::register_identity("tx0", "qcb1newbie", 0);
+        exec.execute_tx_with_identity(&reg_tx, &mut state, &mut identity, &mut cirfi);
+
+        // Two attestations: still Provisional on-chain.
+        let a1 = Transaction::attest("tx1", "qcb1alice", "qcb1newbie", 0);
+        exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut cirfi);
+        let a2 = Transaction::attest("tx2", "qcb1bob", "qcb1newbie", 0);
+        exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut cirfi);
+        assert_eq!(
+            state.get_account("qcb1newbie").unwrap().verification_tier(),
+            Some(&VerificationTier::Provisional)
+        );
+
+        // Third distinct attestation crosses quorum -- both IdentityStore
+        // AND the on-chain account must now show Verified.
+        let a3 = Transaction::attest("tx3", "qcb1carol", "qcb1newbie", 0);
+        let result = exec.execute_tx_with_identity(&a3, &mut state, &mut identity, &mut cirfi);
+        assert!(result.success);
+        assert!(result.events.iter().any(|e| e.contains("now Verified")));
+        assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Verified);
+        assert_eq!(
+            state.get_account("qcb1newbie").unwrap().verification_tier(),
+            Some(&VerificationTier::Verified),
+            "on-chain account must reflect the quorum-triggered upgrade"
+        );
+    }
+
+    #[test]
+    fn identity_gated_new_tx_types_rejected_without_identity_store() {
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let exec    = Executor::new(config);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+
+        let reg_tx = Transaction::register_identity("tx1", "qcb1newbie", 0);
+        let r1 = exec.execute_tx(&reg_tx, &mut state);
+        assert!(!r1.success, "RegisterIdentity must be rejected by the non-identity-aware executor");
+
+        let attest_tx = Transaction::attest("tx2", "qcb1alice", "qcb1newbie", 0);
+        let r2 = exec.execute_tx(&attest_tx, &mut state);
+        assert!(!r2.success, "Attest must be rejected by the non-identity-aware executor");
     }
 }

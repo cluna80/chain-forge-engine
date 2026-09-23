@@ -11,6 +11,8 @@ use chain_forge_consensus::{
 };
 use chain_forge_state::StateStore;
 use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
+use chain_forge_identity::IdentityStore;
+use chain_forge_cirfi::CirfiEngine;
 use chain_forge_p2p::{
     MockNetworkService, NetworkConfig, NetworkEvent, NetworkService,
     GossipTopic, OutboundMessage, PeerInfo,
@@ -115,6 +117,13 @@ pub type SharedCirfiMetrics = Arc<Mutex<CirfiMetrics>>;
 /// Read by /api/peers.
 pub type SharedPeers = Arc<Mutex<Vec<PeerInfo>>>;
 
+/// Transactions submitted externally via POST /api/tx, waiting to be
+/// picked up by the node's own event loop and fed into submit_tx(). The
+/// API server runs in its own tokio task with no direct reference to the
+/// live Node -- this queue is the bridge between them, following the same
+/// Arc<Mutex<T>> pattern as SharedStatus/SharedExplorer/SharedPeers above.
+pub type SharedTxQueue = Arc<Mutex<Vec<Transaction>>>;
+
 // -- Node error ---------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -193,6 +202,18 @@ pub struct Node {
     /// for it to ever learn what it missed, since gossipsub delivers each
     /// message once and never replays it.
     chain_store: std::collections::BTreeMap<u64, (chain_forge_consensus::CommitCertificate, BlockProposal)>,
+    /// Identity registry (Whitepaper Section 4 / Identity Pilot Design) --
+    /// backs RegisterIdentity and Attest transactions, and ClaimUbi's
+    /// verified-tier gate. Threaded through execute_block_with_identity()
+    /// on every commit so identity state actually persists across blocks.
+    identity: IdentityStore,
+    /// CirFi monetary engine (demurrage, UBI pool, BME) -- backs ClaimUbi
+    /// and RedirectToUbiPool. Threaded through execute_block_with_identity()
+    /// alongside identity, for the same reason.
+    cirfi: CirfiEngine,
+    /// Transactions submitted via POST /api/tx, waiting to be pulled into
+    /// the mempool. Drained once per heartbeat tick in run().
+    tx_queue: SharedTxQueue,
 }
 
 impl Node {
@@ -349,6 +370,21 @@ impl Node {
 
         let peers: SharedPeers = Arc::new(Mutex::new(Vec::new()));
 
+        // IdentityStore's epoch clock is anchored to real wall-clock time,
+        // not the genesis config's ISO8601 timestamp -- avoids parsing that
+        // string just to compute a value used the same way either way:
+        // "epoch 0 starts now." Documented here because it's a deliberate
+        // Phase 0/1 simplification, not an oversight -- see the identity
+        // pilot's own duration fields (30/90 days) for how epoch numbering
+        // is actually consumed downstream.
+        let identity_genesis_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let identity = IdentityStore::new(identity_genesis_ms);
+        let cirfi = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
+        let tx_queue: SharedTxQueue = Arc::new(Mutex::new(Vec::new()));
+
         Ok(Self {
             genesis,
             consensus: Box::new(engine),
@@ -366,6 +402,9 @@ impl Node {
             round_watch: None,
             round_watch_started: None,
             chain_store: std::collections::BTreeMap::new(),
+            identity,
+            cirfi,
+            tx_queue,
         })
     }
 
@@ -391,6 +430,10 @@ impl Node {
 
     pub fn peers(&self) -> SharedPeers {
         self.peers.clone()
+    }
+
+    pub fn tx_queue(&self) -> SharedTxQueue {
+        self.tx_queue.clone()
     }
 
     /// Add a transaction to the mempool.
@@ -475,6 +518,21 @@ impl Node {
                         s.peer_count
                     };
                     debug!(height, peer_count, "node heartbeat");
+
+                    // Drain any transactions submitted externally via
+                    // POST /api/tx since the last tick. The API server runs
+                    // in its own task with no direct reference to this Node,
+                    // so this queue (SharedTxQueue) is the only bridge --
+                    // same reasoning as status/explorer/peers being shared
+                    // the other direction (node -> API).
+                    {
+                        let mut queue = self.tx_queue.lock().unwrap();
+                        let submitted: Vec<Transaction> = queue.drain(..).collect();
+                        drop(queue);
+                        for tx in submitted {
+                            self.submit_tx(tx);
+                        }
+                    }
 
                     // A genesis with bootstrap_nodes configured signals real
                     // peers are expected -- even before the first one has
@@ -1011,6 +1069,8 @@ impl Node {
                     chain_forge_execution::TxBody::Burn { .. }              => "burn",
                     chain_forge_execution::TxBody::Stake { .. }             => "stake",
                     chain_forge_execution::TxBody::Custom { .. }            => "custom",
+                    chain_forge_execution::TxBody::RegisterIdentity         => "register_identity",
+                    chain_forge_execution::TxBody::Attest { .. }            => "attest",
                     chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
                     chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
                     chain_forge_execution::TxBody::SponsorAgent { .. }      => "sponsor_agent",
@@ -1020,7 +1080,10 @@ impl Node {
             })
             .collect();
 
-        let exec_result = self.executor.execute_block(cert.height, txs, &mut self.state, now_ms);
+        self.identity.advance_epoch(now_ms);
+        let exec_result = self.executor.execute_block_with_identity(
+            cert.height, txs, &mut self.state, &mut self.identity, &mut self.cirfi, now_ms,
+        );
 
         info!(
             height     = cert.height,
@@ -1227,6 +1290,8 @@ impl Node {
                     chain_forge_execution::TxBody::Burn { .. }              => "burn",
                     chain_forge_execution::TxBody::Stake { .. }             => "stake",
                     chain_forge_execution::TxBody::Custom { .. }            => "custom",
+                    chain_forge_execution::TxBody::RegisterIdentity         => "register_identity",
+                    chain_forge_execution::TxBody::Attest { .. }            => "attest",
                     chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
                     chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
                     chain_forge_execution::TxBody::SponsorAgent { .. }      => "sponsor_agent",
@@ -1236,7 +1301,10 @@ impl Node {
             })
             .collect();
 
-        let exec_result = self.executor.execute_block(height, txs, &mut self.state, now_ms);
+        self.identity.advance_epoch(now_ms);
+        let exec_result = self.executor.execute_block_with_identity(
+            height, txs, &mut self.state, &mut self.identity, &mut self.cirfi, now_ms,
+        );
 
         info!(
             height,

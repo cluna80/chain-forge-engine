@@ -140,9 +140,10 @@ async fn main() {
     let explorer      = node.explorer();
     let cirfi_metrics = node.cirfi_metrics();
     let peers         = node.peers();
+    let tx_queue      = node.tx_queue();
     let api_port      = args.api_port;
     tokio::spawn(async move {
-        api::serve(api_port, status, explorer, cirfi_metrics, peers).await;
+        api::serve(api_port, status, explorer, cirfi_metrics, peers, tx_queue).await;
     });
 
     // Give the API a moment to bind before the event loop starts.

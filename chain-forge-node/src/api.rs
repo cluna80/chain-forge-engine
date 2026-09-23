@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 use super::node::{NodeStatus, ExplorerState, CirfiMetrics};
 use chain_forge_p2p::PeerInfo;
+use chain_forge_execution::Transaction;
 
 /// Serve the HTTP API on the given port.
 /// Phase 0 implementation: a minimal hand-rolled HTTP server that handles
@@ -21,6 +22,7 @@ pub async fn serve(
     explorer:      Arc<Mutex<ExplorerState>>,
     cirfi_metrics: Arc<Mutex<CirfiMetrics>>,
     peers:         Arc<Mutex<Vec<PeerInfo>>>,
+    tx_queue:      Arc<Mutex<Vec<Transaction>>>,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,6 +46,7 @@ pub async fn serve(
                 let explorer      = explorer.clone();
                 let cirfi_metrics = cirfi_metrics.clone();
                 let peers         = peers.clone();
+                let tx_queue      = tx_queue.clone();
 
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
@@ -61,6 +64,38 @@ pub async fn serve(
                         http_200_json(&body)
                     } else if first_line.starts_with("GET /api/health") {
                         http_200_json(r#"{"status":"ok"}"#)
+                    } else if first_line.starts_with("POST /api/tx") {
+                        // POST /api/tx -- submit a transaction, including
+                        // RegisterIdentity and Attest (Identity Pilot Phase 1).
+                        // Body is a JSON-serialised chain_forge_execution::Transaction.
+                        // Queued here and picked up by the node's own event
+                        // loop on its next heartbeat tick (SharedTxQueue) --
+                        // this API task has no direct reference to the live
+                        // Node to call submit_tx() on directly.
+                        let body_start = request.find("\r\n\r\n")
+                            .map(|i| i + 4)
+                            .unwrap_or(request.len());
+                        let body = &request[body_start..];
+
+                        match serde_json::from_str::<Transaction>(body) {
+                            Ok(tx) => {
+                                let tx_id = tx.id.clone();
+                                tx_queue.lock().unwrap().push(tx);
+                                tracing::info!(tx_id, "transaction queued via POST /api/tx");
+                                let resp = serde_json::json!({
+                                    "status": "queued",
+                                    "tx_id": tx_id
+                                });
+                                http_200_json(&resp.to_string())
+                            }
+                            Err(e) => {
+                                let resp = serde_json::json!({
+                                    "status": "error",
+                                    "message": format!("invalid transaction JSON: {e}")
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                        }
                     } else if first_line.starts_with("POST /api/build") {
                         // Extract JSON body from the request
                         let body_start = request.find("\r\n\r\n")
