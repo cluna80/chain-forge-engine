@@ -381,7 +381,28 @@ impl Node {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let identity = IdentityStore::new(identity_genesis_ms);
+        let mut identity = IdentityStore::new(identity_genesis_ms);
+
+        // Without this, IdentityStore::attest() has no seed to bootstrap
+        // from: it requires the attester to already be Verified+, and with
+        // a fresh store nobody ever is -- meaning no identity could EVER
+        // become Verified via the real attestation flow, no matter how
+        // many people registered or attested each other. The genesis
+        // validator set is the natural root of trust (the same founders
+        // who set the chain's rules to begin with), matching how
+        // web-of-trust systems in practice always need an initial trusted
+        // set to grow from (PGP's original keysigners is the classic
+        // example). Every other identity still goes through the real
+        // 3-attestation quorum; only this fixed, small, known founding set
+        // skips it, via the same genesis bootstrap path the Phase 0 tests
+        // already use (PopAttestation::genesis + verify_identity).
+        for acct in genesis.genesis_accounts.iter().filter(|a| a.role == "validator") {
+            let att = chain_forge_identity::PopAttestation::genesis(&acct.address, 0);
+            if identity.register(acct.address.clone(), acct.address.clone(), att.clone()).is_ok() {
+                let _ = identity.verify_identity(&acct.address, att);
+            }
+        }
+
         let cirfi = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
         let tx_queue: SharedTxQueue = Arc::new(Mutex::new(Vec::new()));
 
@@ -1447,6 +1468,25 @@ mod tests {
         assert_eq!(node.environment(), "devnet");
         assert_eq!(node.consensus.current_height(), 0);
         assert_eq!(node.state.account_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn genesis_validators_are_seeded_as_verified_identities() {
+        // Regression test: without seeding, IdentityStore::attest() has no
+        // Verified+ attester to ever bootstrap from, so no identity could
+        // EVER become Verified via the real attestation flow -- found
+        // while building chain-forge-sim, which would otherwise have had
+        // no seed to register its own personas' attestation chain against.
+        let node = Node::new(GENESIS, None).await.unwrap();
+        for addr in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+            let record = node.identity.get(addr)
+                .unwrap_or_else(|_| panic!("genesis validator {addr} must be seeded into IdentityStore"));
+            assert_eq!(
+                *record.tier(),
+                chain_forge_identity::VerificationTier::Verified,
+                "genesis validator {addr} must start Verified, not just registered"
+            );
+        }
     }
 
     #[tokio::test]

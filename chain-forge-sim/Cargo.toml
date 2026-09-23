@@ -1,0 +1,24 @@
+[package]
+name    = "chain-forge-sim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chain-forge-execution = { path = "../chain-forge-execution" }
+tokio            = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+async-trait      = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow           = "1"
+
+[lib]
+name = "chain_forge_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chain-forge-sim"
+path = "src/main.rs"
