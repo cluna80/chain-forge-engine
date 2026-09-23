@@ -5,7 +5,9 @@
 //! straightforward and dependency-free.
 
 use anyhow::{anyhow, Context, Result};
-use chain_forge_execution::Transaction;
+use chain_forge_core::{Address, HashWidth};
+use chain_forge_crypto::{ClassicalScheme, KeyPair, SchemeId};
+use chain_forge_execution::{Transaction, TxBody};
 use serde::Deserialize;
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,6 +66,22 @@ pub struct SimContext {
     port:      u16,
     nonces:    HashMap<String, u64>,
     pub epoch_log: Vec<TxLogEntry>,
+    /// Signing keys by on-chain address: generated for sim-* personas,
+    /// loaded from key files for named genesis accounts (seed attesters).
+    keys:      HashMap<String, KeyPair>,
+    /// Persona label (e.g. "sim-alice") -> its key-derived address.
+    labels:    HashMap<String, String>,
+    /// Fetched from /api/status in init(); every signature commits to it.
+    chain_id:  String,
+    /// Unique per run, prefixed to every transaction id, so rerunning
+    /// against a live chain never polls a previous run's tx summary.
+    run_tag:   String,
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
 /// Minimal synchronous HTTP/1.1 GET over tokio TCP. Returns the response
@@ -104,8 +122,12 @@ async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> Result
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
     );
-    stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(body_bytes).await?;
+    // One write: headers and body together, so they usually travel in the
+    // same TCP segment. (The node no longer depends on this -- it reads
+    // until Content-Length is satisfied -- but there's no reason to split.)
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(body_bytes);
+    stream.write_all(&request).await?;
 
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
@@ -124,7 +146,84 @@ impl SimContext {
     /// `base_url` should be like "http://10.0.0.90:8080" or "http://localhost:8080".
     pub fn new(base_url: String) -> Self {
         let (host, port) = parse_base_url(&base_url);
-        Self { host, port, nonces: HashMap::new(), epoch_log: Vec::new() }
+        let run_tag = format!("run{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+        Self {
+            host, port,
+            nonces: HashMap::new(),
+            epoch_log: Vec::new(),
+            keys: HashMap::new(),
+            labels: HashMap::new(),
+            chain_id: String::new(),
+            run_tag,
+        }
+    }
+
+    /// Fetch chain_id from the node and load any key files (*.key.json)
+    /// from `keys_dir` -- needed for named genesis accounts like qcb1alice,
+    /// whose addresses aren't derived from keys. Must run before any epoch.
+    pub async fn init(&mut self, keys_dir: Option<&std::path::Path>) -> Result<()> {
+        let (status, body) = http_get(&self.host, self.port, "/api/status").await
+            .context("could not reach node /api/status")?;
+        if status != 200 {
+            return Err(anyhow!("/api/status returned HTTP {status}"));
+        }
+        let v: serde_json::Value = serde_json::from_str(&body).context("/api/status not JSON")?;
+        self.chain_id = v["chain_id"].as_str()
+            .ok_or_else(|| anyhow!("/api/status has no chain_id"))?.to_string();
+
+        if let Some(dir) = keys_dir {
+            for entry in std::fs::read_dir(dir).with_context(|| format!("cannot read keys dir {dir:?}"))? {
+                let path = entry?.path();
+                if !path.to_string_lossy().ends_with(".key.json") { continue; }
+                let k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)
+                    .with_context(|| format!("bad key file {path:?}"))?;
+                let field = |name: &str| k[name].as_str().map(str::to_string)
+                    .ok_or_else(|| anyhow!("{path:?} missing {name}"));
+                let address = field("address")?;
+                let kp = KeyPair {
+                    scheme:      SchemeId::Classical,
+                    public_key:  decode_hex(&field("public_key")?).ok_or_else(|| anyhow!("{path:?}: bad public_key hex"))?,
+                    private_key: decode_hex(&field("private_key")?).ok_or_else(|| anyhow!("{path:?}: bad private_key hex"))?,
+                };
+                tracing::info!(%address, "loaded key file");
+                self.keys.insert(address, kp);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn chain_id(&self) -> &str { &self.chain_id }
+
+    /// Prefix a transaction id with this run's tag.
+    pub fn tag(&self, id: &str) -> String { format!("{}-{id}", self.run_tag) }
+
+    /// The on-chain address for a label, creating a keypair the first time
+    /// a sim-* label is seen. Anything else (qcb1alice, a raw address)
+    /// passes through unchanged.
+    pub fn resolve(&mut self, label: &str) -> String {
+        if let Some(addr) = self.labels.get(label) {
+            return addr.clone();
+        }
+        if !label.starts_with("sim-") {
+            return label.to_string();
+        }
+        let kp = ClassicalScheme.generate_random().expect("ed25519 keygen");
+        let addr = Address::from_public_key(&kp.public_key, "qcb", HashWidth::Bits256)
+            .as_str().to_string();
+        self.labels.insert(label.to_string(), addr.clone());
+        self.keys.insert(addr.clone(), kp);
+        addr
+    }
+
+    /// Non-creating lookup, for read-only paths (expectation checks).
+    pub fn address_of(&self, label: &str) -> String {
+        self.labels.get(label).cloned().unwrap_or_else(|| label.to_string())
+    }
+
+    /// The keypair controlling a label or address, if the sim holds it.
+    pub fn keypair_for(&self, label: &str) -> Option<KeyPair> {
+        self.keys.get(&self.address_of(label)).cloned()
     }
 
     /// Fetch the current on-chain nonce for an address and sync the local
@@ -132,21 +231,51 @@ impl SimContext {
     /// transaction, especially for pre-existing accounts (like genesis
     /// validator addresses used as seed attesters) whose on-chain nonce
     /// may already be ahead of 0.
-    pub async fn sync_nonce(&mut self, address: &str) -> Result<()> {
-        if let Ok(Some(acct)) = self.get_account(address).await {
-            self.nonces.insert(address.to_string(), acct.nonce);
+    pub async fn sync_nonce(&mut self, label: &str) -> Result<()> {
+        let address = self.resolve(label);
+        if let Ok(Some(acct)) = self.get_account(&address).await {
+            self.nonces.insert(address, acct.nonce);
         }
         Ok(())
     }
 
-    pub fn next_nonce(&mut self, sender: &str) -> u64 {
-        let n = self.nonces.entry(sender.to_string()).or_insert(0);
+    pub fn next_nonce(&mut self, label: &str) -> u64 {
+        let address = self.resolve(label);
+        let n = self.nonces.entry(address).or_insert(0);
         let current = *n;
         *n += 1;
         current
     }
 
+    /// Translate labels to addresses, tag the id, sign with the sender's
+    /// key (if the sim holds it), then submit. Personas use this for
+    /// every normal transaction.
     pub async fn submit_tx(
+        &mut self,
+        persona_id: &str,
+        kind: &str,
+        mut tx: Transaction,
+    ) -> Result<TxOutcome> {
+        tx.sender = self.resolve(&tx.sender);
+        match &mut tx.body {
+            TxBody::Attest { claimant_id }         => *claimant_id = self.resolve(claimant_id),
+            TxBody::ClaimUbi { identity_id }       => *identity_id = self.resolve(identity_id),
+            TxBody::Transfer { to, .. }            => *to = self.resolve(to),
+            TxBody::SponsorAgent { agent_address } => *agent_address = self.resolve(agent_address),
+            TxBody::RevokeAgent { agent_address }  => *agent_address = self.resolve(agent_address),
+            _ => {}
+        }
+        tx.id = self.tag(&tx.id);
+        if let Some(kp) = self.keys.get(&tx.sender) {
+            tx.sign(kp, &self.chain_id).map_err(|e| anyhow!("signing failed: {e}"))?;
+        }
+        self.submit_prepared(persona_id, kind, tx).await
+    }
+
+    /// Submit exactly as given: no label translation, no id tag, no
+    /// signing. Fault-injection personas use this to send unsigned,
+    /// forged or tampered transactions (they tag ids themselves).
+    pub async fn submit_prepared(
         &mut self,
         persona_id: &str,
         kind: &str,
@@ -247,7 +376,8 @@ impl SimContext {
         Ok(status)
     }
 
-    pub async fn get_account(&self, address: &str) -> Result<Option<AccountView>> {
+    pub async fn get_account(&self, label: &str) -> Result<Option<AccountView>> {
+        let address = self.address_of(label);
         let path = format!("/api/accounts/{address}");
         let (status, body) = http_get(&self.host, self.port, &path).await?;
         if status == 404 { return Ok(None); }

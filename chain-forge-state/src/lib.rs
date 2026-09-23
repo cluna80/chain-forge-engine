@@ -69,6 +69,12 @@ pub struct AccountState {
     /// state or identity, traveling with it rather than being externally assigned."
     /// None for non-human accounts (treasury, faucet, agent accounts).
     pub charm: Option<IntrinsicCharm>,
+    /// Ed25519 public key bound to this account. Set from genesis, or bound
+    /// by the executor on the account's first successful signed transaction
+    /// (only possible when the address is derived from that key). Once set,
+    /// every transaction from this account must be signed by this key.
+    #[serde(default)]
+    pub public_key: Option<Vec<u8>>,
 }
 
 impl AccountState {
@@ -79,6 +85,7 @@ impl AccountState {
             nonce: 0,
             role,
             charm: None,
+            public_key: None,
         }
     }
 
@@ -92,6 +99,7 @@ impl AccountState {
             nonce: 0,
             role,
             charm: Some(IntrinsicCharm::provisional(current_epoch)),
+            public_key: None,
         }
     }
 
@@ -180,8 +188,24 @@ impl AccountState {
         for (denom, bal) in &self.balances {
             parts.push(format!("{denom}={bal}"));
         }
+        // Key binding is consensus state: nodes must agree which key controls
+        // an account. Appended only when present, so accounts without a
+        // bound key keep exactly the leaf bytes (and state roots) they had.
+        if let Some(pk) = &self.public_key {
+            let hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+            parts.push(format!("pk={hex}"));
+        }
         parts.join("|").into_bytes()
     }
+}
+
+/// Decode a hex string (even length, 0-9a-fA-F). None on any malformed input.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 // -- Merkle state tree (Phase 0 JMT) -----------------------------------------
@@ -337,6 +361,11 @@ impl StateStore {
 
             let mut state = AccountState::new(acct.address.clone(), acct.role.clone());
             state.credit(&denom, amount);
+            if let Some(hex) = &acct.public_key {
+                state.public_key = Some(decode_hex(hex).ok_or_else(|| StateError::GenesisError(
+                    format!("invalid public_key hex for {}", acct.label)
+                ))?);
+            }
             self.upsert_account(state);
         }
 
@@ -365,6 +394,17 @@ impl StateStore {
     pub fn get_account_mut(&mut self, address: &str) -> StateResult<&mut AccountState> {
         self.accounts.get_mut(address)
             .ok_or_else(|| StateError::AccountNotFound(address.to_string()))
+    }
+
+    /// Recompute an account's Merkle leaf after it was mutated in place via
+    /// get_account_mut. Without this, in-place changes (nonce, bound key,
+    /// charm) never reach the state root: only transfer, burn and
+    /// upsert_account refresh leaves themselves. No-op if absent.
+    pub fn refresh_leaf(&mut self, address: &str) {
+        if let Some(acct) = self.accounts.get(address) {
+            let leaf = acct.to_leaf_bytes();
+            self.tree.upsert(address.to_string(), &leaf);
+        }
     }
 
     /// Transfer tokens between accounts.
@@ -561,6 +601,36 @@ mod tests {
         // increment_nonce(). Here we call it manually.
         acct.increment_nonce();
         assert_eq!(acct.nonce, 1);
+    }
+
+    #[test]
+    fn refresh_leaf_makes_in_place_changes_reach_the_root() {
+        let mut s = StateStore::new(HashWidth::Bits256);
+        s.upsert_account(AccountState::new("qcb1abc".into(), "user".into()));
+        let before = s.tree.root_hex().unwrap().to_string();
+
+        s.get_account_mut("qcb1abc").unwrap().public_key = Some(vec![1, 2, 3]);
+        assert_eq!(s.tree.root_hex().unwrap(), before, "in-place edit alone is invisible to the root");
+
+        s.refresh_leaf("qcb1abc");
+        assert_ne!(s.tree.root_hex().unwrap(), before, "refresh_leaf must fold it into the root");
+    }
+
+    #[test]
+    fn bound_public_key_is_part_of_leaf_bytes() {
+        let mut a = AccountState::new("qcb1abc".into(), "user".into());
+        let before = a.to_leaf_bytes();
+        a.public_key = Some(vec![0xab, 0xcd]);
+        let after = a.to_leaf_bytes();
+        assert_ne!(before, after, "binding a key must change the state root");
+        assert!(String::from_utf8(after).unwrap().ends_with("|pk=abcd"));
+    }
+
+    #[test]
+    fn decode_hex_rejects_malformed_input() {
+        assert_eq!(decode_hex("0aff"), Some(vec![0x0a, 0xff]));
+        assert_eq!(decode_hex("abc"), None);
+        assert_eq!(decode_hex("zz"), None);
     }
 
     #[test]

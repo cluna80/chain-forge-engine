@@ -11,10 +11,11 @@
 use chain_forge_sim::{SimRunner, personas::standard_roster};
 use std::time::Duration;
 
-fn parse_args() -> (String, u64, u64) {
+fn parse_args() -> (String, u64, u64, Option<std::path::PathBuf>) {
     let mut base_url = "http://localhost:8080".to_string();
     let mut epochs: u64 = 6;
     let mut epoch_seconds: u64 = 3;
+    let mut keys_dir: Option<std::path::PathBuf> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -28,6 +29,10 @@ fn parse_args() -> (String, u64, u64) {
                 i += 1;
                 if i < args.len() { epochs = args[i].parse().unwrap_or(6); }
             }
+            "--keys-dir" => {
+                i += 1;
+                if i < args.len() { keys_dir = Some(args[i].clone().into()); }
+            }
             "--epoch-seconds" => {
                 i += 1;
                 if i < args.len() { epoch_seconds = args[i].parse().unwrap_or(3); }
@@ -37,13 +42,14 @@ fn parse_args() -> (String, u64, u64) {
                 println!("  --base-url <url>       Node API to drive this against (default: http://localhost:8080)");
                 println!("  --epochs <n>           Number of simulated epochs to run (default: 6)");
                 println!("  --epoch-seconds <n>    Seconds to pause between epochs (default: 3)");
+                println!("  --keys-dir <dir>       Folder of *.key.json files for named genesis accounts (seed attesters)");
                 std::process::exit(0);
             }
             _ => {}
         }
         i += 1;
     }
-    (base_url, epochs, epoch_seconds)
+    (base_url, epochs, epoch_seconds, keys_dir)
 }
 
 #[tokio::main]
@@ -52,7 +58,7 @@ async fn main() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_target(false).with_env_filter(filter).init();
 
-    let (base_url, epochs, epoch_seconds) = parse_args();
+    let (base_url, epochs, epoch_seconds, keys_dir) = parse_args();
 
     println!("chain-forge-sim starting");
     println!("  target:  {base_url}");
@@ -62,6 +68,10 @@ async fn main() {
     println!("sybil resistance. See the report's own scope banner.\n");
 
     let mut runner = SimRunner::new(base_url, epochs, Duration::from_secs(epoch_seconds));
+    if let Err(e) = runner.init(keys_dir.as_deref()).await {
+        eprintln!("sim init failed: {e:#}");
+        std::process::exit(1);
+    }
     for persona in standard_roster() {
         runner.add_persona(persona);
     }

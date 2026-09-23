@@ -42,4 +42,10 @@ pub trait Persona: Send + Sync {
     /// to be true about its own on-chain state right now. Returns an
     /// empty Vec for epochs where this persona has nothing to check yet.
     async fn check_expectations(&self, epoch: u64, ctx: &SimContext) -> Vec<CheckResult>;
+
+    /// Whether this persona ends epoch 0 with an account on-chain. The
+    /// runner's post-epoch-0 barrier waits for every persona that does;
+    /// personas that deliberately never register must return false, or
+    /// the barrier stalls its full timeout waiting for them.
+    fn registers_on_chain(&self) -> bool { true }
 }

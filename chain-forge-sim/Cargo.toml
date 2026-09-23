@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 chain-forge-execution = { path = "../chain-forge-execution" }
+chain-forge-core   = { path = "../chain-forge-core" }
+chain-forge-crypto = { path = "../chain-forge-crypto", features = ["real-crypto"] }
 tokio            = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }

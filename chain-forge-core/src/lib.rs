@@ -176,6 +176,14 @@ impl Address {
         Self(format!("{prefix}1{hex}"))
     }
 
+    /// Derive the address a public key controls: hash the raw key bytes,
+    /// then apply from_pubkey_hash. The single place this rule lives, so
+    /// the executor and any client derive addresses identically.
+    pub fn from_public_key(public_key: &[u8], prefix: &str, width: HashWidth) -> Self {
+        let hash = ChainHash::digest(public_key, width);
+        Self::from_pubkey_hash(&hash, prefix)
+    }
+
     /// Parse a raw address string. Only validates that it is non-empty.
     pub fn from_str(s: &str) -> CoreResult<Self> {
         if s.is_empty() {
@@ -246,7 +254,14 @@ pub struct GenesisExecution {
     pub state_model:        String,   // "account" | "utxo" | "hybrid"
     pub parallel_execution: bool,
     pub gas_model:          String,   // "fixed" | "dynamic" | "eip-1559-style"
+    /// Whether every transaction must carry a valid Ed25519 signature from
+    /// the key bound to its sender. Defaults to true when absent: a genesis
+    /// file has to opt OUT of signature checks explicitly, never opt in.
+    #[serde(default = "default_require_signatures")]
+    pub require_signatures: bool,
 }
+
+fn default_require_signatures() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisCryptography {
@@ -282,6 +297,11 @@ pub struct GenesisAccount {
     pub address: String,
     pub balance: String,
     pub role:    String,   // "validator" | "treasury" | "faucet" | "user"
+    /// Hex-encoded Ed25519 public key bound to this account at genesis.
+    /// Named genesis addresses (e.g. "qcb1alice") are not derived from a
+    /// key, so without this they cannot send signed transactions at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 impl GenesisConfig {
@@ -484,6 +504,23 @@ mod tests {
             "QCB address should start with qcb1, got: {}", addr);
         assert_eq!(addr.as_str().len(), 44, // "qcb1" + 40 hex chars
             "address length should be 44, got: {}", addr.as_str().len());
+    }
+
+    #[test]
+    fn address_from_public_key_is_deterministic_and_key_specific() {
+        let a1 = Address::from_public_key(&[7u8; 32], "qcb", HashWidth::Bits256);
+        let a2 = Address::from_public_key(&[7u8; 32], "qcb", HashWidth::Bits256);
+        let b  = Address::from_public_key(&[8u8; 32], "qcb", HashWidth::Bits256);
+        assert_eq!(a1.as_str(), a2.as_str());
+        assert_ne!(a1.as_str(), b.as_str());
+        assert!(a1.as_str().starts_with("qcb1"));
+    }
+
+    #[test]
+    fn require_signatures_defaults_to_true_when_absent() {
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        assert!(cfg.execution.require_signatures,
+            "a genesis file must opt out of signature checks, never opt in");
     }
 
     #[test]

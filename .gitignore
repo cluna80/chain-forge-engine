@@ -2,3 +2,5 @@
 *.py
 qcb-genesis.json
 Cargo.lock
+
+keys/

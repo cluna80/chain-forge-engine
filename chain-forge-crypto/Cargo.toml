@@ -50,5 +50,10 @@ real-pqc    = ["dep:pqcrypto-dilithium", "dep:pqcrypto-traits", "dep:sha2"]
 # Both real crypto backends.
 real-all    = ["real-crypto", "real-pqc"]
 
+[[bin]]
+name = "chain-forge-keygen"
+path = "src/bin/keygen.rs"
+required-features = ["real-crypto"]
+
 [dev-dependencies]
 tokio = { workspace = true }

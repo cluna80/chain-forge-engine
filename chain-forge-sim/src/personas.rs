@@ -56,6 +56,20 @@ fn rejected_for(outcome: &TxOutcome, expected_fragment: &str) -> Result<(), Stri
     }
 }
 
+/// Like rejected_for, but for rejections the API is expected to make at
+/// submission (the stateless signature pre-check), before execution.
+fn rejected_at_submission_for(outcome: &TxOutcome, expected_fragment: &str) -> Result<(), String> {
+    match outcome {
+        TxOutcome::RejectedAtSubmission { message } if message.contains(expected_fragment) => Ok(()),
+        TxOutcome::RejectedAtSubmission { message } =>
+            Err(format!("rejected at submission, but for the wrong reason: {message}")),
+        TxOutcome::Confirmed { success: true, .. } => Err("was accepted and executed -- signature check did not fire".into()),
+        TxOutcome::Confirmed { success: false, error, .. } =>
+            Err(format!("got past the API pre-check and failed at execution instead: {}", error.clone().unwrap_or_default())),
+        TxOutcome::Queued => Err("was queued -- the API pre-check did not reject it".into()),
+    }
+}
+
 fn tier_check(actual: Option<String>, expected: &str, label: &str) -> CheckResult {
     match &actual {
         Some(t) if t == expected =>
@@ -425,6 +439,7 @@ impl MalformedTransactionSender {
 #[async_trait::async_trait]
 impl Persona for MalformedTransactionSender {
     fn id(&self) -> &str { "sim-malformed" }
+    fn registers_on_chain(&self) -> bool { false }
 
     async fn run_epoch(&mut self, epoch: u64, ctx: &mut SimContext) -> Result<()> {
         if epoch == 0 {
@@ -446,6 +461,137 @@ impl Persona for MalformedTransactionSender {
     }
 }
 
+
+// -- Fault injection: signatures ------------------------------------------------
+//
+// These three only mean anything against a node whose genesis has
+// execution.require_signatures = true (the default).
+
+/// Submits a well-formed but UNSIGNED registration. The API pre-check
+/// must reject it before it ever reaches the mempool.
+pub struct UnsignedSender {
+    verdict: Option<Result<(), String>>,
+}
+
+impl UnsignedSender {
+    pub fn new() -> Self { Self { verdict: None } }
+}
+
+#[async_trait::async_trait]
+impl Persona for UnsignedSender {
+    fn id(&self) -> &str { "sim-unsigned" }
+    fn registers_on_chain(&self) -> bool { false }
+
+    async fn run_epoch(&mut self, epoch: u64, ctx: &mut SimContext) -> Result<()> {
+        if epoch == 0 {
+            let addr = ctx.resolve(self.id());
+            let tx = Transaction::register_identity(&ctx.tag("sim-unsigned-reg"), &addr, 0);
+            let outcome = ctx.submit_prepared(self.id(), "register_unsigned", tx).await?;
+            self.verdict = Some(rejected_at_submission_for(&outcome, "unsigned"));
+        }
+        Ok(())
+    }
+
+    async fn check_expectations(&self, epoch: u64, _ctx: &SimContext) -> Vec<CheckResult> {
+        if epoch != 0 { return Vec::new(); }
+        let label = "unsigned transaction rejected by the API signature pre-check";
+        match &self.verdict {
+            Some(Ok(()))   => vec![CheckResult::pass(label)],
+            Some(Err(why)) => vec![CheckResult::fail(label, why.clone())],
+            None           => vec![CheckResult::fail(label, "attempt never ran")],
+        }
+    }
+}
+
+/// Signs a registration correctly, then changes the nonce afterwards.
+/// The signature no longer covers the transaction, so the API must reject it.
+pub struct TamperedSender {
+    verdict: Option<Result<(), String>>,
+}
+
+impl TamperedSender {
+    pub fn new() -> Self { Self { verdict: None } }
+}
+
+#[async_trait::async_trait]
+impl Persona for TamperedSender {
+    fn id(&self) -> &str { "sim-tamper" }
+    fn registers_on_chain(&self) -> bool { false }
+
+    async fn run_epoch(&mut self, epoch: u64, ctx: &mut SimContext) -> Result<()> {
+        if epoch == 0 {
+            let addr = ctx.resolve(self.id());
+            let kp = ctx.keypair_for(self.id()).expect("resolve() creates a key for sim-* labels");
+            let mut tx = Transaction::register_identity(&ctx.tag("sim-tamper-reg"), &addr, 0);
+            tx.sign(&kp, ctx.chain_id()).map_err(|e| anyhow::anyhow!(e))?;
+            tx.nonce = 7; // altered after signing
+            let outcome = ctx.submit_prepared(self.id(), "register_tampered", tx).await?;
+            self.verdict = Some(rejected_at_submission_for(&outcome, "invalid signature"));
+        }
+        Ok(())
+    }
+
+    async fn check_expectations(&self, epoch: u64, _ctx: &SimContext) -> Vec<CheckResult> {
+        if epoch != 0 { return Vec::new(); }
+        let label = "transaction altered after signing rejected by the API signature pre-check";
+        match &self.verdict {
+            Some(Ok(()))   => vec![CheckResult::pass(label)],
+            Some(Err(why)) => vec![CheckResult::fail(label, why.clone())],
+            None           => vec![CheckResult::fail(label, "attempt never ran")],
+        }
+    }
+}
+
+/// Registers normally with its own key, then tries to act AS sim-alice:
+/// an attestation whose sender is sim-alice's address, validly signed --
+/// but by the forger's key. The signature itself is genuine, so it passes
+/// the stateless API pre-check; only the key-binding check at execution
+/// can stop it, and must.
+pub struct ForgedSender {
+    verdict: Option<Result<(), String>>,
+}
+
+impl ForgedSender {
+    pub fn new() -> Self { Self { verdict: None } }
+}
+
+#[async_trait::async_trait]
+impl Persona for ForgedSender {
+    fn id(&self) -> &str { "sim-forger" }
+
+    async fn run_epoch(&mut self, epoch: u64, ctx: &mut SimContext) -> Result<()> {
+        match epoch {
+            0 => {
+                let nonce = ctx.next_nonce(self.id());
+                let tx = Transaction::register_identity("sim-forger-reg", self.id(), nonce);
+                ctx.submit_tx(self.id(), "register_identity", tx).await?;
+            }
+            // By epoch 2 sim-alice has transacted, so her key is bound.
+            2 => {
+                let victim = ctx.address_of("sim-alice");
+                let own = ctx.address_of(self.id());
+                let kp = ctx.keypair_for(self.id()).expect("registered in epoch 0");
+                let mut tx = Transaction::attest(&ctx.tag("sim-forger-as-alice"), &victim, &own, 0);
+                tx.sign(&kp, ctx.chain_id()).map_err(|e| anyhow::anyhow!(e))?;
+                let outcome = ctx.submit_prepared(self.id(), "attest_forged_sender", tx).await?;
+                self.verdict = Some(rejected_for(&outcome, "does not match the key bound"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn check_expectations(&self, epoch: u64, _ctx: &SimContext) -> Vec<CheckResult> {
+        if epoch != 2 { return Vec::new(); }
+        let label = "validly signed tx sent as another account rejected by key binding at execution";
+        match &self.verdict {
+            Some(Ok(()))   => vec![CheckResult::pass(label)],
+            Some(Err(why)) => vec![CheckResult::fail(label, why.clone())],
+            None           => vec![CheckResult::fail(label, "attempt never ran")],
+        }
+    }
+}
+
 /// The standard roster -- everything this crate ships, ready to hand to a
 /// SimRunner. Callers can also build their own subset directly from the
 /// individual persona types above.
@@ -459,5 +605,8 @@ pub fn standard_roster() -> Vec<Box<dyn Persona>> {
         Box::new(SelfAttestationAttempt::new()),
         Box::new(RateLimitProber::new()),
         Box::new(MalformedTransactionSender::new()),
+        Box::new(UnsignedSender::new()),
+        Box::new(TamperedSender::new()),
+        Box::new(ForgedSender::new()),
     ]
 }

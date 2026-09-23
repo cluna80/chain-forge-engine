@@ -429,6 +429,11 @@ impl Node {
         })
     }
 
+    /// Whether genesis requires signed transactions (API pre-check uses this).
+    pub fn require_signatures(&self) -> bool {
+        self.genesis.execution.require_signatures
+    }
+
     pub fn chain_id(&self) -> &str {
         &self.genesis.chain_id
     }
@@ -457,13 +462,35 @@ impl Node {
         self.tx_queue.clone()
     }
 
-    /// Add a transaction to the mempool.
-    pub fn submit_tx(&mut self, tx: Transaction) {
+    /// Add a transaction to the mempool. Returns true only if it was newly
+    /// added: a tx already pending, or already committed in a block, is
+    /// ignored. The committed check matters because gossip can deliver a
+    /// copy after the block containing it committed; re-proposing it would
+    /// execute it a second time, fail on nonce, and overwrite the explorer's
+    /// record of the original success.
+    pub fn submit_tx(&mut self, tx: Transaction) -> bool {
+        if self.mempool.iter().any(|t| t.id == tx.id) {
+            return false;
+        }
+        if self.explorer.lock().unwrap().txs.contains_key(&tx.id) {
+            debug!(tx_id = %tx.id, "already committed -- ignoring");
+            return false;
+        }
         if self.mempool.len() < self.genesis.limits.mempool_size as usize {
             self.mempool.push(tx);
+            true
         } else {
             warn!("mempool full -- transaction dropped");
+            false
         }
+    }
+
+    /// Drop transactions that a committed block contained. Called from
+    /// commit_block, which every multi-node commit path goes through
+    /// (own proposal, peer's proposal, and state-sync replay).
+    fn remove_committed_from_mempool(&mut self, committed: &[Transaction]) {
+        let ids: std::collections::HashSet<&str> = committed.iter().map(|t| t.id.as_str()).collect();
+        self.mempool.retain(|t| !ids.contains(t.id.as_str()));
     }
 
     /// Main event loop. Processes network events and drives consensus.
@@ -551,7 +578,18 @@ impl Node {
                         let submitted: Vec<Transaction> = queue.drain(..).collect();
                         drop(queue);
                         for tx in submitted {
-                            self.submit_tx(tx);
+                            // Gossip it so ANY proposer can include it, not
+                            // just this node on its own proposer turns. Only
+                            // API-submitted txs are published; txs received
+                            // over gossip are not re-published (gossipsub
+                            // already propagates them through the mesh).
+                            let payload = serde_json::to_vec(&tx).unwrap_or_default();
+                            if self.submit_tx(tx) {
+                                let _ = self.network.publish(OutboundMessage {
+                                    topic:   GossipTopic::Transaction,
+                                    payload,
+                                }).await;
+                            }
                         }
                     }
 
@@ -1077,6 +1115,7 @@ impl Node {
 
         let txs: Vec<Transaction> = serde_json::from_slice(&proposal.tx_data)
             .unwrap_or_default();
+        self.remove_committed_from_mempool(&txs);
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1192,7 +1231,11 @@ impl Node {
         let height = self.consensus.current_height();
         let round  = self.consensus.current_round();
 
-        let txs = std::mem::take(&mut self.mempool);
+        // Copy, don't drain. If this proposal loses its round, the txs must
+        // still be here for the next proposer; they leave the mempool only
+        // when a block containing them commits (commit_block). Draining here
+        // silently lost every tx in any proposal that didn't commit.
+        let txs = self.mempool.clone();
         let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
 
         let proposal = self.consensus
@@ -1447,7 +1490,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000 },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic" },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
@@ -1686,6 +1729,34 @@ mod tests {
         assert!(Node::is_proposer_for(&vs, 3, 0, &ValidatorId("qcb1dave".into())));
         assert!(Node::is_proposer_for(&vs, 4, 0, &ValidatorId("qcb1alice".into())));
         assert!(!Node::is_proposer_for(&vs, 0, 0, &ValidatorId("qcb1bob".into())));
+    }
+
+    #[tokio::test]
+    async fn mempool_ignores_duplicate_and_already_committed_txs() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let tx = Transaction::transfer("dup-1", "qcb1alice", "qcb1bob", "uqcb", 1, 0);
+        assert!(node.submit_tx(tx.clone()));
+        assert!(!node.submit_tx(tx.clone()), "same id twice must not double-queue");
+        assert_eq!(node.mempool.len(), 1);
+
+        node.explorer.lock().unwrap().txs.insert("done-1".into(), TxSummary {
+            id: "done-1".into(), height: 3, sender: "qcb1alice".into(), kind: "transfer".into(),
+            success: true, gas_used: 0, events: vec![], error: None,
+        });
+        let late = Transaction::transfer("done-1", "qcb1alice", "qcb1bob", "uqcb", 1, 0);
+        assert!(!node.submit_tx(late), "a late gossip copy of a committed tx must be ignored");
+    }
+
+    #[tokio::test]
+    async fn committed_txs_leave_the_mempool_and_others_stay() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let a = Transaction::transfer("keep", "qcb1alice", "qcb1bob", "uqcb", 1, 0);
+        let b = Transaction::transfer("gone", "qcb1bob", "qcb1alice", "uqcb", 1, 0);
+        node.submit_tx(a);
+        node.submit_tx(b.clone());
+        node.remove_committed_from_mempool(&[b]);
+        let ids: Vec<&str> = node.mempool.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["keep"]);
     }
 
     #[tokio::test]

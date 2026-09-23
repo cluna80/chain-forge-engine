@@ -16,6 +16,15 @@ use chain_forge_execution::Transaction;
 /// Phase 0 implementation: a minimal hand-rolled HTTP server that handles
 /// the two endpoints the wizard frontend needs, without pulling in a full
 /// web framework (saves ~50MB of compile-time dependencies for Phase 0).
+/// What POST /api/tx checks before a transaction enters the queue.
+/// Only the stateless signature check happens here; key binding needs
+/// account state and is enforced at execution on every node.
+#[derive(Clone)]
+pub struct TxPrecheck {
+    pub chain_id:           String,
+    pub require_signatures: bool,
+}
+
 pub async fn serve(
     port: u16,
     status:        Arc<Mutex<NodeStatus>>,
@@ -23,6 +32,7 @@ pub async fn serve(
     cirfi_metrics: Arc<Mutex<CirfiMetrics>>,
     peers:         Arc<Mutex<Vec<PeerInfo>>>,
     tx_queue:      Arc<Mutex<Vec<Transaction>>>,
+    precheck:      TxPrecheck,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,15 +57,36 @@ pub async fn serve(
                 let cirfi_metrics = cirfi_metrics.clone();
                 let peers         = peers.clone();
                 let tx_queue      = tx_queue.clone();
+                let precheck      = precheck.clone();
 
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 65536];
-                    let n = match stream.read(&mut buf).await {
-                        Ok(n) => n,
-                        Err(_) => return,
-                    };
+                    // Read the WHOLE request: headers, then Content-Length
+                    // bytes of body. A single read() returns whatever TCP has
+                    // delivered so far, which can be the headers alone when a
+                    // client writes them separately from the body. Replying
+                    // and closing with body bytes still unread makes Windows
+                    // reset the connection (os error 10054 on the client).
+                    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+                    let mut chunk = [0u8; 8192];
+                    let read_all = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        async {
+                            loop {
+                                let n = stream.read(&mut chunk).await?;
+                                if n == 0 { break; }
+                                buf.extend_from_slice(&chunk[..n]);
+                                if request_complete(&buf) || buf.len() >= MAX_REQUEST_BYTES {
+                                    break;
+                                }
+                            }
+                            Ok::<(), std::io::Error>(())
+                        },
+                    ).await;
+                    if !matches!(read_all, Ok(Ok(()))) || buf.is_empty() {
+                        return;
+                    }
 
-                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let request = String::from_utf8_lossy(&buf);
                     let first_line = request.lines().next().unwrap_or("");
 
                     let response = if first_line.starts_with("GET /api/status") {
@@ -78,6 +109,18 @@ pub async fn serve(
                         let body = &request[body_start..];
 
                         match serde_json::from_str::<Transaction>(body) {
+                            Ok(tx) if precheck.require_signatures
+                                && chain_forge_execution::verify_signature(&tx, &precheck.chain_id).is_err() => {
+                                let reason = chain_forge_execution::verify_signature(&tx, &precheck.chain_id)
+                                    .unwrap_err();
+                                tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at submission");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
                             Ok(tx) => {
                                 let tx_id = tx.id.clone();
                                 tx_queue.lock().unwrap().push(tx);
@@ -194,6 +237,35 @@ pub async fn serve(
     }
 }
 
+/// Largest request the API will buffer. Transactions are far smaller;
+/// this only bounds memory if a client sends something huge.
+const MAX_REQUEST_BYTES: usize = 65536;
+
+/// Byte offset just past the blank line ending the headers, if present.
+fn header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Content-Length from a header block (case-insensitive); 0 if absent.
+fn content_length(headers: &[u8]) -> usize {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0)
+}
+
+/// True once the headers and the full Content-Length body have arrived.
+fn request_complete(buf: &[u8]) -> bool {
+    match header_end(buf) {
+        Some(end) => buf.len() >= end + content_length(&buf[..end]),
+        None => false,
+    }
+}
+
 fn http_200_json(body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
@@ -218,4 +290,25 @@ fn http_400_json(body: &str) -> String {
         "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
         body.len(), body
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headers_alone_are_not_a_complete_post() {
+        let headers = b"POST /api/tx HTTP/1.1\r\nContent-Length: 10\r\n\r\n";
+        assert!(!request_complete(headers), "must keep reading until the body arrives");
+        let mut full = headers.to_vec();
+        full.extend_from_slice(b"0123456789");
+        assert!(request_complete(&full));
+    }
+
+    #[test]
+    fn content_length_is_case_insensitive_and_defaults_to_zero() {
+        assert_eq!(content_length(b"POST / HTTP/1.1\r\ncontent-length: 42\r\n"), 42);
+        assert_eq!(content_length(b"GET /api/status HTTP/1.1\r\n"), 0);
+        assert!(request_complete(b"GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n"));
+    }
 }

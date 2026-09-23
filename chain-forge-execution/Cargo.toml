@@ -14,6 +14,10 @@ chain-forge-core     = { path = "../chain-forge-core" }
 chain-forge-state    = { path = "../chain-forge-state" }
 chain-forge-identity = { path = "../chain-forge-identity" }
 chain-forge-cirfi    = { path = "../chain-forge-cirfi" }
+# Always real Ed25519. The crypto crate's stub verify() recomputes the
+# "signature" from the PUBLIC key, so anyone could forge one -- it must
+# never be what guards transaction execution.
+chain-forge-crypto   = { path = "../chain-forge-crypto", features = ["real-crypto"] }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
 thiserror         = { workspace = true }

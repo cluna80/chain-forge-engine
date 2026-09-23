@@ -67,6 +67,12 @@ impl SimRunner {
         }
     }
 
+    /// Connect to the node (chain_id) and load named-account key files.
+    /// Must be called once before run().
+    pub async fn init(&mut self, keys_dir: Option<&std::path::Path>) -> Result<()> {
+        self.ctx.init(keys_dir).await
+    }
+
     pub fn add_persona(&mut self, p: Box<dyn Persona>) -> &mut Self {
         self.personas.push(p);
         self
@@ -77,7 +83,10 @@ impl SimRunner {
 
         // Collect all persona IDs upfront so we can check registration
         // landed before proceeding past epoch 0.
-        let persona_ids: Vec<String> = self.personas.iter().map(|p| p.id().to_string()).collect();
+        let persona_ids: Vec<String> = self.personas.iter()
+            .filter(|p| p.registers_on_chain())
+            .map(|p| p.id().to_string())
+            .collect();
 
         for epoch in 0..self.epochs {
             tracing::info!(epoch, personas = self.personas.len(), "epoch starting");

@@ -142,8 +142,13 @@ async fn main() {
     let peers         = node.peers();
     let tx_queue      = node.tx_queue();
     let api_port      = args.api_port;
+    let precheck      = api::TxPrecheck {
+        chain_id:           node.chain_id().to_string(),
+        require_signatures: node.require_signatures(),
+    };
+    info!(require_signatures = precheck.require_signatures, "transaction signature enforcement");
     tokio::spawn(async move {
-        api::serve(api_port, status, explorer, cirfi_metrics, peers, tx_queue).await;
+        api::serve(api_port, status, explorer, cirfi_metrics, peers, tx_queue, precheck).await;
     });
 
     // Give the API a moment to bind before the event loop starts.

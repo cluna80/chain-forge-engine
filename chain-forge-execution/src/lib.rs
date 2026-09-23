@@ -20,7 +20,8 @@
 ///   - Section 8 (merchant payment flow)
 
 use serde::{Deserialize, Serialize};
-use chain_forge_core::GenesisConfig;
+use chain_forge_core::{Address, GenesisConfig, HashWidth};
+use chain_forge_crypto::{ClassicalScheme, KeyPair, SchemeId, Signature, SignatureScheme};
 use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
 use chain_forge_cirfi::CirfiEngine;
@@ -205,6 +206,7 @@ fn advance_nonce_if_not_already(tx: &Transaction, state: &mut StateStore) {
     if let Ok(acct) = state.get_account_mut(&tx.sender) {
         acct.increment_nonce();
     }
+    state.refresh_leaf(&tx.sender);
 }
 
 /// A fully-formed transaction ready for execution.
@@ -220,11 +222,42 @@ pub struct Transaction {
     pub body: TxBody,
     /// Maximum gas the sender is willing to pay.
     pub gas_limit: u64,
-    /// Sender's signature. Empty in Phase 0 -- crypto layer not wired.
+    /// Ed25519 signature over signing_bytes(chain_id). Empty when unsigned.
     pub signature: Vec<u8>,
+    /// Ed25519 public key (32 bytes) that produced `signature`. Must either
+    /// match the key bound to `sender`, or -- for an account with no bound
+    /// key yet -- be the key `sender` was derived from.
+    #[serde(default)]
+    pub public_key: Vec<u8>,
 }
 
 impl Transaction {
+    /// The exact bytes a sender signs. Domain-separated and bound to the
+    /// chain id, so a signature from one chain (or one message type) can
+    /// never be replayed as a transaction on another. Covers every field
+    /// except the signature itself.
+    pub fn signing_bytes(&self, chain_id: &str) -> Vec<u8> {
+        let payload = serde_json::to_vec(&(
+            &self.id, &self.sender, self.nonce, &self.body, self.gas_limit, &self.public_key,
+        )).expect("transaction fields always serialise");
+        let mut out = Vec::with_capacity(payload.len() + chain_id.len() + 24);
+        out.extend_from_slice(b"chain-forge/tx/v1\n");
+        out.extend_from_slice(chain_id.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Set public_key from `keypair` and sign. Clients call this last,
+    /// after every other field is final.
+    pub fn sign(&mut self, keypair: &KeyPair, chain_id: &str) -> Result<(), String> {
+        self.public_key = keypair.public_key.clone();
+        let sig = ClassicalScheme.sign(&self.signing_bytes(chain_id), keypair)
+            .map_err(|e| e.to_string())?;
+        self.signature = sig.bytes;
+        Ok(())
+    }
+
     /// Approximate serialised size in bytes (used for gas calculation).
     pub fn payload_size_bytes(&self) -> usize {
         let body_size = match &self.body {
@@ -255,6 +288,7 @@ impl Transaction {
             },
             gas_limit: 100_000,
             signature: vec![],
+            public_key: vec![],
         }
     }
 
@@ -267,6 +301,7 @@ impl Transaction {
             body: TxBody::Burn { denom: denom.to_string(), amount },
             gas_limit: 100_000,
             signature: vec![],
+            public_key: vec![],
         }
     }
 
@@ -279,6 +314,7 @@ impl Transaction {
             body: TxBody::ClaimUbi { identity_id: identity_id.to_string() },
             gas_limit: 50_000,
             signature: vec![],
+            public_key: vec![],
         }
     }
 
@@ -291,6 +327,7 @@ impl Transaction {
             body: TxBody::RegisterIdentity,
             gas_limit: 50_000,
             signature: vec![],
+            public_key: vec![],
         }
     }
 
@@ -303,6 +340,7 @@ impl Transaction {
             body: TxBody::Attest { claimant_id: claimant_id.to_string() },
             gas_limit: 50_000,
             signature: vec![],
+            public_key: vec![],
         }
     }
 
@@ -315,6 +353,7 @@ impl Transaction {
             body: TxBody::RedirectToUbiPool { amount },
             gas_limit: 50_000,
             signature: vec![],
+            public_key: vec![],
         }
     }
 
@@ -327,6 +366,7 @@ impl Transaction {
             body: TxBody::SponsorAgent { agent_address: agent_address.to_string() },
             gas_limit: 50_000,
             signature: vec![],
+            public_key: vec![],
         }
     }
 }
@@ -390,6 +430,14 @@ pub struct ExecutionConfig {
     pub max_tx_bytes:    u64,
     /// Native token denom (fees are paid in this).
     pub native_denom:    String,
+    /// Chain id mixed into every signature (cross-chain replay protection).
+    pub chain_id:        String,
+    /// Prefix for key-derived addresses, e.g. "qcb" -> "qcb1...".
+    pub address_prefix:  String,
+    /// Hash width used to derive addresses from public keys.
+    pub hash_width:      HashWidth,
+    /// Enforce signatures and key binding on every transaction.
+    pub require_signatures: bool,
 }
 
 impl ExecutionConfig {
@@ -399,8 +447,71 @@ impl ExecutionConfig {
             block_gas_limit: genesis.limits.block_gas_limit,
             max_tx_bytes:    genesis.limits.max_tx_bytes,
             native_denom:    genesis.native_token.denom.clone(),
+            chain_id:        genesis.chain_id.clone(),
+            address_prefix:  genesis.address_prefix.clone(),
+            hash_width:      genesis.hash_width().unwrap_or(HashWidth::Bits256),
+            require_signatures: genesis.execution.require_signatures,
         }
     }
+}
+
+// -- Authorization --------------------------------------------------------------
+
+/// Check that `tx` is authorised by the key that controls `tx.sender`.
+///
+/// 1. The Ed25519 signature must verify over signing_bytes(chain_id).
+/// 2. If the sender's account has a bound key, the signing key must be it.
+/// 3. Otherwise the sender address must be derived from the signing key --
+///    so an unbound address can only ever be claimed by its own key holder.
+///    Named addresses (genesis labels like "qcb1alice") are never derived,
+///    so they are only usable when genesis bound a key to them.
+fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
+    if !config.require_signatures {
+        return Ok(());
+    }
+    verify_signature(tx, &config.chain_id)?;
+
+    match state.get_account(&tx.sender).ok().and_then(|a| a.public_key.clone()) {
+        Some(bound) if bound == tx.public_key => Ok(()),
+        Some(_) => Err(format!("signing key does not match the key bound to {}", tx.sender)),
+        None => {
+            let derived = Address::from_public_key(&tx.public_key, &config.address_prefix, config.hash_width);
+            if derived.as_str() == tx.sender {
+                Ok(())
+            } else {
+                Err(format!("{} has no bound key and is not derived from the signing key", tx.sender))
+            }
+        }
+    }
+}
+
+/// Stateless half of authorization: is `tx.signature` a valid Ed25519
+/// signature by `tx.public_key` over this transaction on this chain?
+/// Needs no state, so the HTTP API runs it at submission to reject bad
+/// signatures immediately; the executor runs it again (plus the key
+/// binding check, which does need state) on every node at execution.
+pub fn verify_signature(tx: &Transaction, chain_id: &str) -> Result<(), String> {
+    if tx.public_key.len() != 32 {
+        return Err(format!("unsigned or malformed: public_key must be 32 bytes, got {}", tx.public_key.len()));
+    }
+    let sig = Signature { scheme: SchemeId::Classical, bytes: tx.signature.clone() };
+    ClassicalScheme
+        .verify(&tx.signing_bytes(chain_id), &sig, &tx.public_key)
+        .map_err(|e| format!("invalid signature: {e}"))
+}
+
+/// Bind the signing key to the sender's account on its first successful
+/// signed transaction (the account may have just been created by it).
+fn bind_key_if_unbound(config: &ExecutionConfig, tx: &Transaction, state: &mut StateStore) {
+    if !config.require_signatures {
+        return;
+    }
+    if let Ok(acct) = state.get_account_mut(&tx.sender) {
+        if acct.public_key.is_none() {
+            acct.public_key = Some(tx.public_key.clone());
+        }
+    }
+    state.refresh_leaf(&tx.sender);
 }
 
 // -- Executor -----------------------------------------------------------------
@@ -434,6 +545,10 @@ impl Executor {
                 tx.id.clone(), gas_required, tx.gas_limit,
                 format!("gas limit {} below required {}", tx.gas_limit, gas_required),
             );
+        }
+
+        if let Err(e) = verify_authorization(&self.config, tx, state) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
         let expected_nonce = state.get_account(&tx.sender)
@@ -627,6 +742,7 @@ impl Executor {
 
         if result.is_ok() {
             advance_nonce_if_not_already(tx, state);
+            bind_key_if_unbound(&self.config, tx, state);
         }
 
         match result {
@@ -653,6 +769,10 @@ impl Executor {
                 tx.gas_limit,
                 format!("gas limit {} below required {}", tx.gas_limit, gas_required),
             );
+        }
+
+        if let Err(e) = verify_authorization(&self.config, tx, state) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
         // Nonce check
@@ -730,6 +850,7 @@ impl Executor {
 
         if result.is_ok() {
             advance_nonce_if_not_already(tx, state);
+            bind_key_if_unbound(&self.config, tx, state);
         }
 
         match result {
@@ -890,7 +1011,7 @@ mod tests {
             "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
             "address_prefix": "qcb",
             "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 5000 },
-            "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic" },
+            "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
             "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
             "network": { "network_id": "qcb-testnet-1-net", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "both", "max_peers": 50 },
             "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 5000, "mempool_ttl_seconds": 300 },
@@ -1021,6 +1142,10 @@ mod tests {
             block_gas_limit: 1_500,   // fits only 1 tx at 1_000 gas each
             max_tx_bytes:    65_536,
             native_denom:    "uqcb".into(),
+            chain_id:        "qcb-testnet-1".into(),
+            address_prefix:  "qcb".into(),
+            hash_width:      HashWidth::Bits256,
+            require_signatures: false,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -1051,6 +1176,7 @@ mod tests {
             },
             gas_limit: 100_000,
             signature: vec![],
+            public_key: vec![],
         };
 
         let result = exec.execute_tx(&tx, &mut state);
@@ -1071,6 +1197,7 @@ mod tests {
             },
             gas_limit: 100_000,
             signature: vec![],
+            public_key: vec![],
         };
 
         let result = exec.execute_tx(&tx, &mut state);
@@ -1315,5 +1442,116 @@ mod tests {
         let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut cirfi);
         assert!(r.success, "second attest with nonce 1 must succeed: {:?}", r.error);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 2);
+    }
+
+    // -- Signature verification (require_signatures = true) -------------------
+
+    fn key(seed: &str) -> KeyPair {
+        ClassicalScheme.generate_keypair(seed).unwrap()
+    }
+
+    /// Plain executor with signatures enforced, and qcb1alice's genesis
+    /// account bound to a known key (as a genesis public_key would do).
+    fn signed_setup() -> (Executor, StateStore, KeyPair) {
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut config = ExecutionConfig::from_genesis(&genesis);
+        config.require_signatures = true;
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let alice = key("alice-test-key");
+        state.get_account_mut("qcb1alice").unwrap().public_key = Some(alice.public_key.clone());
+        (Executor::new(config), state, alice)
+    }
+
+    #[test]
+    fn unsigned_tx_rejected_when_signatures_required() {
+        let (exec, mut state, _) = signed_setup();
+        let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("unsigned"));
+        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 0, "rejected tx must not advance nonce");
+    }
+
+    #[test]
+    fn tx_signed_by_bound_key_succeeds() {
+        let (exec, mut state, alice) = signed_setup();
+        let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(r.success, "{:?}", r.error);
+    }
+
+    #[test]
+    fn tx_signed_by_wrong_key_rejected() {
+        let (exec, mut state, _) = signed_setup();
+        let mallory = key("mallory");
+        let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1mallory", "uqcb", 100, 0);
+        tx.sign(&mallory, "qcb-testnet-1").unwrap();
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("does not match the key bound"));
+    }
+
+    #[test]
+    fn tampered_tx_rejected() {
+        let (exec, mut state, alice) = signed_setup();
+        let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+        tx.body = TxBody::Transfer { to: "qcb1bob".into(), denom: "uqcb".into(), amount: 4_000_000 };
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("invalid signature"));
+    }
+
+    #[test]
+    fn signature_from_another_chain_rejected() {
+        let (exec, mut state, alice) = signed_setup();
+        let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sign(&alice, "some-other-chain").unwrap();
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("invalid signature"));
+    }
+
+    #[test]
+    fn named_address_without_bound_key_cannot_be_claimed() {
+        // qcb1bob has a genesis balance but no bound key. A signature from
+        // any key is useless for it: the address isn't derived from a key.
+        let (exec, mut state, _) = signed_setup();
+        let mallory = key("mallory");
+        let mut tx = Transaction::transfer("tx1", "qcb1bob", "qcb1mallory", "uqcb", 100, 0);
+        tx.sign(&mallory, "qcb-testnet-1").unwrap();
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("not derived from the signing key"));
+    }
+
+    #[test]
+    fn key_derived_address_registers_and_binds_its_key() {
+        let (_, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut config = ExecutionConfig::from_genesis(&genesis);
+        config.require_signatures = true;
+        let exec = Executor::new(config);
+
+        let user = key("new-user");
+        let addr = Address::from_public_key(&user.public_key, "qcb", HashWidth::Bits256);
+        let mut reg = Transaction::register_identity("r0", addr.as_str(), 0);
+        reg.sign(&user, "qcb-testnet-1").unwrap();
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi);
+        assert!(r.success, "{:?}", r.error);
+
+        let acct = state.get_account(addr.as_str()).unwrap();
+        assert_eq!(acct.public_key.as_deref(), Some(user.public_key.as_slice()), "first tx binds the key");
+        assert_eq!(acct.nonce, 1);
+
+        // A different key can no longer act for this address.
+        let other = key("someone-else");
+        let mut hijack = Transaction::attest("h1", addr.as_str(), "qcb1alice", 1);
+        hijack.sign(&other, "qcb-testnet-1").unwrap();
+        let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut cirfi);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("does not match the key bound"));
     }
 }
