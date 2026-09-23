@@ -48,6 +48,21 @@ pub enum IdentityError {
     #[error("verification proof is invalid: {0}")]
     InvalidProof(String),
 
+    #[error("identity {0} cannot attest for itself")]
+    SelfAttestation(String),
+
+    #[error("attester {0} is not Verified -- only Verified or Established identities can vouch for a new claimant")]
+    AttesterNotVerified(String),
+
+    #[error("attester {0} has already vouched for this claimant")]
+    AlreadyAttested(String),
+
+    #[error("attester {0} has reached the maximum attestations allowed this epoch")]
+    AttestationRateLimitExceeded(String),
+
+    #[error("identity {0} is already past Provisional -- no further attestations needed")]
+    AlreadyVerified(String),
+
     #[error("internal identity error: {0}")]
     Internal(String),
 }
@@ -169,6 +184,64 @@ impl PopAttestation {
         }
         Ok(())
     }
+}
+
+// -- Web-of-trust quorum -------------------------------------------------------
+
+/// Minimum number of distinct Verified-or-Established attesters a
+/// Provisional identity needs before it graduates to Verified.
+/// Whitepaper Section 4 / Identity Pilot Design Section 3.1: "provisional
+/// target: 3 attestations." Provisional here means governance-adjustable,
+/// not fixed at the protocol layer -- Section 6.6 governs CirFi-adjacent
+/// parameters like this one the same way it governs decay rates.
+pub const ATTESTATION_QUORUM: usize = 3;
+
+/// Maximum number of distinct claimants one identity can vouch for within
+/// a single epoch. Named in the Identity Pilot Design (Section 3.1) as a
+/// parameter to finalize before Phase 1; bounds how much damage a single
+/// compromised or malicious Verified identity can do by rapidly vouching
+/// for a cohort of fake claimants. Provisional value, governance-adjustable.
+pub const MAX_ATTESTATIONS_PER_EPOCH: u32 = 5;
+
+/// Tracks which distinct identities have vouched for a Provisional
+/// claimant so far, on the way to reaching ATTESTATION_QUORUM.
+///
+/// Kept as a Vec rather than a HashSet so serialization order is
+/// deterministic (matters for state-root determinism across nodes,
+/// same reasoning as the rest of this codebase's state layer).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttestationLedger {
+    pub attesters: Vec<String>,
+}
+
+impl AttestationLedger {
+    pub fn has_attested(&self, attester_id: &str) -> bool {
+        self.attesters.iter().any(|a| a == attester_id)
+    }
+
+    /// Records a new distinct attester. No-ops (does not duplicate) if
+    /// this attester has already vouched -- callers should still treat a
+    /// repeat as an error via IdentityStore::attest's own dedupe check;
+    /// this method itself just guarantees the invariant either way.
+    fn add(&mut self, attester_id: String) {
+        if !self.has_attested(&attester_id) {
+            self.attesters.push(attester_id);
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.attesters.len()
+    }
+}
+
+/// What happened as a result of a single attest() call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestationOutcome {
+    /// Recorded, but the claimant has not yet reached quorum.
+    Recorded { attester_count: usize, quorum: usize },
+    /// This attestation was the one that crossed the quorum threshold --
+    /// the claimant has just been upgraded Provisional -> Verified.
+    QuorumReachedVerified,
 }
 
 // -- Decay exemption credits --------------------------------------------------
@@ -318,6 +391,15 @@ pub struct IdentityRecord {
     pub total_ubi_claimed: u128,
     /// Agents sponsored by this identity (agent address -> authorized).
     pub sponsored_agents: Vec<String>,
+    /// Distinct Verified+ identities who have vouched for THIS identity
+    /// while it was Provisional, on the way to ATTESTATION_QUORUM.
+    pub attestation_ledger: AttestationLedger,
+    /// The epoch this identity last gave an attestation to someone else --
+    /// used to reset attestations_given_count when a new epoch begins.
+    pub attestations_given_epoch: u64,
+    /// How many distinct claimants this identity has vouched for so far
+    /// in attestations_given_epoch. Reset to 0 whenever the epoch advances.
+    pub attestations_given_count: u32,
 }
 
 impl IdentityRecord {
@@ -335,6 +417,9 @@ impl IdentityRecord {
             claimed_this_epoch: false,
             total_ubi_claimed: 0,
             sponsored_agents: Vec::new(),
+            attestation_ledger: AttestationLedger::default(),
+            attestations_given_epoch: 0,
+            attestations_given_count: 0,
         }
     }
 
@@ -508,6 +593,93 @@ impl IdentityStore {
         record.verify(attestation)?;
         tracing::info!(id, "identity verified (Provisional -> Verified)");
         Ok(())
+    }
+
+    /// Record a web-of-trust attestation: `attester_id` vouches that
+    /// `claimant_id` is a unique human. This is the real Phase 1 mechanism
+    /// named in Whitepaper Section 4 and specified in the Identity Pilot
+    /// Design (Section 3.1) -- distinct from verify_identity() above, which
+    /// remains the Phase 0 genesis bootstrap path (a single attestation
+    /// immediately upgrades a genesis identity, since there is no existing
+    /// Verified population yet to draw attesters from at genesis).
+    ///
+    /// Enforces, in order:
+    /// - an identity cannot attest for itself
+    /// - the attester must already be Verified or Established -- a
+    ///   Provisional identity cannot vouch for anyone, which is what
+    ///   prevents two Provisional (possibly synthetic) identities from
+    ///   bootstrapping each other into Verified status
+    /// - the claimant must currently be Provisional (already-Verified
+    ///   identities don't need more attestations)
+    /// - the attester can only vouch for a given claimant once (repeat
+    ///   attestations from the same attester don't inflate the count)
+    /// - the attester is rate-limited to MAX_ATTESTATIONS_PER_EPOCH
+    ///   distinct claimants per epoch, resetting each time the epoch
+    ///   advances
+    ///
+    /// Once the claimant's distinct-attester count reaches
+    /// ATTESTATION_QUORUM, the claimant is upgraded to Verified as a
+    /// side effect of this call.
+    pub fn attest(
+        &mut self,
+        claimant_id: &str,
+        attester_id: &str,
+    ) -> IdResult<AttestationOutcome> {
+        if claimant_id == attester_id {
+            return Err(IdentityError::SelfAttestation(attester_id.to_string()));
+        }
+
+        let attester_tier = self.records.get(attester_id)
+            .ok_or_else(|| IdentityError::NotFound(attester_id.to_string()))?
+            .tier()
+            .clone();
+        if !attester_tier.grants_full_ubi() {
+            return Err(IdentityError::AttesterNotVerified(attester_id.to_string()));
+        }
+
+        {
+            let claimant = self.records.get(claimant_id)
+                .ok_or_else(|| IdentityError::NotFound(claimant_id.to_string()))?;
+            if !matches!(claimant.tier(), VerificationTier::Provisional) {
+                return Err(IdentityError::AlreadyVerified(claimant_id.to_string()));
+            }
+            if claimant.attestation_ledger.has_attested(attester_id) {
+                return Err(IdentityError::AlreadyAttested(attester_id.to_string()));
+            }
+        }
+
+        let epoch = self.clock.current_epoch;
+
+        // Rate limit, tracked on the attester's own record. Reset the
+        // window here rather than in advance_epoch(), so an attester who
+        // never vouches for anyone doesn't need per-epoch upkeep -- the
+        // window resets lazily, the first time they attest in a new epoch.
+        {
+            let attester_record = self.records.get_mut(attester_id).unwrap();
+            if attester_record.attestations_given_epoch != epoch {
+                attester_record.attestations_given_epoch = epoch;
+                attester_record.attestations_given_count = 0;
+            }
+            if attester_record.attestations_given_count >= MAX_ATTESTATIONS_PER_EPOCH {
+                return Err(IdentityError::AttestationRateLimitExceeded(attester_id.to_string()));
+            }
+            attester_record.attestations_given_count += 1;
+        }
+
+        let claimant = self.records.get_mut(claimant_id).unwrap();
+        claimant.attestation_ledger.add(attester_id.to_string());
+        let count = claimant.attestation_ledger.count();
+
+        if count >= ATTESTATION_QUORUM {
+            claimant.charm.verify(epoch);
+            tracing::info!(
+                claimant_id, attester_count = count,
+                "identity verified via web-of-trust quorum (Provisional -> Verified)"
+            );
+            Ok(AttestationOutcome::QuorumReachedVerified)
+        } else {
+            Ok(AttestationOutcome::Recorded { attester_count: count, quorum: ATTESTATION_QUORUM })
+        }
     }
 
     // -- UBI claim gating (Charm Confinement) ---------------------------------
@@ -926,5 +1098,152 @@ mod tests {
         store.claim_ubi("h2").unwrap();
 
         assert_eq!(store.clock.total_distributed, DAILY_UBI_RATE_UCIRFI * 2);
+    }
+
+    // -- Web-of-trust quorum (Phase 1 identity pilot mechanism) ----------------
+
+    fn register_provisional(store: &mut IdentityStore, id: &str, address: &str) {
+        store.register(id.to_string(), address.to_string(), genesis_attestation(id)).unwrap();
+    }
+
+    #[test]
+    fn quorum_upgrades_claimant_after_three_distinct_attestations() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "a1", "qcb1a1");
+        register_and_verify(&mut store, "a2", "qcb1a2");
+        register_and_verify(&mut store, "a3", "qcb1a3");
+        register_provisional(&mut store, "newbie", "qcb1newbie");
+
+        assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Provisional);
+
+        let r1 = store.attest("newbie", "a1").unwrap();
+        assert_eq!(r1, AttestationOutcome::Recorded { attester_count: 1, quorum: ATTESTATION_QUORUM });
+        assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Provisional);
+
+        let r2 = store.attest("newbie", "a2").unwrap();
+        assert_eq!(r2, AttestationOutcome::Recorded { attester_count: 2, quorum: ATTESTATION_QUORUM });
+        assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Provisional);
+
+        let r3 = store.attest("newbie", "a3").unwrap();
+        assert_eq!(r3, AttestationOutcome::QuorumReachedVerified);
+        assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Verified);
+    }
+
+    #[test]
+    fn below_quorum_attestations_leave_claimant_provisional() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "a1", "qcb1a1");
+        register_and_verify(&mut store, "a2", "qcb1a2");
+        register_provisional(&mut store, "newbie", "qcb1newbie");
+
+        store.attest("newbie", "a1").unwrap();
+        store.attest("newbie", "a2").unwrap();
+
+        assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Provisional,
+            "2 attestations must not reach a quorum of 3");
+    }
+
+    #[test]
+    fn duplicate_attestation_from_same_attester_rejected() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "a1", "qcb1a1");
+        register_provisional(&mut store, "newbie", "qcb1newbie");
+
+        store.attest("newbie", "a1").unwrap();
+        let result = store.attest("newbie", "a1");
+
+        assert!(matches!(result, Err(IdentityError::AlreadyAttested(_))),
+            "the same attester vouching twice must not inflate the count");
+    }
+
+    #[test]
+    fn self_attestation_rejected() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "a1", "qcb1a1");
+
+        let result = store.attest("a1", "a1");
+        assert!(matches!(result, Err(IdentityError::SelfAttestation(_))));
+    }
+
+    #[test]
+    fn provisional_identity_cannot_vouch_for_others() {
+        let mut store = make_store();
+        register_provisional(&mut store, "p1", "qcb1p1");
+        register_provisional(&mut store, "p2", "qcb1p2");
+
+        // Two Provisional identities cannot bootstrap each other into
+        // Verified status -- this is the specific attack the pilot design
+        // names as the web-of-trust base layer's core sybil resistance.
+        let result = store.attest("p2", "p1");
+        assert!(matches!(result, Err(IdentityError::AttesterNotVerified(_))));
+    }
+
+    #[test]
+    fn already_verified_claimant_rejects_further_attestations() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "a1", "qcb1a1");
+        register_and_verify(&mut store, "human", "qcb1human"); // already Verified via genesis path
+
+        let result = store.attest("human", "a1");
+        assert!(matches!(result, Err(IdentityError::AlreadyVerified(_))));
+    }
+
+    #[test]
+    fn attestation_rate_limit_enforced_per_epoch() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "attester", "qcb1attester");
+
+        // MAX_ATTESTATIONS_PER_EPOCH distinct claimants succeed...
+        for i in 0..MAX_ATTESTATIONS_PER_EPOCH {
+            let id = format!("claimant{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
+
+        // ...the next one in the SAME epoch is rejected.
+        register_provisional(&mut store, "one_too_many", "qcb1one_too_many");
+        let result = store.attest("one_too_many", "attester");
+        assert!(matches!(result, Err(IdentityError::AttestationRateLimitExceeded(_))));
+    }
+
+    #[test]
+    fn attestation_rate_limit_resets_next_epoch() {
+        let mut store = IdentityStore::with_epoch_ms(0, 1000);
+        register_and_verify(&mut store, "attester", "qcb1attester");
+
+        for i in 0..MAX_ATTESTATIONS_PER_EPOCH {
+            let id = format!("claimant{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
+
+        register_provisional(&mut store, "blocked_this_epoch", "qcb1blocked");
+        assert!(store.attest("blocked_this_epoch", "attester").is_err());
+
+        // Advance to a new epoch -- the rate limit window resets.
+        store.advance_epoch(1500);
+        register_provisional(&mut store, "allowed_next_epoch", "qcb1allowed");
+        let result = store.attest("allowed_next_epoch", "attester");
+        assert!(result.is_ok(), "rate limit must reset once a new epoch begins");
+    }
+
+    #[test]
+    fn rejected_attestation_does_not_consume_rate_limit_budget() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "attester", "qcb1attester");
+        register_provisional(&mut store, "newbie", "qcb1newbie");
+
+        // A self-attestation attempt and a not-found attempt should both
+        // fail WITHOUT spending any of the attester's per-epoch budget.
+        let _ = store.attest("attester", "attester"); // self-attestation, rejected
+        let _ = store.attest("does_not_exist", "attester"); // NotFound, rejected
+
+        // The attester should still have their full budget -- prove it by
+        // successfully using all MAX_ATTESTATIONS_PER_EPOCH slots afterward.
+        for i in 0..MAX_ATTESTATIONS_PER_EPOCH {
+            let id = format!("claimant{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
     }
 }
