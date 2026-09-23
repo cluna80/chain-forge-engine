@@ -176,6 +176,37 @@ pub enum TxBody {
     },
 }
 
+/// Advance the sender's nonce after a successful transaction, for the tx
+/// types whose handlers don't already do it.
+///
+/// Transfer, Burn and Stake advance the nonce inside StateStore::transfer /
+/// StateStore::burn, and ClaimUbi / RedirectToUbiPool advance it inside the
+/// CirfiEngine calls they make. Every other body type previously advanced
+/// nothing -- which meant RegisterIdentity, Attest, SponsorAgent,
+/// RevokeAgent and Custom transactions left the sender's nonce unchanged
+/// on success. Consequences: the same signed transaction could be
+/// replayed with the same nonce indefinitely, and a sender who correctly
+/// incremented their own nonce after one of these txs got every following
+/// tx rejected with a nonce mismatch. Found by chain-forge-sim against the
+/// live 4-validator testnet: attesters' second transactions in the same
+/// session were all rejected "expected 0, got 1".
+fn advance_nonce_if_not_already(tx: &Transaction, state: &mut StateStore) {
+    let already_advances = matches!(
+        tx.body,
+        TxBody::Transfer { .. }
+            | TxBody::Burn { .. }
+            | TxBody::Stake { .. }
+            | TxBody::ClaimUbi { .. }
+            | TxBody::RedirectToUbiPool { .. }
+    );
+    if already_advances {
+        return;
+    }
+    if let Ok(acct) = state.get_account_mut(&tx.sender) {
+        acct.increment_nonce();
+    }
+}
+
 /// A fully-formed transaction ready for execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -594,6 +625,10 @@ impl Executor {
             }
         };
 
+        if result.is_ok() {
+            advance_nonce_if_not_already(tx, state);
+        }
+
         match result {
             Ok(_) => TransactionResult::ok(tx.id.clone(), gas_required, tx.gas_limit, events),
             Err(e) => TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e),
@@ -692,6 +727,10 @@ impl Executor {
                 Err("identity-gated transaction requires identity-aware executor".to_string())
             }
         };
+
+        if result.is_ok() {
+            advance_nonce_if_not_already(tx, state);
+        }
 
         match result {
             Ok(_) => TransactionResult::ok(tx.id.clone(), gas_required, tx.gas_limit, events),
@@ -1238,5 +1277,43 @@ mod tests {
         let attest_tx = Transaction::attest("tx2", "qcb1alice", "qcb1newbie", 0);
         let r2 = exec.execute_tx(&attest_tx, &mut state);
         assert!(!r2.success, "Attest must be rejected by the non-identity-aware executor");
+    }
+
+    #[test]
+    fn identity_txs_advance_sender_nonce_and_block_replay() {
+        use chain_forge_identity::PopAttestation;
+
+        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+        for name in ["qcb1bob", "qcb1carol"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att).unwrap();
+        }
+
+        // Registration advances the new account's nonce 0 -> 1.
+        let reg = Transaction::register_identity("r0", "qcb1newbie", 0);
+        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi).success);
+        assert_eq!(state.get_account("qcb1newbie").unwrap().nonce, 1);
+
+        // Replaying the exact same registration is now a nonce mismatch,
+        // not a second trip into the identity logic.
+        let replay = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi);
+        assert!(!replay.success);
+        assert!(replay.error.as_deref().unwrap_or("").contains("nonce mismatch"));
+
+        // An attester's first attest advances their nonce, so their second
+        // transaction must use nonce 1 -- and does succeed with it.
+        let a1 = Transaction::attest("a1", "qcb1alice", "qcb1newbie", 0);
+        assert!(exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut cirfi).success);
+        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1);
+
+        exec.execute_tx_with_identity(
+            &Transaction::register_identity("r1", "qcb1other", 0),
+            &mut state, &mut identity, &mut cirfi,
+        );
+        let a2 = Transaction::attest("a2", "qcb1alice", "qcb1other", 1);
+        let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut cirfi);
+        assert!(r.success, "second attest with nonce 1 must succeed: {:?}", r.error);
+        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 2);
     }
 }

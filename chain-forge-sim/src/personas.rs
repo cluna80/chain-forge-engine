@@ -24,6 +24,11 @@ async fn bootstrap_via_seeds(
     ctx: &mut SimContext,
 ) -> Result<()> {
     for seed in seeds {
+        // Seed attesters are pre-existing genesis validator accounts whose
+        // on-chain nonce is already ahead of 0 (they've committed blocks).
+        // Sync the local counter before the first use so nonce mismatches
+        // don't silently reject every attestation.
+        ctx.sync_nonce(seed).await?;
         let nonce = ctx.next_nonce(seed);
         let tx = Transaction::attest(
             &format!("bootstrap-{seed}-{claimant_id}"),
@@ -32,6 +37,23 @@ async fn bootstrap_via_seeds(
         ctx.submit_tx(seed, "attest_bootstrap", tx).await?;
     }
     Ok(())
+}
+
+/// A fault-injection check only counts as a pass if the node rejected the
+/// transaction for the specific reason being tested. Any other failure --
+/// most importantly a nonce mismatch, which is how the first "clean" live
+/// run produced three false passes -- is reported as a FAIL with the real
+/// error attached, so a check can never pass by accident again.
+fn rejected_for(outcome: &TxOutcome, expected_fragment: &str) -> Result<(), String> {
+    match outcome {
+        TxOutcome::Confirmed { success: false, error: Some(e), .. } if e.contains(expected_fragment) => Ok(()),
+        TxOutcome::Confirmed { success: false, error, .. } =>
+            Err(format!("rejected, but for the wrong reason: {}", error.clone().unwrap_or_default())),
+        TxOutcome::Confirmed { success: true, .. } => Err("was accepted -- guard did not fire".into()),
+        TxOutcome::RejectedAtSubmission { message } =>
+            Err(format!("rejected at submission instead of by the guard: {message}")),
+        TxOutcome::Queued => Err("never confirmed -- outcome unknown".into()),
+    }
 }
 
 fn tier_check(actual: Option<String>, expected: &str, label: &str) -> CheckResult {
@@ -64,6 +86,7 @@ impl Persona for HonestEarlyAdopter {
                 bootstrap_via_seeds(self.id(), &SEED_ATTESTERS, ctx).await?;
             }
             3 => {
+                ctx.sync_nonce(self.id()).await?;
                 let nonce = ctx.next_nonce(self.id());
                 let tx = Transaction::claim_ubi("sim-alice-ubi", self.id(), self.id(), nonce);
                 ctx.submit_tx(self.id(), "claim_ubi", tx).await?;
@@ -75,10 +98,10 @@ impl Persona for HonestEarlyAdopter {
 
     async fn check_expectations(&self, epoch: u64, ctx: &SimContext) -> Vec<CheckResult> {
         let mut checks = Vec::new();
-        if epoch == 1 {
-            let acct = ctx.get_account(self.id()).await.ok().flatten();
-            checks.push(tier_check(acct.and_then(|a| a.tier), "Provisional", "sim-alice pre-quorum"));
-        }
+        // Note: pre-quorum check removed -- sim-alice can reach quorum
+        // within epoch 1 itself if attestations commit quickly, making
+        // the "expected Provisional at end of epoch 1" assertion
+        // timing-dependent rather than a real invariant.
         if epoch == 2 {
             let acct = ctx.get_account(self.id()).await.ok().flatten();
             checks.push(tier_check(acct.and_then(|a| a.tier), "Verified", "sim-alice post-quorum"));
@@ -119,6 +142,7 @@ impl Persona for ReliableAttester {
             // this exercises peer-to-peer (non-seed) attestation, alongside
             // Newcomer's other two attesters (see Newcomer below).
             3 => {
+                ctx.sync_nonce(self.id()).await?;
                 let nonce = ctx.next_nonce(self.id());
                 let tx = Transaction::attest("sim-bob-attests-newcomer", self.id(), "sim-newcomer", nonce);
                 ctx.submit_tx(self.id(), "attest_organic", tx).await?;
@@ -157,6 +181,7 @@ impl Persona for Newcomer {
         // submitted here at epoch 2, deliberately mixing the two paths.
         if epoch == 2 {
             for seed in &SEED_ATTESTERS[..2] {
+                ctx.sync_nonce(seed).await?;
                 let nonce = ctx.next_nonce(seed);
                 let tx = Transaction::attest(&format!("seed-{seed}-newcomer"), seed, self.id(), nonce);
                 ctx.submit_tx(seed, "attest_bootstrap", tx).await?;
@@ -225,11 +250,11 @@ impl Persona for DormantParticipant {
 // -- 4. Fault injection: duplicate registration --------------------------------
 
 pub struct DuplicateRegistrationAttempt {
-    second_attempt_rejected: Option<bool>,
+    verdict: Option<Result<(), String>>,
 }
 
 impl DuplicateRegistrationAttempt {
-    pub fn new() -> Self { Self { second_attempt_rejected: None } }
+    pub fn new() -> Self { Self { verdict: None } }
 }
 
 #[async_trait::async_trait]
@@ -250,10 +275,7 @@ impl Persona for DuplicateRegistrationAttempt {
                 let nonce = ctx.next_nonce(self.id());
                 let tx = Transaction::register_identity("sim-duptest-reg2", self.id(), nonce);
                 let outcome = ctx.submit_tx(self.id(), "register_identity_duplicate", tx).await?;
-                self.second_attempt_rejected = Some(matches!(
-                    outcome,
-                    TxOutcome::Confirmed { success: false, .. } | TxOutcome::RejectedAtSubmission { .. }
-                ));
+                self.verdict = Some(rejected_for(&outcome, "already exists"));
             }
             _ => {}
         }
@@ -262,12 +284,11 @@ impl Persona for DuplicateRegistrationAttempt {
 
     async fn check_expectations(&self, epoch: u64, _ctx: &SimContext) -> Vec<CheckResult> {
         if epoch != 1 { return Vec::new(); }
-        match self.second_attempt_rejected {
-            Some(true)  => vec![CheckResult::pass("duplicate registration correctly rejected")],
-            Some(false) => vec![CheckResult::fail("duplicate registration correctly rejected",
-                "second attempt was NOT rejected -- possible state corruption")],
-            None => vec![CheckResult::fail("duplicate registration correctly rejected",
-                "second attempt outcome unknown -- submit_tx may have errored at the transport level")],
+        match &self.verdict {
+            Some(Ok(()))   => vec![CheckResult::pass("duplicate registration rejected by the already-exists guard")],
+            Some(Err(why)) => vec![CheckResult::fail("duplicate registration rejected by the already-exists guard", why.clone())],
+            None => vec![CheckResult::fail("duplicate registration rejected by the already-exists guard",
+                "second attempt never ran -- submit_tx errored at the transport level")],
         }
     }
 }
@@ -275,11 +296,11 @@ impl Persona for DuplicateRegistrationAttempt {
 // -- 5. Fault injection: self-attestation --------------------------------------
 
 pub struct SelfAttestationAttempt {
-    rejected: Option<bool>,
+    verdict: Option<Result<(), String>>,
 }
 
 impl SelfAttestationAttempt {
-    pub fn new() -> Self { Self { rejected: None } }
+    pub fn new() -> Self { Self { verdict: None } }
 }
 
 #[async_trait::async_trait]
@@ -301,10 +322,7 @@ impl Persona for SelfAttestationAttempt {
                 let nonce = ctx.next_nonce(self.id());
                 let tx = Transaction::attest("sim-selfattest-tx", self.id(), self.id(), nonce);
                 let outcome = ctx.submit_tx(self.id(), "self_attest", tx).await?;
-                self.rejected = Some(matches!(
-                    outcome,
-                    TxOutcome::Confirmed { success: false, .. } | TxOutcome::RejectedAtSubmission { .. }
-                ));
+                self.verdict = Some(rejected_for(&outcome, "cannot attest for itself"));
             }
             _ => {}
         }
@@ -313,11 +331,10 @@ impl Persona for SelfAttestationAttempt {
 
     async fn check_expectations(&self, epoch: u64, _ctx: &SimContext) -> Vec<CheckResult> {
         if epoch != 1 { return Vec::new(); }
-        match self.rejected {
-            Some(true)  => vec![CheckResult::pass("self-attestation correctly rejected")],
-            Some(false) => vec![CheckResult::fail("self-attestation correctly rejected",
-                "was NOT rejected -- real bug, identity could vouch for itself")],
-            None => vec![CheckResult::fail("self-attestation correctly rejected", "outcome unknown")],
+        match &self.verdict {
+            Some(Ok(()))   => vec![CheckResult::pass("self-attestation rejected by the self-attest guard")],
+            Some(Err(why)) => vec![CheckResult::fail("self-attestation rejected by the self-attest guard", why.clone())],
+            None => vec![CheckResult::fail("self-attestation rejected by the self-attest guard", "attempt never ran")],
         }
     }
 }
@@ -325,11 +342,11 @@ impl Persona for SelfAttestationAttempt {
 // -- 6. Fault injection: per-epoch attestation rate limit ----------------------
 
 pub struct RateLimitProber {
-    sixth_rejected: Option<bool>,
+    verdict: Option<Result<(), String>>,
 }
 
 impl RateLimitProber {
-    pub fn new() -> Self { Self { sixth_rejected: None } }
+    pub fn new() -> Self { Self { verdict: None } }
 }
 
 #[async_trait::async_trait]
@@ -356,19 +373,29 @@ impl Persona for RateLimitProber {
             }
             // MAX_ATTESTATIONS_PER_EPOCH is 5 -- attempt all 6 in one epoch.
             3 => {
-                let mut last_outcome = None;
+                // Sync own nonce -- this persona registered in epoch 0
+                // but hasn't transacted since, so the local counter is
+                // still 0 while on-chain it's 1.
+                ctx.sync_nonce(self.id()).await?;
+                let mut outcomes = Vec::new();
                 for i in 0..6 {
                     let claimant = format!("sim-ratelimit-claimant{i}");
                     let nonce = ctx.next_nonce(self.id());
                     let tx = Transaction::attest(
                         &format!("sim-ratelimit-attest{i}"), self.id(), &claimant, nonce,
                     );
-                    last_outcome = Some(ctx.submit_tx(self.id(), "attest_ratelimit_probe", tx).await?);
+                    outcomes.push(ctx.submit_tx(self.id(), "attest_ratelimit_probe", tx).await?);
                 }
-                self.sixth_rejected = last_outcome.map(|o| matches!(
-                    o,
-                    TxOutcome::Confirmed { success: false, .. } | TxOutcome::RejectedAtSubmission { .. }
-                ));
+                // The limit is only genuinely exercised if the first five
+                // actually got through the attest logic and succeeded.
+                let first_five_ok = outcomes[..5].iter()
+                    .all(|o| matches!(o, TxOutcome::Confirmed { success: true, .. }));
+                self.verdict = Some(if !first_five_ok {
+                    let bad = outcomes[..5].iter().position(|o| !matches!(o, TxOutcome::Confirmed { success: true, .. })).unwrap();
+                    Err(format!("attestation #{} of the allowed five did not succeed ({:?}) -- rate limit was never reached", bad + 1, outcomes[bad]))
+                } else {
+                    rejected_for(&outcomes[5], "maximum attestations allowed this epoch")
+                });
             }
             _ => {}
         }
@@ -377,11 +404,10 @@ impl Persona for RateLimitProber {
 
     async fn check_expectations(&self, epoch: u64, _ctx: &SimContext) -> Vec<CheckResult> {
         if epoch != 3 { return Vec::new(); }
-        match self.sixth_rejected {
-            Some(true)  => vec![CheckResult::pass("6th attestation in one epoch correctly rate-limited")],
-            Some(false) => vec![CheckResult::fail("6th attestation in one epoch correctly rate-limited",
-                "was NOT rejected -- rate limit not enforced end-to-end")],
-            None => vec![CheckResult::fail("6th attestation in one epoch correctly rate-limited", "outcome unknown")],
+        match &self.verdict {
+            Some(Ok(()))   => vec![CheckResult::pass("5 attestations accepted, 6th rejected by the per-epoch rate limit")],
+            Some(Err(why)) => vec![CheckResult::fail("5 attestations accepted, 6th rejected by the per-epoch rate limit", why.clone())],
+            None => vec![CheckResult::fail("5 attestations accepted, 6th rejected by the per-epoch rate limit", "probe never ran")],
         }
     }
 }

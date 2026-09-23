@@ -27,7 +27,7 @@ pub async fn serve(
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -49,7 +49,7 @@ pub async fn serve(
                 let tx_queue      = tx_queue.clone();
 
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
+                    let mut buf = vec![0u8; 65536];
                     let n = match stream.read(&mut buf).await {
                         Ok(n) => n,
                         Err(_) => return,

@@ -75,6 +75,10 @@ impl SimRunner {
     pub async fn run(&mut self) -> Result<SimReport> {
         let mut report = SimReport::new(self.personas.iter().map(|p| p.id().to_string()).collect());
 
+        // Collect all persona IDs upfront so we can check registration
+        // landed before proceeding past epoch 0.
+        let persona_ids: Vec<String> = self.personas.iter().map(|p| p.id().to_string()).collect();
+
         for epoch in 0..self.epochs {
             tracing::info!(epoch, personas = self.personas.len(), "epoch starting");
             let mut epoch_report = EpochReport::new(epoch);
@@ -92,6 +96,27 @@ impl SimRunner {
             // Give the live testnet time to actually process what just
             // happened before checking expectations against it.
             tokio::time::sleep(self.epoch_pause).await;
+
+            // After epoch 0 specifically, wait until all persona accounts
+            // actually appear on-chain before proceeding. If registrations
+            // were slow to commit (still queued at end of epoch 0), epoch 1
+            // attestations will fail with "identity not found" and cascade
+            // failures through the rest of the run. This barrier prevents
+            // that without changing epoch_pause globally.
+            if epoch == 0 {
+                tracing::info!("epoch 0 complete -- waiting for all registrations to confirm on-chain");
+                for id in &persona_ids {
+                    let confirmed = self.ctx.wait_for_account(
+                        id,
+                        30,
+                        std::time::Duration::from_secs(1),
+                    ).await;
+                    if !confirmed {
+                        tracing::warn!(persona_id = id, "registration still not confirmed after barrier -- proceeding anyway");
+                    }
+                }
+                tracing::info!("registration barrier passed");
+            }
 
             for persona in self.personas.iter() {
                 let checks = persona.check_expectations(epoch, &self.ctx).await;

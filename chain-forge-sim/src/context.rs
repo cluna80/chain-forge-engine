@@ -96,11 +96,16 @@ async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> Result
     let mut stream = TcpStream::connect((host, port)).await
         .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
 
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+    // Use byte length (not char count) for Content-Length -- they differ
+    // for any non-ASCII character, and getting this wrong causes the node's
+    // HTTP parser to see a truncated or malformed body.
+    let body_bytes = body.as_bytes();
+    let headers = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
     );
-    stream.write_all(request.as_bytes()).await?;
+    stream.write_all(headers.as_bytes()).await?;
+    stream.write_all(body_bytes).await?;
 
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
@@ -122,6 +127,18 @@ impl SimContext {
         Self { host, port, nonces: HashMap::new(), epoch_log: Vec::new() }
     }
 
+    /// Fetch the current on-chain nonce for an address and sync the local
+    /// counter to it. Call this once per address before the first
+    /// transaction, especially for pre-existing accounts (like genesis
+    /// validator addresses used as seed attesters) whose on-chain nonce
+    /// may already be ahead of 0.
+    pub async fn sync_nonce(&mut self, address: &str) -> Result<()> {
+        if let Ok(Some(acct)) = self.get_account(address).await {
+            self.nonces.insert(address.to_string(), acct.nonce);
+        }
+        Ok(())
+    }
+
     pub fn next_nonce(&mut self, sender: &str) -> u64 {
         let n = self.nonces.entry(sender.to_string()).or_insert(0);
         let current = *n;
@@ -138,13 +155,23 @@ impl SimContext {
         let tx_id = tx.id.clone();
         let body = serde_json::to_string(&tx).context("failed to serialise transaction")?;
 
-        let (status, resp_body) = http_post_json(&self.host, self.port, "/api/tx", &body).await?;
+        // Retry on connection reset (os error 10054) -- the node uses
+        // Connection: close and Windows TCP sometimes resets the connection
+        // before the response is fully received. Two attempts is enough.
+        let (status, resp_body) = {
+            let mut result = http_post_json(&self.host, self.port, "/api/tx", &body).await;
+            if result.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                result = http_post_json(&self.host, self.port, "/api/tx", &body).await;
+            }
+            result?
+        };
 
         let outcome = if status == 200 {
             let parsed: TxSubmitResponse = serde_json::from_str(&resp_body)
                 .context("POST /api/tx returned unexpected JSON shape")?;
             if parsed.status == "queued" {
-                self.poll_for_confirmation(&tx_id, 6, std::time::Duration::from_millis(500)).await
+                self.poll_for_confirmation(&tx_id, 16, std::time::Duration::from_secs(1)).await
             } else {
                 TxOutcome::RejectedAtSubmission {
                     message: parsed.message.unwrap_or_else(|| "unknown rejection".into()),
@@ -170,9 +197,12 @@ impl SimContext {
         interval: std::time::Duration,
     ) -> TxOutcome {
         let path = format!("/api/tx/{tx_id}");
-        for _ in 0..max_attempts {
-            if let Ok((status, body)) = http_get(&self.host, self.port, &path).await {
-                if status == 200 {
+        for attempt in 0..max_attempts {
+            // Give the node a moment before the first poll -- it needs to
+            // actually commit the block containing this tx first.
+            tokio::time::sleep(interval).await;
+            match http_get(&self.host, self.port, &path).await {
+                Ok((200, body)) => {
                     if let Ok(s) = serde_json::from_str::<TxSummaryResponse>(&body) {
                         return TxOutcome::Confirmed {
                             success: s.success,
@@ -181,14 +211,33 @@ impl SimContext {
                         };
                     }
                 }
+                Ok((404, _)) => {
+                    // Not committed yet -- keep polling.
+                }
+                Ok((status, body)) => {
+                    tracing::debug!(tx_id, attempt, status, "unexpected poll status: {body}");
+                }
+                Err(e) => {
+                    // Connection reset (os error 10054) and similar transient
+                    // errors -- the node closed the TCP connection after the
+                    // previous response (Connection: close), which is normal.
+                    // Just retry rather than propagating as a persona error.
+                    tracing::debug!(tx_id, attempt, error = %e, "poll connection error, retrying");
+                }
             }
-            tokio::time::sleep(interval).await;
         }
         TxOutcome::Queued
     }
 
     pub async fn submit_raw_malformed(&mut self, persona_id: &str, body: &str) -> Result<u16> {
-        let (status, _) = http_post_json(&self.host, self.port, "/api/tx", body).await?;
+        let (status, _) = {
+            let mut result = http_post_json(&self.host, self.port, "/api/tx", body).await;
+            if result.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                result = http_post_json(&self.host, self.port, "/api/tx", body).await;
+            }
+            result?
+        };
         self.epoch_log.push(TxLogEntry {
             persona_id: persona_id.to_string(),
             tx_id:      "malformed-raw".to_string(),
@@ -212,6 +261,25 @@ impl SimContext {
 
     pub fn drain_epoch_log(&mut self) -> Vec<TxLogEntry> {
         std::mem::take(&mut self.epoch_log)
+    }
+
+    /// Wait until a given address has a confirmed on-chain account,
+    /// polling until it appears or the attempt budget runs out.
+    /// Used to stall the sim before proceeding past epoch 0 when
+    /// registrations are slow to commit.
+    pub async fn wait_for_account(
+        &self,
+        address: &str,
+        max_attempts: u32,
+        interval: std::time::Duration,
+    ) -> bool {
+        for _ in 0..max_attempts {
+            if let Ok(Some(_)) = self.get_account(address).await {
+                return true;
+            }
+            tokio::time::sleep(interval).await;
+        }
+        false
     }
 }
 
