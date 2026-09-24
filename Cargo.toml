@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "chain-forge-sim",
+    "chain-forge-service",
     "chain-forge-core",
     "chain-forge-consensus",
     "chain-forge-p2p",

@@ -1,0 +1,27 @@
+[package]
+name    = "chain-forge-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# The local Chain Forge service: the wizard's backend on a developer's
+# machine. Turns a wizard genesis into a running local chain (keys,
+# genesis file, one node process per validator) and reports on it.
+
+[dependencies]
+chain-forge-core   = { path = "../chain-forge-core" }
+chain-forge-crypto = { path = "../chain-forge-crypto", features = ["real-crypto"] }
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lib]
+name = "chain_forge_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chain-forge-service"
+path = "src/main.rs"
