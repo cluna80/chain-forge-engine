@@ -278,6 +278,13 @@ pub struct GenesisConsensus {
     pub consensus_type:   String,   // "proof-of-stake" | "proof-of-authority"
     pub validator_set_size: u32,
     pub block_time_ms:    u64,
+    /// Cap each validator's voting power per verified human (QCB's "one
+    /// human, bounded power" rule). Off unless a genesis turns it on, and
+    /// requires the identity module -- personhood needs an identity layer.
+    /// Previously this was switched on implicitly by consensus_type
+    /// "proof-of-stake", so any chain choosing PoS got it unknowingly.
+    #[serde(default)]
+    pub personhood_weighted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +390,9 @@ impl GenesisConfig {
         }
         if m.cirfi && !m.identity {
             errors.push("module \"cirfi\" requires \"identity\": UBI is paid only to verified humans".into());
+        }
+        if self.consensus.personhood_weighted && !m.identity {
+            errors.push("consensus.personhood_weighted requires the \"identity\" module: personhood needs an identity layer".into());
         }
         if m.agents && !m.identity {
             errors.push("module \"agents\" requires \"identity\": every agent needs a verified human sponsor".into());
@@ -615,6 +625,19 @@ mod tests {
         let e = with_modules(&["bank", "cirfi", "agents"], &[]).enabled_modules().unwrap_err();
         assert!(e.contains("\"cirfi\" requires \"identity\""));
         assert!(e.contains("\"agents\" requires \"identity\""));
+    }
+
+    #[test]
+    fn personhood_weighting_is_off_by_default_and_needs_identity() {
+        let mut cfg = with_modules(&["bank", "staking"], &[]);
+        assert!(!cfg.consensus.personhood_weighted, "choosing PoS must not imply personhood");
+        cfg.consensus.personhood_weighted = true;
+        let e = cfg.enabled_modules().unwrap_err();
+        assert!(e.contains("personhood_weighted requires"));
+
+        let mut qcb = with_modules(&["bank", "staking", "identity", "cirfi", "agents"], &[]);
+        qcb.consensus.personhood_weighted = true;
+        assert!(qcb.enabled_modules().is_ok());
     }
 
     #[test]

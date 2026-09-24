@@ -253,6 +253,7 @@ impl Node {
         info!(
             staking = modules.staking, identity = modules.identity,
             cirfi = modules.cirfi, agents = modules.agents,
+            personhood_weighted = genesis.consensus.personhood_weighted,
             "modules enabled"
         );
 
@@ -278,7 +279,9 @@ impl Node {
             .map(|a| ValidatorInfo {
                 id: ValidatorId(a.address.clone()),
                 voting_power: 1,
-                pop_verified: true,
+                // Genesis validators are the seeded verified identities --
+                // but only a chain with an identity layer has any.
+                pop_verified: modules.identity,
             })
             .collect();
 
@@ -304,7 +307,7 @@ impl Node {
         };
 
         // Build consensus config
-        let personhood_cfg = if genesis.consensus.consensus_type == "proof-of-stake" {
+        let personhood_cfg = if genesis.consensus.personhood_weighted {
             Some(PersonhoodConfig {
                 power_cap: 1,
                 reject_expired_pop: false,
@@ -1507,7 +1510,7 @@ mod tests {
         "environment": { "mode": "devnet", "faucet_enabled": true, "relaxed_limits": true },
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
-        "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000 },
+        "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
         "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
@@ -1751,10 +1754,12 @@ mod tests {
 
     #[tokio::test]
     async fn plain_chain_seeds_no_identities() {
-        let plain = GENESIS.replace(
-            r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
-            r#""modules": ["bank", "staking"]"#,
-        );
+        let plain = GENESIS
+            .replace(
+                r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
+                r#""modules": ["bank", "staking"]"#,
+            )
+            .replace(r#""personhood_weighted": true"#, r#""personhood_weighted": false"#);
         let node = Node::new(&plain, None).await.unwrap();
         assert!(node.identity.get("qcb1alice").is_err(),
             "without the identity module there is no web of trust to seed");
@@ -1768,6 +1773,16 @@ mod tests {
         );
         let err = Node::new(&bad, None).await.err().expect("must refuse to start");
         assert!(err.to_string().contains("unknown module \"dex\""));
+    }
+
+    #[tokio::test]
+    async fn node_refuses_personhood_consensus_without_identity() {
+        let bad = GENESIS.replace(
+            r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
+            r#""modules": ["bank", "staking"]"#,
+        ); // fixture keeps personhood_weighted: true
+        let err = Node::new(&bad, None).await.err().expect("must refuse to start");
+        assert!(err.to_string().contains("personhood_weighted requires"));
     }
 
     #[tokio::test]
