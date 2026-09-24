@@ -246,6 +246,16 @@ impl Node {
             }
         }
 
+        // Hard error, in every environment: running with a module list the
+        // engine can't honour would mean the chain behaves differently
+        // from what its genesis says.
+        let modules = genesis.enabled_modules().map_err(NodeError::Genesis)?;
+        info!(
+            staking = modules.staking, identity = modules.identity,
+            cirfi = modules.cirfi, agents = modules.agents,
+            "modules enabled"
+        );
+
         info!(
             chain_id    = %genesis.chain_id,
             environment = %genesis.environment.mode,
@@ -396,7 +406,10 @@ impl Node {
         // 3-attestation quorum; only this fixed, small, known founding set
         // skips it, via the same genesis bootstrap path the Phase 0 tests
         // already use (PopAttestation::genesis + verify_identity).
-        for acct in genesis.genesis_accounts.iter().filter(|a| a.role == "validator") {
+        // Only chains running the identity module have a web of trust to seed.
+        let seed_accounts = genesis.genesis_accounts.iter()
+            .filter(|a| modules.identity && a.role == "validator");
+        for acct in seed_accounts {
             let att = chain_forge_identity::PopAttestation::genesis(&acct.address, 0);
             if identity.register(acct.address.clone(), acct.address.clone(), att.clone()).is_ok() {
                 let _ = identity.verify_identity(&acct.address, att);
@@ -427,6 +440,11 @@ impl Node {
             cirfi,
             tx_queue,
         })
+    }
+
+    /// Optional modules this chain runs (API pre-check uses this).
+    pub fn enabled_modules(&self) -> chain_forge_core::EnabledModules {
+        self.genesis.enabled_modules().unwrap_or_default()
     }
 
     /// Whether genesis requires signed transactions (API pre-check uses this).
@@ -1494,7 +1512,7 @@ mod tests {
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
-        "modules": ["bank", "staking"],
+        "modules": ["bank", "staking", "identity", "cirfi", "agents"],
         "custom_modules": [],
         "genesis_accounts": [
             { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator" },
@@ -1729,6 +1747,27 @@ mod tests {
         assert!(Node::is_proposer_for(&vs, 3, 0, &ValidatorId("qcb1dave".into())));
         assert!(Node::is_proposer_for(&vs, 4, 0, &ValidatorId("qcb1alice".into())));
         assert!(!Node::is_proposer_for(&vs, 0, 0, &ValidatorId("qcb1bob".into())));
+    }
+
+    #[tokio::test]
+    async fn plain_chain_seeds_no_identities() {
+        let plain = GENESIS.replace(
+            r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
+            r#""modules": ["bank", "staking"]"#,
+        );
+        let node = Node::new(&plain, None).await.unwrap();
+        assert!(node.identity.get("qcb1alice").is_err(),
+            "without the identity module there is no web of trust to seed");
+    }
+
+    #[tokio::test]
+    async fn node_refuses_to_start_with_an_unknown_module() {
+        let bad = GENESIS.replace(
+            r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
+            r#""modules": ["bank", "dex"]"#,
+        );
+        let err = Node::new(&bad, None).await.err().expect("must refuse to start");
+        assert!(err.to_string().contains("unknown module \"dex\""));
     }
 
     #[tokio::test]

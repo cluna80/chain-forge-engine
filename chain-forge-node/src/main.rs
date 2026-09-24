@@ -145,6 +145,7 @@ async fn main() {
     let precheck      = api::TxPrecheck {
         chain_id:           node.chain_id().to_string(),
         require_signatures: node.require_signatures(),
+        modules:            node.enabled_modules(),
     };
     info!(require_signatures = precheck.require_signatures, "transaction signature enforcement");
     tokio::spawn(async move {

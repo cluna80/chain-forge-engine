@@ -20,7 +20,7 @@
 ///   - Section 8 (merchant payment flow)
 
 use serde::{Deserialize, Serialize};
-use chain_forge_core::{Address, GenesisConfig, HashWidth};
+use chain_forge_core::{Address, EnabledModules, GenesisConfig, HashWidth};
 use chain_forge_crypto::{ClassicalScheme, KeyPair, SchemeId, Signature, SignatureScheme};
 use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
@@ -438,6 +438,9 @@ pub struct ExecutionConfig {
     pub hash_width:      HashWidth,
     /// Enforce signatures and key binding on every transaction.
     pub require_signatures: bool,
+    /// Optional modules this chain runs. Transactions belonging to a
+    /// module that is off are rejected before anything else happens.
+    pub modules: EnabledModules,
 }
 
 impl ExecutionConfig {
@@ -451,6 +454,9 @@ impl ExecutionConfig {
             address_prefix:  genesis.address_prefix.clone(),
             hash_width:      genesis.hash_width().unwrap_or(HashWidth::Bits256),
             require_signatures: genesis.execution.require_signatures,
+            // Fail closed: a genesis with an invalid module list gets no
+            // optional modules. (The node refuses to start on one anyway.)
+            modules: genesis.enabled_modules().unwrap_or_default(),
         }
     }
 }
@@ -483,6 +489,32 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
             }
         }
     }
+}
+
+/// Which optional module a transaction type belongs to, if any. Transfer,
+/// Burn and Custom are core and always allowed.
+pub fn required_module(body: &TxBody) -> Option<&'static str> {
+    match body {
+        TxBody::Transfer { .. } | TxBody::Burn { .. } | TxBody::Custom { .. } => None,
+        TxBody::Stake { .. } => Some("staking"),
+        TxBody::RegisterIdentity | TxBody::Attest { .. } => Some("identity"),
+        TxBody::ClaimUbi { .. } | TxBody::RedirectToUbiPool { .. } => Some("cirfi"),
+        TxBody::SponsorAgent { .. } | TxBody::RevokeAgent { .. } => Some("agents"),
+    }
+}
+
+/// Reject a transaction whose module this chain doesn't run. Stateless, so
+/// the HTTP API applies it at submission as well as the executor.
+pub fn module_check(tx: &Transaction, modules: &EnabledModules) -> Result<(), String> {
+    let Some(name) = required_module(&tx.body) else { return Ok(()) };
+    let on = match name {
+        "staking"  => modules.staking,
+        "identity" => modules.identity,
+        "cirfi"    => modules.cirfi,
+        "agents"   => modules.agents,
+        _ => false,
+    };
+    if on { Ok(()) } else { Err(format!("module \"{name}\" is not enabled on this chain")) }
 }
 
 /// Stateless half of authorization: is `tx.signature` a valid Ed25519
@@ -547,6 +579,9 @@ impl Executor {
             );
         }
 
+        if let Err(e) = module_check(tx, &self.config.modules) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
+        }
         if let Err(e) = verify_authorization(&self.config, tx, state) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
@@ -771,6 +806,9 @@ impl Executor {
             );
         }
 
+        if let Err(e) = module_check(tx, &self.config.modules) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
+        }
         if let Err(e) = verify_authorization(&self.config, tx, state) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
@@ -1015,7 +1053,7 @@ mod tests {
             "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
             "network": { "network_id": "qcb-testnet-1-net", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "both", "max_peers": 50 },
             "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 5000, "mempool_ttl_seconds": 300 },
-            "modules": ["bank", "staking"],
+            "modules": ["bank", "staking", "identity", "cirfi", "agents"],
             "custom_modules": [],
             "genesis_accounts": [
                 { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "user" },
@@ -1146,6 +1184,7 @@ mod tests {
             address_prefix:  "qcb".into(),
             hash_width:      HashWidth::Bits256,
             require_signatures: false,
+            modules:         EnabledModules::all(),
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -1553,5 +1592,57 @@ mod tests {
         let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut cirfi);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("does not match the key bound"));
+    }
+
+    // -- Module gating -----------------------------------------------------------
+
+    fn plain_chain_exec() -> Executor {
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut config = ExecutionConfig::from_genesis(&genesis);
+        config.modules = EnabledModules::default(); // bank only
+        Executor::new(config)
+    }
+
+    #[test]
+    fn plain_chain_rejects_identity_cirfi_agent_and_stake_txs() {
+        let (_, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let exec = plain_chain_exec();
+        let cases = [
+            (Transaction::register_identity("t1", "qcb1alice", 0), "identity"),
+            (Transaction::attest("t2", "qcb1alice", "qcb1bob", 0), "identity"),
+            (Transaction::claim_ubi("t3", "qcb1alice", "qcb1alice", 0), "cirfi"),
+            (Transaction::sponsor_agent("t4", "qcb1alice", "qcb1agent", 0), "agents"),
+        ];
+        for (tx, module) in cases {
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+            assert!(!r.success, "{} must be rejected on a plain chain", tx.id);
+            assert!(r.error.unwrap().contains(&format!("module \"{module}\" is not enabled")));
+        }
+        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 0, "gated txs must not advance the nonce");
+    }
+
+    #[test]
+    fn plain_chain_still_allows_core_transfers() {
+        let (_, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let exec = plain_chain_exec();
+        let tx = Transaction::transfer("t1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        assert!(r.success, "{:?}", r.error);
+    }
+
+    #[test]
+    fn every_tx_type_maps_to_a_known_module_or_core() {
+        let known: Vec<&str> = chain_forge_core::KNOWN_MODULES.iter().map(|(n, _)| *n).collect();
+        let bodies = [
+            TxBody::RegisterIdentity,
+            TxBody::Attest { claimant_id: "x".into() },
+            TxBody::ClaimUbi { identity_id: "x".into() },
+            TxBody::SponsorAgent { agent_address: "x".into() },
+            TxBody::RevokeAgent { agent_address: "x".into() },
+        ];
+        for body in bodies {
+            let m = required_module(&body).expect("gated tx types name their module");
+            assert!(known.contains(&m), "{m} missing from KNOWN_MODULES");
+        }
     }
 }

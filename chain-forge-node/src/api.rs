@@ -23,6 +23,7 @@ use chain_forge_execution::Transaction;
 pub struct TxPrecheck {
     pub chain_id:           String,
     pub require_signatures: bool,
+    pub modules:            chain_forge_core::EnabledModules,
 }
 
 pub async fn serve(
@@ -109,6 +110,16 @@ pub async fn serve(
                         let body = &request[body_start..];
 
                         match serde_json::from_str::<Transaction>(body) {
+                            Ok(tx) if chain_forge_execution::module_check(&tx, &precheck.modules).is_err() => {
+                                let reason = chain_forge_execution::module_check(&tx, &precheck.modules)
+                                    .unwrap_err();
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
                             Ok(tx) if precheck.require_signatures
                                 && chain_forge_execution::verify_signature(&tx, &precheck.chain_id).is_err() => {
                                 let reason = chain_forge_execution::verify_signature(&tx, &precheck.chain_id)

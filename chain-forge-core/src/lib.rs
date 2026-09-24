@@ -226,6 +226,37 @@ pub struct GenesisConfig {
     pub genesis_accounts: Vec<GenesisAccount>,
 }
 
+// -- Modules ----------------------------------------------------------------------
+
+/// Every module name a genesis may list, with what it switches on. This is
+/// the single source of truth: the wizard should offer exactly these, and
+/// the engine refuses any genesis that names something else. A module the
+/// engine silently ignored would be worse than no option at all.
+pub const KNOWN_MODULES: &[(&str, &str)] = &[
+    ("bank",     "accounts, transfers and burns (always on)"),
+    ("staking",  "Stake transactions"),
+    ("identity", "proof of personhood: RegisterIdentity and web-of-trust Attest"),
+    ("cirfi",    "UBI claims and the UBI pool (requires identity)"),
+    ("agents",   "sponsored agents (requires identity)"),
+];
+
+/// Which optional engine modules a chain has switched on. The core (bank:
+/// accounts, transfers, burns) is always on and isn't represented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EnabledModules {
+    pub staking:  bool,
+    pub identity: bool,
+    pub cirfi:    bool,
+    pub agents:   bool,
+}
+
+impl EnabledModules {
+    /// Everything on -- the QCB module set.
+    pub fn all() -> Self {
+        Self { staking: true, identity: true, cirfi: true, agents: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisEnvironment {
     pub mode:           String,   // "devnet" | "testnet" | "mainnet"
@@ -324,6 +355,42 @@ impl GenesisConfig {
 
     /// Validate basic invariants. Returns a list of human-readable errors
     /// so the engine can report all problems at once rather than one at a time.
+    /// Resolve `modules` into EnabledModules, or explain every problem.
+    /// Unlike validate(), whose findings the node only logs, an error here
+    /// must stop the node: it means the chain would run with different
+    /// behaviour than its genesis describes.
+    pub fn enabled_modules(&self) -> Result<EnabledModules, String> {
+        let mut m = EnabledModules::default();
+        let mut errors = Vec::new();
+        let known: Vec<&str> = KNOWN_MODULES.iter().map(|(n, _)| *n).collect();
+
+        for name in &self.modules {
+            match name.as_str() {
+                "bank"     => {}
+                "staking"  => m.staking = true,
+                "identity" => m.identity = true,
+                "cirfi"    => m.cirfi = true,
+                "agents"   => m.agents = true,
+                other => errors.push(format!(
+                    "unknown module \"{other}\" (known modules: {})", known.join(", ")
+                )),
+            }
+        }
+        for name in &self.custom_modules {
+            errors.push(format!(
+                "custom module \"{name}\": Chain Forge does not support custom modules yet; remove it from custom_modules"
+            ));
+        }
+        if m.cirfi && !m.identity {
+            errors.push("module \"cirfi\" requires \"identity\": UBI is paid only to verified humans".into());
+        }
+        if m.agents && !m.identity {
+            errors.push("module \"agents\" requires \"identity\": every agent needs a verified human sponsor".into());
+        }
+
+        if errors.is_empty() { Ok(m) } else { Err(errors.join("; ")) }
+    }
+
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
@@ -514,6 +581,40 @@ mod tests {
         assert_eq!(a1.as_str(), a2.as_str());
         assert_ne!(a1.as_str(), b.as_str());
         assert!(a1.as_str().starts_with("qcb1"));
+    }
+
+    fn with_modules(modules: &[&str], custom: &[&str]) -> GenesisConfig {
+        let mut cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        cfg.modules = modules.iter().map(|s| s.to_string()).collect();
+        cfg.custom_modules = custom.iter().map(|s| s.to_string()).collect();
+        cfg
+    }
+
+    #[test]
+    fn plain_chain_enables_no_optional_modules() {
+        let m = with_modules(&["bank"], &[]).enabled_modules().unwrap();
+        assert_eq!(m, EnabledModules::default());
+    }
+
+    #[test]
+    fn qcb_module_set_enables_everything() {
+        let m = with_modules(&["bank", "staking", "identity", "cirfi", "agents"], &[]).enabled_modules().unwrap();
+        assert_eq!(m, EnabledModules::all());
+    }
+
+    #[test]
+    fn unknown_and_custom_modules_are_refused() {
+        let e = with_modules(&["bank", "dex"], &[]).enabled_modules().unwrap_err();
+        assert!(e.contains("unknown module \"dex\""));
+        let e = with_modules(&["bank"], &["my_thing"]).enabled_modules().unwrap_err();
+        assert!(e.contains("does not support custom modules"));
+    }
+
+    #[test]
+    fn modules_that_need_identity_are_refused_without_it() {
+        let e = with_modules(&["bank", "cirfi", "agents"], &[]).enabled_modules().unwrap_err();
+        assert!(e.contains("\"cirfi\" requires \"identity\""));
+        assert!(e.contains("\"agents\" requires \"identity\""));
     }
 
     #[test]
