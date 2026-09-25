@@ -662,6 +662,10 @@ impl Executor {
                         ) {
                             acct.attach_charm(record.charm.clone());
                         }
+                        // Charm and tier are now in the account; propagate
+                        // the change to the Merkle leaf so the state root
+                        // reflects the new tier and light clients can verify it.
+                        state.refresh_leaf(&tx.sender);
                     })
                     .map_err(|e| e.to_string())
             }
@@ -694,6 +698,13 @@ impl Executor {
                         ) {
                             acct.attach_charm(record.charm.clone());
                         }
+                        // Propagate the charm/tier change to the Merkle leaf.
+                        // Without this, a quorum of attestations that upgrades
+                        // a claimant from Provisional to Verified changes the
+                        // IdentityStore and the AccountState but never reaches
+                        // the state root — so light clients and external
+                        // verifiers can't trust what tier they read.
+                        state.refresh_leaf(claimant_id);
                     })
                     .map_err(|e| e.to_string())
             }
@@ -1601,6 +1612,60 @@ mod tests {
         let mut config = ExecutionConfig::from_genesis(&genesis);
         config.modules = EnabledModules::default(); // bank only
         Executor::new(config)
+    }
+
+    #[test]
+    fn charm_and_tier_reach_state_root_after_register_and_attest() {
+        // This test catches the bug where attach_charm() updated AccountState
+        // but refresh_leaf() was never called, so the state root never changed
+        // after identity transactions even though the account data did.
+        //
+        // setup_with_identity() seeds qcb1alice as already Verified, so we
+        // use fresh addresses: qcb1newcomer as the claimant and qcb1alice
+        // (already Verified) as one of the three attesters.
+        use chain_forge_identity::{IdentityStore, PopAttestation};
+        use chain_forge_cirfi::CirfiEngine;
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let exec = Executor::new(config);
+
+        // Seed three Verified attesters in the identity store.
+        let mut identity = IdentityStore::new(0);
+        for name in ["qcb1alice", "qcb1bob", "qcb1carol"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att).unwrap();
+        }
+        let mut cirfi = CirfiEngine::new("ucirfi".into(), "uqcb".into());
+
+        let root_before = state.commit(0, 0, false).root_hash;
+
+        // Register newcomer -- should change the state root (Provisional charm attached).
+        let reg = Transaction::register_identity("t-reg", "qcb1newcomer", 0);
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi);
+        assert!(r.success, "registration failed: {:?}", r.error);
+        let root_after_reg = state.commit(0, 0, false).root_hash;
+        assert_ne!(root_before, root_after_reg,
+            "state root must change when RegisterIdentity attaches a Provisional charm");
+
+        // Three attestations trigger the quorum upgrade to Verified.
+        // sender = the Verified attester vouching; claimant_id = newcomer.
+        for (i, attester) in ["qcb1alice", "qcb1bob", "qcb1carol"].iter().enumerate() {
+            let attest = Transaction::attest(
+                &format!("t-attest-{i}"), attester, "qcb1newcomer", 0
+            );
+            let r = exec.execute_tx_with_identity(&attest, &mut state, &mut identity, &mut cirfi);
+            assert!(r.success, "attest {i} failed: {:?}", r.error);
+        }
+        let root_after_verify = state.commit(0, 0, false).root_hash;
+        assert_ne!(root_after_reg, root_after_verify,
+            "state root must change when Attest upgrades a claimant from Provisional to Verified");
+
+        let acct = state.get_account("qcb1newcomer").expect("account must exist");
+        assert!(acct.charm.is_some(), "verified account must have a charm");
     }
 
     #[test]
