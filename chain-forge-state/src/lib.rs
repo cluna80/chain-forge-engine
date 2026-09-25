@@ -522,6 +522,19 @@ impl StateStore {
         tracing::info!(height = snapshot.height, "state restored from snapshot");
     }
 
+    /// Export the current state as a snapshot for persistence to disk.
+    /// Unlike commit() snapshots (which require take_snapshot=true), this
+    /// always exports — used by the node's persistence layer after each block.
+    pub fn export_snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            height:    self.height,
+            root_hash: self.roots.last()
+                .map(|r| r.root_hash.clone())
+                .unwrap_or_default(),
+            accounts: self.accounts.clone(),
+        }
+    }
+
     /// Iterator over all accounts in the store.
     pub fn all_accounts(&self) -> impl Iterator<Item = &AccountState> {
         self.accounts.values()

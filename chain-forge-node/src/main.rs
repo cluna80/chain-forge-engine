@@ -39,6 +39,8 @@ struct Args {
     /// Path to this validator's key file (*.key.json). Required for signing
     /// proposals and votes on a real multi-node network.
     key_file: Option<std::path::PathBuf>,
+    /// Directory to persist state between restarts. If absent, state is lost on shutdown.
+    data_dir: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -48,6 +50,7 @@ fn parse_args() -> Args {
     let mut api_port = 8080u16;
     let mut p2p_port: Option<u16> = None;
     let mut key_file: Option<std::path::PathBuf> = None;
+    let mut data_dir: Option<std::path::PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -72,6 +75,10 @@ fn parse_args() -> Args {
                     p2p_port = args[i].parse().ok();
                 }
             }
+            "--data-dir" | "-d" => {
+                i += 1;
+                if i < args.len() { data_dir = Some(std::path::PathBuf::from(&args[i])); }
+            }
             "--key-file" | "-k" => {
                 i += 1;
                 if i < args.len() { key_file = Some(std::path::PathBuf::from(&args[i])); }
@@ -83,6 +90,7 @@ fn parse_args() -> Args {
                 println!("  --api-port <port>    HTTP API port (default: 8080)");
                 println!("  --p2p-port <port>    Override P2P bind port from genesis");
                 println!("  --key-file <path>    Path to this validator's *.key.json file (for signing)");
+                println!("  --data-dir <path>    Directory to persist chain state (default: memory-only)");
                 println!("                       (needed to run multiple local nodes)");
                 std::process::exit(0);
             }
@@ -91,7 +99,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { genesis_path, validator_address, api_port, p2p_port, key_file }
+    Args { genesis_path, validator_address, api_port, p2p_port, key_file, data_dir }
 }
 
 #[tokio::main]
@@ -156,6 +164,20 @@ async fn main() {
         require_signatures: node.require_signatures(),
         modules:            node.enabled_modules(),
     };
+    // Set the data directory for state persistence.
+    if let Some(ref dir) = args.data_dir {
+        match node.set_data_dir(dir.clone()) {
+            Ok(()) => {
+                if node.load_persisted_state() {
+                    info!(dir = %dir.display(), "resumed from persisted state");
+                } else {
+                    info!(dir = %dir.display(), "no persisted state found — starting from genesis");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not set data dir — running memory-only"),
+        }
+    }
+
     // Load the validator signing key if one was supplied.
     if let Some(ref path) = args.key_file {
         if let Err(e) = node.load_signing_key(path) {

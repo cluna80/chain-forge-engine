@@ -253,6 +253,7 @@ pub enum BmeSource {
 /// The full CirFi monetary engine.
 /// Holds demurrage tiers, UBI pool, and BME engine.
 /// Called once per epoch by the node to process all accounts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CirfiEngine {
     pub tiers:      Vec<DemurrageTier>,
     pub ubi_pool:   UbiPool,

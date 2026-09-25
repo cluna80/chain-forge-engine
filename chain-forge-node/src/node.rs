@@ -176,6 +176,9 @@ pub struct Node {
     /// This node's validator identity. None = observer node (no voting).
     validator_id: Option<ValidatorId>,
     /// Pending transactions waiting to be proposed in the next block.
+    /// Directory for persisting chain state between restarts.
+    /// If None the node runs in memory-only mode (state lost on restart).
+    data_dir: Option<std::path::PathBuf>,
     /// Ed25519 keypair for signing proposals and votes. None for observer nodes.
     signing_key: Option<KeyPair>,
     mempool:   Vec<Transaction>,
@@ -447,6 +450,7 @@ impl Node {
             explorer,
             cirfi_metrics,
             peers,
+            data_dir: None,
             signing_key: None,
             validator_id,
             mempool: Vec::new(),
@@ -564,6 +568,69 @@ impl Node {
         tracing::info!(address = %address, "validator signing key loaded");
         self.signing_key = Some(kp);
         Ok(())
+    }
+
+    /// Set the data directory for state persistence.
+    /// Creates the persist subdirectory if needed. Safe to call before
+    /// any blocks are committed; the first commit writes the initial files.
+    pub fn set_data_dir(&mut self, dir: std::path::PathBuf) -> Result<(), String> {
+        let persist = dir.join("persist");
+        std::fs::create_dir_all(&persist)
+            .map_err(|e| format!("cannot create persist dir {:?}: {e}", persist))?;
+        self.data_dir = Some(dir);
+        Ok(())
+    }
+
+    /// Write chain state to disk. Called after every committed block.
+    /// Writes three JSON files: state snapshot, identity store, CirFi engine.
+    fn persist_state(&self) {
+        let Some(ref dir) = self.data_dir else { return };
+        let persist = dir.join("persist");
+        let snap    = self.state.export_snapshot();
+        for (name, value) in [
+            ("state.json",    serde_json::to_string_pretty(&snap)        .ok()),
+            ("identity.json", serde_json::to_string_pretty(&self.identity).ok()),
+            ("cirfi.json",    serde_json::to_string_pretty(&self.cirfi)   .ok()),
+        ] {
+            if let Some(json) = value {
+                let _ = std::fs::write(persist.join(name), json);
+            }
+        }
+        tracing::debug!(height = snap.height, "state persisted to disk");
+    }
+
+    /// Load chain state from disk. Returns true if state was found and loaded.
+    /// On success, the node resumes from the last persisted height.
+    pub fn load_persisted_state(&mut self) -> bool {
+        let Some(ref dir) = self.data_dir else { return false };
+        let persist = dir.join("persist");
+        let snap_path  = persist.join("state.json");
+        let id_path    = persist.join("identity.json");
+        let cirfi_path = persist.join("cirfi.json");
+        if !snap_path.exists() { return false; }
+
+        let mut load = || -> Result<(), Box<dyn std::error::Error>> {
+            let snap: chain_forge_state::StateSnapshot =
+                serde_json::from_str(&std::fs::read_to_string(&snap_path)?)?;
+            let height = snap.height;
+            self.state.restore_snapshot(snap);
+
+            if id_path.exists() {
+                self.identity = serde_json::from_str(&std::fs::read_to_string(&id_path)?)?;
+            }
+            if cirfi_path.exists() {
+                self.cirfi = serde_json::from_str(&std::fs::read_to_string(&cirfi_path)?)?;
+            }
+            tracing::info!(height, "chain state loaded from disk");
+            Ok(())
+        };
+        match load() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not load persisted state — starting from genesis");
+                false
+            }
+        }
     }
 
     /// Add a transaction to the mempool. Returns true only if it was newly
@@ -1321,6 +1388,10 @@ impl Node {
         // keeps every committed block permanently, so a peer that falls
         // behind has something to actually request and replay.
         self.chain_store.insert(committed_height, (cert, proposal.clone()));
+
+        // Write state to disk so a restarted node resumes from this height
+        // rather than replaying from genesis. No-op when data_dir is None.
+        self.persist_state();
 
         Ok(())
     }

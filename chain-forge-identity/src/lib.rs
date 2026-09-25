@@ -537,6 +537,7 @@ impl UbiClock {
 ///   - One UBI claim per verified identity per epoch
 ///   - Agent sponsorship bounded by identity tier
 ///   - Liveness enforcement gates continued rights
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityStore {
     records:  HashMap<String, IdentityRecord>,
     /// Index: address -> identity_id for fast lookup by account address.
