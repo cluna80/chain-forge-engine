@@ -1,16 +1,20 @@
-﻿[package]
-name = "chain-forge-consensus"
+[package]
+name    = "chain-forge-consensus"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
+chain-forge-crypto = { path = "../chain-forge-crypto", features = ["real-crypto"], optional = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
 async-trait = { workspace = true }
-tracing = { workspace = true }
+tracing     = { workspace = true }
+
+[features]
+real-crypto = ["chain-forge-crypto"]
 
 [dev-dependencies]
 tokio = { workspace = true }

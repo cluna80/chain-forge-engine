@@ -15,6 +15,9 @@
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "real-crypto")]
+use chain_forge_crypto::{ClassicalScheme, KeyPair, Signature, SchemeId, SignatureScheme};
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// All errors the consensus layer can produce.
@@ -96,14 +99,15 @@ impl std::fmt::Display for ValidatorId {
 pub struct ValidatorInfo {
     pub id: ValidatorId,
 
-    /// Relative voting power. Consensus safety requires that no Byzantine
-    /// subset exceeds 1/3 of total_power across the set.
+    /// Relative voting power.
     pub voting_power: u64,
 
-    /// Whether this validator's identity has been PoP-verified. Used by
-    /// the personhood-weighted variant to enforce per-human power caps.
-    /// Ignored by PoA and plain-PoS variants.
+    /// Whether PoP-verified (used by personhood-weighted variant).
     pub pop_verified: bool,
+
+    /// Ed25519 public key for this validator. Used to verify signatures on
+    /// proposals and votes. Empty on chains without real-crypto.
+    pub public_key: Vec<u8>,
 }
 
 /// The complete validator set at a given block height.
@@ -135,6 +139,12 @@ impl ValidatorSet {
             .find(|v| &v.id == id)
             .map(|v| v.voting_power)
             .unwrap_or(0)
+    }
+
+    /// Ed25519 public key for a validator. Empty if not registered.
+    pub fn public_key_of(&self, id: &ValidatorId) -> &[u8] {
+        self.validators.iter().find(|v| &v.id == id)
+            .map(|v| v.public_key.as_slice()).unwrap_or(&[])
     }
 
     /// True if the given set of votes (validator → power) meets the quorum.
@@ -209,6 +219,42 @@ pub struct Vote {
 }
 
 // ── Commit certificate ────────────────────────────────────────────────────────
+
+// ── Signing bytes ──────────────────────────────────────────────────────────────────────
+
+/// Bytes a proposer signs for `BlockProposal::signature`.
+/// Domain-separated with chain_id to prevent cross-chain replay.
+pub fn proposal_signing_bytes(
+    chain_id: &str, height: BlockHeight, round: Round,
+    block_hash: &BlockHash, parent_hash: &BlockHash,
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFP|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(&height.to_le_bytes());
+    b.extend_from_slice(&round.to_le_bytes());
+    b.extend_from_slice(block_hash.0.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(parent_hash.0.as_bytes());
+    b
+}
+
+/// Bytes a validator signs for `Vote::signature`.
+pub fn vote_signing_bytes(
+    chain_id: &str, vote_type: &VoteType, height: BlockHeight, round: Round,
+    block_hash: Option<&BlockHash>,
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFV|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.push(match vote_type { VoteType::Prevote => 0, VoteType::Precommit => 1, VoteType::Nil => 2 });
+    b.extend_from_slice(&height.to_le_bytes());
+    b.extend_from_slice(&round.to_le_bytes());
+    if let Some(bh) = block_hash { b.extend_from_slice(bh.0.as_bytes()); }
+    b
+}
 
 /// Proof that a block was committed: the block hash plus the set of
 /// pre-commit votes whose combined power meets quorum.
@@ -354,6 +400,10 @@ pub trait ConsensusEngine: Send + Sync {
 
     /// Return the current validator set (may change between epochs).
     fn validator_set(&self) -> &ValidatorSet;
+
+    /// Replace the validator set (used to backfill public keys after loading key files).
+    /// Default is a no-op so existing impls compile without change.
+    fn update_validator_set(&mut self, _vs: ValidatorSet) -> Result<(), ConsensusError> { Ok(()) }
 
     /// Called by the node when it is this validator's turn to propose.
     /// Returns a `BlockProposal` ready to broadcast to peers.
@@ -816,6 +866,7 @@ mod tests {
                     id: ValidatorId(format!("val_{i}")),
                     voting_power: p,
                     pop_verified: true,
+                    public_key: vec![],
                 })
                 .collect(),
         }
@@ -957,6 +1008,11 @@ impl RoundVotes {
 
 /// Tendermint-style BFT engine.
 pub struct TendermintEngine {
+    /// This validator's Ed25519 signing keypair. None for observer nodes.
+    #[cfg(feature = "real-crypto")]
+    signing_key: Option<KeyPair>,
+    /// Chain ID for domain-separating signed messages.
+    chain_id: String,
     config:         Option<ConsensusConfig>,
     validator_set:  Option<ValidatorSet>,
     height:         BlockHeight,
@@ -975,6 +1031,9 @@ pub struct TendermintEngine {
 impl TendermintEngine {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "real-crypto")]
+            signing_key:      None,
+            chain_id:         String::new(),
             config:           None,
             validator_set:    None,
             height:           0,
@@ -984,6 +1043,18 @@ impl TendermintEngine {
             votes:            BTreeMap::new(),
             current_proposal: None,
         }
+    }
+
+    /// Set the signing key for this validator. Called by the node at startup
+    /// when a key file is loaded. Does nothing without the real-crypto feature.
+    #[cfg(feature = "real-crypto")]
+    pub fn set_signing_key(&mut self, key: KeyPair, chain_id: String) {
+        self.signing_key = Some(key);
+        self.chain_id = chain_id;
+    }
+    #[cfg(not(feature = "real-crypto"))]
+    pub fn set_signing_key(&mut self, _key: (), chain_id: String) {
+        self.chain_id = chain_id;
     }
 
     /// Determine the proposer for a given (height, round) by round-robin over
@@ -1115,6 +1186,11 @@ impl ConsensusEngine for TendermintEngine {
             .expect("validator_set() called before init()")
     }
 
+    fn update_validator_set(&mut self, vs: ValidatorSet) -> Result<(), ConsensusError> {
+        self.validator_set = Some(vs);
+        Ok(())
+    }
+
     async fn propose(
         &mut self,
         height: BlockHeight,
@@ -1146,6 +1222,15 @@ impl ConsensusEngine for TendermintEngine {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        // Sign before moving parent_hash into the struct.
+        #[cfg(feature = "real-crypto")]
+        let signature = if let Some(ref kp) = self.signing_key {
+            let bytes = proposal_signing_bytes(&self.chain_id, height, round, &block_hash, &parent_hash);
+            ClassicalScheme.sign(&bytes, kp).map(|s| s.bytes).unwrap_or_default()
+        } else { vec![] };
+        #[cfg(not(feature = "real-crypto"))]
+        let signature = vec![];
+
         let proposal = BlockProposal {
             height,
             round,
@@ -1154,7 +1239,7 @@ impl ConsensusEngine for TendermintEngine {
             parent_hash,
             timestamp_ms: now_ms,
             tx_data,
-            signature: vec![], // TODO: sign with validator key (crypto layer)
+            signature,
         };
 
         debug!(
@@ -1189,7 +1274,26 @@ impl ConsensusEngine for TendermintEngine {
             )));
         }
 
-        // TODO: verify proposer signature once crypto layer is wired up.
+        // Verify the proposer's signature if we have the crypto feature and
+        // the proposal carries a non-empty signature.
+        #[cfg(feature = "real-crypto")]
+        if !proposal.signature.is_empty() {
+            let vs = self.validator_set.as_ref()
+                .ok_or_else(|| ConsensusError::Internal("no validator set".into()))?;
+            let pub_key = vs.public_key_of(&proposal.proposer);
+            if !pub_key.is_empty() {
+                let msg = proposal_signing_bytes(
+                    &self.chain_id, proposal.height, proposal.round,
+                    &proposal.block_hash, &proposal.parent_hash,
+                );
+                let sig = Signature { scheme: SchemeId::Classical, bytes: proposal.signature.clone() };
+                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_|
+                    ConsensusError::MalformedProposal(format!(
+                        "invalid signature from proposer {}", proposal.proposer
+                    ))
+                )?;
+            }
+        }
 
         // Locking rule: if we are locked on a block, only accept proposals
         // for that block (or if we see a valid-block polka that unlocks us).
@@ -1230,7 +1334,23 @@ impl ConsensusEngine for TendermintEngine {
             return Err(ConsensusError::UnknownValidator(vote.validator.clone()));
         }
 
-        // TODO: verify vote signature once crypto layer is wired up.
+        // Verify the vote's signature if we have the crypto feature.
+        #[cfg(feature = "real-crypto")]
+        if !vote.signature.is_empty() {
+            let vs = self.validator_set.as_ref()
+                .ok_or_else(|| ConsensusError::Internal("no validator set".into()))?;
+            let pub_key = vs.public_key_of(&vote.validator);
+            if !pub_key.is_empty() {
+                let msg = vote_signing_bytes(
+                    &self.chain_id, &vote.vote_type, vote.height, vote.round,
+                    vote.block_hash.as_ref(),
+                );
+                let sig = Signature { scheme: SchemeId::Classical, bytes: vote.signature.clone() };
+                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_|
+                    ConsensusError::UnknownValidator(vote.validator.clone())
+                )?;
+            }
+        }
 
         let round_votes = self.votes.entry(vote.round).or_default();
 
@@ -1822,6 +1942,7 @@ mod tests {
                     id: ValidatorId(format!("val_{i:02}")),
                     voting_power: 1,
                     pop_verified: true,
+                    public_key: vec![],
                 })
                 .collect(),
         };
@@ -2052,6 +2173,7 @@ mod tests {
                 id:           ValidatorId(format!("fba_val_{i}")),
                 voting_power: 1,
                 pop_verified: true,
+                    public_key: vec![],
             }).collect(),
         }
     }
@@ -2225,9 +2347,9 @@ mod tests {
         let validators = ValidatorSet {
             height: 0,
             validators: vec![
-                ValidatorInfo { id: ValidatorId("big".into()), voting_power: 10, pop_verified: true },
-                ValidatorInfo { id: ValidatorId("v2".into()),  voting_power: 1,  pop_verified: true },
-                ValidatorInfo { id: ValidatorId("v3".into()),  voting_power: 1,  pop_verified: true },
+                ValidatorInfo { id: ValidatorId("big".into()), voting_power: 10, pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("v2".into()),  voting_power: 1,  pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("v3".into()),  voting_power: 1,  pop_verified: true, public_key: vec![] },
             ],
         };
         engine.init(config, validators).await.unwrap();
@@ -2277,6 +2399,7 @@ mod tests {
                 id:           ValidatorId(format!("hs_val_{i}")),
                 voting_power: 1,
                 pop_verified: true,
+                    public_key: vec![],
             }).collect(),
         }
     }
@@ -2479,10 +2602,10 @@ mod tests {
         let validators = ValidatorSet {
             height: 0,
             validators: vec![
-                ValidatorInfo { id: ValidatorId("hs_big".into()), voting_power: 10, pop_verified: true },
-                ValidatorInfo { id: ValidatorId("hs_v2".into()),  voting_power: 1,  pop_verified: true },
-                ValidatorInfo { id: ValidatorId("hs_v3".into()),  voting_power: 1,  pop_verified: true },
-                ValidatorInfo { id: ValidatorId("hs_v4".into()),  voting_power: 1,  pop_verified: true },
+                ValidatorInfo { id: ValidatorId("hs_big".into()), voting_power: 10, pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("hs_v2".into()),  voting_power: 1,  pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("hs_v3".into()),  voting_power: 1,  pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("hs_v4".into()),  voting_power: 1,  pop_verified: true, public_key: vec![] },
             ],
         };
         engine.init(config, validators).await.unwrap();

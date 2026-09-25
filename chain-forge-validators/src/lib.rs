@@ -688,6 +688,7 @@ impl ValidatorRegistry {
                 id:           r.id.clone(),
                 voting_power: r.consensus_power(),
                 pop_verified: r.pop_verified,
+            public_key: vec![],
             })
             .collect();
 

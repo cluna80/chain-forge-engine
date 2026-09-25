@@ -36,6 +36,9 @@ struct Args {
     /// one node locally on the same machine for a local multi-node testnet --
     /// each instance must bind a distinct port even though they share genesis.
     p2p_port: Option<u16>,
+    /// Path to this validator's key file (*.key.json). Required for signing
+    /// proposals and votes on a real multi-node network.
+    key_file: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -44,6 +47,7 @@ fn parse_args() -> Args {
     let mut validator_address = None;
     let mut api_port = 8080u16;
     let mut p2p_port: Option<u16> = None;
+    let mut key_file: Option<std::path::PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -68,12 +72,17 @@ fn parse_args() -> Args {
                     p2p_port = args[i].parse().ok();
                 }
             }
+            "--key-file" | "-k" => {
+                i += 1;
+                if i < args.len() { key_file = Some(std::path::PathBuf::from(&args[i])); }
+            }
             "--help" | "-h" => {
                 println!("chain-forge-node");
                 println!("  --genesis <path>     Path to genesis.json (default: genesis.json)");
                 println!("  --validator <addr>   This node's validator address");
                 println!("  --api-port <port>    HTTP API port (default: 8080)");
                 println!("  --p2p-port <port>    Override P2P bind port from genesis");
+                println!("  --key-file <path>    Path to this validator's *.key.json file (for signing)");
                 println!("                       (needed to run multiple local nodes)");
                 std::process::exit(0);
             }
@@ -82,7 +91,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { genesis_path, validator_address, api_port, p2p_port }
+    Args { genesis_path, validator_address, api_port, p2p_port, key_file }
 }
 
 #[tokio::main]
@@ -147,6 +156,13 @@ async fn main() {
         require_signatures: node.require_signatures(),
         modules:            node.enabled_modules(),
     };
+    // Load the validator signing key if one was supplied.
+    if let Some(ref path) = args.key_file {
+        if let Err(e) = node.load_signing_key(path) {
+            tracing::warn!(path = %path.display(), error = %e, "could not load key file — node will run as observer");
+        }
+    }
+
     info!(require_signatures = precheck.require_signatures, "transaction signature enforcement");
     tokio::spawn(async move {
         api::serve(api_port, status, explorer, cirfi_metrics, peers, tx_queue, precheck).await;

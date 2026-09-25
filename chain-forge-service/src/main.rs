@@ -275,6 +275,14 @@ async fn create_chain(body: &str, cfg: &Config, chains: &Chains) -> (u16, Value)
                 .arg("--validator").arg(validator)
                 .arg("--api-port").arg(api_port.to_string())
                 .arg("--p2p-port").arg(p2p_port.to_string())
+                // Pass the key file if the service generated one for this validator.
+                // Named accounts (those with pre-supplied public_key in genesis) will
+                // have their key file in the keys/ directory under the chain dir.
+                .args({
+                    let key_path = dir.join("keys").join(format!("{validator}.key.json"));
+                    if key_path.exists() { vec!["--key-file".into(), key_path.to_string_lossy().to_string()] }
+                    else { vec![] }
+})
                 .env("RUST_LOG", "info")
                 .env("NO_COLOR", "1")
                 .stdout(log).stderr(err)

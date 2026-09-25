@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn, error};
 
 use chain_forge_core::{GenesisConfig, HashWidth};
+use chain_forge_crypto::{ClassicalScheme, KeyPair, SchemeId, Signature, SignatureScheme};
+use chain_forge_consensus::{proposal_signing_bytes, vote_signing_bytes};
 use chain_forge_consensus::{
     ConsensusConfig, ConsensusVariant, PersonhoodConfig,
     ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, BlockProposal, Vote, VoteType,
@@ -174,6 +176,8 @@ pub struct Node {
     /// This node's validator identity. None = observer node (no voting).
     validator_id: Option<ValidatorId>,
     /// Pending transactions waiting to be proposed in the next block.
+    /// Ed25519 keypair for signing proposals and votes. None for observer nodes.
+    signing_key: Option<KeyPair>,
     mempool:   Vec<Transaction>,
     /// Proposals seen but not yet committed, keyed by (height, round).
     /// Needed because a CommitCertificate carries only the block_hash, not
@@ -276,12 +280,22 @@ impl Node {
         let validators: Vec<ValidatorInfo> = genesis.genesis_accounts
             .iter()
             .filter(|a| a.role == "validator")
-            .map(|a| ValidatorInfo {
-                id: ValidatorId(a.address.clone()),
-                voting_power: 1,
-                // Genesis validators are the seeded verified identities --
-                // but only a chain with an identity layer has any.
-                pop_verified: modules.identity,
+            .map(|a| {
+                // Decode the genesis public key (hex) if present. This is
+                // what lets vote/proposal signature verification work from
+                // block 0 without any out-of-band key exchange.
+                let public_key = a.public_key.as_deref().and_then(|hex| {
+                    if hex.len() % 2 != 0 { return None; }
+                    (0..hex.len()).step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i+2], 16).ok())
+                        .collect::<Option<Vec<u8>>>()
+                }).unwrap_or_default();
+                ValidatorInfo {
+                    id: ValidatorId(a.address.clone()),
+                    voting_power: 1,
+                    pop_verified: modules.identity,
+                    public_key,
+                }
             })
             .collect();
 
@@ -297,6 +311,7 @@ impl Node {
                     id: ValidatorId(format!("synthetic-val-{i:02}")),
                     voting_power: 1,
                     pop_verified: true,
+                    public_key: vec![],
                 });
             }
         }
@@ -432,6 +447,7 @@ impl Node {
             explorer,
             cirfi_metrics,
             peers,
+            signing_key: None,
             validator_id,
             mempool: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
@@ -481,6 +497,73 @@ impl Node {
 
     pub fn tx_queue(&self) -> SharedTxQueue {
         self.tx_queue.clone()
+    }
+
+    /// Sign a Vote with this node's key, domain-separated by chain_id.
+    /// No-op (leaves signature empty) if no signing key is loaded.
+    fn sign_vote(&self, vote: &mut Vote) {
+        let Some(ref kp) = self.signing_key else { return };
+        let chain_id = self.genesis.chain_id.as_str();
+        let bytes = vote_signing_bytes(
+            chain_id, &vote.vote_type, vote.height, vote.round,
+            vote.block_hash.as_ref(),
+        );
+        if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
+            vote.signature = sig.bytes;
+        }
+    }
+
+    /// Sign a BlockProposal with this node's key.
+    fn sign_proposal(&self, proposal: &mut BlockProposal) {
+        let Some(ref kp) = self.signing_key else { return };
+        let chain_id = self.genesis.chain_id.as_str();
+        let bytes = proposal_signing_bytes(
+            chain_id, proposal.height, proposal.round,
+            &proposal.block_hash, &proposal.parent_hash,
+        );
+        if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
+            proposal.signature = sig.bytes;
+        }
+    }
+
+    /// Load a validator key file and bind it to this node.
+    /// Called from main.rs when --key-file is supplied.
+    pub fn load_signing_key(&mut self, path: &std::path::Path) -> Result<(), String> {
+        fn hex_decode(s: &str) -> Option<Vec<u8>> {
+            let s = s.trim();
+            if s.len() % 2 != 0 { return None; }
+            (0..s.len()).step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
+                .collect()
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read key file {:?}: {e}", path))?;
+        let k: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("bad JSON in key file {:?}: {e}", path))?;
+        let field = |name: &str| k[name].as_str()
+            .ok_or_else(|| format!("key file {:?} missing field '{name}'", path))
+            .and_then(|s| hex_decode(s)
+                .ok_or_else(|| format!("key file {:?}: '{name}' is not valid hex", path)));
+        let kp = KeyPair {
+            scheme:      SchemeId::Classical,
+            public_key:  field("public_key")?,
+            private_key: field("private_key")?,
+        };
+        // Bind the keypair to the consensus layer so it can verify peer keys
+        // Look up this validator's address from the key file to match genesis
+        let address = k["address"].as_str()
+            .unwrap_or_default().to_string();
+        // Backfill the public key into the consensus ValidatorSet so that
+        // peer validators can verify our proposals and votes immediately.
+        let my_id = chain_forge_consensus::ValidatorId(address.clone());
+        let mut vs = self.consensus.validator_set().clone();
+        if let Some(vi) = vs.validators.iter_mut().find(|v| v.id == my_id) {
+            vi.public_key = kp.public_key.clone();
+            self.consensus.update_validator_set(vs).ok();
+        }
+        tracing::info!(address = %address, "validator signing key loaded");
+        self.signing_key = Some(kp);
+        Ok(())
     }
 
     /// Add a transaction to the mempool. Returns true only if it was newly
@@ -706,7 +789,8 @@ impl Node {
                             match self.consensus.on_timeout(height, round).await {
                                 Ok(nil_vote_template) => {
                                     warn!(height, round, "round timed out waiting for quorum, advancing round");
-                                    let nil_vote = Vote { validator: my_id.clone(), ..nil_vote_template };
+                                    let mut nil_vote = Vote { validator: my_id.clone(), ..nil_vote_template };
+                                    self.sign_vote(&mut nil_vote);
                                     let _ = self.network.publish(OutboundMessage {
                                         topic:   GossipTopic::ConsensusVote,
                                         payload: serde_json::to_vec(&nil_vote).unwrap_or_default(),
@@ -1035,7 +1119,8 @@ impl Node {
         // than cycling through every intermediate round one at a time.
         if let Ok(nil_vote_template) = self.consensus.on_timeout(height, their_round - 1).await {
             if let Some(my_id) = self.validator_id.clone() {
-                let nil_vote = Vote { validator: my_id, ..nil_vote_template };
+                let mut nil_vote = Vote { validator: my_id, ..nil_vote_template };
+                self.sign_vote(&mut nil_vote);
                 let _ = self.network.publish(OutboundMessage {
                     topic:   GossipTopic::ConsensusVote,
                     payload: serde_json::to_vec(&nil_vote).unwrap_or_default(),
@@ -1737,10 +1822,10 @@ mod tests {
         let vs = ValidatorSet {
             height: 0,
             validators: vec![
-                ValidatorInfo { id: ValidatorId("qcb1alice".into()), voting_power: 1, pop_verified: true },
-                ValidatorInfo { id: ValidatorId("qcb1bob".into()),   voting_power: 1, pop_verified: true },
-                ValidatorInfo { id: ValidatorId("qcb1carol".into()), voting_power: 1, pop_verified: true },
-                ValidatorInfo { id: ValidatorId("qcb1dave".into()),  voting_power: 1, pop_verified: true },
+                ValidatorInfo { id: ValidatorId("qcb1alice".into()), voting_power: 1, pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("qcb1bob".into()),   voting_power: 1, pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("qcb1carol".into()), voting_power: 1, pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("qcb1dave".into()),  voting_power: 1, pop_verified: true, public_key: vec![] },
             ],
         };
         // Sorted order: alice, bob, carol, dave -- rotates by (height+round) % 4.
