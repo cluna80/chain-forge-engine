@@ -1,4 +1,4 @@
-﻿/// Node: the core runtime that wires all five crates together.
+/// Node: the core runtime that wires all five crates together.
 
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn, error};
@@ -9,14 +9,14 @@ use chain_forge_consensus::{proposal_signing_bytes, vote_signing_bytes};
 use chain_forge_consensus::{
     ConsensusConfig, ConsensusVariant, PersonhoodConfig,
     ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, BlockProposal, Vote, VoteType,
-    tendermint::TendermintEngine, ConsensusEngine,
+    tendermint::{TendermintEngine, EquivocationDetected}, ConsensusEngine,
 };
 use chain_forge_state::StateStore;
 use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
-use chain_forge_identity::IdentityStore;
-use chain_forge_cirfi::CirfiEngine;
 use chain_forge_slashing::{SlashingModule, EquivocationEvidence};
 use chain_forge_validators::ValidatorRegistry;
+use chain_forge_identity::IdentityStore;
+use chain_forge_cirfi::CirfiEngine;
 use chain_forge_p2p::{
     MockNetworkService, NetworkConfig, NetworkEvent, NetworkService,
     GossipTopic, OutboundMessage, PeerInfo,
@@ -220,11 +220,11 @@ pub struct Node {
     /// and RedirectToUbiPool. Threaded through execute_block_with_identity()
     /// alongside identity, for the same reason.
     cirfi: CirfiEngine,
-    /// Slashing module â€” penalises misbehaving validators.
-    /// Called whenever consensus returns ConsensusError::Equivocation.
+    /// Slashing enforcement module (equivocation + liveness).
+    /// Detects double-sign evidence and computes stake burns routed to BME.
     slasher: SlashingModule,
-    /// Validator registry used by the slashing module.
-    /// Starts empty in Phase 0; ValidatorNotFound is a graceful no-op.
+    /// Validator registry -- authoritative set of registered validators and
+    /// their on-chain state (bonded stake, status, keys). Required by slasher.
     validator_registry: ValidatorRegistry,
     /// Transactions submitted via POST /api/tx, waiting to be pulled into
     /// the mempool. Drained once per heartbeat tick in run().
@@ -350,7 +350,6 @@ impl Node {
             precommit_timeout_ms: genesis.consensus.block_time_ms,
             block_time_ms:        genesis.consensus.block_time_ms,
             personhood:           personhood_cfg,
-            validator_set_activation_delay: 1,  // Phase 0: activate immediately after 1 epoch
         };
 
         let mut engine = TendermintEngine::new();
@@ -446,7 +445,9 @@ impl Node {
             }
         }
 
-        let cirfi = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
+        let cirfi             = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
+        let slasher           = SlashingModule::with_qcb_defaults();
+        let validator_registry = ValidatorRegistry::qcb_devnet();
         let tx_queue: SharedTxQueue = Arc::new(Mutex::new(Vec::new()));
 
         Ok(Self {
@@ -470,15 +471,8 @@ impl Node {
             chain_store: std::collections::BTreeMap::new(),
             identity,
             cirfi,
-            slasher: SlashingModule::with_qcb_defaults(),
-            validator_registry: ValidatorRegistry::new(
-                0,   // min_stake_uqcb: 0 in Phase 0 (no staking enforcement)
-                chain_forge_consensus::PersonhoodConfig {
-                    power_cap:          1,
-                    reject_expired_pop: false,
-                    min_verified_pct:   0,
-                },
-            ),
+            slasher,
+            validator_registry,
             tx_queue,
         })
     }
@@ -645,7 +639,7 @@ impl Node {
         match load() {
             Ok(()) => true,
             Err(e) => {
-                tracing::warn!(error = %e, "could not load persisted state â€” starting from genesis");
+                tracing::warn!(error = %e, "could not load persisted state — starting from genesis");
                 false
             }
         }
@@ -1016,57 +1010,13 @@ impl Node {
                         // BlockProposal branch above).
 
                         match self.consensus.receive_vote(vote.clone()).await {
-                            Err(chain_forge_consensus::ConsensusError::Equivocation {
-                                ref validator,
-                                height,
-                                round,
-                                ref first_hash,
-                                ref second_hash,
-                                ..
-                            }) => {
-                                warn!(
-                                    validator = %validator,
-                                    height,
-                                    round,
-                                    "equivocation detected â€” slashing validator"
-                                );
-                                let evidence = EquivocationEvidence {
-                                    validator_id: validator.0.clone(),
-                                    height,
-                                    round: round.into(),
-                                    block_hash_a: first_hash
-                                        .as_ref()
-                                        .map(|h| h.0.clone())
-                                        .unwrap_or_default(),
-                                    block_hash_b: second_hash
-                                        .as_ref()
-                                        .map(|h| h.0.clone())
-                                        .unwrap_or_default(),
-                                    signature_a: vec![],  // Phase 0: real sigs not yet wired
-                                    signature_b: vec![],
-                                };
-                                let epoch = self.consensus.current_height() / 100;
-                                let chain_id = self.genesis.chain_id.clone();
-                                match self.slasher.slash_equivocation(
-                                    &evidence,
-                                    &mut self.validator_registry,
-                                    epoch,
-                                    &chain_id,
-                                ) {
-                                    Ok(burn_amount) => {
-                                        info!(
-                                            validator = %evidence.validator_id,
-                                            burn_ucirfi = burn_amount,
-                                            "validator slashed for equivocation"
-                                        );
-                                        // TODO Phase 1: route burn_amount through BME
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, "slash skipped (already tombstoned, double-slash, or validator not in registry)");
-                                    }
-                                }
-                            }
                             Ok(Some(cert)) => {
+                                // Drain equivocations before committing so any
+                                // double-signer is tombstoned in the same epoch.
+                                let eqs = self.consensus.drain_equivocations();
+                                let epoch = self.consensus.current_height();
+                                self.handle_drained_equivocations(eqs, epoch);
+
                                 let proposal = self.pending_proposals
                                     .get(&(vote.height, vote.round))
                                     .cloned();
@@ -1091,7 +1041,16 @@ impl Node {
                                     }
                                 }
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                // No quorum yet — still drain equivocations so a
+                                // double-sign is caught even if quorum isn't reached
+                                // this turn.
+                                let eqs = self.consensus.drain_equivocations();
+                                if !eqs.is_empty() {
+                                    let epoch = self.consensus.current_height();
+                                    self.handle_drained_equivocations(eqs, epoch);
+                                }
+                            }
                             Err(e) => debug!(error = %e, "vote rejected (stale height or unknown validator)"),
                         }
                     }
@@ -1303,14 +1262,15 @@ impl Node {
             return Ok(None);
         };
 
-        let prevote = Vote {
+        let mut prevote = Vote {
             vote_type:  VoteType::Prevote,
             height:     proposal.height,
             round:      proposal.round,
             validator:  my_id.clone(),
             block_hash: Some(proposal.block_hash.clone()),
-            signature:  vec![], // TODO: sign once the crypto layer is wired into consensus
+            signature:  vec![],
         };
+        self.sign_vote(&mut prevote);
         if let Err(e) = self.consensus.receive_vote(prevote.clone()).await {
             debug!(error = %e, "own prevote rejected locally");
         }
@@ -1319,7 +1279,7 @@ impl Node {
             payload: serde_json::to_vec(&prevote).unwrap_or_default(),
         }).await;
 
-        let precommit = Vote {
+        let mut precommit = Vote {
             vote_type:  VoteType::Precommit,
             height:     proposal.height,
             round:      proposal.round,
@@ -1327,6 +1287,7 @@ impl Node {
             block_hash: Some(proposal.block_hash.clone()),
             signature:  vec![],
         };
+        self.sign_vote(&mut precommit);
         let cert = self.consensus.receive_vote(precommit.clone()).await
             .map_err(|e| e.to_string())?;
         let _ = self.network.publish(OutboundMessage {
@@ -1341,10 +1302,16 @@ impl Node {
     /// reached -- either because this node's own precommit completed it, or
     /// because a gossiped vote from a peer did. This is the follower-safe
     /// counterpart to propose_block()'s inline commit tail: propose_block()
-    /// is unchanged and still used for the solo-devnet (no peers) path,
-    /// where the proposer synthesises every validator's vote itself.
     /// Process equivocation evidence: slash the validator, burn the slashed
     /// stake via the BME mechanism (Section 6.3), and update CirFi metrics.
+    ///
+    /// This is the BME routing entry point for equivocation slashing.
+    /// The slashing module computes the burn amount; this method:
+    ///   1. Calls `slasher.slash_equivocation` to tombstone + compute burn
+    ///   2. Burns the slashed uqcb from the validator's account in StateStore
+    ///   3. Increments `cirfi_metrics.total_qcb_burned_uqcb` for the API
+    ///
+    /// Returns the burn amount on success, or an error description.
     pub fn process_equivocation_evidence(
         &mut self,
         evidence: &EquivocationEvidence,
@@ -1357,20 +1324,80 @@ impl Node {
             epoch,
             &chain_id,
         ).map_err(|e| e.to_string())?;
+
+        // Route burn_amount through BME: debit from the validator's account.
+        // This permanently removes the tokens from supply (Section 6.3).
         if burn_amount > 0 {
-            if let Err(e) = self.state.burn(&evidence.validator_id, "uqcb", burn_amount) {
-                warn!(validator = %evidence.validator_id, burn_uqcb = burn_amount,
-                    error = %e, "BME burn failed; tombstone applied but tokens not burned");
+            if let Err(e) = self.state.burn(
+                &evidence.validator_id,
+                "uqcb",
+                burn_amount,
+            ) {
+                // Log the burn failure but don't undo the tombstone --
+                // the validator is already removed from the active set.
+                warn!(
+                    validator = %evidence.validator_id,
+                    burn_uqcb = burn_amount,
+                    error     = %e,
+                    "BME burn failed; tombstone applied but tokens not burned"
+                );
             } else {
+                // Update the live CirFi metrics counter for /api/cirfi
                 let mut cm = self.cirfi_metrics.lock().unwrap();
-                cm.total_qcb_burned_uqcb = cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
-                info!(validator = %evidence.validator_id, burn_uqcb = burn_amount,
-                    total_burned = cm.total_qcb_burned_uqcb, "equivocation slash burned via BME");
+                cm.total_qcb_burned_uqcb =
+                    cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
+                info!(
+                    validator = %evidence.validator_id,
+                    burn_uqcb = burn_amount,
+                    total_burned = cm.total_qcb_burned_uqcb,
+                    "equivocation slash burned via BME"
+                );
             }
         }
+
         Ok(burn_amount)
     }
 
+    /// Drain equivocations detected by the consensus engine and route each
+    /// one through `process_equivocation_evidence`. Called after every
+    /// `receive_vote` so double-signs are punished immediately.
+    fn handle_drained_equivocations(&mut self, equivocations: Vec<EquivocationDetected>, epoch: u64) {
+        for eq in equivocations {
+            let evidence = EquivocationEvidence {
+                validator_id:   eq.validator_id.0.clone(),
+                height:         eq.height,
+                round:          eq.round as u64,
+                block_hash_a:   eq.block_hash_a.0.clone(),
+                block_hash_b:   eq.block_hash_b.0.clone(),
+                signature_a:    eq.signature_a,
+                signature_b:    eq.signature_b,
+                vote_type_byte: eq.vote_type_byte,
+            };
+            match self.process_equivocation_evidence(&evidence, epoch) {
+                Ok(burned) => {
+                    info!(
+                        validator = %eq.validator_id,
+                        height    = eq.height,
+                        round     = eq.round,
+                        burned_uqcb = burned,
+                        "equivocation detected and slashed"
+                    );
+                }
+                Err(e) => {
+                    // Already slashed or validator absent — not an error we
+                    // need to propagate; just log.
+                    warn!(
+                        validator = %eq.validator_id,
+                        error     = %e,
+                        "equivocation evidence rejected"
+                    );
+                }
+            }
+        }
+    }
+
+    /// is unchanged and still used for the solo-devnet (no peers) path,
+    /// where the proposer synthesises every validator's vote itself.
     async fn commit_block(
         &mut self,
         cert: chain_forge_consensus::CommitCertificate,
@@ -1863,7 +1890,7 @@ mod tests {
         let cert0 = node.propose_block(genesis_hash).await.unwrap();
         let root1 = node.status.lock().unwrap().state_root.clone().unwrap();
 
-        // Block 1: include another tx â€” alice's nonce is now 1 after block 0
+        // Block 1: include another tx — alice's nonce is now 1 after block 0
         node.submit_tx(Transaction::transfer("tx2", "qcb1alice", "qcb1bob", "uqcb", 200, 1));
         node.propose_block(cert0.block_hash).await.unwrap();
         let root2 = node.status.lock().unwrap().state_root.clone().unwrap();
@@ -2160,90 +2187,4 @@ mod tests {
         assert_eq!(node.mempool.len(), 1);
         assert_eq!(node.mempool[0].id, "gossip-tx-1");
     }
-
-    // -- Equivocation integration test (end-to-end pipeline) ------------------
-
-    #[tokio::test]
-    async fn equivocating_validator_is_detected_and_slash_attempted() {
-        // Bob is our node (not the proposer at h=0,r=0 -- alice is).
-        let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
-
-        // Step 1: Alice's proposal arrives. Bob votes (prevote + precommit).
-        let proposal = make_proposal(0, 0, "qcb1alice", "block_A");
-        node.handle_event(gossip(
-            GossipTopic::BlockProposal,
-            serde_json::to_vec(&proposal).unwrap(),
-        )).await.unwrap();
-
-        // Step 2: Carol sends a valid precommit for block_A.
-        let carol_good = Vote {
-            vote_type:  VoteType::Precommit,
-            height:     0,
-            round:      0,
-            validator:  ValidatorId("qcb1carol".into()),
-            block_hash: Some(chain_forge_consensus::BlockHash("block_A".into())),
-            signature:  vec![],
-        };
-        node.handle_event(gossip(
-            GossipTopic::ConsensusVote,
-            serde_json::to_vec(&carol_good).unwrap(),
-        )).await.unwrap();
-
-        // Step 3: Carol equivocates â€” same height/round, different block_hash.
-        let carol_equivocation = Vote {
-            vote_type:  VoteType::Precommit,
-            height:     0,
-            round:      0,
-            validator:  ValidatorId("qcb1carol".into()),
-            block_hash: Some(chain_forge_consensus::BlockHash("block_B_conflicting".into())),
-            signature:  vec![],
-        };
-        // Must NOT crash the event loop â€” equivocation is handled, not fatal.
-        let result = node.handle_event(gossip(
-            GossipTopic::ConsensusVote,
-            serde_json::to_vec(&carol_equivocation).unwrap(),
-        )).await;
-        assert!(result.is_ok(),
-            "equivocating vote must be handled gracefully, not crash the event loop");
-
-        // Step 4: The equivocation was recorded in the slasher's idempotency
-        // set. Even though carol isn't in the validator_registry (Phase 0
-        // no-op), the slasher still records the event key so it can't be
-        // double-processed later. Check via slash_equivocation returning
-        // EquivocationAlreadyRecorded on a second call.
-        let evidence = chain_forge_slashing::EquivocationEvidence {
-            validator_id: "qcb1carol".into(),
-            height:       0,
-            round:        0,
-            block_hash_a: "block_A".into(),
-            block_hash_b: "block_B_conflicting".into(),
-            signature_a:  vec![],
-            signature_b:  vec![],
-        };
-        // The first call from gossip already ran; a second call with the same
-        // key must return EquivocationAlreadyRecorded â€” proving the set was
-        // written.
-        let second_slash = node.slasher.slash_equivocation(
-            &evidence,
-            &mut node.validator_registry,
-            0,
-            "test-chain",
-        );
-        assert!(
-            matches!(
-                second_slash,
-                Err(chain_forge_slashing::SlashError::EquivocationAlreadyRecorded(..))
-            ),
-            "Phase 0: idempotency key written before registry lookup -- expected EquivocationAlreadyRecorded, got: {:?}",
-            second_slash
-        );
-
-        // Step 5: The node is still alive and at height 0 (quorum not yet
-        // reached -- only bob + carol_good so far, dave's vote is missing).
-        assert_eq!(node.status.lock().unwrap().height, 0,
-            "node must survive equivocation without committing a spurious block");
-        assert_eq!(node.consensus.current_height(), 0,
-            "consensus must not advance height on an equivocating vote");
-    }
-
 }

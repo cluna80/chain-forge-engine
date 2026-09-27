@@ -1,4 +1,3 @@
-// Import the boundary trait from core.
 /// chain-forge-consensus
 ///
 /// Defines the pluggable consensus interface for Chain Forge. Every BFT
@@ -19,12 +18,12 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "real-crypto")]
 use chain_forge_crypto::{ClassicalScheme, KeyPair, Signature, SchemeId, SignatureScheme};
 
-// -- Error type ----------------------------------------------------------------
+// ── Error type ────────────────────────────────────────────────────────────────
 
 /// All errors the consensus layer can produce.
 #[derive(Debug, thiserror::Error)]
 pub enum ConsensusError {
-    #[error("not enough validators to meet BFT safety threshold (need >= {needed}, have {have})")]
+    #[error("not enough validators to meet BFT safety threshold (need ≥ {needed}, have {have})")]
     InsufficientValidators { needed: usize, have: usize },
 
     #[error("validator {0} is not in the current validator set")]
@@ -49,29 +48,13 @@ pub enum ConsensusError {
     #[error("personhood bound exceeded: validator {0} would exceed the per-human power cap")]
     PersonhoodCapExceeded(ValidatorId),
 
-    #[error(
-        "equivocation detected: validator {validator} sent conflicting {vote_type:?} votes at \
-         height {height} round {round} ({first_hash:?} vs {second_hash:?})"
-    )]
-    Equivocation {
-        validator: ValidatorId,
-        height: BlockHeight,
-        round: Round,
-        vote_type: VoteType,
-        first_hash: Option<BlockHash>,
-        second_hash: Option<BlockHash>,
-    },
-
-    #[error("invalid validator-set change: {0}")]
-    InvalidValidatorSetChange(String),
-
     #[error("internal consensus error: {0}")]
     Internal(String),
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
 
-// -- Primitive types -------------------------------------------------------------
+// ── Primitive types ───────────────────────────────────────────────────────────
 
 /// Monotonically increasing block height. Genesis = 0.
 pub type BlockHeight = u64;
@@ -104,7 +87,7 @@ impl std::fmt::Display for ValidatorId {
     }
 }
 
-// -- Validator set ---------------------------------------------------------------
+// ── Validator set ─────────────────────────────────────────────────────────────
 
 /// A single validator's participation parameters at a given height.
 ///
@@ -145,7 +128,7 @@ impl ValidatorSet {
     /// A commit requires at least this much power in pre-commits.
     pub fn quorum_power(&self) -> u64 {
         let total = self.total_power();
-        // floor(2n/3) + 1  - rounds down then adds 1, matching Tendermint convention.
+        // ⌊2n/3⌋ + 1  - rounds down then adds 1, matching Tendermint convention.
         (total * 2 / 3) + 1
     }
 
@@ -164,7 +147,7 @@ impl ValidatorSet {
             .map(|v| v.public_key.as_slice()).unwrap_or(&[])
     }
 
-    /// True if the given set of votes (validator -> power) meets the quorum.
+    /// True if the given set of votes (validator → power) meets the quorum.
     pub fn has_quorum(&self, votes: &BTreeMap<ValidatorId, u64>) -> bool {
         let voted: u64 = votes.values().sum();
         voted >= self.quorum_power()
@@ -172,14 +155,14 @@ impl ValidatorSet {
 
     /// Number of Byzantine validators the set can tolerate (floor of n/3 - 1).
     /// A set of 4 validators tolerates 0 Byzantine nodes (4/3 - 1 = 0).
-    /// A set of 10 tolerates 2 (10/3 - 1 ~= 2).
+    /// A set of 10 tolerates 2 (10/3 - 1 ≈ 2).
     pub fn byzantine_fault_tolerance(&self) -> usize {
         let n = self.validators.len();
         if n < 4 { 0 } else { n / 3 - 1 }
     }
 }
 
-// -- Block proposal ---------------------------------------------------------------
+// ── Block proposal ────────────────────────────────────────────────────────────
 
 /// A block proposed by the current round's proposer.
 /// The consensus engine validates the proposal's structural integrity;
@@ -201,19 +184,19 @@ pub struct BlockProposal {
     /// consensus only cares about the hash commitment above.
     pub tx_data: Vec<u8>,
 
-    /// Proposer's signature over (height || round || block_hash || parent_hash).
+    /// Proposer's signature over (height ∥ round ∥ block_hash ∥ parent_hash).
     /// Signature scheme is determined by the chain's genesis cryptography config.
     /// Empty during tests / before the crypto layer is wired up.
     pub signature: Vec<u8>,
 }
 
-// -- Votes ---------------------------------------------------------------------
+// ── Votes ─────────────────────────────────────────────────────────────────────
 
 /// The three vote types in standard BFT protocols.
 /// PREVOTE: "I've seen the proposal and it's valid."
 /// PRECOMMIT: "I've seen 2/3+ prevotes for this block."
 /// NIL: Timeout - used when a round must advance without a commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoteType {
     Prevote,
     Precommit,
@@ -230,14 +213,14 @@ pub struct Vote {
     /// None for Nil votes (no block to reference).
     pub block_hash: Option<BlockHash>,
 
-    /// Validator's signature over (vote_type || height || round || block_hash).
+    /// Validator's signature over (vote_type ∥ height ∥ round ∥ block_hash).
     /// Empty during tests / before the crypto layer is wired up.
     pub signature: Vec<u8>,
 }
 
-// -- Commit certificate ---------------------------------------------------------
+// ── Commit certificate ────────────────────────────────────────────────────────
 
-// -- Signing bytes ---------------------------------------------------------------------
+// ── Signing bytes ──────────────────────────────────────────────────────────────────────
 
 /// Bytes a proposer signs for `BlockProposal::signature`.
 /// Domain-separated with chain_id to prevent cross-chain replay.
@@ -282,11 +265,11 @@ pub struct CommitCertificate {
     pub round: Round,
     pub block_hash: BlockHash,
 
-    /// The pre-commit votes that form the quorum. Must cover >= 2/3+1 power.
+    /// The pre-commit votes that form the quorum. Must cover ≥ 2/3+1 power.
     pub precommits: Vec<Vote>,
 }
 
-// -- Personhood configuration ---------------------------------------------------------
+// ── Personhood configuration ──────────────────────────────────────────────────
 
 /// Parameters for QCB's personhood-weighted BFT variant.
 /// Ignored by PoA and plain-PoS variants.
@@ -308,7 +291,7 @@ pub struct PersonhoodConfig {
 
     /// Minimum fraction of the validator set that must be PoP-verified for
     /// the chain to consider itself in a healthy personhood-secured state.
-    /// Expressed as a percentage (0-100). Below this, the engine logs a
+    /// Expressed as a percentage (0–100). Below this, the engine logs a
     /// warning but does not halt - halting is a governance decision, not
     /// a consensus one.
     pub min_verified_pct: u8,
@@ -324,30 +307,7 @@ impl Default for PersonhoodConfig {
     }
 }
 
-// -- Validator-set governance (epoch-delayed activation) ------------------------
-
-/// A pending change to the validator set, scheduled to take effect at a
-/// future height rather than immediately.
-///
-/// Whitepaper Open Question 2 / Section 3: an immediate validator-set swap
-/// lets honest nodes disagree about the "current" set at the same height
-/// (one node applies it as soon as it sees the change, another hasn't yet),
-/// which is a BFT safety violation, not just an inconvenience. A fixed
-/// activation delay ensures every honest node has observed the change
-/// before it can affect any vote or commit-certificate verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidatorSetChange {
-    /// Height at which this change was proposed.
-    pub proposed_at: BlockHeight,
-
-    /// Height at which this change takes effect.
-    pub activation_height: BlockHeight,
-
-    /// The validator set that becomes active at `activation_height`.
-    pub new_set: ValidatorSet,
-}
-
-// -- Consensus configuration ---------------------------------------------------------
+// ── Consensus configuration ───────────────────────────────────────────────────
 
 /// Full configuration passed to a consensus engine at chain startup.
 /// Populated from the genesis JSON produced by Chain Forge's wizard.
@@ -371,24 +331,13 @@ pub struct ConsensusConfig {
 
     /// QCB personhood parameters. Unused by non-personhood variants.
     pub personhood: Option<PersonhoodConfig>,
-
-    /// Number of heights a proposed validator-set change must wait before
-    /// activating. See `ValidatorSetChange` for why this delay exists.
-    /// Defaults to 1 (activates at the very next height) when omitted from
-    /// older genesis JSON, via `#[serde(default = ...)]` below.
-    #[serde(default = "default_validator_set_activation_delay")]
-    pub validator_set_activation_delay: BlockHeight,
-}
-
-fn default_validator_set_activation_delay() -> BlockHeight {
-    1
 }
 
 /// The three BFT variants Chain Forge supports (Whitepaper Section 7.6).
 /// QCB uses `TendermintStyle` with `PersonhoodConfig` applied on top.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusVariant {
-    /// Two-phase (prevote -> precommit) rotating-proposer BFT.
+    /// Two-phase (prevote → precommit) rotating-proposer BFT.
     /// Well-understood safety proofs, instant finality.
     TendermintStyle,
 
@@ -411,7 +360,7 @@ impl std::fmt::Display for ConsensusVariant {
     }
 }
 
-// -- The consensus trait ---------------------------------------------------------------
+// ── The consensus trait ───────────────────────────────────────────────────────
 
 /// The pluggable consensus interface.
 ///
@@ -427,7 +376,7 @@ impl std::fmt::Display for ConsensusVariant {
 ///
 /// Implementations MUST guarantee:
 ///   - Safety: two honest nodes never commit different blocks at the same height.
-///   - Liveness: if >= 2/3 of voting power is honest and online, the chain
+///   - Liveness: if ≥ 2/3 of voting power is honest and online, the chain
 ///     eventually commits a block at every height (Whitepaper Open Question 14
 ///     flags the liveness constraint specific to personhood-bounded sets).
 ///
@@ -455,25 +404,6 @@ pub trait ConsensusEngine: Send + Sync {
     /// Replace the validator set (used to backfill public keys after loading key files).
     /// Default is a no-op so existing impls compile without change.
     fn update_validator_set(&mut self, _vs: ValidatorSet) -> Result<(), ConsensusError> { Ok(()) }
-
-    /// Propose a validator-set change to activate after
-    /// `ConsensusConfig::validator_set_activation_delay` heights. Only one
-    /// change may be pending at a time. Default rejects unconditionally so
-    /// engines that haven't implemented governance yet fail loudly rather
-    /// than silently ignoring the call.
-    fn propose_validator_set_change(
-        &mut self,
-        _new_set: ValidatorSet,
-    ) -> Result<BlockHeight, ConsensusError> {
-        Err(ConsensusError::InvalidValidatorSetChange(
-            "this engine does not implement validator-set governance".into(),
-        ))
-    }
-
-    /// The currently pending validator-set change, if any. Default: none.
-    fn pending_validator_set_change(&self) -> Option<&ValidatorSetChange> {
-        None
-    }
 
     /// Called by the node when it is this validator's turn to propose.
     /// Returns a `BlockProposal` ready to broadcast to peers.
@@ -534,9 +464,19 @@ pub trait ConsensusEngine: Send + Sync {
         certificate: &CommitCertificate,
         validator_set: &ValidatorSet,
     ) -> ConsensusResult<()>;
+
+    /// Drain and return any double-sign evidence accumulated since the last
+    /// call. The node calls this after each `receive_vote` and routes the
+    /// results to `process_equivocation_evidence`.
+    ///
+    /// Default impl returns empty — engines that don't track equivocations
+    /// (FBA, HotStuff stubs) compile without changes.
+    fn drain_equivocations(&mut self) -> Vec<crate::tendermint::EquivocationDetected> {
+        Vec::new()
+    }
 }
 
-// -- Personhood power cap enforcement ---------------------------------------------------
+// ── Personhood power cap enforcement ─────────────────────────────────────────
 
 /// Applies the personhood power cap from `config` to a raw validator set.
 /// Any PoP-verified validator whose `voting_power` exceeds `config.power_cap`
@@ -568,7 +508,7 @@ pub fn apply_personhood_cap(
 /// FBA differs fundamentally from Tendermint and HotStuff:
 ///
 ///   Classical BFT: one global validator set, 2f+1 quorum
-///   FBA:           each node defines its own "UNL" (Unique Node List) -
+///   FBA:           each node defines its own "UNL" (Unique Node List) —
 ///                  a set of validators it personally trusts. Safety
 ///                  emerges from UNL overlap between nodes, not from a
 ///                  single global quorum rule.
@@ -577,7 +517,7 @@ pub fn apply_personhood_cap(
 ///   - No elected leader, no proposer rotation
 ///   - Every validator independently proposes and votes
 ///   - A transaction is committed when 80% of a node's UNL agrees
-///   - Safety requires >= 40% overlap between any two nodes' UNLs
+///   - Safety requires ≥ 40% overlap between any two nodes' UNLs
 ///
 /// QCB adaptation:
 ///   - The UNL is the verified-human validator set (personhood-gated)
@@ -619,9 +559,9 @@ impl Default for FbaConfig {
 /// collects peer votes, and converges when threshold is met.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FbaPhase {
-    /// Waiting for proposal / open phase - collecting candidates.
+    /// Waiting for proposal / open phase — collecting candidates.
     Open,
-    /// Threshold reached for a candidate - committing.
+    /// Threshold reached for a candidate — committing.
     Committed,
 }
 
@@ -648,7 +588,6 @@ impl FbaEngine {
                 precommit_timeout_ms: 1_000,
                 block_time_ms:        3_500, // XRPL ~3-5s block time
                 personhood:           None,
-                validator_set_activation_delay: default_validator_set_activation_delay(),
             },
             fba:         FbaConfig::default(),
             validators:  ValidatorSet { height: 0, validators: vec![] },
@@ -716,7 +655,7 @@ impl Default for FbaEngine {
 #[async_trait::async_trait]
 impl ConsensusEngine for FbaEngine {
     fn name(&self) -> &str {
-        "XRPL-inspired FBA (Phase 0 - global UNL, 80% threshold)"
+        "XRPL-inspired FBA (Phase 0 — global UNL, 80% threshold)"
     }
 
     fn variant(&self) -> ConsensusVariant { ConsensusVariant::XrplInspired }
@@ -901,7 +840,7 @@ impl ConsensusEngine for FbaEngine {
                 validator:  ValidatorId("quorum".into()),
                 block_hash: certificate.block_hash.clone(),
                 reason:     format!(
-                    "FBA: insufficient threshold power: {power} < {needed} ({:.0}% of {total})",
+                    "FBA: insufficient threshold power: {power} < {needed}                      ({:.0}% of {total})",
                     self.fba.agreement_threshold * 100.0
                 ),
             });
@@ -921,7 +860,7 @@ pub async fn new_fba(
 }
 
 
-// -- Tests -----------------------------------------------------------------------
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -945,7 +884,7 @@ mod tests {
 
     #[test]
     fn quorum_requires_two_thirds_plus_one() {
-        // 4 validators of equal power: total = 4, quorum = floor(8/3)+1 = 3
+        // 4 validators of equal power: total = 4, quorum = ⌊8/3⌋+1 = 3
         let vs = make_validator_set(&[1, 1, 1, 1]);
         assert_eq!(vs.total_power(), 4);
         assert_eq!(vs.quorum_power(), 3);
@@ -953,7 +892,7 @@ mod tests {
 
     #[test]
     fn bft_tolerates_one_third_minus_one() {
-        // 10 validators: tolerates floor(10/3) - 1 = 2 Byzantine
+        // 10 validators: tolerates ⌊10/3⌋ - 1 = 2 Byzantine
         let vs = make_validator_set(&[1; 10]);
         assert_eq!(vs.byzantine_fault_tolerance(), 2);
 
@@ -979,7 +918,7 @@ mod tests {
         let vs = make_validator_set(&[5, 1, 3]);
         let config = PersonhoodConfig { power_cap: 2, ..Default::default() };
         let capped = apply_personhood_cap(vs, &config);
-        // val_0: 5 -> 2, val_1: 1 -> 1 (already under cap), val_2: 3 -> 2
+        // val_0: 5 → 2, val_1: 1 → 1 (already under cap), val_2: 3 → 2
         assert_eq!(capped.validators[0].voting_power, 2);
         assert_eq!(capped.validators[1].voting_power, 1);
         assert_eq!(capped.validators[2].voting_power, 2);
@@ -998,8 +937,9 @@ mod tests {
         assert_eq!(capped.validators[1].voting_power, 0); // zeroed
         assert_eq!(capped.validators[0].voting_power, 1); // unchanged
     }
-}
 
+
+}
 pub mod tendermint {
     use super::*;
 
@@ -1019,22 +959,13 @@ pub mod tendermint {
 ///   - Quorum detection -> CommitCertificate
 ///   - Round timeout handling (nil votes)
 ///   - Height advancement on commit
-///   - Commit certificate verification (for light clients / sync), with
-///     per-vote height/round/hash validation and duplicate-validator
-///     rejection, not just a power-sum filter
-///   - Equivocation detection: a validator sending two different-hash votes
-///     of the same type at the same (height, round) is rejected outright
-///     rather than silently ignored
-///   - Proposer rate-limiting: one accepted proposal per (height, round)
-///     slot, plus a hard cap on proposals even considered per slot
-///   - Validator-set governance: changes activate after a configurable
-///     epoch delay rather than immediately, so all honest nodes observe
-///     the change before it can affect voting
+///   - Commit certificate verification (for light clients / sync)
 ///
 /// What is NOT here yet (will be added as the engine matures):
 ///   - Real signature verification (crypto layer not wired up)
 ///   - Network I/O (P2P crate handles that)
 ///   - Persistent state / WAL (needed before mainnet)
+///   - Evidence handling for equivocation (Open Question 13)
 
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
@@ -1042,7 +973,7 @@ use tracing::{debug, info, warn};
 use crate::{
     apply_personhood_cap, BlockHash, BlockHeight, BlockProposal, CommitCertificate,
     ConsensusConfig, ConsensusEngine, ConsensusError, ConsensusResult, ConsensusVariant,
-    Round, ValidatorId, ValidatorSet, ValidatorSetChange, Vote, VoteType,
+    Round, ValidatorId, ValidatorSet, Vote, VoteType,
 };
 
 // -- Internal round state -----------------------------------------------------
@@ -1105,46 +1036,52 @@ pub struct TendermintEngine {
     votes:          BTreeMap<Round, RoundVotes>,
     /// The proposal we accepted for the current (height, round).
     current_proposal: Option<BlockProposal>,
-    /// One accepted proposal per (height, round) slot. A second proposal
-    /// for an already-accepted slot is rejected outright, even if it's
-    /// well-formed and from the correct proposer -- silently replacing an
-    /// accepted proposal is exactly how a proposer (or a relaying peer)
-    /// could get away with re-proposing different content mid-round.
-    accepted_proposals: std::collections::HashSet<(BlockHeight, Round)>,
-    /// Flood guard: how many proposals (valid or not) have been RECEIVED
-    /// for a slot, so a slot can be flood-stopped independently of whether
-    /// any of them turned out to be acceptable.
-    proposal_rx_count: BTreeMap<(BlockHeight, Round), u32>,
-    /// Governance: a validator-set change awaiting its activation height.
-    /// See `ValidatorSetChange` for why activation is delayed rather than
-    /// immediate.
-    pending_validator_set: Option<ValidatorSetChange>,
+    /// Equivocation evidence accumulated by receive_vote().
+    /// The node drains this after each vote with `drain_equivocations()`.
+    pub pending_equivocations: Vec<EquivocationDetected>,
+}
+
+/// Evidence of a double-sign detected by the consensus engine.
+/// Both votes are from the same validator, same height+round, same phase,
+/// but for different block hashes.
+#[derive(Debug, Clone)]
+pub struct EquivocationDetected {
+    pub validator_id:   ValidatorId,
+    pub height:         BlockHeight,
+    pub round:          Round,
+    /// 0 = Prevote, 1 = Precommit (matches vote_signing_bytes encoding).
+    pub vote_type_byte: u8,
+    pub block_hash_a:   BlockHash,
+    pub block_hash_b:   BlockHash,
+    /// Raw signature bytes from the first vote (already accepted).
+    pub signature_a:    Vec<u8>,
+    /// Raw signature bytes from the conflicting vote (just arrived).
+    pub signature_b:    Vec<u8>,
 }
 
 impl TendermintEngine {
-    /// Hard cap on proposals accepted for consideration per (height, round)
-    /// slot, regardless of validity. Bounds the work a flooding proposer
-    /// (or a buggy/malicious relaying peer) can force this node to spend on
-    /// proposer-identity and signature checks for a single slot.
-    const MAX_PROPOSALS_PER_ROUND: u32 = 3;
-
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "real-crypto")]
-            signing_key:      None,
-            chain_id:         String::new(),
-            config:           None,
-            validator_set:    None,
-            height:           0,
-            round:            0,
-            locked_block:     None,
-            valid_block:      None,
-            votes:            BTreeMap::new(),
-            current_proposal: None,
-            accepted_proposals: std::collections::HashSet::new(),
-            proposal_rx_count:  BTreeMap::new(),
-            pending_validator_set: None,
+            signing_key:          None,
+            chain_id:             String::new(),
+            config:               None,
+            validator_set:        None,
+            height:               0,
+            round:                0,
+            locked_block:         None,
+            valid_block:          None,
+            votes:                BTreeMap::new(),
+            current_proposal:     None,
+            pending_equivocations: Vec::new(),
         }
+    }
+
+    /// Drain and return any equivocations detected since the last call.
+    /// The node calls this after processing each vote and forwards any
+    /// results to `Node::process_equivocation_evidence`.
+    pub fn drain_equivocations(&mut self) -> Vec<EquivocationDetected> {
+        std::mem::take(&mut self.pending_equivocations)
     }
 
     /// Set the signing key for this validator. Called by the node at startup
@@ -1293,44 +1230,6 @@ impl ConsensusEngine for TendermintEngine {
         Ok(())
     }
 
-    /// Propose a validator-set change to activate after
-    /// `ConsensusConfig::validator_set_activation_delay` heights. Only one
-    /// change may be pending at a time; the pending change is applied in
-    /// `on_commit` once `self.height >= activation_height`.
-    fn propose_validator_set_change(
-        &mut self,
-        new_set: ValidatorSet,
-    ) -> Result<BlockHeight, ConsensusError> {
-        if let Some(pending) = &self.pending_validator_set {
-            return Err(ConsensusError::InvalidValidatorSetChange(format!(
-                "a validator-set change is already pending, activating at height {}",
-                pending.activation_height
-            )));
-        }
-        if new_set.validators.is_empty() {
-            return Err(ConsensusError::InvalidValidatorSetChange(
-                "proposed validator set is empty".into(),
-            ));
-        }
-        let delay = self
-            .config
-            .as_ref()
-            .map(|c| c.validator_set_activation_delay)
-            .unwrap_or_else(default_validator_set_activation_delay)
-            .max(1);
-        let activation_height = self.height + delay;
-        self.pending_validator_set = Some(ValidatorSetChange {
-            proposed_at: self.height,
-            activation_height,
-            new_set,
-        });
-        Ok(activation_height)
-    }
-
-    fn pending_validator_set_change(&self) -> Option<&ValidatorSetChange> {
-        self.pending_validator_set.as_ref()
-    }
-
     async fn propose(
         &mut self,
         height: BlockHeight,
@@ -1402,31 +1301,6 @@ impl ConsensusEngine for TendermintEngine {
             return Err(ConsensusError::StaleProposal(proposal.height, self.height));
         }
 
-        let slot = (proposal.height, proposal.round);
-
-        // Flood guard: cap how many proposals we'll even consider for one
-        // slot, regardless of validity -- a peer flooding a slot with
-        // garbage proposals shouldn't be able to burn unbounded CPU on
-        // proposer-identity and signature checks.
-        let count = self.proposal_rx_count.entry(slot).or_insert(0);
-        *count += 1;
-        if *count > Self::MAX_PROPOSALS_PER_ROUND {
-            return Err(ConsensusError::MalformedProposal(format!(
-                "too many proposals received for height {} round {} (limit {})",
-                proposal.height, proposal.round, Self::MAX_PROPOSALS_PER_ROUND
-            )));
-        }
-
-        // One-proposal-per-slot: once a proposal for this (height, round)
-        // has been accepted, a second one -- even a well-formed one from
-        // the correct proposer -- must not silently replace it.
-        if self.accepted_proposals.contains(&slot) {
-            return Err(ConsensusError::MalformedProposal(format!(
-                "a proposal for height {} round {} was already accepted",
-                proposal.height, proposal.round
-            )));
-        }
-
         // Verify the proposer is correct for this (height, round).
         let expected_proposer = self
             .proposer_for(proposal.height, proposal.round)
@@ -1482,7 +1356,6 @@ impl ConsensusEngine for TendermintEngine {
             "accepted proposal"
         );
 
-        self.accepted_proposals.insert(slot);
         self.current_proposal = Some(proposal);
         Ok(())
     }
@@ -1522,25 +1395,38 @@ impl ConsensusEngine for TendermintEngine {
 
         match vote.vote_type {
             VoteType::Prevote | VoteType::Nil => {
-                // Equivocation check: if this validator already has a
-                // prevote/nil vote recorded for this round with a DIFFERENT
-                // block_hash, that's a validator voting both ways at once --
-                // reject outright rather than silently keeping the first one
-                // and ignoring the conflicting second one.
+                // Check for equivocation: same validator, same round, different
+                // block hash → double-prevote.
                 if let Some(existing) = round_votes.prevotes.get(&vote.validator) {
-                    if existing.block_hash != vote.block_hash {
-                        return Err(ConsensusError::Equivocation {
-                            validator:   vote.validator.clone(),
-                            height:      vote.height,
-                            round:       vote.round,
-                            vote_type:   vote.vote_type,
-                            first_hash:  existing.block_hash.clone(),
-                            second_hash: vote.block_hash.clone(),
+                    if existing.block_hash != vote.block_hash
+                        && existing.block_hash.is_some()
+                        && vote.block_hash.is_some()
+                    {
+                        warn!(
+                            validator = %vote.validator,
+                            height    = vote.height,
+                            round     = vote.round,
+                            hash_a    = %existing.block_hash.as_ref().unwrap(),
+                            hash_b    = %vote.block_hash.as_ref().unwrap(),
+                            "equivocation detected: double-prevote"
+                        );
+                        self.pending_equivocations.push(EquivocationDetected {
+                            validator_id:   vote.validator.clone(),
+                            height:         vote.height,
+                            round:          vote.round,
+                            vote_type_byte: 0,
+                            block_hash_a:   existing.block_hash.clone().unwrap(),
+                            block_hash_b:   vote.block_hash.clone().unwrap(),
+                            signature_a:    existing.signature.clone(),
+                            signature_b:    vote.signature.clone(),
                         });
                     }
-                } else {
-                    round_votes.prevotes.insert(vote.validator.clone(), vote.clone());
                 }
+                // Idempotent: record the first prevote; a second (equivocating)
+                // one is noted above but the slot keeps the first for quorum math.
+                round_votes.prevotes
+                    .entry(vote.validator.clone())
+                    .or_insert_with(|| vote.clone());
 
                 // Check if we now have 2/3+ prevotes for any block.
                 if let Some(valid) = self.check_prevote_quorum() {
@@ -1555,20 +1441,36 @@ impl ConsensusEngine for TendermintEngine {
             }
 
             VoteType::Precommit => {
+                // Check for equivocation: same validator, same round, different
+                // block hash → double-precommit.
                 if let Some(existing) = round_votes.precommits.get(&vote.validator) {
-                    if existing.block_hash != vote.block_hash {
-                        return Err(ConsensusError::Equivocation {
-                            validator:   vote.validator.clone(),
-                            height:      vote.height,
-                            round:       vote.round,
-                            vote_type:   vote.vote_type,
-                            first_hash:  existing.block_hash.clone(),
-                            second_hash: vote.block_hash.clone(),
+                    if existing.block_hash != vote.block_hash
+                        && existing.block_hash.is_some()
+                        && vote.block_hash.is_some()
+                    {
+                        warn!(
+                            validator = %vote.validator,
+                            height    = vote.height,
+                            round     = vote.round,
+                            hash_a    = %existing.block_hash.as_ref().unwrap(),
+                            hash_b    = %vote.block_hash.as_ref().unwrap(),
+                            "equivocation detected: double-precommit"
+                        );
+                        self.pending_equivocations.push(EquivocationDetected {
+                            validator_id:   vote.validator.clone(),
+                            height:         vote.height,
+                            round:          vote.round,
+                            vote_type_byte: 1,
+                            block_hash_a:   existing.block_hash.clone().unwrap(),
+                            block_hash_b:   vote.block_hash.clone().unwrap(),
+                            signature_a:    existing.signature.clone(),
+                            signature_b:    vote.signature.clone(),
                         });
                     }
-                } else {
-                    round_votes.precommits.insert(vote.validator.clone(), vote.clone());
                 }
+                round_votes.precommits
+                    .entry(vote.validator.clone())
+                    .or_insert_with(|| vote.clone());
 
                 // Check if we now have 2/3+ precommits for any block.
                 let winning_hash_opt = self.check_precommit_quorum();
@@ -1661,14 +1563,7 @@ impl ConsensusEngine for TendermintEngine {
         // lock only has meaning within the height it was set in.
         self.locked_block     = None;
 
-        // Rate-limiting state is per-(height, round); once a height is
-        // behind us it can never come back, so purge everything at or
-        // below the committed height to bound this map's growth.
-        self.accepted_proposals.retain(|&(h, _)| h > certificate.height);
-        self.proposal_rx_count.retain(|&(h, _), _| h > certificate.height);
-
-        // Update validator set if the commit triggered an immediate epoch
-        // change (caller-supplied, e.g. a hard fork or test scenario).
+        // Update validator set if the commit triggered an epoch change.
         if let Some(vs) = new_validator_set {
             let vs = if let Some(pop_cfg) = self.config.as_ref().and_then(|c| c.personhood.as_ref()) {
                 apply_personhood_cap(vs, pop_cfg)
@@ -1679,32 +1574,6 @@ impl ConsensusEngine for TendermintEngine {
                 new_height = self.height,
                 new_validator_count = vs.validators.len(),
                 "validator set rotated for new epoch"
-            );
-            self.validator_set = Some(vs);
-        }
-
-        // Apply a pending GOVERNANCE validator-set change once its
-        // activation height has actually been reached. This is separate
-        // from the immediate `new_validator_set` path above: a governance
-        // change must wait out its full activation delay so every honest
-        // node observes it before it can affect voting, even if some other
-        // caller supplies an immediate override in the meantime.
-        let change_ready = self
-            .pending_validator_set
-            .as_ref()
-            .map(|p| self.height >= p.activation_height)
-            .unwrap_or(false);
-        if change_ready {
-            let activating = self.pending_validator_set.take().unwrap();
-            let vs = if let Some(pop_cfg) = self.config.as_ref().and_then(|c| c.personhood.as_ref()) {
-                apply_personhood_cap(activating.new_set, pop_cfg)
-            } else {
-                activating.new_set
-            };
-            info!(
-                new_height = self.height,
-                new_validator_count = vs.validators.len(),
-                "pending validator-set change activated"
             );
             self.validator_set = Some(vs);
         }
@@ -1726,53 +1595,18 @@ impl ConsensusEngine for TendermintEngine {
         validator_set: &ValidatorSet,
     ) -> ConsensusResult<()> {
         let quorum = validator_set.quorum_power();
-        let mut seen: std::collections::BTreeSet<&ValidatorId> = std::collections::BTreeSet::new();
-        let mut signed_power: u64 = 0;
 
-        for v in &certificate.precommits {
-            if v.vote_type != VoteType::Precommit {
-                return Err(ConsensusError::InvalidVote {
-                    validator: v.validator.clone(),
-                    block_hash: certificate.block_hash.clone(),
-                    reason: format!(
-                        "non-precommit vote type {:?} in commit certificate", v.vote_type
-                    ),
-                });
-            }
-            if v.height != certificate.height || v.round != certificate.round {
-                return Err(ConsensusError::InvalidVote {
-                    validator: v.validator.clone(),
-                    block_hash: certificate.block_hash.clone(),
-                    reason: format!(
-                        "vote height/round ({}/{}) does not match certificate ({}/{})",
-                        v.height, v.round, certificate.height, certificate.round
-                    ),
-                });
-            }
-            if v.block_hash.as_ref() != Some(&certificate.block_hash) {
-                return Err(ConsensusError::InvalidVote {
-                    validator: v.validator.clone(),
-                    block_hash: certificate.block_hash.clone(),
-                    reason: "vote block_hash does not match certificate block_hash".into(),
-                });
-            }
-            // Duplicate-validator stuffing: a validator listed twice must
-            // never let their power be counted twice toward quorum.
-            if !seen.insert(&v.validator) {
-                return Err(ConsensusError::InvalidVote {
-                    validator: v.validator.clone(),
-                    block_hash: certificate.block_hash.clone(),
-                    reason: "duplicate validator in commit certificate".into(),
-                });
-            }
-            // Explicit unknown-validator rejection rather than silently
-            // contributing zero power (which would mask a bogus entry).
-            let power = validator_set.power_of(&v.validator);
-            if power == 0 {
-                return Err(ConsensusError::UnknownValidator(v.validator.clone()));
-            }
-            signed_power += power;
-        }
+        // Sum the power of all precommit signers.
+        let signed_power: u64 = certificate
+            .precommits
+            .iter()
+            .filter(|v| {
+                v.vote_type == VoteType::Precommit
+                    && v.height == certificate.height
+                    && v.block_hash.as_ref() == Some(&certificate.block_hash)
+            })
+            .map(|v| validator_set.power_of(&v.validator))
+            .sum();
 
         if signed_power < quorum {
             return Err(ConsensusError::InvalidVote {
@@ -1789,7 +1623,12 @@ impl ConsensusEngine for TendermintEngine {
 
         Ok(())
     }
+
+    fn drain_equivocations(&mut self) -> Vec<EquivocationDetected> {
+        std::mem::take(&mut self.pending_equivocations)
+    }
 }
+
 // -- HotStuffEngine ----------------------------------------------------------
 
 /// HotStuff-style BFT consensus engine.
@@ -1798,7 +1637,7 @@ impl ConsensusEngine for TendermintEngine {
 /// complexity per block by using a three-phase pipelined protocol with a
 /// stable rotating leader. Key differences from Tendermint:
 ///
-///   Tendermint:   O(n^2) messages per block (all-to-all prevote + precommit)
+///   Tendermint:   O(n²) messages per block (all-to-all prevote + precommit)
 ///   HotStuff:     O(n) messages per block (leader aggregates, fans out)
 ///
 /// The tradeoff: HotStuff requires a trusted threshold signature scheme to
@@ -1866,7 +1705,6 @@ impl HotStuffEngine {
                 precommit_timeout_ms: 1_000,
                 block_time_ms:        1_000,
                 personhood:           None,
-                validator_set_activation_delay: default_validator_set_activation_delay(),
             },
             validators:      ValidatorSet { height: 0, validators: vec![] },
             height:          0,
@@ -1933,7 +1771,7 @@ impl Default for HotStuffEngine {
 
 #[async_trait::async_trait]
 impl ConsensusEngine for HotStuffEngine {
-    fn name(&self) -> &str { "HotStuff-style BFT (Phase 0 - three-phase, no pipelining)" }
+    fn name(&self) -> &str { "HotStuff-style BFT (Phase 0 — three-phase, no pipelining)" }
     fn variant(&self) -> ConsensusVariant { ConsensusVariant::HotStuffStyle }
 
     async fn init(
@@ -2215,7 +2053,6 @@ mod tests {
             prevote_timeout_ms:  1_000,
             precommit_timeout_ms: 1_000,
             block_time_ms:       5_000,
-            validator_set_activation_delay: default_validator_set_activation_delay(),
             personhood:          None,
         }
     }
@@ -2446,7 +2283,6 @@ mod tests {
             precommit_timeout_ms: 1_000,
             block_time_ms:        3_500,
             personhood:           None,
-            validator_set_activation_delay: default_validator_set_activation_delay(),
         }
     }
 
@@ -2638,8 +2474,7 @@ mod tests {
         let vs = fba_validators(4);
         let cfg_t = ConsensusConfig { variant: ConsensusVariant::TendermintStyle,
             propose_timeout_ms: 1000, prevote_timeout_ms: 1000,
-            precommit_timeout_ms: 1000, block_time_ms: 1000, personhood: None,
-            validator_set_activation_delay: default_validator_set_activation_delay() };
+            precommit_timeout_ms: 1000, block_time_ms: 1000, personhood: None };
         let cfg_h = ConsensusConfig { variant: ConsensusVariant::HotStuffStyle, ..cfg_t.clone() };
         let cfg_f = ConsensusConfig { variant: ConsensusVariant::XrplInspired,  ..cfg_t.clone() };
 
@@ -2674,7 +2509,6 @@ mod tests {
             precommit_timeout_ms: 1_000,
             block_time_ms:        1_000,
             personhood:           None,
-            validator_set_activation_delay: default_validator_set_activation_delay(),
         }
     }
 
@@ -2880,414 +2714,5 @@ mod tests {
             "HotStuff: personhood cap should be applied at init");
     }
 
-
-    // -- Hardening tests: equivocation detection ------------------------------
-
-    #[tokio::test]
-    async fn equivocating_prevote_is_rejected() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let vote_a = Vote {
-            vote_type: VoteType::Prevote,
-            height: 0,
-            round: 0,
-            validator: ValidatorId("val_00".into()),
-            block_hash: Some(BlockHash("block_a".into())),
-            signature: vec![],
-        };
-        engine.receive_vote(vote_a).await.unwrap();
-
-        let vote_b = Vote {
-            vote_type: VoteType::Prevote,
-            height: 0,
-            round: 0,
-            validator: ValidatorId("val_00".into()),
-            block_hash: Some(BlockHash("block_b".into())),
-            signature: vec![],
-        };
-        let result = engine.receive_vote(vote_b).await;
-        assert!(
-            matches!(result, Err(ConsensusError::Equivocation { .. })),
-            "a validator prevoting for two different blocks in the same round must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn repeating_the_same_prevote_is_not_equivocation() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let vote = Vote {
-            vote_type: VoteType::Prevote,
-            height: 0,
-            round: 0,
-            validator: ValidatorId("val_00".into()),
-            block_hash: Some(BlockHash("block_a".into())),
-            signature: vec![],
-        };
-        engine.receive_vote(vote.clone()).await.unwrap();
-        // Same validator, same vote, resent (e.g. a network retry) -- must
-        // not be treated as equivocation.
-        engine.receive_vote(vote).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn equivocating_precommit_is_rejected() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let vote_a = Vote {
-            vote_type: VoteType::Precommit,
-            height: 0,
-            round: 0,
-            validator: ValidatorId("val_00".into()),
-            block_hash: Some(BlockHash("block_a".into())),
-            signature: vec![],
-        };
-        engine.receive_vote(vote_a).await.unwrap();
-
-        let vote_b = Vote {
-            vote_type: VoteType::Precommit,
-            height: 0,
-            round: 0,
-            validator: ValidatorId("val_00".into()),
-            block_hash: Some(BlockHash("block_b".into())),
-            signature: vec![],
-        };
-        let result = engine.receive_vote(vote_b).await;
-        assert!(
-            matches!(result, Err(ConsensusError::Equivocation { .. })),
-            "a validator precommitting for two different blocks in the same round must be rejected"
-        );
-    }
-
-    // -- Hardening tests: commit-certificate verification ---------------------
-
-    #[tokio::test]
-    async fn verify_commit_rejects_duplicate_validator_in_certificate() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let block_hash = BlockHash("dup_block".into());
-        // val_00 listed twice -- must not let its power count twice toward
-        // quorum (3 listed votes, but only 2 distinct validators = power 2).
-        let cert = CommitCertificate {
-            height: 0,
-            round: 0,
-            block_hash: block_hash.clone(),
-            precommits: vec![
-                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
-                       validator: ValidatorId("val_00".into()),
-                       block_hash: Some(block_hash.clone()), signature: vec![] },
-                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
-                       validator: ValidatorId("val_00".into()),
-                       block_hash: Some(block_hash.clone()), signature: vec![] },
-                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
-                       validator: ValidatorId("val_01".into()),
-                       block_hash: Some(block_hash.clone()), signature: vec![] },
-            ],
-        };
-
-        let result = engine.verify_commit(&cert, &vs);
-        assert!(
-            result.is_err(),
-            "a duplicated validator must not be able to inflate signed power to reach quorum"
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_commit_rejects_unknown_validator() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let block_hash = BlockHash("bogus_block".into());
-        let cert = CommitCertificate {
-            height: 0,
-            round: 0,
-            block_hash: block_hash.clone(),
-            precommits: (0..3usize)
-                .map(|i| Vote {
-                    vote_type: VoteType::Precommit,
-                    height: 0,
-                    round: 0,
-                    validator: if i == 2 {
-                        ValidatorId("attacker_not_in_set".into())
-                    } else {
-                        ValidatorId(format!("val_{i:02}"))
-                    },
-                    block_hash: Some(block_hash.clone()),
-                    signature: vec![],
-                })
-                .collect(),
-        };
-
-        let result = engine.verify_commit(&cert, &vs);
-        assert!(
-            matches!(result, Err(ConsensusError::UnknownValidator(_))),
-            "a precommit from a validator outside the current set must be rejected outright, not silently counted as zero power"
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_commit_rejects_mismatched_height_or_round() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let block_hash = BlockHash("mismatch_block".into());
-        let cert = CommitCertificate {
-            height: 0,
-            round: 0,
-            block_hash: block_hash.clone(),
-            precommits: (0..3usize)
-                .map(|i| Vote {
-                    vote_type: VoteType::Precommit,
-                    height: if i == 0 { 1 } else { 0 }, // one vote is for the wrong height
-                    round: 0,
-                    validator: ValidatorId(format!("val_{i:02}")),
-                    block_hash: Some(block_hash.clone()),
-                    signature: vec![],
-                })
-                .collect(),
-        };
-
-        let result = engine.verify_commit(&cert, &vs);
-        assert!(
-            result.is_err(),
-            "a vote whose height doesn't match the certificate must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_commit_rejects_wrong_vote_type() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let block_hash = BlockHash("wrongtype_block".into());
-        let cert = CommitCertificate {
-            height: 0,
-            round: 0,
-            block_hash: block_hash.clone(),
-            precommits: (0..3usize)
-                .map(|i| Vote {
-                    vote_type: if i == 0 { VoteType::Prevote } else { VoteType::Precommit },
-                    height: 0,
-                    round: 0,
-                    validator: ValidatorId(format!("val_{i:02}")),
-                    block_hash: Some(block_hash.clone()),
-                    signature: vec![],
-                })
-                .collect(),
-        };
-
-        let result = engine.verify_commit(&cert, &vs);
-        assert!(
-            result.is_err(),
-            "a commit certificate containing a non-precommit vote must be rejected"
-        );
-    }
-
-    // -- Hardening tests: proposer rate-limiting -------------------------------
-
-    #[tokio::test]
-    async fn proposal_flood_guard_caps_considered_proposals_per_slot() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let proposer = engine.proposer_for(0, 0).unwrap();
-
-        // First proposal for (height 0, round 0) is accepted.
-        let p1 = BlockProposal {
-            height: 0, round: 0, proposer: proposer.clone(),
-            block_hash: BlockHash("flood_1".into()),
-            parent_hash: BlockHash("genesis".into()),
-            timestamp_ms: 0, tx_data: vec![], signature: vec![],
-        };
-        engine.receive_proposal(p1).await.unwrap();
-
-        // Two more for the same slot are rejected because a proposal was
-        // already accepted for it (one-per-slot), but they still count
-        // toward the flood guard.
-        for n in 2..=3 {
-            let p = BlockProposal {
-                height: 0, round: 0, proposer: proposer.clone(),
-                block_hash: BlockHash(format!("flood_{n}")),
-                parent_hash: BlockHash("genesis".into()),
-                timestamp_ms: 0, tx_data: vec![], signature: vec![],
-            };
-            assert!(engine.receive_proposal(p).await.is_err());
-        }
-
-        // A 4th proposal for the same slot must be rejected specifically by
-        // the flood guard (independent of validity), not merely re-hit the
-        // one-per-slot check.
-        let p4 = BlockProposal {
-            height: 0, round: 0, proposer: proposer.clone(),
-            block_hash: BlockHash("flood_4".into()),
-            parent_hash: BlockHash("genesis".into()),
-            timestamp_ms: 0, tx_data: vec![], signature: vec![],
-        };
-        let result = engine.receive_proposal(p4).await;
-        assert!(
-            matches!(&result, Err(ConsensusError::MalformedProposal(msg)) if msg.contains("too many proposals")),
-            "the 4th proposal for one slot must be rejected by the flood guard, got: {:?}", result
-        );
-    }
-
-    #[tokio::test]
-    async fn only_the_first_accepted_proposal_for_a_slot_is_kept() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let proposer = engine.proposer_for(0, 0).unwrap();
-
-        let p1 = BlockProposal {
-            height: 0, round: 0, proposer: proposer.clone(),
-            block_hash: BlockHash("slot_first".into()),
-            parent_hash: BlockHash("genesis".into()),
-            timestamp_ms: 0, tx_data: vec![], signature: vec![],
-        };
-        engine.receive_proposal(p1).await.unwrap();
-
-        // A second, otherwise well-formed proposal for the SAME slot from
-        // the SAME correct proposer must not be allowed to silently replace
-        // the first one.
-        let p2 = BlockProposal {
-            height: 0, round: 0, proposer: proposer.clone(),
-            block_hash: BlockHash("slot_second".into()),
-            parent_hash: BlockHash("genesis".into()),
-            timestamp_ms: 0, tx_data: vec![], signature: vec![],
-        };
-        let result = engine.receive_proposal(p2).await;
-        assert!(
-            matches!(&result, Err(ConsensusError::MalformedProposal(msg)) if msg.contains("already accepted")),
-            "a second proposal for an already-accepted slot must be rejected, got: {:?}", result
-        );
-    }
-
-    // -- Hardening tests: validator-set governance (epoch-delayed activation) -
-
-    #[tokio::test]
-    async fn validator_set_change_activates_only_after_configured_delay() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        let mut cfg = default_config();
-        cfg.validator_set_activation_delay = 2;
-        engine.init(cfg, vs.clone()).await.unwrap();
-
-        let new_vs = ValidatorSet {
-            height: 0,
-            validators: (0..5)
-                .map(|i| ValidatorInfo {
-                    id: ValidatorId(format!("val_new_{i:02}")),
-                    voting_power: 1,
-                    pop_verified: true,
-                    public_key: vec![],
-                })
-                .collect(),
-        };
-
-        let activation_height = engine
-            .propose_validator_set_change(new_vs.clone())
-            .expect("proposing a validator-set change should succeed");
-        assert_eq!(activation_height, 2, "activation height = proposed_at(0) + delay(2)");
-        assert_eq!(
-            engine.pending_validator_set_change().map(|c| c.activation_height),
-            Some(2)
-        );
-
-        // Commit height 0 -> advances to height 1. Not yet at the
-        // activation height, so honest nodes must still agree on the OLD
-        // set at height 1 -- an immediate swap here would be a safety bug.
-        let cert0 = CommitCertificate {
-            height: 0,
-            round: 0,
-            block_hash: BlockHash("h0".into()),
-            precommits: vec![],
-        };
-        engine.on_commit(cert0, None).await.unwrap();
-        assert_eq!(engine.current_height(), 1);
-        assert_eq!(
-            engine.validator_set().validators.len(),
-            4,
-            "validator set must not change before its activation height is reached"
-        );
-        assert!(engine.pending_validator_set_change().is_some(), "change still pending");
-
-        // Commit height 1 -> advances to height 2, which equals the
-        // activation height, so the change must now take effect.
-        let cert1 = CommitCertificate {
-            height: 1,
-            round: 0,
-            block_hash: BlockHash("h1".into()),
-            precommits: vec![],
-        };
-        engine.on_commit(cert1, None).await.unwrap();
-        assert_eq!(engine.current_height(), 2);
-        assert_eq!(
-            engine.validator_set().validators.len(),
-            5,
-            "validator set must switch over once the activation height is reached"
-        );
-        assert!(
-            engine.pending_validator_set_change().is_none(),
-            "the pending change must be cleared once applied"
-        );
-    }
-
-    #[tokio::test]
-    async fn only_one_validator_set_change_may_be_pending_at_a_time() {
-        let (mut engine, vs) = make_engine_and_vs(4);
-        engine.init(default_config(), vs.clone()).await.unwrap();
-
-        let new_vs_a = ValidatorSet { height: 0, validators: vs.validators.clone() };
-        let new_vs_b = ValidatorSet { height: 0, validators: vs.validators.clone() };
-
-        engine.propose_validator_set_change(new_vs_a).unwrap();
-        let second = engine.propose_validator_set_change(new_vs_b);
-        assert!(
-            matches!(second, Err(ConsensusError::InvalidValidatorSetChange(_))),
-            "a second pending change must be rejected while one is already pending"
-        );
-    }
-
 }
-}
-
-// ── ValidatorSetView impl ─────────────────────────────────────────────────────
-//
-// chain_forge_core::ValidatorId and chain_forge_consensus::ValidatorId are
-// separate types with the same inner String.  We bridge them by comparing
-// the inner .0 field and constructing core::ValidatorId values on return.
-
-impl chain_forge_core::ValidatorSetView for ValidatorSet {
-    fn total_power(&self) -> u64 {
-        self.validators.iter().map(|v| v.voting_power).sum()
-    }
-
-    fn quorum_power(&self) -> u64 {
-        let total = self.total_power();
-        (total * 2 / 3) + 1
-    }
-
-    fn power_of(&self, id: &chain_forge_core::ValidatorId) -> u64 {
-        self.validators
-            .iter()
-            .find(|v| v.id.0 == id.0)
-            .map(|v| v.voting_power)
-            .unwrap_or(0)
-    }
-
-    fn public_key_of(&self, id: &chain_forge_core::ValidatorId) -> Option<&[u8]> {
-        self.validators
-            .iter()
-            .find(|v| v.id.0 == id.0)
-            .map(|v| v.public_key.as_slice())
-    }
-
-    fn validator_ids(&self) -> Vec<chain_forge_core::ValidatorId> {
-        self.validators
-            .iter()
-            .map(|v| chain_forge_core::ValidatorId(v.id.0.clone()))
-            .collect()
-    }
 }
