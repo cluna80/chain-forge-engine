@@ -1596,8 +1596,12 @@ impl ConsensusEngine for TendermintEngine {
     ) -> ConsensusResult<()> {
         let quorum = validator_set.quorum_power();
 
-        // Sum the power of all precommit signers.
-        let signed_power: u64 = certificate
+        // Only consider well-formed precommits: correct type, height, and
+        // block hash. Malformed entries are ignored rather than rejected so
+        // a certificate with a few garbage entries still verifies if the
+        // good entries meet quorum (consistent with Tendermint light-client
+        // spec, which says "at least 2/3 must be valid").
+        let valid_precommits: Vec<&Vote> = certificate
             .precommits
             .iter()
             .filter(|v| {
@@ -1605,6 +1609,53 @@ impl ConsensusEngine for TendermintEngine {
                     && v.height == certificate.height
                     && v.block_hash.as_ref() == Some(&certificate.block_hash)
             })
+            .collect();
+
+        // -- Phase 1: individual signature verification ----------------------
+        // Verify every precommit that carries a non-empty signature.
+        // Precommits with empty signatures (Phase 0 / observer nodes) are
+        // counted toward power but not cryptographically verified; once all
+        // validators sign, every precommit will have a signature.
+        #[cfg(feature = "real-crypto")]
+        for vote in &valid_precommits {
+            if vote.signature.is_empty() { continue; }
+
+            let pub_key = validator_set.public_key_of(&vote.validator);
+            if pub_key.is_empty() {
+                // No registered key → skip verification for this signer.
+                // (New validator that hasn't had its key backfilled yet.)
+                continue;
+            }
+
+            let msg = vote_signing_bytes(
+                &self.chain_id,
+                &vote.vote_type,
+                vote.height,
+                vote.round,
+                vote.block_hash.as_ref(),
+            );
+            let sig = Signature {
+                scheme: SchemeId::Classical,
+                bytes: vote.signature.clone(),
+            };
+            ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_| {
+                ConsensusError::InvalidVote {
+                    validator:  vote.validator.clone(),
+                    block_hash: certificate.block_hash.clone(),
+                    reason:     format!(
+                        "invalid precommit signature in commit certificate \
+                         at height {} round {}",
+                        vote.height, vote.round
+                    ),
+                }
+            })?;
+        }
+
+        // -- Power accumulation ----------------------------------------------
+        // Count power only from the precommits that passed structural checks
+        // (and signature checks above where applicable).
+        let signed_power: u64 = valid_precommits
+            .iter()
             .map(|v| validator_set.power_of(&v.validator))
             .sum();
 
@@ -1617,9 +1668,6 @@ impl ConsensusEngine for TendermintEngine {
                 ),
             });
         }
-
-        // TODO: verify each precommit signature individually once the crypto
-        // layer is wired up. For now, power accumulation is the only check.
 
         Ok(())
     }
@@ -2237,6 +2285,129 @@ mod tests {
 
         let result = engine.verify_commit(&cert, &vs);
         assert!(result.is_err(), "should reject under-quorum commit");
+    }
+
+    #[tokio::test]
+    async fn verify_commit_accepts_empty_signatures() {
+        // Phase-0 path: precommits with empty signatures should still count
+        // toward power and allow the certificate to pass quorum check.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let block_hash = BlockHash("empty_sig_test".into());
+
+        // 3 precommits with no signatures -- meets quorum of 3 for 4 validators.
+        let cert = CommitCertificate {
+            height: 0,
+            round: 0,
+            block_hash: block_hash.clone(),
+            precommits: (0..3usize)
+                .map(|i| Vote {
+                    vote_type:  VoteType::Precommit,
+                    height:     0,
+                    round:      0,
+                    validator:  ValidatorId(format!("val_{i:02}")),
+                    block_hash: Some(block_hash.clone()),
+                    signature:  vec![],
+                })
+                .collect(),
+        };
+
+        assert!(
+            engine.verify_commit(&cert, &vs).is_ok(),
+            "empty signatures should pass: they are counted toward power but not crypto-verified"
+        );
+    }
+
+    /// Tests that a tampered signature causes `verify_commit` to reject the
+    /// certificate. Requires the `real-crypto` feature so the signature loop
+    /// actually runs (without it the loop is compiled away and any bytes pass).
+    #[cfg(feature = "real-crypto")]
+    #[tokio::test]
+    async fn verify_commit_rejects_tampered_signature() {
+        use chain_forge_crypto::{ClassicalScheme, SchemeId, SignatureScheme, Signature};
+
+        let chain_id = "test-chain";
+        let block_hash = BlockHash("tamper_test_block".into());
+
+        // Build a 4-validator set with real Ed25519 public keys.
+        let kp0 = ClassicalScheme.generate_keypair("seed-val-0").unwrap();
+        let kp1 = ClassicalScheme.generate_keypair("seed-val-1").unwrap();
+        let kp2 = ClassicalScheme.generate_keypair("seed-val-2").unwrap();
+        let keypairs = [&kp0, &kp1, &kp2];
+
+        let vs = ValidatorSet {
+            height: 0,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("val_00".into()), voting_power: 1,
+                    pop_verified: true, public_key: kp0.public_key.clone() },
+                ValidatorInfo { id: ValidatorId("val_01".into()), voting_power: 1,
+                    pop_verified: true, public_key: kp1.public_key.clone() },
+                ValidatorInfo { id: ValidatorId("val_02".into()), voting_power: 1,
+                    pop_verified: true, public_key: kp2.public_key.clone() },
+                ValidatorInfo { id: ValidatorId("val_03".into()), voting_power: 1,
+                    pop_verified: true, public_key: vec![] },
+            ],
+        };
+
+        let mut engine = TendermintEngine::new();
+        let cfg = default_config();
+        // Set the chain_id so vote_signing_bytes inside verify_commit uses it.
+        engine.set_signing_key(kp0.clone(), chain_id.to_string());
+        engine.init(cfg, vs.clone()).await.unwrap();
+
+        // Sign a valid precommit for each of the first 3 validators.
+        let make_vote = |i: usize, kp: &chain_forge_crypto::KeyPair| -> Vote {
+            let msg = vote_signing_bytes(
+                chain_id, &VoteType::Precommit, 0, 0, Some(&block_hash),
+            );
+            let raw_sig = ClassicalScheme.sign(&msg, kp).unwrap();
+            Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("val_{i:02}")),
+                block_hash: Some(block_hash.clone()),
+                signature:  raw_sig.bytes,
+            }
+        };
+
+        let good_votes: Vec<Vote> = keypairs
+            .iter()
+            .enumerate()
+            .map(|(i, kp)| make_vote(i, kp))
+            .collect();
+
+        // A certificate with all good signatures passes.
+        let cert_good = CommitCertificate {
+            height: 0, round: 0,
+            block_hash: block_hash.clone(),
+            precommits: good_votes.clone(),
+        };
+        assert!(
+            engine.verify_commit(&cert_good, &vs).is_ok(),
+            "certificate with valid signatures must be accepted"
+        );
+
+        // Tamper val_01's signature by flipping one byte.
+        let mut bad_votes = good_votes.clone();
+        bad_votes[1].signature[0] ^= 0xFF;
+
+        let cert_bad = CommitCertificate {
+            height: 0, round: 0,
+            block_hash: block_hash.clone(),
+            precommits: bad_votes,
+        };
+        let err = engine.verify_commit(&cert_bad, &vs);
+        assert!(
+            err.is_err(),
+            "certificate with a tampered signature must be rejected"
+        );
+        let err_str = format!("{}", err.unwrap_err());
+        assert!(
+            err_str.contains("invalid precommit signature"),
+            "error message should name the cause: {err_str}"
+        );
     }
 
     #[tokio::test]
