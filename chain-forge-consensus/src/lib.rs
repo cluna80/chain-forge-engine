@@ -2410,6 +2410,127 @@ mod tests {
         );
     }
 
+    // -- Equivocation detection tests -----------------------------------------
+
+    #[tokio::test]
+    async fn double_prevote_is_detected_and_drained() {
+        // A validator that prevotes for two different blocks in the same
+        // height/round must be caught and surfaced via drain_equivocations.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let block_a = BlockHash("block_alpha".into());
+        let block_b = BlockHash("block_beta".into());
+        let equivocator = ValidatorId("val_00".into());
+
+        // First prevote for block_a.
+        let vote_a = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  equivocator.clone(),
+            block_hash: Some(block_a.clone()),
+            signature:  vec![],
+        };
+        engine.receive_vote(vote_a).await.unwrap();
+        assert!(engine.drain_equivocations().is_empty(),
+            "no evidence after a single prevote");
+
+        // Second prevote for a different block in the same slot → equivocation.
+        let vote_b = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  equivocator.clone(),
+            block_hash: Some(block_b.clone()),
+            signature:  vec![],
+        };
+        engine.receive_vote(vote_b).await.unwrap();
+
+        let evidence = engine.drain_equivocations();
+        assert_eq!(evidence.len(), 1, "exactly one equivocation event");
+        let ev = &evidence[0];
+        assert_eq!(ev.validator_id, equivocator);
+        assert_eq!(ev.height, 0);
+        assert_eq!(ev.round, 0);
+        assert_eq!(ev.vote_type_byte, 0, "prevote type byte = 0");
+        // The two conflicting block hashes must both be recorded.
+        let hashes = [&ev.block_hash_a, &ev.block_hash_b];
+        assert!(hashes.contains(&&block_a), "block_a must appear in evidence");
+        assert!(hashes.contains(&&block_b), "block_b must appear in evidence");
+
+        // drain is destructive: a second call returns nothing.
+        assert!(engine.drain_equivocations().is_empty(),
+            "drain_equivocations must be idempotent/empty after first drain");
+    }
+
+    #[tokio::test]
+    async fn double_precommit_is_detected_and_drained() {
+        // Same as above but for the precommit phase.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let block_a = BlockHash("commit_alpha".into());
+        let block_b = BlockHash("commit_beta".into());
+        let equivocator = ValidatorId("val_01".into());
+
+        let vote_a = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  equivocator.clone(),
+            block_hash: Some(block_a.clone()),
+            signature:  vec![],
+        };
+        engine.receive_vote(vote_a).await.unwrap();
+        assert!(engine.drain_equivocations().is_empty());
+
+        let vote_b = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  equivocator.clone(),
+            block_hash: Some(block_b.clone()),
+            signature:  vec![],
+        };
+        engine.receive_vote(vote_b).await.unwrap();
+
+        let evidence = engine.drain_equivocations();
+        assert_eq!(evidence.len(), 1);
+        let ev = &evidence[0];
+        assert_eq!(ev.validator_id, equivocator);
+        assert_eq!(ev.vote_type_byte, 1, "precommit type byte = 1");
+        let hashes = [&ev.block_hash_a, &ev.block_hash_b];
+        assert!(hashes.contains(&&block_a));
+        assert!(hashes.contains(&&block_b));
+    }
+
+    #[tokio::test]
+    async fn duplicate_vote_same_block_is_not_equivocation() {
+        // A validator re-sending the exact same vote (same block hash) must NOT
+        // be flagged as equivocation. Only conflicting block hashes are evidence.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let block = BlockHash("only_block".into());
+        let validator = ValidatorId("val_02".into());
+
+        let vote = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block.clone()),
+            signature:  vec![],
+        };
+
+        engine.receive_vote(vote.clone()).await.unwrap();
+        engine.receive_vote(vote).await.unwrap(); // same vote again
+
+        assert!(engine.drain_equivocations().is_empty(),
+            "identical vote re-sent must not produce equivocation evidence");
+    }
+
     #[tokio::test]
     async fn personhood_cap_applied_on_init() {
         use crate::PersonhoodConfig;
