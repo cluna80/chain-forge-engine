@@ -1,4 +1,4 @@
-/// Node: the core runtime that wires all five crates together.
+﻿/// Node: the core runtime that wires all five crates together.
 
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn, error};
@@ -220,7 +220,7 @@ pub struct Node {
     /// and RedirectToUbiPool. Threaded through execute_block_with_identity()
     /// alongside identity, for the same reason.
     cirfi: CirfiEngine,
-    /// Slashing module — penalises misbehaving validators.
+    /// Slashing module â€” penalises misbehaving validators.
     /// Called whenever consensus returns ConsensusError::Equivocation.
     slasher: SlashingModule,
     /// Validator registry used by the slashing module.
@@ -645,7 +645,7 @@ impl Node {
         match load() {
             Ok(()) => true,
             Err(e) => {
-                tracing::warn!(error = %e, "could not load persisted state — starting from genesis");
+                tracing::warn!(error = %e, "could not load persisted state â€” starting from genesis");
                 false
             }
         }
@@ -1028,7 +1028,7 @@ impl Node {
                                     validator = %validator,
                                     height,
                                     round,
-                                    "equivocation detected — slashing validator"
+                                    "equivocation detected â€” slashing validator"
                                 );
                                 let evidence = EquivocationEvidence {
                                     validator_id: validator.0.clone(),
@@ -1343,6 +1343,34 @@ impl Node {
     /// counterpart to propose_block()'s inline commit tail: propose_block()
     /// is unchanged and still used for the solo-devnet (no peers) path,
     /// where the proposer synthesises every validator's vote itself.
+    /// Process equivocation evidence: slash the validator, burn the slashed
+    /// stake via the BME mechanism (Section 6.3), and update CirFi metrics.
+    pub fn process_equivocation_evidence(
+        &mut self,
+        evidence: &EquivocationEvidence,
+        epoch: u64,
+    ) -> Result<u128, String> {
+        let chain_id = self.genesis.chain_id.clone();
+        let burn_amount = self.slasher.slash_equivocation(
+            evidence,
+            &mut self.validator_registry,
+            epoch,
+            &chain_id,
+        ).map_err(|e| e.to_string())?;
+        if burn_amount > 0 {
+            if let Err(e) = self.state.burn(&evidence.validator_id, "uqcb", burn_amount) {
+                warn!(validator = %evidence.validator_id, burn_uqcb = burn_amount,
+                    error = %e, "BME burn failed; tombstone applied but tokens not burned");
+            } else {
+                let mut cm = self.cirfi_metrics.lock().unwrap();
+                cm.total_qcb_burned_uqcb = cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
+                info!(validator = %evidence.validator_id, burn_uqcb = burn_amount,
+                    total_burned = cm.total_qcb_burned_uqcb, "equivocation slash burned via BME");
+            }
+        }
+        Ok(burn_amount)
+    }
+
     async fn commit_block(
         &mut self,
         cert: chain_forge_consensus::CommitCertificate,
@@ -1835,7 +1863,7 @@ mod tests {
         let cert0 = node.propose_block(genesis_hash).await.unwrap();
         let root1 = node.status.lock().unwrap().state_root.clone().unwrap();
 
-        // Block 1: include another tx — alice's nonce is now 1 after block 0
+        // Block 1: include another tx â€” alice's nonce is now 1 after block 0
         node.submit_tx(Transaction::transfer("tx2", "qcb1alice", "qcb1bob", "uqcb", 200, 1));
         node.propose_block(cert0.block_hash).await.unwrap();
         let root2 = node.status.lock().unwrap().state_root.clone().unwrap();
@@ -2161,7 +2189,7 @@ mod tests {
             serde_json::to_vec(&carol_good).unwrap(),
         )).await.unwrap();
 
-        // Step 3: Carol equivocates — same height/round, different block_hash.
+        // Step 3: Carol equivocates â€” same height/round, different block_hash.
         let carol_equivocation = Vote {
             vote_type:  VoteType::Precommit,
             height:     0,
@@ -2170,7 +2198,7 @@ mod tests {
             block_hash: Some(chain_forge_consensus::BlockHash("block_B_conflicting".into())),
             signature:  vec![],
         };
-        // Must NOT crash the event loop — equivocation is handled, not fatal.
+        // Must NOT crash the event loop â€” equivocation is handled, not fatal.
         let result = node.handle_event(gossip(
             GossipTopic::ConsensusVote,
             serde_json::to_vec(&carol_equivocation).unwrap(),
@@ -2193,7 +2221,7 @@ mod tests {
             signature_b:  vec![],
         };
         // The first call from gossip already ran; a second call with the same
-        // key must return EquivocationAlreadyRecorded — proving the set was
+        // key must return EquivocationAlreadyRecorded â€” proving the set was
         // written.
         let second_slash = node.slasher.slash_equivocation(
             &evidence,
