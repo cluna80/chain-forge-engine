@@ -496,6 +496,16 @@ pub mod real {
         identify:  identify::Behaviour,
     }
 
+    // -- Swarm commands -------------------------------------------------------
+
+    /// Commands sent from the service handle into the swarm event loop.
+    enum SwarmCommand {
+        /// Ban a peer: disconnect them and block future connections.
+        BanPeer(libp2p::PeerId),
+        /// Shut the swarm down cleanly.
+        Shutdown,
+    }
+
     // -- Libp2p service -------------------------------------------------------
 
     /// Real libp2p-backed network service.
@@ -507,10 +517,15 @@ pub mod real {
         pub outbound_tx: mpsc::UnboundedSender<OutboundMessage>,
         /// Inbound event receiver -- the node polls this.
         pub event_rx:    mpsc::UnboundedReceiver<NetworkEvent>,
-        /// Local peer ID for logging.
-        pub local_peer_id: String,
-        /// Connected peer count (updated by swarm event loop).
-        pub peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Command channel: ban_peer / stop reach the swarm loop here.
+        cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
+        /// Local peer ID, exposed through NetworkService::local_peer_id().
+        pub local_peer_id_inner: PeerId,
+        /// Live peer map: peer_id → multiaddr, shared with swarm event loop.
+        /// `peers()` reads from this without round-tripping through the loop.
+        peer_map: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
+        /// Whether the service is still running.
+        running: bool,
     }
 
     impl Libp2pService {
@@ -626,13 +641,15 @@ pub mod real {
 
             let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
             let (event_tx, event_rx)           = mpsc::unbounded_channel::<NetworkEvent>();
-            let peer_count = std::sync::Arc::new(
-                std::sync::atomic::AtomicUsize::new(0));
-            let peer_count_clone = peer_count.clone();
+            let (cmd_tx, mut cmd_rx)           = mpsc::unbounded_channel::<SwarmCommand>();
+
+            // Shared peer map: swarm loop writes, service handle reads.
+            let peer_map: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let peer_map_loop = peer_map.clone();
 
             // Swarm event loop
             tokio::spawn(async move {
-                let mut peer_addrs: HashMap<String, String> = HashMap::new();
                 // Tracks how many simultaneous connections exist per peer_id, so a
                 // redundant-connection dedupe-close (see ConnectionClosed below)
                 // doesn't get misread as the peer fully disconnecting.
@@ -654,6 +671,29 @@ pub mod real {
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "gossip publish error");
+                                }
+                            }
+                        }
+
+                        // Command from service handle (ban / shutdown)
+                        Some(cmd) = cmd_rx.recv() => {
+                            match cmd {
+                                SwarmCommand::BanPeer(peer_id) => {
+                                    tracing::info!(peer = %peer_id, "banning peer");
+                                    swarm.behaviour_mut()
+                                        .gossipsub.remove_explicit_peer(&peer_id);
+                                    let _ = swarm.disconnect_peer_id(peer_id.clone());
+                                    // Remove from shared map
+                                    peer_map_loop.lock().unwrap()
+                                        .remove(&peer_id.to_string());
+                                    peer_conn_count.remove(&peer_id.to_string());
+                                    let _ = event_tx.send(NetworkEvent::PeerDisconnected(
+                                        PeerId(peer_id.to_string())
+                                    ));
+                                }
+                                SwarmCommand::Shutdown => {
+                                    tracing::info!("P2P swarm shutting down");
+                                    break;
                                 }
                             }
                         }
@@ -698,10 +738,8 @@ pub mod real {
                                         tracing::info!(peer = %peer, addr = %addr, "mDNS peer discovered");
                                         swarm.behaviour_mut()
                                             .gossipsub.add_explicit_peer(&peer);
-                                        peer_addrs.insert(peer.to_string(), addr.to_string());
-                                        let count = peer_addrs.len();
-                                        peer_count_clone.store(count,
-                                            std::sync::atomic::Ordering::Relaxed);
+                                        peer_map_loop.lock().unwrap()
+                                            .insert(peer.to_string(), addr.to_string());
                                         let _ = event_tx.send(NetworkEvent::PeerConnected(
                                             PeerInfo {
                                                 peer_id:   PeerId(peer.to_string()),
@@ -720,10 +758,8 @@ pub mod real {
                                     for (peer, _) in peers {
                                         swarm.behaviour_mut()
                                             .gossipsub.remove_explicit_peer(&peer);
-                                        peer_addrs.remove(&peer.to_string());
-                                        let count = peer_addrs.len();
-                                        peer_count_clone.store(count,
-                                            std::sync::atomic::Ordering::Relaxed);
+                                        peer_map_loop.lock().unwrap()
+                                            .remove(&peer.to_string());
                                         let _ = event_tx.send(NetworkEvent::PeerDisconnected(
                                             PeerId(peer.to_string())
                                         ));
@@ -745,9 +781,8 @@ pub mod real {
                                         .or_insert(0);
                                     *count += 1;
                                     let is_new_peer = *count == 1;
-                                    peer_addrs.insert(peer_id.to_string(), addr.clone());
-                                    peer_count_clone.store(peer_addrs.len(),
-                                        std::sync::atomic::Ordering::Relaxed);
+                                    peer_map_loop.lock().unwrap()
+                                        .insert(peer_id.to_string(), addr.clone());
                                     if is_new_peer {
                                         // This fires for EVERY first connection, not just
                                         // mDNS-discovered ones -- bootstrap-dialed peers land
@@ -780,17 +815,14 @@ pub mod real {
                                         // One of possibly several connections to this peer
                                         // closed (see the dedupe note above), but at least one
                                         // remains -- the peer is still genuinely connected, so
-                                        // peer_addrs/peer_count and node.rs's tracking must NOT
-                                        // change here.
+                                        // peer_map and node.rs's tracking must NOT change here.
                                         continue;
                                     }
-                                    peer_addrs.remove(&peer_id.to_string());
-                                    peer_count_clone.store(peer_addrs.len(),
-                                        std::sync::atomic::Ordering::Relaxed);
+                                    peer_map_loop.lock().unwrap()
+                                        .remove(&peer_id.to_string());
                                     // Same gap in the other direction -- a dropped connection
                                     // must also reach node.rs, or a peer that disconnects stays
                                     // "connected" forever from the node's point of view.
-
                                     let _ = event_tx.send(NetworkEvent::PeerDisconnected(
                                         PeerId(peer_id.to_string())
                                     ));
@@ -807,15 +839,18 @@ pub mod real {
                 Self {
                     outbound_tx,
                     event_rx,
-                    local_peer_id: peer_id_str.clone(),
-                    peer_count,
+                    cmd_tx,
+                    local_peer_id_inner: PeerId(peer_id_str.clone()),
+                    peer_map,
+                    running: true,
                 },
                 format!("/ip4/0.0.0.0/tcp/{}", config.p2p_port),
             ))
         }
 
+        /// Number of currently connected peers (reads shared map, no lock contention).
         pub fn peer_count(&self) -> usize {
-            self.peer_count.load(std::sync::atomic::Ordering::Relaxed)
+            self.peer_map.lock().unwrap().len()
         }
     }
 
@@ -838,26 +873,39 @@ pub mod real {
         }
 
         async fn peers(&self) -> P2pResult<Vec<PeerInfo>> {
-            // Phase 1: return empty list; full peer roster via shared state in Phase 2
-            Ok(Vec::new())
+            let map = self.peer_map.lock().unwrap();
+            let peers = map.iter()
+                .map(|(peer_id, addr)| PeerInfo {
+                    peer_id:   PeerId(peer_id.clone()),
+                    addr:      addr.clone(),
+                    chain_id:  None,
+                    connected: true,
+                    score:     0,
+                })
+                .collect();
+            Ok(peers)
         }
 
-        async fn ban_peer(&mut self, _peer_id: PeerId, _reason: &str) -> P2pResult<()> {
-            // TODO Phase 1: send ban command to swarm event loop
-            Ok(())
+        async fn ban_peer(&mut self, peer_id: PeerId, reason: &str) -> P2pResult<()> {
+            tracing::warn!(peer = %peer_id.0, reason, "banning peer");
+            let libp2p_peer: libp2p::PeerId = peer_id.0.parse()
+                .map_err(|e| P2pError::Internal(format!("invalid peer id: {e}")))?;
+            self.cmd_tx.send(SwarmCommand::BanPeer(libp2p_peer))
+                .map_err(|e| P2pError::Internal(format!("cmd send: {e}")))
         }
 
         async fn stop(&mut self) -> P2pResult<()> {
-            // TODO Phase 1: send shutdown signal to swarm event loop
-            Ok(())
+            self.running = false;
+            self.cmd_tx.send(SwarmCommand::Shutdown)
+                .map_err(|e| P2pError::Internal(format!("cmd send: {e}")))
         }
 
         fn is_running(&self) -> bool {
-            true // started in constructor
+            self.running
         }
 
         fn local_peer_id(&self) -> Option<&PeerId> {
-            None // PeerId stored as String; return None until we store as PeerId
+            Some(&self.local_peer_id_inner)
         }
     }
 
