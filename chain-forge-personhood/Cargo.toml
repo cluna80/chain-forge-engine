@@ -1,0 +1,44 @@
+[package]
+name = "chain-forge-personhood"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+chain-forge-core = { path = "../chain-forge-core" }
+chain-forge-consensus = { path = "../chain-forge-consensus" }
+chain-forge-crypto    = { path = "../chain-forge-crypto" }
+
+ark-ff = "0.4"
+ark-ec = "0.4"
+ark-std = "0.4"
+ark-relations = "0.4"
+ark-r1cs-std = "0.4"
+ark-groth16 = "0.4"
+ark-snark = "0.4"
+ark-crypto-primitives = { version = "0.4", features = ["crh", "merkle_tree", "r1cs"] }
+ark-bls12-381 = "0.4"
+ark-ed-on-bls12-381 = { version = "0.4", features = ["r1cs"] }
+ark-serialize = "0.4"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[[bin]]
+name = "single_membership"
+path = "src/bin/single_membership.rs"
+
+[[bin]]
+name = "n_distinct_issuers"
+path = "src/bin/n_distinct_issuers.rs"
+
+[[bin]]
+name = "n_distinct_approved_issuers"
+path = "src/bin/n_distinct_approved_issuers.rs"
+
+[[bin]]
+name = "issuer_governance"
+path = "src/bin/issuer_governance.rs"
+
+[[bin]]
+name = "governance_authority_demo"
+path = "src/bin/governance_authority_demo.rs"

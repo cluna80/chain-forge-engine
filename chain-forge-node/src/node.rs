@@ -15,6 +15,8 @@ use chain_forge_state::StateStore;
 use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
 use chain_forge_identity::IdentityStore;
 use chain_forge_cirfi::CirfiEngine;
+use chain_forge_slashing::{SlashingModule, EquivocationEvidence};
+use chain_forge_validators::ValidatorRegistry;
 use chain_forge_p2p::{
     MockNetworkService, NetworkConfig, NetworkEvent, NetworkService,
     GossipTopic, OutboundMessage, PeerInfo,
@@ -218,6 +220,12 @@ pub struct Node {
     /// and RedirectToUbiPool. Threaded through execute_block_with_identity()
     /// alongside identity, for the same reason.
     cirfi: CirfiEngine,
+    /// Slashing module — penalises misbehaving validators.
+    /// Called whenever consensus returns ConsensusError::Equivocation.
+    slasher: SlashingModule,
+    /// Validator registry used by the slashing module.
+    /// Starts empty in Phase 0; ValidatorNotFound is a graceful no-op.
+    validator_registry: ValidatorRegistry,
     /// Transactions submitted via POST /api/tx, waiting to be pulled into
     /// the mempool. Drained once per heartbeat tick in run().
     tx_queue: SharedTxQueue,
@@ -342,6 +350,7 @@ impl Node {
             precommit_timeout_ms: genesis.consensus.block_time_ms,
             block_time_ms:        genesis.consensus.block_time_ms,
             personhood:           personhood_cfg,
+            validator_set_activation_delay: 1,  // Phase 0: activate immediately after 1 epoch
         };
 
         let mut engine = TendermintEngine::new();
@@ -461,6 +470,15 @@ impl Node {
             chain_store: std::collections::BTreeMap::new(),
             identity,
             cirfi,
+            slasher: SlashingModule::with_qcb_defaults(),
+            validator_registry: ValidatorRegistry::new(
+                0,   // min_stake_uqcb: 0 in Phase 0 (no staking enforcement)
+                chain_forge_consensus::PersonhoodConfig {
+                    power_cap:          1,
+                    reject_expired_pop: false,
+                    min_verified_pct:   0,
+                },
+            ),
             tx_queue,
         })
     }
@@ -998,6 +1016,56 @@ impl Node {
                         // BlockProposal branch above).
 
                         match self.consensus.receive_vote(vote.clone()).await {
+                            Err(chain_forge_consensus::ConsensusError::Equivocation {
+                                ref validator,
+                                height,
+                                round,
+                                ref first_hash,
+                                ref second_hash,
+                                ..
+                            }) => {
+                                warn!(
+                                    validator = %validator,
+                                    height,
+                                    round,
+                                    "equivocation detected — slashing validator"
+                                );
+                                let evidence = EquivocationEvidence {
+                                    validator_id: validator.0.clone(),
+                                    height,
+                                    round: round.into(),
+                                    block_hash_a: first_hash
+                                        .as_ref()
+                                        .map(|h| h.0.clone())
+                                        .unwrap_or_default(),
+                                    block_hash_b: second_hash
+                                        .as_ref()
+                                        .map(|h| h.0.clone())
+                                        .unwrap_or_default(),
+                                    signature_a: vec![],  // Phase 0: real sigs not yet wired
+                                    signature_b: vec![],
+                                };
+                                let epoch = self.consensus.current_height() / 100;
+                                let chain_id = self.genesis.chain_id.clone();
+                                match self.slasher.slash_equivocation(
+                                    &evidence,
+                                    &mut self.validator_registry,
+                                    epoch,
+                                    &chain_id,
+                                ) {
+                                    Ok(burn_amount) => {
+                                        info!(
+                                            validator = %evidence.validator_id,
+                                            burn_ucirfi = burn_amount,
+                                            "validator slashed for equivocation"
+                                        );
+                                        // TODO Phase 1: route burn_amount through BME
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "slash skipped (already tombstoned, double-slash, or validator not in registry)");
+                                    }
+                                }
+                            }
                             Ok(Some(cert)) => {
                                 let proposal = self.pending_proposals
                                     .get(&(vote.height, vote.round))
@@ -2064,4 +2132,90 @@ mod tests {
         assert_eq!(node.mempool.len(), 1);
         assert_eq!(node.mempool[0].id, "gossip-tx-1");
     }
+
+    // -- Equivocation integration test (end-to-end pipeline) ------------------
+
+    #[tokio::test]
+    async fn equivocating_validator_is_detected_and_slash_attempted() {
+        // Bob is our node (not the proposer at h=0,r=0 -- alice is).
+        let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+
+        // Step 1: Alice's proposal arrives. Bob votes (prevote + precommit).
+        let proposal = make_proposal(0, 0, "qcb1alice", "block_A");
+        node.handle_event(gossip(
+            GossipTopic::BlockProposal,
+            serde_json::to_vec(&proposal).unwrap(),
+        )).await.unwrap();
+
+        // Step 2: Carol sends a valid precommit for block_A.
+        let carol_good = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  ValidatorId("qcb1carol".into()),
+            block_hash: Some(chain_forge_consensus::BlockHash("block_A".into())),
+            signature:  vec![],
+        };
+        node.handle_event(gossip(
+            GossipTopic::ConsensusVote,
+            serde_json::to_vec(&carol_good).unwrap(),
+        )).await.unwrap();
+
+        // Step 3: Carol equivocates — same height/round, different block_hash.
+        let carol_equivocation = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  ValidatorId("qcb1carol".into()),
+            block_hash: Some(chain_forge_consensus::BlockHash("block_B_conflicting".into())),
+            signature:  vec![],
+        };
+        // Must NOT crash the event loop — equivocation is handled, not fatal.
+        let result = node.handle_event(gossip(
+            GossipTopic::ConsensusVote,
+            serde_json::to_vec(&carol_equivocation).unwrap(),
+        )).await;
+        assert!(result.is_ok(),
+            "equivocating vote must be handled gracefully, not crash the event loop");
+
+        // Step 4: The equivocation was recorded in the slasher's idempotency
+        // set. Even though carol isn't in the validator_registry (Phase 0
+        // no-op), the slasher still records the event key so it can't be
+        // double-processed later. Check via slash_equivocation returning
+        // EquivocationAlreadyRecorded on a second call.
+        let evidence = chain_forge_slashing::EquivocationEvidence {
+            validator_id: "qcb1carol".into(),
+            height:       0,
+            round:        0,
+            block_hash_a: "block_A".into(),
+            block_hash_b: "block_B_conflicting".into(),
+            signature_a:  vec![],
+            signature_b:  vec![],
+        };
+        // The first call from gossip already ran; a second call with the same
+        // key must return EquivocationAlreadyRecorded — proving the set was
+        // written.
+        let second_slash = node.slasher.slash_equivocation(
+            &evidence,
+            &mut node.validator_registry,
+            0,
+            "test-chain",
+        );
+        assert!(
+            matches!(
+                second_slash,
+                Err(chain_forge_slashing::SlashError::EquivocationAlreadyRecorded(..))
+            ),
+            "Phase 0: idempotency key written before registry lookup -- expected EquivocationAlreadyRecorded, got: {:?}",
+            second_slash
+        );
+
+        // Step 5: The node is still alive and at height 0 (quorum not yet
+        // reached -- only bob + carol_good so far, dave's vote is missing).
+        assert_eq!(node.status.lock().unwrap().height, 0,
+            "node must survive equivocation without committing a spurious block");
+        assert_eq!(node.consensus.current_height(), 0,
+            "consensus must not advance height on an equivocating vote");
+    }
+
 }

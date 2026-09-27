@@ -718,3 +718,44 @@ mod tests {
         assert_eq!(cfg.native_token.denom, cfg2.native_token.denom);
     }
 }
+
+// ── Workspace boundary ────────────────────────────────────────────────────────
+//
+// ValidatorId and ValidatorSetView live here so boundary crates such as
+// chain-forge-personhood can depend on just this crate rather than the full
+// chain-forge-consensus crate.
+
+use std::fmt;
+
+/// Opaque identifier for a validator.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash,
+         serde::Serialize, serde::Deserialize)]
+pub struct ValidatorId(pub String);
+
+impl fmt::Display for ValidatorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Read-only view of a validator set — sufficient for quorum and key lookups.
+///
+/// Implemented by `chain_forge_consensus::ValidatorSet` and by test stubs.
+/// Personhood and other crates accept `&dyn ValidatorSetView` so they don't
+/// need to import the full consensus crate.
+pub trait ValidatorSetView: Send + Sync {
+    /// Sum of all validators' voting power.
+    fn total_power(&self) -> u64;
+
+    /// Minimum power that constitutes a quorum (2/3 * total_power + 1).
+    fn quorum_power(&self) -> u64;
+
+    /// Voting power of one validator; 0 if unknown.
+    fn power_of(&self, id: &ValidatorId) -> u64;
+
+    /// ML-DSA public key bytes for a validator; None if unknown.
+    fn public_key_of(&self, id: &ValidatorId) -> Option<&[u8]>;
+
+    /// All validator IDs in this set (order unspecified, owned for type safety).
+    fn validator_ids(&self) -> Vec<ValidatorId>;
+}

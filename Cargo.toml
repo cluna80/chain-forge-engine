@@ -17,6 +17,7 @@ members = [
     "chain-forge-governance",
     "chain-forge-slashing",
     "chain-forge-node",
+    "chain-forge-personhood",
 ]
 
 [workspace.package]
@@ -34,3 +35,4 @@ sha3        = "0.10"
 thiserror   = "1"
 async-trait = "0.1"
 tracing     = "0.1"
+

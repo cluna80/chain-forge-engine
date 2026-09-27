@@ -30,10 +30,14 @@ license.workspace = true
 # Whitepaper refs: Q6 (slashing conditions), Q14 (validator liveness),
 # Section 3.3 (personhood-weighted BFT security), Section 6.3 (burn).
 
+[features]
+real-crypto = ["chain-forge-crypto"]
+
 [dependencies]
 chain-forge-core       = { path = "../chain-forge-core" }
 chain-forge-validators = { path = "../chain-forge-validators" }
 chain-forge-consensus  = { path = "../chain-forge-consensus" }
+chain-forge-crypto     = { path = "../chain-forge-crypto", optional = true }
 serde                  = { workspace = true }
 serde_json             = { workspace = true }
 thiserror              = { workspace = true }

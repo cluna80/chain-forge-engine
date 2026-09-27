@@ -59,6 +59,9 @@ pub enum SlashError {
 
     #[error("internal slashing error: {0}")]
     Internal(String),
+
+    #[error("equivocation evidence rejected: {0}")]
+    InvalidEvidence(String),
 }
 
 pub type SlashResult<T> = Result<T, SlashError>;
@@ -258,6 +261,13 @@ pub struct SlashingModule {
     pub liveness_slashed_uqcb: u128,
 }
 
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 { return Err(format!("odd hex length: {}", s.len())); }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i+2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
 impl SlashingModule {
     pub fn new(config: SlashingConfig) -> Self {
         Self {
@@ -281,11 +291,60 @@ impl SlashingModule {
     ///
     /// Tombstones the validator (permanent removal) and slashes their stake.
     /// Returns the amount to burn via BME.
+    pub fn verify_evidence(
+        chain_id:  &str,
+        evidence:  &EquivocationEvidence,
+        pub_key_a: &[u8],
+        pub_key_b: &[u8],
+    ) -> SlashResult<()> {
+        if evidence.signature_a.is_empty() && evidence.signature_b.is_empty() {
+            return Ok(());
+        }
+        let make_msg = |block_hash: &str| -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"CFV|");
+            b.extend_from_slice(chain_id.as_bytes());
+            b.push(b'|');
+            b.push(1u8); // Precommit
+            b.extend_from_slice(&evidence.height.to_le_bytes());
+            b.extend_from_slice(&(evidence.round as u32).to_le_bytes());
+            b.extend_from_slice(block_hash.as_bytes());
+            b
+        };
+        #[cfg(feature = "real-crypto")]
+        {
+            use chain_forge_crypto::{ClassicalScheme, Signature, SchemeId, SignatureScheme};
+            if !evidence.signature_a.is_empty() {
+                let msg = make_msg(&evidence.block_hash_a);
+                let sig = Signature { scheme: SchemeId::Classical, bytes: evidence.signature_a.clone() };
+                ClassicalScheme.verify(&msg, &sig, pub_key_a)
+                    .map_err(|e| SlashError::InvalidEvidence(format!("signature_a invalid: {e}")))?;
+            }
+            if !evidence.signature_b.is_empty() {
+                let msg = make_msg(&evidence.block_hash_b);
+                let sig = Signature { scheme: SchemeId::Classical, bytes: evidence.signature_b.clone() };
+                ClassicalScheme.verify(&msg, &sig, pub_key_b)
+                    .map_err(|e| SlashError::InvalidEvidence(format!("signature_b invalid: {e}")))?;
+            }
+        }
+        #[cfg(not(feature = "real-crypto"))]
+        {
+            let _ = (pub_key_a, pub_key_b, make_msg);
+            if !evidence.signature_a.is_empty() || !evidence.signature_b.is_empty() {
+                return Err(SlashError::InvalidEvidence(
+                    "non-empty signatures require real-crypto feature".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn slash_equivocation(
         &mut self,
         evidence:  &EquivocationEvidence,
         registry:  &mut ValidatorRegistry,
         epoch:     u64,
+        chain_id:  &str,
     ) -> SlashResult<u128> {
         let key = (
             evidence.validator_id.clone(),
@@ -293,7 +352,9 @@ impl SlashingModule {
             evidence.round,
         );
 
-        // Idempotent: same evidence cannot be processed twice
+        // Idempotent: record evidence key BEFORE any fallible work so that
+        // no error path (ValidatorNotFound, InvalidEvidence, etc.) allows
+        // the same evidence to be replayed once the transient condition clears.
         if self.equivocation_set.contains(&key) {
             return Err(SlashError::EquivocationAlreadyRecorded(
                 evidence.validator_id.clone(),
@@ -301,9 +362,18 @@ impl SlashingModule {
                 evidence.round,
             ));
         }
+        self.equivocation_set.insert(key.clone());
 
         let record = registry.get(&evidence.validator_id)
             .map_err(|_| SlashError::ValidatorNotFound(evidence.validator_id.clone()))?;
+
+        // Only decode pubkey and verify signatures when evidence carries non-empty sigs.
+        // Empty sigs = trusted internal equivocation detector path (Phase 0 fast-path).
+        if !evidence.signature_a.is_empty() || !evidence.signature_b.is_empty() {
+            let pub_key = decode_hex(&record.keys.consensus_pubkey)
+                .map_err(|e| SlashError::InvalidEvidence(format!("bad consensus_pubkey hex: {e}")))?;
+            Self::verify_evidence(chain_id, evidence, &pub_key, &pub_key)?;
+        }
 
         if record.status == chain_forge_validators::ValidatorStatus::Tombstoned {
             return Err(SlashError::AlreadyTombstoned(evidence.validator_id.clone()));
@@ -319,7 +389,6 @@ impl SlashingModule {
         registry.tombstone(&evidence.validator_id, epoch)
             .map_err(|e| SlashError::Registry(e.to_string()))?;
 
-        self.equivocation_set.insert(key);
         self.total_slashed_uqcb         += slash_amount;
         self.equivocation_slashed_uqcb  += slash_amount;
 
@@ -582,7 +651,7 @@ mod tests {
         let mut slasher = SlashingModule::with_qcb_defaults();
 
         let ev = evidence("val1", 10, 0);
-        let burned = slasher.slash_equivocation(&ev, &mut reg, 5).unwrap();
+        let burned = slasher.slash_equivocation(&ev, &mut reg, 5, "test-chain").unwrap();
 
         assert!(burned > 0, "some stake must be burned");
         let rec = reg.get("val1").unwrap();
@@ -598,9 +667,9 @@ mod tests {
         let mut slasher = SlashingModule::with_qcb_defaults();
 
         let ev = evidence("val1", 10, 0);
-        slasher.slash_equivocation(&ev, &mut reg, 5).unwrap();
+        slasher.slash_equivocation(&ev, &mut reg, 5, "test-chain").unwrap();
 
-        let result = slasher.slash_equivocation(&ev, &mut reg, 5);
+        let result = slasher.slash_equivocation(&ev, &mut reg, 5, "test-chain");
         assert!(result.is_err(), "same evidence must not be processed twice");
     }
 
@@ -611,8 +680,8 @@ mod tests {
 
         // A validator equivocating at height 10 and 11 are two separate events
         // (once tombstoned after first, second should return AlreadyTombstoned)
-        slasher.slash_equivocation(&evidence("val1", 10, 0), &mut reg, 5).unwrap();
-        let result = slasher.slash_equivocation(&evidence("val1", 11, 0), &mut reg, 5);
+        slasher.slash_equivocation(&evidence("val1", 10, 0), &mut reg, 5, "test-chain").unwrap();
+        let result = slasher.slash_equivocation(&evidence("val1", 11, 0), &mut reg, 5, "test-chain");
         assert!(result.is_err(), "tombstoned validator cannot be slashed again");
     }
 
@@ -621,7 +690,7 @@ mod tests {
         let mut reg     = registry_with_validator("val1", FULL_STAKE_UQCB);
         let mut slasher = SlashingModule::with_qcb_defaults();
 
-        slasher.slash_equivocation(&evidence("val1", 5, 0), &mut reg, 10).unwrap();
+        slasher.slash_equivocation(&evidence("val1", 5, 0), &mut reg, 10, "test-chain").unwrap();
         let history = slasher.history_for("val1");
         assert_eq!(history.len(), 1);
         assert!(history[0].tombstoned);
@@ -681,7 +750,7 @@ mod tests {
         let mut slasher = SlashingModule::with_qcb_defaults();
 
         // Jail via equivocation first
-        slasher.slash_equivocation(&evidence("val1", 1, 0), &mut reg, 1).unwrap();
+        slasher.slash_equivocation(&evidence("val1", 1, 0), &mut reg, 1, "test-chain").unwrap();
         // (now tombstoned, not jailed, but similar test: inactive validator)
         let slash_count_before = slasher.total_slashed_uqcb;
 
@@ -697,8 +766,8 @@ mod tests {
         let mut reg2    = registry_with_validator("val2", FULL_STAKE_UQCB);
         let mut slasher = SlashingModule::with_qcb_defaults();
 
-        let burned1 = slasher.slash_equivocation(&evidence("val1", 1, 0), &mut reg,  5).unwrap();
-        let burned2 = slasher.slash_equivocation(&evidence("val2", 2, 0), &mut reg2, 5).unwrap();
+        let burned1 = slasher.slash_equivocation(&evidence("val1", 1, 0), &mut reg,  5, "test-chain").unwrap();
+        let burned2 = slasher.slash_equivocation(&evidence("val2", 2, 0), &mut reg2, 5, "test-chain").unwrap();
 
         assert_eq!(slasher.total_slashed_uqcb, burned1 + burned2);
         assert_eq!(slasher.history().len(), 2);
@@ -714,6 +783,57 @@ mod tests {
         // assert strictly less with 49x to avoid floating-point equality edge
         assert!(liveness_slash * 49 < equivocation_slash,
             "liveness penalty must be much lighter than equivocation penalty");
+    }
+
+    #[test]
+    fn fake_evidence_with_non_empty_signatures_is_rejected() {
+        // Build a registry with a validator whose consensus_pubkey is valid hex
+        // (the default helper uses "pk_val1" which is odd-length and would fail
+        // decode_hex -- here we supply a proper 32-byte all-zero key in hex).
+        let mut reg = ValidatorRegistry::qcb_devnet();
+        let req = RegistrationRequest {
+            id:          ValidatorId("attacker".to_string()),
+            moniker:     "Attacker".to_string(),
+            keys:        KeyBundle::new_ed25519(
+                             // 32 bytes = 64 hex chars, all zeros -- valid hex, invalid Ed25519 key
+                             "0000000000000000000000000000000000000000000000000000000000000000",
+                             "qcb1attacker",
+                         ),
+            commission:  Commission::new(500, 2_000).unwrap(),
+            bonded_uqcb: FULL_STAKE_UQCB,
+            website:     None,
+        };
+        reg.register(req, 0).unwrap();
+        reg.confirm_pop("attacker", VerificationTier::Verified, 1).unwrap();
+
+        let mut slasher = SlashingModule::with_qcb_defaults();
+
+        // Construct evidence with non-empty (forged) signatures.
+        // Without the real-crypto feature the stub rejects any non-empty signature.
+        let fake_evidence = EquivocationEvidence {
+            validator_id: "attacker".to_string(),
+            height:       42,
+            round:        0,
+            block_hash_a: "aaaa".to_string(),
+            block_hash_b: "bbbb".to_string(),
+            signature_a:  vec![0xde, 0xad, 0xbe, 0xef],  // forged
+            signature_b:  vec![0xca, 0xfe, 0xba, 0xbe],  // forged
+        };
+
+        let result = slasher.slash_equivocation(&fake_evidence, &mut reg, 5, "test-chain");
+
+        assert!(
+            matches!(result, Err(SlashError::InvalidEvidence(..))),
+            "forged signatures must be rejected with InvalidEvidence, got: {:?}",
+            result
+        );
+
+        // Validator must NOT be tombstoned -- slash was rejected before any state change
+        let rec = reg.get("attacker").unwrap();
+        assert_eq!(rec.status, ValidatorStatus::Active,
+            "validator status must remain Active after rejected evidence");
+        assert_eq!(rec.bonded_uqcb, FULL_STAKE_UQCB,
+            "stake must be unchanged after rejected evidence");
     }
 }
 
