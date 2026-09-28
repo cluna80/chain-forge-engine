@@ -1398,25 +1398,29 @@ impl ConsensusEngine for TendermintEngine {
                 // Check for equivocation: same validator, same round, different
                 // block hash → double-prevote.
                 if let Some(existing) = round_votes.prevotes.get(&vote.validator) {
-                    if existing.block_hash != vote.block_hash
-                        && existing.block_hash.is_some()
-                        && vote.block_hash.is_some()
-                    {
+                    // Equivocation: same slot, different block_hash.
+                    // Nil-vs-real counts: a prevote-nil followed by prevote-block
+                    // (or vice-versa) at the same (height, round) is a double-sign.
+                    if existing.block_hash != vote.block_hash {
+                        let hash_a = existing.block_hash.clone()
+                            .unwrap_or_else(|| BlockHash("nil".into()));
+                        let hash_b = vote.block_hash.clone()
+                            .unwrap_or_else(|| BlockHash("nil".into()));
                         warn!(
                             validator = %vote.validator,
                             height    = vote.height,
                             round     = vote.round,
-                            hash_a    = %existing.block_hash.as_ref().unwrap(),
-                            hash_b    = %vote.block_hash.as_ref().unwrap(),
-                            "equivocation detected: double-prevote"
+                            hash_a    = %hash_a,
+                            hash_b    = %hash_b,
+                            "equivocation detected: double-prevote (nil-or-real)"
                         );
                         self.pending_equivocations.push(EquivocationDetected {
                             validator_id:   vote.validator.clone(),
                             height:         vote.height,
                             round:          vote.round,
                             vote_type_byte: 0,
-                            block_hash_a:   existing.block_hash.clone().unwrap(),
-                            block_hash_b:   vote.block_hash.clone().unwrap(),
+                            block_hash_a:   hash_a,
+                            block_hash_b:   hash_b,
                             signature_a:    existing.signature.clone(),
                             signature_b:    vote.signature.clone(),
                         });
@@ -1444,25 +1448,29 @@ impl ConsensusEngine for TendermintEngine {
                 // Check for equivocation: same validator, same round, different
                 // block hash → double-precommit.
                 if let Some(existing) = round_votes.precommits.get(&vote.validator) {
-                    if existing.block_hash != vote.block_hash
-                        && existing.block_hash.is_some()
-                        && vote.block_hash.is_some()
-                    {
+                    // Equivocation: same slot, different block_hash.
+                    // Nil-vs-real counts: precommit-nil then precommit-block at
+                    // the same (height, round) is a double-sign.
+                    if existing.block_hash != vote.block_hash {
+                        let hash_a = existing.block_hash.clone()
+                            .unwrap_or_else(|| BlockHash("nil".into()));
+                        let hash_b = vote.block_hash.clone()
+                            .unwrap_or_else(|| BlockHash("nil".into()));
                         warn!(
                             validator = %vote.validator,
                             height    = vote.height,
                             round     = vote.round,
-                            hash_a    = %existing.block_hash.as_ref().unwrap(),
-                            hash_b    = %vote.block_hash.as_ref().unwrap(),
-                            "equivocation detected: double-precommit"
+                            hash_a    = %hash_a,
+                            hash_b    = %hash_b,
+                            "equivocation detected: double-precommit (nil-or-real)"
                         );
                         self.pending_equivocations.push(EquivocationDetected {
                             validator_id:   vote.validator.clone(),
                             height:         vote.height,
                             round:          vote.round,
                             vote_type_byte: 1,
-                            block_hash_a:   existing.block_hash.clone().unwrap(),
-                            block_hash_b:   vote.block_hash.clone().unwrap(),
+                            block_hash_a:   hash_a,
+                            block_hash_b:   hash_b,
                             signature_a:    existing.signature.clone(),
                             signature_b:    vote.signature.clone(),
                         });
@@ -2529,6 +2537,112 @@ mod tests {
 
         assert!(engine.drain_equivocations().is_empty(),
             "identical vote re-sent must not produce equivocation evidence");
+    }
+
+    #[tokio::test]
+    async fn nil_vs_real_precommit_is_equivocation() {
+        // A precommit-nil followed by a precommit-block (or vice-versa) at the
+        // same (height, round) is equivocation — the is_some() guards that
+        // previously let this through were a bug.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let validator = ValidatorId("val_00".into());
+        let block = BlockHash("real_block".into());
+
+        let nil_vote = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: None,         // precommit-nil
+            signature:  vec![],
+        };
+        let real_vote = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block),  // precommit-block
+            signature:  vec![],
+        };
+
+        engine.receive_vote(nil_vote).await.unwrap();
+        engine.receive_vote(real_vote).await.unwrap();
+
+        let evidence = engine.drain_equivocations();
+        assert_eq!(evidence.len(), 1, "nil-vs-real precommit must be detected as equivocation");
+        assert_eq!(evidence[0].validator_id, validator);
+    }
+
+    #[tokio::test]
+    async fn nil_vs_real_prevote_is_equivocation() {
+        // Same as above but for prevotes.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let validator = ValidatorId("val_01".into());
+        let block = BlockHash("some_block".into());
+
+        let nil_vote = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: None,
+            signature:  vec![],
+        };
+        let real_vote = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block),
+            signature:  vec![],
+        };
+
+        engine.receive_vote(nil_vote).await.unwrap();
+        engine.receive_vote(real_vote).await.unwrap();
+
+        let evidence = engine.drain_equivocations();
+        assert_eq!(evidence.len(), 1, "nil-vs-real prevote must be detected as equivocation");
+        assert_eq!(evidence[0].validator_id, validator);
+    }
+
+    #[tokio::test]
+    async fn different_round_same_block_is_not_equivocation() {
+        // Voting for the same (or different) block in different rounds is
+        // legitimate Tendermint protocol — NOT equivocation.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let validator = ValidatorId("val_02".into());
+        let block_a = BlockHash("block_a".into());
+        let block_b = BlockHash("block_b".into());
+
+        let vote_round_0 = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block_a),
+            signature:  vec![],
+        };
+        // Different round — valid protocol re-proposal, not equivocation.
+        let vote_round_1 = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      1,
+            validator:  validator.clone(),
+            block_hash: Some(block_b),
+            signature:  vec![],
+        };
+
+        engine.receive_vote(vote_round_0).await.unwrap();
+        engine.receive_vote(vote_round_1).await.unwrap();
+
+        assert!(engine.drain_equivocations().is_empty(),
+            "votes in different rounds must not trigger equivocation detection");
     }
 
     #[tokio::test]
