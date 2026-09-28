@@ -542,6 +542,72 @@ impl Node {
         }
     }
 
+    /// Verify that a gossiped vote's signature is valid for the claimed validator.
+    ///
+    /// Returns:
+    ///   `Ok(())`        — signature is valid, or no key is on file for this
+    ///                     validator (Phase 0 devnet tolerance — warn only).
+    ///   `Err(String)`   — signature is present but cryptographically wrong,
+    ///                     or the validator is not in the active set at all.
+    ///                     Caller must drop the vote.
+    ///
+    /// Design: we look up the sender's public key from the consensus ValidatorSet
+    /// (populated from genesis or backfilled by `load_signing_key`). If the key
+    /// is non-empty we MUST verify — an empty signature against a known key is
+    /// treated as a forgery. If the key is empty we allow through so a mixed
+    /// key/no-key devnet still works.
+    ///
+    /// Whitepaper refs: Section 7.5 (validator identity), Section 8.1 (vote rules).
+    fn verify_vote_signature(&self, vote: &Vote) -> Result<(), String> {
+        let vs = self.consensus.validator_set();
+
+        // Validator must be in the active set — unknown ids are always rejected.
+        let vi = vs.validators.iter()
+            .find(|v| v.id == vote.validator)
+            .ok_or_else(|| format!(
+                "validator {} not in active set", vote.validator
+            ))?;
+
+        // No key on file: Phase 0 tolerance — pass through with a debug note.
+        // Once real keys are loaded (--key-file / genesis public_key), this
+        // branch is never reached for any honest validator.
+        if vi.public_key.is_empty() {
+            debug!(
+                validator = %vote.validator,
+                "no public key on file for validator — skipping signature check (Phase 0)"
+            );
+            return Ok(());
+        }
+
+        // Key is present — now the signature MUST be non-empty and valid.
+        if vote.signature.is_empty() {
+            return Err(format!(
+                "validator {} has a key on file but vote carries an empty signature",
+                vote.validator
+            ));
+        }
+
+        let chain_id = self.genesis.chain_id.as_str();
+        let msg = chain_forge_consensus::vote_signing_bytes(
+            chain_id,
+            &vote.vote_type,
+            vote.height,
+            vote.round,
+            vote.block_hash.as_ref(),
+        );
+
+        let sig = chain_forge_crypto::Signature {
+            scheme: chain_forge_crypto::SchemeId::Classical,
+            bytes:  vote.signature.clone(),
+        };
+
+        ClassicalScheme.verify(&msg, &sig, &vi.public_key)
+            .map_err(|e| format!(
+                "signature verification failed for validator {}: {e}",
+                vote.validator
+            ))
+    }
+
     /// Load a validator key file and bind it to this node.
     /// Called from main.rs when --key-file is supplied.
     pub fn load_signing_key(&mut self, path: &std::path::Path) -> Result<(), String> {
@@ -996,6 +1062,26 @@ impl Node {
                             return Ok(());
                         }
 
+                        // Verify the vote signature before feeding it into
+                        // consensus. This stops forged votes from being counted
+                        // toward quorum — the first line of vote security.
+                        // Only verified when the sending validator has a public
+                        // key in the ValidatorSet (loaded from genesis or via
+                        // load_signing_key). Validators without a key on file
+                        // are allowed through with a warn so a mixed key/no-key
+                        // network (Phase 0 devnet) doesn't hard-break.
+                        if let Err(reject) = self.verify_vote_signature(&vote) {
+                            warn!(
+                                from      = %msg.from,
+                                validator = %vote.validator,
+                                height    = vote.height,
+                                round     = vote.round,
+                                reason    = %reject,
+                                "vote rejected: invalid signature"
+                            );
+                            return Ok(());
+                        }
+
                         // NOTE: deliberately no catch_up_round_if_behind() call here.
                         // A single vote is just one peer's contribution toward
                         // quorum in whatever round IT thinks is current -- treating
@@ -1396,6 +1482,92 @@ impl Node {
         }
     }
 
+    /// Check liveness participation for every validator after a block commits
+    /// and apply slashing to any that have crossed the miss threshold.
+    ///
+    /// Uses `cert.precommits` (the votes that formed the quorum) as the
+    /// authoritative signer set, and `consensus.validator_set()` for the full
+    /// active set. Any validator absent from the quorum is recorded as a miss.
+    /// Once a validator's miss rate exceeds `liveness_miss_pct_threshold`
+    /// (default 20%) over the sliding `liveness_window_blocks` (default 500),
+    /// `record_block` returns `Ok(Some(burn_amount))`, the validator is jailed
+    /// by the slashing module itself, and this method burns the penalty via BME.
+    ///
+    /// Whitepaper refs: Section 8.2 (liveness slashing), Section 6.3 (BME burn).
+    fn check_liveness_after_commit(
+        &mut self,
+        cert: &chain_forge_consensus::CommitCertificate,
+    ) {
+        // Build the set of validator ids that actually signed this block.
+        let signers: std::collections::HashSet<String> = cert
+            .precommits
+            .iter()
+            .map(|v| v.validator.0.clone())
+            .collect();
+
+        // Full active validator set for this height.
+        let all_validators: Vec<String> = self
+            .consensus
+            .validator_set()
+            .validators
+            .iter()
+            .map(|v| v.id.0.clone())
+            .collect();
+
+        let height = cert.height;
+        let epoch  = height; // epoch == height until per-epoch batching is wired
+
+        for vid in &all_validators {
+            let signed = signers.contains(vid);
+            match self.slasher.record_block(
+                vid,
+                signed,
+                &mut self.validator_registry,
+                epoch,
+            ) {
+                Ok(None) => {
+                    // Window filling or threshold not yet crossed — nothing to do.
+                }
+                Ok(Some(burn_amount)) => {
+                    // Liveness threshold crossed: validator jailed by record_block,
+                    // now burn the penalty stake via BME (Section 6.3).
+                    if burn_amount > 0 {
+                        if let Err(e) = self.state.burn(vid, "uqcb", burn_amount) {
+                            warn!(
+                                validator = %vid,
+                                burn_uqcb = burn_amount,
+                                error     = %e,
+                                "liveness slash: BME burn failed; jail applied but tokens not burned"
+                            );
+                        } else {
+                            let mut cm = self.cirfi_metrics.lock().unwrap();
+                            cm.total_qcb_burned_uqcb =
+                                cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
+                            warn!(
+                                validator    = %vid,
+                                height,
+                                burn_uqcb    = burn_amount,
+                                total_burned = cm.total_qcb_burned_uqcb,
+                                "liveness failure: validator jailed and stake burned via BME"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Validator already jailed / tombstoned — not an error we
+                    // need to propagate; record_block is idempotent on its
+                    // penalty, so this is expected once a validator is out.
+                    debug!(
+                        validator = %vid,
+                        height,
+                        error     = %e,
+                        "liveness record_block skipped (validator already jailed/tombstoned)"
+                    );
+                }
+            }
+        }
+    }
+
     /// is unchanged and still used for the solo-devnet (no peers) path,
     /// where the proposer synthesises every validator's vote itself.
     async fn commit_block(
@@ -1510,7 +1682,12 @@ impl Node {
         // Unlike pending_proposals (a short-lived voting cache), chain_store
         // keeps every committed block permanently, so a peer that falls
         // behind has something to actually request and replay.
-        self.chain_store.insert(committed_height, (cert, proposal.clone()));
+        self.chain_store.insert(committed_height, (cert.clone(), proposal.clone()));
+
+        // Record block participation for every validator and slash any that
+        // have crossed the liveness miss threshold (>20% absent in 500-block
+        // sliding window → jail + 0.1% stake burn via BME, Section 8.2).
+        self.check_liveness_after_commit(&cert);
 
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
