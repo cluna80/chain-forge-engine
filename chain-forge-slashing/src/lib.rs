@@ -237,7 +237,10 @@ impl SlashingConfig {
             equivocation_slash_bps:      500,    // 5%
             liveness_slash_bps:          10,     // 0.1%
             liveness_miss_pct_threshold: 20,     // >20% missed triggers slash
-            liveness_window_blocks:      500,
+            // ATTACK TEST: window lowered to 10 blocks so liveness slash fires
+            // within ~10 seconds of Bob going offline (3 misses out of 10 = 30%
+            // > 20% threshold). Restore to 500 for production.
+            liveness_window_blocks:      10,
             min_remaining_stake:         0, // no floor -- slash the full computed amount
         }
     }
