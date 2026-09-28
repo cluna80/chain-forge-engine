@@ -385,10 +385,15 @@ pub struct IdentityRecord {
     pub charm: IntrinsicCharm,
     /// The attestation that created or last renewed this record.
     pub attestation: PopAttestation,
-    /// Whether this identity has claimed UBI in the current epoch.
+    /// Whether this identity has claimed CirFi yield in the current epoch.
     pub claimed_this_epoch: bool,
-    /// Total UBI claimed across all epochs (in ucirfi base units).
+    /// Total CirFi yield claimed across all epochs (in ucirfi base units).
     pub total_ubi_claimed: u128,
+    /// The last epoch in which this identity performed on-chain activity
+    /// (sent a tx, validated a block, processed a merchant settlement).
+    /// CirFi yield requires activity in the current epoch — this is the
+    /// earned-yield gate. None = never active.
+    pub last_active_epoch: Option<u64>,
     /// Agents sponsored by this identity (agent address -> authorized).
     pub sponsored_agents: Vec<String>,
     /// Distinct Verified+ identities who have vouched for THIS identity
@@ -416,6 +421,7 @@ impl IdentityRecord {
             attestation,
             claimed_this_epoch: false,
             total_ubi_claimed: 0,
+            last_active_epoch: None,
             sponsored_agents: Vec::new(),
             attestation_ledger: AttestationLedger::default(),
             attestations_given_epoch: 0,
@@ -715,14 +721,53 @@ impl IdentityStore {
             return Err(IdentityError::AlreadyClaimed(id.to_string(), epoch));
         }
 
+        // Earned-yield gate: CirFi is NOT a UBI drip — it must be earned.
+        // The identity must have performed at least one on-chain action this
+        // epoch (tx submission, validator participation, merchant settlement).
+        // record_activity() / record_activity_by_address() are called by the
+        // execution layer whenever such an event occurs.
+        let active_this_epoch = record.last_active_epoch == Some(epoch);
+        if !active_this_epoch {
+            return Err(IdentityError::NotVerified(
+                id.to_string(),
+                record.charm.tier.clone(),
+            ));
+        }
+
         let amount = UbiClock::ubi_per_epoch();
         record.claimed_this_epoch = true;
         record.total_ubi_claimed += amount;
         record.charm.record_participation(epoch);
         self.clock.total_distributed += amount;
 
-        tracing::debug!(id, epoch, amount_ucirfi = amount, "UBI claimed");
+        tracing::debug!(id, epoch, amount_ucirfi = amount, "CirFi yield claimed");
         Ok(amount)
+    }
+
+    /// Record on-chain activity for an identity, enabling CirFi yield claim
+    /// for this epoch. Called by the execution layer whenever a verified
+    /// identity submits a tx, participates as a validator, or processes a
+    /// merchant settlement. No-op if the identity is not found.
+    pub fn record_activity(&mut self, id: &str) {
+        let epoch = self.clock.current_epoch;
+        if let Some(record) = self.records.get_mut(id) {
+            record.last_active_epoch = Some(epoch);
+            tracing::debug!(id, epoch, "on-chain activity recorded for CirFi yield eligibility");
+        }
+    }
+
+    /// Same as record_activity but looks up by wallet address rather than
+    /// identity id. Used by the execution layer which knows addresses, not ids.
+    pub fn record_activity_by_address(&mut self, address: &str) {
+        let epoch = self.clock.current_epoch;
+        // find the record whose address matches
+        for record in self.records.values_mut() {
+            if record.address == address {
+                record.last_active_epoch = Some(epoch);
+                tracing::debug!(address, epoch, "on-chain activity recorded for CirFi yield eligibility");
+                return;
+            }
+        }
     }
 
     /// Advance the UBI epoch. Resets claim flags for all identities.
@@ -987,9 +1032,22 @@ mod tests {
     }
 
     #[test]
-    fn verified_identity_claims_ubi() {
+    fn verified_but_inactive_cannot_claim_yield() {
         let mut store = make_store();
         register_and_verify(&mut store, "h1", "qcb1h1");
+
+        // Verified but no on-chain activity recorded — must fail.
+        let result = store.claim_ubi("h1");
+        assert!(result.is_err(), "CirFi yield requires on-chain activity; passive claim must fail");
+    }
+
+    #[test]
+    fn active_verified_identity_claims_yield() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "h1", "qcb1h1");
+
+        // Record activity (simulates tx submission).
+        store.record_activity("h1");
 
         let amount = store.claim_ubi("h1").unwrap();
         assert_eq!(amount, DAILY_UBI_RATE_UCIRFI);
@@ -999,6 +1057,7 @@ mod tests {
     fn charm_confinement_one_claim_per_epoch() {
         let mut store = make_store();
         register_and_verify(&mut store, "h1", "qcb1h1");
+        store.record_activity("h1");
 
         store.claim_ubi("h1").unwrap();
         let second = store.claim_ubi("h1");
@@ -1010,12 +1069,14 @@ mod tests {
         let mut store = IdentityStore::with_epoch_ms(0, 1000);
         register_and_verify(&mut store, "h1", "qcb1h1");
 
+        store.record_activity("h1");
         store.claim_ubi("h1").unwrap();
         store.advance_epoch(1001); // advance past 1 epoch duration
 
-        // Should be able to claim again in new epoch
+        // Must record activity again in the new epoch before claiming.
+        store.record_activity("h1");
         let result = store.claim_ubi("h1");
-        assert!(result.is_ok(), "should allow claim in new epoch");
+        assert!(result.is_ok(), "should allow claim in new epoch after activity");
     }
 
     #[test]
@@ -1094,6 +1155,9 @@ mod tests {
         let mut store = make_store();
         register_and_verify(&mut store, "h1", "qcb1h1");
         register_and_verify(&mut store, "h2", "qcb1h2");
+
+        store.record_activity("h1");
+        store.record_activity("h2");
 
         store.claim_ubi("h1").unwrap();
         store.claim_ubi("h2").unwrap();

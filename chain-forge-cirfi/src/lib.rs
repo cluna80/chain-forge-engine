@@ -320,7 +320,9 @@ impl CirfiEngine {
         account: &mut AccountState,
         identity_store: &mut IdentityStore,
     ) -> CirfiResult<u128> {
-        // Delegate claim gating to identity store (Charm Confinement)
+        // Delegate claim gating to identity store.
+        // Checks in order: tier (must be Verified+), liveness, one-claim-per-epoch,
+        // and the earned-yield gate (must have on-chain activity this epoch).
         let ubi_amount = identity_store.claim_ubi(identity_id)
             .map_err(|e| CirfiError::NotVerified(format!("{identity_id}: {e}")))?;
 
@@ -474,34 +476,17 @@ impl CirfiEngine {
             }
         }
 
-        // Step 3: distribute UBI to verified humans who have claimed
-        // (actual claim calls come from individual tx submissions --
-        //  here we process any unclaimed verified identities automatically
-        //  in devnet mode)
-        let verified_ids: Vec<(String, String)> = identity
-            .verified_identity_ids()
-            .into_iter()
-            .filter_map(|id| {
-                identity.get(&id).ok().map(|r| (id, r.address.clone()))
-            })
-            .collect();
-
-        for (id, address) in verified_ids {
-            // Try to get or create account
-            if state.get_account(&address).is_err() {
-                let new_acct = chain_forge_state::AccountState::new(
-                    address.clone(), "user".to_string()
-                );
-                state.upsert_account(new_acct);
-            }
-
-            if let Ok(account) = state.get_account_mut(&address) {
-                if let Ok(amount) = self.distribute_ubi(&id, account, identity) {
-                    summary.ubi_recipients += 1;
-                    summary.total_ubi_distributed += amount;
-                }
-            }
-        }
+        // Step 3: CirFi yield is NOT auto-distributed.
+        //
+        // Yield claims are explicit tx submissions from each identity.
+        // The execution layer calls distribute_ubi() when it processes a
+        // ClaimYield transaction, after verifying that record_activity()
+        // has been called for this identity in the current epoch.
+        //
+        // This ensures CirFi is earned (participation-gated), not a
+        // passive UBI drip. Any identity that did not submit at least one
+        // on-chain action this epoch is simply ineligible — no exception
+        // in devnet mode either, so tests catch regressions early.
 
         tracing::info!(
             epoch                 = summary.epoch,
@@ -694,10 +679,25 @@ mod tests {
     }
 
     #[test]
-    fn ubi_distribution_credits_verified_human() {
+    fn yield_distribution_requires_on_chain_activity() {
         let mut engine = make_engine();
         let mut identity = make_identity_store();
         register_and_verify(&mut identity, "h1", "qcb1h1");
+
+        // Verified but NO activity recorded this epoch — must be rejected.
+        let mut account = make_account("qcb1h1", 0);
+        let result = engine.distribute_ubi("h1", &mut account, &mut identity);
+        assert!(result.is_err(), "CirFi yield requires on-chain activity; passive claim must fail");
+    }
+
+    #[test]
+    fn yield_distribution_credits_active_verified_human() {
+        let mut engine = make_engine();
+        let mut identity = make_identity_store();
+        register_and_verify(&mut identity, "h1", "qcb1h1");
+
+        // Record on-chain activity this epoch (simulates tx submission).
+        identity.record_activity("h1");
 
         let mut account = make_account("qcb1h1", 0);
         let amount = engine.distribute_ubi("h1", &mut account, &mut identity).unwrap();
@@ -707,15 +707,16 @@ mod tests {
     }
 
     #[test]
-    fn ubi_double_claim_rejected() {
+    fn yield_double_claim_rejected() {
         let mut engine = make_engine();
         let mut identity = make_identity_store();
         register_and_verify(&mut identity, "h1", "qcb1h1");
+        identity.record_activity("h1");
 
         let mut account = make_account("qcb1h1", 0);
         engine.distribute_ubi("h1", &mut account, &mut identity).unwrap();
         let second = engine.distribute_ubi("h1", &mut account, &mut identity);
-        assert!(second.is_err(), "cannot claim UBI twice in same epoch");
+        assert!(second.is_err(), "cannot claim CirFi yield twice in same epoch");
     }
 
     #[test]
