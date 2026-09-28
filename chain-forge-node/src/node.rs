@@ -287,10 +287,20 @@ impl Node {
         state.apply_genesis(&genesis)
             .map_err(|e| NodeError::State(e.to_string()))?;
 
-        // Build validator set from genesis accounts
-        let validators: Vec<ValidatorInfo> = genesis.genesis_accounts
+        // Build validator set from genesis accounts.
+        // pop_verified is derived from the IdentityStore after seeding, not
+        // from the raw modules.identity flag. This ensures that only
+        // addresses that actually hold a Verified+ IdentityRecord are marked
+        // as PoP-verified in the consensus layer — the source of truth is
+        // always the identity store, not a configuration flag.
+        // Note: identity seeding happens a few lines below this point; we
+        // re-derive pop_verified after seeding (see "Backfill pop_verified"
+        // comment below) so the two stay in sync.
+        let validator_accounts: Vec<_> = genesis.genesis_accounts
             .iter()
             .filter(|a| a.role == "validator")
+            .collect();
+        let validators: Vec<ValidatorInfo> = validator_accounts.iter()
             .map(|a| {
                 // Decode the genesis public key (hex) if present. This is
                 // what lets vote/proposal signature verification work from
@@ -304,7 +314,8 @@ impl Node {
                 ValidatorInfo {
                     id: ValidatorId(a.address.clone()),
                     voting_power: 1,
-                    pop_verified: modules.identity,
+                    // Placeholder — backfilled from IdentityStore after seeding.
+                    pop_verified: false,
                     public_key,
                 }
             })
@@ -443,6 +454,33 @@ impl Node {
             if identity.register(acct.address.clone(), acct.address.clone(), att.clone()).is_ok() {
                 let _ = identity.verify_identity(&acct.address, att);
             }
+        }
+
+        // Backfill pop_verified in the consensus engine's validator set now that
+        // identity seeding is complete. The genesis_vs was built before seeding
+        // (pop_verified: false placeholder), so we fetch a clone, fix each entry,
+        // and push it back via update_validator_set.
+        //
+        // Proof-of-personhood admission: a validator must hold a Verified+
+        // IdentityRecord to participate in block production. We derive from the
+        // store so the consensus layer's source of truth is always the identity
+        // store, not a configuration flag.
+        {
+            let mut vs = engine.validator_set().clone();
+            for v in &mut vs.validators {
+                v.pop_verified = identity.get(&v.id.0)
+                    .map(|r| r.charm.tier.grants_consensus())
+                    .unwrap_or(false);
+                if !v.pop_verified {
+                    warn!(
+                        validator = %v.id,
+                        "genesis validator has no Verified identity record — \
+                         pop_verified=false, voting power will be clamped to 0 \
+                         by apply_personhood_cap if personhood_weighted=true"
+                    );
+                }
+            }
+            let _ = engine.update_validator_set(vs);
         }
 
         let cirfi             = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
@@ -1609,6 +1647,16 @@ impl Node {
             .collect();
 
         self.identity.advance_epoch(now_ms);
+
+        // Validator participation = on-chain activity for CirFi yield eligibility.
+        // Every validator who signed a precommit in this block's commit certificate
+        // gets their activity stamped for this epoch. This means validators earn
+        // CirFi yield for doing their job — producing/signing blocks — without
+        // needing to submit separate Transfer or Stake txs.
+        for vote in &cert.precommits {
+            self.identity.record_activity(&vote.validator.0);
+        }
+
         let exec_result = self.executor.execute_block_with_identity(
             cert.height, txs, &mut self.state, &mut self.identity, &mut self.cirfi, now_ms,
         );
@@ -1622,6 +1670,39 @@ impl Node {
             state_root = %exec_result.state_root,
             "block executed and committed (multi-node quorum)"
         );
+
+        // Refresh pop_verified in the live validator set from IdentityStore.
+        //
+        // This is the per-block PoP admission check: if an identity was
+        // just upgraded to Verified (via a quorum of Attest txs in this
+        // block), they gain voting power starting next block. If a validator's
+        // identity record was revoked or expired, they lose it.
+        //
+        // We do this BEFORE on_commit so the updated validator set is what
+        // the consensus engine sees when it starts the next height.
+        {
+            let current_vs = self.consensus.validator_set().clone();
+            let mut updated_vs = current_vs;
+            let mut any_changed = false;
+            for v in &mut updated_vs.validators {
+                let now_verified = self.identity.get(&v.id.0)
+                    .map(|r| r.charm.tier.grants_consensus())
+                    .unwrap_or(false);
+                if v.pop_verified != now_verified {
+                    if now_verified {
+                        info!(validator = %v.id, "PoP gate: identity Verified — granting consensus power");
+                    } else {
+                        warn!(validator = %v.id, "PoP gate: identity not Verified — revoking consensus power");
+                    }
+                    v.pop_verified = now_verified;
+                    any_changed = true;
+                }
+            }
+            if any_changed {
+                updated_vs.height = cert.height;
+                let _ = self.consensus.update_validator_set(updated_vs);
+            }
+        }
 
         self.consensus.on_commit(cert.clone(), None).await
             .map_err(|e| e.to_string())?;

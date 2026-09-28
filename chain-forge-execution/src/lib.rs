@@ -605,9 +605,17 @@ impl Executor {
                 if let Ok(sender_acct) = state.get_account_mut(&tx.sender) {
                     sender_acct.record_spend_for_exemption(epoch);
                 }
-                state.transfer(&tx.sender, to, denom, *amount)
+                let result = state.transfer(&tx.sender, to, denom, *amount)
                     .map(|_| events.push(format!("transfer: {} {} -> {}", amount, denom, to)))
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string());
+                // CirFi earned-yield gate: a successful transfer counts as
+                // on-chain activity for the sender, making them eligible to
+                // claim CirFi yield this epoch. We use record_activity_by_address
+                // so the lookup goes through wallet address → identity record.
+                if result.is_ok() {
+                    identity.record_activity_by_address(&tx.sender);
+                }
+                result
             }
 
             TxBody::Burn { denom, amount } => {
@@ -617,9 +625,14 @@ impl Executor {
             }
 
             TxBody::Stake { validator, amount } => {
-                state.transfer(&tx.sender, validator, &self.config.native_denom, *amount)
+                let result = state.transfer(&tx.sender, validator, &self.config.native_denom, *amount)
                     .map(|_| events.push(format!("stake: {} -> {}", amount, validator)))
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string());
+                // Staking is on-chain activity — record for CirFi yield eligibility.
+                if result.is_ok() {
+                    identity.record_activity_by_address(&tx.sender);
+                }
+                result
             }
 
             TxBody::Custom { module, payload } => {
@@ -1293,6 +1306,9 @@ mod tests {
 
         let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
 
+        // CirFi earned-yield gate: must record on-chain activity before claiming.
+        identity.record_activity("qcb1alice");
+
         let tx = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
         let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
 
@@ -1306,6 +1322,8 @@ mod tests {
     #[test]
     fn charm_confinement_blocks_double_ubi_claim() {
         let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+
+        identity.record_activity("qcb1alice");
 
         let tx1 = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
         let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut cirfi);
@@ -1321,6 +1339,7 @@ mod tests {
         let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
 
         // Claim UBI first so alice has ucirfi to redirect
+        identity.record_activity("qcb1alice");
         let claim = Transaction::claim_ubi("tx0", "qcb1alice", "qcb1alice", 0);
         let r0 = exec.execute_tx_with_identity(&claim, &mut state, &mut identity, &mut cirfi);
         assert!(r0.success, "{:?}", r0.error);
