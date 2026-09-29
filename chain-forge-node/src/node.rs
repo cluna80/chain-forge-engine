@@ -190,6 +190,17 @@ pub struct Node {
     /// vote), this is how the node finds the tx_data to actually execute.
     /// Entries at or below a committed height are pruned on commit.
     pending_proposals: std::collections::HashMap<(u64, u32), chain_forge_consensus::BlockProposal>,
+    /// Commit certificates that arrived (via receive_vote returning Some) when
+    /// the corresponding proposal had not yet been stored.  This is the
+    /// partition-recovery latch: when a node's proposal gossip is delayed
+    /// (network blip, slow link, reorder), votes can reach quorum before the
+    /// proposal body lands.  The cert is parked here; the BlockProposal handler
+    /// checks on every new proposal arrival and commits immediately if a cert
+    /// is already waiting.  Without this latch the block is never committed
+    /// after the partition heals, because receive_vote is not called again and
+    /// the proposal handler does not re-check quorum.
+    /// Entries at or below a committed height are pruned alongside pending_proposals.
+    pending_certs: std::collections::HashMap<(u64, u32), chain_forge_consensus::CommitCertificate>,
     /// The (height, round) this node last proposed for, if it is the
     /// proposer and hasn't seen a commit yet. Prevents re-proposing (and
     /// re-broadcasting identical content the gossip layer will just reject
@@ -602,6 +613,7 @@ impl Node {
             validator_id,
             mempool: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
+            pending_certs:     std::collections::HashMap::new(),
             last_proposed: None,
             round_watch: None,
             round_watch_started: None,
@@ -1161,14 +1173,32 @@ impl Node {
                             (proposal.height, proposal.round), proposal.clone(),
                         );
 
-                        match self.cast_and_broadcast_own_votes(&proposal).await {
-                            Ok(Some(cert)) => {
-                                if let Err(e) = self.commit_block(cert, &proposal).await {
-                                    error!(error = %e, "commit failed after reaching quorum via own vote");
-                                }
+                        // Partition-recovery check: if a CommitCertificate for this
+                        // (height, round) was already parked by the vote handler (votes
+                        // arrived and reached quorum before this proposal body did),
+                        // commit immediately.  We do NOT call cast_and_broadcast_own_votes
+                        // in this path because (a) the quorum is already reached and the
+                        // cert is valid, and (b) those votes were already counted and
+                        // broadcast when they were first received.
+                        if let Some(cert) = self.pending_certs.remove(&(proposal.height, proposal.round)) {
+                            info!(
+                                height = proposal.height,
+                                round  = proposal.round,
+                                "proposal arrived after quorum: committing deferred block"
+                            );
+                            if let Err(e) = self.commit_block(cert, &proposal).await {
+                                error!(error = %e, "commit failed on deferred proposal commit (partition recovery)");
                             }
-                            Ok(None) => {}
-                            Err(e) => warn!(error = %e, "failed to cast own votes for received proposal"),
+                        } else {
+                            match self.cast_and_broadcast_own_votes(&proposal).await {
+                                Ok(Some(cert)) => {
+                                    if let Err(e) = self.commit_block(cert, &proposal).await {
+                                        error!(error = %e, "commit failed after reaching quorum via own vote");
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => warn!(error = %e, "failed to cast own votes for received proposal"),
+                            }
                         }
                     }
 
@@ -1250,17 +1280,21 @@ impl Node {
                                         }
                                     }
                                     None => {
-                                        // Quorum reached on a proposal we never received --
-                                        // possible if this vote arrived before the proposal
-                                        // gossip did. We cannot execute without the tx_data,
-                                        // so we log and wait; the proposal message, once it
-                                        // arrives, currently will not re-trigger this commit
-                                        // (a known gap -- see the deployment notes).
+                                        // Quorum reached but the proposal body hasn't arrived
+                                        // yet (votes can travel faster than large proposal
+                                        // payloads, and a partition heal may deliver votes
+                                        // before the proposer's message is retransmitted).
+                                        // Park the certificate so the BlockProposal handler
+                                        // can commit the moment the body lands, without
+                                        // needing to call receive_vote again.
                                         warn!(
                                             height = vote.height,
                                             round  = vote.round,
-                                            "quorum reached but proposal not yet seen; cannot execute block"
+                                            "quorum reached but proposal not yet seen; \
+                                             parking certificate for deferred commit"
                                         );
+                                        self.pending_certs
+                                            .insert((vote.height, vote.round), cert);
                                     }
                                 }
                             }
@@ -1880,10 +1914,12 @@ impl Node {
             }
         }
 
-        // Drop proposals at or below the height we just committed -- they
-        // can no longer be voted on and would otherwise accumulate forever.
+        // Drop proposals and parked certs at or below the height we just
+        // committed -- they can no longer be voted on and would otherwise
+        // accumulate forever.
         let committed_height = cert.height;
         self.pending_proposals.retain(|(h, _), _| *h > committed_height);
+        self.pending_certs.retain(|(h, _), _| *h > committed_height);
 
         // Unlike pending_proposals (a short-lived voting cache), chain_store
         // keeps every committed block permanently, so a peer that falls
@@ -2541,6 +2577,60 @@ mod tests {
         assert!(!node.pending_proposals.contains_key(&(0, 0)),
             "committed proposal must be pruned");
         assert_eq!(node.explorer.lock().unwrap().blocks.len(), 1);
+    }
+
+    /// Partition recovery: votes reach quorum before the proposal body arrives.
+    ///
+    /// Simulates the case where a brief network partition (or reordered gossip)
+    /// causes all three precommits to be processed first, with the proposal
+    /// gossip arriving afterwards.  Before the fix, the block was never committed
+    /// in this scenario; after the fix, `pending_certs` parks the certificate
+    /// and the BlockProposal handler commits it as soon as the body lands.
+    #[tokio::test]
+    async fn partition_recovery_votes_before_proposal() {
+        // Bob is not the proposer at (0,0) -- alice is -- so Bob votes and
+        // processes gossip but doesn't produce the proposal itself.
+        let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_partition_test");
+
+        // Three precommits arrive BEFORE the proposal gossip.
+        // The node feeds them to receive_vote(); on the 3rd one it returns
+        // Some(cert) but there is no pending proposal, so the cert is parked.
+        for validator in &["qcb1alice", "qcb1carol", "qcb1dave"] {
+            let vote = Vote {
+                vote_type:  VoteType::Precommit,
+                height: 0, round: 0,
+                validator:  ValidatorId(validator.to_string()),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            node.handle_event(gossip(
+                GossipTopic::ConsensusVote,
+                serde_json::to_vec(&vote).unwrap(),
+            )).await.unwrap();
+        }
+
+        // Quorum was reached but no commit yet (proposal body not present).
+        assert_eq!(node.status.lock().unwrap().height, 0,
+            "no commit yet -- proposal hasn't arrived");
+        assert!(node.pending_proposals.is_empty(),
+            "proposal body not stored yet");
+        assert!(node.pending_certs.contains_key(&(0, 0)),
+            "certificate must be parked in pending_certs");
+
+        // Now the proposal gossip arrives (partition heals / reorder resolved).
+        let payload = serde_json::to_vec(&proposal).unwrap();
+        node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
+
+        // The Proposal handler must detect the parked cert and commit immediately.
+        assert_eq!(node.consensus.current_height(), 1,
+            "consensus engine must advance to height 1 after deferred commit");
+        assert_eq!(node.explorer.lock().unwrap().blocks.len(), 1,
+            "block must appear in explorer after deferred commit");
+        assert!(node.pending_certs.is_empty(),
+            "parked certificate must be pruned after commit");
+        assert!(!node.pending_proposals.contains_key(&(0, 0)),
+            "committed proposal must be pruned");
     }
 
     #[tokio::test]
