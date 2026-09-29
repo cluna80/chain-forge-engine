@@ -92,6 +92,14 @@ pub enum IdentityError {
     #[error("sybil confirmation for identity {0} not found; cannot reverse")]
     SybilConfirmationNotFound(String),
 
+    // -- Phase D errors -------------------------------------------------------
+
+    #[error("attester {0} has not attested identity {1} and cannot report it as a suspected sybil")]
+    CannotReportWithoutAttestation(String, String),
+
+    #[error("attester {0} has already reported identity {1} as a suspected sybil")]
+    AlreadyReported(String, String),
+
     #[error("internal identity error: {0}")]
     Internal(String),
 }
@@ -341,6 +349,70 @@ pub const ATTESTATION_CAP_PER_WINDOW: u32 = 3;
 /// the cap. Pilot value: 90 epochs (≈ 90 days if one epoch = one day).
 pub const ATTESTATION_CAP_WINDOW_EPOCHS: u64 = 90;
 
+// -- Phase D constants --------------------------------------------------------
+
+/// Standard CS penalty rate for attesters of a confirmed sybil, in basis points.
+///
+/// 12000 bps = 120% (100% clawback of CS earned + 20% deterrent).
+/// Pilot value per QCB-Attestation-Guard-Design.md §3: "100% earned back
+/// + 20% as a deterrent signal." Governance-tunable.
+///
+/// The actual deduction is: cs_earned_from_attestation * ATTEST_PENALTY_RATE_BPS / 10000.
+/// With 12000 bps on X CS earned: attester loses 1.2 * X (net -20% deterrent).
+pub const ATTEST_PENALTY_RATE_BPS: u32 = 12_000;
+
+/// Flat revocation cost in basis points of CS earned from that attestation.
+///
+/// 1000 bps = 10%. Pilot value per QCB-Attestation-Guard-Design.md §4:
+/// "A small, flat CS deduction on revocation (initially: 10% of CS earned
+/// from that attestation), regardless of reason or timing."
+///
+/// Governance-tunable. Applied by the execution layer using the
+/// `RevocationCost` value returned by `revoke_attestation()`.
+pub const REVOCATION_COST_BPS: u32 = 1_000;
+
+/// Penalty reduction for attesters who self-reported before coordinator
+/// confirmation, in basis points of the STANDARD penalty.
+///
+/// 5000 bps = 50% reduction. Pilot value: attester who flagged a sybil
+/// before the coordinator's `confirm_sybil` call pays half the normal penalty.
+/// Governance-tunable.
+pub const SELF_REPORT_PENALTY_REDUCTION_BPS: u32 = 5_000;
+
+/// Carries the CS deduction signal from `revoke_attestation` to the
+/// execution layer. The identity crate does not own CS arithmetic —
+/// it signals what happened; the execution layer applies the deduction.
+///
+/// `cost_bps`: the basis-points rate to apply against the CS earned
+/// from this attestation. At pilot launch this is always REVOCATION_COST_BPS
+/// (10%); governance can tune it without a code change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationCost {
+    /// The attester whose CS should be debited.
+    pub attester_id: String,
+    /// The attested identity whose attestation was revoked.
+    pub attested_id: String,
+    /// Rate in basis points (1 bps = 0.01%) to apply against the CS earned
+    /// from this attestation. 1000 = 10%.
+    pub cost_bps: u32,
+}
+
+/// A self-report event: an attester pre-emptively flags an identity they
+/// vouched for as a suspected sybil, before the coordinator acts.
+///
+/// If the coordinator subsequently confirms the sybil, the self-reporting
+/// attester's penalty is reduced by SELF_REPORT_PENALTY_REDUCTION_BPS.
+/// If the identity is never confirmed, the report has no effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SybilReport {
+    /// The attester who filed the report.
+    pub attester_id: String,
+    /// The suspected sybil identity.
+    pub suspected_id: String,
+    /// The epoch in which the report was filed.
+    pub report_epoch: u64,
+}
+
 /// Tracks which distinct identities have vouched for a Provisional
 /// claimant so far, on the way to reaching ATTESTATION_QUORUM.
 ///
@@ -469,6 +541,9 @@ fn attestation_record_key(attester_id: &str, attested_id: &str) -> String {
 /// audit trail for CS penalties: it records who was penalized and why, so
 /// that reversals can undo exactly the right penalties and no others.
 ///
+/// Phase D: the log also records which attesters self-reported before
+/// confirmation (and therefore qualify for the reduced penalty rate).
+///
 /// The `reversed` flag is set true by `reverse_sybil`; the entry is kept
 /// rather than deleted so the reversal itself is auditable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,14 +554,34 @@ pub struct SybilConfirmationLog {
     pub coordinator_id: String,
     /// The epoch in which the confirmation was issued.
     pub confirmed_epoch: u64,
-    /// The attester IDs whose records were penalized (Active -> Penalized).
-    /// Revoked-at-time-of-confirmation attestations are NOT included —
-    /// the attester already paid the revocation cost and exited cleanly.
-    pub penalized_attesters: Vec<String>,
+    /// Per-attester penalty records for attesters whose records were penalized
+    /// (Active → Penalized). Revoked attestations are NOT included.
+    pub penalized_attesters: Vec<PenaltyRecord>,
     /// Whether this confirmation has been reversed by `reverse_sybil`.
     pub reversed: bool,
     /// If reversed: the epoch in which it was reversed.
     pub reversal_epoch: Option<u64>,
+}
+
+/// One attester's penalty entry within a `SybilConfirmationLog`.
+///
+/// Phase D: records whether the attester self-reported before the
+/// coordinator confirmation, which determines their effective penalty rate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyRecord {
+    /// The attester whose CS is to be penalized.
+    pub attester_id: String,
+    /// Effective penalty rate in basis points.
+    ///
+    /// For attesters who did NOT self-report: ATTEST_PENALTY_RATE_BPS (120%).
+    /// For attesters who self-reported before confirmation:
+    ///   ATTEST_PENALTY_RATE_BPS * (1 - SELF_REPORT_PENALTY_REDUCTION_BPS/10000)
+    ///   = 120% * 50% = 60%.
+    /// Governance-tunable; the rate is computed at confirmation time and
+    /// recorded here so reversals don't need to recompute it.
+    pub penalty_bps: u32,
+    /// Whether this attester filed a self-report before coordinator confirmation.
+    pub self_reported: bool,
 }
 
 // -- Decay exemption credits --------------------------------------------------
@@ -851,6 +946,14 @@ pub struct IdentityStore {
     /// are kept (reversed=true) for auditability. This map is append-only from
     /// the coordinator's perspective; entries are never deleted.
     pub(crate) sybil_confirmations: HashMap<String, SybilConfirmationLog>,
+    /// Phase D: pending self-reports from attesters who suspect an identity
+    /// they vouched for is a sybil, submitted before coordinator confirmation.
+    ///
+    /// Key: suspected identity ID → list of reports from attesters.
+    /// Cleared (entry removed) when `confirm_sybil` is called and the reports
+    /// are consumed into the confirmation log's `PenaltyRecord.self_reported` fields.
+    /// Entries are also preserved if the coordinator reverses and re-confirms.
+    pub(crate) pending_sybil_reports: HashMap<String, Vec<SybilReport>>,
 }
 
 impl IdentityStore {
@@ -862,6 +965,7 @@ impl IdentityStore {
             attestation_records: HashMap::new(),
             coordinator_id: None,
             sybil_confirmations: HashMap::new(),
+            pending_sybil_reports: HashMap::new(),
         }
     }
 
@@ -874,6 +978,7 @@ impl IdentityStore {
             attestation_records: HashMap::new(),
             coordinator_id: None,
             sybil_confirmations: HashMap::new(),
+            pending_sybil_reports: HashMap::new(),
         }
     }
 
@@ -1026,8 +1131,13 @@ impl IdentityStore {
     /// Revoke a previously-given attestation.
     ///
     /// Phase A: updates the `AttestationRecord` status to `Revoked` and records
-    /// the revocation epoch. Phase B will also free the cap slot here.
-    /// Phase D will apply the flat CS revocation cost here.
+    /// the revocation epoch. The rolling-window cap slot is freed automatically
+    /// because Phase B's cap count excludes Revoked records.
+    ///
+    /// Phase D: returns a `RevocationCost` that the execution layer uses to
+    /// apply the flat CS deduction (REVOCATION_COST_BPS = 10% of CS earned
+    /// from this attestation). The identity crate does not own CS arithmetic;
+    /// `RevocationCost` is the signal, not the deduction itself.
     ///
     /// Design decision Q1: revocation frees the rolling-window cap slot.
     /// An honest attester who discovers a mistake is not penalized by a
@@ -1040,7 +1150,7 @@ impl IdentityStore {
         &mut self,
         attester_id: &str,
         attested_id: &str,
-    ) -> IdResult<()> {
+    ) -> IdResult<RevocationCost> {
         let key = attestation_record_key(attester_id, attested_id);
         let epoch = self.clock.current_epoch;
 
@@ -1094,7 +1204,11 @@ impl IdentityStore {
             attester_id, attested_id, epoch,
             "attestation revoked"
         );
-        Ok(())
+        Ok(RevocationCost {
+            attester_id: attester_id.to_string(),
+            attested_id: attested_id.to_string(),
+            cost_bps: REVOCATION_COST_BPS,
+        })
     }
 
     /// Return all attestation records where `attester_id` is the attester.
@@ -1391,16 +1505,48 @@ impl IdentityStore {
 
         let epoch = self.clock.current_epoch;
 
+        // Collect any pending self-reports for this identity (Phase D).
+        // These are attesters who flagged this identity as suspected before
+        // the coordinator acted — they receive the reduced penalty rate.
+        let self_reporters: std::collections::HashSet<String> = self
+            .pending_sybil_reports
+            .remove(sybil_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.attester_id)
+            .collect();
+
         // Walk all attestation records for this identity. Penalize active
         // ones; skip revoked ones (attester already paid their exit cost).
-        let mut penalized_attesters: Vec<String> = Vec::new();
+        let mut penalty_records: Vec<PenaltyRecord> = Vec::new();
         for record in self.attestation_records.values_mut() {
             if record.attested_id == sybil_id && record.status == AttestationStatus::Active {
                 record.status = AttestationStatus::Penalized;
                 record.penalty_applied = true;
-                penalized_attesters.push(record.attester_id.clone());
+
+                let self_reported = self_reporters.contains(&record.attester_id);
+                // Reduced rate for self-reporters: standard * (1 - reduction)
+                // E.g. 12000 * (1 - 5000/10000) = 12000 * 50% = 6000 bps (60%)
+                let penalty_bps = if self_reported {
+                    ATTEST_PENALTY_RATE_BPS
+                        * (10_000 - SELF_REPORT_PENALTY_REDUCTION_BPS)
+                        / 10_000
+                } else {
+                    ATTEST_PENALTY_RATE_BPS
+                };
+
+                penalty_records.push(PenaltyRecord {
+                    attester_id: record.attester_id.clone(),
+                    penalty_bps,
+                    self_reported,
+                });
             }
         }
+
+        // Collect attester IDs for the return value (execution layer applies CS deductions).
+        let penalized_ids: Vec<String> = penalty_records.iter()
+            .map(|pr| pr.attester_id.clone())
+            .collect();
 
         // Write the confirmation log entry.
         self.sybil_confirmations.insert(
@@ -1409,7 +1555,7 @@ impl IdentityStore {
                 sybil_id: sybil_id.to_string(),
                 coordinator_id: coord,
                 confirmed_epoch: epoch,
-                penalized_attesters: penalized_attesters.clone(),
+                penalized_attesters: penalty_records,
                 reversed: false,
                 reversal_epoch: None,
             },
@@ -1419,11 +1565,70 @@ impl IdentityStore {
             sybil_id,
             coordinator = caller_id,
             epoch,
-            penalized_count = penalized_attesters.len(),
+            penalized_count = penalized_ids.len(),
             "sybil confirmed; attesters penalized"
         );
 
-        Ok(penalized_attesters)
+        Ok(penalized_ids)
+    }
+
+    /// File a self-report: `attester_id` flags an identity they vouched for
+    /// as a suspected sybil before the coordinator acts (Phase D).
+    ///
+    /// If the coordinator subsequently calls `confirm_sybil` for this identity,
+    /// this attester's CS penalty is reduced by SELF_REPORT_PENALTY_REDUCTION_BPS
+    /// (50% of the standard rate). If the identity is never confirmed, the report
+    /// has no effect.
+    ///
+    /// Requirements:
+    /// - The attester must have an active (non-revoked, non-penalized) attestation
+    ///   for `suspected_id`. An attester who has already revoked their attestation
+    ///   has no exposure and cannot file a report.
+    /// - The attester may not file a duplicate report for the same suspected identity.
+    ///
+    /// Returns `Ok(())` if the report was accepted.
+    pub fn report_suspected_sybil(
+        &mut self,
+        attester_id: &str,
+        suspected_id: &str,
+    ) -> IdResult<()> {
+        // The attester must have an active attestation for this identity.
+        let key = attestation_record_key(attester_id, suspected_id);
+        let record = self.attestation_records.get(&key)
+            .ok_or_else(|| IdentityError::CannotReportWithoutAttestation(
+                attester_id.to_string(),
+                suspected_id.to_string(),
+            ))?;
+        if !record.is_active() {
+            return Err(IdentityError::CannotReportWithoutAttestation(
+                attester_id.to_string(),
+                suspected_id.to_string(),
+            ));
+        }
+
+        // Reject duplicate reports from the same attester for the same identity.
+        let reports = self.pending_sybil_reports
+            .entry(suspected_id.to_string())
+            .or_insert_with(Vec::new);
+        if reports.iter().any(|r| r.attester_id == attester_id) {
+            return Err(IdentityError::AlreadyReported(
+                attester_id.to_string(),
+                suspected_id.to_string(),
+            ));
+        }
+
+        let epoch = self.clock.current_epoch;
+        reports.push(SybilReport {
+            attester_id: attester_id.to_string(),
+            suspected_id: suspected_id.to_string(),
+            report_epoch: epoch,
+        });
+
+        tracing::info!(
+            attester_id, suspected_id, epoch,
+            "self-report filed; attester will receive penalty reduction if identity is confirmed as sybil"
+        );
+        Ok(())
     }
 
     /// Reverse a sybil confirmation (coordinator-only).
@@ -1466,7 +1671,12 @@ impl IdentityStore {
         };
 
         // Restore each penalized record back to Active.
-        for attester_id in &penalized_attesters {
+        // penalized_attesters is Vec<PenaltyRecord>; extract the attester IDs.
+        let attester_ids: Vec<String> = penalized_attesters.iter()
+            .map(|pr| pr.attester_id.clone())
+            .collect();
+
+        for attester_id in &attester_ids {
             let key = attestation_record_key(attester_id, sybil_id);
             if let Some(record) = self.attestation_records.get_mut(&key) {
                 if record.status == AttestationStatus::Penalized {
@@ -1480,11 +1690,11 @@ impl IdentityStore {
             sybil_id,
             coordinator = caller_id,
             epoch,
-            restored_count = penalized_attesters.len(),
+            restored_count = attester_ids.len(),
             "sybil confirmation reversed; attester penalties cleared"
         );
 
-        Ok(penalized_attesters)
+        Ok(attester_ids)
     }
 
     /// Look up the sybil confirmation log for an identity (read-only).
@@ -2473,7 +2683,186 @@ mod tests {
         let log = restored.sybil_confirmation("sybil").expect("log must survive roundtrip");
         assert_eq!(log.sybil_id, "sybil");
         assert_eq!(log.coordinator_id, "coordinator");
-        assert_eq!(log.penalized_attesters, vec!["alice".to_string()]);
+        assert_eq!(log.penalized_attesters.len(), 1);
+        assert_eq!(log.penalized_attesters[0].attester_id, "alice");
+        assert_eq!(log.penalized_attesters[0].penalty_bps, ATTEST_PENALTY_RATE_BPS);
+        assert!(!log.penalized_attesters[0].self_reported);
         assert!(!log.reversed);
+    }
+
+    // -- Phase D: revocation cost and self-report exemption -------------------
+
+    #[test]
+    fn revocation_returns_cost_signal() {
+        // revoke_attestation returns a RevocationCost carrying the attester,
+        // attested identity, and the basis-points rate. The identity crate
+        // signals; the execution layer applies the CS deduction.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+        store.attest("bob", "alice").unwrap();
+
+        let cost = store.revoke_attestation("alice", "bob").unwrap();
+        assert_eq!(cost.attester_id, "alice");
+        assert_eq!(cost.attested_id, "bob");
+        assert_eq!(cost.cost_bps, REVOCATION_COST_BPS,
+            "revocation cost must be REVOCATION_COST_BPS ({})", REVOCATION_COST_BPS);
+    }
+
+    #[test]
+    fn self_report_before_confirmation_reduces_penalty() {
+        // An attester who self-reports before the coordinator confirms the sybil
+        // receives a 50% reduction on the standard penalty rate.
+        // Standard: ATTEST_PENALTY_RATE_BPS = 12000 (120%)
+        // Reduced:  12000 * (1 - 5000/10000) = 12000 * 50% = 6000 bps (60%)
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_and_verify(&mut store, "bob", "qcb1bob");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+
+        store.attest("sybil", "alice").unwrap();
+        store.attest("sybil", "bob").unwrap();
+
+        // Alice self-reports before the coordinator acts.
+        store.report_suspected_sybil("alice", "sybil").unwrap();
+
+        let penalized = store.confirm_sybil("coordinator", "sybil").unwrap();
+        assert_eq!(penalized.len(), 2, "both attesters must be penalized");
+
+        let log = store.sybil_confirmation("sybil").unwrap();
+        let alice_rec = log.penalized_attesters.iter().find(|pr| pr.attester_id == "alice")
+            .expect("alice must be in the penalty log");
+        let bob_rec = log.penalized_attesters.iter().find(|pr| pr.attester_id == "bob")
+            .expect("bob must be in the penalty log");
+
+        // Alice self-reported: reduced rate
+        let expected_reduced = ATTEST_PENALTY_RATE_BPS
+            * (10_000 - SELF_REPORT_PENALTY_REDUCTION_BPS)
+            / 10_000;
+        assert_eq!(alice_rec.penalty_bps, expected_reduced,
+            "self-reporter must get reduced penalty ({}), got {}",
+            expected_reduced, alice_rec.penalty_bps);
+        assert!(alice_rec.self_reported, "alice must be marked as self_reported=true");
+
+        // Bob did not self-report: full rate
+        assert_eq!(bob_rec.penalty_bps, ATTEST_PENALTY_RATE_BPS,
+            "non-reporter must get the full penalty rate");
+        assert!(!bob_rec.self_reported, "bob must be marked as self_reported=false");
+    }
+
+    #[test]
+    fn self_report_requires_active_attestation() {
+        // An attester must have an active attestation for the suspected identity
+        // to file a self-report. Revoked attestation = no exposure = no report.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        // Alice revokes before trying to report
+        store.revoke_attestation("alice", "sybil").unwrap();
+
+        let result = store.report_suspected_sybil("alice", "sybil");
+        assert!(
+            matches!(result, Err(IdentityError::CannotReportWithoutAttestation(..))),
+            "revoked attester must not be allowed to self-report, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn self_report_without_any_attestation_rejected() {
+        // An identity that never attested the suspected sybil cannot file a report.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_and_verify(&mut store, "outsider", "qcb1outsider");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        // outsider never attested sybil
+        let result = store.report_suspected_sybil("outsider", "sybil");
+        assert!(
+            matches!(result, Err(IdentityError::CannotReportWithoutAttestation(..))),
+            "non-attester must not be allowed to self-report, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn duplicate_self_report_rejected() {
+        // An attester may not file more than one report for the same suspected identity.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        store.report_suspected_sybil("alice", "sybil").unwrap();
+
+        let result = store.report_suspected_sybil("alice", "sybil");
+        assert!(
+            matches!(result, Err(IdentityError::AlreadyReported(..))),
+            "duplicate report must be rejected, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn non_self_reporter_gets_full_penalty() {
+        // An attester who did not self-report gets ATTEST_PENALTY_RATE_BPS, not reduced.
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        // No self-report filed; confirm directly.
+        store.confirm_sybil("coordinator", "sybil").unwrap();
+
+        let log = store.sybil_confirmation("sybil").unwrap();
+        assert_eq!(log.penalized_attesters.len(), 1);
+        let pr = &log.penalized_attesters[0];
+        assert_eq!(pr.attester_id, "alice");
+        assert_eq!(pr.penalty_bps, ATTEST_PENALTY_RATE_BPS,
+            "non-reporter must receive the full penalty");
+        assert!(!pr.self_reported);
+    }
+
+    #[test]
+    fn pending_sybil_reports_survive_json_roundtrip() {
+        // pending_sybil_reports is part of IdentityStore state and must survive
+        // JSON serialization so node restarts don't lose pending reports.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+        store.report_suspected_sybil("alice", "sybil").unwrap();
+
+        let json = serde_json::to_string(&store).expect("serialize must succeed");
+        let restored: IdentityStore = serde_json::from_str(&json).expect("deserialize must succeed");
+
+        let reports = restored.pending_sybil_reports.get("sybil")
+            .expect("pending reports must survive roundtrip");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].attester_id, "alice");
+        assert_eq!(reports[0].suspected_id, "sybil");
+    }
+
+    #[test]
+    fn pending_reports_consumed_on_sybil_confirmation() {
+        // After confirm_sybil, pending_sybil_reports for that identity must be
+        // cleared (reports are consumed into the log, not kept as pending).
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+        store.report_suspected_sybil("alice", "sybil").unwrap();
+
+        store.confirm_sybil("coordinator", "sybil").unwrap();
+
+        // Pending reports for "sybil" must be gone (entry removed, not empty vec)
+        assert!(
+            store.pending_sybil_reports.get("sybil").is_none(),
+            "pending reports must be cleared after sybil confirmation"
+        );
     }
 }
