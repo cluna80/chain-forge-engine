@@ -31,19 +31,6 @@ QCB's purpose is to be the substrate for a charm-based agent economy where ident
 
 ---
 
-1.1 Lineage
-
-QCB's design draws from four chains whose original designs survived contact with real value:
-
-· Bitcoin — fixed-supply scarcity. 210 million $QCB, minted at genesis, never increased.
-· XRP Ledger — native DEX with a single quote asset and no user-facing gas fee. $CIRFI is the default quote for open pools, exactly as XRP is the bridge asset on XRPL. The no-gas model is adopted wholesale.
-· Ethereum — fee-burn mechanism, broadened on QCB to all protocol revenue sources; and a permissioned EVM execution environment (Section 7.2).
-· Flare — protocol-level compliance primitives for real-world assets, with EVM capability that does not require bridging to a separate chain. Adopted as inspiration for the permissioned pool model and RWA attestation design; no technical bridge to Flare is implied or planned.
-
-What QCB adds that none of them have is the identity layer that makes the combination coherent: personhood-weighted consensus, a decaying circulation currency, and a two-token separation with no inter-conversion. Each of the four lineage chains is missing at least one of these, and each missing piece is why QCB cannot be built on top of any of them.
-
----
-
 2. Why Build From Scratch
 
 Frameworks like Cosmos SDK (via CometBFT) and Solana offer fast paths to a working chain, but both come with inherited assumptions QCB is not willing to accept:
@@ -96,7 +83,7 @@ QCB's identity layer design has advanced past the research phase: the attestatio
 
 As a starting point for those targets (illustrative, not final — subject to revision as the pilot is designed): a sybil rate below 3% under adversarial red-team testing, and a per-verification cost below $5 per verified human. Naming even provisional numbers here converts the pilot from a procedural commitment into a falsifiable one; see Open Question 1 for where these get finalized against real pilot data.
 
-Important framing correction: 3% sybil penetration should not be read as "safe" in isolation. Quantitative modeling (Section 6.8) shows that whether 3% fraudulent identities pose a real threat depends heavily on legitimate governance participation — the same 3% fraud rate that's negligible against consensus safety (which tolerates fraud up to roughly 50% of the legitimate population) can dominate governance votes if legitimate turnout is low. The correct statement is: 3% is the maximum adversarial identity rate the initial identity pilot is designed to tolerate, subject to the governance participation and BFT safety models in Sections 6.8 and 3, not a number that is safe on its own terms.
+Important framing correction: 3% sybil penetration should not be read as "safe" in isolation. Quantitative modeling (Section 6.6) shows that whether 3% fraudulent identities pose a real threat depends heavily on legitimate governance participation — the same 3% fraud rate that's negligible against consensus safety (which tolerates fraud up to roughly 50% of the legitimate population) can dominate governance votes if legitimate turnout is low. The correct statement is: 3% is the maximum adversarial identity rate the initial identity pilot is designed to tolerate, subject to the governance participation and BFT safety models in Sections 6.6 and 3, not a number that is safe on its own terms.
 
 ---
 
@@ -194,7 +181,7 @@ The strategy is only as strong as the pilot. Everything above is downstream of t
 
 5. Core Protocol Modules
 
-QCB has four native protocol-level components, implemented directly in the chain's own state machine rather than as smart contracts or SDK modules. Being protocol-level is not the same as being constitutional (Section 7.3): existing as native state-machine logic determines where these components run; the constitutional layer determines how hard they are to change. Charm Confinement and Intrinsic Charm's specific mechanics, and Charmed Agents' operating rules, are protocol-level but ordinary-governance-adjustable — they can be tuned as the system matures. Only the pieces named explicitly in Section 7.3 (the identity interface, the two-token separation, and the sovereignty constraint) sit behind the higher constitutional bar. CirFi's core issuance formula and demurrage structure are protocol-level and governance-adjustable in their specific rates (Section 6.8), but the two-token separation of function that CirFi depends on is itself constitutional.
+QCB has four native protocol-level components, implemented directly in the chain's own state machine rather than as smart contracts or SDK modules. Being protocol-level is not the same as being constitutional (Section 7.3): existing as native state-machine logic determines where these components run; the constitutional layer determines how hard they are to change. Charm Confinement and Intrinsic Charm's specific mechanics, and Charmed Agents' operating rules, are protocol-level but ordinary-governance-adjustable — they can be tuned as the system matures. Only the pieces named explicitly in Section 7.3 (the identity interface, the two-token separation, and the sovereignty constraint) sit behind the higher constitutional bar. CirFi's core issuance formula and demurrage structure are protocol-level and governance-adjustable in their specific rates (Section 6.6), but the two-token separation of function that CirFi depends on is itself constitutional.
 
 5.0 What "Charm" Means
 
@@ -234,27 +221,6 @@ The chain's native monetary protocol:
 
 See Section 6.2 for the demurrage decay schedule (Balance Range / Monthly Decay table) — it is CirFi's core mechanism and is defined once there rather than duplicated here.
 
-A consequence of demurrage worth naming explicitly: because holding $CIRFI as a delayed donation is economically irrational — the balance decays — any organization that accepts $CIRFI as payment or donation is a natural recipient of continuous, demurrage-driven spending pressure. This applies to environmental organizations and social-impact causes as much as to merchants. No special mechanism is required; demurrage already creates this flow. A verified environmental organization that accepts $CIRFI for real-world work (habitat restoration, carbon offset verification, renewable energy installation) would receive a steady, protocol-enforced stream of value from holders who would otherwise lose it to decay. This is different from a one-time donation campaign or a periodic NFT fundraiser: it is a structural, ongoing consequence of how $CIRFI is designed. The chain does not need to designate specific beneficiaries or create a new module to produce this effect. It needs only to not block it — and the constitutional layer's prohibition on restricting what merchants and services can be paid in $CIRFI ensures it cannot be blocked by governance either. See Open Question 28 for what a deliberate green initiative built on this foundation would involve.
-
-
-5.5 Phase 3 Consensus Extension: Reputation-Weighted Sortition
-
-The current consensus design (personhood-weighted BFT) gives every verified validator equal weight up to the per-human power cap. This is the correct design for Phase 1 and 2: it is simple, auditable, and the cap is what makes it meaningfully different from stake-weighted consensus. It is running on the testnet today.
-
-The intended direction for consensus evolution post-pilot is reputation-weighted sortition: a layered extension that keeps the personhood bound as a hard ceiling while introducing earned reputation as the factor that determines the probability of being selected as block proposer within that ceiling.
-
-**Why sortition, not direct weighting.** Direct reputation weighting (higher reputation = more votes) would re-introduce the capital-accumulation dynamic the personhood cap is designed to eliminate. Sortition avoids this: every eligible validator is in the selection pool, but the probability of selection is weighted by reputation. In expectation, high-reputation validators propose more blocks over time. But any individual validator can be selected in any round, and no validator can accumulate permanent dominance.
-
-**What reputation is earned from.** The intent is that consensus reputation draws from the same activity signals as the Contribution Score (Section 6.12) — $CIRFI transacted, agent work completed, attestations given — plus a validator-specific signal: actual block proposal and vote participation rate. A validator who is consistently online and proposing valid blocks earns consensus reputation from that participation directly. This ties consensus influence to honest operation, not just economic activity.
-
-**Time decay prevents ossification.** Consensus reputation decays on the same 90-day rolling window as the Contribution Score. A cohort of early validators cannot build an unbeatable lead over later participants. Ongoing contribution is required to maintain selection probability. This mirrors the liveness pressure already embedded in the identity layer's charm tier system: presence and participation are the only durable advantages.
-
-**What this requires before it can be specified.** Reputation-weighted sortition is a named future extension rather than a current design decision for three reasons. First, the identity pilot must run to establish what "contribution" actually looks like at realistic scale — designing sortition weights before that data exists would be speculation on speculation. Second, formal security analysis is required: the cold-start window (before reputation is established) needs explicit adversarial modeling, and the interaction between personhood verification and reputation accumulation needs to be proven safe against a Sybil attacker who gains personhood status. Third, the Contribution Score itself (Section 6.12) must be operational and calibrated before its signals can be safely imported into a consensus-layer decision.
-
-**Reference designs.** Harlequin (2026) implements reputation-weighted sortition with time decay in a pure proof-of-personhood context. Its security analysis explicitly names the cold-start window as a risk requiring mitigation, which is the same risk QCB would face in the transition from Phase 2 BFT to Phase 3 sortition. Idena has operated 1-person-1-vote consensus with stake weighting since 2019. Neither design is identical to what QCB intends; both are useful reference points for the formal work this extension requires.
-
-This extension is recorded here as design intent, not a specification. It will be specified once the pilot has produced contribution data and the Contribution Score is calibrated.
-
 ---
 
 6. Token Economics
@@ -280,8 +246,6 @@ This mirrors proven two-token models — MakerDAO's DAI/MKR, VeChain's VTHO/VET,
 $CIRFI is the money that moves.
 
 Function: daily activity rewards distribution to verified humans, merchant payments at point of sale, peer-to-peer transfers, and any transaction requiring a circulating medium of exchange.
-
-**$CIRFI and network fees.** $CIRFI is not used to pay network fees, and holding $CIRFI is not required to transact on QCB. Swaps on the native AMM charge only the pool fee (Section 6.5); there is no separate gas fee. This removes the "I need a second token to transact" friction that afflicts gas-based chains and keeps the active participant experience simple: earn $CIRFI, spend $CIRFI, no second token required. Network-level costs are absorbed into the pool fee itself — see Section 6.5 for how the fee split covers them.
 
 Supply mechanism:
 
@@ -313,19 +277,17 @@ $CIRFI value: not designed to appreciate. Value is measured in utility — how m
 
 $QCB is the asset that captures the network's value.
 
-Function: chain security (staking to validators), governance over protocol parameters, capturing value from network activity through the Burn-and-Mint Equilibrium, and acting as the accounting unit for the protocol's share of AMM swap fees. There is no user-facing gas fee — network costs are absorbed into the pool fee (Section 6.5). EVM execution costs above the per-epoch human subsidy are paid in $QCB (Section 7.2), creating a demand sink from developers whose usage exceeds ordinary human activity without burdening ordinary users.
+Function: chain security (staking to validators), gas fees on QCB Chain, governance over protocol parameters, and capturing value from network activity.
 
 Supply mechanism: $QCB has a fixed or capped supply. Unlike $CIRFI, it does not grow with population — scarce by design, appropriate for an asset intended to be held and appreciate. Supply contracts over time through buyback-and-burn funded by merchant fees and staking lockups that remove tokens from circulation.
 
 Staking: $QCB holders stake to validators to secure the chain, earning yield from a portion of merchant fees, governance rights over protocol parameters, and consensus participation — staked $QCB is the mechanism through which validator influence is exercised, bounded by proof-of-personhood (see Section 3.3).
 
-Buyback and Burn (BME). QCB's burn mechanism is funded by all protocol revenue sources, not merchant fees alone. Every economic action on QCB that generates a protocol fee — merchant settlement, AMM swaps, settlement layer conversions, RWA issuance, capacity market tasks, Sponsored Contract execution — contributes a defined share to an open-market $QCB buyback-and-burn. The protocol uses fiat or stablecoin revenue to buy $QCB on the open market and destroy it permanently. Broadening the burn to every revenue source makes $QCB's scarcity proportional to total chain activity, not to any single category of activity; this partially mitigates the merchant-adoption dependency without eliminating it.
-
-The illustrative formula for merchant fees:
+Buyback and Burn (BME):
 
 Daily $QCB burned = Daily merchant fee revenue in fiat ÷ Current $QCB price
 
-All protocol fee sources follow the same pattern. The protocol uses that revenue to buy $QCB on the open market and permanently destroy the purchased $QCB. The burn rate is inversely proportional to price — at $0.01, $20,000 in daily fees burns 2 million $QCB; at $1, the same fees burn only 20,000 $QCB. When price is low, burning accelerates; when price is high, burning slows — self-adjusting, not discretionary. This assumes price is the only variable driving burn significance; in practice, low prices often coincide with weak holder confidence and higher selling pressure, so the fiat value destroyed per burn can fall even as the token quantity burned rises. The mechanism is self-adjusting in token terms, not necessarily in economic-impact terms.
+Merchant fees, collected in fiat or stablecoin, buy $QCB on the open market and burn it permanently. The burn rate is inversely proportional to price — at $0.01, $20,000 in daily fees burns 2 million $QCB; at $1, the same fees burn only 20,000 $QCB. When price is low, burning accelerates; when price is high, burning slows — self-adjusting, not discretionary. This assumes price is the only variable driving burn significance; in practice, low prices often coincide with weak holder confidence and higher selling pressure, so the fiat value destroyed per burn can fall even as the token quantity burned rises. The mechanism is self-adjusting in token terms, not necessarily in economic-impact terms.
 
 $QCB value: driven by network activity. As more $CIRFI is spent at merchants, more fees flow into the system, buying and burning $QCB and paying staking yield to holders. $QCB is not designed to be spent — it is designed to be held, staked, and appreciated over time. If merchant fee revenue is insufficient to fund meaningful burns, $QCB's value rests on the eventual prospect of adoption rather than current activity — a condition the protocol treats as a transitional phase, not a steady state, and one addressed as a permanence risk in Section 12.
 
@@ -339,55 +301,13 @@ Proactive redirect vs. passive decay: these two pathways diverge in their effect
 
 The reflexive risk: BME funded by speculative redirects is not the same as BME funded by commerce. If holders redirect because they believe $QCB will appreciate, and $QCB appreciates because holders redirect, that is a self-referential loop that can inflate and then correct. The existing BME "live vs. speculative" threshold — burns funded at 1% of $QCB daily volume for 90 consecutive days — is the guard against this: redirect-driven BME, like any BME activity, is classified as speculative until it is complemented by merchant-driven BME that confirms real economic activity underlies the volume. The fee calibration and the specific conditions under which redirect-driven BME counts toward the "live" threshold are Open Question 25.
 
-**Unconditional holding.** $QCB is not subject to demurrage, decay, or any protocol-level pressure to move. A holder can acquire $QCB — by buying it on the open market with a stable asset, by earning it through the long-term distribution mechanism (Section 6.11), or through any future activity-based accrual mechanism (Open Question 26(d)) — and hold it indefinitely without loss. Identity lapses affect the holder's ability to earn more $QCB and to access identity-gated features (agent sponsorship, Sponsored Contract deployment, governance voting), but do not affect ownership of $QCB already held. QCB's economic rights require continued verification; ownership does not.
-
 6.4 Value Flow Between the Two Tokens
-
-**No inter-conversion between the two tokens.** $CIRFI and $QCB are not inter-convertible at any level of the protocol. There is no conversion path, no dedicated AMM pool, and no other protocol mechanism that accepts $CIRFI in exchange for $QCB — or vice versa. The only ways to acquire $QCB are (a) market purchase using qUSD (USDC-backed in Phase 2; sovereign in Phase 3+ if the chain has earned it — see Section 6.7), or (b) earned distribution through protocol mechanisms that reward verified activity (Section 6.11, and Open Question 26(d) for the accrual variant). This stricter-than-usual separation is deliberate: $CIRFI's demurrage mechanism only functions if holders cannot escape decay by converting into the appreciating asset. Most dual-token systems permit free trading between their two tokens; QCB does not, because doing so would hollow out the circulation pressure the monetary design depends on.
 
 The relationship is a one-directional value flow: a verified human receives $CIRFI → spends it at a merchant → the merchant pays a fee in fiat → that fee funds both buyback-and-burn of $QCB and staking yield to $QCB stakers → $QCB supply contracts, staking demand rises, and price appreciates. This flow describes the token movements that fund $QCB's value capture, not the mechanism that gives $CIRFI itself value — $CIRFI's value comes from the fiat settlement layer described in Section 8.2, which is the load-bearing piece that makes merchant acceptance possible in the first place.
 
 $CIRFI does not benefit directly from $QCB's appreciation, and $CIRFI holders do not receive $QCB. The engine is $CIRFI moving through the economy; the pool is $QCB deepening as a result. $CIRFI's job is to circulate, not appreciate. $QCB's job is to appreciate, not circulate.
 
-**The operational loop.** A user who wants to participate in both sides of the QCB economy follows a multi-step loop through the stable asset layer. The entry path is USDC → qUSD (1:1, no fee) → $CIRFI via an AMM swap, where the user acquires the circulation currency. The $CIRFI is then used — spent at merchants, locked for $QCB distribution, swapped on the AMM, or paid for capacity market work. When the user wants to acquire $QCB exposure, the path is $CIRFI → qUSD → $QCB: the $CIRFI is swapped for qUSD on the AMM, and the qUSD is used to purchase $QCB. The reverse path is symmetric: $QCB → qUSD → $CIRFI. Every conversion between the two tokens goes through the stable asset layer, in both directions. There is no direct $CIRFI/$QCB path, and there is no protocol-level conversion mechanism at any step. This is what preserves $CIRFI's demurrage mechanism — a user cannot escape the decay by converting into $QCB in a single step — while still giving users a functioning operational loop between the two assets.
-
-6.5 The Native AMM
-
-QCB's native Automated Market Maker is a protocol-level component, not an application. It is where $CIRFI is traded against every other asset on the chain, and it is the mechanism that gives $CIRFI a use before merchants, capacity markets, or any other demand source exists.
-
-**Design lineage.** The AMM follows the XRP Ledger's model: $CIRFI is the default quote asset for open pools, and there is no user-facing gas fee. The pool fee is the only cost of a swap.
-
-**Pool structure.**
-
-Pool type | Quote asset | Access
---- | --- | ---
-Open pools | $CIRFI | Any QCB wallet
-Stable pools | qUSD (USDC-backed in Phase 2; sovereign in Phase 3+ — see Section 6.7) | Any QCB wallet
-Permissioned pools | $CIRFI or qUSD | Verified humans meeting pool-defined compliance rules
-
-The flagship pool is **$CIRFI/qUSD**, which gives users the exit-and-re-entry loop between the circulation currency and a stable environment. **There is no $CIRFI/$QCB pool.** $QCB cannot be purchased with $CIRFI at any level of the protocol. To acquire $QCB, a user must use qUSD on the open market, or earn it through the long-term distribution mechanism (Section 6.11) or a future activity-based accrual mechanism (Open Question 26(d)).
-
-**Pool fee and split.** The pool fee is provisionally 0.3% per swap, governance-adjustable. It splits three ways:
-
-Destination | Share | Purpose
---- | --- | ---
-Liquidity providers | ~70% | Compensates LPs for capital and impermanent loss
-BME buyback-and-burn | ~20% | Funds $QCB value capture
-Protocol treasury | ~10% | Covers network-level costs, validator rewards, operations
-
-The exact split is governance-adjustable (Section 6.8). The values shown are illustrative and subject to Phase 2 calibration (Open Question 29).
-
-**No user-facing gas fee.** Network-level costs are absorbed into the pool fee. The ~10% treasury allocation is what covers them. A verified human can swap without ever holding a second token.
-
-**Multi-hop routing.** A swap between two non-$CIRFI assets routes through $CIRFI (or the cheapest available stable asset) via the AMM's router. The router compares paths and selects the lowest-cost route.
-
-**Permissioned pools for regulated assets.** The AMM supports permissioned-pool mechanics: a pool can require that every participant be a verified human meeting specific compliance conditions. The protocol-level identity layer makes this enforceable — it is not "is this address on an allowlist," it is "is this a verified unique human meeting the pool's conditions." This is the foundation for the tokenized securities opportunity described in Open Question 27.
-
-**What the AMM does not support.** Currency substitutes are excluded by Section 7.3's sovereignty constraint. Identity-bound tokens (qCR, staking receipts) are non-transferable by design and do not trade. The $CIRFI/$QCB pair is not supported — see Section 6.4.
-
----
-
-6.6 Why Two Tokens
+6.5 Why Two Tokens
 
 A single-token model cannot serve both functions without contradiction:
 
@@ -401,26 +321,7 @@ The Cosmos ecosystem's experience is instructive: ATOM's staking yield comes mai
 
 One currency, by design: QCB operates with exactly two protocol-level tokens ($CIRFI and $QCB), and the protocol does not permit application-layer currency issuance. Other tokens on the chain — utility tokens, access tokens, NFTs, community tokens, meme coins — serve non-currency purposes (collectibles, reputation, culture, access) and are explicitly not currencies. This is not a limitation on what developers can build; it is a positive design commitment that makes demurrage load-bearing and $QCB's value capture coherent. Demurrage only drives circulation if $CIRFI is the currency — the moment currency-substitutes are permitted, users route around demurrage by holding whatever doesn't decay. A single protocol currency also means all economic activity traces through the BME to $QCB; multiple currencies would split the value capture and weaken $QCB's long-term thesis. QCB is a chain that wants to be a currency, not a platform that hosts many currencies. Those are different products.
 
-6.7 Stable Assets
-
-QCB has one stable asset: qUSD. It is a protocol-native stable token — the chain's own unit of account and AMM quote currency — but it is not created from nothing. It is backed by real external value, and its backing evolves in two phases as the chain matures.
-
-**Phase 2: qUSD, backed 1:1 by USDC.** When a user deposits USDC onto QCB via Circle's Cross-Chain Transfer Protocol, the protocol mints qUSD 1:1 in return. Burning qUSD returns USDC at the same rate. There is no fee to wrap or unwrap. The underlying USDC is held in a protocol-native vault — a chain module, not a multisig — so the minting and burning of qUSD is governed by QCB's own consensus, not by Circle.
-
-From the user's perspective, qUSD is simply qUSD. The USDC backing is an implementation detail. Every AMM pool that quotes against a stable asset quotes against qUSD. Every cross-reference in this whitepaper to "qUSD" in Phase 2 means this USDC-backed version.
-
-A note on the sovereignty constraint (Section 7.1): QCB's constitutional layer prohibits dependencies on another chain's consensus engine. qUSD transactions settle on QCB's own consensus — the dependency on Circle is at the redemption layer, not the transaction layer. The named risk is Circle's ability to freeze the underlying USDC held in the protocol vault, which would make that portion of qUSD undercollateralized. This is an accepted tradeoff: Circle is a publicly traded US company with audited reserves, and the freeze capability is a regulatory instrument, not an arbitrary one. Users who want a stable unit without any Circle exposure can wait for Phase 3+.
-
-**Phase 3+ conditional: qUSD transitions to sovereign backing.** If and when QCB has demonstrated sufficient maturity — an established $QCB market price, proven chain stability, and a governance community confident enough to vote for the transition — qUSD can migrate to sovereign backing. In sovereign mode, qUSD is minted by users who lock $QCB as collateral in a CDP (Collateralized Debt Position) at a provisional 150% collateralization ratio. Burning sovereign qUSD returns the underlying $QCB collateral.
-
-The word "conditional" is load-bearing. This transition does not happen on a schedule. It happens only through a governance vote, and that vote should only pass when the chain has earned it. The reason is the Terra/LUNA failure (2022): Terra's UST was algorithmically backed by LUNA, and when confidence broke, the two tokens entered a death spiral — UST lost its peg, LUNA was minted to defend it, hyperinflation destroyed LUNA's value, and UST collapsed completely. qUSD-sovereign differs from UST in one critical respect: it is over-collateralized by real locked $QCB, not algorithmically backed by a swap. But the systemic risk is analogous — a rapid $QCB price crash can destabilize the peg faster than liquidations can execute. This is why the Phase 2 USDC-backed qUSD must remain redeemable throughout the transition, providing a stable floor while sovereign backing establishes itself.
-
-**Coexistence during transition.** When sovereign qUSD is introduced, both backing mechanisms coexist under the same qUSD ticker. Users can hold USDC-backed qUSD (redeemable for USDC via the protocol vault) or mint sovereign qUSD (backed by their own $QCB collateral). From the AMM's perspective they are the same asset. Governance can eventually vote to wind down the USDC-backed mechanism once sovereign qUSD has sufficient collateralization depth to sustain the peg without it.
-
-**Governance.** Phase 2 qUSD parameters (vault limits, CCTP configuration) are ordinary-governance parameters (Section 6.8). The transition to sovereign backing requires a governance vote. Sovereign qUSD parameters (collateral ratio, liquidation threshold, oracle selection) are also ordinary-governance, but the decision to activate sovereign backing in the first place is a constitutional-weight decision given the systemic risk it introduces.
-
-**$QCB acquisition via qUSD.** qUSD is the stable asset through which $QCB is purchased on the open market — both on QCB's native AMM and on external venues once QCB is listed. The path is: deposit USDC → mint qUSD → buy $QCB. There is no path from $CIRFI to $QCB that does not go through qUSD (or another stable asset).
-6.8 Governance
+6.6 Governance
 
 Governance operates on a one-human, one-vote basis for parameters affecting $CIRFI (decay rates, exemption thresholds, activity reward rates), ensuring the currency's rules are set by its users, not by capital. $QCB holders govern parameters affecting the chain itself (validator set, gas fees, treasury allocation) — stake-weighted, consistent with the asset's role as network ownership, but bounded by the personhood weighting described in Section 3.3.
 
@@ -438,14 +339,14 @@ These three protections compose: a proposal needs the participation quorum, the 
 
 Limits of this model: the f / (p + f) derivation assumes fraudulent identities act as a single coordinated bloc and that legitimate turnout p is exogenous — independent of what the attacker does. Both assumptions cut in different directions. Treating fraud as one coordinated bloc is conservative: real Sybil populations that split, abstain strategically, or vote with legitimate blocs to avoid detection are less dangerous than the model assumes, so uncoordinated fraud is safer than these floors imply. Treating turnout as exogenous is not conservative: a sophisticated attacker can suppress legitimate turnout directly — spamming proposals, inducing governance fatigue, targeted discouragement of specific voters — which lowers p and raises the attacker's effective vote share without raising f at all. The quorum floors derived above should therefore be read as minimum protection against passive, uncoordinated fraud, not as sufficient protection against an active turnout-suppression campaign, which is a distinct attack surface this model does not cover. Until Open Question 17 is resolved, QCB's governance should be treated as defended against passive fraud only — turnout suppression is an accepted, named open risk during the pilot phase, not a solved problem. See Open Question 17.
 
-6.9 Distribution
+6.7 Distribution
 
 Clarification on scope: ongoing $CIRFI issuance (Section 6.2) is 100% claimed by the activity rewards formula — verified humans × daily rate — with no other line item drawing from it. The table below is not a breakdown of that ongoing issuance; it describes a separate, one-time genesis allocation, funded from the initial $QCB supply and/or a dedicated CIRFI seed reserve set aside at launch, used to bootstrap development, merchant incentives, validator participation, and a stability reserve before organic activity rewards issuance and merchant fee revenue are self-sustaining. This distinction was ambiguous in an earlier draft; the two pools (ongoing per-day CIRFI issuance vs. one-time genesis allocation) do not overlap or double-count each other.
 
 Allocation | Share | Illustrative % | Notes
 Activity rewards distributions (genesis reserve contribution) | Majority | ~70% | Seeds early activity reward payouts before verified-population issuance alone is sufficient
 Reserve pool | Minority | ~11% | Yield-bearing assets backing stability
-Long-term distribution | Small | ~4% | Released to $CIRFI lockers over 8 years — see Section 6.11
+Long-term distribution | Small | ~4% | Released to $CIRFI lockers over 8 years — see Section 6.9
 Development | Small | ~7% | Vested, disclosed on-chain
 Merchant incentives | Small | ~5% | Onboarding rewards, early-adopter bonuses
 Validator rewards | Small | ~3% | Staking incentives for chain security
@@ -454,7 +355,7 @@ Illustrative percentages shown are non-final examples consistent with the ceilin
 
 Distribution principle: this genesis allocation is designed so activity-rewards-directed funds remain the majority share by construction, not by target percentage — consistent with, and reinforcing, the fact that ongoing $CIRFI issuance (Section 6.2) is already 100% activity rewards by formula. For the allocations funded separately (development, merchant incentives, validator rewards, reserve pool), no single non-activity-rewards allocation is intended to exceed a low double-digit percentage of the genesis allocation — a ceiling meant to prevent any one interest group (founders, merchants, or validators) from accumulating outsized claims on the system's initial resources. Exact percentages within that ceiling remain to be finalized (see Section 12), but the ceiling itself, and the structural dominance of activity rewards, are intended as founding commitments rather than launch-day placeholders.
 
-6.10 Summary
+6.8 Summary
 
 | $CIRFI | $QCB
 Purpose | Circulate | Capture value
@@ -468,9 +369,9 @@ Appreciation | Not a goal | Primary goal
 
 $CIRFI is the money you spend. $QCB is the asset you hold. QCB captures the value. CIRFI creates it.
 
-6.11 Long-Term Distribution
+6.9 Long-Term Distribution
 
-The genesis allocation in Section 6.9 solves how QCB bootstraps before organic issuance and fee revenue are self-sustaining. It does not, on its own, solve a separate problem: with the entire 210 million $QCB cap minted at genesis, every unit is already spoken for on day one. A person who verifies and begins participating years into QCB's life has no path to $QCB that a person present at genesis didn't already have. For a chain designed to still be functioning long after its founders are gone (Section 7.3), that is a real legitimacy gap, not a cosmetic one.
+The genesis allocation in Section 6.7 solves how QCB bootstraps before organic issuance and fee revenue are self-sustaining. It does not, on its own, solve a separate problem: with the entire 210 million $QCB cap minted at genesis, every unit is already spoken for on day one. A person who verifies and begins participating years into QCB's life has no path to $QCB that a person present at genesis didn't already have. For a chain designed to still be functioning long after its founders are gone (Section 7.3), that is a real legitimacy gap, not a cosmetic one.
 
 The fix is not new issuance — the 210 million cap stays exactly as fixed and tested as it already is. The fix is a locked release schedule carved out of the existing genesis allocation: a portion is set aside at genesis and released gradually, over years, to verified humans who lock $CIRFI, rather than being distributed to its final holders all at once.
 
@@ -478,59 +379,15 @@ This is deliberately not described as mining. Nothing is created; existing, alre
 
 Parameters:
 
-Size — 4% of total $QCB supply (8.4 million $QCB), carved from the Reserve pool line in Section 6.9's genesis allocation (reducing it from ~15% to ~11% of the total genesis allocation). This keeps the mechanism well inside the "low double-digit percentage" ceiling Section 6.9 already sets for any single non-activity-rewards allocation.
+Size — 4% of total $QCB supply (8.4 million $QCB), carved from the Reserve pool line in Section 6.7's genesis allocation (reducing it from ~15% to ~11% of the total genesis allocation). This keeps the mechanism well inside the "low double-digit percentage" ceiling Section 6.7 already sets for any single non-activity-rewards allocation.
 
 Duration — 8 years.
 
-Curve — linear, not decaying. This is a deliberate choice, not a default: Section 6.9's merchant incentives line already carries the "be early" incentive — rewarding merchants who onboard sooner rather than later. A decaying curve here (Bitcoin-style halving, front-loaded release) would duplicate that same message through a second mechanism aimed at a different audience. This mechanism's job is different: staying open to genuine latecomers for a meaningful stretch of QCB's life, not accelerating early participation. A flat, linear release is what actually keeps that door open for eight years instead of mostly closing it in the first one or two.
+Curve — linear, not decaying. This is a deliberate choice, not a default: Section 6.7's merchant incentives line already carries the "be early" incentive — rewarding merchants who onboard sooner rather than later. A decaying curve here (Bitcoin-style halving, front-loaded release) would duplicate that same message through a second mechanism aimed at a different audience. This mechanism's job is different: staying open to genuine latecomers for a meaningful stretch of QCB's life, not accelerating early participation. A flat, linear release is what actually keeps that door open for eight years instead of mostly closing it in the first one or two.
 
-Mechanism — verified humans who lock $CIRFI receive a proportional share of the pool as it releases. The specific lock duration, minimum lock size, and proportional-share formula are implementation parameters, not fixed here; they are governed the same way other CirFi parameters are (Section 6.8), not constitutionally.
+Mechanism — verified humans who lock $CIRFI receive a proportional share of the pool as it releases. The specific lock duration, minimum lock size, and proportional-share formula are implementation parameters, not fixed here; they are governed the same way other CirFi parameters are (Section 6.6), not constitutionally.
 
-What this is not: this section covers the genesis-phase scheduled $QCB release only. The primary ongoing incentive surface past the genesis phase — the Contribution Score, tier unlocks, and activity-weighted fee sharing — is specified in Section 6.12.
-
-6.12 $CIRFI Contribution Score and Incentive Design
-
-The locking mechanism in Section 6.11 covers a specific genesis-phase distribution of capped $QCB supply. The primary ongoing incentive surface for $CIRFI — how people are rewarded for real economic participation past the genesis phase — is the Contribution Score.
-
-**Why not locking.** Passive locking (liquidity mining / staking 2020–2023 style) is explicitly avoided as the main incentive. Locking rewards capital, not contribution. It is gameable by large holders, incompatible with demurrage, and produces incentives that run counter to QCB's core design: $CIRFI should move, not sit. The Contribution Score is the design that replaces it.
-
-**What the Contribution Score is.** The Contribution Score (CS) is an on-chain, per-identity metric that accumulates from real economic activity. Only Verified humans accumulate a Contribution Score — it is bound to a personhood-verified identity, not to a wallet address, so it cannot be farmed through multi-wallet splitting or capital-heavy positions.
-
-**90-day rolling window.** CS reflects the last 90 days of activity only. Older activity fades out. This has two effects: early participants cannot build a permanent lead over newcomers, and the score requires sustained contribution rather than one-time bursts. 90 days is calibrated to be long enough to reflect genuine commitment and short enough to keep activity pressure continuous.
-
-**Score inputs.** The following on-chain activities generate CS within the rolling window:
-
-$CIRFI transacted (moved, not merely held) contributes 1 point per $CIRFI unit. This directly rewards circulation over holding and reinforces demurrage's pressure in the same direction.
-
-Unique counterparties in the window apply a +50% multiplier when the verified human has transacted with more than 10 distinct addresses. This is the anti-wash-trading mechanism: moving $CIRFI back and forth to yourself does not earn the bonus.
-
-Agent transactions executed via a sponsored agent contribute 10 points per execution. Sponsoring and running productive agents is the primary high-contribution path for participants who integrate deeply with the protocol.
-
-Attestations given to new claimants contribute 50 points per attestation. This rewards genuine identity-layer participation — bringing real humans onto the chain.
-
-Activity rewards claimed each epoch contributes 25 points per epoch. Liveness is rewarded: claiming activity rewards requires being present and active, and persistent claimants accumulate score steadily.
-
-**The four tiers.** CS thresholds define four contribution tiers:
-
-Participant (0–999): standard protocol access. No fee discounts or bonus access. The default state for new or low-activity verified humans.
-
-Contributor (1,000–9,999): 10% AMM fee discount; up to 5 sponsored agents.
-
-Established (10,000–49,999): 25% AMM fee discount; up to 10 sponsored agents; proportional share of the protocol fee share pool (see below).
-
-Core (50,000+): 30% AMM fee discount; up to 20 sponsored agents; larger proportional share of the protocol fee share pool; Priority Access (see below).
-
-The Core threshold of 50,000 is a placeholder, to be calibrated against real usage data once the chain has meaningful activity. This is Open Question 32.
-
-**Protocol fee share pool.** A portion of monthly BME revenue — protocol fees already collected, not new token emissions — is distributed to Established and Core contributors proportional to their CS score at the end of each month. The exact percentage is a governance parameter, not hardcoded. This is the "activity-weighted fee sharing" model: real revenue from real protocol activity, shared with the humans who generated the most of it. No new tokens are created.
-
-**Priority Access (Core only).** Core-tier verified humans receive a time-limited exclusive window to participate in newly launched capacity markets, permissioned pools, and high-value agent opportunities before they open to lower tiers. In practice: when a new AMM pool, agent capacity market, or specialized economic zone launches, Core contributors have early entry (indicative: 48–72 hours) before the opportunity opens to the full participant set. This makes high contribution concretely valuable as new economic surfaces are added to the chain.
-
-**What this design avoids.** No passive yield on locked $CIRFI. No token emissions as incentive rewards. No capital-heavy farming path. The fee share pool distributes existing revenue, not freshly minted tokens. The contribution score cannot be gamed by holding large balances or splitting across wallets.
-
-**Open Question 32: Core threshold calibration.** The 50,000 CS threshold for Core tier is a placeholder. The right threshold depends on what "typical sustained daily activity" looks like on QCB once the chain has real users. Too low, and Core becomes the default state rather than a mark of genuine contribution. Too high, and it becomes permanently out of reach for ordinary participants. Calibration requires real usage data from the identity pilot and early chain operation.
-
-Open Question 33: Governance parameter for fee share percentage. The fraction of monthly BME revenue allocated to the protocol fee share pool is a governance parameter. A reasonable starting range is 5–15%, but the right value depends on total BME revenue, the number of Established and Core contributors, and the chain's overall fee economics at launch.
+What this is not: this section does not cover activity-based $QCB accrual — a related but distinct idea where $QCB is earned through measured $CIRFI economic activity rather than through locking a balance. That mechanism depends on unresolved questions this document is not yet in a position to answer, including — in one of its proposed forms — a dependency on Human Capacity Markets, which is itself unresolved. It is recorded as a named extension under Open Question 26, not specified here, and not treated as a second claim on this section's 4% allocation.
 
 ---
 
@@ -568,8 +425,6 @@ Identity-layer coupling: every EVM state transition in QCB requires a SponsorID 
 
 Scope: the permissioned EVM is orthogonal to the settlement layer (Section 8) and does not change $CIRFI's external value proposition, the merchant-adoption problem, or the cold-start requirement (Section 8.5). Adding an EVM execution environment adds a familiar development surface for building on QCB's economy; it does not add a reason for that economy to exist. The settlement layer remains the load-bearing precondition for $CIRFI having external value, regardless of what execution environment sits above it.
 
-**EVM gas.** Execution of Sponsored Contracts consumes computational resources. Following the same no-user-gas principle as the AMM (Section 6.5), verified humans receive a per-epoch subsidy covering standard EVM transaction costs — ordinary users never hold $QCB just to execute a contract. Above that cap — for high-compute contracts, DeFi protocols, or sustained heavy usage — gas is paid in $QCB. This creates a $QCB demand sink from developers and protocols whose resource consumption exceeds the ordinary human subsidy, without imposing a "hold $QCB to use EVM" requirement on ordinary verified humans. The subsidy cap, the above-cap rate, and whether the cap is per-human or per-contract are unresolved parameters (Open Question 31).
-
 7.3 The Constitutional Layer
 
 QCB is designed for long-term survival — past any single development team, jurisdiction, or identity method. That requirement is different from designing for launch, and it demands a layer of rules that sits above ordinary governance.
@@ -584,11 +439,11 @@ What lives in the constitutional layer:
 · The sovereignty constraint — three related commitments that form a unified whole: (a) no bridge or interoperability path that allows unverified actors to hold or use $CIRFI or $QCB; (b) no EVM execution environment that allows anonymous accounts (accounts without a verified SponsorID) to hold, transfer, or govern $CIRFI or $QCB — the permissioned EVM layer (Section 7.2) is explicitly carved out as constitutional-compliant because it enforces SponsorID linkage; and (c) no token issued on QCB may function as a currency substitute for $CIRFI — currency issuance is reserved to the protocol, and no application-layer token may be accepted as payment through QCB's economic plumbing (activity rewards, Merchant API, Charmed Agent settlement). The three constraints reinforce each other: bridges, anonymous accounts, and parallel currencies are all vectors for the same attack — allowing unverified or unaccountable actors to access the economic mechanisms the identity layer is designed to control.
 · The amendment process itself — what supermajority, what verification-of-humans threshold, and what waiting period is required to change anything in this layer.
 
-What does not live here: decay rates, fee percentages, exemption thresholds, treasury allocations, and other tunable parameters remain ordinary governance — adjustable by the one-human-one-vote process described in Section 6.8, without the higher bar required for constitutional change.
+What does not live here: decay rates, fee percentages, exemption thresholds, treasury allocations, and other tunable parameters remain ordinary governance — adjustable by the one-human-one-vote process described in Section 6.6, without the higher bar required for constitutional change.
 
 How the constitutional layer is enforced: hybrid, and honestly so. Ordinary governance transactions are code-restricted from touching constitutional values directly — no standard parameter-change vote can alter the identity-replacement mechanism, the two-token split, or the sovereignty constraint. But as with any permissionless chain, code enforcement has a ceiling: validators could still, in principle, agree to run modified client software that ignores these restrictions — the same way Bitcoin's 21 million cap or Ethereum's Merge were ultimately upheld by social consensus, not by any barrier a sufficiently coordinated majority couldn't route around. QCB does not claim its constitutional layer is unbreakable. It claims that breaking it requires an explicit, visible, and deliberately difficult act — not an ordinary governance vote — and that this friction is the actual protection, consistent with how every durable chain's hardest constraints have worked in practice.
 
-Amendment process (sketch, to be finalized): a constitutional change requires (a) a supermajority of verified-human votes substantially higher than the threshold for ordinary governance — proposed at two-thirds or greater — (b) a minimum quorum of total verified humans participating, derived in Section 6.8 (see that section for the derivation): not the 3% majority-safety floor used for ordinary CIRFI votes, but the stricter 6% blocking-safety floor Section 6.8 sets for supermajority-approval changes, per the f / (p + f) < 1/3 condition against the Section 4 sybil-rate target, plus the absolute-minimum-voter-count protection from 6.8 rather than a percentage alone, and (c) a mandatory public waiting period between proposal and execution, giving the network time to review, contest, or exit before the change takes effect. Exact thresholds remain an open question (Section 12), but the shape — higher bar, broader participation, enforced delay, all three of 6.8's protections applied at the higher constitutional bar — is intended to be a founding commitment.
+Amendment process (sketch, to be finalized): a constitutional change requires (a) a supermajority of verified-human votes substantially higher than the threshold for ordinary governance — proposed at two-thirds or greater — (b) a minimum quorum of total verified humans participating, derived in Section 6.6 (see that section for the derivation): not the 3% majority-safety floor used for ordinary CIRFI votes, but the stricter 6% blocking-safety floor Section 6.6 sets for supermajority-approval changes, per the f / (p + f) < 1/3 condition against the Section 4 sybil-rate target, plus the absolute-minimum-voter-count protection from 6.6 rather than a percentage alone, and (c) a mandatory public waiting period between proposal and execution, giving the network time to review, contest, or exit before the change takes effect. Exact thresholds remain an open question (Section 12), but the shape — higher bar, broader participation, enforced delay, all three of 6.6's protections applied at the higher constitutional bar — is intended to be a founding commitment.
 
 The purpose of this separation is specific: a chain intended to last for generations cannot depend on any single identity method surviving decades of adversarial pressure unchanged. The current identity layer (Section 4) is a design choice, not a permanent commitment — the constitutional layer's amendment process is what makes it replaceable without the chain itself dying alongside it.
 
@@ -615,24 +470,23 @@ Chain Forge's current priority is its consensus module — building out multiple
 
 · **Real libp2p P2P networking.** The `--features real-network` build flag activates genuine libp2p peer-to-peer communication in place of the mock transport used during unit testing. Four nodes (Alice, Bob, Carol, Dave) have been demonstrated exchanging consensus messages and reaching quorum across a local network, with peer counts visible via the `/api/status` REST endpoint.
 
-· **4-node genesis with configurable quorum.** The genesis configuration supports a variable validator set and quorum threshold. The tested configuration (4 validators, quorum=3) matches a standard BFT fault tolerance of f=1 — the chain continues producing blocks with 3 of 4 validators, providing a meaningful liveness-under-attack test surface.
+· **4-node genesis with configurable quorum.** The tested configuration (4 validators, quorum=3) matches a standard BFT fault tolerance of f=1 — the chain continues producing blocks with 3 of 4 validators, providing a meaningful liveness-under-attack test surface.
 
-· **ValidatorRegistry fix: genesis validators activated at startup.** A critical gap was identified and closed: `ValidatorRegistry::qcb_devnet()` previously created an empty registry, causing the slashing module to silently return `Ok(None)` for every `record_block` call because it could not find any validator by ID. The fix registers all genesis-account validators at node startup and calls `confirm_pop()` to activate them, so the slashing module has a fully-populated, active registry from block 1.
+· **Partition tolerance and recovery verified live.** A hard TCP-level network partition was applied to Alice's P2P port using iptables DROP rules (not a polite disconnect — all packets silently discarded). During the 5-second partition hold, Bob, Carol, and Dave continued committing blocks (height 3 → 7) using the 3-of-4 quorum, with no chain halt, no fork, and no loss of finality. When the partition was healed, Alice synced from height 3 to 7 in under 2 seconds and resumed consensus participation — with zero manual intervention. This is the first time the whitepaper's BFT fault-tolerance claim (f=1, Section 3) has live evidence behind it, and it confirms the `pending_certs` recovery path introduced in an earlier session works correctly under real network conditions. The partition recovery path is also the node catch-up path: this result incidentally proves that a fresh node joining an existing network can bootstrap from peers, a prerequisite for the Phase 4 / Phase 5+ permissionless validator onboarding design.
 
-· **Liveness slashing confirmed working.** With the registry fix in place, stopping a validator (Bob) mid-run produces the expected sequence: the slashing module detects >20% missed blocks within the liveness window, emits `WARN validator jailed`, applies a 1,000,000 uQCB slash, and records the event in slash history. The liveness window is configurable (defaulting to 500 blocks; reduced to 10 for automated testing).
+· **ValidatorRegistry fix: genesis validators activated at startup.** `ValidatorRegistry::qcb_devnet()` previously created an empty registry, causing the slashing module to silently return `Ok(None)` for every liveness-tracking call. The fix registers all genesis-account validators at node startup and calls `confirm_pop()` to activate them, so the slashing module has a fully-populated, active registry from block 1.
 
-· **Attack tests passing.** Three adversarial scenarios are covered by in-process integration tests:
-  1. *Forged vote rejection* (`forged_vote_is_rejected`): a vote with a garbage signature from a known validator ID is injected via `handle_event`; consensus height does not advance, confirming the engine rejects malformed votes rather than accepting them.
-  2. *Equivocation detection and slash* (`equivocation_detected_and_slashed`): two conflicting prevotes at the same (height, round) from the same validator are injected; `drain_equivocations()` fires, `process_equivocation_evidence()` records the slash, and the validator's slash history is non-empty.
-  3. *Liveness slash* (confirmed on the live testnet, not only in unit tests — see above).
+· **Liveness slashing confirmed working.** Stopping a validator mid-run produces the expected sequence: the slashing module detects >20% missed blocks within the liveness window, emits a jailed warning, applies a 1,000,000 uQCB slash, and records the event in slash history.
 
-· **ML-DSA (Dilithium3) post-quantum crypto wired.** The `chain-forge-crypto` crate implements CRYSTALS-Dilithium3 (ML-DSA) as the validator signing scheme, directly addressing the post-quantum exposure described in Section 10. Validator key generation, signing, and verification use Dilithium3 rather than a classical elliptic-curve scheme — the 2.4 KB signature size trade-off is accepted at this stage, consistent with the Section 10.3 discussion of absorbing PQC costs early rather than retrofitting later.
+· **Attack tests passing (in-process).** Three adversarial scenarios covered by in-process integration tests: forged vote rejection (garbage-signature vote does not advance consensus height), equivocation detection and slash (two conflicting prevotes from same validator trigger a slash record), and liveness slash (confirmed on live testnet above). Note: these tests inject events directly into the consensus engine's internal event handler. The corresponding gap — a misbehaving peer sending forged or equivocating messages over real libp2p gossip — has not yet been exercised. That test is the next adversarial milestone.
 
-· **Block explorer REST API live.** The `/api/status`, `/api/blocks/`, `/api/txs/`, and `/api/accounts/` endpoints serve live chain state and are populated on every block commit, enabling external observers to track chain activity without a node client.
+· **ML-DSA (Dilithium3) post-quantum crypto wired.** The `chain-forge-crypto` crate implements CRYSTALS-Dilithium3 (ML-DSA) as the validator signing scheme, addressing the post-quantum exposure described in Section 10.
 
-· **State persistence.** Committed blocks are written to disk via `persist_state()` on every commit, so a restarted node resumes from its last committed height rather than replaying from genesis.
+· **Block explorer REST API live.** `/api/status`, `/api/blocks/`, `/api/txs/`, and `/api/accounts/` serve live chain state on every block commit.
 
-What remains open at the Chain Forge layer: HotStuff-style and XRPL-inspired BFT variants (only Tendermint-style is implemented and tested); a production-grade state tree (JMT-based, replacing the current in-memory state); the full personhood-weighting overlay on top of basic BFT quorum; and the dedicated Chain Forge whitepaper for the developer audience. The Tendermint-style implementation now has a working, tested reference that can serve as the comparison baseline as additional variants are added.
+· **State persistence.** Committed blocks are written to disk on every commit; restarted nodes resume from their last committed height.
+
+What remains open at the Chain Forge layer: HotStuff-style and XRPL-inspired BFT variants; production-grade state tree (JMT-based); personhood-weighting overlay; dedicated Chain Forge whitepaper. The Tendermint-style implementation provides the working reference baseline for all of these.
 
 A dedicated Chain Forge whitepaper, aimed at the developer audience who would build their own chains on it, is expected once the engine is closer to a general release. For now, this document is the only public artifact and carries both the engine's story and the flagship chain's.
 
@@ -644,7 +498,7 @@ A dedicated Chain Forge whitepaper, aimed at the developer audience who would bu
 
 Merchants receive: a fiat settlement option (zero volatility exposure), fees of 0.5%–1% versus 2%–3% for credit cards, and a Stripe-compatible API with Shopify/WooCommerce plugins for fast onboarding. QCB's structural advantage is a demand engine: demurrage means active earners must spend, giving merchants direct, built-in customer demand rather than having to create it.
 
-Bootstrapping gap: this demand engine only functions once merchant density is high enough that verified humans have somewhere to spend. In the first 6–12 months post-launch, before that density exists, onboarding is expected to rely on direct merchant incentive allocations (Section 6.9) and manual outreach rather than organic acceptance growth driven by demurrage pressure alone. The protocol does not yet specify what happens if merchant acceptance fails to reach critical mass within that window — that scenario is covered by Open Question 11's stagnation-resilience question, not by an automatic fallback mechanism described here.
+Bootstrapping gap: this demand engine only functions once merchant density is high enough that verified humans have somewhere to spend. In the first 6–12 months post-launch, before that density exists, onboarding is expected to rely on direct merchant incentive allocations (Section 6.7) and manual outreach rather than organic acceptance growth driven by demurrage pressure alone. The protocol does not yet specify what happens if merchant acceptance fails to reach critical mass within that window — that scenario is covered by Open Question 11's stagnation-resilience question, not by an automatic fallback mechanism described here.
 
 8.2 Where $CIRFI's value comes from — and why the settlement layer is load-bearing
 
@@ -729,7 +583,7 @@ The asymmetry matters: QCB's signature scheme is the actual exposure. Its hash f
 
 10.2 The specific risk to a personhood-weighted chain
 
-QCB's threat surface here is a superset of a typical chain's, for a structural reason: Section 3.3 already establishes that consensus security inherits identity-layer weaknesses. The same is true of cryptographic weaknesses — if validator signatures are forgeable, the personhood-weighting that bounds Sybil influence (Section 6.8's entire quorum derivation) becomes irrelevant, because an attacker who can forge signatures doesn't need fraudulent identities at all. Quantum vulnerability in the signature scheme is a more direct path to consensus and governance compromise than Sybil attacks are, because it bypasses the identity layer entirely rather than gaming it.
+QCB's threat surface here is a superset of a typical chain's, for a structural reason: Section 3.3 already establishes that consensus security inherits identity-layer weaknesses. The same is true of cryptographic weaknesses — if validator signatures are forgeable, the personhood-weighting that bounds Sybil influence (Section 6.6's entire quorum derivation) becomes irrelevant, because an attacker who can forge signatures doesn't need fraudulent identities at all. Quantum vulnerability in the signature scheme is a more direct path to consensus and governance compromise than Sybil attacks are, because it bypasses the identity layer entirely rather than gaming it.
 
 There is also a forward-exposure risk specific to how blockchains reveal public keys: once an account signs a transaction, its public key becomes visible on-chain. This does not expose past transactions to retroactive forgery — those are already settled and finalized — but it does mean that from the moment of first use, an account's public key is a standing target: a sufficiently capable CRQC could forge future signatures from that exposed key at any point afterward, for as long as the account continues using a quantum-vulnerable scheme. For a chain explicitly designed to still be functioning "long after its founders are no longer involved" (Section 7.3), a multi-decade CRQC risk window is not a hypothetical edge case — it's within the chain's stated design horizon.
 
@@ -753,7 +607,7 @@ This tradeoff is real and worth stating plainly rather than deferring entirely: 
 Time horizons below are rough ranges, not commitments — appropriate for a multi-year infrastructure build where later phases depend on unresolved questions (identity layer design, consensus variant selection) that earlier phases must answer first. Phase 0's range for Chain Forge has been widened from an earlier draft: a from-scratch, safety-proofed, pluggable BFT engine is a materially harder problem than Bitcoin's original client, which itself took roughly two years of focused solo development for a simpler design (a single, non-pluggable consensus mechanism, no personhood-weighting layer). A small team building a harder problem should expect a longer, not shorter, timeline.
 
 Phase | Milestone | Rough Horizon | Status
-Phase 0 (Chain Forge) | Consensus engine design and implementation — pluggable BFT variants (Tendermint-style, HotStuff-style, XRPL-inspired) | 18–48 months | **In progress — Tendermint-style BFT operational on 4-node testnet as of September 2026; HotStuff and XRPL variants pending. See Section 7.4 for detail.**
+Phase 0 (Chain Forge) | Consensus engine design and implementation — pluggable BFT variants (Tendermint-style, HotStuff-style, XRPL-inspired) | 18–48 months | **In progress — Tendermint-style BFT operational and partition-tolerant on 4-node testnet as of September 2026 (live iptables partition test passing; f=1 BFT fault tolerance confirmed); HotStuff and XRPL variants pending. See Section 7.4 for detail.**
 Phase 0 (QCB) | Whitepaper, identity layer research — proceeds in parallel with Chain Forge Phase 0, dependent on it for a working consensus target | 18–48 months | **In progress — whitepaper complete (this document); attestation guard Phases A–D implemented in chain-forge-identity (65 tests passing, September 2026); identity pilot parameters provisional.**
 Phase 1 | Personhood-weighted BFT consensus live on testnet; Charm Confinement + Intrinsic Charm implemented | 18–30 months following Phase 0 | Pending — prerequisite (pluggable BFT consensus) now has a working base; personhood-weighting overlay not yet built
 Phase 2 | Identity layer pilot (small integration test, then real-world pilot against cost/sybil targets); CirFi module activation, activity reward claims open | 6–12 months following Phase 1 | Pending
@@ -763,7 +617,7 @@ Phase 5+ | Decentralized governance maturity; permissioned EVM layer (Section 7.
 
 **Phase 0 checkpoint (September 2026).** The Chain Forge engine has reached a meaningful internal milestone within Phase 0: the Tendermint-style consensus variant is functional end-to-end, from genesis block through multi-node quorum, liveness enforcement, and adversarial attack resistance. This is not Phase 0 complete — HotStuff and XRPL variants remain, the state layer is not production-grade, and personhood-weighting is not yet overlaid — but it confirms the pluggable architecture's core premise: the consensus module can be built, tested, and iterated on independently of the application layer above it. The next internal milestone within Phase 0 is a second BFT variant running against the same application interface, which will demonstrate that the pluggability is real rather than theoretical.
 
-**Attestation guard implementation (September 2026).** The on-chain sybil-resistance layer for the identity pilot has been implemented through Phase D in the `chain-forge-identity` crate. The four phases cover: (A) quadratic-cost cap enforcement — hard limit of 3 outbound attestations per 90-epoch window per attester; (B) revocation with cost — `RevokeAttestation` at 10% CS deduction (1,000 bps), cap slot freed on revocation; (C) sybil confirmation with CS penalty — coordinator-gated `ConfirmSybil` applies 120% CS clawback to penalized attesters (12,000 bps), `ReportSuspectedSybil` logs a self-report with 50% penalty reduction on independent confirmation; (D) `ReverseSybil` — coordinator can reverse a confirmed sybil, crediting back CS penalties. Execution layer updated with four new `TxBody` variants (`RevokeAttestation`, `ConfirmSybil`, `ReverseSybil`, `ReportSuspectedSybil`). REST endpoint `/api/identity/{address}` added. Pilot parameters from `docs/QCB-Attestation-Guard-Design.md` are implemented as compiled constants; governance-tunable parameterization is deferred to Phase 1. The coordinator role is a named temporary centralization — see `docs/QCB-Attestation-Guard-Design.md §Coordinator`.
+**Attestation guard implementation (September 2026).** The on-chain sybil-resistance layer for the identity pilot has been implemented through Phase D in the `chain-forge-identity` crate. The four phases cover: (A) quadratic-cost cap enforcement — hard limit of 3 outbound attestations per 90-epoch window per attester; (B) revocation with cost — `RevokeAttestation` at 10% CS deduction (1,000 bps), cap slot freed on revocation; (C) sybil confirmation with CS penalty — coordinator-gated `ConfirmSybil` applies 120% CS clawback to penalized attesters (12,000 bps), `ReportSuspectedSybil` logs a self-report with 50% penalty reduction on independent confirmation; (D) `ReverseSybil` — coordinator can reverse a confirmed sybil, crediting back CS penalties. Execution layer updated with four new `TxBody` variants. REST endpoint `/api/identity/{address}` added. Pilot parameters from `QCB-Attestation-Guard-Design.md` are implemented as compiled constants; governance-tunable parameterization is deferred to Phase 1. The coordinator role is a named temporary centralization — see `docs/QCB-Attestation-Guard-Design.md §Coordinator`.
 
 ---
 
@@ -777,8 +631,8 @@ Calibration questions — decisions needed before or shortly after launch:
 4. Reserve strategy — what backs price stability, if anything
 5. Jurisdiction and legal entity structure, given activity rewards distribution and merchant payment processing
 6. Validator economics — staking incentives, slashing conditions, bounds on per-human validator power
-7. Exact token distribution percentages within the Section 6.9 ceiling (illustrative percentages shown there are examples, not commitments)
-8. Constitutional amendment thresholds — the exact percentage-quorum, absolute-minimum-voter-count, and waiting-period length for Section 7.3's amendment process; Section 6.8/7.3 now derive a floor (>6% turnout) from the Section 4 sybil target, but the absolute-count floor and exact waiting period are still unset
+7. Exact token distribution percentages within the Section 6.7 ceiling (illustrative percentages shown there are examples, not commitments)
+8. Constitutional amendment thresholds — the exact percentage-quorum, absolute-minimum-voter-count, and waiting-period length for Section 7.3's amendment process; Section 6.6/7.3 now derive a floor (>6% turnout) from the Section 4 sybil target, but the absolute-count floor and exact waiting period are still unset
 
 Permanence questions — decisions that matter because QCB is designed for long-term survival, not just launch:
 
@@ -788,9 +642,9 @@ Permanence questions — decisions that matter because QCB is designed for long-
 12. Long-horizon funding — how core protocol development is funded in year 15 or 20, once initial development allocations are spent and the chain's original team may no longer be primarily responsible for it
 13. Consensus-layer bug migration path — the process for patching or replacing the consensus implementation itself if a critical flaw is found, without a chain split or loss of finality guarantees
 14. Validator availability and liveness under partial-participation conditions — unlike Proof of Work (recruit more hashpower) or Proof of Stake (recruit more stake), a personhood-weighted validator set is bounded by a fixed, slow-growing pool of verified humans. What happens to finality and block production if a large fraction of verified humans go offline at once — through censorship, coercion, natural events, or simple apathy — has not yet been addressed. This is a consensus-design constraint arising directly from Section 3's personhood-weighting choice, not a tunable parameter, and needs a concrete answer before Phase 1 testnet. Related to, but distinct from, Q13: a sustained liveness failure may be one of the triggers for Q13's consensus-migration path, but liveness itself (can the chain keep producing blocks right now) and migration (replacing the consensus implementation) are separate problems needing separate answers.
-15. Minimum legitimate participation rate required for governance to remain Sybil-resistant at the maximum tolerated fraudulent-identity rate — Sections 4, 6.8, and 7.3 are now mathematically linked via two distinct derivations against Section 4's sybil-rate target: a >3% turnout floor from the majority-safety condition (f / (p + f) < 0.5, protecting ordinary CIRFI votes) and a >6% floor from the stricter blocking-safety condition (f / (p + f) < 1/3, protecting supermajority constitutional votes). The absolute-minimum-voter-count floor referenced in 6.8, and how both thresholds should adjust if the Section 4 target itself changes after pilot data comes in, remain unset. This question exists specifically to keep identity, ordinary governance, and constitutional governance treated as one linked security model rather than three separate ones.
+15. Minimum legitimate participation rate required for governance to remain Sybil-resistant at the maximum tolerated fraudulent-identity rate — Sections 4, 6.6, and 7.3 are now mathematically linked via two distinct derivations against Section 4's sybil-rate target: a >3% turnout floor from the majority-safety condition (f / (p + f) < 0.5, protecting ordinary CIRFI votes) and a >6% floor from the stricter blocking-safety condition (f / (p + f) < 1/3, protecting supermajority constitutional votes). The absolute-minimum-voter-count floor referenced in 6.6, and how both thresholds should adjust if the Section 4 target itself changes after pilot data comes in, remain unset. This question exists specifically to keep identity, ordinary governance, and constitutional governance treated as one linked security model rather than three separate ones.
 16. Post-quantum migration trigger and algorithm choice — Section 10 establishes that the signature scheme must be constitutionally replaceable, but not which post-quantum algorithm(s) QCB adopts at launch versus in reserve, what specific event (a NIST guidance update, a demonstrated cryptographically-relevant quantum computer, a fixed calendar review date) triggers migration for already-live accounts and validators, and which of Section 10.3's three candidate approaches to absorbing PQC's larger signature size (larger blocks, fee adjustments, or a hybrid scheme applied only to high-value/validator transactions) QCB actually adopts.
-17. Turnout-suppression resistance — Section 6.8's quorum floors are derived assuming legitimate turnout is independent of attacker behavior, but a sophisticated attacker can suppress legitimate turnout directly (proposal spam, governance fatigue, targeted discouragement), lowering p and raising fraud's effective vote share without needing more fraudulent identities. The current model defends against passive, uncoordinated fraud; it does not yet defend against an active campaign to depress legitimate participation. What mechanism (participation incentives, spam-resistant proposal costs, fatigue-aware quorum adjustment) closes this gap is unresolved.
+17. Turnout-suppression resistance — Section 6.6's quorum floors are derived assuming legitimate turnout is independent of attacker behavior, but a sophisticated attacker can suppress legitimate turnout directly (proposal spam, governance fatigue, targeted discouragement), lowering p and raising fraud's effective vote share without needing more fraudulent identities. The current model defends against passive, uncoordinated fraud; it does not yet defend against an active campaign to depress legitimate participation. What mechanism (participation incentives, spam-resistant proposal costs, fatigue-aware quorum adjustment) closes this gap is unresolved.
 18. Settlement layer reserve sizing — how large must the fiat/stablecoin reserve be at genesis to absorb the first wave of merchant conversions without exhausting? The minimum reserve is a function of daily $CIRFI issuance rate, the fraction of activity rewards that gets spent at merchants (rather than held or transferred peer-to-peer), the merchant conversion rate (what share of merchants opt for fiat vs. holding $CIRFI), and the settlement rate. None of these are known at genesis; the reserve must be sized against a plausible range of outcomes rather than a point estimate. This question links to Open Question 4 (reserve strategy) and must be resolved before mainnet activity rewards issuance begins.
 
 Provisional reserve model at launch parameters ($0.0000001/CIRFI, 1,000 $CIRFI/day activity rewards, assumptions: 50% of activity rewards spent at merchants, 80% of merchants take fiat settlement):
@@ -819,41 +673,11 @@ This question is intentionally left open rather than specified, because three pr
 
 Until (a)-(c) have concrete answers, Human Capacity Markets remains a named possibility, not a designed mechanism, and it does not appear in the Abstract, Section 5, or the token-economics sections. If it is pursued, it should enter the document the way Section 4.6's strategic directions do: as a contingent extension with named success and failure conditions, evaluated against a working pilot before being described as a feature QCB has.
 
-A related, equally unresolved idea has been proposed alongside this one: activity-based $QCB accrual, under which verified humans (and, by attribution, their sponsored agents) would earn $QCB credits for measured $CIRFI economic activity — spending, Capacity Market work, agent activity that passes some quality filter — rather than for locking a balance, which is what Section 6.11's long-term distribution mechanism already covers. It is recorded here, as a fourth prerequisite, rather than specified, because it inherits the same three open questions above in a stricter form:
+A related, equally unresolved idea has been proposed alongside this one: activity-based $QCB accrual, under which verified humans (and, by attribution, their sponsored agents) would earn $QCB credits for measured $CIRFI economic activity — spending, Capacity Market work, agent activity that passes some quality filter — rather than for locking a balance, which is what Section 6.9's long-term distribution mechanism already covers. It is recorded here, as a fourth prerequisite, rather than specified, because it inherits the same three open questions above in a stricter form:
 
-(d) Source of funds and gaming resistance — any real version of this draws $QCB from the same fixed, genesis-minted 210 million supply as everything else (Section 6.9); it is not a second, independently-sized allocation, and sizing it correctly requires deciding how it relates to Section 6.11's 4% long-term distribution pool before either can be finalized. Two of its proposed qualifying activities — Capacity Market work and sponsored-agent volume — are Human Capacity Market primitives, so this cannot be resolved ahead of (a)-(c) above; it is downstream of them, not parallel to them. It also introduces its own attack surface on top of HCM's: attributing agent activity to a human sponsor's accrual creates a direct incentive to run low-quality or synthetic agent activity purely to farm credits. Candidate mitigations — quality filters on what counts as attributable activity, per-identity rate limits or diminishing returns, a requirement that the sponsor maintain their own qualifying activity alongside their agents' — are named here as directions, not as a specified design. As with Human Capacity Markets itself, the identity layer's sybil resistance (Section 4) is the first line of defense against this, not a substitute for it; a mechanism that pays out real $QCB for activity is a stronger incentive to defeat that sybil resistance than sponsorship alone, and should be evaluated with that in mind before it is built, not after.
+(d) Source of funds and gaming resistance — any real version of this draws $QCB from the same fixed, genesis-minted 210 million supply as everything else (Section 6.7); it is not a second, independently-sized allocation, and sizing it correctly requires deciding how it relates to Section 6.9's 4% long-term distribution pool before either can be finalized. Two of its proposed qualifying activities — Capacity Market work and sponsored-agent volume — are Human Capacity Market primitives, so this cannot be resolved ahead of (a)-(c) above; it is downstream of them, not parallel to them. It also introduces its own attack surface on top of HCM's: attributing agent activity to a human sponsor's accrual creates a direct incentive to run low-quality or synthetic agent activity purely to farm credits. Candidate mitigations — quality filters on what counts as attributable activity, per-identity rate limits or diminishing returns, a requirement that the sponsor maintain their own qualifying activity alongside their agents' — are named here as directions, not as a specified design. As with Human Capacity Markets itself, the identity layer's sybil resistance (Section 4) is the first line of defense against this, not a substitute for it; a mechanism that pays out real $QCB for activity is a stronger incentive to defeat that sybil resistance than sponsorship alone, and should be evaluated with that in mind before it is built, not after.
 
 ---
-
-27. Tokenized Securities (SEC Innovation Exemption) — considered, downstream of AMM
-
-On September 17, 2026, the SEC issued a five-year conditional Innovation Exemption allowing Tokenized Securities Venues (TSVs) to trade tokenized NMS stock through permissioned AMM liquidity pools, exempt from the exchange definition under the Exchange Act. This creates a concrete regulatory opening that QCB's design maps to more naturally than most chains, because the exemption's core requirement — permissioned pools — is exactly what QCB's identity layer provides at the protocol level. A verified-human gate on an AMM pool is a stronger compliance primitive than an issuer-managed allowlist: it is not "is this address on the list" but "is this a verified unique human," which is a meaningful upgrade for KYC-adjacent purposes.
-
-The prerequisites, none of which exist yet: the native AMM (Phase 2); a defined stable settlement asset (Section 6.7 introduces qUSD as QCB’s protocol-native stable asset, USDC-backed in Phase 2 and transitioning to sovereign backing in Phase 3+ only if the chain earns it; Open Questions 18-22 cover the broader settlement layer); permissioned pool mechanics in the AMM (an additional design layer beyond the AMM itself); and a US legal entity to operate the TSV, since the SEC requires the venue operator to be a US person. The last of these is not a technical requirement but a legal one, and it is the most serious gate: QCB can be the settlement layer, but someone must be the TSV.
-
-This is parked here rather than in the roadmap for the same reason Human Capacity Markets is parked at Open Question 26: its prerequisites are themselves unresolved. The five-year window (expiring September 17, 2031) provides real time to reach this milestone, but only in the order the roadmap already specifies: identity pilot, settlement layer, then AMM. Attempting to build a TSV compliance layer before the AMM exists would be building on nothing.
-
-What is not contingent: the personhood differentiator. The SEC's framework explicitly allows permissioning "at the pool or at the token itself." QCB's proof-of-personhood is already at the protocol level, not the token level. That is worth preserving as a design constraint even before a TSV is in scope.
-
-28. Green Initiative — the demurrage mechanism as foundation, capacity market as execution layer
-
-As noted in Section 5.4, demurrage already creates spending pressure toward any organization that accepts $CIRFI. No new mechanism is required for environmental organizations to benefit from this. What would require new design work is a deliberate green initiative that makes environmental action economically visible and rewarded within the protocol, rather than simply permitting it.
-
-Three components have been proposed and are recorded here as downstream possibilities, all contingent on their upstream prerequisites:
-
-The first is verified environmental work as a capacity market task category. If Human Capacity Markets (Open Question 26) is built, adding environmental verification as a task category — a human photographs a reforestation site, audits a carbon offset, confirms a solar installation — is a parameter change, not a new module. The work settles in $CIRFI, is gated by the identity layer, and accrues QCB Credits the same way any other capacity market task does. This is something a chain without a personhood layer and a capacity market cannot replicate: their equivalent is a one-time donation event, not an ongoing paid contribution stream with verified attesters.
-
-The second is tokenized carbon credits in a permissioned AMM pool. A verified environmental project issues carbon credit tokens; those tokens trade in a gated pool against a stable asset; the proceeds fund the project. The identity layer makes the MRV (Monitoring, Reporting, Verification) step attestable by verified humans, whose identity and reputation are at stake, rather than by an opaque third party. This is downstream of the AMM existing and the permissioned pool mechanics being built, which are themselves downstream of the settlement layer.
-
-The third is what does not require any new design: the demurrage-driven environmental spending described in Section 5.4. It is already a consequence of the monetary design, not a feature to build.
-
-The honest competitive comparison: other chains position themselves as green primarily on the basis of energy-efficient consensus and NGO validator partnerships. QCB's green story, if pursued, would be grounded in mechanism rather than marketing: demurrage forces value toward whatever accepts $CIRFI, the identity layer makes environmental attestation verifiable, and the capacity market (if built) makes environmental work paid. That is a structural difference from a one-time NFT sale or a validator credentialing program. It is also entirely downstream of the identity pilot, the settlement layer, and Human Capacity Markets — none of which are complete. This is recorded here as a named possibility, not a roadmap item.
-
-29. AMM pool fee calibration. Section 6.5 commits to a pool-fee-only model with a provisional 0.3% rate, split ~70/20/10 between LPs, BME, and treasury. The check that the 10% treasury allocation actually covers per-swap network costs cannot be verified until real volume exists on testnet. If costs exceed the treasury allocation, the pool fee rate, the split, or both must be adjusted. This is a Phase 2 calibration question.
-
-30. BME revenue source allocation. Section 6.3 broadens $QCB's buyback-and-burn from merchant-fee-only to all protocol revenue sources. The open question is the split: what share of each revenue source (merchant fees, AMM swap fees, settlement layer fees, RWA issuance fees, capacity market fees, Sponsored Contract gas) funds the buyback-and-burn versus other destinations such as validator rewards or the treasury. The pool-fee split allocates ~20% of the 0.3% AMM fee to BME; comparable splits for other revenue sources are unspecified.
-
-31. EVM gas subsidy cap and high-compute rate. Section 7.2 commits to a per-epoch subsidy for verified humans running Sponsored Contracts, above which gas is paid in $QCB. The size of the subsidy cap, the rate for high-compute usage, and whether the cap is per-human or per-contract are unresolved parameters. This is a Phase 5+ question, dependent on the EVM layer existing and real computational cost data being available.
 
 13. Conclusion
 
