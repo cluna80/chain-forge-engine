@@ -132,6 +132,46 @@ impl std::fmt::Display for VerificationTier {
     }
 }
 
+// -- PoP proof verifier -------------------------------------------------------
+
+/// Pluggable verifier for the cryptographic proof inside a `PopAttestation`.
+///
+/// Phase 0: the identity layer doesn't verify the proof at all (the
+/// `PopAttestation::verify` stub accepts any non-empty attester). Phase 1:
+/// callers inject a `PopProofVerifier` into `IdentityStore::verify_identity`
+/// so the real ZK proof is checked without coupling this crate to the
+/// heavyweight `chain-forge-personhood` / arkworks dependency tree.
+///
+/// The expected contract for a real (Phase 1+) implementation:
+///   - `proof_bytes`: serialized Groth16 proof (arkworks canonical encoding).
+///   - `public_inputs_bytes`: serialized public inputs for the circuit
+///     (e.g. the VRC Merkle root as a BLS12-381 Fr element).
+/// Returns `Ok(())` if the proof is valid, or `Err(reason)` if it is not.
+///
+/// The Genesis / Phase 0 stub (`NoOpVerifier`) always returns `Ok(())` and
+/// is the default used when no real verifier is supplied.
+pub trait PopProofVerifier: Send + Sync {
+    fn verify_pop_proof(
+        &self,
+        proof_bytes: &[u8],
+        public_inputs_bytes: &[u8],
+    ) -> Result<(), String>;
+}
+
+/// Phase 0 no-op: every attestation passes. Used during genesis bootstrap
+/// and in all tests that are not specifically testing proof verification.
+///
+/// This is the type that `IdentityStore::verify_identity` uses by default
+/// when the caller passes `None` as the verifier. When the identity pilot
+/// moves to Phase 1, callers pass `Some(&Groth16VrcVerifier { ... })`.
+pub struct NoOpVerifier;
+
+impl PopProofVerifier for NoOpVerifier {
+    fn verify_pop_proof(&self, _proof_bytes: &[u8], _public_inputs: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 // -- PoP attestation ----------------------------------------------------------
 
 /// A proof-of-personhood attestation.
@@ -171,16 +211,68 @@ impl PopAttestation {
         }
     }
 
-    /// Verify the attestation. Phase 0: always returns Ok for non-empty
-    /// identity_id and known attester. Phase 1+: cryptographic check.
-    pub fn verify(&self) -> IdResult<()> {
+    /// Verify the attestation, optionally checking the embedded ZK proof.
+    ///
+    /// * `verifier = None`  — Phase 0 (no-op): structural checks only.
+    ///   Accepts any attestation with a non-empty identity_id and attester.
+    ///   Used at genesis and in all Phase 0 tests.
+    ///
+    /// * `verifier = Some(v)` — Phase 1+: after the structural checks, calls
+    ///   `v.verify_pop_proof(&self.proof, &[])` (public inputs are passed as
+    ///   empty here; real callers that have public inputs — e.g. a VRC root —
+    ///   should use `verify_with_inputs`).
+    pub fn verify(&self, verifier: Option<&dyn PopProofVerifier>) -> IdResult<()> {
         if self.identity_id.is_empty() {
             return Err(IdentityError::InvalidProof("empty identity_id".into()));
         }
-        // Phase 0: accept genesis and any non-empty attester.
-        // Phase 1: verify ZK proof against web-of-trust or ceremony output.
         if self.attester.is_empty() {
             return Err(IdentityError::InvalidProof("empty attester".into()));
+        }
+        // Phase 0: structural checks only — no ZK proof needed.
+        // Phase 1+: verify the embedded proof against the supplied verifier.
+        if let Some(v) = verifier {
+            if !self.proof.is_empty() {
+                v.verify_pop_proof(&self.proof, &[])
+                    .map_err(IdentityError::InvalidProof)?;
+            }
+            // A real Phase 1 attestation MUST carry a proof; a genesis
+            // attestation legitimately has an empty proof vec. If the caller
+            // passed a verifier and the proof is empty, only genesis
+            // attestations (attester == "genesis") are allowed through.
+            // Everything else is rejected to prevent a proof-stripping attack.
+            else if self.attester != "genesis" {
+                return Err(IdentityError::InvalidProof(
+                    "non-genesis attestation missing ZK proof (Phase 1 enforcement)".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Same as `verify`, but passes `public_inputs_bytes` to the verifier
+    /// for circuits whose public inputs are not embedded in the proof itself
+    /// (e.g. the VRC Merkle root supplied separately by the identity pilot
+    /// ceremony coordinator).
+    pub fn verify_with_inputs(
+        &self,
+        verifier: &dyn PopProofVerifier,
+        public_inputs_bytes: &[u8],
+    ) -> IdResult<()> {
+        if self.identity_id.is_empty() {
+            return Err(IdentityError::InvalidProof("empty identity_id".into()));
+        }
+        if self.attester.is_empty() {
+            return Err(IdentityError::InvalidProof("empty attester".into()));
+        }
+        if self.proof.is_empty() && self.attester != "genesis" {
+            return Err(IdentityError::InvalidProof(
+                "non-genesis attestation missing ZK proof".into(),
+            ));
+        }
+        if !self.proof.is_empty() {
+            verifier
+                .verify_pop_proof(&self.proof, public_inputs_bytes)
+                .map_err(IdentityError::InvalidProof)?;
         }
         Ok(())
     }
@@ -430,8 +522,15 @@ impl IdentityRecord {
     }
 
     /// Verify this identity (upgrade Provisional -> Verified).
-    pub fn verify(&mut self, attestation: PopAttestation) -> IdResult<()> {
-        attestation.verify()?;
+    ///
+    /// Pass `verifier = Some(v)` to enforce ZK proof validation (Phase 1+),
+    /// or `None` to skip proof checking (Phase 0 genesis bootstrap).
+    pub fn verify(
+        &mut self,
+        attestation: PopAttestation,
+        verifier: Option<&dyn PopProofVerifier>,
+    ) -> IdResult<()> {
+        attestation.verify(verifier)?;
         let epoch = attestation.epoch;
         self.charm.verify(epoch);
         self.attestation = attestation;
@@ -581,7 +680,9 @@ impl IdentityStore {
         if self.records.contains_key(&id) {
             return Err(IdentityError::AlreadyExists(id));
         }
-        attestation.verify()?;
+        // Registration creates a Provisional identity; no ZK proof is
+        // required at registration time (structural checks only).
+        attestation.verify(None)?;
         let epoch = self.clock.current_epoch;
         let record = IdentityRecord::new(id.clone(), address.clone(), attestation, epoch);
         self.by_address.insert(address, id.clone());
@@ -590,14 +691,24 @@ impl IdentityStore {
     }
 
     /// Verify a Provisional identity (upgrade to Verified).
+    ///
+    /// * `verifier = None`  — Phase 0 (genesis / tests): no ZK proof required.
+    ///   The attestation's structural checks (non-empty identity_id, attester)
+    ///   are still enforced.
+    ///
+    /// * `verifier = Some(v)` — Phase 1+: the embedded `attestation.proof`
+    ///   is passed to `v.verify_pop_proof(...)`. Non-genesis attestations
+    ///   without a proof are rejected. Use `PopAttestation::verify_with_inputs`
+    ///   directly when the VRC root must be supplied as a separate public input.
     pub fn verify_identity(
         &mut self,
         id: &str,
         attestation: PopAttestation,
+        verifier: Option<&dyn PopProofVerifier>,
     ) -> IdResult<()> {
         let record = self.records.get_mut(id)
             .ok_or_else(|| IdentityError::NotFound(id.to_string()))?;
-        record.verify(attestation)?;
+        record.verify(attestation, verifier)?;
         tracing::info!(id, "identity verified (Provisional -> Verified)");
         Ok(())
     }
@@ -927,7 +1038,7 @@ mod tests {
             address.to_string(),
             genesis_attestation(id),
         ).unwrap();
-        store.verify_identity(id, genesis_attestation(id)).unwrap();
+        store.verify_identity(id, genesis_attestation(id), None).unwrap();
     }
 
     // -- VerificationTier tests -----------------------------------------------

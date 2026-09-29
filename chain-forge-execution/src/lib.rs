@@ -1304,7 +1304,7 @@ mod tests {
         let mut identity = IdentityStore::new(0);
         let att = PopAttestation::genesis("qcb1alice", 0);
         identity.register("qcb1alice".into(), "qcb1alice".into(), att.clone()).unwrap();
-        identity.verify_identity("qcb1alice", att).unwrap();
+        identity.verify_identity("qcb1alice", att, None).unwrap();
 
         let cirfi = CirfiEngine::new("ucirfi".into(), "uqcb".into());
         (Executor::new(config), state, identity, cirfi)
@@ -1437,7 +1437,7 @@ mod tests {
         for name in ["qcb1bob", "qcb1carol"] {
             let att = PopAttestation::genesis(name, 0);
             identity.register(name.into(), name.into(), att.clone()).unwrap();
-            identity.verify_identity(name, att).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
         }
 
         // Register the real claimant via the actual transaction path.
@@ -1493,7 +1493,7 @@ mod tests {
         for name in ["qcb1bob", "qcb1carol"] {
             let att = PopAttestation::genesis(name, 0);
             identity.register(name.into(), name.into(), att.clone()).unwrap();
-            identity.verify_identity(name, att).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
         }
 
         // Registration advances the new account's nonce 0 -> 1.
@@ -1666,7 +1666,7 @@ mod tests {
         for name in ["qcb1alice", "qcb1bob", "qcb1carol"] {
             let att = PopAttestation::genesis(name, 0);
             identity.register(name.into(), name.into(), att.clone()).unwrap();
-            identity.verify_identity(name, att).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
         }
         let mut cirfi = CirfiEngine::new("ucirfi".into(), "uqcb".into());
 

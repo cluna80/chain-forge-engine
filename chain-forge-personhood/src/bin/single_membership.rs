@@ -2,65 +2,18 @@
 //! (Refactored to use the shared `chain_forge_personhood` lib; behavior unchanged from
 //! the original standalone version.)
 
-use ark_bls12_381::{Bls12_381, Fr};
-use ark_crypto_primitives::crh::{CRHScheme, CRHSchemeGadget, TwoToOneCRHScheme, TwoToOneCRHSchemeGadget};
+use ark_bls12_381::Bls12_381;
+use ark_crypto_primitives::crh::{CRHScheme, TwoToOneCRHScheme};
 use ark_groth16::Groth16;
-use ark_r1cs_std::prelude::*;
-use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::SNARK;
 use ark_std::rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use std::time::Instant;
 
 use chain_forge_personhood::{
-    enforce_membership_and_extract_issuer, make_leaf, root_to_public_inputs, LeafHash,
-    LeafHashGadget, RootVar, TwoToOneHash, TwoToOneHashGadget, VrcMembershipPath,
-    VrcRegistryTree,
+    make_leaf, root_to_public_inputs, LeafHash, TwoToOneHash,
+    VrcRegistryTree, VrcMembershipCircuit,
 };
-
-struct VrcMembershipCircuit {
-    root: Option<<TwoToOneHash as TwoToOneCRHScheme>::Output>,
-    leaf: Option<Vec<u8>>,
-    path: Option<VrcMembershipPath>,
-    leaf_crh_params: <LeafHash as CRHScheme>::Parameters,
-    two_to_one_params: <TwoToOneHash as TwoToOneCRHScheme>::Parameters,
-}
-
-impl ConstraintSynthesizer<Fr> for VrcMembershipCircuit {
-    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        let root_val = self.root.ok_or(SynthesisError::AssignmentMissing)?;
-        let root_var: RootVar =
-            AllocVar::new_input(ark_relations::ns!(cs, "root"), || Ok(root_val))?;
-
-        let leaf_params_var =
-            <LeafHashGadget as CRHSchemeGadget<LeafHash, Fr>>::ParametersVar::new_constant(
-                ark_relations::ns!(cs, "leaf_params"),
-                &self.leaf_crh_params,
-            )?;
-        let two_to_one_params_var =
-            <TwoToOneHashGadget as TwoToOneCRHSchemeGadget<TwoToOneHash, Fr>>::ParametersVar::new_constant(
-                ark_relations::ns!(cs, "two_to_one_params"),
-                &self.two_to_one_params,
-            )?;
-
-        let leaf = self.leaf.ok_or(SynthesisError::AssignmentMissing)?;
-        let path = self.path.ok_or(SynthesisError::AssignmentMissing)?;
-
-        // Issuer id isn't used in this single-credential demo, but exercising
-        // the same shared helper as the N-distinct-issuers circuit keeps both
-        // binaries provably running identical membership logic.
-        let _issuer_id = enforce_membership_and_extract_issuer(
-            cs,
-            leaf,
-            path,
-            &leaf_params_var,
-            &two_to_one_params_var,
-            &root_var,
-        )?;
-
-        Ok(())
-    }
-}
 
 fn main() {
     println!("=== QCB Tier 1: VRC membership ZK proof (Groth16 over BLS12-381) ===\n");

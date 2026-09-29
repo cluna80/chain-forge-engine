@@ -5,9 +5,11 @@ edition = "2021"
 
 [dependencies]
 thiserror = { workspace = true }
-chain-forge-core = { path = "../chain-forge-core" }
+chain-forge-core      = { path = "../chain-forge-core" }
 chain-forge-consensus = { path = "../chain-forge-consensus" }
 chain-forge-crypto    = { path = "../chain-forge-crypto" }
+chain-forge-identity  = { path = "../chain-forge-identity" }
+serde = { workspace = true }
 
 ark-ff = "0.4"
 ark-ec = "0.4"

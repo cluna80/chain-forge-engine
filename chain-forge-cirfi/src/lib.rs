@@ -540,7 +540,7 @@ mod tests {
     fn register_and_verify(store: &mut IdentityStore, id: &str, address: &str) {
         let att = PopAttestation::genesis(id, 0);
         store.register(id.to_string(), address.to_string(), att.clone()).unwrap();
-        store.verify_identity(id, att).unwrap();
+        store.verify_identity(id, att, None).unwrap();
     }
 
     // -- Demurrage tier tests -------------------------------------------------

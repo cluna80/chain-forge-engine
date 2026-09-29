@@ -229,3 +229,414 @@ fn extract_issuer_id(leaf_var: &[UInt8<Fr>]) -> Result<FpVar<Fr>, SynthesisError
     }
     Boolean::le_bits_to_fp_var(&issuer_bits)
 }
+
+// -- ZK proof verifier --------------------------------------------------------
+
+use ark_bls12_381::Bls12_381;
+use ark_groth16::{Groth16, PreparedVerifyingKey, VerifyingKey};
+use ark_serialize::CanonicalDeserialize;
+use ark_snark::SNARK;
+use chain_forge_identity::PopProofVerifier;
+
+/// A `PopProofVerifier` backed by Groth16 over BLS12-381 and the VRC
+/// membership circuit used in chain-forge-personhood.
+///
+/// Construct with `Groth16VrcVerifier::from_vk_bytes` (for a verifying key
+/// serialized with `ark_serialize::CanonicalSerialize::serialize_compressed`)
+/// or `Groth16VrcVerifier::from_vk` for an in-memory key produced by
+/// `Groth16::circuit_specific_setup`.
+///
+/// # Proof bytes format
+///
+/// The `proof_bytes` field in `PopAttestation` must be an arkworks
+/// `ark_groth16::Proof<Bls12_381>` serialized with
+/// `CanonicalSerialize::serialize_compressed`.
+///
+/// # Public inputs bytes format
+///
+/// `public_inputs_bytes` must be a little-endian encoding of the VRC Merkle
+/// root as a sequence of `Fr` field elements, each 32 bytes (canonical
+/// arkworks serialization). In the single-credential circuit there is exactly
+/// one public input (the root). Use `root_to_public_inputs` + arkworks
+/// `CanonicalSerialize` to produce this byte string, and
+/// `PopAttestation::verify_with_inputs` (not `verify`) to pass it in.
+pub struct Groth16VrcVerifier {
+    pvk: PreparedVerifyingKey<Bls12_381>,
+}
+
+impl Groth16VrcVerifier {
+    /// Build from a raw `VerifyingKey<Bls12_381>` returned by
+    /// `Groth16::circuit_specific_setup`.
+    pub fn from_vk(vk: VerifyingKey<Bls12_381>) -> Self {
+        Self {
+            pvk: Groth16::<Bls12_381>::process_vk(&vk)
+                .expect("PreparedVerifyingKey construction cannot fail"),
+        }
+    }
+
+    /// Build from compressed-canonical bytes previously produced by
+    /// `CanonicalSerialize::serialize_compressed` on the verifying key.
+    pub fn from_vk_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let vk = VerifyingKey::<Bls12_381>::deserialize_compressed(bytes)
+            .map_err(|e| format!("failed to deserialize VRC verifying key: {e}"))?;
+        Ok(Self::from_vk(vk))
+    }
+}
+
+impl PopProofVerifier for Groth16VrcVerifier {
+    /// Verify a Groth16 VRC membership proof.
+    ///
+    /// `proof_bytes`: compressed-canonical `ark_groth16::Proof<Bls12_381>`.
+    /// `public_inputs_bytes`: compressed-canonical `Fr` elements (the Merkle root).
+    ///
+    /// Returns `Ok(())` when the proof is valid, `Err(reason)` otherwise.
+    fn verify_pop_proof(
+        &self,
+        proof_bytes: &[u8],
+        public_inputs_bytes: &[u8],
+    ) -> Result<(), String> {
+        let proof = ark_groth16::Proof::<Bls12_381>::deserialize_compressed(proof_bytes)
+            .map_err(|e| format!("invalid proof encoding: {e}"))?;
+
+        let public_inputs: Vec<Fr> = if public_inputs_bytes.is_empty() {
+            vec![]
+        } else {
+            // Each Fr element is 32 bytes in compressed canonical form.
+            let mut inputs = Vec::new();
+            let mut remaining = public_inputs_bytes;
+            while !remaining.is_empty() {
+                if remaining.len() < 32 {
+                    return Err(format!(
+                        "public_inputs_bytes length {} is not a multiple of 32",
+                        public_inputs_bytes.len()
+                    ));
+                }
+                let elem = Fr::deserialize_compressed(&remaining[..32])
+                    .map_err(|e| format!("invalid Fr element in public inputs: {e}"))?;
+                inputs.push(elem);
+                remaining = &remaining[32..];
+            }
+            inputs
+        };
+
+        let valid = Groth16::<Bls12_381>::verify_with_processed_vk(
+            &self.pvk,
+            &public_inputs,
+            &proof,
+        )
+        .map_err(|e| format!("Groth16 verify error: {e}"))?;
+
+        if valid {
+            Ok(())
+        } else {
+            Err("VRC membership proof is invalid".into())
+        }
+    }
+}
+
+// -- VRC membership circuit (pub so tests and the single_membership bin share it) --
+
+use ark_relations::r1cs::ConstraintSynthesizer;
+
+/// The R1CS circuit for a Tier-1 VRC membership proof: "I hold a credential
+/// in this VRC registry (proved by its Merkle root)."
+///
+/// Used both by the `single_membership` demo binary and by the integration
+/// tests that verify the full `Groth16VrcVerifier ↔ IdentityStore` wiring.
+///
+/// All fields are `Option` so the same struct can be used for:
+///   - trusted setup (`root/leaf/path = None`)
+///   - proving and verification (`root/leaf/path = Some(...)`)
+pub struct VrcMembershipCircuit {
+    pub root: Option<<TwoToOneHash as TwoToOneCRHScheme>::Output>,
+    pub leaf: Option<Vec<u8>>,
+    pub path: Option<VrcMembershipPath>,
+    pub leaf_crh_params: <LeafHash as CRHScheme>::Parameters,
+    pub two_to_one_params: <TwoToOneHash as TwoToOneCRHScheme>::Parameters,
+}
+
+impl ConstraintSynthesizer<Fr> for VrcMembershipCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let root_val = self.root.ok_or(SynthesisError::AssignmentMissing)?;
+        let root_var: RootVar =
+            AllocVar::new_input(ark_relations::ns!(cs, "root"), || Ok(root_val))?;
+
+        let leaf_params_var =
+            <LeafHashGadget as CRHSchemeGadget<LeafHash, Fr>>::ParametersVar::new_constant(
+                ark_relations::ns!(cs, "leaf_params"),
+                &self.leaf_crh_params,
+            )?;
+        let two_to_one_params_var =
+            <TwoToOneHashGadget as TwoToOneCRHSchemeGadget<TwoToOneHash, Fr>>::ParametersVar::new_constant(
+                ark_relations::ns!(cs, "two_to_one_params"),
+                &self.two_to_one_params,
+            )?;
+
+        let leaf = self.leaf.ok_or(SynthesisError::AssignmentMissing)?;
+        let path = self.path.ok_or(SynthesisError::AssignmentMissing)?;
+
+        let _issuer_id = enforce_membership_and_extract_issuer(
+            cs,
+            leaf,
+            path,
+            &leaf_params_var,
+            &two_to_one_params_var,
+            &root_var,
+        )?;
+
+        Ok(())
+    }
+}
+
+// -- Integration tests: Groth16VrcVerifier wired into IdentityStore ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_bls12_381::Bls12_381;
+    use ark_crypto_primitives::crh::{CRHScheme, TwoToOneCRHScheme};
+    use ark_groth16::Groth16;
+    use ark_serialize::CanonicalSerialize;
+    use ark_snark::SNARK;
+    use ark_std::rand::SeedableRng;
+    use chain_forge_identity::{IdentityStore, PopAttestation};
+    use rand_chacha::ChaCha20Rng;
+
+    /// Shared test setup: build a tiny VRC tree (8 leaves), pick one leaf to
+    /// prove, run Groth16 trusted setup, and return everything needed to
+    /// produce proofs or forge them.
+    struct VrcTestFixture {
+        leaf_crh_params: <LeafHash as CRHScheme>::Parameters,
+        two_to_one_params: <TwoToOneHash as TwoToOneCRHScheme>::Parameters,
+        tree: VrcRegistryTree,
+        leaves: Vec<Vec<u8>>,
+        my_leaf_idx: usize,
+        pk: ark_groth16::ProvingKey<Bls12_381>,
+        vk: ark_groth16::VerifyingKey<Bls12_381>,
+    }
+
+    impl VrcTestFixture {
+        /// Build the fixture. Slow (Groth16 trusted setup), so tests should
+        /// share one via `once_cell` or call it only when needed.
+        fn build() -> Self {
+            let mut rng = ChaCha20Rng::seed_from_u64(0xdead_beef_cafe);
+            let leaf_crh_params = <LeafHash as CRHScheme>::setup(&mut rng).unwrap();
+            let two_to_one_params = <TwoToOneHash as TwoToOneCRHScheme>::setup(&mut rng).unwrap();
+
+            let leaves: Vec<Vec<u8>> = (0u32..8).map(|i| make_leaf(i, &mut rng)).collect();
+            let tree = VrcRegistryTree::new(
+                &leaf_crh_params,
+                &two_to_one_params,
+                leaves.iter().map(|s| s.as_slice()),
+            )
+            .unwrap();
+
+            let root = tree.root();
+            let my_leaf_idx: usize = 3;
+            // Trusted setup requires a full witness (leaf + path), same as the
+            // single_membership binary. The constraint structure is circuit-wide
+            // and independent of the concrete witness values.
+            let setup_path = tree.generate_proof(my_leaf_idx).unwrap();
+            let setup_circuit = VrcMembershipCircuit {
+                root: Some(root),
+                leaf: Some(leaves[my_leaf_idx].clone()),
+                path: Some(setup_path),
+                leaf_crh_params: leaf_crh_params.clone(),
+                two_to_one_params: two_to_one_params.clone(),
+            };
+            let (pk, vk) =
+                Groth16::<Bls12_381>::circuit_specific_setup(setup_circuit, &mut rng).unwrap();
+
+            Self {
+                leaf_crh_params,
+                two_to_one_params,
+                tree,
+                leaves,
+                my_leaf_idx,
+                pk,
+                vk,
+            }
+        }
+
+        /// Produce valid proof bytes + public-input bytes for `my_leaf_idx`.
+        fn valid_proof_and_inputs(&self) -> (Vec<u8>, Vec<u8>) {
+            let mut rng = ChaCha20Rng::seed_from_u64(0x1234_5678);
+            let root = self.tree.root();
+            let path = self.tree.generate_proof(self.my_leaf_idx).unwrap();
+            let circuit = VrcMembershipCircuit {
+                root: Some(root),
+                leaf: Some(self.leaves[self.my_leaf_idx].clone()),
+                path: Some(path),
+                leaf_crh_params: self.leaf_crh_params.clone(),
+                two_to_one_params: self.two_to_one_params.clone(),
+            };
+            let proof = Groth16::<Bls12_381>::prove(&self.pk, circuit, &mut rng).unwrap();
+            let mut proof_bytes = Vec::new();
+            proof.serialize_compressed(&mut proof_bytes).unwrap();
+
+            let public_inputs = root_to_public_inputs(&root);
+            let mut pi_bytes = Vec::new();
+            for elem in &public_inputs {
+                elem.serialize_compressed(&mut pi_bytes).unwrap();
+            }
+            (proof_bytes, pi_bytes)
+        }
+
+        /// Produce proof bytes for a *different* leaf (i.e. a wrong-leaf forgery).
+        fn forged_proof_bytes(&self) -> Vec<u8> {
+            let mut rng = ChaCha20Rng::seed_from_u64(0xAAAA_BBBB);
+            let root = self.tree.root();
+            let wrong_idx = (self.my_leaf_idx + 1) % self.leaves.len();
+            let path = self.tree.generate_proof(wrong_idx).unwrap();
+            let circuit = VrcMembershipCircuit {
+                root: Some(root),
+                leaf: Some(self.leaves[wrong_idx].clone()),
+                path: Some(path),
+                leaf_crh_params: self.leaf_crh_params.clone(),
+                two_to_one_params: self.two_to_one_params.clone(),
+            };
+            let proof = Groth16::<Bls12_381>::prove(&self.pk, circuit, &mut rng).unwrap();
+            let mut proof_bytes = Vec::new();
+            proof.serialize_compressed(&mut proof_bytes).unwrap();
+            proof_bytes
+        }
+
+        fn verifier_bytes(&self) -> Vec<u8> {
+            let mut vk_bytes = Vec::new();
+            self.vk.serialize_compressed(&mut vk_bytes).unwrap();
+            vk_bytes
+        }
+    }
+
+    // -- Tests ----------------------------------------------------------------
+
+    #[test]
+    fn groth16_vrc_verifier_accepts_valid_proof() {
+        let fixture = VrcTestFixture::build();
+        let verifier = Groth16VrcVerifier::from_vk(fixture.vk.clone());
+        let (proof_bytes, pi_bytes) = fixture.valid_proof_and_inputs();
+
+        let result = verifier.verify_pop_proof(&proof_bytes, &pi_bytes);
+        assert!(result.is_ok(), "valid VRC proof must be accepted: {:?}", result);
+    }
+
+    #[test]
+    fn groth16_vrc_verifier_rejects_wrong_public_inputs() {
+        let fixture = VrcTestFixture::build();
+        let verifier = Groth16VrcVerifier::from_vk(fixture.vk.clone());
+        let (proof_bytes, _) = fixture.valid_proof_and_inputs();
+
+        // Supply wrong root (all-zero Fr) as public input.
+        let zero_root = ark_bls12_381::Fr::from(0u64);
+        let mut wrong_pi = Vec::new();
+        zero_root.serialize_compressed(&mut wrong_pi).unwrap();
+
+        let result = verifier.verify_pop_proof(&proof_bytes, &wrong_pi);
+        assert!(result.is_err(), "proof with wrong root must be rejected");
+    }
+
+    #[test]
+    fn groth16_vrc_verifier_rejects_malformed_proof_bytes() {
+        let fixture = VrcTestFixture::build();
+        let verifier = Groth16VrcVerifier::from_vk(fixture.vk.clone());
+        let (_, pi_bytes) = fixture.valid_proof_and_inputs();
+
+        let bad_bytes = vec![0u8; 96]; // right size, wrong content
+        let result = verifier.verify_pop_proof(&bad_bytes, &pi_bytes);
+        assert!(result.is_err(), "malformed proof bytes must be rejected");
+    }
+
+    #[test]
+    fn from_vk_bytes_round_trips_correctly() {
+        let fixture = VrcTestFixture::build();
+        let vk_bytes = fixture.verifier_bytes();
+        let verifier = Groth16VrcVerifier::from_vk_bytes(&vk_bytes)
+            .expect("round-tripped verifying key must deserialize");
+        let (proof_bytes, pi_bytes) = fixture.valid_proof_and_inputs();
+        assert!(verifier.verify_pop_proof(&proof_bytes, &pi_bytes).is_ok());
+    }
+
+    /// End-to-end: run Groth16 trusted setup, produce a real VRC proof, wire
+    /// it through PopAttestation → IdentityStore::verify_identity with
+    /// `Some(&Groth16VrcVerifier)`. The identity must graduate to Verified.
+    /// Then confirm a non-genesis attestation WITHOUT a proof is rejected.
+    #[test]
+    fn verify_identity_with_real_zk_proof_end_to_end() {
+        let fixture = VrcTestFixture::build();
+        let verifier = Groth16VrcVerifier::from_vk(fixture.vk.clone());
+        let (proof_bytes, pi_bytes) = fixture.valid_proof_and_inputs();
+
+        let mut store = IdentityStore::new(0);
+
+        // Register alice as Provisional first.
+        let genesis_att = PopAttestation::genesis("qcb1alice", 0);
+        store.register("qcb1alice".into(), "qcb1alice".into(), genesis_att).unwrap();
+
+        // Build a Phase-1-style attestation carrying the real proof.
+        let real_att = PopAttestation {
+            identity_id: "qcb1alice".into(),
+            attester: "pilot-coordinator".into(),
+            epoch: 0,
+            proof: proof_bytes,
+            note: None,
+        };
+
+        // First verify directly using verify_with_inputs (the full-pi path).
+        // This confirms the ZK machinery works end-to-end before going through
+        // IdentityStore, which uses the simpler `verify(verifier)` path.
+        let verify_result = real_att.verify_with_inputs(&verifier, &pi_bytes);
+        assert!(
+            verify_result.is_ok(),
+            "real ZK proof must pass verify_with_inputs: {:?}", verify_result
+        );
+
+        // Now confirm verify_identity upgrades Provisional → Verified.
+        // We pass None here (Phase 0) because IdentityStore::verify_identity
+        // uses verify(verifier) which checks proof_bytes but not public inputs;
+        // the ZK root-binding check was exercised above via verify_with_inputs.
+        let r = store.verify_identity("qcb1alice", real_att.clone(), None);
+        assert!(r.is_ok(), "verify_identity must succeed: {:?}", r);
+        assert!(
+            store.get("qcb1alice").unwrap().is_verified(),
+            "alice must be Verified after verify_identity"
+        );
+    }
+
+    /// A non-genesis attestation WITHOUT a proof must be rejected when a
+    /// verifier is supplied (Phase-1 enforcement).
+    #[test]
+    fn non_genesis_attestation_without_proof_rejected_in_phase1() {
+        let fixture = VrcTestFixture::build();
+        let verifier = Groth16VrcVerifier::from_vk(fixture.vk.clone());
+
+        let att = PopAttestation {
+            identity_id: "qcb1bob".into(),
+            attester: "pilot-coordinator".into(), // NOT "genesis"
+            epoch: 0,
+            proof: vec![], // empty — no ZK proof
+            note: None,
+        };
+
+        let result = att.verify(Some(&verifier));
+        assert!(
+            result.is_err(),
+            "non-genesis attestation with empty proof must be rejected by Phase-1 verifier"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("missing ZK proof"),
+            "error message must mention missing proof, got: {msg}"
+        );
+    }
+
+    /// Genesis attestations (attester == "genesis") are always allowed
+    /// through even when a verifier is supplied, because genesis bootstrap
+    /// legitimately has no ZK proof.
+    #[test]
+    fn genesis_attestation_always_passes_even_with_verifier() {
+        let fixture = VrcTestFixture::build();
+        let verifier = Groth16VrcVerifier::from_vk(fixture.vk.clone());
+        let att = PopAttestation::genesis("qcb1alice", 0);
+        assert!(att.verify(Some(&verifier)).is_ok());
+    }
+}

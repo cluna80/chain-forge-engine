@@ -452,7 +452,8 @@ impl Node {
         for acct in seed_accounts {
             let att = chain_forge_identity::PopAttestation::genesis(&acct.address, 0);
             if identity.register(acct.address.clone(), acct.address.clone(), att.clone()).is_ok() {
-                let _ = identity.verify_identity(&acct.address, att);
+                // Phase 0: genesis bootstrap; no ZK proof required.
+                let _ = identity.verify_identity(&acct.address, att, None);
             }
         }
 
@@ -517,7 +518,8 @@ impl Node {
                     // verify_identity() returns () on success — we look up the
                     // resulting tier from the record to pass to confirm_pop.
                     let genesis_att = chain_forge_identity::PopAttestation::genesis(id, epoch);
-                    match identity.verify_identity(id, genesis_att) {
+                    // Phase 0: genesis bootstrap; no ZK proof required.
+                    match identity.verify_identity(id, genesis_att, None) {
                         Ok(()) => {
                             // Fetch the tier the identity store assigned after verification.
                             let tier = identity.get(id)
