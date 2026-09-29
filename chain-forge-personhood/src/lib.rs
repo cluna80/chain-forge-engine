@@ -589,6 +589,74 @@ mod tests {
         );
     }
 
+    /// A valid proof from a completely DIFFERENT VRC registry (different tree,
+    /// different root, different trusted setup) must be rejected when verified
+    /// against this registry's public inputs.
+    ///
+    /// This is the circuit's hard boundary: the Groth16 proof commits to the
+    /// specific proving key (and thus to the specific circuit+root), so a proof
+    /// from a foreign registry is cryptographically incompatible with this VK.
+    ///
+    /// If this test fails (foreign proof verifies), the verifier is not
+    /// performing the expected cryptographic check. That would mean any holder
+    /// of *any* VRC credential from *any* registry could claim membership in
+    /// this registry — a complete break of the sybil-resistance guarantee.
+    #[test]
+    fn groth16_vrc_verifier_rejects_proof_from_different_registry() {
+        use ark_std::rand::SeedableRng;
+
+        let fixture = fixture();
+        let verifier = Groth16VrcVerifier::from_vk(fixture.vk.clone());
+
+        // Build a completely separate registry tree with different leaves and
+        // its own Groth16 trusted setup — simulating a foreign VRC issuer.
+        let mut rng = ChaCha20Rng::seed_from_u64(0xDEAD_CAFE_1234_5678);
+        let leaf_crh_params = <LeafHash as CRHScheme>::setup(&mut rng).unwrap();
+        let two_to_one_params = <TwoToOneHash as TwoToOneCRHScheme>::setup(&mut rng).unwrap();
+
+        let foreign_leaves: Vec<Vec<u8>> = (200u32..208).map(|i| make_leaf(i, &mut rng)).collect();
+        let foreign_tree = VrcRegistryTree::new(
+            &leaf_crh_params,
+            &two_to_one_params,
+            foreign_leaves.iter().map(|s| s.as_slice()),
+        ).unwrap();
+
+        let foreign_root = foreign_tree.root();
+        let foreign_path = foreign_tree.generate_proof(0).unwrap();
+        let foreign_setup_circuit = VrcMembershipCircuit {
+            root: Some(foreign_root),
+            leaf: Some(foreign_leaves[0].clone()),
+            path: Some(foreign_path.clone()),
+            leaf_crh_params: leaf_crh_params.clone(),
+            two_to_one_params: two_to_one_params.clone(),
+        };
+        let (foreign_pk, _foreign_vk) =
+            Groth16::<Bls12_381>::circuit_specific_setup(foreign_setup_circuit, &mut rng).unwrap();
+
+        // Produce a valid proof against the foreign registry.
+        let foreign_circuit = VrcMembershipCircuit {
+            root: Some(foreign_root),
+            leaf: Some(foreign_leaves[0].clone()),
+            path: Some(foreign_path),
+            leaf_crh_params: leaf_crh_params.clone(),
+            two_to_one_params: two_to_one_params.clone(),
+        };
+        let foreign_proof =
+            Groth16::<Bls12_381>::prove(&foreign_pk, foreign_circuit, &mut rng).unwrap();
+        let mut foreign_proof_bytes = Vec::new();
+        foreign_proof.serialize_compressed(&mut foreign_proof_bytes).unwrap();
+
+        // Public inputs are from THIS registry (not the foreign one).
+        let (_, pi_bytes) = fixture.valid_proof_and_inputs();
+
+        // The foreign proof must not verify against this registry's verifier.
+        let result = verifier.verify_pop_proof(&foreign_proof_bytes, &pi_bytes);
+        assert!(
+            result.is_err(),
+            "a proof from a foreign registry must be rejected by this registry's verifier"
+        );
+    }
+
     #[test]
     fn from_vk_bytes_round_trips_correctly() {
         let fixture = fixture();
