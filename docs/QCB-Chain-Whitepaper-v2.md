@@ -609,6 +609,31 @@ Relationship | Foundation | First building on that foundation
 
 Chain Forge's current priority is its consensus module — building out multiple pluggable BFT variants (Tendermint-style, HotStuff-style, and an XRPL-inspired agreement model) so that QCB, and any future chain built on the engine, can select the algorithm that fits its needs rather than inheriting one hardcoded choice. QCB's personhood-weighted BFT (Section 3) is one configuration of that engine, not a separate codebase — validating Chain Forge's pluggable design is itself part of what QCB's launch needs to prove.
 
+**Phase 0 progress as of September 2026.** The Chain Forge consensus engine has crossed its first major milestone: a 4-node Tendermint-style BFT testnet is producing and committing blocks under real network conditions. Specific achievements confirmed on the development network:
+
+· **Tendermint consensus operational.** A `chain_id`-aware TendermintEngine is live in `chain-forge-node`. The prior bug where `chain_id` was never set in `init()` — which caused silent consensus failures across multi-node networks — has been identified and fixed. Nodes now correctly scope their vote sets to their configured chain ID, preventing cross-chain vote contamination.
+
+· **Real libp2p P2P networking.** The `--features real-network` build flag activates genuine libp2p peer-to-peer communication in place of the mock transport used during unit testing. Four nodes (Alice, Bob, Carol, Dave) have been demonstrated exchanging consensus messages and reaching quorum across a local network, with peer counts visible via the `/api/status` REST endpoint.
+
+· **4-node genesis with configurable quorum.** The genesis configuration supports a variable validator set and quorum threshold. The tested configuration (4 validators, quorum=3) matches a standard BFT fault tolerance of f=1 — the chain continues producing blocks with 3 of 4 validators, providing a meaningful liveness-under-attack test surface.
+
+· **ValidatorRegistry fix: genesis validators activated at startup.** A critical gap was identified and closed: `ValidatorRegistry::qcb_devnet()` previously created an empty registry, causing the slashing module to silently return `Ok(None)` for every `record_block` call because it could not find any validator by ID. The fix registers all genesis-account validators at node startup and calls `confirm_pop()` to activate them, so the slashing module has a fully-populated, active registry from block 1.
+
+· **Liveness slashing confirmed working.** With the registry fix in place, stopping a validator (Bob) mid-run produces the expected sequence: the slashing module detects >20% missed blocks within the liveness window, emits `WARN validator jailed`, applies a 1,000,000 uQCB slash, and records the event in slash history. The liveness window is configurable (defaulting to 500 blocks; reduced to 10 for automated testing).
+
+· **Attack tests passing.** Three adversarial scenarios are covered by in-process integration tests:
+  1. *Forged vote rejection* (`forged_vote_is_rejected`): a vote with a garbage signature from a known validator ID is injected via `handle_event`; consensus height does not advance, confirming the engine rejects malformed votes rather than accepting them.
+  2. *Equivocation detection and slash* (`equivocation_detected_and_slashed`): two conflicting prevotes at the same (height, round) from the same validator are injected; `drain_equivocations()` fires, `process_equivocation_evidence()` records the slash, and the validator's slash history is non-empty.
+  3. *Liveness slash* (confirmed on the live testnet, not only in unit tests — see above).
+
+· **ML-DSA (Dilithium3) post-quantum crypto wired.** The `chain-forge-crypto` crate implements CRYSTALS-Dilithium3 (ML-DSA) as the validator signing scheme, directly addressing the post-quantum exposure described in Section 10. Validator key generation, signing, and verification use Dilithium3 rather than a classical elliptic-curve scheme — the 2.4 KB signature size trade-off is accepted at this stage, consistent with the Section 10.3 discussion of absorbing PQC costs early rather than retrofitting later.
+
+· **Block explorer REST API live.** The `/api/status`, `/api/blocks/`, `/api/txs/`, and `/api/accounts/` endpoints serve live chain state and are populated on every block commit, enabling external observers to track chain activity without a node client.
+
+· **State persistence.** Committed blocks are written to disk via `persist_state()` on every commit, so a restarted node resumes from its last committed height rather than replaying from genesis.
+
+What remains open at the Chain Forge layer: HotStuff-style and XRPL-inspired BFT variants (only Tendermint-style is implemented and tested); a production-grade state tree (JMT-based, replacing the current in-memory state); the full personhood-weighting overlay on top of basic BFT quorum; and the dedicated Chain Forge whitepaper for the developer audience. The Tendermint-style implementation now has a working, tested reference that can serve as the comparison baseline as additional variants are added.
+
 A dedicated Chain Forge whitepaper, aimed at the developer audience who would build their own chains on it, is expected once the engine is closer to a general release. For now, this document is the only public artifact and carries both the engine's story and the flagship chain's.
 
 ---
@@ -727,14 +752,16 @@ This tradeoff is real and worth stating plainly rather than deferring entirely: 
 
 Time horizons below are rough ranges, not commitments — appropriate for a multi-year infrastructure build where later phases depend on unresolved questions (identity layer design, consensus variant selection) that earlier phases must answer first. Phase 0's range for Chain Forge has been widened from an earlier draft: a from-scratch, safety-proofed, pluggable BFT engine is a materially harder problem than Bitcoin's original client, which itself took roughly two years of focused solo development for a simpler design (a single, non-pluggable consensus mechanism, no personhood-weighting layer). A small team building a harder problem should expect a longer, not shorter, timeline.
 
-Phase | Milestone | Rough Horizon
-Phase 0 (Chain Forge) | Consensus engine design and implementation — pluggable BFT variants (Tendermint-style, HotStuff-style, XRPL-inspired) | 18–48 months
-Phase 0 (QCB) | Whitepaper, identity layer research — proceeds in parallel with Chain Forge Phase 0, dependent on it for a working consensus target | 18–48 months
-Phase 1 | Personhood-weighted BFT consensus live on testnet; Charm Confinement + Intrinsic Charm implemented | 18–30 months following Phase 0
-Phase 2 | Identity layer pilot (small integration test, then real-world pilot against cost/sybil targets); CirFi module activation, UBI claims open | 6–12 months following Phase 1
-Phase 3 | Merchant API + Stripe-compatible integration, BME activation, first on-chain burns | 6–12 months following Phase 2
-Phase 4 | Charmed Agents live, physical merchant expansion, 1 million verified humans | Multi-year, adoption-dependent
-Phase 5+ | Decentralized governance maturity; permissioned EVM layer (Section 7.2) activated once identity layer is proven at scale; interoperability reconsidered only if a PoP-preserving bridge design exists
+Phase | Milestone | Rough Horizon | Status
+Phase 0 (Chain Forge) | Consensus engine design and implementation — pluggable BFT variants (Tendermint-style, HotStuff-style, XRPL-inspired) | 18–48 months | **In progress — Tendermint-style BFT operational on 4-node testnet as of September 2026; HotStuff and XRPL variants pending. See Section 7.4 for detail.**
+Phase 0 (QCB) | Whitepaper, identity layer research — proceeds in parallel with Chain Forge Phase 0, dependent on it for a working consensus target | 18–48 months | **In progress — whitepaper complete (this document); identity layer design active.**
+Phase 1 | Personhood-weighted BFT consensus live on testnet; Charm Confinement + Intrinsic Charm implemented | 18–30 months following Phase 0 | Pending — prerequisite (pluggable BFT consensus) now has a working base; personhood-weighting overlay not yet built
+Phase 2 | Identity layer pilot (small integration test, then real-world pilot against cost/sybil targets); CirFi module activation, UBI claims open | 6–12 months following Phase 1 | Pending
+Phase 3 | Merchant API + Stripe-compatible integration, BME activation, first on-chain burns | 6–12 months following Phase 2 | Pending
+Phase 4 | Charmed Agents live, physical merchant expansion, 1 million verified humans | Multi-year, adoption-dependent | Pending
+Phase 5+ | Decentralized governance maturity; permissioned EVM layer (Section 7.2) activated once identity layer is proven at scale; interoperability reconsidered only if a PoP-preserving bridge design exists | — | Pending
+
+**Phase 0 checkpoint (September 2026).** The Chain Forge engine has reached a meaningful internal milestone within Phase 0: the Tendermint-style consensus variant is functional end-to-end, from genesis block through multi-node quorum, liveness enforcement, and adversarial attack resistance. This is not Phase 0 complete — HotStuff and XRPL variants remain, the state layer is not production-grade, and personhood-weighting is not yet overlaid — but it confirms the pluggable architecture's core premise: the consensus module can be built, tested, and iterated on independently of the application layer above it. The next internal milestone within Phase 0 is a second BFT variant running against the same application interface, which will demonstrate that the pluggability is real rather than theoretical.
 
 ---
 
