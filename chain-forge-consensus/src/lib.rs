@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use chain_forge_core::ValidatorSetView;
 
 #[cfg(feature = "real-crypto")]
 use chain_forge_crypto::{ClassicalScheme, KeyPair, Signature, SchemeId, SignatureScheme};
@@ -74,18 +75,15 @@ impl std::fmt::Display for BlockHash {
     }
 }
 
-/// Opaque validator identifier. In QCB this encodes both the consensus key
-/// and the PoP-attested human identity; for PoA chains it's just the public
-/// key. The consensus layer treats it as an opaque comparable identifier -
-/// interpretation is the identity layer's concern.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ValidatorId(pub String);
-
-impl std::fmt::Display for ValidatorId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.0[..8.min(self.0.len())])
-    }
-}
+/// Opaque validator identifier. Re-exported from chain-forge-core so that
+/// boundary crates (chain-forge-personhood, etc.) can hold the same type
+/// without depending on this crate.
+///
+/// In QCB this encodes both the consensus key and the PoP-attested human
+/// identity; for PoA chains it's just the public key. The consensus layer
+/// treats it as an opaque comparable identifier — interpretation is the
+/// identity layer's concern.
+pub use chain_forge_core::ValidatorId;
 
 // ── Validator set ─────────────────────────────────────────────────────────────
 
@@ -159,6 +157,35 @@ impl ValidatorSet {
     pub fn byzantine_fault_tolerance(&self) -> usize {
         let n = self.validators.len();
         if n < 4 { 0 } else { n / 3 - 1 }
+    }
+}
+
+// -- ValidatorSetView ---------------------------------------------------------
+
+/// Implement the cross-crate read-only view trait so that chain-forge-personhood
+/// and other boundary crates can accept `&dyn ValidatorSetView` without taking
+/// a direct dependency on the full consensus crate.
+impl ValidatorSetView for ValidatorSet {
+    fn total_power(&self) -> u64 {
+        self.total_power()
+    }
+
+    fn quorum_power(&self) -> u64 {
+        self.quorum_power()
+    }
+
+    fn power_of(&self, id: &ValidatorId) -> u64 {
+        self.power_of(id)
+    }
+
+    /// Returns `None` if the validator has no bound key (empty slice).
+    fn public_key_of(&self, id: &ValidatorId) -> Option<&[u8]> {
+        let key = self.public_key_of(id);
+        if key.is_empty() { None } else { Some(key) }
+    }
+
+    fn validator_ids(&self) -> Vec<ValidatorId> {
+        self.validators.iter().map(|v| v.id.clone()).collect()
     }
 }
 
