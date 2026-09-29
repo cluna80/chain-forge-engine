@@ -231,6 +231,32 @@ pub struct Node {
     tx_queue: SharedTxQueue,
 }
 
+/// Map a transaction body to a short string label for the explorer.
+///
+/// This function is the single source of truth for the kind string used
+/// in TxSummary. It must be updated whenever a new TxBody variant is added
+/// — the compiler enforces exhaustiveness, so a missing arm is a build error,
+/// not a silent bug.
+pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static str {
+    use chain_forge_execution::TxBody;
+    match body {
+        TxBody::Transfer { .. }             => "transfer",
+        TxBody::Burn { .. }                 => "burn",
+        TxBody::Stake { .. }                => "stake",
+        TxBody::Custom { .. }              => "custom",
+        TxBody::RegisterIdentity            => "register_identity",
+        TxBody::Attest { .. }              => "attest",
+        TxBody::ClaimUbi { .. }            => "claim_ubi",
+        TxBody::RedirectToUbiPool { .. }   => "ubi_redirect",
+        TxBody::SponsorAgent { .. }        => "sponsor_agent",
+        TxBody::RevokeAgent { .. }         => "revoke_agent",
+        TxBody::RevokeAttestation { .. }   => "revoke_attestation",
+        TxBody::ConfirmSybil { .. }        => "confirm_sybil",
+        TxBody::ReverseSybil { .. }        => "reverse_sybil",
+        TxBody::ReportSuspectedSybil { .. }=> "report_suspected_sybil",
+    }
+}
+
 impl Node {
     /// Create a new node from a genesis JSON string.
     pub async fn new(
@@ -1702,25 +1728,7 @@ impl Node {
             .as_millis() as u64;
 
         let tx_meta: Vec<(String, String, String)> = txs.iter()
-            .map(|t| {
-                let kind = match &t.body {
-                    chain_forge_execution::TxBody::Transfer { .. }          => "transfer",
-                    chain_forge_execution::TxBody::Burn { .. }              => "burn",
-                    chain_forge_execution::TxBody::Stake { .. }             => "stake",
-                    chain_forge_execution::TxBody::Custom { .. }            => "custom",
-                    chain_forge_execution::TxBody::RegisterIdentity         => "register_identity",
-                    chain_forge_execution::TxBody::Attest { .. }            => "attest",
-                    chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
-                    chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
-                    chain_forge_execution::TxBody::SponsorAgent { .. }         => "sponsor_agent",
-                    chain_forge_execution::TxBody::RevokeAgent { .. }          => "revoke_agent",
-                    chain_forge_execution::TxBody::RevokeAttestation { .. }    => "revoke_attestation",
-                    chain_forge_execution::TxBody::ConfirmSybil { .. }         => "confirm_sybil",
-                    chain_forge_execution::TxBody::ReverseSybil { .. }         => "reverse_sybil",
-                    chain_forge_execution::TxBody::ReportSuspectedSybil { .. } => "report_suspected_sybil",
-                };
-                (t.id.clone(), t.sender.clone(), kind.to_string())
-            })
+            .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
         self.identity.advance_epoch(now_ms);
@@ -2023,25 +2031,7 @@ impl Node {
 
         // Capture tx metadata for the explorer before txs are consumed.
         let tx_meta: Vec<(String, String, String)> = txs.iter()
-            .map(|t| {
-                let kind = match &t.body {
-                    chain_forge_execution::TxBody::Transfer { .. }          => "transfer",
-                    chain_forge_execution::TxBody::Burn { .. }              => "burn",
-                    chain_forge_execution::TxBody::Stake { .. }             => "stake",
-                    chain_forge_execution::TxBody::Custom { .. }            => "custom",
-                    chain_forge_execution::TxBody::RegisterIdentity         => "register_identity",
-                    chain_forge_execution::TxBody::Attest { .. }            => "attest",
-                    chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
-                    chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
-                    chain_forge_execution::TxBody::SponsorAgent { .. }         => "sponsor_agent",
-                    chain_forge_execution::TxBody::RevokeAgent { .. }          => "revoke_agent",
-                    chain_forge_execution::TxBody::RevokeAttestation { .. }    => "revoke_attestation",
-                    chain_forge_execution::TxBody::ConfirmSybil { .. }         => "confirm_sybil",
-                    chain_forge_execution::TxBody::ReverseSybil { .. }         => "reverse_sybil",
-                    chain_forge_execution::TxBody::ReportSuspectedSybil { .. } => "report_suspected_sybil",
-                };
-                (t.id.clone(), t.sender.clone(), kind.to_string())
-            })
+            .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
         self.identity.advance_epoch(now_ms);
