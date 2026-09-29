@@ -51,3 +51,7 @@ path = "tests/devnet_4node.rs"
 [[test]]
 name = "adversarial_gossip"
 path = "tests/adversarial_gossip.rs"
+
+[[test]]
+name = "attestation_live"
+path = "tests/attestation_live.rs"

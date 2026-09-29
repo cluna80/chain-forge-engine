@@ -126,3 +126,40 @@ intentionally left visible in the test suite as a TODO marker.
 `chain-forge-node/tests/adversarial_gossip.rs`,
 `chain-forge-node/src/node.rs` (`verify_vote_signature`),
 `tests/devnet/genesis-4node.json`
+
+---
+
+## §4  Duplicate Attest is not rejected at API submission time
+
+**Symptom**
+
+Submitting a second `Attest` from the same attester for the same claimant
+returns `"status":"queued"` at the `/api/tx` endpoint — the same response as
+a valid first attestation.
+
+**Root cause**
+
+The HTTP API layer (`chain-forge-node/src/api.rs`) does not hold a reference
+to the identity module's state, so it cannot check whether a
+(attester, claimant) pair has already been attested.  The gate is enforced
+at execution time (inside the block executor), but the test does not yet
+verify the execution-time result via `GET /api/tx/{id}`.
+
+**Fix needed**
+
+One of:
+1. Add a pre-check in the API submission path that consults `IdentityStore`
+   for duplicate attestations (requires the API to hold a read handle to the
+   identity store).
+2. In the `attestation_live` test, poll `GET /api/tx/{id}` for the duplicate
+   attest tx and assert `success: false` (the same pattern used for the
+   coordinator gate in `attestation_coordinator_gate`).
+
+Option 2 is the minimal fix that would close the test gap.
+
+**Affects**
+
+`chain-forge-node/tests/attestation_live.rs` (`attestation_guard_live`,
+phase 6 — duplicate attest check),
+`chain-forge-node/src/api.rs` (submission-time pre-check),
+`chain-forge-identity/src/lib.rs` (`attest()` duplicate guard)
