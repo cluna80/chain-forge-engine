@@ -55,25 +55,26 @@
     {
       "label": "Alice",
       "address": "qcb1alice",
-      "balance": "5000000",
-      "role": "validator"
+      "balance": "500000000",
+      "role": "validator",
+      "_comment": "500 QCB = 500_000_000 uqcb; 10x the max equivocation slash (5% of 500 QCB = 25 QCB). Raised from 5 QCB to fix KNOWN_ISSUES §1 (genesis stake underflows slash penalty)."
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
-      "balance": "5000000",
+      "balance": "500000000",
       "role": "validator"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
-      "balance": "5000000",
+      "balance": "500000000",
       "role": "validator"
     },
     {
       "label": "Dave",
       "address": "qcb1dave",
-      "balance": "5000000",
+      "balance": "500000000",
       "role": "validator"
     }
   ],

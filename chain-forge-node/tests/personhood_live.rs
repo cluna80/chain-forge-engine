@@ -373,9 +373,8 @@ fn section_3_3_different_humans_each_get_full_cap() {
 /// and the cap mechanism are correct (verified by the in-process tests above),
 /// but the live validator count is non-deterministic until §1 and §2 are fixed.
 ///
-/// Re-enable by removing `#[ignore]` once KNOWN_ISSUES §1 and §2 are resolved.
+/// KNOWN_ISSUES §1 and §2 resolved — test re-enabled.
 #[test]
-#[ignore]
 fn validators_api_live_power_snapshot() {
     // Build the binary first.
     let build = Command::new("cargo")
@@ -421,15 +420,13 @@ fn validators_api_live_power_snapshot() {
     let arr = validators.as_array()
         .expect("GET /api/validators should return a JSON array");
 
-    // NOTE: Due to known issue §1 (genesis stake underflows slash penalty) and
-    // the false-equivocation race at startup, some validators may be tombstoned
-    // before quorum stabilises.  We therefore assert ≥ 2 (at least alice and dave
-    // survive in practice), and that every validator in the returned set has
-    // voting_power=1 and pop_verified=true.  The total power must equal the count
-    // of returned validators, confirming the 1-per-human cap is in effect.
-    assert!(
-        arr.len() >= 2,
-        "expected at least 2 surviving validators, got {} — startup tombstone bug?",
+    // All 4 genesis validators should survive: §1 and §2 are fixed.
+    // §1 fix: genesis stake raised to 500 QCB (10× the max equivocation slash).
+    // §2 fix: liveness window does not open until height >= liveness_start_height (10).
+    assert_eq!(
+        arr.len(), 4,
+        "expected all 4 genesis validators to survive startup, got {} — \
+         startup tombstone bug? check KNOWN_ISSUES §1 and §2",
         arr.len()
     );
 
@@ -457,8 +454,8 @@ fn validators_api_live_power_snapshot() {
     }
 
     println!(
-        "[live] PASS: GET /api/validators confirmed — {count} validators, \
+        "[live] PASS: GET /api/validators confirmed — {} validators, \
          total_power={total_power} (one per human, per §3.3)",
-        count = arr.len(),
+        arr.len(),
     );
 }

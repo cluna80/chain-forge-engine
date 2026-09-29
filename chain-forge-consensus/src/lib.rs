@@ -1423,12 +1423,21 @@ impl ConsensusEngine for TendermintEngine {
         match vote.vote_type {
             VoteType::Prevote | VoteType::Nil => {
                 // Check for equivocation: same validator, same round, different
-                // block hash → double-prevote.
+                // non-nil block hash → double-prevote.
+                //
+                // A nil prevote followed by a real-block prevote (or vice-versa)
+                // is NOT equivocation: it is standard BFT round-change behavior
+                // (lock release / polka-nil → new proposal).  Only two different
+                // non-nil block hashes at the same (height, round) constitute a
+                // double-sign.  KNOWN_ISSUES §2 root cause: the previous check
+                // treated nil-vs-real as equivocation, which tombstoned validators
+                // that simply changed their vote during the startup gossip race.
                 if let Some(existing) = round_votes.prevotes.get(&vote.validator) {
-                    // Equivocation: same slot, different block_hash.
-                    // Nil-vs-real counts: a prevote-nil followed by prevote-block
-                    // (or vice-versa) at the same (height, round) is a double-sign.
-                    if existing.block_hash != vote.block_hash {
+                    let is_equivocation =
+                        existing.block_hash.is_some()
+                        && vote.block_hash.is_some()
+                        && existing.block_hash != vote.block_hash;
+                    if is_equivocation {
                         let hash_a = existing.block_hash.clone()
                             .unwrap_or_else(|| BlockHash("nil".into()));
                         let hash_b = vote.block_hash.clone()
@@ -1439,7 +1448,7 @@ impl ConsensusEngine for TendermintEngine {
                             round     = vote.round,
                             hash_a    = %hash_a,
                             hash_b    = %hash_b,
-                            "equivocation detected: double-prevote (nil-or-real)"
+                            "equivocation detected: double-prevote (two real blocks)"
                         );
                         self.pending_equivocations.push(EquivocationDetected {
                             validator_id:   vote.validator.clone(),
@@ -1473,12 +1482,18 @@ impl ConsensusEngine for TendermintEngine {
 
             VoteType::Precommit => {
                 // Check for equivocation: same validator, same round, different
-                // block hash → double-precommit.
+                // non-nil block hash → double-precommit.
+                //
+                // Nil-vs-real is NOT equivocation (same reasoning as prevote above:
+                // standard BFT allows a precommit-nil to be superseded by a real
+                // precommit in the same round after a polka is observed).  Only two
+                // conflicting real-block precommits constitute a double-sign.
                 if let Some(existing) = round_votes.precommits.get(&vote.validator) {
-                    // Equivocation: same slot, different block_hash.
-                    // Nil-vs-real counts: precommit-nil then precommit-block at
-                    // the same (height, round) is a double-sign.
-                    if existing.block_hash != vote.block_hash {
+                    let is_equivocation =
+                        existing.block_hash.is_some()
+                        && vote.block_hash.is_some()
+                        && existing.block_hash != vote.block_hash;
+                    if is_equivocation {
                         let hash_a = existing.block_hash.clone()
                             .unwrap_or_else(|| BlockHash("nil".into()));
                         let hash_b = vote.block_hash.clone()
@@ -1489,7 +1504,7 @@ impl ConsensusEngine for TendermintEngine {
                             round     = vote.round,
                             hash_a    = %hash_a,
                             hash_b    = %hash_b,
-                            "equivocation detected: double-precommit (nil-or-real)"
+                            "equivocation detected: double-precommit (two real blocks)"
                         );
                         self.pending_equivocations.push(EquivocationDetected {
                             validator_id:   vote.validator.clone(),

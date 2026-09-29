@@ -229,6 +229,15 @@ pub struct SlashingConfig {
     /// Minimum stake after slash. Prevents slashing below minimum registration.
     /// Set to 0 to allow full slash.
     pub min_remaining_stake: u128,
+    /// Grace period: do not enforce liveness until this block height is reached.
+    ///
+    /// During startup the gossip mesh has not yet formed, so the first several
+    /// rounds look like "misses" even though every validator is online.  This
+    /// window gives the network time to connect before liveness counting begins.
+    ///
+    /// Default: 10 blocks (~5 s at 500 ms block time).
+    /// Set to 0 to enforce liveness from genesis (not recommended for devnet).
+    pub liveness_start_height: u64,
 }
 
 impl SlashingConfig {
@@ -242,6 +251,9 @@ impl SlashingConfig {
             // > 20% threshold). Restore to 500 for production.
             liveness_window_blocks:      10,
             min_remaining_stake:         0, // no floor -- slash the full computed amount
+            // Grace period: don't start counting liveness misses until the
+            // gossip mesh has had time to form (KNOWN_ISSUES §2 fix).
+            liveness_start_height:       10,
         }
     }
 
@@ -452,13 +464,24 @@ impl SlashingModule {
 
     /// Record a block outcome for a validator's liveness window.
     /// Returns Some(slash_amount_to_burn) if liveness threshold is exceeded.
+    ///
+    /// `current_height` is checked against `config.liveness_start_height`:
+    /// if `current_height < liveness_start_height` the call is a no-op and
+    /// always returns `Ok(None)`.  This gives the gossip mesh time to form
+    /// before any liveness penalties are applied (KNOWN_ISSUES §2 fix).
     pub fn record_block(
         &mut self,
-        validator_id: &str,
-        proposed:     bool,
-        registry:     &mut ValidatorRegistry,
-        epoch:        u64,
+        validator_id:   &str,
+        proposed:       bool,
+        registry:       &mut ValidatorRegistry,
+        epoch:          u64,
+        current_height: u64,
     ) -> SlashResult<Option<u128>> {
+        // Grace period: network hasn't formed yet — don't count any misses.
+        if current_height < self.config.liveness_start_height {
+            return Ok(None);
+        }
+
         let window_size = self.config.liveness_window_blocks;
         let window = self.liveness_windows
             .entry(validator_id.to_string())
@@ -563,15 +586,16 @@ mod tests {
     fn registry_with_validator(id: &str, stake: u128) -> ValidatorRegistry {
         let mut reg = ValidatorRegistry::qcb_devnet();
         let req = RegistrationRequest {
-            id:          ValidatorId(id.to_string()),
-            moniker:     format!("Validator {id}"),
-            keys:        KeyBundle::new_ed25519(
-                             &format!("pk_{id}"),
-                             &format!("qcb1{id}"),
-                         ),
-            commission:  Commission::new(500, 2_000).unwrap(),
-            bonded_uqcb: stake,
-            website:     None,
+            id:               ValidatorId(id.to_string()),
+            moniker:          format!("Validator {id}"),
+            keys:             KeyBundle::new_ed25519(
+                                  &format!("pk_{id}"),
+                                  &format!("qcb1{id}"),
+                              ),
+            commission:       Commission::new(500, 2_000).unwrap(),
+            bonded_uqcb:      stake,
+            website:          None,
+            owner_identity_id: None,
         };
         reg.register(req, 0).unwrap();
         reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
@@ -619,6 +643,7 @@ mod tests {
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      500,
             min_remaining_stake:         ENTRY_STAKE_UQCB, // floor at 1k QCB
+            liveness_start_height:       0,
         };
         // bonded = just 1M above the floor
         let bonded = ENTRY_STAKE_UQCB + 1_000_000;
@@ -734,23 +759,26 @@ mod tests {
     #[test]
     fn liveness_slash_triggers_after_threshold() {
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
-        // Use a small window (10 blocks) and low threshold (20%) for a fast test
+        // Use a small window (10 blocks) and low threshold (20%) for a fast test.
+        // liveness_start_height=0 so the grace period doesn't block these unit tests.
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
             liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
+            liveness_start_height:       0, // no grace period in unit tests
         });
 
-        // Fill window: 8 proposed + 2 missed = 20% -- at threshold, not triggered
-        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0).unwrap(); }
-        for _ in 0..2 { slasher.record_block("val1", false, &mut reg, 0).unwrap(); }
+        // Fill window: 8 proposed + 2 missed = 20% -- at threshold, not triggered.
+        // current_height=100 so we're well past any grace period.
+        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap(); }
+        for _ in 0..2 { slasher.record_block("val1", false, &mut reg, 0, 100).unwrap(); }
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Active,
             "exactly at threshold should not trigger");
 
         // One more miss replaces a 'true': 7 proposed + 3 missed = 30% > 20% -> triggers
-        slasher.record_block("val1", false, &mut reg, 0).unwrap();
+        slasher.record_block("val1", false, &mut reg, 0, 100).unwrap();
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Jailed,
             "exceeding threshold must jail");
         assert!(slasher.liveness_slashed_uqcb > 0);
@@ -765,15 +793,39 @@ mod tests {
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
+            liveness_start_height:       0,
         });
 
         // Fill window and exceed threshold to trigger slash
-        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0).unwrap(); }
-        for _ in 0..3 { slasher.record_block("val1", false, &mut reg, 0).unwrap(); }
+        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap(); }
+        for _ in 0..3 { slasher.record_block("val1", false, &mut reg, 0, 100).unwrap(); }
 
         // Window should have reset after the slash
         let window = slasher.liveness_window("val1").unwrap();
         assert!(!window.filled, "window must reset after liveness slash");
+    }
+
+    #[test]
+    fn liveness_grace_period_suppresses_early_slashes() {
+        let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
+        let mut slasher = SlashingModule::new(SlashingConfig {
+            equivocation_slash_bps:      500,
+            liveness_slash_bps:          10,
+            liveness_miss_pct_threshold: 20,
+            liveness_window_blocks:      10,
+            min_remaining_stake:         0,
+            liveness_start_height:       10, // standard grace period
+        });
+
+        // Record 10 misses at heights 0..9 — all within the grace period.
+        // None should trigger a slash even though the window would be 100% missed.
+        for h in 0..10u64 {
+            let result = slasher.record_block("val1", false, &mut reg, 0, h).unwrap();
+            assert!(result.is_none(), "grace period must suppress slash at height {h}");
+        }
+        assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Active,
+            "validator must remain Active during grace period");
+        assert_eq!(slasher.liveness_slashed_uqcb, 0);
     }
 
     #[test]
@@ -786,8 +838,9 @@ mod tests {
         // (now tombstoned, not jailed, but similar test: inactive validator)
         let slash_count_before = slasher.total_slashed_uqcb;
 
-        // Block records for a tombstoned validator should be silently ignored
-        for _ in 0..501 { slasher.record_block("val1", false, &mut reg, 2).unwrap(); }
+        // Block records for a tombstoned validator should be silently ignored.
+        // Use height=100 to clear the default grace period.
+        for _ in 0..501 { slasher.record_block("val1", false, &mut reg, 2, 100).unwrap(); }
         assert_eq!(slasher.total_slashed_uqcb, slash_count_before,
             "inactive validator must not be slashed again via liveness");
     }

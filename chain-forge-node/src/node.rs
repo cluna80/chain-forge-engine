@@ -1709,6 +1709,7 @@ impl Node {
                 signed,
                 &mut self.validator_registry,
                 epoch,
+                height,
             ) {
                 Ok(None) => {
                     // Window filling or threshold not yet crossed — nothing to do.
