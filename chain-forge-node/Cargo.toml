@@ -38,4 +38,16 @@ real-network = []
 default = ["real-network"]
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio             = { workspace = true }
+serde_json        = { workspace = true }
+chain-forge-consensus = { path = "../chain-forge-consensus", features = ["real-crypto"] }
+chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network"] }
+chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto"] }
+
+[[test]]
+name = "devnet_4node"
+path = "tests/devnet_4node.rs"
+
+[[test]]
+name = "adversarial_gossip"
+path = "tests/adversarial_gossip.rs"
