@@ -509,7 +509,8 @@ impl Node {
                     let id = &acct.address;
 
                     // Register as Candidate first (no-op if already present).
-                    validator_registry.register_genesis_validator(id);
+                    // Block height 0: we are in node startup, before block 1 is produced.
+                    validator_registry.register_genesis_validator(id, 0);
 
                     // Verify identity against IdentityStore (Integration Point 1).
                     // Only if verification succeeds does the validator enter Active.

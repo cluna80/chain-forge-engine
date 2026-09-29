@@ -548,7 +548,24 @@ impl ValidatorRegistry {
     ///
     /// No-ops if the validator is already registered (idempotent, safe to call
     /// from genesis seeding loops that may run more than once).
-    pub fn register_genesis_validator(&mut self, id: &str) {
+    ///
+    /// # Safety / Misuse
+    ///
+    /// This method bypasses the stake and key requirements that `register()` enforces.
+    /// It **must only be called before block 1 is produced** (i.e., during node startup
+    /// from `Node::new_with_p2p_port` or equivalent genesis-initialization paths).
+    ///
+    /// The method panics at runtime if `highest_committed_block` > 0, so misuse from
+    /// a running chain is caught immediately rather than silently. Pass the node's
+    /// current committed block height so this invariant can be enforced.
+    pub fn register_genesis_validator(&mut self, id: &str, highest_committed_block: u64) {
+        assert_eq!(
+            highest_committed_block, 0,
+            "register_genesis_validator called after genesis (block {}): \
+             this is a validator-creation backdoor — call it only during node startup \
+             before block 1 is produced",
+            highest_committed_block
+        );
         if self.validators.contains_key(id) {
             return; // already registered, no-op
         }
