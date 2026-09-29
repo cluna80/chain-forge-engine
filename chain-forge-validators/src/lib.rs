@@ -322,6 +322,19 @@ pub struct ValidatorRecord {
     pub moniker:          String,
     /// Optional website or contact URI.
     pub website:          Option<String>,
+    /// The identity address of the *human* who controls this validator.
+    ///
+    /// This is the personhood-weighting link (Section 3.3): a single verified
+    /// human may operate multiple validator addresses (e.g., for redundancy or
+    /// stake partitioning), but their combined voting power may not exceed
+    /// `PersonhoodConfig::power_cap`. Without this field, `apply_personhood_cap`
+    /// operates per-`ValidatorInfo` entry and a multi-validator human bypasses
+    /// the cap by registering two entries.
+    ///
+    /// When `None`, the validator is treated as its own owner (`id.0` is used
+    /// as the owner key). This preserves backward compatibility for genesis
+    /// validators and the existing test suite.
+    pub owner_identity_id: Option<String>,
 }
 
 impl ValidatorRecord {
@@ -418,6 +431,9 @@ pub struct RegistrationRequest {
     pub bonded_uqcb:  u128,
     /// Optional website.
     pub website:      Option<String>,
+    /// The identity address of the controlling human (Section 3.3).
+    /// When `None`, defaults to the validator's own `id` at set-build time.
+    pub owner_identity_id: Option<String>,
 }
 
 // -- ValidatorRegistry --------------------------------------------------------
@@ -438,6 +454,10 @@ pub struct ValidatorRegistry {
     by_pubkey:    HashMap<String, String>,
     /// Index: account address -> validator ID.
     by_address:   HashMap<String, String>,
+    /// Index: owner_identity_id -> list of validator IDs controlled by that human.
+    /// Key is the effective owner key: `owner_identity_id` when set, `id.0` otherwise.
+    /// Used by `build_validator_set` to enforce the per-human power cap (Section 3.3).
+    validators_by_human: HashMap<String, Vec<String>>,
     /// Minimum stake required to register.
     min_stake_uqcb: u128,
     /// PersonhoodConfig applied when building the ValidatorSet.
@@ -455,6 +475,7 @@ impl ValidatorRegistry {
             validators:          HashMap::new(),
             by_pubkey:           HashMap::new(),
             by_address:          HashMap::new(),
+            validators_by_human: HashMap::new(),
             min_stake_uqcb,
             personhood_config,
             liveness_threshold:  0.05, // >5% missed blocks triggers jail warning
@@ -521,7 +542,15 @@ impl ValidatorRegistry {
             jail_records:      Vec::new(),
             moniker:           req.moniker,
             website:           req.website,
+            owner_identity_id: req.owner_identity_id.clone(),
         };
+
+        // Maintain per-human index for personhood cap enforcement.
+        let owner_key = req.owner_identity_id.clone().unwrap_or_else(|| id_str.clone());
+        self.validators_by_human
+            .entry(owner_key)
+            .or_default()
+            .push(id_str.clone());
 
         self.by_pubkey.insert(req.keys.consensus_pubkey, id_str.clone());
         self.by_address.insert(req.keys.account_address, id_str.clone());
@@ -595,7 +624,14 @@ impl ValidatorRegistry {
             jail_records:      Vec::new(),
             moniker:           id.to_string(),
             website:           None,
+            owner_identity_id: None, // genesis validators own themselves
         };
+        // Genesis validators own themselves (owner_identity_id = None → key = id).
+        self.validators_by_human
+            .entry(id.to_string())
+            .or_default()
+            .push(id.to_string());
+
         self.validators.insert(id.to_string(), record);
         tracing::info!(id, "genesis validator registered as Candidate");
     }
@@ -759,21 +795,58 @@ impl ValidatorRegistry {
     /// Candidates, Jailed, and Tombstoned validators are excluded.
     /// apply_personhood_cap() is applied to enforce the power ceiling.
     pub fn build_validator_set(&self, height: u64) -> ValidatorSet {
-        use chain_forge_consensus::apply_personhood_cap;
-
-        let validators: Vec<ValidatorInfo> = self.validators.values()
+        // Collect all active, PoP-verified validators as candidates.
+        let candidates: Vec<&ValidatorRecord> = self.validators.values()
             .filter(|r| r.status == ValidatorStatus::Active && r.pop_verified)
-            .map(|r| ValidatorInfo {
-                id:           r.id.clone(),
-                voting_power: r.consensus_power(),
-                pop_verified: r.pop_verified,
-            public_key: vec![],
-            })
             .collect();
 
-        let mut vs = ValidatorSet { height, validators };
-        vs = apply_personhood_cap(vs, &self.personhood_config);
-        vs
+        // Per-human power budget: tracks how much of power_cap this human has
+        // already consumed across their registered validators, oldest-first.
+        // "Oldest-first" is approximated by registration epoch; in a tie, any
+        // ordering is acceptable — the cap is what matters, not which validator
+        // is chosen.
+        let power_cap = self.personhood_config.power_cap;
+        let mut human_power_used: HashMap<String, u64> = HashMap::new();
+
+        let validators: Vec<ValidatorInfo> = {
+            // Sort by registered_epoch so the first-registered validator for a
+            // given human gets priority for the cap allocation.
+            let mut sorted = candidates;
+            sorted.sort_by_key(|r| r.registered_epoch);
+
+            sorted.iter().map(|r| {
+                // Effective owner key: explicit owner_identity_id or fall back to id.
+                let owner = r.owner_identity_id.as_deref().unwrap_or(r.id.0.as_str());
+                let used  = human_power_used.entry(owner.to_string()).or_insert(0);
+                let base  = r.consensus_power(); // 1 for verified Active, 0 otherwise
+
+                // How much of the human's power cap remains?
+                let remaining = power_cap.saturating_sub(*used);
+                let granted   = base.min(remaining);
+
+                *used += granted;
+
+                if granted < base {
+                    tracing::info!(
+                        validator = %r.id,
+                        owner,
+                        human_power_used = *used,
+                        power_cap,
+                        "per-human power cap applied: validator granted {} of {} requested power",
+                        granted, base,
+                    );
+                }
+
+                ValidatorInfo {
+                    id:           r.id.clone(),
+                    voting_power: granted,
+                    pop_verified: r.pop_verified,
+                    public_key:   vec![],
+                }
+            }).collect()
+        };
+
+        ValidatorSet { height, validators }
     }
 
     /// All active validators (for display / API).
@@ -823,15 +896,13 @@ mod tests {
 
     fn req(id: &str, addr: &str, stake: u128) -> RegistrationRequest {
         RegistrationRequest {
-            id:          ValidatorId(id.to_string()),
-            moniker:     format!("Validator {id}"),
-            keys:        KeyBundle::new_ed25519(
-                             &format!("pubkey_{id}"),
-                             addr,
-                         ),
-            commission:  Commission::new(500, 2_000).unwrap(), // 5% rate, 20% max
-            bonded_uqcb: stake,
-            website:     None,
+            id:               ValidatorId(id.to_string()),
+            moniker:          format!("Validator {id}"),
+            keys:             KeyBundle::new_ed25519(&format!("pubkey_{id}"), addr),
+            commission:       Commission::new(500, 2_000).unwrap(), // 5% rate, 20% max
+            bonded_uqcb:      stake,
+            website:          None,
+            owner_identity_id: None,
         }
     }
 
@@ -1156,6 +1227,159 @@ mod tests {
                 "stake must not grant extra voting power: {}",
                 v.id.0);
         }
+    }
+
+    // -- Personhood-weighting: per-human cap (Section 3.3) --------------------
+
+    fn req_with_owner(id: &str, addr: &str, stake: u128, owner: &str) -> RegistrationRequest {
+        RegistrationRequest {
+            id:               ValidatorId(id.to_string()),
+            moniker:          format!("Validator {id}"),
+            keys:             KeyBundle::new_ed25519(&format!("pubkey_{id}"), addr),
+            commission:       Commission::new(500, 2_000).unwrap(),
+            bonded_uqcb:      stake,
+            website:          None,
+            owner_identity_id: Some(owner.to_string()),
+        }
+    }
+
+    /// **The Section 3.3 test**: one human, two validators, one with 10× the stake.
+    /// The second validator must receive 0 voting power — the human's cap of 1
+    /// is fully consumed by the first (lower-registered-epoch) validator.
+    ///
+    /// This is the whitepaper's core claim: stake does not compound voting influence
+    /// beyond the per-human cap, regardless of how many validator addresses a human
+    /// controls.
+    #[test]
+    fn two_validators_same_human_combined_power_capped() {
+        let mut reg = ValidatorRegistry::new(
+            ENTRY_STAKE_UQCB,
+            PersonhoodConfig {
+                power_cap:          1,   // max 1 unit of power per human
+                reject_expired_pop: false,
+                min_verified_pct:   0,
+            },
+        );
+
+        // Human "qcb1human1" registers two validators.
+        // val_small: entry stake (1k QCB), registered first.
+        // val_large: 10× stake (10k QCB), registered second.
+        // Under Section 3.3 the 10× stake MUST NOT grant extra influence.
+        reg.register(req_with_owner("val_small", "qcb1val_small",
+            ENTRY_STAKE_UQCB, "qcb1human1"), 0).unwrap();
+        reg.register(req_with_owner("val_large", "qcb1val_large",
+            STANDARD_STAKE_UQCB, "qcb1human1"), 0).unwrap();
+
+        reg.confirm_pop("val_small", VerificationTier::Verified, 1).unwrap();
+        reg.confirm_pop("val_large", VerificationTier::Verified, 1).unwrap();
+
+        let vs = reg.build_validator_set(1);
+        assert_eq!(vs.validators.len(), 2, "both validators should appear in the set");
+
+        let power_small = vs.validators.iter()
+            .find(|v| v.id.0 == "val_small").map(|v| v.voting_power).unwrap();
+        let power_large = vs.validators.iter()
+            .find(|v| v.id.0 == "val_large").map(|v| v.voting_power).unwrap();
+
+        // Combined power must not exceed the per-human cap.
+        assert_eq!(
+            power_small + power_large, 1,
+            "combined voting power for one human must equal power_cap=1 (not 2): \
+             small={power_small}, large={power_large}"
+        );
+
+        // The first-registered validator (val_small) gets the allocation.
+        assert_eq!(power_small, 1,
+            "val_small (first-registered) must receive the full power cap");
+        assert_eq!(power_large, 0,
+            "val_large (second-registered, 10× stake) must receive 0 power \
+             — stake does not compound influence beyond the per-human cap (Section 3.3)");
+    }
+
+    /// Two *different* humans, two validators — each should get their full cap.
+    /// This confirms the cap is per-human, not global.
+    #[test]
+    fn two_validators_different_humans_each_get_full_cap() {
+        let mut reg = ValidatorRegistry::new(
+            ENTRY_STAKE_UQCB,
+            PersonhoodConfig {
+                power_cap:          1,
+                reject_expired_pop: false,
+                min_verified_pct:   0,
+            },
+        );
+
+        reg.register(req_with_owner("val_a", "qcb1val_a",
+            ENTRY_STAKE_UQCB, "qcb1human_a"), 0).unwrap();
+        reg.register(req_with_owner("val_b", "qcb1val_b",
+            ENTRY_STAKE_UQCB, "qcb1human_b"), 0).unwrap();
+
+        reg.confirm_pop("val_a", VerificationTier::Verified, 1).unwrap();
+        reg.confirm_pop("val_b", VerificationTier::Verified, 1).unwrap();
+
+        let vs = reg.build_validator_set(1);
+        for v in &vs.validators {
+            assert_eq!(v.voting_power, 1,
+                "each distinct human must receive the full power cap: {}",
+                v.id.0);
+        }
+        assert_eq!(vs.total_power(), 2,
+            "total power must equal number of distinct verified humans");
+    }
+
+    /// Three validators sharing one owner identity (edge case: cap=1 means only
+    /// the first gets any power, regardless of stake).
+    #[test]
+    fn three_validators_one_human_only_first_gets_power() {
+        let mut reg = ValidatorRegistry::new(
+            ENTRY_STAKE_UQCB,
+            PersonhoodConfig {
+                power_cap:          1,
+                reject_expired_pop: false,
+                min_verified_pct:   0,
+            },
+        );
+
+        for (id, addr, epoch) in [
+            ("v1", "qcb1v1", 0u64),
+            ("v2", "qcb1v2", 1u64),
+            ("v3", "qcb1v3", 2u64),
+        ] {
+            reg.register(req_with_owner(id, addr, ENTRY_STAKE_UQCB, "qcb1human_x"), epoch).unwrap();
+            reg.confirm_pop(id, VerificationTier::Verified, epoch + 1).unwrap();
+        }
+
+        let vs = reg.build_validator_set(3);
+        let total: u64 = vs.validators.iter().map(|v| v.voting_power).sum();
+        assert_eq!(total, 1,
+            "three validators, one human, power_cap=1 → total must be 1");
+    }
+
+    /// Validators without an explicit owner_identity_id default to owning themselves.
+    /// Existing tests should be unaffected.
+    #[test]
+    fn validators_without_owner_id_default_to_self_owned() {
+        let mut reg = ValidatorRegistry::new(
+            ENTRY_STAKE_UQCB,
+            PersonhoodConfig {
+                power_cap:          1,
+                reject_expired_pop: false,
+                min_verified_pct:   0,
+            },
+        );
+
+        // Use the existing `req()` helper — owner_identity_id is None.
+        for (id, addr) in [("a", "qcb1a"), ("b", "qcb1b"), ("c", "qcb1c")] {
+            reg.register(req(id, addr, ENTRY_STAKE_UQCB), 0).unwrap();
+            reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
+        }
+
+        let vs = reg.build_validator_set(1);
+        for v in &vs.validators {
+            assert_eq!(v.voting_power, 1,
+                "self-owned validator must get full cap: {}", v.id.0);
+        }
+        assert_eq!(vs.total_power(), 3);
     }
 
     // -- Jailing and tombstoning ----------------------------------------------
