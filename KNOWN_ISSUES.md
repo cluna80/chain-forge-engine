@@ -129,37 +129,47 @@ intentionally left visible in the test suite as a TODO marker.
 
 ---
 
-## §4  Duplicate Attest is not rejected at API submission time
+## §4  Duplicate-attestation guard not directly exercised in tests
 
 **Symptom**
 
-Submitting a second `Attest` from the same attester for the same claimant
-returns `"status":"queued"` at the `/api/tx` endpoint — the same response as
-a valid first attestation.
+The `attestation_guard_live` test submits a second `Attest` from `qcb1bob`
+with `nonce=1`.  The tx is rejected at execution time with:
+
+```
+"error": "nonce mismatch: expected 0, got 1"
+```
+
+The rejection is correct (the tx fails), but it hit the **nonce guard**
+before reaching the duplicate-attestation guard.  This means the
+duplicate-attestation guard in `IdentityStore::attest()` has not been
+directly exercised by the integration tests.
 
 **Root cause**
 
-The HTTP API layer (`chain-forge-node/src/api.rs`) does not hold a reference
-to the identity module's state, so it cannot check whether a
-(attester, claimant) pair has already been attested.  The gate is enforced
-at execution time (inside the block executor), but the test does not yet
-verify the execution-time result via `GET /api/tx/{id}`.
+In the test, the first `Attest` uses `nonce=0` and the duplicate also uses
+`nonce=0` would re-use the same nonce, so `nonce=1` was chosen to make the tx
+distinct. But `nonce=1` is invalid because Bob's account nonce is still `0`
+after the first attest (the account nonce advances per-committed-tx, and Bob
+sent the first attest at nonce=0). The nonce guard fires first.
 
 **Fix needed**
 
-One of:
-1. Add a pre-check in the API submission path that consults `IdentityStore`
-   for duplicate attestations (requires the API to hold a read handle to the
-   identity store).
-2. In the `attestation_live` test, poll `GET /api/tx/{id}` for the duplicate
-   attest tx and assert `success: false` (the same pattern used for the
-   coordinator gate in `attestation_coordinator_gate`).
+To directly exercise the duplicate-attest guard, the test needs to:
+1. Confirm the first attest landed (poll `GET /api/tx/{first_attest_id}`,
+   assert `success: true`).
+2. Read Bob's committed nonce from `/api/accounts/qcb1bob` and use it for
+   the duplicate tx.
+3. Submit the duplicate with the correct nonce.
+4. Assert `success: false` with an error containing "duplicate" or "already
+   attested" rather than "nonce mismatch".
 
-Option 2 is the minimal fix that would close the test gap.
+This is a test coverage gap, not a code bug.  The nonce guard provides
+defense-in-depth (the duplicate tx cannot slip through), but the
+attestation-specific guard is not separately confirmed live.
 
 **Affects**
 
 `chain-forge-node/tests/attestation_live.rs` (`attestation_guard_live`,
-phase 6 — duplicate attest check),
-`chain-forge-node/src/api.rs` (submission-time pre-check),
+phase 6),
 `chain-forge-identity/src/lib.rs` (`attest()` duplicate guard)

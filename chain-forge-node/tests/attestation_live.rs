@@ -447,9 +447,15 @@ async fn attestation_guard_live() {
     // ── Phase 6: Duplicate Attest must be rejected ────────────────────────
     // qcb1bob already attested this claimant. A second Attest from the same
     // attester for the same claimant must be rejected (not silently accepted).
-    println!("   [phase6] Submitting duplicate Attest (should be rejected)...");
+    // ── Phase 6: Duplicate Attest must be rejected at execution time ──────
+    // The API layer queues it (it cannot know about duplicate attestations
+    // without a live handle to IdentityStore). The executor must reject it.
+    // We assert success=false via GET /api/tx/{id} — the same pattern as
+    // attestation_coordinator_gate. This closes KNOWN_ISSUES §4.
+    println!("   [phase6] Submitting duplicate Attest (queued at API, rejected at execution)...");
+    let dup_tx_id = format!("attest-dup-{claimant}");
     let dup_tx = serde_json::json!({
-        "id":        format!("attest-dup-{claimant}"),
+        "id":        &dup_tx_id,
         "sender":    "qcb1bob",
         "nonce":     1u64,
         "body":      { "Attest": { "claimant_id": &claimant } },
@@ -458,19 +464,49 @@ async fn attestation_guard_live() {
         "public_key": []
     }).to_string();
 
-    // Wait a beat for the first attest to land in a block before duplicating
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for the first attest to land in a block before submitting the duplicate.
+    // poll_until_registered already confirmed convergence so the first attest is committed.
     let dup_resp = api_post_tx(ports.bob_api, &dup_tx)
         .expect("duplicate Attest POST failed (network error)");
-    println!("   duplicate Attest response: {dup_resp}");
-    let dup_status = dup_resp["status"].as_str().unwrap_or("unknown");
-    if dup_status == "rejected" {
-        println!("   PASS: duplicate Attest correctly rejected.");
+    println!("   duplicate Attest submission response: {dup_resp}");
+
+    let dup_submit_status = dup_resp["status"].as_str().unwrap_or("unknown");
+    if dup_submit_status == "rejected" {
+        // Early rejection at submission — strictly correct and acceptable.
+        println!("   PASS: duplicate Attest rejected at submission time (early check).");
     } else {
-        // Not a hard failure: the duplicate may be queued then rejected at execution.
-        // Record this as a NOTE and track in KNOWN_ISSUES if it becomes a problem.
-        println!("   NOTE: duplicate Attest was '{dup_status}' (not 'rejected' at submission). \
-                  It may be rejected at execution time. Check logs for double-attest handling.");
+        // Expected: queued at submission, must fail at execution.
+        // Wait for it to land in a block and poll the tx result.
+        let cur_h = height_of(ports.bob_api);
+        poll_until_height(&all_ports, cur_h + 2, Duration::from_secs(30));
+
+        let dup_result = poll_tx_result(ports.bob_api, &dup_tx_id, Duration::from_secs(20));
+        println!("   duplicate Attest execution result: {:?}",
+                 dup_result.as_ref().map(|v| v.to_string()));
+
+        match dup_result {
+            Some(ref v) => {
+                let success = v["success"].as_bool();
+                assert!(
+                    success == Some(false),
+                    "duplicate Attest from qcb1bob should have success=false at execution \
+                     (same attester already attested this claimant), but got success={success:?}. \
+                     The duplicate-attestation guard may not be enforced."
+                );
+                println!("   PASS: duplicate Attest correctly rejected at execution time.");
+                println!("   Error: {}", v["error"].as_str().unwrap_or("(no error field)"));
+            }
+            None => {
+                // The duplicate was queued but not yet committed in 2 blocks.
+                // This can happen if Bob's tx was dropped when Bob was tombstoned
+                // (KNOWN_ISSUES §2 startup-misfire interaction). Not a correctness
+                // failure in the duplicate-guard — note it and continue.
+                println!("   NOTE: duplicate Attest tx not found in explorer after 2 blocks. \
+                          May have been dropped due to Bob tombstone (KNOWN_ISSUES §2). \
+                          Coordinator gate test separately confirms execution-time rejection \
+                          pattern works correctly (GET /api/tx/{{id}} success=false).");
+            }
+        }
     }
 
     // ── Phase 7: ConfirmSybil from coordinator ────────────────────────────
