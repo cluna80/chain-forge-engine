@@ -8,91 +8,45 @@ session boundaries.  Each entry has a short title, the symptom, the root cause
 
 ## §1  Genesis stake underflows slash penalty (BME burn fails silently)
 
-**Symptom**
+**Status: RESOLVED** — commit `87634ba`
 
-During the adversarial equivocation test, Alice's node logs:
+**Was**: `tests/devnet/genesis-4node.json` gave each validator 5 QCB
+(5_000_000 uqcb) but the bonded amount in `ValidatorRecord` defaulted to
+ENTRY_STAKE (1000 QCB), making the computed slash (5% = 50 QCB) larger than
+the bank balance, so the BME burn failed silently while the tombstone still
+applied.
 
-```
-WARN  equivocation detected — validator tombstoned validator=qcb1alice slashed=50000000
-WARN  BME burn failed; tombstone applied but tokens not burned
-      validator=qcb1alice burn_uqcb=50000000
-      error=insufficient balance: account qcb1alice has 5000000 but 50000000 required
-```
-
-The tombstone is correctly applied, but the burn (the economic penalty) is a
-no-op because the genesis stake (5 000 000 uqcb = 5 UQCB) is smaller than the
-configured slash penalty (50 000 000 uqcb = 50 UQCB).
-
-**Root cause**
-
-`tests/devnet/genesis-4node.json` gives each validator 5 000 000 uqcb.
-The slashing module's `EQUIVOCATION_SLASH_RATE` (or equivalent constant) is
-calibrated for a much larger stake.
-
-**Fix needed**
-
-Either:
-- Raise the genesis stake to at least 10× the max slash amount (e.g. 500M uqcb
-  per validator), or
-- Lower the slash penalty to be a percentage of actual stake rather than an
-  absolute amount.
-
-The correct long-term answer is percentage-based slashing (e.g. 10% of bonded
-stake), which scales correctly regardless of genesis amounts.
-
-**Affects**
-
-`chain-forge-node/tests/devnet/genesis-4node.json`,
-`chain-forge-slashing/src/lib.rs`
+**Fix**: Raised the genesis account balance in `genesis-4node.json` from
+5_000_000 to 500_000_000 uqcb (500 QCB) — safely above the maximum possible
+equivocation slash (5% of ENTRY_STAKE = 50 QCB).
 
 ---
 
 ## §2  Liveness slashing misfires during startup gossip warmup
 
-**Symptom**
+**Status: RESOLVED** — commit `87634ba`
 
-Immediately after the 4-node devnet starts, nodes jail each other for liveness
-failures before the network has fully formed:
+**Was**: Two separate causes produced false tombstones at startup:
 
-```
-WARN  liveness failure — validator jailed validator="qcb1carol" missed_pct=40 slashed=1000000
-WARN  liveness failure — validator jailed validator="qcb1dave"  missed_pct=60 slashed=1000000
-WARN  liveness failure — validator jailed validator="qcb1alice" missed_pct=70 slashed=1000000
-```
+1. **Liveness grace period missing**: the liveness window started counting from
+   block 0, before the P2P mesh formed, so the first several rounds looked like
+   "missed" blocks.
 
-These fire in the first few seconds, before all nodes are connected and
-participating in consensus.
+2. **False equivocation detection (the primary cause)**: the consensus engine
+   treated a nil-prevote followed by a real-prevote (or vice-versa) at the same
+   (height, round) as a double-sign.  This is incorrect — changing from a nil
+   vote to a real vote is standard BFT round-change behavior, not Byzantine.
 
-**Root cause (likely)**
+**Fix**:
+- Added `liveness_start_height: u64` (default 10) to `SlashingConfig`.
+  `record_block()` now accepts `current_height` and skips enforcement below the
+  threshold.
+- Fixed the equivocation guard in `chain-forge-consensus/src/lib.rs` to require
+  **both** conflicting votes to be non-nil:
+  `existing.block_hash.is_some() && vote.block_hash.is_some() && existing != vote`.
 
-The liveness window begins counting rounds from block 0, before any validator
-has had a chance to join the gossip mesh.  The first several rounds look like
-"missed" because the P2P connections haven't formed yet.
-
-**Fix needed**
-
-One of:
-1. **Warmup grace period**: Do not begin liveness enforcement until a node has
-   participated in at least N rounds (e.g. N=10) or until a configurable
-   `liveness_start_height` has been reached.
-2. **Per-validator first-seen tracking**: Start each validator's liveness window
-   from the first round where they sent a valid vote, not from genesis.
-
-Option 2 is more correct for permissionless validator onboarding (Phase 4+).
-Option 1 is simpler and acceptable for the current fixed-validator devnet.
-
-**Risk**
-
-If all four validators jail each other before quorum stabilises, the chain
-halts at startup.  Current tests pass because the jailing happens after enough
-blocks are committed, but this is not guaranteed as block times or network
-latency change.  This will almost certainly manifest as a cold-start failure
-when scaling to 7+ nodes or running on real hardware with startup latency.
-
-**Affects**
-
-`chain-forge-slashing/src/lib.rs` (liveness window logic),
-`chain-forge-consensus/src/lib.rs` (participation tracking)
+**Verification**: `validators_api_live_power_snapshot` (personhood_live) now
+passes 5-for-5 runs, showing 4 active validators with total_power=4.
 
 ---
 
