@@ -415,11 +415,13 @@ impl Node {
             net_config.p2p_port = port;
         }
 
-        // Real libp2p when this crate's "real-network" feature is enabled;
-        // otherwise the in-memory mock (fast, deterministic, used by tests
-        // and by default builds). Both satisfy the same NetworkService
-        // trait, so nothing downstream of this block knows which one is live.
-        #[cfg(feature = "real-network")]
+        // Real libp2p when the "real-network" feature is enabled AND we are
+        // not running under `cargo test`.  Unit tests (cfg(test)) always use
+        // the fast in-memory mock regardless of the feature flag, so they
+        // stay deterministic and don't bind real ports.  The devnet
+        // integration test spawns a compiled binary that is NOT compiled with
+        // cfg(test), so it gets the real libp2p stack.
+        #[cfg(all(feature = "real-network", not(test)))]
         let network: Box<dyn NetworkService> = {
             let (svc, local_addr) = chain_forge_p2p::real::Libp2pService::start(&net_config)
                 .await
@@ -428,7 +430,7 @@ impl Node {
             Box::new(svc)
         };
 
-        #[cfg(not(feature = "real-network"))]
+        #[cfg(not(all(feature = "real-network", not(test))))]
         let network: Box<dyn NetworkService> = {
             let mut svc = MockNetworkService::new();
             svc.start(net_config.clone()).await

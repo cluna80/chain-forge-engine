@@ -30,9 +30,12 @@ tracing-subscriber    = { version = "0.3", features = ["env-filter"] }
 
 [features]
 # Use real libp2p networking instead of the in-memory mock.
-# Off by default so `cargo test` stays fast; enable for real deployments:
-#   cargo run --release --features real-network -- --genesis genesis.json
+# Enabled by default so `cargo build --bin chain-forge-node` and the
+# devnet integration tests always produce a real-network binary.
+# Unit tests (cfg(test)) are carved out inside node.rs so they still
+# use the fast in-memory mock regardless of this feature flag.
 real-network = []
+default = ["real-network"]
 
 [dev-dependencies]
 tokio = { workspace = true }
