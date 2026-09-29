@@ -23,7 +23,13 @@ What it does **not** prove:
 
 The circuit boundary is cryptographically confirmed: a proof from a foreign registry (different proving key, different root) is rejected by this registry's verifier. The guarantee is **membership in this specific registry**, not membership in any registry.
 
-**Future path if stronger binding is needed:** A nullifier (hash of the leaf plus a domain separator) added as a public input would allow on-chain double-spend detection — each leaf could only produce one accepted proof per domain. This is a real cryptographic change, not a test fix. The current design defers this to post-pilot, pending evidence that the weaker guarantee is insufficient.
+**The nullifier decision (make it now, not later):** A nullifier (hash of the leaf plus a domain separator) added as a public input would allow on-chain double-spend detection — each leaf could only produce one accepted proof per domain. This is a real cryptographic change, not a test fix.
+
+The honest position on deferral: the pilot cannot detect credential reuse without a nullifier. There is no instrumentation path — detecting that the same credential produced two identity claims requires either (a) a nullifier on-chain, or (b) an off-chain registry of credential→claim mappings, which reintroduces centralization. "Wait for pilot evidence" is therefore not a real trigger, because the pilot won't surface what it can't measure.
+
+**Decision for Phase 1:** The pilot will *not* attempt to detect or prevent credential reuse. The risk is accepted and named: a single valid credential could produce proofs for multiple identity claims in different contexts, and the pilot has no mechanism to detect this. The defense is issuance policy — single-credential-per-human, enforced by the issuer relationship — and the pilot will instrument issuer behavior (credential issuance counts per issuer), not proof reuse.
+
+**Trigger for adding a nullifier:** A nullifier becomes necessary when (a) the system moves to permissionless issuers who cannot be held to a single-credential policy, or (b) pilot issuers report credential transfers or compromise at any non-trivial rate. Either condition requires the nullifier before the next credential issuance round, not after it.
 
 ---
 
@@ -114,6 +120,8 @@ Rationale: The cap must be *below* typical honest usage so that farmers exhaust 
 | Confirmation lock period | Not enforced (Phase 1) | Simplicity; revisit if timing abuse observed |
 
 All parameters are governance-tunable without a protocol upgrade. Adjust based on pilot data, not prior expectations.
+
+**Review trigger:** Parameters are reviewed at the earlier of (a) 90 days after pilot opens, or (b) 50 verified humans reached. At that point: check observed attestation frequency against the cap (raise if honest users are hitting the ceiling), check sybil discovery rate against the penalty rate (raise if discovery is frequent enough that farmers are still net-positive), and check revocation frequency for timing-attack patterns (enforce the confirmation lock period if observed). Parameters that float without a review point are parameters that never get reviewed.
 
 ---
 
