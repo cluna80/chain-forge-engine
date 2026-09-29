@@ -264,6 +264,12 @@ pub async fn serve(
                         // GET /api/cirfi — CirFi monetary engine metrics (Section 9.1)
                         let cm = cirfi_metrics.lock().unwrap();
                         http_200_json(&serde_json::to_string(&*cm).unwrap_or_default())
+                    } else if first_line.starts_with("GET /api/validators") {
+                        // GET /api/validators — current validator set with voting powers.
+                        // Returns the personhood-weighted set from the last committed block.
+                        // Used by integration tests to verify per-human power cap (Section 3.3).
+                        let ex = explorer.lock().unwrap();
+                        http_200_json(&serde_json::to_string(&ex.validator_powers).unwrap_or_default())
                     } else if first_line.starts_with("GET /api/peers") {
                         // GET /api/peers — connected peers (real network layer)
                         let p = peers.lock().unwrap();

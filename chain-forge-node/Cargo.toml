@@ -55,3 +55,7 @@ path = "tests/adversarial_gossip.rs"
 [[test]]
 name = "attestation_live"
 path = "tests/attestation_live.rs"
+
+[[test]]
+name = "personhood_live"
+path = "tests/personhood_live.rs"

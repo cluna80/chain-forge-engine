@@ -74,6 +74,15 @@ pub struct AccountSummary {
     pub exemption_days: u32,
 }
 
+/// Voting-power snapshot for one validator.
+/// Used by GET /api/validators to expose the current personhood-weighted set.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ValidatorPowerSummary {
+    pub id:           String,
+    pub voting_power: u64,
+    pub pop_verified: bool,
+}
+
 /// Explorer state, updated by the node on each committed block.
 #[derive(Debug, Default)]
 pub struct ExplorerState {
@@ -83,6 +92,9 @@ pub struct ExplorerState {
     pub txs: std::collections::HashMap<String, TxSummary>,
     /// address -> latest account snapshot.
     pub accounts: std::collections::HashMap<String, AccountSummary>,
+    /// Current validator set with voting powers, as of the last committed block.
+    /// Updated every block. Used by GET /api/validators.
+    pub validator_powers: Vec<ValidatorPowerSummary>,
 }
 
 pub const MAX_RECENT_BLOCKS: usize = 100;
@@ -1914,6 +1926,14 @@ impl Node {
                     exemption_days: a.exemption_days(),
                 });
             }
+
+            // Sync validator power snapshot for GET /api/validators.
+            let vs = self.validator_registry.build_validator_set(exec_result.height);
+            ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
+                id:           v.id.0.clone(),
+                voting_power: v.voting_power,
+                pop_verified: v.pop_verified,
+            }).collect();
         }
 
         // Drop proposals and parked certs at or below the height we just
@@ -2168,6 +2188,14 @@ impl Node {
                     exemption_days: a.exemption_days(),
                 });
             }
+
+            // Sync validator power snapshot for GET /api/validators.
+            let vs = self.validator_registry.build_validator_set(exec_result.height);
+            ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
+                id:           v.id.0.clone(),
+                voting_power: v.voting_power,
+                pop_verified: v.pop_verified,
+            }).collect();
         }
 
         // Update CirFi metrics snapshot (Section 9.1 / 5.4)
