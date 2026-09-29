@@ -363,6 +363,16 @@ async fn adversarial_unknown_validator() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 2: Equivocation over gossip triggers a slash
+//
+// The attacker waits for the gossipsub mesh to form, reads the CURRENT chain
+// height, and immediately sends two conflicting Prevotes for (current+1, 0).
+// Because the equivocating votes arrive while that height is still open for
+// voting, drain_equivocations() fires, tombstones Alice, and burns her stake.
+//
+// We verify this by:
+//   1. Asserting the chain keeps advancing (Bob/Carol/Dave have quorum).
+//   2. Grepping the node logs for "equivocation detected" — hard assertion,
+//      not a soft NOTE.  If those words aren't in the logs the test fails.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -372,6 +382,8 @@ async fn adversarial_equivocation_over_gossip() {
     println!("\n── Adversarial test: equivocation (double-vote) over gossip ─────────");
 
     let log_dir = std::env::temp_dir().join("qcb-adversarial-equivoc");
+    // Fresh log directory each run.
+    let _ = std::fs::remove_dir_all(&log_dir);
     std::fs::create_dir_all(&log_dir).unwrap();
 
     let _nodes = spawn_devnet(&log_dir);
@@ -379,7 +391,7 @@ async fn adversarial_equivocation_over_gossip() {
     println!("   Waiting for API ports...");
     assert!(wait_all_apis_up(), "nodes did not start");
 
-    // Wait for height 2.
+    // Wait for height 2 (chain is running).
     println!("   [phase1] Waiting for height >= 2...");
     assert!(
         poll_until_height(&[ALICE_API, BOB_API, CAROL_API, DAVE_API], 2,
@@ -387,21 +399,26 @@ async fn adversarial_equivocation_over_gossip() {
         "chain did not reach height 2 before attack"
     );
 
+    // Launch attacker and wait for gossipsub mesh.
+    let attacker = start_attacker(ALICE_P2P).await;
+    eprintln!("   [attacker] waiting 2s for gossipsub mesh to form...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Read the CURRENT committed height, then equivocate on current+1.
+    // That height is guaranteed to be open for voting right now.
+    let current_height = height_of(ALICE_API);
+    let attack_height  = current_height + 1;
+    eprintln!("   [attacker] current height={current_height}, equivocating on height={attack_height}");
+
     // Record Alice's balance before the slash.
     let balance_before = balance_of(ALICE_API, "qcb1alice");
     eprintln!("   alice balance before: {balance_before:?} uqcb");
 
-    // Launch attacker.
-    let attacker = start_attacker(ALICE_P2P).await;
-
-    // Give the gossipsub mesh time to form before sending.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Send two conflicting prevotes from qcb1alice for height 3, round 0.
-    // Same (validator, height, round, vote_type) but DIFFERENT block hashes.
+    // Two conflicting Prevotes: same (validator=qcb1alice, height, round=0)
+    // but DIFFERENT block hashes — the canonical equivocation signature.
     let vote_a = Vote {
         vote_type:  VoteType::Prevote,
-        height:     3,
+        height:     attack_height,
         round:      0,
         validator:  ValidatorId("qcb1alice".to_string()),
         block_hash: Some(BlockHash("block_hash_version_AAAAAAAAAAAAA".to_string())),
@@ -409,7 +426,7 @@ async fn adversarial_equivocation_over_gossip() {
     };
     let vote_b = Vote {
         vote_type:  VoteType::Prevote,
-        height:     3,
+        height:     attack_height,
         round:      0,
         validator:  ValidatorId("qcb1alice".to_string()),
         block_hash: Some(BlockHash("block_hash_version_BBBBBBBBBBBBB".to_string())),
@@ -419,34 +436,43 @@ async fn adversarial_equivocation_over_gossip() {
     let payload_a = serde_json::to_vec(&vote_a).unwrap();
     let payload_b = serde_json::to_vec(&vote_b).unwrap();
 
-    eprintln!("   [attacker] sending equivocating prevotes (A then B) for height=3 round=0...");
+    eprintln!("   [attacker] sending equivocating prevotes A then B for \
+               height={attack_height} round=0...");
     attacker.publish(OutboundMessage { topic: GossipTopic::ConsensusVote, payload: payload_a })
         .await.expect("publish vote A");
-    // Small gap so both arrive and are processed in order.
+    // Small gap so votes arrive and are processed in order.
     tokio::time::sleep(Duration::from_millis(200)).await;
     attacker.publish(OutboundMessage { topic: GossipTopic::ConsensusVote, payload: payload_b })
         .await.expect("publish vote B");
 
-    // Give nodes time to detect equivocation and process the slash.
+    // Give nodes time to detect equivocation, drain it, and apply the slash.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Chain must still advance.
-    println!("   [phase2] Verifying chain advanced past height 4 after equivocation...");
+    // Chain must still advance — Bob/Carol/Dave have quorum without Alice.
+    println!("   [phase2] Verifying chain advanced past height {}...",
+             attack_height + 2);
     let advanced = poll_until_height(
-        &[BOB_API, CAROL_API, DAVE_API], 4,
-        Duration::from_secs(20), "post-equivoc",
+        &[BOB_API, CAROL_API, DAVE_API],
+        attack_height + 2,
+        Duration::from_secs(20),
+        "post-equivoc",
     );
 
     let balance_after = balance_of(ALICE_API, "qcb1alice");
     eprintln!("   alice balance after:  {balance_after:?} uqcb");
 
+    // ── Hard assertion 1: log evidence that equivocation was detected ─────────
+    // We grep Alice's own log because she receives gossip from the attacker
+    // and her consensus engine must log the detection.
+    let alice_log = std::fs::read_to_string(log_dir.join("qcb1alice.log"))
+        .unwrap_or_default();
+    let equivoc_detected = alice_log.contains("equivocation detected")
+        || alice_log.contains("tombstone");
+
     println!();
     println!("── Result ───────────────────────────────────────────────────────────");
 
-    if advanced {
-        println!("   PASS: chain advanced after equivocation attack (Bob/Carol/Dave quorum).");
-    } else {
-        println!("   WARN: chain did not advance — inspecting logs.");
+    if !advanced {
         for name in ["qcb1alice", "qcb1bob"] {
             let log = log_dir.join(format!("{name}.log"));
             if let Ok(content) = std::fs::read_to_string(&log) {
@@ -456,28 +482,35 @@ async fn adversarial_equivocation_over_gossip() {
                 for l in tail { println!("   {l}"); }
             }
         }
-        panic!("chain stalled after equivocation attack");
+        panic!("chain stalled after equivocation attack — Bob/Carol/Dave should have quorum");
     }
+    println!("   PASS: chain advanced after equivocation (Bob/Carol/Dave quorum maintained).");
 
-    // Check slash: Alice's balance should have decreased.
-    // In Phase 0 (no signatures), the equivocation IS detected by the
-    // consensus engine's vote bookkeeping (same validator, same height/round,
-    // different block hashes) — signatures are NOT required for detection.
+    // ── Hard assertion 2: equivocation must appear in logs ───────────────────
+    assert!(
+        equivoc_detected,
+        "equivocation was NOT detected by Alice's node — votes may have landed on an \
+         already-committed height. Check qcb1alice.log for 'equivocation detected' or \
+         'tombstone'. attack_height={attack_height}"
+    );
+    println!("   PASS: 'equivocation detected' / tombstone found in Alice's log.");
+
+    // ── Soft check: balance slash ─────────────────────────────────────────────
+    // The slash burns stake; may exceed genesis balance in Phase 0
+    // (genesis has 5M uqcb but slash penalty is 50M) — the BME burn will fail
+    // but the tombstone still applies.  Balance check is informational.
     match (balance_before, balance_after) {
         (Some(before), Some(after)) if after < before => {
-            println!("   PASS: Alice's balance slashed ({before} → {after} uqcb, burned {})", before - after);
+            println!("   PASS: Alice's balance slashed ({before} → {after} uqcb, \
+                      burned {}).", before - after);
         }
         (Some(before), Some(after)) => {
-            // Balance unchanged — log a note but don't fail, because the slash
-            // may not have fired if the equivocating votes arrived for a height
-            // already committed. The chain-continuity assertion above is the
-            // primary safety check.
-            println!("   NOTE: balance unchanged ({before} → {after}). \
-                      Equivocation may have arrived for an already-committed height. \
-                      Run `cargo test` at a slower block time to hit the window.");
+            println!("   NOTE: balance unchanged ({before} → {after} uqcb). \
+                      Likely BME burn failed (slash > stake) — tombstone still applied. \
+                      See 'BME burn failed' in logs.");
         }
         _ => {
-            println!("   NOTE: could not read Alice's balance — API may not expose accounts yet.");
+            println!("   NOTE: could not read Alice's balance from API.");
         }
     }
 }
