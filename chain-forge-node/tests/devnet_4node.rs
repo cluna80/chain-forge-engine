@@ -77,8 +77,11 @@ fn node_binary() -> PathBuf {
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| repo_root().join("target"));
-    let debug   = target.join("debug").join("chain-forge-node");
-    let release = target.join("release").join("chain-forge-node");
+    // On Windows the binary is `chain-forge-node.exe`; EXE_SUFFIX is ".exe"
+    // on Windows and "" everywhere else.
+    let exe = format!("chain-forge-node{}", std::env::consts::EXE_SUFFIX);
+    let debug   = target.join("debug").join(&exe);
+    let release = target.join("release").join(&exe);
     if release.exists() { release } else { debug }
 }
 
