@@ -79,12 +79,54 @@ Rationale: The cap must be *below* typical honest usage so that farmers exhaust 
 
 ---
 
+## Implementation Design Decisions
+
+Before code, these questions need explicit answers — the code defaults to whatever we write here.
+
+**Q1: Does revocation free a cap slot?**
+Yes. A revoked attestation does not count against the attester's 3-slot budget. Rationale: if revocation permanently consumed a slot, an honest attester who discovers a mistake is penalized twice — once by the CS hit, once by a permanently reduced future budget. That's disproportionate. The ring buffer implementation should free the slot on revocation.
+
+**Q2: Is the CS penalty applied at the moment of sybil confirmation, or does it reach back to affect past CS calculations?**
+At the moment of confirmation. Alice's CS at epoch 100 (when Bob is confirmed sybil) takes the -20% hit on the CS she earned from that attestation. It does not retroactively change her CS history at earlier epochs. Rationale: retroactive recalculation is complex and surprising; at-confirmation is auditable and predictable. The penalty is on the *current* CS balance as a deduction, not a re-scoring of the past.
+
+**Q3: Can the coordinator reverse a sybil confirmation? Do reversed penalties come back?**
+Yes on both counts. `ReverseSybil` is a valid coordinator action. When reversed: CS penalties are credited back, attestation records are un-penalized, and the reversal is logged. Rationale: false positives happen, and a system where coordinator mistakes are permanent has a different trust property than one where mistakes are correctable. The log ensures reversals are auditable. Note: this means coordinator authority includes CS modification (confirm increases penalty, reverse credits it back) — see Q5.
+
+**Q4: What's the minimum pilot size for the cap to actually bind behavior?**
+The cap starts to matter around 30–50 active attesters. At 5 people, 3 attestations/90 days is unconstrained. At 30+, the cap starts to differentiate honest-but-limited-network attesters from would-be farmers. The coordinator should track "attesters who have hit the cap" as a metric from day 1 — if no one hits the cap in the first 90 days, the cap is decorative and should be revisited. If >20% of attesters hit the cap, it may be too low.
+
+**Q5: Does the coordinator have authority over CS directly, or only over sybil flags (with CS as an automatic consequence)?**
+The coordinator flags sybils; CS modification is automatic on the on-chain side. But because the coordinator can `ReverseSybil` (Q3), the coordinator effectively has indirect CS modification authority through confirmation and reversal. This is intentional and named here: during the pilot, the coordinator is the effective CS modification authority for sybil-related penalties. This is centralization. See the coordinator caveat below.
+
+---
+
+## Pilot-Phase Centralization: Coordinator Role
+
+**This is a temporary deviation from the sovereignty design principle, and it must be named as such.**
+
+During the pilot, sybil confirmation (`ConfirmSybil`) and reversal (`ReverseSybil`) are performed by a designated coordinator role — a specific key or multisig with authority to call those methods on the identity store. This coordinator role:
+
+- Is the only entity that can confirm a sybil (no governance challenge mechanism in Phase 1)
+- Has indirect CS modification authority through sybil confirmation and reversal
+- Is a centralized dependency in a system designed to remove centralized dependencies
+
+**Why this is acceptable for the pilot:** The pilot needs a mechanism to confirm sybils. Designing on-chain governance challenges before the pilot has produced a single confirmed sybil is designing in the dark. The coordinator role is the honest minimum for pilot-phase sybil confirmation.
+
+**Migration path:** Upon pilot completion, sybil confirmation migrates to one of:
+- (a) On-chain governance: `ConfirmSybil { identity, evidence }` governance transaction with defined evidence format and challenge process
+- (b) Retirement: if the pilot produces no confirmed sybils, the mechanism may not be needed, and the coordinator role is removed without replacement
+
+The coordinator role is not a permanent feature. If it persists past the pilot without an explicit decision to keep it, that is a governance failure, not an intended design.
+
+---
+
 ## Implementation Surface
 
 **New on-chain state:**
-- `attestation_window_count: Map<(ValidatorId, u64), u32>` — per-epoch-window cap tracking
-- `attestation_record: Map<(attester_id, identity_id), AttestationEntry>` — for penalty lookup on sybil discovery
-- `pending_sybil_flags: Map<identity_id, Vec<attester_id>>` — self-reports awaiting governance confirmation
+- `attestation_records: Map<(attester_id, identity_id), AttestationRecord>` — full record per attestation: epoch, status (Active/Revoked/Penalized), revocation_epoch, penalty_applied
+- `attester_cap_window: Map<attester_id, [Option<u64>; 3]>` — ring buffer of 3 epoch slots per attester for rolling-window cap tracking (replaces the simpler `attestation_window_count` map; ring buffer is bounded and handles the 90-day rollover correctly without additional queries)
+- `pending_sybil_reports: Map<identity_id, Vec<(attester_id, report_epoch)>>` — self-reports awaiting coordinator confirmation
+- `coordinator_id: Option<ValidatorId>` — pilot-phase coordinator key; None until set at pilot launch
 
 **New governance-tunable parameters:**
 - `attest_cap_per_window: u32` — initial value: 3

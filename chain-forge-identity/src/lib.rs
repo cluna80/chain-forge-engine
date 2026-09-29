@@ -63,6 +63,12 @@ pub enum IdentityError {
     #[error("identity {0} is already past Provisional -- no further attestations needed")]
     AlreadyVerified(String),
 
+    #[error("no active attestation from {0} for {1}")]
+    AttestationNotFound(String, String),
+
+    #[error("attestation from {0} for {1} is already revoked")]
+    AttestationAlreadyRevoked(String, String),
+
     #[error("internal identity error: {0}")]
     Internal(String),
 }
@@ -334,6 +340,76 @@ pub enum AttestationOutcome {
     /// This attestation was the one that crossed the quorum threshold --
     /// the claimant has just been upgraded Provisional -> Verified.
     QuorumReachedVerified,
+}
+
+// -- Attestation records (Phase A: guard data model) --------------------------
+
+/// The lifecycle status of one outbound attestation made by an attester.
+///
+/// Transitions:
+///   Active -> Revoked   (attester calls revoke_attestation)
+///   Active -> Penalized (coordinator calls confirm_sybil — Phase C)
+///   Penalized -> Active (coordinator calls reverse_sybil — Phase C)
+///
+/// Revoked is terminal: a revoked attestation cannot be re-activated or
+/// penalized after revocation. If a sybil is confirmed after an attester
+/// revokes their attestation, the attester paid the revocation cost but
+/// does not pay the sybil penalty (revocation was the exit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttestationStatus {
+    /// The attestation is active and the attester is exposed to sybil risk.
+    Active,
+    /// The attester voluntarily revoked this attestation (paid the flat cost).
+    /// A slot is freed in the rolling-window cap budget (design decision Q1).
+    Revoked,
+    /// The attested identity was confirmed as a sybil; the CS penalty has been
+    /// applied to the attester. Set by confirm_sybil (Phase C coordinator call).
+    Penalized,
+}
+
+/// The full on-chain record for one attestation event.
+///
+/// One record per (attester_id, attested_id) pair. Written by `attest()` and
+/// updated by `revoke_attestation()` (Phase A) and `confirm_sybil()` /
+/// `reverse_sybil()` (Phase C). This record is the source of truth for penalty
+/// lookup and the rolling-window cap's slot tracking.
+///
+/// Phase A: populated by attest(), read by attestations_by_attester().
+/// Phase B: attester_cap_slots on IdentityStore reads these to enforce the cap.
+/// Phase C: confirm_sybil() / reverse_sybil() walk these records by attested_id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationRecord {
+    /// The identity who gave the attestation.
+    pub attester_id: String,
+    /// The identity who received the attestation.
+    pub attested_id: String,
+    /// The epoch in which the attestation was made.
+    pub epoch: u64,
+    /// Current status of this attestation.
+    pub status: AttestationStatus,
+    /// The epoch in which this attestation was revoked, if applicable.
+    pub revocation_epoch: Option<u64>,
+    /// Whether a CS penalty has been applied to the attester for this
+    /// attestation. Set true by confirm_sybil, set false by reverse_sybil.
+    /// False by default; true only in Penalized state.
+    pub penalty_applied: bool,
+}
+
+impl AttestationRecord {
+    pub fn new(attester_id: String, attested_id: String, epoch: u64) -> Self {
+        Self {
+            attester_id,
+            attested_id,
+            epoch,
+            status: AttestationStatus::Active,
+            revocation_epoch: None,
+            penalty_applied: false,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status == AttestationStatus::Active
+    }
 }
 
 // -- Decay exemption credits --------------------------------------------------
@@ -642,12 +718,29 @@ impl UbiClock {
 ///   - One UBI claim per verified identity per epoch
 ///   - Agent sponsorship bounded by identity tier
 ///   - Liveness enforcement gates continued rights
+///
+/// Phase A additions (attestation guard data model):
+///   - `attestation_records`: the per-pair record of every attestation event,
+///     used as the source of truth for penalty lookup (Phase C) and cap slot
+///     tracking (Phase B).
+///   - `coordinator_id`: the pilot-phase coordinator key. None until set;
+///     required for confirm_sybil / reverse_sybil (Phase C). Named here as
+///     a pilot-phase temporary centralization — see design doc.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityStore {
     records:  HashMap<String, IdentityRecord>,
     /// Index: address -> identity_id for fast lookup by account address.
     by_address: HashMap<String, String>,
     pub clock: UbiClock,
+    /// Phase A: per-pair attestation records for penalty and cap tracking.
+    /// Key: (attester_id, attested_id). One record per pair; a second
+    /// attestation from the same attester to the same attested identity is
+    /// rejected by attest() before reaching here, so the key is unique.
+    attestation_records: HashMap<(String, String), AttestationRecord>,
+    /// Phase C (pilot-phase centralization): the coordinator identity ID.
+    /// None = coordinator not yet configured; Some(id) = coordinator is active.
+    /// Required for confirm_sybil and reverse_sybil calls.
+    pub coordinator_id: Option<String>,
 }
 
 impl IdentityStore {
@@ -656,6 +749,8 @@ impl IdentityStore {
             records:    HashMap::new(),
             by_address: HashMap::new(),
             clock:      UbiClock::new(genesis_time_ms),
+            attestation_records: HashMap::new(),
+            coordinator_id: None,
         }
     }
 
@@ -665,6 +760,8 @@ impl IdentityStore {
             records:    HashMap::new(),
             by_address: HashMap::new(),
             clock:      UbiClock::with_epoch_duration_ms(genesis_time_ms, epoch_duration_ms),
+            attestation_records: HashMap::new(),
+            coordinator_id: None,
         }
     }
 
@@ -788,6 +885,18 @@ impl IdentityStore {
         claimant.attestation_ledger.add(attester_id.to_string());
         let count = claimant.attestation_ledger.count();
 
+        // Phase A: write the attestation record. This is the source of truth
+        // for Phase B (cap slot tracking) and Phase C (penalty lookup).
+        let record = AttestationRecord::new(
+            attester_id.to_string(),
+            claimant_id.to_string(),
+            epoch,
+        );
+        self.attestation_records.insert(
+            (attester_id.to_string(), claimant_id.to_string()),
+            record,
+        );
+
         if count >= ATTESTATION_QUORUM {
             claimant.charm.verify(epoch);
             tracing::info!(
@@ -798,6 +907,86 @@ impl IdentityStore {
         } else {
             Ok(AttestationOutcome::Recorded { attester_count: count, quorum: ATTESTATION_QUORUM })
         }
+    }
+
+    /// Revoke a previously-given attestation.
+    ///
+    /// Phase A: updates the `AttestationRecord` status to `Revoked` and records
+    /// the revocation epoch. Phase B will also free the cap slot here.
+    /// Phase D will apply the flat CS revocation cost here.
+    ///
+    /// Design decision Q1: revocation frees the rolling-window cap slot.
+    /// An honest attester who discovers a mistake is not penalized by a
+    /// permanently reduced future budget on top of the CS cost.
+    ///
+    /// Returns `Err(AttestationNotFound)` if no active attestation from
+    /// `attester_id` for `attested_id` exists. Returns
+    /// `Err(AttestationAlreadyRevoked)` if already revoked.
+    pub fn revoke_attestation(
+        &mut self,
+        attester_id: &str,
+        attested_id: &str,
+    ) -> IdResult<()> {
+        let key = (attester_id.to_string(), attested_id.to_string());
+        let epoch = self.clock.current_epoch;
+
+        let rec = self.attestation_records.get_mut(&key)
+            .ok_or_else(|| IdentityError::AttestationNotFound(
+                attester_id.to_string(),
+                attested_id.to_string(),
+            ))?;
+
+        match rec.status {
+            AttestationStatus::Revoked => {
+                return Err(IdentityError::AttestationAlreadyRevoked(
+                    attester_id.to_string(),
+                    attested_id.to_string(),
+                ));
+            }
+            AttestationStatus::Active | AttestationStatus::Penalized => {
+                rec.status = AttestationStatus::Revoked;
+                rec.revocation_epoch = Some(epoch);
+            }
+        }
+
+        // Remove this attester's contribution from the attested identity's
+        // ledger and CS contribution. The identity is not marked as sybil —
+        // only a coordinator confirm_sybil does that (Phase C).
+        if let Some(identity) = self.records.get_mut(attested_id) {
+            identity.attestation_ledger.attesters.retain(|a| a != attester_id);
+            // If removing this attestation drops the count below quorum AND
+            // the identity is currently Verified solely because of this
+            // quorum, it should be re-evaluated. For Phase A, we flag it
+            // in the record only — full tier re-evaluation is Phase C scope.
+            // (An identity that was verified through other paths, such as
+            // verify_identity(), is not affected by attestation revocation.)
+        }
+
+        tracing::info!(
+            attester_id, attested_id, epoch,
+            "attestation revoked"
+        );
+        Ok(())
+    }
+
+    /// Return all attestation records where `attester_id` is the attester.
+    ///
+    /// Phase A query method. Used by the coordinator dashboard (Phase E) and
+    /// by Phase B cap enforcement to count active attestations in the rolling window.
+    pub fn attestations_by_attester(&self, attester_id: &str) -> Vec<&AttestationRecord> {
+        self.attestation_records.values()
+            .filter(|r| r.attester_id == attester_id)
+            .collect()
+    }
+
+    /// Return all attestation records where `attested_id` is the attested identity.
+    ///
+    /// Phase C uses this to walk all attesters who vouched for a confirmed sybil,
+    /// applying CS penalties to each active attester.
+    pub fn attestations_for_identity(&self, attested_id: &str) -> Vec<&AttestationRecord> {
+        self.attestation_records.values()
+            .filter(|r| r.attested_id == attested_id)
+            .collect()
     }
 
     // -- UBI claim gating (Charm Confinement) ---------------------------------
@@ -1457,5 +1646,156 @@ mod tests {
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
         }
+    }
+
+    // -- Phase A: attestation record data model --------------------------------
+
+    #[test]
+    fn attest_writes_attestation_record() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        store.attest("bob", "alice").unwrap();
+
+        let records = store.attestations_by_attester("alice");
+        assert_eq!(records.len(), 1);
+        let rec = records[0];
+        assert_eq!(rec.attester_id, "alice");
+        assert_eq!(rec.attested_id, "bob");
+        assert_eq!(rec.status, AttestationStatus::Active);
+        assert!(rec.revocation_epoch.is_none());
+        assert!(!rec.penalty_applied);
+    }
+
+    #[test]
+    fn attestations_by_attester_returns_all_records_for_attester() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+        register_provisional(&mut store, "carol", "qcb1carol");
+
+        store.attest("bob", "alice").unwrap();
+        store.attest("carol", "alice").unwrap();
+
+        let records = store.attestations_by_attester("alice");
+        assert_eq!(records.len(), 2);
+
+        let mut attested: Vec<_> = records.iter().map(|r| r.attested_id.as_str()).collect();
+        attested.sort();
+        assert_eq!(attested, vec!["bob", "carol"]);
+    }
+
+    #[test]
+    fn attestations_for_identity_returns_all_attesters() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_and_verify(&mut store, "dave", "qcb1dave");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        store.attest("bob", "alice").unwrap();
+        store.attest("bob", "dave").unwrap();
+
+        let for_bob = store.attestations_for_identity("bob");
+        assert_eq!(for_bob.len(), 2);
+
+        let mut attesters: Vec<_> = for_bob.iter().map(|r| r.attester_id.as_str()).collect();
+        attesters.sort();
+        assert_eq!(attesters, vec!["alice", "dave"]);
+    }
+
+    #[test]
+    fn revoke_attestation_marks_record_revoked() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        store.attest("bob", "alice").unwrap();
+        store.revoke_attestation("alice", "bob").unwrap();
+
+        let records = store.attestations_by_attester("alice");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, AttestationStatus::Revoked);
+        assert_eq!(records[0].revocation_epoch, Some(0)); // epoch 0 in tests
+    }
+
+    #[test]
+    fn revoke_nonexistent_attestation_returns_error() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        // alice never attested bob, so revocation should fail
+        let result = store.revoke_attestation("alice", "bob");
+        assert!(
+            matches!(result, Err(IdentityError::AttestationNotFound(..))),
+            "expected AttestationNotFound, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn revoke_already_revoked_attestation_returns_error() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        store.attest("bob", "alice").unwrap();
+        store.revoke_attestation("alice", "bob").unwrap();
+
+        // Second revocation of the same attestation must fail
+        let result = store.revoke_attestation("alice", "bob");
+        assert!(
+            matches!(result, Err(IdentityError::AttestationAlreadyRevoked(..))),
+            "expected AttestationAlreadyRevoked, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn revocation_removes_attester_from_ledger() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        store.attest("bob", "alice").unwrap();
+        assert_eq!(store.get("bob").unwrap().attestation_ledger.count(), 1);
+
+        store.revoke_attestation("alice", "bob").unwrap();
+
+        // Alice's contribution is removed from bob's attestation ledger
+        assert_eq!(store.get("bob").unwrap().attestation_ledger.count(), 0,
+            "revoking should remove the attester from the ledger");
+    }
+
+    #[test]
+    fn failed_attest_does_not_write_attestation_record() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        // Self-attestation fails -- should not write a record
+        let _ = store.attest("alice", "alice");
+        assert!(store.attestations_by_attester("alice").is_empty(),
+            "failed attest must not write an attestation record");
+
+        // Not-found fails -- should not write a record
+        let _ = store.attest("does_not_exist", "alice");
+        assert!(store.attestations_by_attester("does_not_exist").is_empty());
+    }
+
+    #[test]
+    fn attestation_record_epoch_matches_store_epoch() {
+        let mut store = IdentityStore::with_epoch_ms(0, 1000);
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        // Advance to epoch 3
+        store.advance_epoch(1001);
+        store.advance_epoch(2002);
+        store.advance_epoch(3003);
+
+        store.attest("bob", "alice").unwrap();
+
+        let records = store.attestations_by_attester("alice");
+        assert_eq!(records[0].epoch, 3, "attestation epoch must match the store's current epoch");
     }
 }
