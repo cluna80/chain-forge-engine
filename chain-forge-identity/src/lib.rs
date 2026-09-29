@@ -60,6 +60,9 @@ pub enum IdentityError {
     #[error("attester {0} has reached the maximum attestations allowed this epoch")]
     AttestationRateLimitExceeded(String),
 
+    #[error("attester {0} has reached the rolling-window attestation cap ({1} active attestations in the past {2} epochs)")]
+    AttestationCapExceeded(String, u32, u64),
+
     #[error("identity {0} is already past Provisional -- no further attestations needed")]
     AlreadyVerified(String),
 
@@ -68,6 +71,9 @@ pub enum IdentityError {
 
     #[error("attestation from {0} for {1} is already revoked")]
     AttestationAlreadyRevoked(String, String),
+
+    #[error("attestation from {0} for {1} is penalized and cannot be revoked; use reverse_sybil to undo the confirmation first")]
+    AttestationAlreadyPenalized(String, String),
 
     #[error("internal identity error: {0}")]
     Internal(String),
@@ -301,6 +307,23 @@ pub const ATTESTATION_QUORUM: usize = 3;
 /// for a cohort of fake claimants. Provisional value, governance-adjustable.
 pub const MAX_ATTESTATIONS_PER_EPOCH: u32 = 5;
 
+/// Hard cap on outbound attestations per rolling window (Phase B / guard 2).
+///
+/// An attester may have at most this many ACTIVE (non-revoked) attestations
+/// within the past ATTESTATION_CAP_WINDOW_EPOCHS epochs at any point in time.
+/// Revoked attestations do not count — revocation frees the slot (design Q1).
+///
+/// Pilot value: 3. Governance-tunable. The cap is enforced on the derived
+/// count from attestation_records, not from a separate ring buffer — at pilot
+/// scale this is acceptable; add a ring buffer index if count grows past ~50k.
+pub const ATTESTATION_CAP_PER_WINDOW: u32 = 3;
+
+/// Rolling window size in epochs for the attestation cap (Phase B).
+///
+/// An attestation made more than this many epochs ago does not count against
+/// the cap. Pilot value: 90 epochs (≈ 90 days if one epoch = one day).
+pub const ATTESTATION_CAP_WINDOW_EPOCHS: u64 = 90;
+
 /// Tracks which distinct identities have vouched for a Provisional
 /// claimant so far, on the way to reaching ATTESTATION_QUORUM.
 ///
@@ -410,6 +433,15 @@ impl AttestationRecord {
     pub fn is_active(&self) -> bool {
         self.status == AttestationStatus::Active
     }
+}
+
+/// Canonical key for `IdentityStore::attestation_records`.
+///
+/// Uses a null-byte separator so serde_json can serialize the HashMap as a
+/// valid JSON object (JSON object keys must be strings; tuple keys fail).
+/// Identity IDs are address strings and cannot contain null bytes.
+fn attestation_record_key(attester_id: &str, attested_id: &str) -> String {
+    format!("{}\x00{}", attester_id, attested_id)
 }
 
 // -- Decay exemption credits --------------------------------------------------
@@ -733,10 +765,35 @@ pub struct IdentityStore {
     by_address: HashMap<String, String>,
     pub clock: UbiClock,
     /// Phase A: per-pair attestation records for penalty and cap tracking.
-    /// Key: (attester_id, attested_id). One record per pair; a second
-    /// attestation from the same attester to the same attested identity is
-    /// rejected by attest() before reaching here, so the key is unique.
-    attestation_records: HashMap<(String, String), AttestationRecord>,
+    ///
+    /// Key order: (attester_id, attested_id). This choice is a named trade-off:
+    ///
+    ///   - attestations_by_attester(attester_id): full scan. O(n) over all records
+    ///     where n = total attestation count across all attesters. This is the
+    ///     Phase B query (cap enforcement) and it happens on every new attestation.
+    ///
+    ///   - attestations_for_identity(attested_id): full scan. O(n) over the same
+    ///     set. This is the Phase C query (penalty walk on sybil confirmation) and
+    ///     it is infrequent (only on coordinator confirm_sybil).
+    ///
+    /// Neither key order gives efficient lookup on both axes in a single HashMap.
+    /// A second reverse index (attested_id → Vec<attester_id>) would make one
+    /// query O(1) but adds write complexity and a consistency surface.
+    ///
+    /// PILOT ASSUMPTION: at pilot scale (hundreds to low thousands of total
+    /// attestations), full scans are acceptable. If total attestation count
+    /// exceeds ~50,000, add a reverse index:
+    ///   `attestations_by_attested: HashMap<String, Vec<String>>`
+    /// pointing from attested_id to the list of attester_ids.
+    /// This assumption must be revisited before production scale.
+    ///
+    /// KEY FORMAT: `"{attester_id}\x00{attested_id}"` — null byte separator.
+    /// The null byte cannot appear in identity IDs (which are address strings),
+    /// so there is no collision risk. This format is chosen over a tuple key
+    /// because serde_json cannot serialize HashMap<(String,String), _> to valid
+    /// JSON (tuple keys become JSON arrays, which are illegal as object keys).
+    /// See `attestation_record_key()` for the canonical constructor.
+    pub(crate) attestation_records: HashMap<String, AttestationRecord>,
     /// Phase C (pilot-phase centralization): the coordinator identity ID.
     /// None = coordinator not yet configured; Some(id) = coordinator is active.
     /// Required for confirm_sybil and reverse_sybil calls.
@@ -828,9 +885,9 @@ impl IdentityStore {
     ///   identities don't need more attestations)
     /// - the attester can only vouch for a given claimant once (repeat
     ///   attestations from the same attester don't inflate the count)
-    /// - the attester is rate-limited to MAX_ATTESTATIONS_PER_EPOCH
-    ///   distinct claimants per epoch, resetting each time the epoch
-    ///   advances
+    /// - the attester is rate-limited to ATTESTATION_CAP_PER_WINDOW
+    ///   active attestations in a rolling ATTESTATION_CAP_WINDOW_EPOCHS window;
+    ///   revoked attestations free their slot back
     ///
     /// Once the claimant's distinct-attester count reaches
     /// ATTESTATION_QUORUM, the claimant is upgraded to Verified as a
@@ -865,20 +922,22 @@ impl IdentityStore {
 
         let epoch = self.clock.current_epoch;
 
-        // Rate limit, tracked on the attester's own record. Reset the
-        // window here rather than in advance_epoch(), so an attester who
-        // never vouches for anyone doesn't need per-epoch upkeep -- the
-        // window resets lazily, the first time they attest in a new epoch.
-        {
-            let attester_record = self.records.get_mut(attester_id).unwrap();
-            if attester_record.attestations_given_epoch != epoch {
-                attester_record.attestations_given_epoch = epoch;
-                attester_record.attestations_given_count = 0;
-            }
-            if attester_record.attestations_given_count >= MAX_ATTESTATIONS_PER_EPOCH {
-                return Err(IdentityError::AttestationRateLimitExceeded(attester_id.to_string()));
-            }
-            attester_record.attestations_given_count += 1;
+        // Phase B: rolling-window cap enforcement.
+        // Count active attestations from this attester in the last
+        // ATTESTATION_CAP_WINDOW_EPOCHS epochs. Derived from attestation_records
+        // so it stays consistent with revocations without a separate buffer.
+        let window_start = epoch.saturating_sub(ATTESTATION_CAP_WINDOW_EPOCHS);
+        let active_in_window = self.attestations_by_attester(attester_id)
+            .iter()
+            .filter(|r| r.is_active() && r.epoch >= window_start)
+            .count() as u32;
+
+        if active_in_window >= ATTESTATION_CAP_PER_WINDOW {
+            return Err(IdentityError::AttestationCapExceeded(
+                attester_id.to_string(),
+                active_in_window,
+                ATTESTATION_CAP_WINDOW_EPOCHS,
+            ));
         }
 
         let claimant = self.records.get_mut(claimant_id).unwrap();
@@ -893,7 +952,7 @@ impl IdentityStore {
             epoch,
         );
         self.attestation_records.insert(
-            (attester_id.to_string(), claimant_id.to_string()),
+            attestation_record_key(attester_id, claimant_id),
             record,
         );
 
@@ -927,7 +986,7 @@ impl IdentityStore {
         attester_id: &str,
         attested_id: &str,
     ) -> IdResult<()> {
-        let key = (attester_id.to_string(), attested_id.to_string());
+        let key = attestation_record_key(attester_id, attested_id);
         let epoch = self.clock.current_epoch;
 
         let rec = self.attestation_records.get_mut(&key)
@@ -943,7 +1002,21 @@ impl IdentityStore {
                     attested_id.to_string(),
                 ));
             }
-            AttestationStatus::Active | AttestationStatus::Penalized => {
+            AttestationStatus::Penalized => {
+                // A penalized attestation means the CS penalty has already been
+                // applied by confirm_sybil. Revocation at this point would remove
+                // the ledger entry without undoing the penalty — a confusing state.
+                // The correct sequence is: coordinator calls reverse_sybil first
+                // (which clears Penalized → Active and credits back the CS), then
+                // the attester can revoke normally. This error makes that explicit
+                // rather than silently allowing a Penalized → Revoked transition
+                // that leaves penalty_applied=true on a "revoked" record.
+                return Err(IdentityError::AttestationAlreadyPenalized(
+                    attester_id.to_string(),
+                    attested_id.to_string(),
+                ));
+            }
+            AttestationStatus::Active => {
                 rec.status = AttestationStatus::Revoked;
                 rec.revocation_epoch = Some(epoch);
             }
@@ -1591,41 +1664,47 @@ mod tests {
 
     #[test]
     fn attestation_rate_limit_enforced_per_epoch() {
+        // Phase B: rolling-window cap (ATTESTATION_CAP_PER_WINDOW = 3) is the
+        // binding rate limit. ATTESTATION_CAP_PER_WINDOW distinct claimants succeed...
         let mut store = make_store();
         register_and_verify(&mut store, "attester", "qcb1attester");
 
-        // MAX_ATTESTATIONS_PER_EPOCH distinct claimants succeed...
-        for i in 0..MAX_ATTESTATIONS_PER_EPOCH {
+        for i in 0..ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
         }
 
-        // ...the next one in the SAME epoch is rejected.
+        // ...the next one within the same rolling window is rejected.
         register_provisional(&mut store, "one_too_many", "qcb1one_too_many");
         let result = store.attest("one_too_many", "attester");
-        assert!(matches!(result, Err(IdentityError::AttestationRateLimitExceeded(_))));
+        assert!(matches!(result, Err(IdentityError::AttestationCapExceeded(_, _, _))));
     }
 
     #[test]
     fn attestation_rate_limit_resets_next_epoch() {
-        let mut store = IdentityStore::with_epoch_ms(0, 1000);
+        // Phase B: the cap resets after ATTESTATION_CAP_WINDOW_EPOCHS (90),
+        // not after a single epoch. Advance past the full window to free the budget.
+        let mut store = IdentityStore::with_epoch_ms(0, 1);
         register_and_verify(&mut store, "attester", "qcb1attester");
 
-        for i in 0..MAX_ATTESTATIONS_PER_EPOCH {
+        for i in 0..ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
         }
 
-        register_provisional(&mut store, "blocked_this_epoch", "qcb1blocked");
-        assert!(store.attest("blocked_this_epoch", "attester").is_err());
+        register_provisional(&mut store, "blocked_in_window", "qcb1blocked");
+        assert!(store.attest("blocked_in_window", "attester").is_err());
 
-        // Advance to a new epoch -- the rate limit window resets.
-        store.advance_epoch(1500);
-        register_provisional(&mut store, "allowed_next_epoch", "qcb1allowed");
-        let result = store.attest("allowed_next_epoch", "attester");
-        assert!(result.is_ok(), "rate limit must reset once a new epoch begins");
+        // Advance past the full window so all attestations age out.
+        let target_ms = (ATTESTATION_CAP_WINDOW_EPOCHS + 1) as u64;
+        store.stay_lively("attester", target_ms);
+        store.advance_epoch(target_ms);
+
+        register_provisional(&mut store, "allowed_after_window", "qcb1allowed");
+        let result = store.attest("allowed_after_window", "attester");
+        assert!(result.is_ok(), "rolling cap must free after window passes, got {:?}", result);
     }
 
     #[test]
@@ -1635,13 +1714,13 @@ mod tests {
         register_provisional(&mut store, "newbie", "qcb1newbie");
 
         // A self-attestation attempt and a not-found attempt should both
-        // fail WITHOUT spending any of the attester's per-epoch budget.
+        // fail WITHOUT spending any of the attester's rolling-window budget.
         let _ = store.attest("attester", "attester"); // self-attestation, rejected
         let _ = store.attest("does_not_exist", "attester"); // NotFound, rejected
 
         // The attester should still have their full budget -- prove it by
-        // successfully using all MAX_ATTESTATIONS_PER_EPOCH slots afterward.
-        for i in 0..MAX_ATTESTATIONS_PER_EPOCH {
+        // successfully using all ATTESTATION_CAP_PER_WINDOW slots afterward.
+        for i in 0..ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
@@ -1797,5 +1876,207 @@ mod tests {
 
         let records = store.attestations_by_attester("alice");
         assert_eq!(records[0].epoch, 3, "attestation epoch must match the store's current epoch");
+    }
+
+    #[test]
+    fn revoke_penalized_attestation_returns_error() {
+        // A Penalized record means confirm_sybil has already applied a CS penalty.
+        // Revocation at that point is blocked — the attester must have the coordinator
+        // call reverse_sybil first (Phase C). This test exercises the error path;
+        // Phase C will test the full confirm → reverse → revoke sequence.
+        //
+        // We manufacture a Penalized record directly since confirm_sybil is Phase C.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        store.attest("bob", "alice").unwrap();
+
+        // Manually set the record to Penalized (simulating what confirm_sybil will do)
+        let key = attestation_record_key("alice", "bob");
+        store.attestation_records.get_mut(&key).unwrap().status = AttestationStatus::Penalized;
+        store.attestation_records.get_mut(&key).unwrap().penalty_applied = true;
+
+        let result = store.revoke_attestation("alice", "bob");
+        assert!(
+            matches!(result, Err(IdentityError::AttestationAlreadyPenalized(..))),
+            "revoking a penalized attestation must return AttestationAlreadyPenalized, got {:?}", result
+        );
+    }
+
+    // -- Phase B: rolling-window cap enforcement --------------------------------
+
+    #[test]
+    fn rolling_window_cap_blocks_fourth_attestation() {
+        // An attester is allowed ATTESTATION_CAP_PER_WINDOW (3) active
+        // attestations in a rolling window; the fourth must be rejected.
+        let mut store = make_store();
+        register_and_verify(&mut store, "attester", "qcb1attester");
+
+        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+            let id = format!("claimant{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
+
+        register_provisional(&mut store, "blocked", "qcb1blocked");
+        let result = store.attest("blocked", "attester");
+        assert!(
+            matches!(result, Err(IdentityError::AttestationCapExceeded(..))),
+            "fourth attestation in window must be rejected by the cap, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn rolling_window_cap_does_not_count_revoked_attestations() {
+        // Design decision Q1: revocation frees the slot. After revoking one
+        // attestation from a full budget, the attester can make a new one.
+        let mut store = make_store();
+        register_and_verify(&mut store, "attester", "qcb1attester");
+
+        // Fill the cap
+        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+            let id = format!("claimant{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
+
+        // Revoke one — this should free a slot
+        store.revoke_attestation("attester", "claimant0").unwrap();
+
+        // Now a new attestation should be allowed
+        register_provisional(&mut store, "new_claimant", "qcb1new");
+        let result = store.attest("new_claimant", "attester");
+        assert!(
+            result.is_ok(),
+            "after revoking one attestation the cap slot must be freed, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn rolling_window_cap_does_not_count_old_attestations() {
+        // Attestations older than ATTESTATION_CAP_WINDOW_EPOCHS do not count
+        // against the cap. After the window passes, the attester's budget resets.
+        // Use 1-epoch-duration store and advance past the window.
+        let mut store = IdentityStore::with_epoch_ms(0, 1);
+        register_and_verify(&mut store, "attester", "qcb1attester");
+
+        // Fill the cap at epoch 0
+        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+            let id = format!("claimant{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
+
+        // Advance past the window: current epoch = CAP_WINDOW + 1, so all
+        // attestations from epoch 0 are now outside the [window_start, now] range.
+        // Keep the attester lively so liveness enforcement doesn't downgrade them.
+        let target_ms = (ATTESTATION_CAP_WINDOW_EPOCHS + 1) as u64;
+        store.stay_lively("attester", target_ms);
+        store.advance_epoch(target_ms);
+
+        // A new attestation should now be allowed — old ones expired out of window
+        register_provisional(&mut store, "fresh", "qcb1fresh");
+        let result = store.attest("fresh", "attester");
+        assert!(
+            result.is_ok(),
+            "attestations older than the window must not count against the cap, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn rolling_window_cap_counts_only_active_attestations_in_window() {
+        // A mix: some active in window, some revoked, some old. Only active
+        // in-window ones consume the budget.
+        let mut store = IdentityStore::with_epoch_ms(0, 1);
+        register_and_verify(&mut store, "attester", "qcb1attester");
+
+        // Attest two at epoch 0, then advance past the window for one of them
+        register_provisional(&mut store, "old", "qcb1old");
+        store.attest("old", "attester").unwrap();            // epoch 0 — will be old
+
+        register_provisional(&mut store, "revoked", "qcb1revoked");
+        store.attest("revoked", "attester").unwrap();        // epoch 0 — will be revoked
+
+        // Advance past window; "old" is now expired.
+        // Keep the attester lively so liveness enforcement doesn't downgrade them.
+        let mid_ms = (ATTESTATION_CAP_WINDOW_EPOCHS + 1) as u64;
+        store.stay_lively("attester", mid_ms);
+        store.advance_epoch(mid_ms);
+        store.revoke_attestation("attester", "revoked").unwrap(); // revoked at epoch > 0
+
+        // Now attest two more in the new window (epochs > window_start)
+        for i in 0..2 {
+            let id = format!("fresh{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
+
+        // Budget: 2 active in window (fresh0, fresh1). One more is allowed.
+        register_provisional(&mut store, "third_fresh", "qcb1third");
+        let result = store.attest("third_fresh", "attester");
+        assert!(result.is_ok(), "expected cap budget available, got {:?}", result);
+
+        // Fourth in the current window should be blocked
+        register_provisional(&mut store, "fourth_fresh", "qcb1fourth");
+        let blocked = store.attest("fourth_fresh", "attester");
+        assert!(
+            matches!(blocked, Err(IdentityError::AttestationCapExceeded(..))),
+            "fourth in-window active attestation must be blocked, got {:?}", blocked
+        );
+    }
+
+    #[test]
+    fn identity_store_with_attestation_records_survives_json_roundtrip() {
+        // Guard against regression: IdentityStore is serialized as JSON by the
+        // node (identity.json snapshot). A HashMap<(String,String), _> key fails
+        // JSON serialization (tuple keys become arrays, which JSON rejects as
+        // object keys). This test ensures the string-keyed map survives a
+        // serde_json roundtrip so node restarts don't lose attestation history.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+        store.attest("bob", "alice").unwrap();
+
+        let json = serde_json::to_string(&store)
+            .expect("IdentityStore must serialize to JSON without error");
+        let restored: IdentityStore = serde_json::from_str(&json)
+            .expect("IdentityStore must deserialize from JSON without error");
+
+        let records = restored.attestations_by_attester("alice");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].attester_id, "alice");
+        assert_eq!(records[0].attested_id, "bob");
+        assert_eq!(records[0].status, AttestationStatus::Active);
+    }
+
+    #[test]
+    fn attestation_record_epoch_is_fixed_across_revocation() {
+        // Phase B relies on record.epoch staying fixed (the epoch the attestation
+        // was made) so it can correctly compute whether the attestation falls within
+        // the 90-day rolling window at cap-check time. Revocation must not mutate
+        // the epoch field — only revocation_epoch is set.
+        let mut store = IdentityStore::with_epoch_ms(0, 1000);
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        // Attest at epoch 2
+        store.advance_epoch(1001);
+        store.advance_epoch(2002);
+        store.attest("bob", "alice").unwrap();
+        let attest_epoch = store.attestations_by_attester("alice")[0].epoch;
+        assert_eq!(attest_epoch, 2);
+
+        // Advance clock and revoke at epoch 5
+        store.advance_epoch(3003);
+        store.advance_epoch(4004);
+        store.advance_epoch(5005);
+        store.revoke_attestation("alice", "bob").unwrap();
+
+        let records = store.attestations_by_attester("alice");
+        assert_eq!(records[0].epoch, 2,
+            "revocation must not change record.epoch — it stays as the attestation epoch");
+        assert_eq!(records[0].revocation_epoch, Some(5),
+            "revocation_epoch must record when the revocation happened");
     }
 }
