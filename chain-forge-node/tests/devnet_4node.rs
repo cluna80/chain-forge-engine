@@ -82,7 +82,17 @@ fn node_binary() -> PathBuf {
     let exe = format!("chain-forge-node{}", std::env::consts::EXE_SUFFIX);
     let debug   = target.join("debug").join(&exe);
     let release = target.join("release").join(&exe);
-    if release.exists() { release } else { debug }
+
+    // Prefer the binary that was most recently modified so that a freshly-built
+    // debug binary (e.g. after `cargo build -p chain-forge-node`) is used even
+    // when an older release binary also exists.  Fall back to whichever exists.
+    match (debug.metadata().and_then(|m| m.modified()),
+           release.metadata().and_then(|m| m.modified())) {
+        (Ok(dt), Ok(rt)) => if dt >= rt { debug } else { release },
+        (Ok(_), Err(_))  => debug,
+        (Err(_), Ok(_))  => release,
+        (Err(_), Err(_)) => debug, // neither exists — return debug so the skip message names a path
+    }
 }
 
 fn genesis_path() -> PathBuf {
