@@ -104,6 +104,13 @@ impl GasModel {
                     // crosses quorum and triggers a tier upgrade isn't
                     // meaningfully heavier at Phase 0/1 gas-metering precision.
                     TxBody::Attest { .. }            => op_multiplier * 2,
+                    // Attestation guard Phase D operations.
+                    TxBody::RevokeAttestation { .. }   => op_multiplier * 2,
+                    TxBody::ReportSuspectedSybil { .. }=> op_multiplier * 2,
+                    // ConfirmSybil walks all attestation records for an identity --
+                    // heavier than a single write.
+                    TxBody::ConfirmSybil { .. }        => op_multiplier * 8,
+                    TxBody::ReverseSybil { .. }        => op_multiplier * 8,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -174,6 +181,35 @@ pub enum TxBody {
     /// Revoke a previously sponsored agent.
     RevokeAgent {
         agent_address: String,
+    },
+    /// Revoke a previously submitted attestation (Phase D attestation guard).
+    /// The sender revokes their own attestation of `attested_id`.
+    /// Incurs a CS revocation cost (REVOCATION_COST_BPS) and frees the
+    /// sender's rolling-window slot so they can attest again within the
+    /// same 90-epoch window.
+    RevokeAttestation {
+        attested_id: String,
+    },
+    /// Coordinator-only: confirm that `sybil_id` is a sybil (Phase C / D).
+    /// Walks all active attestation records for `sybil_id` and applies a CS
+    /// penalty to each attester (ATTEST_PENALTY_RATE_BPS). Attesters who
+    /// self-reported before this confirmation receive a reduced penalty
+    /// (SELF_REPORT_PENALTY_REDUCTION_BPS applied).
+    ConfirmSybil {
+        sybil_id: String,
+    },
+    /// Coordinator-only: reverse a prior sybil confirmation (Phase C / D).
+    /// Credits back the CS penalty that was applied on ConfirmSybil and
+    /// un-penalizes the attestation records. The reversal is logged.
+    ReverseSybil {
+        sybil_id: String,
+    },
+    /// Report a suspected sybil before the coordinator acts (Phase D
+    /// self-report exemption). The sender must have an active attestation for
+    /// `suspected_id`. If the coordinator later confirms the sybil, the
+    /// sender's penalty is reduced by SELF_REPORT_PENALTY_REDUCTION_BPS.
+    ReportSuspectedSybil {
+        suspected_id: String,
     },
 }
 
@@ -271,6 +307,10 @@ impl Transaction {
             TxBody::RedirectToUbiPool { .. }          => 16,
             TxBody::SponsorAgent { agent_address }    => agent_address.len() + 8,
             TxBody::RevokeAgent  { agent_address }    => agent_address.len() + 8,
+            TxBody::RevokeAttestation { attested_id }    => attested_id.len() + 8,
+            TxBody::ConfirmSybil { sybil_id }            => sybil_id.len() + 8,
+            TxBody::ReverseSybil { sybil_id }            => sybil_id.len() + 8,
+            TxBody::ReportSuspectedSybil { suspected_id }=> suspected_id.len() + 8,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -364,6 +404,58 @@ impl Transaction {
             sender: sender.to_string(),
             nonce,
             body: TxBody::SponsorAgent { agent_address: agent_address.to_string() },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Revoke a previous attestation (Phase D attestation guard).
+    pub fn revoke_attestation(id: &str, sender: &str, attested_id: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::RevokeAttestation { attested_id: attested_id.to_string() },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Coordinator-only: confirm `sybil_id` as a sybil (Phase D attestation guard).
+    pub fn confirm_sybil(id: &str, coordinator: &str, sybil_id: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: coordinator.to_string(),
+            nonce,
+            body: TxBody::ConfirmSybil { sybil_id: sybil_id.to_string() },
+            gas_limit: 200_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Coordinator-only: reverse a prior sybil confirmation (Phase D attestation guard).
+    pub fn reverse_sybil(id: &str, coordinator: &str, sybil_id: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: coordinator.to_string(),
+            nonce,
+            body: TxBody::ReverseSybil { sybil_id: sybil_id.to_string() },
+            gas_limit: 200_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Self-report a suspected sybil before coordinator confirmation (Phase D).
+    pub fn report_suspected_sybil(id: &str, sender: &str, suspected_id: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::ReportSuspectedSybil { suspected_id: suspected_id.to_string() },
             gas_limit: 50_000,
             signature: vec![],
             public_key: vec![],
@@ -497,7 +589,12 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
     match body {
         TxBody::Transfer { .. } | TxBody::Burn { .. } | TxBody::Custom { .. } => None,
         TxBody::Stake { .. } => Some("staking"),
-        TxBody::RegisterIdentity | TxBody::Attest { .. } => Some("identity"),
+        TxBody::RegisterIdentity
+        | TxBody::Attest { .. }
+        | TxBody::RevokeAttestation { .. }
+        | TxBody::ConfirmSybil { .. }
+        | TxBody::ReverseSybil { .. }
+        | TxBody::ReportSuspectedSybil { .. } => Some("identity"),
         TxBody::ClaimUbi { .. } | TxBody::RedirectToUbiPool { .. } => Some("cirfi"),
         TxBody::SponsorAgent { .. } | TxBody::RevokeAgent { .. } => Some("agents"),
     }
@@ -797,6 +894,88 @@ impl Executor {
                     Err(format!("identity {} not found", tx.sender))
                 }
             }
+
+            // -- Attestation guard Phase D tx types ---------------------------
+
+            TxBody::RevokeAttestation { attested_id } => {
+                // The identity crate enforces all rules (active record exists,
+                // not already revoked) and returns the CS cost signal.
+                identity.revoke_attestation(&tx.sender, attested_id)
+                    .map(|cost| {
+                        // cost.cost_bps signals how much CS to deduct.
+                        // Phase 0 / pilot: we emit the cost as an event so the
+                        // coordinator dashboard can track it. Full CS deduction
+                        // from the state store is wired up in a later phase when
+                        // the CS ledger is on-chain. For now the event is the
+                        // observable signal.
+                        events.push(format!(
+                            "revoke_attestation: {} revoked attestation of {} \
+                             (cs_cost_bps={})",
+                            cost.attester_id, cost.attested_id, cost.cost_bps
+                        ));
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::ConfirmSybil { sybil_id } => {
+                // Only the coordinator can call this. During pilot phase the
+                // coordinator_id field on IdentityStore is the gating key;
+                // if not set, the call returns NotCoordinator.
+                identity.confirm_sybil(&tx.sender, sybil_id)
+                    .map(|penalized_ids| {
+                        // penalized_ids: Vec<String> of attester addresses that
+                        // received CS penalties. Emitted so the coordinator
+                        // dashboard can reconstruct the penalty ledger.
+                        if penalized_ids.is_empty() {
+                            events.push(format!(
+                                "confirm_sybil: {} confirmed as sybil \
+                                 (no active attesters to penalize)",
+                                sybil_id
+                            ));
+                        } else {
+                            events.push(format!(
+                                "confirm_sybil: {} confirmed as sybil, \
+                                 {} attester(s) penalized: {}",
+                                sybil_id,
+                                penalized_ids.len(),
+                                penalized_ids.join(", ")
+                            ));
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::ReverseSybil { sybil_id } => {
+                // Coordinator reverses a prior sybil confirmation. CS penalties
+                // are credited back and attestation records un-penalized.
+                identity.reverse_sybil(&tx.sender, sybil_id)
+                    .map(|restored_ids| {
+                        events.push(format!(
+                            "reverse_sybil: {} sybil confirmation reversed, \
+                             {} attester(s) restored: {}",
+                            sybil_id,
+                            restored_ids.len(),
+                            restored_ids.join(", ")
+                        ));
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::ReportSuspectedSybil { suspected_id } => {
+                // Self-report: attester flags an identity they vouched for as
+                // suspected sybil. If the coordinator later confirms, the
+                // attester receives a 50% penalty reduction. The sender must
+                // have an active attestation for suspected_id.
+                identity.report_suspected_sybil(&tx.sender, suspected_id)
+                    .map(|_| {
+                        events.push(format!(
+                            "report_suspected_sybil: {} flagged {} as suspected sybil \
+                             (self-report logged, awaiting coordinator confirmation)",
+                            tx.sender, suspected_id
+                        ));
+                    })
+                    .map_err(|e| e.to_string())
+            }
         };
 
         if result.is_ok() {
@@ -915,7 +1094,11 @@ impl Executor {
             | TxBody::ClaimUbi { .. }
             | TxBody::RedirectToUbiPool { .. }
             | TxBody::SponsorAgent { .. }
-            | TxBody::RevokeAgent { .. } => {
+            | TxBody::RevokeAgent { .. }
+            | TxBody::RevokeAttestation { .. }
+            | TxBody::ConfirmSybil { .. }
+            | TxBody::ReverseSybil { .. }
+            | TxBody::ReportSuspectedSybil { .. } => {
                 Err("identity-gated transaction requires identity-aware executor".to_string())
             }
         };
@@ -1733,6 +1916,11 @@ mod tests {
             TxBody::ClaimUbi { identity_id: "x".into() },
             TxBody::SponsorAgent { agent_address: "x".into() },
             TxBody::RevokeAgent { agent_address: "x".into() },
+            // Phase D attestation guard tx types
+            TxBody::RevokeAttestation { attested_id: "x".into() },
+            TxBody::ConfirmSybil { sybil_id: "x".into() },
+            TxBody::ReverseSybil { sybil_id: "x".into() },
+            TxBody::ReportSuspectedSybil { suspected_id: "x".into() },
         ];
         for body in bodies {
             let m = required_module(&body).expect("gated tx types name their module");

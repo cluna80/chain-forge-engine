@@ -208,6 +208,43 @@ pub async fn serve(
                             Some(t) => http_200_json(&serde_json::to_string(t).unwrap_or_default()),
                             None    => http_404(),
                         }
+                    } else if first_line.starts_with("GET /api/identity/") {
+                        // GET /api/identity/{address} — identity record for an address.
+                        // Returns the explorer-visible identity state: verification tier
+                        // and charm data synced from IdentityStore on every committed block.
+                        // Full attestation history lives in the identity crate; this endpoint
+                        // exposes the summary that survived the ExplorerState sync.
+                        let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                        let address = path.trim_start_matches("/api/identity/");
+                        let ex = explorer.lock().unwrap();
+                        match ex.accounts.get(address) {
+                            Some(a) => {
+                                let is_registered = a.tier.is_some();
+                                let resp = serde_json::json!({
+                                    "address":       address,
+                                    "registered":    is_registered,
+                                    "tier":          a.tier,
+                                    "exemption_days": a.exemption_days,
+                                    // attestation_count and attester_list are
+                                    // available via the identity crate's IdentityStore
+                                    // directly; ExplorerState carries tier/charm only.
+                                    "note": "full attestation history available via IdentityStore"
+                                });
+                                http_200_json(&resp.to_string())
+                            }
+                            None => {
+                                // Address not found in explorer — either never registered
+                                // or node hasn't committed a block since registration.
+                                let resp = serde_json::json!({
+                                    "address":    address,
+                                    "registered": false,
+                                    "tier":       serde_json::Value::Null,
+                                    "exemption_days": 0,
+                                    "note": "address not found in explorer state"
+                                });
+                                http_200_json(&resp.to_string())
+                            }
+                        }
                     } else if first_line.starts_with("GET /api/accounts/") {
                         // GET /api/accounts/{address} — balance, nonce, charm state
                         let path = first_line.split_whitespace().nth(1).unwrap_or("");
@@ -321,5 +358,23 @@ mod tests {
         assert_eq!(content_length(b"POST / HTTP/1.1\r\ncontent-length: 42\r\n"), 42);
         assert_eq!(content_length(b"GET /api/status HTTP/1.1\r\n"), 0);
         assert!(request_complete(b"GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n"));
+    }
+
+    #[test]
+    fn identity_path_strips_prefix_correctly() {
+        // Ensure the identity endpoint parses the address segment correctly.
+        let first_line = "GET /api/identity/qcb1alice HTTP/1.1";
+        let path = first_line.split_whitespace().nth(1).unwrap_or("");
+        let address = path.trim_start_matches("/api/identity/");
+        assert_eq!(address, "qcb1alice");
+    }
+
+    #[test]
+    fn identity_route_does_not_match_accounts_prefix() {
+        // /api/identity/ must not be swallowed by /api/accounts/ logic.
+        // (The if-else order in serve() puts identity before accounts.)
+        let first_line = "GET /api/identity/qcb1bob HTTP/1.1";
+        assert!(first_line.starts_with("GET /api/identity/"));
+        assert!(!first_line.starts_with("GET /api/accounts/"));
     }
 }

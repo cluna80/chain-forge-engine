@@ -1,8 +1,16 @@
 # QCB Attestation Guard Design
 
-**Status:** Draft — provisional pilot parameters, subject to revision from pilot data  
-**Relates to:** Open Question 24 (whitepaper), Section 3.3 (PoP), Section 4 (Identity)  
+**Status:** Implemented through Phase D — `chain-forge-identity` crate, September 2026 (65 tests passing). Pilot parameters compiled as constants; governance-tunable parameterization deferred to Phase 1.  
+**Relates to:** Section 3.3 (PoP), Section 4 (Identity), Section 11 (Phase 0 checkpoint)  
 **Not a whitepaper amendment.** Policy parameters are tunable; this doc is the input to a future whitepaper amendment once pilot data is in.
+
+**Implementation surface (as of September 2026):**
+- `chain-forge-identity/src/lib.rs` — attestation guard Phases A–D
+- `chain-forge-execution/src/lib.rs` — `TxBody` variants: `RevokeAttestation`, `ConfirmSybil`, `ReverseSybil`, `ReportSuspectedSybil`
+- `chain-forge-core/src/lib.rs` — `GenesisConfig.attestation_coordinator: Option<String>`
+- `chain-forge-node/src/node.rs` — coordinator wiring at node startup from genesis config
+- `chain-forge-node/src/api.rs` — `GET /api/identity/{address}` REST endpoint
+- `genesis-3node.json` — `attestation_coordinator: "qcb1alice"` (pilot coordinator, Alice validator)
 
 ---
 

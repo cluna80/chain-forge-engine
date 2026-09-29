@@ -74,5 +74,6 @@
       "balance": "5000000",
       "role": "validator"
     }
-  ]
+  ],
+  "attestation_coordinator": "qcb1alice"
 }

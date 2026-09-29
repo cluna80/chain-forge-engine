@@ -484,6 +484,17 @@ impl Node {
             let _ = engine.update_validator_set(vs);
         }
 
+        // Pilot-phase attestation coordinator. If genesis names one, wire it
+        // into the identity store so ConfirmSybil / ReverseSybil txs work.
+        // Without this, both tx types return NotCoordinator immediately.
+        // Named temporary centralization; see QCB-Attestation-Guard-Design.md.
+        if let Some(ref coord) = genesis.attestation_coordinator {
+            identity.set_coordinator(Some(coord.clone()));
+            info!(coordinator = %coord, "attestation coordinator configured from genesis");
+        } else {
+            info!("no attestation_coordinator in genesis — ConfirmSybil/ReverseSybil disabled until set");
+        }
+
         let cirfi   = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
         let slasher = SlashingModule::with_qcb_defaults();
 
@@ -1701,8 +1712,12 @@ impl Node {
                     chain_forge_execution::TxBody::Attest { .. }            => "attest",
                     chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
                     chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
-                    chain_forge_execution::TxBody::SponsorAgent { .. }      => "sponsor_agent",
-                    chain_forge_execution::TxBody::RevokeAgent { .. }       => "revoke_agent",
+                    chain_forge_execution::TxBody::SponsorAgent { .. }         => "sponsor_agent",
+                    chain_forge_execution::TxBody::RevokeAgent { .. }          => "revoke_agent",
+                    chain_forge_execution::TxBody::RevokeAttestation { .. }    => "revoke_attestation",
+                    chain_forge_execution::TxBody::ConfirmSybil { .. }         => "confirm_sybil",
+                    chain_forge_execution::TxBody::ReverseSybil { .. }         => "reverse_sybil",
+                    chain_forge_execution::TxBody::ReportSuspectedSybil { .. } => "report_suspected_sybil",
                 };
                 (t.id.clone(), t.sender.clone(), kind.to_string())
             })
@@ -2018,8 +2033,12 @@ impl Node {
                     chain_forge_execution::TxBody::Attest { .. }            => "attest",
                     chain_forge_execution::TxBody::ClaimUbi { .. }          => "claim_ubi",
                     chain_forge_execution::TxBody::RedirectToUbiPool { .. } => "ubi_redirect",
-                    chain_forge_execution::TxBody::SponsorAgent { .. }      => "sponsor_agent",
-                    chain_forge_execution::TxBody::RevokeAgent { .. }       => "revoke_agent",
+                    chain_forge_execution::TxBody::SponsorAgent { .. }         => "sponsor_agent",
+                    chain_forge_execution::TxBody::RevokeAgent { .. }          => "revoke_agent",
+                    chain_forge_execution::TxBody::RevokeAttestation { .. }    => "revoke_attestation",
+                    chain_forge_execution::TxBody::ConfirmSybil { .. }         => "confirm_sybil",
+                    chain_forge_execution::TxBody::ReverseSybil { .. }         => "reverse_sybil",
+                    chain_forge_execution::TxBody::ReportSuspectedSybil { .. } => "report_suspected_sybil",
                 };
                 (t.id.clone(), t.sender.clone(), kind.to_string())
             })

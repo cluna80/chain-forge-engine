@@ -224,6 +224,13 @@ pub struct GenesisConfig {
     pub modules:         Vec<String>,
     pub custom_modules:  Vec<String>,
     pub genesis_accounts: Vec<GenesisAccount>,
+    /// Pilot-phase sybil coordinator: the address authorized to call
+    /// ConfirmSybil and ReverseSybil on-chain. None means coordinator
+    /// authority is not set — attestation guard Phases C/D will reject
+    /// ConfirmSybil and ReverseSybil until this is configured.
+    /// Temporary centralization: see QCB-Attestation-Guard-Design.md §Coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_coordinator: Option<String>,
 }
 
 // -- Modules ----------------------------------------------------------------------
