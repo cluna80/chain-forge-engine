@@ -483,9 +483,68 @@ impl Node {
             let _ = engine.update_validator_set(vs);
         }
 
-        let cirfi             = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
-        let slasher           = SlashingModule::with_qcb_defaults();
-        let validator_registry = ValidatorRegistry::qcb_devnet();
+        let cirfi   = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
+        let slasher = SlashingModule::with_qcb_defaults();
+
+        // Seed the ValidatorRegistry with genesis validators, gated on
+        // identity verification (Point 1 of the identity integration plan).
+        //
+        // Policy: a genesis validator whose identity fails verify_identity()
+        // is registered as a Candidate but NOT activated — it stays at
+        // voting power 0 with a WARN log. The node does not refuse to start,
+        // because one validator's bad state should not halt the whole chain.
+        // The failure is visible in /api/status via the ValidatorRegistry and
+        // will surface in the per-block PoP refresh. This is the intended
+        // "start inactive, log loudly" policy from the integration design doc.
+        let mut validator_registry = ValidatorRegistry::qcb_devnet();
+        {
+            // Only seed if the identity module is enabled — otherwise there is
+            // no IdentityStore to verify against, and registering validators
+            // without any PoP check would bypass the personhood gate entirely.
+            if modules.identity {
+                let epoch = identity.clock.current_epoch;
+                for acct in genesis.genesis_accounts.iter()
+                    .filter(|a| a.role == "validator")
+                {
+                    let id = &acct.address;
+
+                    // Register as Candidate first (no-op if already present).
+                    validator_registry.register_genesis_validator(id);
+
+                    // Verify identity against IdentityStore (Integration Point 1).
+                    // Only if verification succeeds does the validator enter Active.
+                    // verify_identity() returns () on success — we look up the
+                    // resulting tier from the record to pass to confirm_pop.
+                    let genesis_att = chain_forge_identity::PopAttestation::genesis(id, epoch);
+                    match identity.verify_identity(id, genesis_att) {
+                        Ok(()) => {
+                            // Fetch the tier the identity store assigned after verification.
+                            let tier = identity.get(id)
+                                .map(|r| r.charm.tier.clone())
+                                .unwrap_or(chain_forge_identity::VerificationTier::Provisional);
+                            if let Err(e) = validator_registry.confirm_pop(id, tier, epoch) {
+                                warn!(
+                                    validator = id,
+                                    error     = %e,
+                                    "genesis validator confirm_pop failed after verify_identity"
+                                );
+                            } else {
+                                info!(validator = id, "genesis validator PoP confirmed — Active");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                validator = id,
+                                error     = %e,
+                                "genesis validator identity verification failed — \
+                                 staying Candidate (pop_verified=false, voting power 0)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let tx_queue: SharedTxQueue = Arc::new(Mutex::new(Vec::new()));
 
         Ok(Self {
@@ -1648,6 +1707,46 @@ impl Node {
 
         self.identity.advance_epoch(now_ms);
 
+        // Integration Point 3 (Push): after advancing the epoch, sync the
+        // ValidatorRegistry with any identity lapses that just happened.
+        //
+        // advance_epoch() calls lapse() on any Verified/Established identity
+        // that hasn't been active for LIVENESS_EPOCH_WINDOW epochs, dropping
+        // them to Provisional. The ValidatorRegistry is a separate module that
+        // doesn't hear about this unless we tell it. Without this call, a
+        // lapsed validator stays Active with full consensus power — exactly the
+        // attack Section 3.3's personhood-weighting is supposed to prevent.
+        //
+        // We use Push: epoch advance fires here, we immediately reconcile the
+        // registry. Pull (querying at every round start) is the
+        // production-hardening path but Push is simpler and equally correct.
+        //
+        // revoke_pop() is idempotent: calling it on an already-Candidate
+        // validator is a no-op, so racing epoch advances or duplicate calls
+        // are safe.
+        {
+            let epoch = self.identity.clock.current_epoch;
+            let validator_ids: Vec<String> = self.validator_registry
+                .all_validators()
+                .into_iter()
+                .map(|r| r.id.0.clone())
+                .collect();
+            for vid in &validator_ids {
+                let still_verified = self.identity.get(vid)
+                    .map(|r| r.charm.tier.grants_consensus())
+                    .unwrap_or(false);
+                if !still_verified {
+                    if let Err(e) = self.validator_registry.revoke_pop(vid, epoch) {
+                        // NotFound is fine (validator not in registry); other
+                        // errors are unexpected — log but don't crash the node.
+                        if !matches!(e, chain_forge_validators::ValidatorError::NotFound(_)) {
+                            warn!(validator = vid, error = %e, "revoke_pop failed after epoch advance");
+                        }
+                    }
+                }
+            }
+        }
+
         // Validator participation = on-chain activity for CirFi yield eligibility.
         // Every validator who signed a precommit in this block's commit certificate
         // gets their activity stamped for this epoch. This means validators earn
@@ -1924,6 +2023,32 @@ impl Node {
             .collect();
 
         self.identity.advance_epoch(now_ms);
+
+        // Integration Point 3 (Push) — same reconciliation as the multi-node
+        // commit path: after advancing the epoch, revoke ValidatorRegistry
+        // entries for any identity that just lapsed. See the multi-node path
+        // above for the full design comment.
+        {
+            let epoch = self.identity.clock.current_epoch;
+            let validator_ids: Vec<String> = self.validator_registry
+                .all_validators()
+                .into_iter()
+                .map(|r| r.id.0.clone())
+                .collect();
+            for vid in &validator_ids {
+                let still_verified = self.identity.get(vid)
+                    .map(|r| r.charm.tier.grants_consensus())
+                    .unwrap_or(false);
+                if !still_verified {
+                    if let Err(e) = self.validator_registry.revoke_pop(vid, epoch) {
+                        if !matches!(e, chain_forge_validators::ValidatorError::NotFound(_)) {
+                            warn!(validator = vid, error = %e, "revoke_pop failed after epoch advance");
+                        }
+                    }
+                }
+            }
+        }
+
         let exec_result = self.executor.execute_block_with_identity(
             height, txs, &mut self.state, &mut self.identity, &mut self.cirfi, now_ms,
         );

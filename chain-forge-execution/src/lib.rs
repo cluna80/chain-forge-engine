@@ -802,6 +802,16 @@ impl Executor {
         if result.is_ok() {
             advance_nonce_if_not_already(tx, state);
             bind_key_if_unbound(&self.config, tx, state);
+            // Every successfully committed transaction is on-chain activity.
+            // Transfer and Stake already call this inside their match arms (so
+            // the CirFi yield comment lives next to the transfer logic), but
+            // all other tx types — RegisterIdentity, Attest, SponsorAgent,
+            // RevokeAgent, ClaimUbi, RedirectToUbiPool — also count: submitting
+            // ANY committed tx proves liveness for this epoch. Duplicate calls
+            // to record_activity_by_address are idempotent (only the first
+            // write per epoch sticks), so the double-call for Transfer/Stake
+            // is harmless.
+            identity.record_activity_by_address(&tx.sender);
         }
 
         match result {

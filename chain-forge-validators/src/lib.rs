@@ -536,6 +536,53 @@ impl ValidatorRegistry {
         Ok(())
     }
 
+    /// Register a genesis validator without the full stake/key requirements.
+    ///
+    /// Genesis validators are the founding set whose identity was established
+    /// during chain genesis. They don't yet hold real cryptographic key bundles
+    /// (those are added as validators come online) and they receive their stake
+    /// from the genesis state rather than a bonding transaction, so the normal
+    /// registration path — which enforces stake threshold and key validity —
+    /// would block them. This method inserts a minimal Candidate record so
+    /// `confirm_pop` can activate them once their identity is verified.
+    ///
+    /// No-ops if the validator is already registered (idempotent, safe to call
+    /// from genesis seeding loops that may run more than once).
+    pub fn register_genesis_validator(&mut self, id: &str) {
+        if self.validators.contains_key(id) {
+            return; // already registered, no-op
+        }
+        let validator_id = ValidatorId(id.to_string());
+        let record = ValidatorRecord {
+            id:                validator_id.clone(),
+            keys:              KeyBundle {
+                consensus_pubkey: String::new(),
+                account_address:  id.to_string(),
+                pqc_pubkey:       None,
+                scheme:           "genesis-stub".to_string(),
+            },
+            commission:        Commission {
+                rate_bps:           0,
+                max_rate_bps:       2000,
+                last_changed_epoch: 0,
+            },
+            bonded_uqcb:       self.min_stake_uqcb, // treated as genesis-funded
+            stake_tier:        StakeTier::from_bonded(self.min_stake_uqcb),
+            status:            ValidatorStatus::Candidate,
+            pop_verified:      false,
+            verification_tier: None,
+            registered_epoch:  0,
+            last_status_epoch: 0,
+            blocks_proposed:   0,
+            blocks_missed:     0,
+            jail_records:      Vec::new(),
+            moniker:           id.to_string(),
+            website:           None,
+        };
+        self.validators.insert(id.to_string(), record);
+        tracing::info!(id, "genesis validator registered as Candidate");
+    }
+
     // -- PoP verification gate ------------------------------------------------
 
     /// Called by the identity layer when a validator's PoP is confirmed.
