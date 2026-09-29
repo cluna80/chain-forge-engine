@@ -468,11 +468,28 @@ async fn adversarial_equivocation_over_gossip() {
     let balance_after = balance_of(ports.alice_api, "qcb1alice");
     eprintln!("   alice balance after:  {balance_after:?} uqcb");
 
-    // ── Hard assertion: log evidence that equivocation was detected ────────────
-    let alice_log = std::fs::read_to_string(log_dir.join("qcb1alice.log"))
-        .unwrap_or_default();
-    let equivoc_detected = alice_log.contains("equivocation detected")
-        || alice_log.contains("tombstone");
+    // ── Hard assertion: log evidence that equivocation was detected ──────────
+    //
+    // We search ALL four node logs for a line that matches ALL THREE of:
+    //   1. "equivocation detected" or "tombstone" — the detection keyword
+    //   2. "qcb1alice"   — the validator the attacker impersonated
+    //   3. attack_height — so startup-misfire lines (height=0, KNOWN_ISSUES §2)
+    //                      don't produce a false-green
+    //
+    // A loose substring match on "equivocation detected" alone would pass on the
+    // startup-misfire qcb1bob/qcb1dave height=0 lines that are always present.
+    let height_str = attack_height.to_string();
+    let equivoc_detected = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]
+        .iter()
+        .any(|node| {
+            let log = std::fs::read_to_string(log_dir.join(format!("{node}.log")))
+                .unwrap_or_default();
+            log.lines().any(|line| {
+                (line.contains("equivocation detected") || line.contains("tombstone"))
+                    && line.contains("qcb1alice")
+                    && line.contains(&height_str)
+            })
+        });
 
     println!();
     println!("── Result ───────────────────────────────────────────────────────────");
@@ -485,10 +502,12 @@ async fn adversarial_equivocation_over_gossip() {
 
     assert!(
         equivoc_detected,
-        "equivocation NOT detected in qcb1alice.log — votes may have landed \
-         on already-committed height. attack_height={attack_height}"
+        "equivocation NOT detected for qcb1alice at height={attack_height} in any node log \
+         (startup-misfire lines at height=0 do not count). \
+         Votes may have landed on an already-committed height."
     );
-    println!("   PASS: 'equivocation detected' / tombstone confirmed in Alice's log.");
+    println!("   PASS: equivocation detected for qcb1alice at height={attack_height} \
+              (confirmed in node logs, not a startup-misfire line).");
 
     // Slash-balance check is informational: BME burn may fail if penalty > stake
     // (see KNOWN_ISSUES.md §1).
