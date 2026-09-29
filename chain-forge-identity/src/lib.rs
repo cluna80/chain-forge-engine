@@ -75,6 +75,23 @@ pub enum IdentityError {
     #[error("attestation from {0} for {1} is penalized and cannot be revoked; use reverse_sybil to undo the confirmation first")]
     AttestationAlreadyPenalized(String, String),
 
+    // -- Phase C errors -------------------------------------------------------
+
+    #[error("coordinator not configured; call set_coordinator before confirm_sybil / reverse_sybil")]
+    CoordinatorNotSet,
+
+    #[error("caller {0} is not the configured coordinator")]
+    NotCoordinator(String),
+
+    #[error("identity {0} is not registered")]
+    IdentityNotFound(String),
+
+    #[error("identity {0} has already been confirmed as a sybil")]
+    AlreadyConfirmedSybil(String),
+
+    #[error("sybil confirmation for identity {0} not found; cannot reverse")]
+    SybilConfirmationNotFound(String),
+
     #[error("internal identity error: {0}")]
     Internal(String),
 }
@@ -444,6 +461,34 @@ fn attestation_record_key(attester_id: &str, attested_id: &str) -> String {
     format!("{}\x00{}", attester_id, attested_id)
 }
 
+// -- Sybil confirmation log (Phase C) -----------------------------------------
+
+/// An immutable log entry created when the coordinator confirms a sybil.
+///
+/// Written by `confirm_sybil`, read by `reverse_sybil`. The log is the
+/// audit trail for CS penalties: it records who was penalized and why, so
+/// that reversals can undo exactly the right penalties and no others.
+///
+/// The `reversed` flag is set true by `reverse_sybil`; the entry is kept
+/// rather than deleted so the reversal itself is auditable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SybilConfirmationLog {
+    /// The identity confirmed as a sybil.
+    pub sybil_id: String,
+    /// The coordinator who issued the confirmation.
+    pub coordinator_id: String,
+    /// The epoch in which the confirmation was issued.
+    pub confirmed_epoch: u64,
+    /// The attester IDs whose records were penalized (Active -> Penalized).
+    /// Revoked-at-time-of-confirmation attestations are NOT included —
+    /// the attester already paid the revocation cost and exited cleanly.
+    pub penalized_attesters: Vec<String>,
+    /// Whether this confirmation has been reversed by `reverse_sybil`.
+    pub reversed: bool,
+    /// If reversed: the epoch in which it was reversed.
+    pub reversal_epoch: Option<u64>,
+}
+
 // -- Decay exemption credits --------------------------------------------------
 
 /// Tracks how many days of demurrage exemption an identity has earned
@@ -797,7 +842,15 @@ pub struct IdentityStore {
     /// Phase C (pilot-phase centralization): the coordinator identity ID.
     /// None = coordinator not yet configured; Some(id) = coordinator is active.
     /// Required for confirm_sybil and reverse_sybil calls.
+    /// This is a named temporary centralization — see QCB-Attestation-Guard-Design.md,
+    /// "Pilot-Phase Centralization" section. Migrates to on-chain governance post-pilot.
     pub coordinator_id: Option<String>,
+    /// Phase C: audit log of sybil confirmations and their reversals.
+    ///
+    /// Key: sybil identity ID. One entry per confirmed sybil. Reversed entries
+    /// are kept (reversed=true) for auditability. This map is append-only from
+    /// the coordinator's perspective; entries are never deleted.
+    pub(crate) sybil_confirmations: HashMap<String, SybilConfirmationLog>,
 }
 
 impl IdentityStore {
@@ -808,6 +861,7 @@ impl IdentityStore {
             clock:      UbiClock::new(genesis_time_ms),
             attestation_records: HashMap::new(),
             coordinator_id: None,
+            sybil_confirmations: HashMap::new(),
         }
     }
 
@@ -819,6 +873,7 @@ impl IdentityStore {
             clock:      UbiClock::with_epoch_duration_ms(genesis_time_ms, epoch_duration_ms),
             attestation_records: HashMap::new(),
             coordinator_id: None,
+            sybil_confirmations: HashMap::new(),
         }
     }
 
@@ -1277,6 +1332,164 @@ impl IdentityStore {
             record.charm.last_attested_epoch =
                 target_epoch.saturating_sub(LIVENESS_EPOCH_WINDOW / 2);
         }
+    }
+
+    // -- Phase C: coordinator role and sybil confirmation ---------------------
+
+    /// Configure the pilot-phase coordinator identity.
+    ///
+    /// The coordinator is the only entity authorized to call `confirm_sybil`
+    /// and `reverse_sybil`. This is a named temporary centralization; see the
+    /// QCB-Attestation-Guard-Design.md "Pilot-Phase Centralization" section.
+    ///
+    /// Can be called multiple times to rotate the coordinator key.
+    /// Passing `None` disables the coordinator role (no sybil confirmations
+    /// possible until a new coordinator is set).
+    pub fn set_coordinator(&mut self, coordinator_id: Option<String>) {
+        self.coordinator_id = coordinator_id;
+    }
+
+    /// Confirm an identity as a sybil (coordinator-only).
+    ///
+    /// Effects:
+    /// - All ACTIVE attestation records for `sybil_id` are marked `Penalized`
+    ///   and `penalty_applied = true`. Revoked records are untouched — the
+    ///   attester already paid the revocation cost and exited cleanly.
+    /// - A `SybilConfirmationLog` entry is written with the list of penalized
+    ///   attesters, for use by `reverse_sybil`.
+    /// - Returns the list of attester IDs that were penalized, so the
+    ///   execution layer can apply the CS deduction to each.
+    ///
+    /// Errors:
+    /// - `CoordinatorNotSet`: no coordinator configured.
+    /// - `NotCoordinator`: caller is not the configured coordinator.
+    /// - `IdentityNotFound`: `sybil_id` is not registered.
+    /// - `AlreadyConfirmedSybil`: already confirmed and not yet reversed.
+    pub fn confirm_sybil(
+        &mut self,
+        caller_id: &str,
+        sybil_id: &str,
+    ) -> IdResult<Vec<String>> {
+        // Auth: only the coordinator can confirm sybils.
+        let coord = self.coordinator_id.clone()
+            .ok_or(IdentityError::CoordinatorNotSet)?;
+        if caller_id != coord {
+            return Err(IdentityError::NotCoordinator(caller_id.to_string()));
+        }
+
+        // The sybil identity must be registered.
+        if !self.records.contains_key(sybil_id) {
+            return Err(IdentityError::IdentityNotFound(sybil_id.to_string()));
+        }
+
+        // Idempotency: cannot re-confirm an already-confirmed sybil.
+        if let Some(log) = self.sybil_confirmations.get(sybil_id) {
+            if !log.reversed {
+                return Err(IdentityError::AlreadyConfirmedSybil(sybil_id.to_string()));
+            }
+        }
+
+        let epoch = self.clock.current_epoch;
+
+        // Walk all attestation records for this identity. Penalize active
+        // ones; skip revoked ones (attester already paid their exit cost).
+        let mut penalized_attesters: Vec<String> = Vec::new();
+        for record in self.attestation_records.values_mut() {
+            if record.attested_id == sybil_id && record.status == AttestationStatus::Active {
+                record.status = AttestationStatus::Penalized;
+                record.penalty_applied = true;
+                penalized_attesters.push(record.attester_id.clone());
+            }
+        }
+
+        // Write the confirmation log entry.
+        self.sybil_confirmations.insert(
+            sybil_id.to_string(),
+            SybilConfirmationLog {
+                sybil_id: sybil_id.to_string(),
+                coordinator_id: coord,
+                confirmed_epoch: epoch,
+                penalized_attesters: penalized_attesters.clone(),
+                reversed: false,
+                reversal_epoch: None,
+            },
+        );
+
+        tracing::info!(
+            sybil_id,
+            coordinator = caller_id,
+            epoch,
+            penalized_count = penalized_attesters.len(),
+            "sybil confirmed; attesters penalized"
+        );
+
+        Ok(penalized_attesters)
+    }
+
+    /// Reverse a sybil confirmation (coordinator-only).
+    ///
+    /// Effects:
+    /// - All `Penalized` attestation records that were penalized in the
+    ///   original `confirm_sybil` call are restored to `Active` with
+    ///   `penalty_applied = false`.
+    /// - The `SybilConfirmationLog` entry is marked `reversed = true`.
+    /// - Returns the list of attester IDs whose penalties were reversed,
+    ///   so the execution layer can credit the CS back.
+    ///
+    /// Errors:
+    /// - `CoordinatorNotSet`: no coordinator configured.
+    /// - `NotCoordinator`: caller is not the configured coordinator.
+    /// - `SybilConfirmationNotFound`: no confirmation exists for `sybil_id`,
+    ///   or the confirmation has already been reversed.
+    pub fn reverse_sybil(
+        &mut self,
+        caller_id: &str,
+        sybil_id: &str,
+    ) -> IdResult<Vec<String>> {
+        // Auth: only the coordinator can reverse.
+        let coord = self.coordinator_id.clone()
+            .ok_or(IdentityError::CoordinatorNotSet)?;
+        if caller_id != coord {
+            return Err(IdentityError::NotCoordinator(caller_id.to_string()));
+        }
+
+        let epoch = self.clock.current_epoch;
+
+        // Find the confirmation log; fail if it doesn't exist or is already reversed.
+        let penalized_attesters = {
+            let log = self.sybil_confirmations.get_mut(sybil_id)
+                .filter(|l| !l.reversed)
+                .ok_or_else(|| IdentityError::SybilConfirmationNotFound(sybil_id.to_string()))?;
+            log.reversed = true;
+            log.reversal_epoch = Some(epoch);
+            log.penalized_attesters.clone()
+        };
+
+        // Restore each penalized record back to Active.
+        for attester_id in &penalized_attesters {
+            let key = attestation_record_key(attester_id, sybil_id);
+            if let Some(record) = self.attestation_records.get_mut(&key) {
+                if record.status == AttestationStatus::Penalized {
+                    record.status = AttestationStatus::Active;
+                    record.penalty_applied = false;
+                }
+            }
+        }
+
+        tracing::info!(
+            sybil_id,
+            coordinator = caller_id,
+            epoch,
+            restored_count = penalized_attesters.len(),
+            "sybil confirmation reversed; attester penalties cleared"
+        );
+
+        Ok(penalized_attesters)
+    }
+
+    /// Look up the sybil confirmation log for an identity (read-only).
+    pub fn sybil_confirmation(&self, identity_id: &str) -> Option<&SybilConfirmationLog> {
+        self.sybil_confirmations.get(identity_id)
     }
 }
 
@@ -2078,5 +2291,189 @@ mod tests {
             "revocation must not change record.epoch — it stays as the attestation epoch");
         assert_eq!(records[0].revocation_epoch, Some(5),
             "revocation_epoch must record when the revocation happened");
+    }
+
+    // -- Phase C: coordinator role and sybil confirmation ---------------------
+
+    #[test]
+    fn confirm_sybil_requires_coordinator_set() {
+        // confirm_sybil must fail when no coordinator is configured.
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        let result = store.confirm_sybil("alice", "sybil");
+        assert!(
+            matches!(result, Err(IdentityError::CoordinatorNotSet)),
+            "expected CoordinatorNotSet, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn confirm_sybil_rejects_non_coordinator_caller() {
+        // Only the configured coordinator can confirm a sybil.
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        let result = store.confirm_sybil("alice", "sybil"); // alice is not coordinator
+        assert!(
+            matches!(result, Err(IdentityError::NotCoordinator(_))),
+            "expected NotCoordinator, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn confirm_sybil_penalizes_active_attesters() {
+        // confirm_sybil marks all active attestation records for the sybil
+        // as Penalized and returns the list of penalized attesters.
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+
+        // Three attesters vouch for the sybil
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_and_verify(&mut store, "bob", "qcb1bob");
+        register_and_verify(&mut store, "carol", "qcb1carol");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+
+        store.attest("sybil", "alice").unwrap();
+        store.attest("sybil", "bob").unwrap();
+        store.attest("sybil", "carol").unwrap();
+
+        let penalized = store.confirm_sybil("coordinator", "sybil").unwrap();
+        assert_eq!(penalized.len(), 3, "all three attesters must be penalized");
+
+        // Every attested record for the sybil is now Penalized
+        let records = store.attestations_for_identity("sybil");
+        assert_eq!(records.len(), 3);
+        for rec in records {
+            assert_eq!(
+                rec.status, AttestationStatus::Penalized,
+                "record for attester {} must be Penalized", rec.attester_id
+            );
+            assert!(rec.penalty_applied, "penalty_applied must be true");
+        }
+
+        // Confirmation log is written
+        let log = store.sybil_confirmation("sybil").expect("log must exist");
+        assert_eq!(log.sybil_id, "sybil");
+        assert!(!log.reversed);
+        assert_eq!(log.penalized_attesters.len(), 3);
+    }
+
+    #[test]
+    fn confirm_sybil_skips_revoked_attestations() {
+        // An attester who revoked before sybil confirmation pays only the
+        // revocation cost — they are NOT included in the penalized list.
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_and_verify(&mut store, "bob", "qcb1bob");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+
+        store.attest("sybil", "alice").unwrap();
+        store.attest("sybil", "bob").unwrap();
+
+        // Bob revokes before the coordinator acts
+        store.revoke_attestation("bob", "sybil").unwrap();
+
+        let penalized = store.confirm_sybil("coordinator", "sybil").unwrap();
+        assert_eq!(penalized, vec!["alice".to_string()],
+            "only alice (active attester) must be penalized; bob revoked cleanly");
+
+        // Alice's record is Penalized; bob's is still Revoked
+        let alice_rec = store.attestation_records
+            .get(&attestation_record_key("alice", "sybil"))
+            .expect("alice's record must exist");
+        assert_eq!(alice_rec.status, AttestationStatus::Penalized);
+
+        let bob_rec = store.attestation_records
+            .get(&attestation_record_key("bob", "sybil"))
+            .expect("bob's record must exist");
+        assert_eq!(bob_rec.status, AttestationStatus::Revoked,
+            "bob's revoked record must remain Revoked, not be retroactively penalized");
+    }
+
+    #[test]
+    fn reverse_sybil_restores_penalized_records() {
+        // reverse_sybil undoes confirm_sybil: records return to Active,
+        // penalty_applied resets to false, reversal is logged.
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        store.confirm_sybil("coordinator", "sybil").unwrap();
+
+        // Verify penalized state
+        let rec = store.attestation_records
+            .get(&attestation_record_key("alice", "sybil"))
+            .unwrap();
+        assert_eq!(rec.status, AttestationStatus::Penalized);
+
+        // Reverse
+        let restored = store.reverse_sybil("coordinator", "sybil").unwrap();
+        assert_eq!(restored, vec!["alice".to_string()]);
+
+        // Record is back to Active
+        let rec = store.attestation_records
+            .get(&attestation_record_key("alice", "sybil"))
+            .unwrap();
+        assert_eq!(rec.status, AttestationStatus::Active,
+            "record must be Active after reversal");
+        assert!(!rec.penalty_applied,
+            "penalty_applied must be false after reversal");
+
+        // Log records the reversal
+        let log = store.sybil_confirmation("sybil").unwrap();
+        assert!(log.reversed, "log must be marked reversed");
+        assert!(log.reversal_epoch.is_some());
+    }
+
+    #[test]
+    fn reverse_sybil_allows_reconfirmation() {
+        // After a reversal, the coordinator can confirm the same identity again.
+        // The second confirmation starts fresh and penalizes the current Active records.
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+
+        store.confirm_sybil("coordinator", "sybil").unwrap();
+        store.reverse_sybil("coordinator", "sybil").unwrap();
+
+        // Can confirm again after reversal
+        let penalized = store.confirm_sybil("coordinator", "sybil");
+        assert!(penalized.is_ok(), "re-confirmation after reversal must succeed");
+    }
+
+    #[test]
+    fn identity_store_with_sybil_confirmations_survives_json_roundtrip() {
+        // sybil_confirmations must survive serde_json serialization so node
+        // state snapshots don't lose confirmation history across restarts.
+        let mut store = make_store();
+        store.set_coordinator(Some("coordinator".to_string()));
+
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "sybil", "qcb1sybil");
+        store.attest("sybil", "alice").unwrap();
+        store.confirm_sybil("coordinator", "sybil").unwrap();
+
+        let json = serde_json::to_string(&store).expect("serialize must succeed");
+        let restored: IdentityStore = serde_json::from_str(&json).expect("deserialize must succeed");
+
+        let log = restored.sybil_confirmation("sybil").expect("log must survive roundtrip");
+        assert_eq!(log.sybil_id, "sybil");
+        assert_eq!(log.coordinator_id, "coordinator");
+        assert_eq!(log.penalized_attesters, vec!["alice".to_string()]);
+        assert!(!log.reversed);
     }
 }
