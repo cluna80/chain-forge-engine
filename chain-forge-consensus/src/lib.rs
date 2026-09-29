@@ -3149,3 +3149,24 @@ mod tests {
 
 }
 }
+
+/// Compile-time assertion that `chain_forge_consensus::ValidatorId` and
+/// `chain_forge_core::ValidatorId` are exactly the same type.
+///
+/// If this fails to compile, it means the unification was broken — someone
+/// introduced a local `ValidatorId` definition in consensus rather than
+/// re-exporting from core. That split would cause silent type-mismatch errors
+/// at crate boundaries (e.g. in chain-forge-personhood) that are hard to debug.
+#[cfg(test)]
+mod validator_id_identity {
+    fn assert_same_type<T>(_: T) {}
+
+    #[test]
+    fn consensus_and_core_validator_id_are_the_same_type() {
+        // If ValidatorId were separately defined in consensus and core,
+        // this would fail to compile ("mismatched types").
+        let core_id = chain_forge_core::ValidatorId("test".into());
+        let consensus_id: crate::ValidatorId = core_id; // must compile
+        assert_same_type(consensus_id);
+    }
+}
