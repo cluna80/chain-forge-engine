@@ -632,6 +632,21 @@ impl ValidatorRegistry {
 
     /// Called when a validator's PoP lapses (liveness failure in identity layer).
     /// Their consensus power drops to 0; they become Candidate again.
+    ///
+    /// # Intentional design: lapsing is not a slashing offense
+    ///
+    /// `revoke_pop` demotes the validator to Candidate with zero voting power.
+    /// It does NOT jail them, does NOT slash their stake, and does NOT record a
+    /// `JailRecord`. This is a deliberate choice from Section 3.3 of the whitepaper:
+    /// personhood-weighting is a bound on influence, not a punishment for inactivity.
+    ///
+    /// Slashing is reserved for equivocation and consensus-level liveness failures
+    /// (evidence-based offenses handled by the slashing module). A validator who
+    /// goes offline and lets their identity lapse is simply inactive — they stop
+    /// accruing rewards and lose their seat in the active set, but their stake is
+    /// not penalized. They re-enter the active set by re-verifying their identity
+    /// and having `confirm_pop` called again, via the same path as any other
+    /// Candidate-to-Active transition.
     pub fn revoke_pop(&mut self, validator_id: &str, epoch: u64) -> ValResult<()> {
         let record = self.validators.get_mut(validator_id)
             .ok_or_else(|| ValidatorError::NotFound(validator_id.to_string()))?;
@@ -955,6 +970,148 @@ mod tests {
         assert_eq!(reg.total_active(), 0);
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Candidate);
         assert_eq!(reg.get("val1").unwrap().consensus_power(), 0);
+    }
+
+    // -- State-machine coherence: revoke/confirm cycle ------------------------
+    //
+    // These tests answer the question: "does a lapsed+re-verified validator land
+    // in the same functional state as a fresh validator after confirm_pop?"
+    //
+    // The answer is: consensus-critical fields (pop_verified, status,
+    // verification_tier, consensus_power) converge completely. Historical fields
+    // (blocks_proposed, blocks_missed, last_status_epoch) do NOT reset — these
+    // are intentional scars: the chain keeps history of what a validator did.
+    // The jail_records intentionally DO remain empty on lapse (not a slashing
+    // offense), and this must remain true to preserve the lapse-vs-slash
+    // distinction from Section 3.3 of the whitepaper.
+
+    #[test]
+    fn lapse_does_not_record_a_slash() {
+        // A validator that lapses (identity goes offline) must not accumulate a
+        // JailRecord. Lapsing is an inactivity event, not a punishable offense.
+        // Slashing is reserved for equivocation and consensus liveness failures.
+        let mut reg = registry();
+        reg.register_genesis_validator("alice", 0);
+        reg.confirm_pop("alice", VerificationTier::Verified, 0).unwrap();
+
+        // Simulate two lapse/re-verify cycles
+        reg.revoke_pop("alice", 5).unwrap();
+        reg.confirm_pop("alice", VerificationTier::Verified, 6).unwrap();
+        reg.revoke_pop("alice", 10).unwrap();
+        reg.confirm_pop("alice", VerificationTier::Verified, 11).unwrap();
+
+        let record = reg.get("alice").unwrap();
+        assert!(
+            record.jail_records.is_empty(),
+            "revoke_pop must never write a JailRecord — lapse is not a slashing offense \
+             (Section 3.3: personhood-weighting is a bound on influence, not a punishment)"
+        );
+    }
+
+    #[test]
+    fn revoke_confirm_cycle_produces_same_consensus_state_as_fresh_validator() {
+        // The critical question: does a lapsed-then-re-verified validator re-enter
+        // the active set identically to a validator who was never lapsed?
+        //
+        // Fields checked here are the "consensus-critical" ones — the fields that
+        // the consensus layer and the validator set builder actually use when
+        // deciding who counts toward quorum:
+        //   - pop_verified
+        //   - status
+        //   - verification_tier
+        //   - consensus_power()
+        //
+        // Historical fields (blocks_proposed, blocks_missed, last_status_epoch)
+        // intentionally differ: the chain keeps a scar. That's fine — those fields
+        // are not used to gate entry into the active set.
+        let mut reg = registry();
+
+        // Path A: fresh validator, never lapsed.
+        reg.register_genesis_validator("fresh", 0);
+        reg.confirm_pop("fresh", VerificationTier::Verified, 0).unwrap();
+
+        // Path B: validator that was Active, then lapsed, then re-verified.
+        reg.register_genesis_validator("lapsed", 0);
+        reg.confirm_pop("lapsed", VerificationTier::Verified, 0).unwrap();
+        // Simulate lapse at epoch 5 (identity went offline)
+        reg.revoke_pop("lapsed", 5).unwrap();
+        // Re-verify at epoch 10 (came back online, identity re-verified)
+        reg.confirm_pop("lapsed", VerificationTier::Verified, 10).unwrap();
+
+        let fresh  = reg.get("fresh").unwrap();
+        let lapsed = reg.get("lapsed").unwrap();
+
+        // Consensus-critical fields must converge.
+        assert_eq!(
+            fresh.pop_verified, lapsed.pop_verified,
+            "pop_verified must converge after re-verification"
+        );
+        assert_eq!(
+            fresh.status, lapsed.status,
+            "status must converge after re-verification (both Active)"
+        );
+        assert_eq!(
+            fresh.verification_tier, lapsed.verification_tier,
+            "verification_tier must converge after re-verification"
+        );
+        assert_eq!(
+            fresh.consensus_power(), lapsed.consensus_power(),
+            "consensus_power() must converge — lapsed validator re-enters with full weight"
+        );
+        assert!(lapsed.pop_verified, "lapsed validator must be pop_verified after re-confirmation");
+        assert_eq!(lapsed.status, ValidatorStatus::Active, "lapsed validator must be Active after re-confirmation");
+        assert_eq!(lapsed.consensus_power(), 1, "lapsed validator must have consensus power 1 after re-confirmation");
+
+        // No jail was recorded (lapse is not a slash).
+        assert!(lapsed.jail_records.is_empty(),
+            "jail_records must be empty — lapse is not a slashing offense");
+
+        // Historical fields intentionally differ (this is the "scar"):
+        // lapsed.last_status_epoch != fresh.last_status_epoch (epoch 10 vs epoch 0)
+        // -- not checked because the difference is intentional.
+        // lapsed.blocks_proposed / blocks_missed may differ -- also intentional.
+        // These differences do NOT affect quorum eligibility.
+    }
+
+    #[test]
+    fn reactivation_path_is_identical_for_failed_startup_and_lapsed_validator() {
+        // Both a validator whose verify_identity failed at startup (Candidate,
+        // never pop_verified) and a validator who was Active and then lapsed
+        // (Candidate, pop_verified revoked) should re-activate via the SAME call:
+        //   confirm_pop(id, tier, epoch)
+        // This test proves there is no separate "resurrection" path needed.
+        let mut reg = registry();
+
+        // Path A: failed startup — register_genesis_validator ran but confirm_pop
+        // was never called (verify_identity failed, stayed Candidate).
+        reg.register_genesis_validator("failed-startup", 0);
+        // Note: no confirm_pop here — this is the "stayed Candidate" case.
+
+        // Path B: was Active, lapsed, now back as Candidate.
+        reg.register_genesis_validator("was-active", 0);
+        reg.confirm_pop("was-active", VerificationTier::Verified, 0).unwrap();
+        reg.revoke_pop("was-active", 5).unwrap();
+        // Now "was-active" is also Candidate with pop_verified=false.
+
+        // Both should be Candidate with pop_verified=false before re-verify.
+        for id in ["failed-startup", "was-active"] {
+            let r = reg.get(id).unwrap();
+            assert_eq!(r.status, ValidatorStatus::Candidate, "{id}: expected Candidate");
+            assert!(!r.pop_verified, "{id}: expected pop_verified = false");
+            assert_eq!(r.consensus_power(), 0, "{id}: expected 0 consensus power");
+        }
+
+        // Re-activate BOTH through the SAME confirm_pop call.
+        reg.confirm_pop("failed-startup", VerificationTier::Verified, 10).unwrap();
+        reg.confirm_pop("was-active",     VerificationTier::Verified, 10).unwrap();
+
+        // Both must now be Active with identical consensus-critical state.
+        for id in ["failed-startup", "was-active"] {
+            let r = reg.get(id).unwrap();
+            assert_eq!(r.status, ValidatorStatus::Active, "{id}: must be Active after confirm_pop");
+            assert!(r.pop_verified, "{id}: must be pop_verified after confirm_pop");
+            assert_eq!(r.consensus_power(), 1, "{id}: must have consensus_power 1 after confirm_pop");
+        }
     }
 
     // -- ValidatorSet building ------------------------------------------------

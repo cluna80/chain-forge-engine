@@ -2632,28 +2632,21 @@ mod tests {
         // In production: Alice's node goes offline, so no txs from her address
         // land on-chain. Bob, Carol, and Dave stay active (they keep transacting).
         //
-        // We simulate this by:
-        //   - Keeping Alice's last_attested_epoch at 0 (genesis, never updated).
-        //   - Updating Bob/Carol/Dave's last_attested_epoch to a recent epoch
-        //     (epoch 10 here) so they remain lively after the 91-epoch clock jump.
-        //   - Alice at epoch 0, with clock at epoch 91: delta = 91 > WINDOW (90).
-        //   - Others at epoch 10, with clock at epoch 91: delta = 81 ≤ WINDOW (90).
+        // We use the test helpers `lapse_only` and `stay_lively` to be explicit
+        // about who lapses and who doesn't. This prevents the "all four validators
+        // lapse when you jump the clock" class of test bug.
+        let target_epoch = LIVENESS_EPOCH_WINDOW + 1; // epoch 91
+        node.identity.lapse_only("qcb1alice", target_epoch);
         for addr in ["qcb1bob", "qcb1carol", "qcb1dave"] {
-            let record = node.identity.get_mut(addr)
-                .unwrap_or_else(|| panic!("{addr} must be in IdentityStore"));
-            // Simulate recent on-chain activity at epoch 10 -- they stayed active.
-            record.charm.last_attested_epoch = 10;
+            node.identity.stay_lively(addr, target_epoch);
         }
-        // Alice stays at last_attested_epoch = 0 (her genesis value, never updated
-        // because her node was offline and no txs landed from her address).
 
         // ── Step 5: Trigger advance_epoch + the Point 3 reconcile sweep ───────
-        // We call advance_epoch with a timestamp that jumps 91+ epochs forward
-        // (one epoch = 86_400_000 ms = 24 hours; jump = 91 * 24h + 1ms).
+        // Jump the clock forward `target_epoch` epochs (91 * 24h).
         // The advance_epoch() call in Node::propose_block is what actually runs
         // the sweep in production; we drive it directly here to keep the test
         // synchronous and deterministic.
-        let jump_ms = (LIVENESS_EPOCH_WINDOW + 1) * 86_400_000; // 91 days in ms
+        let jump_ms = target_epoch * 86_400_000; // target_epoch days in ms
         let now_ms  = node.identity.clock.epoch_start_ms + jump_ms;
 
         // advance_epoch lints the lapse; the reconcile sweep (Point 3) revokes pop.

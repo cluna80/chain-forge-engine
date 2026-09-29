@@ -869,6 +869,42 @@ impl IdentityStore {
             .map(|r| r.id.clone())
             .collect()
     }
+
+    // -- Test helpers ---------------------------------------------------------
+    //
+    // These methods manipulate internal epoch state and are intended for use
+    // in integration tests that need to control who lapses across a clock jump.
+    // They are `pub` so downstream crates (chain-forge-node's tests) can reach
+    // them; the names make their test-only intent clear.
+
+    /// Make exactly one identity appear to have been inactive long enough to
+    /// lapse when `advance_epoch` is next called, without touching any other
+    /// identity. Use this in epoch-manipulation tests to be explicit about
+    /// who lapses — prevents the "all validators lapse when you jump the clock"
+    /// class of test bugs.
+    ///
+    /// Sets `last_attested_epoch` to 0 for `id` only. Call this before any
+    /// clock jump; identities you want to stay lively should have a
+    /// `last_attested_epoch` within `LIVENESS_EPOCH_WINDOW` of the target epoch.
+    pub fn lapse_only(&mut self, id: &str, _target_epoch: u64) {
+        if let Some(record) = self.records.get_mut(id) {
+            record.charm.last_attested_epoch = 0;
+        }
+    }
+
+    /// Keep `id` lively through a clock jump to `target_epoch`. Sets
+    /// `last_attested_epoch` to a value within `LIVENESS_EPOCH_WINDOW` of
+    /// `target_epoch` (specifically, `target_epoch - LIVENESS_EPOCH_WINDOW / 2`).
+    ///
+    /// Use alongside `lapse_only` to be explicit about which identities survive
+    /// an epoch jump and which do not.
+    pub fn stay_lively(&mut self, id: &str, target_epoch: u64) {
+        if let Some(record) = self.records.get_mut(id) {
+            // Pick a recent-enough epoch that the identity remains lively.
+            record.charm.last_attested_epoch =
+                target_epoch.saturating_sub(LIVENESS_EPOCH_WINDOW / 2);
+        }
+    }
 }
 
 // -- Tests --------------------------------------------------------------------
