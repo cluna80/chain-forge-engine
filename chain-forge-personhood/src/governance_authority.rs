@@ -48,20 +48,19 @@ const GOVERNANCE_DOMAIN: &[u8] = b"chain-forge:governance:v1:";
 /// Callers choose `action_tag` per action type so that signatures cannot be
 /// replayed across action types.
 ///
-/// # Domain-separation gaps (low-risk, documented)
+/// # Domain-separation gaps
 ///
-/// * **No chain_id**: a governance vote signed on chain A could in principle be
-///   replayed on chain B if both chains share the same ML-DSA validator set.
-///   Governance votes are out-of-band (not block-consensus messages) and the
-///   registry is per-instance, so cross-chain replay is not a practical concern
-///   today. Add `chain_id` to the domain when governance is promoted to an
-///   on-chain transaction type.
+/// * **No chain_id** (tracked in KNOWN_ISSUES §5): a governance vote signed on
+///   chain A could in principle be replayed on chain B if both chains share the
+///   same ML-DSA validator set. Governance votes are out-of-band (not
+///   block-consensus messages) and the registry is per-instance, so cross-chain
+///   replay is not a practical concern today. Add `chain_id` to the domain
+///   before governance is promoted to an on-chain transaction type.
 ///
-/// * **No epoch/height**: `revoke_immediately` signs over a 4-byte issuer_id,
-///   making a valid signature theoretically replayable in a later epoch if the
-///   validator set is identical. `propose_change` signs over the full issuer
-///   registry state (sorted IDs + new name), making replay impractical.
-///   Add a monotonic sequence number when governance is promoted.
+/// * **Epoch**: same-chain replay is mitigated. `revoke_immediately` context
+///   includes `issuer_id ++ epoch` so a vote is bound to a specific governance
+///   round. `propose_change` binds to the full issuer registry state (sorted
+///   IDs + new name), making replay impractical by construction.
 pub fn governance_vote_signing_bytes(action_tag: &[u8], context_bytes: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(
         GOVERNANCE_DOMAIN.len() + action_tag.len() + 1 + context_bytes.len(),
@@ -142,10 +141,17 @@ impl AuthorizedIssuerRegistry {
 
     /// Revoke an issuer, guarded by a quorum of ML-DSA-signed votes.
     ///
-    /// Canonical context bytes = issuer_id as big-endian u32.
+    /// Canonical context bytes = issuer_id (big-endian u32) ++ epoch (big-endian u64).
+    ///
+    /// The `epoch` parameter binds the signature to a specific governance epoch,
+    /// preventing same-chain replay: a revocation vote signed in epoch N is
+    /// invalid in any other epoch even if the issuer_id and validator set are
+    /// identical. Callers should use the current block height or a governance
+    /// sequence number as the epoch.
     pub fn revoke_with_votes(
         &mut self,
         issuer_id:     u32,
+        epoch:         u64,
         validator_set: &dyn ValidatorSetView,
         votes:         &[GovernanceVote],
     ) -> Result<(), AuthzError> {
@@ -156,7 +162,9 @@ impl AuthorizedIssuerRegistry {
             return Err(AuthzError::EmptyValidatorSet);
         }
 
-        let ctx = issuer_id.to_be_bytes();
+        let mut ctx = Vec::with_capacity(12);
+        ctx.extend_from_slice(&issuer_id.to_be_bytes());
+        ctx.extend_from_slice(&epoch.to_le_bytes());
         let signing_msg = governance_vote_signing_bytes(b"revoke_immediately", &ctx);
         let power = tally_votes(validator_set, votes, &signing_msg)?;
 
@@ -349,10 +357,14 @@ mod tests {
         let add_votes: Vec<_> = (0..3).map(|i| signed_vote(i, &kps, &add_msg)).collect();
         let id = reg.propose_change_with_votes("Issuer Zeta", &vs, &add_votes).unwrap();
 
-        // Revoke
-        let rev_msg = governance_vote_signing_bytes(b"revoke_immediately", &id.to_be_bytes());
+        // Revoke — epoch 1 binds the vote to this specific revocation attempt
+        let epoch: u64 = 1;
+        let mut rev_ctx = Vec::with_capacity(12);
+        rev_ctx.extend_from_slice(&id.to_be_bytes());
+        rev_ctx.extend_from_slice(&epoch.to_le_bytes());
+        let rev_msg = governance_vote_signing_bytes(b"revoke_immediately", &rev_ctx);
         let rev_votes: Vec<_> = (0..3).map(|i| signed_vote(i, &kps, &rev_msg)).collect();
-        reg.revoke_with_votes(id, &vs, &rev_votes).unwrap();
+        reg.revoke_with_votes(id, epoch, &vs, &rev_votes).unwrap();
         assert!(!reg.issuers().contains_key(&id));
     }
 
@@ -360,9 +372,13 @@ mod tests {
     fn test_revoke_nonexistent() {
         let (vs, kps) = make_vs(3);
         let mut reg = AuthorizedIssuerRegistry::new();
-        let rev_msg = governance_vote_signing_bytes(b"revoke_immediately", &99u32.to_be_bytes());
+        let epoch: u64 = 0;
+        let mut rev_ctx = Vec::with_capacity(12);
+        rev_ctx.extend_from_slice(&99u32.to_be_bytes());
+        rev_ctx.extend_from_slice(&epoch.to_le_bytes());
+        let rev_msg = governance_vote_signing_bytes(b"revoke_immediately", &rev_ctx);
         let votes: Vec<_> = (0..3).map(|i| signed_vote(i, &kps, &rev_msg)).collect();
-        let err = reg.revoke_with_votes(99, &vs, &votes).unwrap_err();
+        let err = reg.revoke_with_votes(99, epoch, &vs, &votes).unwrap_err();
         assert!(matches!(err, AuthzError::IssuerNotFound(99)));
     }
 

@@ -86,18 +86,26 @@ fn main() {
     println!("      Registry: {:?}", reg.issuers().keys().collect::<Vec<_>>());
     println!();
 
-    // 4: revoke issuer 0 — context = 0u32_BE
-    let msg4 = governance_vote_signing_bytes(b"revoke_immediately", &0u32.to_be_bytes());
+    // 4: revoke issuer 0 — context = 0u32_BE ++ epoch_LE (epoch=1 for this governance round)
+    let epoch4: u64 = 1;
+    let mut ctx4 = Vec::with_capacity(12);
+    ctx4.extend_from_slice(&0u32.to_be_bytes());
+    ctx4.extend_from_slice(&epoch4.to_le_bytes());
+    let msg4 = governance_vote_signing_bytes(b"revoke_immediately", &ctx4);
     let five4: Vec<_> = (0..5).map(|i| signed_vote(i, &kps, &msg4)).collect();
-    match reg.revoke_with_votes(0, &vs, &five4) {
+    match reg.revoke_with_votes(0, epoch4, &vs, &five4) {
         Ok(()) => { println!("[4] PASS  Issuer 0 revoked"); checks_passed += 1; }
         Err(e) => println!("[4] FAIL  {e}"),
     }
 
-    // 5: revoke nonexistent 99
-    let msg5 = governance_vote_signing_bytes(b"revoke_immediately", &99u32.to_be_bytes());
+    // 5: revoke nonexistent 99 — IssuerNotFound fires before signature check
+    let epoch5: u64 = 1;
+    let mut ctx5 = Vec::with_capacity(12);
+    ctx5.extend_from_slice(&99u32.to_be_bytes());
+    ctx5.extend_from_slice(&epoch5.to_le_bytes());
+    let msg5 = governance_vote_signing_bytes(b"revoke_immediately", &ctx5);
     let five5: Vec<_> = (0..5).map(|i| signed_vote(i, &kps, &msg5)).collect();
-    match reg.revoke_with_votes(99, &vs, &five5) {
+    match reg.revoke_with_votes(99, epoch5, &vs, &five5) {
         Err(AuthzError::IssuerNotFound(id)) => {
             println!("[5] PASS  IssuerNotFound({id})"); checks_passed += 1;
         }

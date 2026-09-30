@@ -149,3 +149,75 @@ attestation-specific guard is not separately confirmed live.
 `chain-forge-node/tests/attestation_live.rs` (`attestation_guard_live`,
 phase 6),
 `chain-forge-identity/src/lib.rs` (`attest()` duplicate guard)
+
+---
+
+## §5  Governance preimage has no chain_id (cross-chain replay possible)
+
+**Status: OPEN — must fix before governance moves on-chain**
+
+**Summary**
+
+`governance_vote_signing_bytes` uses a static domain prefix
+`"chain-forge:governance:v1:"` with no runtime `chain_id`.  A governance vote
+(add or revoke issuer) signed on one chain could in principle be replayed on a
+second chain if both share the same ML-DSA validator set.
+
+**Same-chain epoch replay is fixed** (see below).  Cross-chain replay remains.
+
+**Root cause**
+
+`GOVERNANCE_DOMAIN` is a compile-time constant.  Unlike consensus preimages
+(`vote_signing_bytes`, `proposal_signing_bytes`), governance signing bytes are
+constructed by a module-level function that does not take a `chain_id`
+parameter.  There is no per-chain runtime value in the signed message.
+
+**Conditions that make this exploitable**
+
+The following conditions must all hold simultaneously:
+1. Two chains share the same ML-DSA validator set (same keys, same quorum).
+2. Both chains use the same issuer registry state at the time of the vote
+   (`propose_change` binds to sorted registry IDs, so this is non-trivial).
+3. A governance action is performed on chain A that the attacker wants
+   accepted on chain B.
+
+Under the current architecture, governance is out-of-band (no chain
+transactions, per-instance registry), so the conditions are difficult to
+satisfy.  Risk is low today.
+
+**Fix**
+
+Add `chain_id: &str` as a parameter to `governance_vote_signing_bytes` and
+prepend it between the domain tag and the action tag:
+
+```
+chain-forge:governance:v1:<chain_id>:<action_tag>:<context_bytes>
+```
+
+Update all call sites and the `AuthorizedIssuerRegistry` methods to thread
+`chain_id` through.  The change is mechanical; the protocol break is
+intentional (old governance votes become invalid after the upgrade, which is
+safe because governance has not yet produced any on-chain artifacts).
+
+**Related fix already applied (same-chain epoch replay)**
+
+`revoke_with_votes` now accepts an `epoch: u64` parameter and folds it into
+the context bytes (`issuer_id_BE ++ epoch_LE`) so a revocation vote is bound
+to a specific governance round.  Replay across epochs is no longer possible
+for revocations.  `propose_change` is already epoch-safe by construction
+(context includes the full registry state, which changes after each proposal).
+
+**Trigger conditions for immediate escalation**
+
+This issue must be resolved before any of the following:
+- Governance votes become on-chain transaction types (roadmap §7.3, §6.8, §11).
+- Multi-chain interoperability is introduced and validator sets are shared
+  across chains (roadmap Phase 5+).
+- The same issuer registry instance is used across multiple chain instances.
+
+**Affects**
+
+`chain-forge-personhood/src/governance_authority.rs`
+(`governance_vote_signing_bytes`, `propose_change_with_votes`,
+`revoke_with_votes`), all call sites in
+`chain-forge-personhood/src/bin/governance_authority_demo.rs`.
