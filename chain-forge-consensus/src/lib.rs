@@ -30,8 +30,8 @@ pub enum ConsensusError {
     #[error("validator {0} is not in the current validator set")]
     UnknownValidator(ValidatorId),
 
-    #[error("proposal for height {0} arrived out of order (current height: {1})")]
-    StaleProposal(BlockHeight, BlockHeight),
+    #[error("message for height {0} arrived out of order (current height: {1})")]
+    StaleMessage(BlockHeight, BlockHeight),
 
     #[error("vote from {validator} for block {block_hash} is invalid: {reason}")]
     InvalidVote {
@@ -757,7 +757,7 @@ impl ConsensusEngine for FbaEngine {
         proposal: BlockProposal,
     ) -> ConsensusResult<()> {
         if proposal.height < self.height {
-            return Err(ConsensusError::StaleProposal(proposal.height, self.height));
+            return Err(ConsensusError::StaleMessage(proposal.height, self.height));
         }
         self.pending = Some(proposal.clone());
         self.phase   = FbaPhase::Open;
@@ -1275,7 +1275,7 @@ impl ConsensusEngine for TendermintEngine {
         let _vs  = self.require_validator_set()?;
 
         if height != self.height {
-            return Err(ConsensusError::StaleProposal(height, self.height));
+            return Err(ConsensusError::StaleMessage(height, self.height));
         }
 
         let proposer = self
@@ -1332,7 +1332,7 @@ impl ConsensusEngine for TendermintEngine {
         let _vs = self.require_validator_set()?;
 
         if proposal.height != self.height {
-            return Err(ConsensusError::StaleProposal(proposal.height, self.height));
+            return Err(ConsensusError::StaleMessage(proposal.height, self.height));
         }
 
         // Verify the proposer is correct for this (height, round).
@@ -1399,7 +1399,7 @@ impl ConsensusEngine for TendermintEngine {
 
         // Reject votes for wrong height.
         if vote.height != self.height {
-            return Err(ConsensusError::StaleProposal(vote.height, self.height));
+            return Err(ConsensusError::StaleMessage(vote.height, self.height));
         }
 
         // Reject votes from unknown validators.
@@ -1954,7 +1954,7 @@ impl ConsensusEngine for HotStuffEngine {
         proposal: BlockProposal,
     ) -> ConsensusResult<()> {
         if proposal.height < self.height {
-            return Err(ConsensusError::StaleProposal(proposal.height, self.height));
+            return Err(ConsensusError::StaleMessage(proposal.height, self.height));
         }
         // Phase 0: accept any well-formed proposal from the expected leader
         if self.phase != HotStuffPhase::WaitingForPrepare

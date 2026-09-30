@@ -1365,7 +1365,7 @@ impl Node {
                                     self.handle_drained_equivocations(eqs, epoch);
                                 }
                             }
-                            Err(e) => debug!(error = %e, "vote rejected (stale height or unknown validator)"),
+                            Err(e) => debug!(error = %e, "vote rejected"),
                         }
                     }
 
