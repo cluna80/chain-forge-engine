@@ -47,6 +47,21 @@ const GOVERNANCE_DOMAIN: &[u8] = b"chain-forge:governance:v1:";
 ///
 /// Callers choose `action_tag` per action type so that signatures cannot be
 /// replayed across action types.
+///
+/// # Domain-separation gaps (low-risk, documented)
+///
+/// * **No chain_id**: a governance vote signed on chain A could in principle be
+///   replayed on chain B if both chains share the same ML-DSA validator set.
+///   Governance votes are out-of-band (not block-consensus messages) and the
+///   registry is per-instance, so cross-chain replay is not a practical concern
+///   today. Add `chain_id` to the domain when governance is promoted to an
+///   on-chain transaction type.
+///
+/// * **No epoch/height**: `revoke_immediately` signs over a 4-byte issuer_id,
+///   making a valid signature theoretically replayable in a later epoch if the
+///   validator set is identical. `propose_change` signs over the full issuer
+///   registry state (sorted IDs + new name), making replay impractical.
+///   Add a monotonic sequence number when governance is promoted.
 pub fn governance_vote_signing_bytes(action_tag: &[u8], context_bytes: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(
         GOVERNANCE_DOMAIN.len() + action_tag.len() + 1 + context_bytes.len(),

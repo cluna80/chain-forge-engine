@@ -40,6 +40,12 @@ pub enum ConsensusError {
         reason: String,
     },
 
+    /// Covers three distinct sub-conditions (all currently handled the same way —
+    /// log and discard). If future logic needs to branch on cause, split into:
+    ///   `WrongProposer`    — wrong proposer for this (height, round); normal in round-change
+    ///   `InvalidSignature` — proposer's signature doesn't verify; Byzantine signal
+    ///   `LockViolation`    — proposal conflicts with our locked block; safety rule
+    /// The `String` payload carries which sub-condition fired for log diagnostics.
     #[error("block proposal is malformed: {0}")]
     MalformedProposal(String),
 
