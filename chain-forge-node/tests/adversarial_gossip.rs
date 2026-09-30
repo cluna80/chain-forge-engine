@@ -158,12 +158,21 @@ impl Drop for NodeHandle {
     }
 }
 
+fn devnet_keys_dir() -> PathBuf {
+    repo_root().join("tests").join("devnet").join("keys")
+}
+
+fn key_file_for(label: &str) -> PathBuf {
+    devnet_keys_dir().join(format!("{label}.key.json"))
+}
+
 fn spawn_node(
     name:     &'static str,
     api_port: u16,
     p2p_port: u16,
     log_dir:  &std::path::Path,
     peers:    &[u16],
+    key_file: Option<PathBuf>,
 ) -> NodeHandle {
     let log_path = log_dir.join(format!("{name}.log"));
     let log_file = std::fs::File::create(&log_path)
@@ -180,6 +189,9 @@ fn spawn_node(
        .arg("--p2p-port").arg(p2p_port.to_string());
     for addr in &bootstrap {
         cmd.arg("--bootstrap").arg(addr);
+    }
+    if let Some(kf) = key_file {
+        cmd.arg("--key-file").arg(kf);
     }
     cmd.stdout(log_file.try_clone().unwrap())
        .stderr(log_file)
@@ -269,15 +281,25 @@ fn skip_if_no_binary() -> bool {
 
 // ── Devnet spawn helpers ──────────────────────────────────────────────────────
 
-fn spawn_devnet(ports: &DevnetPorts, log_dir: &std::path::Path) -> Vec<NodeHandle> {
+/// Spawn all four devnet nodes.
+///
+/// `with_keys`: when true, each node is given its `--key-file` so it signs
+/// votes with its Ed25519 private key.  Set true for tests that need real
+/// signature verification (e.g. `adversarial_garbage_signature`).  Set false
+/// for tests that don't care about sig verification and want to avoid the
+/// key-file path dependency.
+fn spawn_devnet(ports: &DevnetPorts, log_dir: &std::path::Path, with_keys: bool) -> Vec<NodeHandle> {
+    let kf = |label: &str| -> Option<PathBuf> {
+        if with_keys { Some(key_file_for(label)) } else { None }
+    };
     let alice = spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p, log_dir,
-                           &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p]);
+                           &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice"));
     let bob   = spawn_node("qcb1bob",   ports.bob_api,   ports.bob_p2p,   log_dir,
-                           &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p]);
+                           &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob"));
     let carol = spawn_node("qcb1carol", ports.carol_api, ports.carol_p2p, log_dir,
-                           &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p]);
+                           &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol"));
     let dave  = spawn_node("qcb1dave",  ports.dave_api,  ports.dave_p2p,  log_dir,
-                           &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p]);
+                           &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave"));
     vec![alice, bob, carol, dave]
 }
 
@@ -341,7 +363,7 @@ async fn adversarial_unknown_validator() {
     println!("   ports: alice_api={} alice_p2p={}", ports.alice_api, ports.alice_p2p);
 
     let log_dir = tempdir("qcb-adv-unknown");
-    let _nodes  = spawn_devnet(&ports, &log_dir);
+    let _nodes  = spawn_devnet(&ports, &log_dir, false);
 
     println!("   Waiting for API ports...");
     assert!(wait_all_apis_up(&ports), "nodes did not start");
@@ -405,7 +427,7 @@ async fn adversarial_equivocation_over_gossip() {
     println!("   ports: alice_api={} alice_p2p={}", ports.alice_api, ports.alice_p2p);
 
     let log_dir = tempdir("qcb-adv-equivoc");
-    let _nodes  = spawn_devnet(&ports, &log_dir);
+    let _nodes  = spawn_devnet(&ports, &log_dir, false);
 
     println!("   Waiting for API ports...");
     assert!(wait_all_apis_up(&ports), "nodes did not start");
@@ -527,41 +549,53 @@ async fn adversarial_equivocation_over_gossip() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 3: Garbage-signature vote from a known validator (STUB — Phase 0 gap)
+// Test 3: Garbage-signature vote from a known validator is rejected (Phase 1)
 //
-// This test is IGNORED by default because it does NOT verify active signature
-// rejection — it only verifies liveness while the sig check is skipped
-// (Phase 0 pass-through).  It is included so the gap is documented and
-// visible in the test suite.
+// Genesis now includes Ed25519 public keys for all four validators.
+// Each node is started with its --key-file so it signs its own votes.
+// A garbage-signature vote (64 bytes of non-zero junk) from a known validator
+// (qcb1bob) MUST be actively rejected and MUST NOT contribute to quorum.
 //
-// To make this test real:
-//   1. Add `public_key` fields to tests/devnet/genesis-4node.json.
-//   2. Replace the Phase-0 PASS branch with an assertion that the garbage-sig
-//      vote was rejected (grep logs for "invalid signature" or equivalent).
-//   3. Remove the `#[ignore]` attribute.
+// Evidence required: at least one node log must contain BOTH "invalid signature"
+// AND "qcb1bob" to confirm the rejection was specific to this vote, not a
+// catch-all or an unrelated error.
 //
-// Run the stub explicitly to confirm the gap is still present:
-//   cargo test -p chain-forge-node --test adversarial_gossip \
-//     adversarial_garbage_signature -- --nocapture --ignored
+// Chain liveness is also verified: the 4-node network must advance past the
+// attack height, proving that rejection of the forged vote does not stall quorum
+// (the real Bob node's signed votes still count).
+//
+// See KNOWN_ISSUES §3 (now resolved) for the Phase-0 history.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "Phase 0 stub: no public keys in genesis so garbage sig is not actively rejected. \
-            See test body for what's needed to promote this to a real test."]
 async fn adversarial_garbage_signature() {
     if skip_if_no_binary() { return; }
 
+    // Key files must exist — generated by `gen-devnet-keys`.
+    let keys_dir = devnet_keys_dir();
+    if !keys_dir.join("bob.key.json").exists() {
+        println!(
+            "SKIP: key files not found at {:?}. \
+             Run `cargo run --features real-crypto -p chain-forge-crypto --bin gen-devnet-keys` first.",
+            keys_dir
+        );
+        return;
+    }
+
     let ports = DevnetPorts::new();
-    println!("\n── Adversarial test: garbage-signature vote (Phase 0 STUB) ──────────");
+    println!("\n── Adversarial test: garbage-signature vote (Phase 1 — real sig check) ─");
     println!("   ports: alice_api={} alice_p2p={}", ports.alice_api, ports.alice_p2p);
 
     let log_dir = tempdir("qcb-adv-sig");
-    let _nodes  = spawn_devnet(&ports, &log_dir);
+    // with_keys=true: each node receives --key-file and signs its votes.
+    // This arms the genesis public keys so verify_vote_signature takes the
+    // real verification path instead of the Phase-0 pass-through.
+    let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
-    assert!(wait_all_apis_up(&ports), "nodes did not start");
+    assert!(wait_all_apis_up(&ports), "nodes did not start in time");
 
-    println!("   [phase1] Waiting for height >= 2...");
+    println!("   [phase1] Waiting for height >= 2 (verifying chain starts with real signing)...");
     assert!(
         poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)),
         "chain did not reach height 2 before attack"
@@ -569,39 +603,76 @@ async fn adversarial_garbage_signature() {
 
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
 
+    // 64 bytes of structured garbage — deterministic so CI is repeatable.
     let mut garbage = vec![0u8; 64];
     for (i, b) in garbage.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(37); }
 
+    // Forge a vote from the real validator qcb1bob but with garbage bytes as
+    // the signature.  With the genesis public key on file, every receiving node
+    // will attempt Ed25519 verification and reject it.
+    let current_height = height_of(ports.alice_api);
+    let attack_height  = current_height + 1;
     let forged_vote = Vote {
         vote_type:  VoteType::Prevote,
-        height:     3,
+        height:     attack_height,
         round:      0,
         validator:  ValidatorId("qcb1bob".to_string()),
-        block_hash: Some(BlockHash("block_h3_r0_genesis000000000000".to_string())),
+        block_hash: Some(BlockHash("block_h_r0_garbage_sig_00000000".to_string())),
         signature:  garbage,
     };
 
-    eprintln!("   [attacker] sending vote from qcb1bob with garbage signature...");
+    eprintln!("   [attacker] sending forged vote from qcb1bob (garbage sig) at height={attack_height}...");
     attacker_publish_vote(&attacker, &forged_vote).await;
+
+    // Give the nodes time to receive, attempt to verify, and log the rejection.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    println!("   [phase2] Verifying chain advanced past height 4...");
+    println!("   [phase2] Verifying chain advanced past attack height...");
     let advanced = poll_until_height(
-        &ports.all_api_ports(), 4, Duration::from_secs(20),
+        &ports.all_api_ports(), attack_height + 2, Duration::from_secs(30),
     );
+
+    // ── Hard assertion: rejection must appear in node logs ────────────────────
+    //
+    // We search all four node logs for a line that contains BOTH:
+    //   1. "invalid signature"  — the rejection reason logged by verify_vote_signature
+    //   2. "qcb1bob"            — confirming it was Bob's forged vote that was rejected
+    //
+    // This is the direct evidence that the garbage-sig vote was actively rejected
+    // rather than silently accepted (the Phase-0 pass-through).
+    let sig_rejected = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]
+        .iter()
+        .any(|node| {
+            let log = std::fs::read_to_string(log_dir.join(format!("{node}.log")))
+                .unwrap_or_default();
+            log.lines().any(|line|
+                (line.contains("invalid signature") || line.contains("vote rejected"))
+                    && line.contains("qcb1bob")
+            )
+        });
 
     println!();
     println!("── Result ───────────────────────────────────────────────────────────");
 
-    if advanced {
-        println!("   PASS (Phase 0 STUB): genesis has no public keys — sig check skipped.");
-        println!("   The vote was accepted but harmless; quorum still requires 3 real nodes.");
-        println!("   This test does NOT count as verified signature rejection.");
-        println!("   See test-body TODO to promote it to a real test.");
-    } else {
-        dump_logs(&log_dir, &["qcb1alice", "qcb1bob"], 20);
-        panic!("chain stalled — unexpected for a garbage-sig attack in Phase 0");
+    if !advanced {
+        dump_logs(&log_dir, &["qcb1alice", "qcb1bob", "qcb1carol"], 25);
+        panic!(
+            "chain stalled at height {}  — expected all 4 nodes to advance past {}: \
+             the real Bob node's signed votes should still count toward quorum.",
+            height_of(ports.alice_api), attack_height + 2
+        );
     }
+    println!("   PASS: chain advanced despite garbage-sig attack (liveness verified).");
+
+    assert!(
+        sig_rejected,
+        "garbage-signature vote from qcb1bob was NOT logged as rejected in any node. \
+         Expected a log line containing 'invalid signature' (or 'vote rejected') \
+         and 'qcb1bob'.  Check that genesis public_key fields are present and \
+         that verify_vote_signature is not taking the Phase-0 pass-through path."
+    );
+    println!("   PASS: garbage-signature vote from qcb1bob was actively rejected \
+              (confirmed in node logs — KNOWN_ISSUES §3 resolved).");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

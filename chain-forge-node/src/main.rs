@@ -41,6 +41,9 @@ struct Args {
     key_file: Option<std::path::PathBuf>,
     /// Directory to persist state between restarts. If absent, state is lost on shutdown.
     data_dir: Option<std::path::PathBuf>,
+    /// Extra bootstrap peer addresses (libp2p multiaddrs, e.g. /ip4/127.0.0.1/tcp/27001).
+    /// Merged with genesis `network.bootstrap_nodes`. Repeatable: --bootstrap A --bootstrap B.
+    bootstrap_peers: Vec<String>,
 }
 
 fn parse_args() -> Args {
@@ -51,6 +54,7 @@ fn parse_args() -> Args {
     let mut p2p_port: Option<u16> = None;
     let mut key_file: Option<std::path::PathBuf> = None;
     let mut data_dir: Option<std::path::PathBuf> = None;
+    let mut bootstrap_peers: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -83,6 +87,10 @@ fn parse_args() -> Args {
                 i += 1;
                 if i < args.len() { key_file = Some(std::path::PathBuf::from(&args[i])); }
             }
+            "--bootstrap" | "-b" => {
+                i += 1;
+                if i < args.len() { bootstrap_peers.push(args[i].clone()); }
+            }
             "--help" | "-h" => {
                 println!("chain-forge-node");
                 println!("  --genesis <path>     Path to genesis.json (default: genesis.json)");
@@ -92,6 +100,8 @@ fn parse_args() -> Args {
                 println!("  --key-file <path>    Path to this validator's *.key.json file (for signing)");
                 println!("  --data-dir <path>    Directory to persist chain state (default: memory-only)");
                 println!("                       (needed to run multiple local nodes)");
+                println!("  --bootstrap <addr>   Extra bootstrap peer (libp2p multiaddr, e.g. /ip4/127.0.0.1/tcp/27001)");
+                println!("                       Repeatable: --bootstrap A --bootstrap B");
                 std::process::exit(0);
             }
             _ => {}
@@ -99,7 +109,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { genesis_path, validator_address, api_port, p2p_port, key_file, data_dir }
+    Args { genesis_path, validator_address, api_port, p2p_port, key_file, data_dir, bootstrap_peers }
 }
 
 #[tokio::main]
@@ -135,9 +145,11 @@ async fn main() {
         }
     };
 
-    // Build and run the node
-    let mut node = match node::Node::new_with_p2p_port(
-        &genesis_json, args.validator_address, args.p2p_port,
+    // Build and run the node. Pass CLI-supplied bootstrap peers so nodes can
+    // find each other immediately via direct dial rather than relying on mDNS
+    // (which is unreliable in CI / container environments).
+    let mut node = match node::Node::new_with_config(
+        &genesis_json, args.validator_address, args.p2p_port, args.bootstrap_peers,
     ).await {
         Ok(n) => n,
         Err(e) => {

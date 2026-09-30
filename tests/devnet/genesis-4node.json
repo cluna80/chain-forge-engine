@@ -57,25 +57,32 @@
       "address": "qcb1alice",
       "balance": "500000000",
       "role": "validator",
-      "_comment": "500 QCB = 500_000_000 uqcb; 10x the max equivocation slash (5% of 500 QCB = 25 QCB). Raised from 5 QCB to fix KNOWN_ISSUES §1 (genesis stake underflows slash penalty)."
+      "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8",
+      "_comment": "500 QCB = 500_000_000 uqcb; 10x the max equivocation slash (5% of 500 QCB = 25 QCB). Raised from 5 QCB to fix KNOWN_ISSUES §1. public_key = Ed25519 verifying key for tests/devnet/keys/alice.key.json (Phase 1 §3)."
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
       "balance": "500000000",
-      "role": "validator"
+      "role": "validator",
+      "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0",
+      "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/bob.key.json"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
       "balance": "500000000",
-      "role": "validator"
+      "role": "validator",
+      "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692",
+      "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/carol.key.json"
     },
     {
       "label": "Dave",
       "address": "qcb1dave",
       "balance": "500000000",
-      "role": "validator"
+      "role": "validator",
+      "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0",
+      "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/dave.key.json"
     }
   ],
   "attestation_coordinator": "qcb1alice"

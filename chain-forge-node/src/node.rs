@@ -252,6 +252,11 @@ pub struct Node {
     /// Transactions submitted via POST /api/tx, waiting to be pulled into
     /// the mempool. Drained once per heartbeat tick in run().
     tx_queue: SharedTxQueue,
+    /// True if the runtime network config has bootstrap peers (from genesis
+    /// or injected via --bootstrap CLI flag). Controls whether the event loop
+    /// waits for real peer connections before attempting to participate in
+    /// consensus. False means no peers are expected (solo devnet mode).
+    has_bootstrap_peers: bool,
 }
 
 /// Map a transaction body to a short string label for the explorer.
@@ -297,6 +302,23 @@ impl Node {
         genesis_json: &str,
         validator_address: Option<String>,
         p2p_port_override: Option<u16>,
+    ) -> Result<Self, NodeError> {
+        Self::new_with_config(genesis_json, validator_address, p2p_port_override, vec![]).await
+    }
+
+    /// Full constructor: P2P port override + extra bootstrap peer addresses.
+    ///
+    /// `extra_bootstrap` is a list of libp2p multiaddr strings
+    /// (e.g. `/ip4/127.0.0.1/tcp/27001`) that are **merged** with the
+    /// genesis `network.bootstrap_nodes` list before the network layer starts.
+    /// This lets the node CLI override or extend the genesis peer list at
+    /// runtime — necessary to run multiple nodes locally without embedding
+    /// per-instance addresses in a shared genesis file.
+    pub async fn new_with_config(
+        genesis_json: &str,
+        validator_address: Option<String>,
+        p2p_port_override: Option<u16>,
+        extra_bootstrap: Vec<String>,
     ) -> Result<Self, NodeError> {
         // Parse and validate genesis
         let genesis = GenesisConfig::from_json(genesis_json)
@@ -405,6 +427,7 @@ impl Node {
 
         let consensus_cfg = ConsensusConfig {
             variant:              ConsensusVariant::TendermintStyle,
+            chain_id:             genesis.chain_id.clone(),
             propose_timeout_ms:   genesis.consensus.block_time_ms * 2,
             prevote_timeout_ms:   genesis.consensus.block_time_ms,
             precommit_timeout_ms: genesis.consensus.block_time_ms,
@@ -425,6 +448,14 @@ impl Node {
         let mut net_config = NetworkConfig::from_genesis(&genesis);
         if let Some(port) = p2p_port_override {
             net_config.p2p_port = port;
+        }
+        // Merge CLI-supplied bootstrap peers into the genesis list so that
+        // nodes launched via --bootstrap can find each other immediately
+        // without relying on mDNS, which is unreliable in CI containers.
+        for addr in extra_bootstrap {
+            if !net_config.bootstrap_nodes.contains(&addr) {
+                net_config.bootstrap_nodes.push(addr);
+            }
         }
 
         // Real libp2p when the "real-network" feature is enabled AND we are
@@ -612,6 +643,10 @@ impl Node {
 
         let tx_queue: SharedTxQueue = Arc::new(Mutex::new(Vec::new()));
 
+        // Record whether the final runtime config has bootstrap peers so the
+        // event loop can decide between solo-devnet and multi-node mode.
+        let has_bootstrap_peers = !net_config.bootstrap_nodes.is_empty();
+
         Ok(Self {
             genesis,
             consensus: Box::new(engine),
@@ -637,6 +672,7 @@ impl Node {
             slasher,
             validator_registry,
             tx_queue,
+            has_bootstrap_peers,
         })
     }
 
@@ -806,6 +842,11 @@ impl Node {
             vi.public_key = kp.public_key.clone();
             self.consensus.update_validator_set(vs).ok();
         }
+        // Set this node's validator identity so the event loop participates
+        // in consensus (casts prevotes / precommits) rather than running as
+        // an observer. Without this, the node logs "validator=None" and never
+        // votes, so the network cannot reach quorum.
+        self.validator_id = Some(chain_forge_consensus::ValidatorId(address.clone()));
         tracing::info!(address = %address, "validator signing key loaded");
         self.signing_key = Some(kp);
         Ok(())
@@ -1016,7 +1057,9 @@ impl Node {
                     // proposal gets rejected on height mismatch. So the solo
                     // fallback now only fires when this node has no bootstrap
                     // peers configured at all -- a genuinely standalone node.
-                    let expects_peers = !self.genesis.network.bootstrap_nodes.is_empty();
+                    // Use the runtime-resolved flag (which accounts for
+                    // --bootstrap CLI peers merged in addition to genesis).
+                    let expects_peers = self.has_bootstrap_peers;
 
                     if peer_count == 0 && !expects_peers {
                         // No real peers, none expected: solo devnet convenience

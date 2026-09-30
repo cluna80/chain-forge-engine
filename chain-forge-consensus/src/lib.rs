@@ -343,6 +343,11 @@ pub struct ConsensusConfig {
     /// Which algorithm variant to instantiate.
     pub variant: ConsensusVariant,
 
+    /// The chain's unique identifier. Domain-separates signed messages so
+    /// a vote valid on one chain cannot be replayed on another.
+    /// Must match the `chain_id` in genesis.json.
+    pub chain_id: String,
+
     /// Milliseconds to wait for a proposal before declaring a round timeout.
     pub propose_timeout_ms: u64,
 
@@ -610,6 +615,7 @@ impl FbaEngine {
         Self {
             config:      ConsensusConfig {
                 variant:              ConsensusVariant::XrplInspired,
+                chain_id:             String::new(),
                 propose_timeout_ms:   4_000,
                 prevote_timeout_ms:   1_000,
                 precommit_timeout_ms: 1_000,
@@ -1239,6 +1245,7 @@ impl ConsensusEngine for TendermintEngine {
             "consensus engine initialised"
         );
 
+        self.chain_id = config.chain_id.clone();
         self.validator_set = Some(vs);
         self.config = Some(config);
         self.height = 0;
@@ -1412,8 +1419,13 @@ impl ConsensusEngine for TendermintEngine {
                     vote.block_hash.as_ref(),
                 );
                 let sig = Signature { scheme: SchemeId::Classical, bytes: vote.signature.clone() };
-                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_|
-                    ConsensusError::UnknownValidator(vote.validator.clone())
+                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|e|
+                    ConsensusError::InvalidVote {
+                        validator:  vote.validator.clone(),
+                        block_hash: vote.block_hash.clone()
+                            .unwrap_or_else(|| BlockHash("nil".into())),
+                        reason:     format!("invalid signature: {e}"),
+                    }
                 )?;
             }
         }
@@ -1798,6 +1810,7 @@ impl HotStuffEngine {
         Self {
             config:          ConsensusConfig {
                 variant:              ConsensusVariant::HotStuffStyle,
+                chain_id:             String::new(),
                 propose_timeout_ms:   3_000,
                 prevote_timeout_ms:   1_000,
                 precommit_timeout_ms: 1_000,
@@ -2147,6 +2160,7 @@ mod tests {
     fn default_config() -> ConsensusConfig {
         ConsensusConfig {
             variant:             ConsensusVariant::TendermintStyle,
+            chain_id:            "test-chain".to_string(),
             propose_timeout_ms:  3_000,
             prevote_timeout_ms:  1_000,
             precommit_timeout_ms: 1_000,
@@ -2823,6 +2837,7 @@ mod tests {
     fn fba_config() -> ConsensusConfig {
         ConsensusConfig {
             variant:              ConsensusVariant::XrplInspired,
+            chain_id:             "test-chain".to_string(),
             propose_timeout_ms:   4_000,
             prevote_timeout_ms:   1_000,
             precommit_timeout_ms: 1_000,
@@ -3018,6 +3033,7 @@ mod tests {
 
         let vs = fba_validators(4);
         let cfg_t = ConsensusConfig { variant: ConsensusVariant::TendermintStyle,
+            chain_id: "test-chain".to_string(),
             propose_timeout_ms: 1000, prevote_timeout_ms: 1000,
             precommit_timeout_ms: 1000, block_time_ms: 1000, personhood: None };
         let cfg_h = ConsensusConfig { variant: ConsensusVariant::HotStuffStyle, ..cfg_t.clone() };
@@ -3049,6 +3065,7 @@ mod tests {
     fn hotstuff_config() -> ConsensusConfig {
         ConsensusConfig {
             variant:              ConsensusVariant::HotStuffStyle,
+            chain_id:             "test-chain".to_string(),
             propose_timeout_ms:   3_000,
             prevote_timeout_ms:   1_000,
             precommit_timeout_ms: 1_000,

@@ -52,34 +52,56 @@ passes 5-for-5 runs, showing 4 active validators with total_power=4.
 
 ## §3  Garbage-signature test is a Phase 0 stub (not verified rejection)
 
-**Symptom**
+**Status: RESOLVED** — commit `TBD` (see below)
 
-`adversarial_garbage_signature` passes but does NOT verify that garbage
-signatures are rejected.  In Phase 0, `verify_vote_signature` takes a
-pass-through path when genesis has no `public_key` fields, so the garbage-sig
-vote is silently accepted.  The chain remains safe only because a single
+**Was**: `adversarial_garbage_signature` passed but did NOT verify that
+garbage signatures are rejected.  In Phase 0, `verify_vote_signature` took a
+pass-through path when genesis had no `public_key` fields, so the garbage-sig
+vote was silently accepted.  The chain remained safe only because a single
 injected vote cannot manufacture quorum.
 
-**Status**
+The test was marked `#[ignore]` and did not count as coverage.
 
-The test is marked `#[ignore]` so it does not count as coverage.  It is
-intentionally left visible in the test suite as a TODO marker.
+**Root cause (discovered during fix)**
 
-**Fix needed**
+Two bugs combined to prevent real signature verification from working:
 
-1. Add `public_key` fields (Ed25519 or equivalent) for each validator in
-   `tests/devnet/genesis-4node.json`.
-2. Update `verify_vote_signature` to actually verify against those keys.
-3. Replace the Phase-0 pass branch in the test with an assertion that the
-   garbage-sig vote is rejected (grep logs for "invalid signature" or the
-   equivalent error variant).
-4. Remove the `#[ignore]` attribute.
+1. **`ConsensusConfig` had no `chain_id` field**: `TendermintEngine.chain_id`
+   was never set from genesis during `init()`.  Vote signing used the real
+   chain_id (`"qcb-devnet-4node"`) but verification used `""` — so all
+   Ed25519 checks failed even for legitimate votes.
+
+2. **Wrong error mapping**: the signature verification failure path mapped the
+   crypto error to `ConsensusError::UnknownValidator` instead of
+   `ConsensusError::InvalidVote`, producing misleading "validator X is not in
+   the current validator set" log messages for what were actually signature
+   failures.
+
+**Fix**
+
+1. Added `public_key` fields (Ed25519) for each validator in
+   `tests/devnet/genesis-4node.json` (done in prior session).
+2. Added `chain_id: String` field to `ConsensusConfig`.
+3. `TendermintEngine::init()` now sets `self.chain_id = config.chain_id.clone()`.
+4. `node.rs` `ConsensusConfig` construction passes `chain_id: genesis.chain_id.clone()`.
+5. Fixed error mapping: signature failure → `ConsensusError::InvalidVote { reason: "invalid signature: ..." }`.
+6. Removed the `#[ignore]` attribute from the test; it now runs in CI.
+
+**Verification**
+
+`adversarial_garbage_signature` passes with both assertions green:
+- `PASS: chain advanced despite garbage-sig attack (liveness verified)` — the
+  3-of-4 honest validators retain quorum and the chain advances past the
+  attack height.
+- `PASS: garbage-signature vote from qcb1bob was actively rejected` — node
+  logs contain a line matching "invalid signature" with "qcb1bob".
 
 **Affects**
 
-`chain-forge-node/tests/adversarial_gossip.rs`,
-`chain-forge-node/src/node.rs` (`verify_vote_signature`),
-`tests/devnet/genesis-4node.json`
+`chain-forge-consensus/src/lib.rs` (`ConsensusConfig`, `TendermintEngine::init`,
+signature error mapping),
+`chain-forge-node/src/node.rs` (`ConsensusConfig` construction),
+`chain-forge-node/tests/adversarial_gossip.rs` (`adversarial_garbage_signature`)
 
 ---
 

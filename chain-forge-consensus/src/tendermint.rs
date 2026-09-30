@@ -343,6 +343,15 @@ impl ConsensusEngine for TendermintEngine {
 
         // Reject votes from unknown validators.
         if vs.power_of(&vote.validator) == 0 {
+            // TEMP DEBUG: dump the validator set so we can see why power is 0
+            let ids: Vec<String> = vs.validators.iter()
+                .map(|v| format!("{}(power={})", v.id, v.voting_power))
+                .collect();
+            tracing::error!(
+                vote_validator = %vote.validator,
+                validators_in_set = ?ids,
+                "DEBUG tendermint.rs: power_of returned 0"
+            );
             return Err(ConsensusError::UnknownValidator(vote.validator.clone()));
         }
 
@@ -537,6 +546,7 @@ mod tests {
     fn default_config() -> ConsensusConfig {
         ConsensusConfig {
             variant:             ConsensusVariant::TendermintStyle,
+            chain_id:            "test-chain".to_string(),
             propose_timeout_ms:  3_000,
             prevote_timeout_ms:  1_000,
             precommit_timeout_ms: 1_000,
