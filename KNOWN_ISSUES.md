@@ -52,7 +52,7 @@ passes 5-for-5 runs, showing 4 active validators with total_power=4.
 
 ## §3  Garbage-signature test is a Phase 0 stub (not verified rejection)
 
-**Status: RESOLVED** — commit `TBD` (see below)
+**Status: RESOLVED** — commit `c07f5d1`
 
 **Was**: `adversarial_garbage_signature` passed but did NOT verify that
 garbage signatures are rejected.  In Phase 0, `verify_vote_signature` took a
