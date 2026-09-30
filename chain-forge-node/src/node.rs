@@ -627,6 +627,18 @@ impl Node {
                             } else {
                                 info!(validator = id, "genesis validator PoP confirmed — Active");
                             }
+                            // Sync the verified charm into the StateStore account so
+                            // the explorer shows the correct tier from block 1.
+                            // Without this, genesis validators are Verified in
+                            // IdentityStore but have no charm in StateStore, so
+                            // /api/identity returns registered:false forever.
+                            if let (Ok(record), Ok(acct)) = (
+                                identity.get(id),
+                                state.get_account_mut(id),
+                            ) {
+                                acct.attach_charm(record.charm.clone());
+                                state.refresh_leaf(id);
+                            }
                         }
                         Err(e) => {
                             warn!(
