@@ -2582,10 +2582,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nil_vs_real_precommit_is_equivocation() {
-        // A precommit-nil followed by a precommit-block (or vice-versa) at the
-        // same (height, round) is equivocation — the is_some() guards that
-        // previously let this through were a bug.
+    async fn nil_vs_real_precommit_is_not_equivocation() {
+        // SPEC: A validator equivocates if and only if it casts two conflicting
+        // NON-NIL precommits for the same (height, round).  A precommit-nil
+        // followed by a precommit-block (or vice-versa) is standard BFT
+        // round-change behavior — the validator observed a polka after sending
+        // nil, or released a lock.  This is correct protocol and MUST NOT be
+        // flagged as equivocation.
+        //
+        // Regression test: the original code compared block_hash inequality
+        // without checking is_some(), treating nil-vs-real as a double-sign.
+        // That caused honest validators to be tombstoned at startup (KNOWN_ISSUES §2).
         let (mut engine, vs) = make_engine_and_vs(4);
         engine.init(default_config(), vs.clone()).await.unwrap();
 
@@ -2605,7 +2612,7 @@ mod tests {
             height:     0,
             round:      0,
             validator:  validator.clone(),
-            block_hash: Some(block),  // precommit-block
+            block_hash: Some(block),  // precommit-block (normal round-change)
             signature:  vec![],
         };
 
@@ -2613,13 +2620,21 @@ mod tests {
         engine.receive_vote(real_vote).await.unwrap();
 
         let evidence = engine.drain_equivocations();
-        assert_eq!(evidence.len(), 1, "nil-vs-real precommit must be detected as equivocation");
-        assert_eq!(evidence[0].validator_id, validator);
+        assert!(
+            evidence.is_empty(),
+            "nil-then-real precommit is normal BFT behavior and must not produce equivocation evidence"
+        );
     }
 
     #[tokio::test]
-    async fn nil_vs_real_prevote_is_equivocation() {
-        // Same as above but for prevotes.
+    async fn nil_vs_real_prevote_is_not_equivocation() {
+        // SPEC: A validator equivocates if and only if it casts two conflicting
+        // NON-NIL prevotes for the same (height, round).  A prevote-nil followed
+        // by a prevote-block is standard polka-nil → new proposal behavior and
+        // MUST NOT be flagged as equivocation.
+        //
+        // Regression test for KNOWN_ISSUES §2 primary cause: the false equivocation
+        // detection that tombstoned honest validators during startup gossip warmup.
         let (mut engine, vs) = make_engine_and_vs(4);
         engine.init(default_config(), vs.clone()).await.unwrap();
 
@@ -2647,7 +2662,89 @@ mod tests {
         engine.receive_vote(real_vote).await.unwrap();
 
         let evidence = engine.drain_equivocations();
-        assert_eq!(evidence.len(), 1, "nil-vs-real prevote must be detected as equivocation");
+        assert!(
+            evidence.is_empty(),
+            "nil-then-real prevote is normal BFT behavior and must not produce equivocation evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_different_real_precommits_is_equivocation() {
+        // SPEC: Two conflicting NON-NIL precommits from the same validator at
+        // the same (height, round) IS equivocation — the validator signed two
+        // different real blocks, which cannot be explained by legitimate
+        // round-change behavior.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let validator = ValidatorId("val_02".into());
+        let block_a = BlockHash("block_A".into());
+        let block_b = BlockHash("block_B".into());
+
+        let vote_a = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block_a),
+            signature:  vec![],
+        };
+        let vote_b = Vote {
+            vote_type:  VoteType::Precommit,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block_b),
+            signature:  vec![],
+        };
+
+        engine.receive_vote(vote_a).await.unwrap();
+        engine.receive_vote(vote_b).await.unwrap();
+
+        let evidence = engine.drain_equivocations();
+        assert_eq!(
+            evidence.len(), 1,
+            "two conflicting real precommits must produce exactly one equivocation record"
+        );
+        assert_eq!(evidence[0].validator_id, validator);
+    }
+
+    #[tokio::test]
+    async fn two_different_real_prevotes_is_equivocation() {
+        // SPEC: Two conflicting NON-NIL prevotes from the same validator at
+        // the same (height, round) IS equivocation.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        let validator = ValidatorId("val_03".into());
+        let block_a = BlockHash("block_X".into());
+        let block_b = BlockHash("block_Y".into());
+
+        let vote_a = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block_a),
+            signature:  vec![],
+        };
+        let vote_b = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  validator.clone(),
+            block_hash: Some(block_b),
+            signature:  vec![],
+        };
+
+        engine.receive_vote(vote_a).await.unwrap();
+        engine.receive_vote(vote_b).await.unwrap();
+
+        let evidence = engine.drain_equivocations();
+        assert_eq!(
+            evidence.len(), 1,
+            "two conflicting real prevotes must produce exactly one equivocation record"
+        );
         assert_eq!(evidence[0].validator_id, validator);
     }
 
