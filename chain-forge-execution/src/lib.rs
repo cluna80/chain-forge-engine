@@ -259,6 +259,7 @@ pub struct Transaction {
     /// Maximum gas the sender is willing to pay.
     pub gas_limit: u64,
     /// Ed25519 signature over signing_bytes(chain_id). Empty when unsigned.
+    #[serde(default)]
     pub signature: Vec<u8>,
     /// Ed25519 public key (32 bytes) that produced `signature`. Must either
     /// match the key bound to `sender`, or -- for an account with no bound
