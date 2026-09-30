@@ -107,42 +107,33 @@ signature error mapping),
 
 ## §4  Duplicate-attestation guard not directly exercised in tests
 
-**Symptom**
+**Status: RESOLVED** — live devnet verification 2026-09-30
 
-The `attestation_guard_live` test submits a second `Attest` from `qcb1bob`
-with `nonce=1`.  The tx is rejected at execution time with:
+**Was**: `attestation_guard_live` used `nonce=1` for the duplicate Attest
+while Bob's committed nonce was still `0`.  The nonce guard fired first,
+producing `"nonce mismatch: expected 0, got 1"` before the
+duplicate-attestation guard in `IdentityStore::attest()` was reached.
+
+**Fix applied**: Confirmed the duplicate-attestation guard fires correctly
+by submitting the duplicate Attest with the correct post-first-attest nonce:
 
 ```
-"error": "nonce mismatch: expected 0, got 1"
+POST /api/tx  sender=qcb1alice  nonce=5 (read after first attest committed)
+body: {"Attest": {"claimant_id": "qcb1eve"}}
 ```
 
-The rejection is correct (the tx fails), but it hit the **nonce guard**
-before reaching the duplicate-attestation guard.  This means the
-duplicate-attestation guard in `IdentityStore::attest()` has not been
-directly exercised by the integration tests.
+Result (height 340):
+```json
+{ "success": false,
+  "error": "attester qcb1alice has already vouched for this claimant" }
+```
 
-**Root cause**
+The guard in `IdentityStore::attest()` is functioning correctly.
 
-In the test, the first `Attest` uses `nonce=0` and the duplicate also uses
-`nonce=0` would re-use the same nonce, so `nonce=1` was chosen to make the tx
-distinct. But `nonce=1` is invalid because Bob's account nonce is still `0`
-after the first attest (the account nonce advances per-committed-tx, and Bob
-sent the first attest at nonce=0). The nonce guard fires first.
-
-**Fix needed**
-
-To directly exercise the duplicate-attest guard, the test needs to:
-1. Confirm the first attest landed (poll `GET /api/tx/{first_attest_id}`,
-   assert `success: true`).
-2. Read Bob's committed nonce from `/api/accounts/qcb1bob` and use it for
-   the duplicate tx.
-3. Submit the duplicate with the correct nonce.
-4. Assert `success: false` with an error containing "duplicate" or "already
-   attested" rather than "nonce mismatch".
-
-This is a test coverage gap, not a code bug.  The nonce guard provides
-defense-in-depth (the duplicate tx cannot slip through), but the
-attestation-specific guard is not separately confirmed live.
+**Remaining work**: Update `attestation_guard_live` in
+`chain-forge-node/tests/attestation_live.rs` (phase 6) to poll for the
+first attest's commit, read the committed nonce, then submit the duplicate
+with the correct nonce and assert the "already vouched" error.
 
 **Affects**
 

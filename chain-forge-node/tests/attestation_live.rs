@@ -452,12 +452,20 @@ async fn attestation_guard_live() {
     // without a live handle to IdentityStore). The executor must reject it.
     // We assert success=false via GET /api/tx/{id} — the same pattern as
     // attestation_coordinator_gate. This closes KNOWN_ISSUES §4.
+    //
+    // IMPORTANT: use Bob's committed nonce (read after the first attest
+    // landed), NOT nonce=1 hardcoded.  Using an incorrect nonce causes the
+    // *nonce guard* to fire first, masking the duplicate-attestation guard.
+    let bob_nonce = api_get(ports.bob_api, "/api/accounts/qcb1bob")
+        .and_then(|v| v["nonce"].as_u64())
+        .unwrap_or(0);
+    println!("   [phase6] Bob's committed nonce after first attest: {bob_nonce}");
     println!("   [phase6] Submitting duplicate Attest (queued at API, rejected at execution)...");
     let dup_tx_id = format!("attest-dup-{claimant}");
     let dup_tx = serde_json::json!({
         "id":        &dup_tx_id,
         "sender":    "qcb1bob",
-        "nonce":     1u64,
+        "nonce":     bob_nonce,
         "body":      { "Attest": { "claimant_id": &claimant } },
         "gas_limit": 100_000u64,
         "signature": [],
@@ -487,14 +495,28 @@ async fn attestation_guard_live() {
         match dup_result {
             Some(ref v) => {
                 let success = v["success"].as_bool();
+                let error_msg = v["error"].as_str().unwrap_or("");
                 assert!(
                     success == Some(false),
                     "duplicate Attest from qcb1bob should have success=false at execution \
                      (same attester already attested this claimant), but got success={success:?}. \
+                     Error was: '{error_msg}'. \
                      The duplicate-attestation guard may not be enforced."
                 );
-                println!("   PASS: duplicate Attest correctly rejected at execution time.");
-                println!("   Error: {}", v["error"].as_str().unwrap_or("(no error field)"));
+                // The error should come from the duplicate-attest guard, not the nonce guard.
+                // If it says "nonce mismatch" the test nonce was wrong (see KNOWN_ISSUES §4 fix).
+                assert!(
+                    !error_msg.contains("nonce mismatch"),
+                    "duplicate Attest was rejected by the NONCE guard ('{error_msg}'), \
+                     not by the duplicate-attestation guard. \
+                     Check that bob_nonce was read correctly after the first attest committed."
+                );
+                assert!(
+                    error_msg.contains("already") || error_msg.contains("duplicate"),
+                    "expected 'already' or 'duplicate' in error, got: '{error_msg}'"
+                );
+                println!("   PASS: duplicate Attest correctly rejected by attestation guard.");
+                println!("   Error: {error_msg}");
             }
             None => {
                 // The duplicate was queued but not yet committed in 2 blocks.
