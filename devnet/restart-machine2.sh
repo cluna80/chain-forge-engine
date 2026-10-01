@@ -5,6 +5,7 @@ set -euo pipefail
 
 BINARY="$HOME/chain-forge-node"
 GENESIS="$HOME/genesis-4node.json"
+KEY="$HOME/qcb1carol.key.json"
 LOG_DIR="$HOME/logs"
 
 echo "==> Stopping any running chain-forge-node processes..."
@@ -17,6 +18,7 @@ echo "==> Starting Carol (api=8083, p2p=26659)..."
 nohup "$BINARY" \
   --genesis "$GENESIS" \
   --validator qcb1carol \
+  --key-file "$KEY" \
   --api-port 8083 \
   --p2p-port 26659 \
   --bootstrap /ip4/192.168.137.2/tcp/26656 \

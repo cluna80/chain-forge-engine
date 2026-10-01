@@ -5,6 +5,7 @@ set -euo pipefail
 
 BINARY="$HOME/chain-forge-node"
 GENESIS="$HOME/genesis-4node.json"
+KEYS="$HOME/chain-forge-engine/tests/devnet/keys"
 LOG_DIR="$HOME/logs"
 
 echo "==> Stopping any running chain-forge-node processes..."
@@ -17,6 +18,7 @@ echo "==> Starting Alice (api=8080, p2p=26656)..."
 nohup "$BINARY" \
   --genesis "$GENESIS" \
   --validator qcb1alice \
+  --key-file "$KEYS/alice.key.json" \
   --api-port 8080 \
   --p2p-port 26656 \
   --bootstrap /ip4/192.168.137.3/tcp/26659 \
@@ -29,6 +31,7 @@ echo "==> Starting Bob (api=8081, p2p=26657)..."
 nohup "$BINARY" \
   --genesis "$GENESIS" \
   --validator qcb1bob \
+  --key-file "$KEYS/bob.key.json" \
   --api-port 8081 \
   --p2p-port 26657 \
   --bootstrap /ip4/192.168.137.3/tcp/26659 \
@@ -41,6 +44,7 @@ echo "==> Starting Dave (api=8082, p2p=26658)..."
 nohup "$BINARY" \
   --genesis "$GENESIS" \
   --validator qcb1dave \
+  --key-file "$KEYS/dave.key.json" \
   --api-port 8082 \
   --p2p-port 26658 \
   --bootstrap /ip4/192.168.137.3/tcp/26659 \
