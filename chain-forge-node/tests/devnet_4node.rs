@@ -246,10 +246,17 @@ fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeP
 
         println!("   Starting {validator}  api=:{api_port}  p2p=:{p2p_port}  log={log_path:?}");
 
+        // Derive key file from validator name: "qcb1alice" -> "alice.key.json"
+        let short_name = validator.strip_prefix("qcb1").unwrap_or(validator);
+        let key_file = repo_root()
+            .join("tests").join("devnet").join("keys")
+            .join(format!("{short_name}.key.json"));
+
         let child = Command::new(bin)
             .args([
                 "--genesis",   genesis.to_str().unwrap(),
                 "--validator", validator,
+                "--key-file",  key_file.to_str().unwrap(),
                 "--api-port",  &api_port.to_string(),
                 "--p2p-port",  &p2p_port.to_string(),
             ])

@@ -136,9 +136,16 @@ fn spawn_node(
         .map(|&p| format!("/ip4/127.0.0.1/tcp/{p}"))
         .collect();
 
+    // Derive key file from validator name: "qcb1alice" -> "alice.key.json"
+    let short_name = name.strip_prefix("qcb1").unwrap_or(name);
+    let key_file = repo_root()
+        .join("tests").join("devnet").join("keys")
+        .join(format!("{short_name}.key.json"));
+
     let mut cmd = Command::new(node_binary());
     cmd.arg("--genesis").arg(genesis_path())
        .arg("--validator").arg(name)
+       .arg("--key-file").arg(&key_file)
        .arg("--api-port").arg(api_port.to_string())
        .arg("--p2p-port").arg(p2p_port.to_string());
     for addr in &bootstrap {
