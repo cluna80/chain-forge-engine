@@ -4,7 +4,7 @@
 set -euo pipefail
 
 BINARY="$HOME/chain-forge-node"
-GENESIS="$HOME/genesis-3node.json"
+GENESIS="$HOME/genesis-4node.json"
 LOG_DIR="$HOME/logs"
 
 echo "==> Stopping any running chain-forge-node processes..."
