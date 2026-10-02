@@ -1,0 +1,21 @@
+[package]
+name        = "chain-forge-vca-pq"
+description = "VCA-PQ-BFT primitives for QCB: verifiable-contribution scoring, adaptive quorum, post-quantum signature slots, and separation-invariant enforcement"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+sha3        = { workspace = true }
+
+chain-forge-core      = { path = "../chain-forge-core" }
+chain-forge-consensus = { path = "../chain-forge-consensus" }
+
+[dev-dependencies]
+tokio = { workspace = true }

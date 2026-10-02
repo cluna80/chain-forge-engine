@@ -18,6 +18,7 @@ members = [
     "chain-forge-slashing",
     "chain-forge-node",
     "chain-forge-personhood",
+    "chain-forge-vca-pq",
 ]
 
 [workspace.package]
