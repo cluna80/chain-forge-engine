@@ -55,7 +55,7 @@ use chain_forge_vca_pq::{
     VcaRegistry, VcaValidatorRecord, WeightConfig,
     compute_adaptive_quorum, compute_weight, verify_separation_invariant,
 };
-use chain_forge_consensus::ValidatorId;
+use chain_forge_core::ValidatorId;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 

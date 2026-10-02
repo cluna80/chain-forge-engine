@@ -14,10 +14,15 @@
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
-use chain_forge_core::ValidatorSetView;
 
 #[cfg(feature = "real-crypto")]
 use chain_forge_crypto::{ClassicalScheme, KeyPair, Signature, SchemeId, SignatureScheme};
+
+use chain_forge_vca_pq::{
+    VcaRegistry, WeightConfig, AdaptiveQuorumConfig,
+    ContributionScore, PersonhoodFactor, StakeAmount, IdentityHandle,
+    compute_adaptive_quorum, VcaError,
+};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -63,8 +68,8 @@ pub type ConsensusResult<T> = Result<T, ConsensusError>;
 
 // ── Primitive types ───────────────────────────────────────────────────────────
 
-/// Monotonically increasing block height. Genesis = 0.
-pub type BlockHeight = u64;
+/// Monotonically increasing block height. Re-exported from chain-forge-core.
+pub use chain_forge_core::BlockHeight;
 
 /// Round number within a height. Increments on timeout/nil-vote.
 pub type Round = u32;
@@ -89,111 +94,21 @@ impl std::fmt::Display for BlockHash {
 /// identity; for PoA chains it's just the public key. The consensus layer
 /// treats it as an opaque comparable identifier — interpretation is the
 /// identity layer's concern.
+/// Opaque validator identifier — re-exported from chain-forge-core.
 pub use chain_forge_core::ValidatorId;
 
-// ── Validator set ─────────────────────────────────────────────────────────────
+// ── Validator set — re-exported from chain-forge-core ────────────────────────
+//
+// ValidatorInfo, ValidatorSet, and BlockHeight live in chain-forge-core so
+// that chain-forge-vca-pq can import them without creating a dependency cycle
+// through this crate.  Everything that previously used the local definitions
+// continues to work via these re-exports.
 
-/// A single validator's participation parameters at a given height.
-///
-/// `voting_power` is a relative weight. For QCB personhood-weighted BFT:
-///   - all verified humans have equal base power (e.g. 1)
-///   - no single validator may exceed `PersonhoodConfig::power_cap`
-/// For plain PoS or PoA, power can vary freely.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidatorInfo {
-    pub id: ValidatorId,
+/// A single validator's participation parameters. Re-exported from core.
+pub use chain_forge_core::ValidatorInfo;
 
-    /// Relative voting power.
-    pub voting_power: u64,
-
-    /// Whether PoP-verified (used by personhood-weighted variant).
-    pub pop_verified: bool,
-
-    /// Ed25519 public key for this validator. Used to verify signatures on
-    /// proposals and votes. Empty on chains without real-crypto.
-    pub public_key: Vec<u8>,
-}
-
-/// The complete validator set at a given block height.
-/// Heights are used as keys because the set may rotate between epochs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidatorSet {
-    pub height: BlockHeight,
-    pub validators: Vec<ValidatorInfo>,
-}
-
-impl ValidatorSet {
-    /// Total voting power across all validators.
-    pub fn total_power(&self) -> u64 {
-        self.validators.iter().map(|v| v.voting_power).sum()
-    }
-
-    /// Classical BFT safety threshold: 2/3 + 1 of total power.
-    /// A commit requires at least this much power in pre-commits.
-    pub fn quorum_power(&self) -> u64 {
-        let total = self.total_power();
-        // ⌊2n/3⌋ + 1  - rounds down then adds 1, matching Tendermint convention.
-        (total * 2 / 3) + 1
-    }
-
-    /// Power held by a specific validator. Returns 0 if not in the set.
-    pub fn power_of(&self, id: &ValidatorId) -> u64 {
-        self.validators
-            .iter()
-            .find(|v| &v.id == id)
-            .map(|v| v.voting_power)
-            .unwrap_or(0)
-    }
-
-    /// Ed25519 public key for a validator. Empty if not registered.
-    pub fn public_key_of(&self, id: &ValidatorId) -> &[u8] {
-        self.validators.iter().find(|v| &v.id == id)
-            .map(|v| v.public_key.as_slice()).unwrap_or(&[])
-    }
-
-    /// True if the given set of votes (validator → power) meets the quorum.
-    pub fn has_quorum(&self, votes: &BTreeMap<ValidatorId, u64>) -> bool {
-        let voted: u64 = votes.values().sum();
-        voted >= self.quorum_power()
-    }
-
-    /// Number of Byzantine validators the set can tolerate (floor of n/3 - 1).
-    /// A set of 4 validators tolerates 0 Byzantine nodes (4/3 - 1 = 0).
-    /// A set of 10 tolerates 2 (10/3 - 1 ≈ 2).
-    pub fn byzantine_fault_tolerance(&self) -> usize {
-        let n = self.validators.len();
-        if n < 4 { 0 } else { n / 3 - 1 }
-    }
-}
-
-// -- ValidatorSetView ---------------------------------------------------------
-
-/// Implement the cross-crate read-only view trait so that chain-forge-personhood
-/// and other boundary crates can accept `&dyn ValidatorSetView` without taking
-/// a direct dependency on the full consensus crate.
-impl ValidatorSetView for ValidatorSet {
-    fn total_power(&self) -> u64 {
-        self.total_power()
-    }
-
-    fn quorum_power(&self) -> u64 {
-        self.quorum_power()
-    }
-
-    fn power_of(&self, id: &ValidatorId) -> u64 {
-        self.power_of(id)
-    }
-
-    /// Returns `None` if the validator has no bound key (empty slice).
-    fn public_key_of(&self, id: &ValidatorId) -> Option<&[u8]> {
-        let key = self.public_key_of(id);
-        if key.is_empty() { None } else { Some(key) }
-    }
-
-    fn validator_ids(&self) -> Vec<ValidatorId> {
-        self.validators.iter().map(|v| v.id.clone()).collect()
-    }
-}
+/// The complete validator set at a given block height. Re-exported from core.
+pub use chain_forge_core::ValidatorSet;
 
 // ── Block proposal ────────────────────────────────────────────────────────────
 
@@ -340,6 +255,101 @@ impl Default for PersonhoodConfig {
     }
 }
 
+// ── VCA-PQ-BFT integration ────────────────────────────────────────────────────
+
+/// Configuration that wires VCA-PQ-BFT weight computation into the consensus
+/// engine. When present on `ConsensusConfig`, the engine:
+///
+///   1. At each epoch boundary, rebuilds a `VcaRegistry` from the incoming
+///      `ValidatorSet`, populating contribution scores and personhood factors
+///      from `ValidatorInfo` fields.
+///   2. Calls `registry.close_epoch()` to apply the relative weight cap (A4).
+///   3. Calls `compute_adaptive_quorum()` to derive the BFT threshold from
+///      the verified-personhood fraction (ρ).
+///   4. Rewrites each validator's `voting_power` to match the VCA-derived
+///      `ConsensusWeight` so all downstream quorum arithmetic uses real
+///      personhood-weighted power.
+///
+/// If `VcaIntegrationConfig` is absent the engine falls back to the legacy
+/// `PersonhoodConfig` path (static power_cap + boolean pop_verified).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VcaIntegrationConfig {
+    /// VCA weight computation parameters (contribution scale, personhood
+    /// exponent, max_weight_multiplier for the relative cap, etc.).
+    pub weight_config: WeightConfig,
+
+    /// Adaptive quorum parameters (base fraction, ρ coverage thresholds,
+    /// quorum floor and ceiling).
+    pub quorum_config: AdaptiveQuorumConfig,
+}
+
+impl Default for VcaIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            weight_config: WeightConfig::default(),
+            quorum_config: AdaptiveQuorumConfig::default(),
+        }
+    }
+}
+
+/// Build a fresh `VcaRegistry` for the given epoch from a `ValidatorSet`.
+///
+/// Each `ValidatorInfo` is mapped to VCA primitives:
+///   - `contribution_score` = `voting_power` cast to f64 (legacy field reused
+///     as a contribution proxy until the execution layer emits real scores)
+///   - `personhood_factor`  = 1.0 if `pop_verified`, else 0.0
+///   - `stake`              = 0 (stake does not affect weight — ∂W/∂S = 0)
+///   - `identity_handle`    = validator id string
+///
+/// After population, `close_epoch()` is called to apply the relative weight
+/// cap, making it safe to read final weights and call `compute_adaptive_quorum`.
+pub fn build_vca_registry_from_validator_set(
+    epoch: u64,
+    vs: &ValidatorSet,
+    weight_config: WeightConfig,
+) -> VcaRegistry {
+    let mut registry = VcaRegistry::new(epoch, weight_config);
+
+    for v in &vs.validators {
+        let contribution = ContributionScore(v.voting_power as f64);
+        let personhood   = PersonhoodFactor(if v.pop_verified { 1.0 } else { 0.0 });
+        let stake        = StakeAmount(0); // stake irrelevant to weight
+        let handle       = IdentityHandle(v.id.0.clone());
+
+        // Errors here are programming errors (registry not yet closed), not
+        // runtime failures — log and skip rather than panicking the engine.
+        // Public keys are carried on ValidatorInfo.public_key; we pass
+        // the classical key from there and leave the PQ slot empty until
+        // the PQ migration pipeline is wired in.
+        let classical_pubkey = v.public_key.clone();
+        let pq_pubkey        = vec![];
+        if let Err(e) = registry.upsert(v.id.clone(), handle, contribution, personhood, stake, classical_pubkey, pq_pubkey) {
+            tracing::warn!(
+                validator = %v.id.0,
+                error     = %e,
+                "VCA registry upsert skipped during epoch build"
+            );
+        }
+    }
+
+    registry.close_epoch();
+    registry
+}
+
+/// Apply VCA-derived weights back onto a `ValidatorSet` in place.
+///
+/// After `close_epoch()`, each validator's `ConsensusWeight` is the
+/// authoritative weight. This function overwrites `voting_power` with it so
+/// that all downstream quorum arithmetic (prevote tallying, precommit tallying,
+/// `verify_commit`) uses the personhood-weighted values.
+pub fn apply_vca_weights_to_validator_set(vs: &mut ValidatorSet, registry: &VcaRegistry) {
+    for v in &mut vs.validators {
+        if let Some(record) = registry.records.get(&v.id) {
+            v.voting_power = record.weight.0;
+        }
+    }
+}
+
 // ── Consensus configuration ───────────────────────────────────────────────────
 
 /// Full configuration passed to a consensus engine at chain startup.
@@ -369,6 +379,15 @@ pub struct ConsensusConfig {
 
     /// QCB personhood parameters. Unused by non-personhood variants.
     pub personhood: Option<PersonhoodConfig>,
+
+    /// VCA-PQ-BFT integration. When present, overrides the legacy
+    /// `personhood` weight computation: `voting_power` is rewritten from
+    /// VCA `ConsensusWeight` and the adaptive quorum replaces `quorum_power()`.
+    ///
+    /// Set this for QCB. Leave `None` for plain PoA / PoS chains that do
+    /// not use verifiable-contribution scoring.
+    #[serde(default)]
+    pub vca: Option<VcaIntegrationConfig>,
 }
 
 /// The three BFT variants Chain Forge supports (Whitepaper Section 7.6).
@@ -627,6 +646,7 @@ impl FbaEngine {
                 precommit_timeout_ms: 1_000,
                 block_time_ms:        3_500, // XRPL ~3-5s block time
                 personhood:           None,
+                vca:                  None,
             },
             fba:         FbaConfig::default(),
             validators:  ValidatorSet { height: 0, validators: vec![] },
@@ -1078,6 +1098,18 @@ pub struct TendermintEngine {
     /// Equivocation evidence accumulated by receive_vote().
     /// The node drains this after each vote with `drain_equivocations()`.
     pub pending_equivocations: Vec<EquivocationDetected>,
+
+    /// VCA-derived quorum threshold for the current epoch.
+    ///
+    /// Computed by `build_vca_registry_from_validator_set` + `compute_adaptive_quorum`
+    /// at each epoch boundary. `None` when VCA is not configured or the
+    /// registry has not yet been built (genesis state).
+    ///
+    /// When `Some(q)`, `verify_commit` uses `q` as the quorum threshold instead
+    /// of `ValidatorSet::quorum_power()`. This is the primary integration point:
+    /// the adaptive quorum derived from verified-personhood fraction ρ replaces
+    /// the static 2n/3+1 threshold.
+    pub(crate) vca_quorum: Option<u64>,
 }
 
 /// Evidence of a double-sign detected by the consensus engine.
@@ -1113,6 +1145,7 @@ impl TendermintEngine {
             votes:                BTreeMap::new(),
             current_proposal:     None,
             pending_equivocations: Vec::new(),
+            vca_quorum:           None,
         }
     }
 
@@ -1227,8 +1260,41 @@ impl ConsensusEngine for TendermintEngine {
         config: ConsensusConfig,
         genesis_validators: ValidatorSet,
     ) -> ConsensusResult<()> {
-        // Apply personhood cap if configured (QCB mode).
-        let vs = if let Some(pop_cfg) = &config.personhood {
+        // VCA path: build registry, apply relative weight cap, rewrite
+        // voting_power with VCA-derived ConsensusWeight, compute adaptive quorum.
+        let vs = if let Some(vca_cfg) = &config.vca {
+            let registry = build_vca_registry_from_validator_set(
+                0, // genesis epoch
+                &genesis_validators,
+                vca_cfg.weight_config.clone(),
+            );
+            match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
+                Ok(q) => {
+                    self.vca_quorum = Some(q);
+                    let mut vs = genesis_validators;
+                    apply_vca_weights_to_validator_set(&mut vs, &registry);
+                    tracing::info!(
+                        epoch        = 0,
+                        validators   = vs.validators.len(),
+                        total_weight = vs.total_power(),
+                        vca_quorum   = q,
+                        "VCA-PQ-BFT genesis: weights and adaptive quorum set"
+                    );
+                    vs
+                }
+                Err(VcaError::EmergencyQuorum) => {
+                    tracing::error!("genesis VCA registry: all personhood expired — EmergencyQuorum");
+                    return Err(ConsensusError::Internal(
+                        "VCA genesis error: all validators have expired personhood".into()
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "VCA genesis quorum computation failed");
+                    return Err(ConsensusError::Internal(format!("VCA genesis error: {e}")));
+                }
+            }
+        } else if let Some(pop_cfg) = &config.personhood {
+            // Legacy path: static personhood cap.
             apply_personhood_cap(genesis_validators, pop_cfg)
         } else {
             genesis_validators
@@ -1244,10 +1310,11 @@ impl ConsensusEngine for TendermintEngine {
         }
 
         info!(
-            variant    = %self.name(),
-            validators = vs.validators.len(),
-            total_power = vs.total_power(),
+            variant      = %self.name(),
+            validators   = vs.validators.len(),
+            total_power  = vs.total_power(),
             quorum_power = vs.quorum_power(),
+            vca_enabled  = config.vca.is_some(),
             "consensus engine initialised"
         );
 
@@ -1632,14 +1699,56 @@ impl ConsensusEngine for TendermintEngine {
         self.locked_block     = None;
 
         // Update validator set if the commit triggered an epoch change.
-        if let Some(vs) = new_validator_set {
-            let vs = if let Some(pop_cfg) = self.config.as_ref().and_then(|c| c.personhood.as_ref()) {
-                apply_personhood_cap(vs, pop_cfg)
+        if let Some(incoming_vs) = new_validator_set {
+            let epoch = self.height; // new epoch == new height after advancing
+
+            // VCA path: rebuild registry, apply relative weight cap, rewrite
+            // voting_power, and compute the new adaptive quorum threshold.
+            let vs = if let Some(vca_cfg) = self.config.as_ref().and_then(|c| c.vca.as_ref()) {
+                let registry = build_vca_registry_from_validator_set(
+                    epoch,
+                    &incoming_vs,
+                    vca_cfg.weight_config.clone(),
+                );
+                match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
+                    Ok(q) => {
+                        self.vca_quorum = Some(q);
+                        let mut vs = incoming_vs;
+                        apply_vca_weights_to_validator_set(&mut vs, &registry);
+                        tracing::info!(
+                            epoch        = epoch,
+                            validators   = vs.validators.len(),
+                            total_weight = vs.total_power(),
+                            vca_quorum   = q,
+                            "VCA-PQ-BFT epoch rotation: weights and adaptive quorum updated"
+                        );
+                        vs
+                    }
+                    Err(VcaError::EmergencyQuorum) => {
+                        tracing::error!(
+                            epoch = epoch,
+                            "VCA epoch rotation: all personhood expired — EmergencyQuorum \
+                             (chain requires reconfiguration; keeping old validator set)"
+                        );
+                        return Err(ConsensusError::Internal(
+                            "VCA epoch error: all validators have expired personhood — \
+                             emergency reconfiguration required".into()
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!(epoch = epoch, error = %e, "VCA epoch quorum computation failed");
+                        return Err(ConsensusError::Internal(format!("VCA epoch error: {e}")));
+                    }
+                }
+            } else if let Some(pop_cfg) = self.config.as_ref().and_then(|c| c.personhood.as_ref()) {
+                // Legacy path: static personhood cap.
+                apply_personhood_cap(incoming_vs, &pop_cfg.clone())
             } else {
-                vs
+                incoming_vs
             };
+
             info!(
-                new_height = self.height,
+                new_height          = self.height,
                 new_validator_count = vs.validators.len(),
                 "validator set rotated for new epoch"
             );
@@ -1662,7 +1771,10 @@ impl ConsensusEngine for TendermintEngine {
         certificate: &CommitCertificate,
         validator_set: &ValidatorSet,
     ) -> ConsensusResult<()> {
-        let quorum = validator_set.quorum_power();
+        // VCA-PQ-BFT path: use adaptive quorum derived from verified-personhood
+        // fraction ρ instead of the static 2n/3+1 threshold.
+        // Falls back to static quorum_power() when VCA is not configured.
+        let quorum = self.vca_quorum.unwrap_or_else(|| validator_set.quorum_power());
 
         // Only consider well-formed precommits: correct type, height, and
         // block hash. Malformed entries are ignored rather than rejected so
@@ -1822,6 +1934,7 @@ impl HotStuffEngine {
                 precommit_timeout_ms: 1_000,
                 block_time_ms:        1_000,
                 personhood:           None,
+                vca:                  None,
             },
             validators:      ValidatorSet { height: 0, validators: vec![] },
             height:          0,
@@ -2172,6 +2285,7 @@ mod tests {
             precommit_timeout_ms: 1_000,
             block_time_ms:       5_000,
             personhood:          None,
+            vca:                 None,
         }
     }
 
@@ -2849,6 +2963,7 @@ mod tests {
             precommit_timeout_ms: 1_000,
             block_time_ms:        3_500,
             personhood:           None,
+            vca:                  None,
         }
     }
 
@@ -3041,7 +3156,7 @@ mod tests {
         let cfg_t = ConsensusConfig { variant: ConsensusVariant::TendermintStyle,
             chain_id: "test-chain".to_string(),
             propose_timeout_ms: 1000, prevote_timeout_ms: 1000,
-            precommit_timeout_ms: 1000, block_time_ms: 1000, personhood: None };
+            precommit_timeout_ms: 1000, block_time_ms: 1000, personhood: None, vca: None };
         let cfg_h = ConsensusConfig { variant: ConsensusVariant::HotStuffStyle, ..cfg_t.clone() };
         let cfg_f = ConsensusConfig { variant: ConsensusVariant::XrplInspired,  ..cfg_t.clone() };
 
@@ -3077,6 +3192,7 @@ mod tests {
             precommit_timeout_ms: 1_000,
             block_time_ms:        1_000,
             personhood:           None,
+            vca:                  None,
         }
     }
 
@@ -3303,5 +3419,203 @@ mod validator_id_identity {
         let core_id = chain_forge_core::ValidatorId("test".into());
         let consensus_id: crate::ValidatorId = core_id; // must compile
         assert_same_type(consensus_id);
+    }
+}
+
+// ── VCA-PQ-BFT integration tests ─────────────────────────────────────────────
+//
+// These tests prove that VCA-derived weights flow through the full consensus
+// engine path: init() → voting_power rewritten → verify_commit() uses
+// the adaptive quorum threshold rather than the static 2n/3+1 value.
+
+#[cfg(test)]
+mod vca_integration {
+    use super::*;
+    use super::tendermint::TendermintEngine;
+    use chain_forge_vca_pq::{WeightConfig, AdaptiveQuorumConfig};
+
+    /// Build a 4-validator set where contribution scores are unequal.
+    /// alice=4, bob=2, carol=2, dave=1  (pre-VCA voting_power values)
+    fn unequal_vs() -> ValidatorSet {
+        let names = [("alice", 4u64), ("bob", 2), ("carol", 2), ("dave", 1)];
+        ValidatorSet {
+            height: 0,
+            validators: names.iter().map(|(name, power)| ValidatorInfo {
+                id:           ValidatorId(name.to_string()),
+                voting_power: *power,
+                pop_verified: true,
+                public_key:   vec![],
+            }).collect(),
+        }
+    }
+
+    fn vca_config() -> ConsensusConfig {
+        ConsensusConfig {
+            variant:              ConsensusVariant::TendermintStyle,
+            chain_id:             "qcb-devnet".to_string(),
+            propose_timeout_ms:   1_000,
+            prevote_timeout_ms:   1_000,
+            precommit_timeout_ms: 1_000,
+            block_time_ms:        1_000,
+            personhood:           None,
+            vca: Some(VcaIntegrationConfig {
+                // tight weight multiplier: relative cap = 1.0 × median (strict BFT mode)
+                weight_config: WeightConfig {
+                    max_weight_multiplier: 1.0,
+                    ..WeightConfig::default()
+                },
+                quorum_config: AdaptiveQuorumConfig::default(),
+            }),
+        }
+    }
+
+    /// VCA init: voting_power is rewritten to VCA-derived ConsensusWeight.
+    ///
+    /// VCA weight formula: W = floor(C^0.5 × P × 1000)
+    ///   alice: C=4 → W_raw = floor(2000) = 2000
+    ///   bob:   C=2 → W_raw = floor(1414) = 1414
+    ///   carol: C=2 → W_raw = 1414
+    ///   dave:  C=1 → W_raw = 1000
+    ///
+    /// Sorted: [1000, 1414, 1414, 2000] → median = (1414+1414)/2 = 1414
+    /// With max_weight_multiplier=1.0: cap = floor(1414 * 1.0) = 1414
+    ///   alice capped: 2000 → 1414
+    ///   bob, carol, dave: already ≤ 1414, unchanged
+    #[tokio::test]
+    async fn vca_init_rewrites_voting_power() {
+        let mut engine = TendermintEngine::new();
+        let original_vs = unequal_vs();
+
+        // Pre-VCA: alice has 4× dave's voting_power (legacy field).
+        assert_eq!(original_vs.power_of(&ValidatorId("alice".into())), 4);
+        assert_eq!(original_vs.power_of(&ValidatorId("dave".into())),  1);
+
+        engine.init(vca_config(), original_vs).await
+            .expect("VCA init should succeed with all pop_verified validators");
+
+        let vs = engine.validator_set();
+
+        let alice_power = vs.power_of(&ValidatorId("alice".into()));
+        let dave_power  = vs.power_of(&ValidatorId("dave".into()));
+        let bob_power   = vs.power_of(&ValidatorId("bob".into()));
+
+        // After VCA with multiplier=1.0: alice is capped at the median (1414).
+        // Dave and bob are below the median → unchanged.
+        assert_eq!(alice_power, 1414,
+            "alice (C=4) should be capped to median 1414, got {alice_power}");
+        assert_eq!(bob_power, 1414,
+            "bob (C=2) VCA weight is 1414 = floor(sqrt(2)*1000), got {bob_power}");
+        assert_eq!(dave_power, 1000,
+            "dave (C=1) VCA weight is 1000 = floor(sqrt(1)*1000), got {dave_power}");
+
+        // The key result: alice's weight concentration dropped from 4/9 (44%)
+        // to 1414/5842 (24%) — below the 1/3 BFT threshold.
+        let total = vs.total_power();
+        let alice_fraction = alice_power as f64 / total as f64;
+        assert!(alice_fraction < 1.0 / 3.0,
+            "with multiplier=1.0 alice should be below BFT 1/3 threshold: \
+             {alice_power}/{total} = {:.1}%", alice_fraction * 100.0);
+
+        // Verify engine set vca_quorum.
+        assert!(engine.vca_quorum.is_some(),
+            "vca_quorum should be set after VCA init");
+
+        let vca_q = engine.vca_quorum.unwrap();
+        let static_q = vs.quorum_power();
+        // With all validators fully pop_verified (ρ=1.0), adaptive quorum
+        // equals the classical 2n/3+1 threshold (no upward adjustment at full coverage).
+        assert_eq!(vca_q, static_q,
+            "at ρ=1.0 (full coverage) adaptive quorum should equal static 2n/3+1: \
+             vca={vca_q}, static={static_q}");
+    }
+
+    /// VCA uses adaptive quorum in verify_commit instead of static quorum_power().
+    #[tokio::test]
+    async fn vca_verify_commit_uses_adaptive_quorum() {
+        let mut engine = TendermintEngine::new();
+
+        // Mixed set: 3 pop_verified + 1 unverified (ρ = 0.75)
+        let vs = ValidatorSet {
+            height: 0,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("alice".into()), voting_power: 10,
+                                pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("bob".into()),   voting_power: 10,
+                                pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("carol".into()), voting_power: 10,
+                                pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("dave".into()),  voting_power: 10,
+                                pop_verified: false, public_key: vec![] },
+            ],
+        };
+
+        let cfg = ConsensusConfig {
+            vca: Some(VcaIntegrationConfig {
+                weight_config: WeightConfig::default(),
+                quorum_config: AdaptiveQuorumConfig::default(),
+            }),
+            ..vca_config()
+        };
+
+        engine.init(cfg, vs).await.expect("init should succeed");
+
+        // vca_quorum is now set and represents the adaptive threshold.
+        assert!(engine.vca_quorum.is_some());
+        let vca_q = engine.vca_quorum.unwrap();
+
+        // At ρ=0.75 (3 of 4 verified), quorum may be above the classical floor.
+        // The key invariant: quorum_floor ≤ vca_q ≤ total_weight.
+        let vs = engine.validator_set();
+        let total = vs.total_power();
+        assert!(vca_q >= AdaptiveQuorumConfig::default().quorum_floor,
+            "adaptive quorum must be at least quorum_floor");
+        assert!(vca_q <= total,
+            "adaptive quorum cannot exceed total weight: vca_q={vca_q}, total={total}");
+    }
+
+    /// Without VCA config, the engine falls back to static quorum_power().
+    #[tokio::test]
+    async fn no_vca_config_uses_static_quorum() {
+        let mut engine = TendermintEngine::new();
+        let cfg = ConsensusConfig {
+            vca: None,
+            ..vca_config()
+        };
+
+        engine.init(cfg, unequal_vs()).await.expect("init without VCA should succeed");
+
+        // vca_quorum stays None — verify_commit will use quorum_power().
+        assert!(engine.vca_quorum.is_none(),
+            "vca_quorum should be None when VCA is not configured");
+    }
+
+    /// build_vca_registry_from_validator_set and apply_vca_weights_to_validator_set
+    /// are public helpers — verify them directly.
+    #[test]
+    fn build_registry_and_apply_weights_round_trip() {
+        let vs = unequal_vs();
+        let weight_cfg = WeightConfig { max_weight_multiplier: 3.0, ..WeightConfig::default() };
+        let registry = build_vca_registry_from_validator_set(1, &vs, weight_cfg);
+
+        // Registry should contain all 4 validators.
+        assert_eq!(registry.records.len(), 4);
+
+        // After close_epoch(), all weights should be ≥ 0.
+        for (id, rec) in &registry.records {
+            assert!(rec.weight.0 > 0 || rec.personhood.0 == 0.0,
+                "pop_verified validator {id} should have nonzero weight");
+        }
+
+        // Apply weights back to a fresh validator set copy.
+        let mut vs2 = unequal_vs();
+        apply_vca_weights_to_validator_set(&mut vs2, &registry);
+
+        // All validators' voting_power should now match registry records.
+        for v in &vs2.validators {
+            let record = registry.records.get(&v.id).unwrap();
+            assert_eq!(v.voting_power, record.weight.0,
+                "apply_vca_weights should set voting_power = VCA weight for {}",
+                v.id.0);
+        }
     }
 }

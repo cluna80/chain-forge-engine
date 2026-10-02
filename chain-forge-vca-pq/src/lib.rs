@@ -71,7 +71,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
-use chain_forge_consensus::{BlockHeight, ValidatorId, ValidatorSet, ValidatorInfo};
+use chain_forge_core::{BlockHeight, ValidatorId, ValidatorSet, ValidatorInfo};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 

@@ -766,3 +766,90 @@ pub trait ValidatorSetView: Send + Sync {
     /// All validator IDs in this set (order unspecified, owned for type safety).
     fn validator_ids(&self) -> Vec<ValidatorId>;
 }
+
+// ── Consensus primitive types ─────────────────────────────────────────────────
+//
+// BlockHeight, ValidatorInfo, and ValidatorSet live here (alongside ValidatorId)
+// so that crates like chain-forge-vca-pq can depend on just chain-forge-core
+// rather than creating a cycle through chain-forge-consensus.
+//
+// chain-forge-consensus re-exports these as `pub use chain_forge_core::*`.
+
+/// Monotonically increasing block height. Genesis = 0.
+pub type BlockHeight = u64;
+
+/// A single validator's participation parameters at a given height.
+///
+/// `voting_power` is a relative weight. For QCB personhood-weighted BFT,
+/// `chain-forge-vca-pq` computes and overwrites this field at epoch
+/// boundaries so the consensus engine uses VCA-derived weights.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ValidatorInfo {
+    pub id:           ValidatorId,
+    pub voting_power: u64,
+    /// Whether this validator holds a valid proof-of-personhood credential.
+    pub pop_verified: bool,
+    /// Ed25519 (or ML-DSA PQ) public key bytes.
+    pub public_key:   Vec<u8>,
+}
+
+/// A snapshot of all active validators at a particular block height.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ValidatorSet {
+    pub height:     BlockHeight,
+    pub validators: Vec<ValidatorInfo>,
+}
+
+impl ValidatorSet {
+    /// Total voting power across all validators.
+    pub fn total_power(&self) -> u64 {
+        self.validators.iter().map(|v| v.voting_power).sum()
+    }
+
+    /// Classical BFT safety threshold: floor(2n/3) + 1 of total power.
+    pub fn quorum_power(&self) -> u64 {
+        let total = self.total_power();
+        (total * 2 / 3) + 1
+    }
+
+    /// Voting power for a specific validator; 0 if not in this set.
+    pub fn power_of(&self, id: &ValidatorId) -> u64 {
+        self.validators.iter()
+            .find(|v| &v.id == id)
+            .map(|v| v.voting_power)
+            .unwrap_or(0)
+    }
+
+    /// Ed25519 public key for a validator. Empty slice if not registered.
+    pub fn public_key_of(&self, id: &ValidatorId) -> &[u8] {
+        self.validators.iter()
+            .find(|v| &v.id == id)
+            .map(|v| v.public_key.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// True if the given map of (validator → power) meets the quorum.
+    pub fn has_quorum(&self, votes: &std::collections::BTreeMap<ValidatorId, u64>) -> bool {
+        let voted: u64 = votes.values().sum();
+        voted >= self.quorum_power()
+    }
+
+    /// Number of Byzantine validators the set can tolerate (floor(n/3) - 1).
+    pub fn byzantine_fault_tolerance(&self) -> usize {
+        let n = self.validators.len();
+        if n < 4 { 0 } else { n / 3 - 1 }
+    }
+}
+
+impl ValidatorSetView for ValidatorSet {
+    fn total_power(&self) -> u64 { self.total_power() }
+    fn quorum_power(&self) -> u64 { self.quorum_power() }
+    fn power_of(&self, id: &ValidatorId) -> u64 { self.power_of(id) }
+    fn public_key_of(&self, id: &ValidatorId) -> Option<&[u8]> {
+        let s = ValidatorSet::public_key_of(self, id);
+        if s.is_empty() { None } else { Some(s) }
+    }
+    fn validator_ids(&self) -> Vec<ValidatorId> {
+        self.validators.iter().map(|v| v.id.clone()).collect()
+    }
+}
