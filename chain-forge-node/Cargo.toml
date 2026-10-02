@@ -43,6 +43,7 @@ serde_json        = { workspace = true }
 chain-forge-consensus = { path = "../chain-forge-consensus", features = ["real-crypto"] }
 chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network"] }
 chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto"] }
+chain-forge-vca-pq    = { path = "../chain-forge-vca-pq" }
 
 [[test]]
 name = "devnet_4node"
@@ -59,3 +60,7 @@ path = "tests/attestation_live.rs"
 [[test]]
 name = "personhood_live"
 path = "tests/personhood_live.rs"
+
+[[test]]
+name = "vca_pq_live"
+path = "tests/vca_pq_live.rs"
