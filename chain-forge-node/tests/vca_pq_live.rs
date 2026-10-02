@@ -308,7 +308,7 @@ fn build_genesis_registry() -> VcaRegistry {
             stake,
             classical_pubkey,
             pq_pubkey,
-        );
+        ).expect("genesis validator upsert must succeed");
     }
 
     registry
@@ -461,7 +461,8 @@ fn vca_pq_primitives_against_live_devnet() {
     // Two validators fully verified, two with zero personhood (ρ ≈ 0.5)
     for (i, &name) in GENESIS_VALIDATORS.iter().enumerate() {
         let personhood = if i < 2 { PersonhoodFactor::verified() } else { PersonhoodFactor::unverified() };
-        partial_registry.upsert(
+        // P=0.0 validators bypass the min_personhood check (they get W=0)
+        let _ = partial_registry.upsert(
             ValidatorId(name.to_string()),
             IdentityHandle(format!("commit:{i:064x}")),
             ContributionScore::new((i + 1) as f64).unwrap(),

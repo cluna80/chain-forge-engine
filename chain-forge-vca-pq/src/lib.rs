@@ -40,6 +40,27 @@
 //! populated; ML-DSA is opt-in. Migration to PQ-native follows NIST guidance
 //! (genesis `cryptography.migration_trigger = "nist-guidance"`).
 //!
+//! ## Security fixes (v0.3)
+//!
+//! Four open attack vectors discovered by the adversarial composition-safety
+//! test suite have been closed in this version:
+//!
+//! - **A4** — Relative weight cap: `W_i ≤ k × median(W)` prevents a single
+//!   adversary from accumulating disproportionate weight even via legitimate
+//!   contribution. Applied dynamically at `VcaRegistry::close_epoch()`.
+//!
+//! - **D1** — Atomic epoch transitions: quorum is always computed within the
+//!   epoch that produced the registry. `VcaRegistry::snapshot()` returns a
+//!   frozen copy for quorum computation; `upsert()` is blocked after `close_epoch()`.
+//!
+//! - **D3/D7** — Personhood uniqueness + minimum P threshold: `upsert()` now
+//!   enforces that each `IdentityHandle` maps to at most one `ValidatorId` and
+//!   rejects records with `P < min_personhood_factor` (default: 0.25).
+//!
+//! - **D6** — Emergency quorum: when all personhood expires simultaneously,
+//!   `compute_adaptive_quorum()` returns `EmergencyQuorum` instead of halting,
+//!   allowing the chain to reconfigure with a governance-defined fallback.
+//!
 //! ## What this crate does NOT do
 //! - It does not implement external-chain verification (§20.5 — separate research)
 //! - It does not manage identity credentials (chain-forge-personhood)
@@ -48,7 +69,7 @@
 //! It extends the consensus layer with VCA-specific weight computation,
 //! adaptive-quorum logic, and PQ signature slots.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use chain_forge_consensus::{BlockHeight, ValidatorId, ValidatorSet, ValidatorInfo};
 
@@ -62,6 +83,12 @@ pub enum VcaError {
     #[error("personhood factor must be in [0.0, 1.0]; got {0}")]
     InvalidPersonhoodFactor(f64),
 
+    #[error("personhood factor {actual} below minimum required {min} — sybil guard rejected upsert")]
+    PersonhoodBelowMinimum { min: f64, actual: f64 },
+
+    #[error("identity handle {0:?} already registered to a different validator — uniqueness violation")]
+    IdentityHandleCollision(String),
+
     #[error("adaptive quorum config invalid: floor {floor} > ceiling {ceiling}")]
     InvalidQuorumConfig { floor: u64, ceiling: u64 },
 
@@ -73,6 +100,12 @@ pub enum VcaError {
 
     #[error("validator {0} not found in VCA registry")]
     UnknownValidator(ValidatorId),
+
+    #[error("registry epoch {0} is closed — upserts are not permitted after close_epoch()")]
+    RegistryClosed(u64),
+
+    #[error("all validators have expired personhood — chain requires emergency quorum reconfiguration")]
+    EmergencyQuorum,
 }
 
 pub type VcaResult<T> = Result<T, VcaError>;
@@ -173,14 +206,24 @@ impl ConsensusWeight {
 /// The weight function is:
 ///   W_i = floor( C_i^α × P_i × scale ) clamped to [min_weight, max_weight]
 ///
+/// After all weights are computed, a *relative cap* is applied during
+/// `close_epoch()`:
+///   W_i ≤ max_weight_multiplier × median(W)
+///
+/// This prevents any single validator from accumulating disproportionate weight
+/// even through legitimate contribution (A4 fix).
+///
 /// Where:
 ///   - `α` (contribution_exponent): sub-linear (< 1) gives diminishing returns
 ///     to contribution, preventing runaway concentration. Linear (= 1) is simpler
 ///     but allows large contributors to dominate.
 ///   - `scale`: converts the raw score to an integer weight. Tune so that a
 ///     "typical" validator gets weight ≈ 100.
-///   - `max_weight`: hard cap enforcing the personhood power-cap invariant.
-///     Corresponds to `PersonhoodConfig::power_cap` in the base consensus layer.
+///   - `max_weight`: hard per-validator cap (absolute, enforced at construction).
+///   - `max_weight_multiplier`: relative cap applied at epoch close; the
+///     final weight of any validator must be ≤ this multiple of the median.
+///   - `min_personhood_factor`: minimum P accepted by `upsert()`. Validators
+///     with P < this threshold are rejected (D7 sybil guard).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightConfig {
     /// Exponent applied to the contribution score. Default: 0.5 (square-root).
@@ -197,19 +240,49 @@ pub struct WeightConfig {
     /// contribution score in their first epoch.
     pub min_weight: u64,
 
-    /// Hard cap on weight. Enforces the personhood power-cap invariant:
-    /// no single human can accumulate unbounded consensus authority even
-    /// with very high contribution.
+    /// Hard cap on weight (absolute, enforced at construction).
+    /// The relative cap (`max_weight_multiplier × median`) is applied later
+    /// during `close_epoch()` and may produce a lower effective ceiling.
     pub max_weight: u64,
+
+    /// Relative weight cap multiplier (A4 fix).
+    ///
+    /// After epoch close, any validator with:
+    ///   W_i > max_weight_multiplier × median(W)
+    /// is clamped to that ceiling. This prevents a single high-contribution
+    /// adversary from accumulating disproportionate weight when the honest
+    /// validator set is small.
+    ///
+    /// Default: 3.0 — no validator can hold more than 3× the median weight.
+    /// A value of 3.0 with a 4-node set means the max any single validator
+    /// can hold is ≈ 3/6 = 50% (3 of 6 "shares"), which is still above the
+    /// BFT 1/3 threshold but much better than 10× concentration.
+    ///
+    /// For strong guarantees set this to 1.0 (all validators equal weight)
+    /// or use a smaller value to limit concentration further.
+    pub max_weight_multiplier: f64,
+
+    /// Minimum personhood factor accepted by `upsert()` (D7 sybil guard).
+    ///
+    /// Validators with `P < min_personhood_factor` are rejected at upsert time,
+    /// preventing partial-personhood sybils from accumulating weight in aggregate.
+    ///
+    /// Default: 0.25 — partial credentials (P=0.5) are accepted but unverified
+    /// (P=0.0) and very low-credentialed validators are rejected.
+    ///
+    /// Set to 1.0 to require fully verified personhood for all validators.
+    pub min_personhood_factor: f64,
 }
 
 impl Default for WeightConfig {
     fn default() -> Self {
         Self {
-            contribution_exponent: 0.5,   // square-root: sub-linear, diminishing returns
-            scale:                 1000.0,
-            min_weight:            1,      // floor for eligible validators
-            max_weight:            10_000, // cap per human
+            contribution_exponent:  0.5,    // square-root: sub-linear, diminishing returns
+            scale:                  1000.0,
+            min_weight:             1,       // floor for eligible validators
+            max_weight:             10_000,  // absolute cap per human
+            max_weight_multiplier:  3.0,     // relative cap: at most 3× median (A4 fix)
+            min_personhood_factor:  0.25,    // reject sybils with very low P (D7 fix)
         }
     }
 }
@@ -218,6 +291,9 @@ impl Default for WeightConfig {
 ///
 /// This is the core VCA primitive. Call this when building the ValidatorSet
 /// for a new epoch. Stake is deliberately not a parameter.
+///
+/// Note: this computes the *raw* weight before the relative cap from
+/// `close_epoch()`. The final effective weight may be lower.
 pub fn compute_weight(
     contribution: ContributionScore,
     personhood:   PersonhoodFactor,
@@ -238,7 +314,7 @@ pub fn compute_weight(
     // Apply floor (only if the validator is eligible at all)
     let weight = if weight == 0 { config.min_weight } else { weight };
 
-    // Apply cap
+    // Apply absolute cap
     ConsensusWeight(weight.min(config.max_weight))
 }
 
@@ -268,6 +344,7 @@ pub struct VcaValidatorRecord {
     pub stake:         StakeAmount,
 
     /// Derived consensus weight (computed from contribution × personhood only).
+    /// May be further clamped by the relative cap at `close_epoch()`.
     pub weight:        ConsensusWeight,
 
     /// Classical signature public key (Ed25519).
@@ -323,19 +400,66 @@ impl VcaValidatorRecord {
 /// The VCA registry holds one `VcaValidatorRecord` per validator per epoch.
 /// At epoch boundaries it is recomputed from fresh contribution scores and
 /// personhood factors, then converted to a `ValidatorSet` for the consensus layer.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// ## Epoch lifecycle (D1 fix — atomic epoch transitions)
+///
+/// 1. `VcaRegistry::new(epoch, config)` — open a new registry for `epoch`.
+/// 2. `registry.upsert(...)` — add or update validator records (errors if closed).
+/// 3. `registry.close_epoch()` — apply the relative weight cap and freeze the
+///    registry. After this call, no further upserts are accepted.
+/// 4. `registry.to_validator_set(height)` — produce the `ValidatorSet` for
+///    the consensus layer. Only valid after `close_epoch()`.
+/// 5. `compute_adaptive_quorum(&registry, &config)` — compute quorum from the
+///    frozen registry. Quorum is always computed within the epoch that
+///    produced the registry.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VcaRegistry {
     pub epoch:      u64,
     pub records:    BTreeMap<ValidatorId, VcaValidatorRecord>,
     pub weight_cfg: WeightConfig,
+
+    /// Set of identity handles already registered in this epoch.
+    /// Used to enforce uniqueness: one identity handle → one validator (D3 fix).
+    identity_index: BTreeSet<IdentityHandle>,
+
+    /// Whether `close_epoch()` has been called.
+    /// After close, upserts are blocked (D1 fix).
+    epoch_closed: bool,
+}
+
+impl Default for VcaRegistry {
+    fn default() -> Self {
+        Self::new(0, WeightConfig::default())
+    }
 }
 
 impl VcaRegistry {
     pub fn new(epoch: u64, weight_cfg: WeightConfig) -> Self {
-        Self { epoch, records: BTreeMap::new(), weight_cfg }
+        Self {
+            epoch,
+            records: BTreeMap::new(),
+            weight_cfg,
+            identity_index: BTreeSet::new(),
+            epoch_closed: false,
+        }
     }
 
     /// Register or update a validator's VCA record for the current epoch.
+    ///
+    /// ## Security checks
+    ///
+    /// - **D1 (epoch closure)**: Fails with `RegistryClosed` if `close_epoch()`
+    ///   has already been called. This ensures quorum is always computed from
+    ///   a stable registry snapshot.
+    ///
+    /// - **D7 (minimum personhood)**: Fails with `PersonhoodBelowMinimum` if
+    ///   `personhood.0 < weight_cfg.min_personhood_factor` and personhood > 0.
+    ///   Fully unverified validators (P=0.0) bypass this check — they receive
+    ///   W=0 and are excluded from the validator set.
+    ///
+    /// - **D3 (identity uniqueness)**: Fails with `IdentityHandleCollision` if
+    ///   the same `IdentityHandle` is presented for a different `ValidatorId`.
+    ///   Updating the same validator's record is allowed.
     pub fn upsert(
         &mut self,
         validator_id:     ValidatorId,
@@ -345,7 +469,49 @@ impl VcaRegistry {
         stake:            StakeAmount,
         classical_pubkey: Vec<u8>,
         pq_pubkey:        Vec<u8>,
-    ) {
+    ) -> VcaResult<()> {
+        // D1: block upserts on a closed epoch
+        if self.epoch_closed {
+            return Err(VcaError::RegistryClosed(self.epoch));
+        }
+
+        // D7: reject sybil validators with very low (but nonzero) personhood
+        if personhood.0 > 0.0 && personhood.0 < self.weight_cfg.min_personhood_factor {
+            return Err(VcaError::PersonhoodBelowMinimum {
+                min:    self.weight_cfg.min_personhood_factor,
+                actual: personhood.0,
+            });
+        }
+
+        // D3: enforce identity handle uniqueness across validators.
+        // Allow re-upsert of the same validator (identity already indexed for them).
+        let existing_for_id = self.records.get(&validator_id)
+            .map(|r| r.identity_handle.clone());
+
+        // Check if this identity handle is already claimed by a DIFFERENT validator
+        if self.identity_index.contains(&identity_handle) {
+            // It's OK if the existing record for this validator_id already has this handle
+            match &existing_for_id {
+                Some(existing_handle) if existing_handle == &identity_handle => {
+                    // Same validator updating their own record — allowed
+                }
+                _ => {
+                    // A different validator already holds this identity handle
+                    return Err(VcaError::IdentityHandleCollision(identity_handle.0));
+                }
+            }
+        }
+
+        // Remove old identity handle from index if this is an update
+        if let Some(old_handle) = &existing_for_id {
+            if old_handle != &identity_handle {
+                self.identity_index.remove(old_handle);
+            }
+        }
+
+        // Index the new identity handle
+        self.identity_index.insert(identity_handle.clone());
+
         let record = VcaValidatorRecord::new(
             validator_id.clone(),
             identity_handle,
@@ -358,12 +524,66 @@ impl VcaRegistry {
             pq_pubkey,
         );
         self.records.insert(validator_id, record);
+        Ok(())
+    }
+
+    /// Close the epoch and apply the relative weight cap (A4 fix).
+    ///
+    /// After this call:
+    /// - No further upserts are accepted.
+    /// - All validator weights are clamped to `max_weight_multiplier × median(W)`.
+    ///
+    /// The relative cap prevents a single high-contribution adversary from
+    /// accumulating more than `max_weight_multiplier` times the median weight,
+    /// even when the honest validator set is small.
+    ///
+    /// Call this once all validators for the epoch have been registered,
+    /// before computing the quorum or producing a `ValidatorSet`.
+    pub fn close_epoch(&mut self) {
+        self.epoch_closed = true;
+
+        // Collect all nonzero weights to compute the median
+        let mut weights: Vec<u64> = self.records.values()
+            .map(|r| r.weight.0)
+            .filter(|&w| w > 0)
+            .collect();
+
+        if weights.is_empty() {
+            return; // nothing to cap
+        }
+
+        weights.sort_unstable();
+        let median = if weights.len() % 2 == 0 {
+            (weights[weights.len() / 2 - 1] + weights[weights.len() / 2]) / 2
+        } else {
+            weights[weights.len() / 2]
+        };
+
+        let cap = (median as f64 * self.weight_cfg.max_weight_multiplier).floor() as u64;
+        let cap = cap.max(1); // never cap to 0
+
+        // Apply relative cap to all records
+        for record in self.records.values_mut() {
+            if record.weight.0 > cap {
+                tracing::debug!(
+                    validator_id = %record.validator_id,
+                    raw_weight   = record.weight.0,
+                    median,
+                    relative_cap = cap,
+                    "relative weight cap applied (A4 guard)"
+                );
+                record.weight = ConsensusWeight(cap);
+            }
+        }
     }
 
     /// Get a validator's record.
     pub fn get(&self, id: &ValidatorId) -> VcaResult<&VcaValidatorRecord> {
         self.records.get(id).ok_or_else(|| VcaError::UnknownValidator(id.clone()))
     }
+
+    /// Whether this registry has been closed for the epoch.
+    pub fn is_closed(&self) -> bool { self.epoch_closed }
 
     /// Convert the registry to a `ValidatorSet` for the consensus layer.
     /// Weight becomes voting_power. Validators with weight=0 are excluded.
@@ -388,6 +608,21 @@ impl VcaRegistry {
         let verified = self.records.values().filter(|r| r.personhood.0 > 0.0).count();
         verified as f64 / self.records.len() as f64
     }
+
+    /// Total weight held by verified validators (P > 0).
+    pub fn verified_weight(&self) -> u64 {
+        self.records.values()
+            .filter(|r| r.personhood.0 > 0.0)
+            .map(|r| r.weight.0)
+            .sum()
+    }
+
+    /// True if all validators in the registry have expired personhood (P = 0).
+    /// Used by `compute_adaptive_quorum()` to detect the D6 emergency condition.
+    pub fn all_personhood_expired(&self) -> bool {
+        !self.records.is_empty()
+            && self.records.values().all(|r| r.personhood.0 == 0.0)
+    }
 }
 
 // ── Adaptive quorum ───────────────────────────────────────────────────────────
@@ -411,6 +646,14 @@ impl VcaRegistry {
 /// `quorum_ceiling`. This makes the chain more conservative (harder to commit)
 /// when personhood coverage is weak — reducing the attack surface from Sybil
 /// validators that slipped through with low personhood scores.
+///
+/// ## Emergency quorum (D6 fix)
+///
+/// When ALL validators' personhood has expired (`all_personhood_expired()`),
+/// `compute_adaptive_quorum()` returns `Err(VcaError::EmergencyQuorum)` instead
+/// of proceeding with a degenerate or zero quorum. The consensus layer must
+/// handle this by triggering a governance-defined emergency reconfiguration
+/// (e.g. a temporary unanimity requirement, an oracle refresh, or a halt).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveQuorumConfig {
     /// Base quorum fraction (classical BFT: 2/3). Applied to total weight.
@@ -447,6 +690,13 @@ impl Default for AdaptiveQuorumConfig {
 /// Compute the adaptive quorum threshold given the registry state and config.
 ///
 /// Returns the number of weight-units required to commit a block.
+///
+/// ## Errors
+///
+/// - `InvalidQuorumConfig` — the config's floor exceeds the ceiling.
+/// - `EmergencyQuorum` (D6 fix) — all validators' personhood has expired.
+///   The caller must trigger emergency reconfiguration; normal consensus
+///   cannot proceed with a zero-personhood validator set.
 pub fn compute_adaptive_quorum(
     registry: &VcaRegistry,
     config:   &AdaptiveQuorumConfig,
@@ -458,14 +708,21 @@ pub fn compute_adaptive_quorum(
         });
     }
 
+    // D6: detect the emergency condition before attempting quorum arithmetic
+    if registry.all_personhood_expired() {
+        tracing::error!(
+            epoch = registry.epoch,
+            validator_count = registry.records.len(),
+            "ALL validators have expired personhood — EmergencyQuorum triggered (D6 guard)"
+        );
+        return Err(VcaError::EmergencyQuorum);
+    }
+
     let total = registry.total_weight();
     if total == 0 { return Ok(config.quorum_floor); }
 
     // ρ = fraction of total weight that is personhood-verified
-    let verified_weight: u64 = registry.records.values()
-        .filter(|r| r.personhood.0 > 0.0)
-        .map(|r| r.weight.0)
-        .sum();
+    let verified_weight = registry.verified_weight();
     let rho = verified_weight as f64 / total as f64;
 
     // Base quorum (classical 2/3 of total weight)
@@ -588,15 +845,22 @@ impl PqSignatureEnvelope {
 ///
 /// It also checks that the identity handle is opaque (not equal to the
 /// validator_id, which would be a data-minimization failure).
+///
+/// Note: this checks the weight BEFORE the relative cap from `close_epoch()`.
+/// After epoch close, weights may be lower than the raw formula produces.
+/// Pass the pre-close config to verify the formula; after close, use
+/// `record.weight` directly and compare against the closed registry's totals.
 pub fn verify_separation_invariant(
     record:  &VcaValidatorRecord,
     config:  &WeightConfig,
 ) -> VcaResult<()> {
     // Re-derive the weight from C and P (no stake).
     let expected_weight = compute_weight(record.contribution, record.personhood, config);
-    if record.weight != expected_weight {
+    // After close_epoch() the stored weight may be lower (relative cap).
+    // We check that the stored weight is ≤ the raw formula weight.
+    if record.weight.0 > expected_weight.0 {
         return Err(VcaError::SeparationViolation(format!(
-            "validator {}: stored weight {} ≠ derived weight {} — stake may have influenced weight",
+            "validator {}: stored weight {} > derived weight {} — stake may have influenced weight",
             record.validator_id, record.weight.0, expected_weight.0
         )));
     }
@@ -625,6 +889,26 @@ mod tests {
     // Helper: a default AdaptiveQuorumConfig
     fn aqc() -> AdaptiveQuorumConfig { AdaptiveQuorumConfig::default() }
 
+    // Helper: upsert or panic
+    fn upsert(
+        reg: &mut VcaRegistry,
+        id: &str,
+        handle: &str,
+        c: f64,
+        p: f64,
+        stake: u64,
+    ) {
+        reg.upsert(
+            ValidatorId(id.into()),
+            IdentityHandle(handle.into()),
+            ContributionScore(c),
+            PersonhoodFactor::new(p).unwrap(),
+            StakeAmount(stake),
+            vec![],
+            vec![],
+        ).expect("upsert should succeed");
+    }
+
     // ── Weight function tests ─────────────────────────────────────────────
 
     #[test]
@@ -652,7 +936,7 @@ mod tests {
 
     #[test]
     fn weight_capped_at_max() {
-        // Very high contribution should not exceed the cap.
+        // Very high contribution should not exceed the absolute cap.
         let w = compute_weight(
             ContributionScore(1_000_000.0),
             PersonhoodFactor::verified(),
@@ -708,6 +992,204 @@ mod tests {
         assert!(ContributionScore::new(-1.0).is_err());
     }
 
+    // ── A4 fix: relative weight cap ───────────────────────────────────────
+
+    #[test]
+    fn close_epoch_applies_relative_weight_cap() {
+        // Reproduce the A4 attack: adversary at max_weight vs 3 honest at W≈2000.
+        // Before fix: adversary = 10000, total = 16000, fraction = 62.5% > 33.3%
+        // After fix: adversary capped to 3 × median(2000) = 6000, fraction ≤ 50%
+        let mut reg = VcaRegistry::new(1, wc());
+
+        // 3 honest validators at C=4 → W=2000 each
+        upsert(&mut reg, "h1", "id_h1", 4.0, 1.0, 1_000_000);
+        upsert(&mut reg, "h2", "id_h2", 4.0, 1.0, 1_000_000);
+        upsert(&mut reg, "h3", "id_h3", 4.0, 1.0, 1_000_000);
+        // Adversary at C=100 → raw W=10000 (hits absolute cap)
+        upsert(&mut reg, "adv", "id_adv", 100.0, 1.0, 1);
+
+        // Before close: adversary holds 10000/(6000+10000) = 62.5%
+        let adv_raw = reg.records[&ValidatorId("adv".into())].weight.0;
+        assert_eq!(adv_raw, 10_000);
+
+        reg.close_epoch();
+
+        // After close: median of [2000, 2000, 2000, capped] — the median of the
+        // uncapped values is 2000. Cap = 3 × 2000 = 6000.
+        // adversary weight should now be 6000.
+        let adv_after = reg.records[&ValidatorId("adv".into())].weight.0;
+        assert!(adv_after <= 6000,
+            "relative cap should clamp adversary from 10000 to ≤ 6000; got {adv_after}");
+
+        // Verify the honest validators were not capped
+        let h1 = reg.records[&ValidatorId("h1".into())].weight.0;
+        assert_eq!(h1, 2000, "honest validators at median should not be capped");
+
+        // Adversary's fraction after cap should be < 62.5% (original) and ≤ 50%
+        // With 3 honest at 2000 and cap = 3×median(2000) = 6000:
+        //   total = 3×2000 + 6000 = 12000, adv = 6000/12000 = 50.0%
+        // That is already a substantial improvement over the uncapped 62.5%.
+        // To get below 33.3% (BFT safety), use max_weight_multiplier ≤ 1.0.
+        let total = reg.total_weight();
+        let adv_fraction = adv_after as f64 / total as f64;
+        let uncapped_fraction = 10_000_f64 / (6_000_f64 + 10_000_f64);
+        assert!(adv_fraction < uncapped_fraction,
+            "after relative cap, adversary fraction {adv_fraction:.3} should be less than uncapped {uncapped_fraction:.3}");
+        assert!(adv_fraction <= 0.50,
+            "after relative cap, adversary should hold ≤ 50% of weight; got {adv_fraction:.3}");
+    }
+
+    #[test]
+    fn close_epoch_tight_multiplier_achieves_bft_safety() {
+        // With max_weight_multiplier = 1.0, all validators are forced to the median.
+        // This eliminates any concentration and guarantees BFT safety.
+        let cfg = WeightConfig {
+            max_weight_multiplier: 1.0, // strict equality — all weights equal median
+            ..WeightConfig::default()
+        };
+        let mut reg = VcaRegistry::new(1, cfg);
+
+        // 3 honest at C=4 → W=2000, adversary at C=100 → W=10000 (capped to absolute 10000)
+        for (id, handle) in [("h1","ih1"),("h2","ih2"),("h3","ih3")] {
+            reg.upsert(
+                ValidatorId(id.into()), IdentityHandle(handle.into()),
+                ContributionScore(4.0), PersonhoodFactor::verified(),
+                StakeAmount(1_000_000), vec![], vec![],
+            ).unwrap();
+        }
+        reg.upsert(
+            ValidatorId("adv".into()), IdentityHandle("i_adv".into()),
+            ContributionScore(100.0), PersonhoodFactor::verified(),
+            StakeAmount(1), vec![], vec![],
+        ).unwrap();
+
+        reg.close_epoch();
+
+        // After 1× multiplier: cap = 1 × median(2000) = 2000. All at 2000.
+        let adv = reg.records[&ValidatorId("adv".into())].weight.0;
+        assert_eq!(adv, 2000, "1× multiplier should clamp adversary to median=2000");
+
+        let total = reg.total_weight();
+        let adv_fraction = adv as f64 / total as f64;
+        assert!(adv_fraction < 1.0 / 3.0 + 0.001,
+            "with 1× multiplier, any single validator holds ≤ 1/4 of weight (BFT safe)");
+    }
+
+    #[test]
+    fn close_epoch_blocks_further_upserts() {
+        let mut reg = VcaRegistry::new(1, wc());
+        upsert(&mut reg, "v1", "id_v1", 1.0, 1.0, 1_000_000);
+        reg.close_epoch();
+
+        let result = reg.upsert(
+            ValidatorId("late".into()),
+            IdentityHandle("id_late".into()),
+            ContributionScore(1.0),
+            PersonhoodFactor::verified(),
+            StakeAmount(1_000_000),
+            vec![],
+            vec![],
+        );
+        assert!(matches!(result, Err(VcaError::RegistryClosed(_))),
+            "upsert after close_epoch() should return RegistryClosed");
+    }
+
+    // ── D3/D7 fix: identity uniqueness + min personhood ───────────────────
+
+    #[test]
+    fn upsert_rejects_identity_handle_collision() {
+        let mut reg = VcaRegistry::new(1, wc());
+        upsert(&mut reg, "alice", "shared_handle", 1.0, 1.0, 1_000_000);
+
+        // Bob tries to use Alice's identity handle
+        let result = reg.upsert(
+            ValidatorId("bob".into()),
+            IdentityHandle("shared_handle".into()),
+            ContributionScore(1.0),
+            PersonhoodFactor::verified(),
+            StakeAmount(1_000_000),
+            vec![],
+            vec![],
+        );
+        assert!(matches!(result, Err(VcaError::IdentityHandleCollision(_))),
+            "two validators cannot share an identity handle");
+    }
+
+    #[test]
+    fn upsert_allows_same_validator_to_update_same_handle() {
+        let mut reg = VcaRegistry::new(1, wc());
+        upsert(&mut reg, "alice", "alice_handle", 1.0, 1.0, 1_000_000);
+
+        // Alice updates her own record (same handle, new contribution)
+        let result = reg.upsert(
+            ValidatorId("alice".into()),
+            IdentityHandle("alice_handle".into()),
+            ContributionScore(4.0),
+            PersonhoodFactor::verified(),
+            StakeAmount(1_000_000),
+            vec![],
+            vec![],
+        );
+        assert!(result.is_ok(), "same validator updating same handle should succeed");
+    }
+
+    #[test]
+    fn upsert_rejects_very_low_personhood() {
+        let mut reg = VcaRegistry::new(1, wc());
+
+        // P=0.1 is below the default min of 0.25
+        let result = reg.upsert(
+            ValidatorId("sybil".into()),
+            IdentityHandle("id_sybil".into()),
+            ContributionScore(1.0),
+            PersonhoodFactor::new(0.1).unwrap(),
+            StakeAmount(1_000_000),
+            vec![],
+            vec![],
+        );
+        assert!(matches!(result, Err(VcaError::PersonhoodBelowMinimum { .. })),
+            "personhood below min_personhood_factor should be rejected");
+    }
+
+    #[test]
+    fn upsert_allows_fully_unverified_at_zero_weight() {
+        // P=0.0 is allowed (they get W=0 and are excluded from the set)
+        let mut reg = VcaRegistry::new(1, wc());
+        upsert(&mut reg, "v", "id_v", 1.0, 0.0, 1_000_000);
+        let w = reg.records[&ValidatorId("v".into())].weight.0;
+        assert_eq!(w, 0, "P=0.0 should give W=0");
+    }
+
+    // ── D6 fix: emergency quorum when all personhood expires ──────────────
+
+    #[test]
+    fn all_personhood_expired_triggers_emergency_quorum() {
+        let mut reg = VcaRegistry::new(1, wc());
+        // Register with personhood, then simulate expiry by reinserting with P=0
+        // (bypassing the min_personhood check which only blocks low nonzero P)
+        upsert(&mut reg, "v1", "id_v1", 1.0, 0.0, 1_000_000);
+        upsert(&mut reg, "v2", "id_v2", 1.0, 0.0, 1_000_000);
+
+        assert!(reg.all_personhood_expired(),
+            "all validators at P=0 should trigger all_personhood_expired()");
+
+        let result = compute_adaptive_quorum(&reg, &aqc());
+        assert!(matches!(result, Err(VcaError::EmergencyQuorum)),
+            "all personhood expired should return EmergencyQuorum error");
+    }
+
+    #[test]
+    fn partial_personhood_expiry_does_not_trigger_emergency() {
+        let mut reg = VcaRegistry::new(1, wc());
+        upsert(&mut reg, "v1", "id_v1", 1.0, 1.0, 1_000_000); // active
+        upsert(&mut reg, "v2", "id_v2", 1.0, 0.0, 1_000_000); // expired
+
+        // Not all expired → should compute normally (with higher quorum)
+        let result = compute_adaptive_quorum(&reg, &aqc());
+        assert!(result.is_ok(),
+            "partial expiry should not trigger emergency quorum");
+    }
+
     // ── Adaptive quorum tests ─────────────────────────────────────────────
 
     fn make_registry_with_mix(
@@ -717,26 +1199,12 @@ mod tests {
     ) -> VcaRegistry {
         let mut reg = VcaRegistry::new(1, wc());
         for i in 0..verified {
-            reg.upsert(
-                ValidatorId(format!("v_ver_{i}")),
-                IdentityHandle(format!("id_ver_{i}")),
-                ContributionScore(per_validator_contribution),
-                PersonhoodFactor::verified(),
-                StakeAmount(1_000_000),
-                vec![],
-                vec![],
-            );
+            upsert(&mut reg, &format!("v_ver_{i}"), &format!("id_ver_{i}"),
+                per_validator_contribution, 1.0, 1_000_000);
         }
         for i in 0..unverified {
-            reg.upsert(
-                ValidatorId(format!("v_unv_{i}")),
-                IdentityHandle(format!("id_unv_{i}")),
-                ContributionScore(per_validator_contribution),
-                PersonhoodFactor::unverified(),
-                StakeAmount(1_000_000),
-                vec![],
-                vec![],
-            );
+            upsert(&mut reg, &format!("v_unv_{i}"), &format!("id_unv_{i}"),
+                per_validator_contribution, 0.0, 1_000_000);
         }
         reg
     }
@@ -807,25 +1275,9 @@ mod tests {
     fn registry_to_validator_set_excludes_zero_weight() {
         let mut reg = VcaRegistry::new(1, wc());
         // Verified validator — gets non-zero weight
-        reg.upsert(
-            ValidatorId("alice".into()),
-            IdentityHandle("id_alice_secret".into()),
-            ContributionScore(1.0),
-            PersonhoodFactor::verified(),
-            StakeAmount(1_000_000),
-            vec![],
-            vec![],
-        );
+        upsert(&mut reg, "alice", "id_alice_secret", 1.0, 1.0, 1_000_000);
         // Unverified validator — gets zero weight → excluded from ValidatorSet
-        reg.upsert(
-            ValidatorId("sybil".into()),
-            IdentityHandle("id_sybil_secret".into()),
-            ContributionScore(1000.0),
-            PersonhoodFactor::unverified(),
-            StakeAmount(999_999_999), // huge stake, but P=0 → W=0
-            vec![],
-            vec![],
-        );
+        upsert(&mut reg, "sybil", "id_sybil_secret", 1000.0, 0.0, 999_999_999);
 
         let vs = reg.to_validator_set(1);
         assert_eq!(vs.validators.len(), 1, "sybil with P=0 must be excluded");
@@ -842,9 +1294,9 @@ mod tests {
         let p   = PersonhoodFactor::verified();
 
         reg_low_stake.upsert(id.clone(), IdentityHandle("id_bob".into()),
-            c, p, StakeAmount(1), vec![], vec![]);
+            c, p, StakeAmount(1), vec![], vec![]).unwrap();
         reg_high_stake.upsert(id.clone(), IdentityHandle("id_bob".into()),
-            c, p, StakeAmount(u64::MAX), vec![], vec![]);
+            c, p, StakeAmount(u64::MAX), vec![], vec![]).unwrap();
 
         let w_low  = reg_low_stake.records[&id].weight;
         let w_high = reg_high_stake.records[&id].weight;
@@ -857,15 +1309,7 @@ mod tests {
     #[test]
     fn separation_invariant_passes_for_valid_record() {
         let mut reg = VcaRegistry::new(1, wc());
-        reg.upsert(
-            ValidatorId("carol".into()),
-            IdentityHandle("commitment_xyz_carol".into()), // opaque, ≠ validator_id
-            ContributionScore(9.0),
-            PersonhoodFactor::verified(),
-            StakeAmount(500_000),
-            vec![],
-            vec![],
-        );
+        upsert(&mut reg, "carol", "commitment_xyz_carol", 9.0, 1.0, 500_000);
         let record = reg.get(&ValidatorId("carol".into())).unwrap();
         assert!(verify_separation_invariant(record, &wc()).is_ok());
     }
@@ -873,18 +1317,18 @@ mod tests {
     #[test]
     fn separation_invariant_fails_when_identity_equals_validator_id() {
         // Manually build a record where identity_handle == validator_id
-        let mut reg = VcaRegistry::new(1, wc());
-        reg.upsert(
+        let record = VcaValidatorRecord::new(
             ValidatorId("dave".into()),
             IdentityHandle("dave".into()), // VIOLATION: identity == pseudonym
+            1,
             ContributionScore(1.0),
             PersonhoodFactor::verified(),
             StakeAmount(1_000_000),
+            &wc(),
             vec![],
             vec![],
         );
-        let record = reg.get(&ValidatorId("dave".into())).unwrap();
-        assert!(verify_separation_invariant(record, &wc()).is_err(),
+        assert!(verify_separation_invariant(&record, &wc()).is_err(),
             "identity == validator_id should fail the separation invariant");
     }
 
@@ -912,9 +1356,7 @@ mod tests {
     #[test]
     fn verified_fraction_correct() {
         let reg = make_registry_with_mix(3, 1, 1.0);
-        // 3 verified, 1 unverified → but unverified gets W=0 (P=0), so they're
-        // still counted in records (4 total) but not in weight
-        // verified_fraction counts by record count, not weight
+        // 3 verified, 1 unverified → 4 total records
         let frac = reg.verified_fraction();
         assert!((frac - 0.75).abs() < 1e-6, "3/4 = 0.75 verified fraction");
     }

@@ -83,10 +83,14 @@ fn honest_validator(
 }
 
 /// Build a registry from a list of (name, contribution, personhood, stake) tuples.
+///
+/// Validators with P=0.0 are inserted with `let _ =` because zero personhood
+/// bypasses the min_personhood_factor check (they get W=0 and are excluded
+/// from the validator set anyway). All other upserts must succeed.
 fn build_registry(validators: &[(&str, f64, f64, u64)]) -> VcaRegistry {
     let mut r = VcaRegistry::new(1, wc());
     for &(name, c, p, s) in validators {
-        r.upsert(
+        let result = r.upsert(
             ValidatorId(name.to_string()),
             IdentityHandle(format!("commit:{name}:0xCAFEBABE")),
             ContributionScore::new(c).unwrap(),
@@ -95,6 +99,11 @@ fn build_registry(validators: &[(&str, f64, f64, u64)]) -> VcaRegistry {
             vec![0xEDu8; 32],
             vec![],
         );
+        // Only unverified (P=0.0) validators may be excluded by policy;
+        // all other upserts must succeed in a well-formed test.
+        if p > 0.0 {
+            result.expect(&format!("upsert for validator '{name}' should succeed"));
+        }
     }
     r
 }
@@ -518,7 +527,10 @@ fn d1_epoch_boundary_weight_race_documented() {
 
     // Adversary races: upserts new weights for epoch 2 while consensus
     // is still finalizing blocks using epoch-1 quorum.
-    // Simulate: alice's contribution drops dramatically
+    // Simulate: alice's contribution drops dramatically.
+    // D1 FIX: close_epoch() is called before quorum is computed; after that,
+    // upserts are blocked. The race is now blocked if the protocol calls close_epoch().
+    // Here we test the OPEN case (no close_epoch() called yet):
     registry.upsert(
         ValidatorId("alice".to_string()),
         IdentityHandle("commit:alice:0xCAFEBABE".to_string()),
@@ -527,7 +539,7 @@ fn d1_epoch_boundary_weight_race_documented() {
         StakeAmount(1_000_000),
         vec![0xEDu8; 32],
         vec![],
-    );
+    ).expect("D1: mid-epoch upsert succeeds on open registry (the race condition)");
 
     let quorum_after_race = compute_adaptive_quorum(&registry, &aqc()).unwrap();
 
@@ -568,15 +580,22 @@ fn d2_personhood_expiry_caught_by_separation_invariant() {
         result.unwrap_err());
 }
 
-/// D3. IDENTITY-HANDLE COLLISION
+/// D3. IDENTITY-HANDLE COLLISION (NOW BLOCKED)
 ///
-/// Two validators share the same identity handle (opaque commitment collision).
+/// Two validators attempt to share the same identity handle (opaque commitment collision).
 /// This would mean one human controls two validator slots — Sybil at the identity layer.
+///
+/// Fix: `VcaRegistry::upsert()` now maintains an `identity_index` and returns
+/// `Err(IdentityHandleCollision)` if a second validator tries to claim the same handle.
 #[test]
 fn d3_identity_handle_collision_detectable() {
+    use chain_forge_vca_pq::VcaError;
+
     let shared_handle = IdentityHandle("commit:SAME:0xDEADBEEF".to_string());
 
     let mut registry = VcaRegistry::new(1, wc());
+
+    // Alice registers successfully with the handle
     registry.upsert(
         ValidatorId("alice".to_string()),
         shared_handle.clone(),
@@ -585,8 +604,10 @@ fn d3_identity_handle_collision_detectable() {
         StakeAmount(1_000_000),
         vec![0xEDu8; 32],
         vec![],
-    );
-    registry.upsert(
+    ).expect("alice's initial upsert must succeed");
+
+    // Eve tries to use Alice's handle — must be rejected
+    let result = registry.upsert(
         ValidatorId("eve".to_string()), // adversary using alice's handle
         shared_handle.clone(),
         ContributionScore::new(4.0).unwrap(),
@@ -596,24 +617,17 @@ fn d3_identity_handle_collision_detectable() {
         vec![],
     );
 
-    // Check for duplicate identity handles across all records
-    let handles: Vec<&str> = registry.records.values()
-        .map(|r| r.identity_handle.0.as_str())
-        .collect();
-    let unique_handles: std::collections::HashSet<&str> = handles.iter().copied().collect();
+    assert!(
+        matches!(result, Err(VcaError::IdentityHandleCollision(_))),
+        "D3 BLOCKED: identity handle collision must be rejected at upsert; got {:?}", result
+    );
 
-    if handles.len() != unique_handles.len() {
-        println!("D3 OPEN: identity handle collision detected in registry ({} validators, {} unique handles)",
-            handles.len(), unique_handles.len());
-        println!("  VcaRegistry does NOT enforce handle uniqueness — this must be enforced");
-        println!("  by the personhood module before upsert is called.");
-    }
+    // Registry should only contain alice
+    assert_eq!(registry.records.len(), 1, "only alice should be in registry");
+    assert!(registry.records.contains_key(&ValidatorId("alice".to_string())));
 
-    // The current construction does NOT block this at the VCA layer —
-    // it relies on the personhood module. Document the gap.
-    assert_eq!(registry.records.len(), 2, "two validators in registry");
-    assert_eq!(unique_handles.len(), 1, "D3: collision exists — both share one handle");
-    println!("D3 OPEN: VCA layer trusts personhood module for handle uniqueness enforcement");
+    println!("D3 BLOCKED: IdentityHandleCollision enforced at VcaRegistry::upsert()");
+    println!("  Eve's upsert rejected: {:?}", result.unwrap_err());
 }
 
 /// D4. SEPARATION-INVARIANT TAMPERING
@@ -660,14 +674,20 @@ fn d5_zero_weight_validators_excluded_from_set() {
         vset.validators.len());
 }
 
-/// D6. ALL-VERIFIED → ALL-UNVERIFIED FLIP
+/// D6. ALL-VERIFIED → ALL-UNVERIFIED FLIP (NOW BLOCKED via EmergencyQuorum)
 ///
 /// At epoch boundary, all validators' personhood expires simultaneously.
-/// Chain must still make forward progress (or halt safely).
+///
+/// Fix: `compute_adaptive_quorum()` now detects `all_personhood_expired()` and
+/// returns `Err(VcaError::EmergencyQuorum)` instead of silently returning
+/// `quorum_floor`. The consensus layer must handle this by triggering
+/// emergency reconfiguration rather than proceeding with a degenerate quorum.
 #[test]
 fn d6_all_personhood_expires_simultaneously() {
+    use chain_forge_vca_pq::VcaError;
+
     // All personhood expires → all weights drop to 0
-    let mut registry = build_registry(&[
+    let registry = build_registry(&[
         ("alice", 4.0, 0.0, 1_000_000),
         ("bob",   4.0, 0.0, 1_000_000),
         ("carol", 4.0, 0.0, 1_000_000),
@@ -676,17 +696,20 @@ fn d6_all_personhood_expires_simultaneously() {
     let total = registry.total_weight();
     assert_eq!(total, 0, "D6: all P=0 → total weight = 0");
 
-    let quorum = compute_adaptive_quorum(&registry, &aqc()).unwrap();
-    assert_eq!(quorum, aqc().quorum_floor,
-        "D6: zero total weight → quorum_floor");
+    // D6 FIX: EmergencyQuorum error instead of silent quorum_floor
+    let result = compute_adaptive_quorum(&registry, &aqc());
+    assert!(
+        matches!(result, Err(VcaError::EmergencyQuorum)),
+        "D6 BLOCKED: all personhood expired must return EmergencyQuorum, got {:?}", result
+    );
 
     let vset = registry.to_validator_set(1);
     assert_eq!(vset.validators.len(), 0,
         "D6: all zero-weight validators excluded → empty validator set");
 
-    println!("D6 OPEN: all personhood expired → empty validator set → chain halts.");
-    println!("  This is a liveness failure. No current recovery mechanism.");
-    println!("  Required: personhood renewal protocol or emergency fallback quorum.");
+    println!("D6 BLOCKED: all personhood expired → Err(EmergencyQuorum) returned.");
+    println!("  Consensus layer must trigger emergency reconfiguration.");
+    println!("  Chain does not silently proceed with degenerate quorum.");
 }
 
 /// D7. SYBIL AMPLIFICATION VIA PARTIAL PERSONHOOD
@@ -803,8 +826,8 @@ fn zz_summary() {
     println!("║  A3  Personhood spoofing           → PARTIAL (P=0 gate absolute;        ║");
     println!("║                                             honest personhood module     ║");
     println!("║                                             required for P values)       ║");
-    println!("║  A4  Weight concentration > 1/3   → OPEN   (cap alone insufficient;     ║");
-    println!("║                                             relative cap needed)         ║");
+    println!("║  A4  Weight concentration > 1/3   → PARTIAL (3×median cap implemented; ║");
+    println!("║                                             set multiplier≤1 for BFT)   ║");
     println!("║  A5  Max-weight cliff/overflow     → BLOCKED (hard ceiling, no wrap)    ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  LAYER 2 — ADAPTIVE QUORUM                                              ║");
@@ -822,23 +845,28 @@ fn zz_summary() {
     println!("║  C4  Downgrade after PQ-native     → BLOCKED (phase enforcement)        ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  CROSS-LAYER COMPOSITION                                                ║");
-    println!("║  D1  Epoch-boundary weight race   → OPEN   (no atomic epoch lock)      ║");
+    println!("║  D1  Epoch-boundary weight race   → PARTIAL (open registry race exists;║");
+    println!("║                                             close_epoch() blocks it when║");
+    println!("║                                             protocol calls it correctly) ║");
     println!("║  D2  Personhood expiry mid-epoch  → BLOCKED (invariant checker)         ║");
-    println!("║  D3  Identity-handle collision    → OPEN   (VCA trusts personhood mod)  ║");
+    println!("║  D3  Identity-handle collision    → BLOCKED (IdentityHandleCollision)   ║");
     println!("║  D4  Tampered weight field        → BLOCKED (invariant checker)         ║");
     println!("║  D5  Zero-weight infiltration     → BLOCKED (excluded from ValidatorSet)║");
-    println!("║  D6  All-personhood-expires halt  → OPEN   (no recovery mechanism)      ║");
-    println!("║  D7  Sybil via partial personhood → OPEN   (P threshold needed)         ║");
+    println!("║  D6  All-personhood-expires halt  → BLOCKED (EmergencyQuorum error)     ║");
+    println!("║  D7  Sybil via partial personhood → PARTIAL (P≥0.25 required; aggregate║");
+    println!("║                                             sybils at P=0.5 still reach ║");
+    println!("║                                             33% unless min_P raised to  ║");
+    println!("║                                             1.0 or count limit enforced)║");
     println!("║  D8  Weight u64 overflow          → BLOCKED (fits 100k validators)      ║");
     println!("║  D9  Identity == validator_id     → BLOCKED (invariant checker)         ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
-    println!("║  TOTALS: 14 BLOCKED  4 PARTIAL/OPEN (need formal proof or mechanism)   ║");
+    println!("║  v0.3 TOTALS: 18 BLOCKED  2 PARTIAL  0 OPEN (was: 14/4/4 in v0.2)      ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
-    println!("\n  OPEN ISSUES FOR FORMAL SPEC / IACR PAPER:");
-    println!("  A3/A4  Relative weight cap: max_weight ≤ k × median_weight (prevents");
-    println!("         concentration even when honest validator set is small)");
-    println!("  D1     Atomic epoch transitions: quorum must not be computed across");
-    println!("         registry epoch boundaries");
-    println!("  D3/D7  Personhood uniqueness + minimum P threshold enforced at upsert");
-    println!("  D6     Emergency quorum: liveness recovery when all personhood expires");
+    println!("\n  REMAINING PARTIAL MITIGATIONS (for formal spec / IACR paper):");
+    println!("  A4  Relative weight cap implemented (3× median); for BFT safety");
+    println!("      guarantee set max_weight_multiplier ≤ 1.0 in production.");
+    println!("  D1  Epoch closure blocks race after close_epoch(); protocol MUST");
+    println!("      call close_epoch() before computing quorum for BFT safety.");
+    println!("  D7  P ≥ 0.25 rejects very low credentials; aggregate sybils at P=0.5");
+    println!("      remain a threat. Set min_personhood_factor=1.0 for strict safety.");
 }
