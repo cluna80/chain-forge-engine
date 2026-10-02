@@ -19,3 +19,7 @@ chain-forge-consensus = { path = "../chain-forge-consensus" }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[[test]]
+name = "adversarial"
+path = "tests/adversarial.rs"
