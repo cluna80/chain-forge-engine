@@ -647,6 +647,8 @@ pub mod real {
             let peer_map: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
             let peer_map_loop = peer_map.clone();
+            // Capture peer_discovery setting so the event loop can gate mDNS.
+            let use_mdns = config.peer_discovery != PeerDiscovery::Bootstrap;
 
             // Swarm event loop
             tokio::spawn(async move {
@@ -734,35 +736,39 @@ pub mod real {
                                 SwarmEvent::Behaviour(ChainForgeBehaviourEvent::Mdns(
                                     mdns::Event::Discovered(peers)
                                 )) => {
-                                    for (peer, addr) in peers {
-                                        tracing::info!(peer = %peer, addr = %addr, "mDNS peer discovered");
-                                        swarm.behaviour_mut()
-                                            .gossipsub.add_explicit_peer(&peer);
-                                        peer_map_loop.lock().unwrap()
-                                            .insert(peer.to_string(), addr.to_string());
-                                        let _ = event_tx.send(NetworkEvent::PeerConnected(
-                                            PeerInfo {
-                                                peer_id:   PeerId(peer.to_string()),
-                                                addr:      addr.to_string(),
-                                                chain_id:  None,
-                                                connected: true,
-                                                score:     0,
-                                            }
-                                        ));
+                                    if use_mdns {
+                                        for (peer, addr) in peers {
+                                            tracing::info!(peer = %peer, addr = %addr, "mDNS peer discovered");
+                                            swarm.behaviour_mut()
+                                                .gossipsub.add_explicit_peer(&peer);
+                                            peer_map_loop.lock().unwrap()
+                                                .insert(peer.to_string(), addr.to_string());
+                                            let _ = event_tx.send(NetworkEvent::PeerConnected(
+                                                PeerInfo {
+                                                    peer_id:   PeerId(peer.to_string()),
+                                                    addr:      addr.to_string(),
+                                                    chain_id:  None,
+                                                    connected: true,
+                                                    score:     0,
+                                                }
+                                            ));
+                                        }
                                     }
                                 }
 
                                 SwarmEvent::Behaviour(ChainForgeBehaviourEvent::Mdns(
                                     mdns::Event::Expired(peers)
                                 )) => {
-                                    for (peer, _) in peers {
-                                        swarm.behaviour_mut()
-                                            .gossipsub.remove_explicit_peer(&peer);
-                                        peer_map_loop.lock().unwrap()
-                                            .remove(&peer.to_string());
-                                        let _ = event_tx.send(NetworkEvent::PeerDisconnected(
-                                            PeerId(peer.to_string())
-                                        ));
+                                    if use_mdns {
+                                        for (peer, _) in peers {
+                                            swarm.behaviour_mut()
+                                                .gossipsub.remove_explicit_peer(&peer);
+                                            peer_map_loop.lock().unwrap()
+                                                .remove(&peer.to_string());
+                                            let _ = event_tx.send(NetworkEvent::PeerDisconnected(
+                                                PeerId(peer.to_string())
+                                            ));
+                                        }
                                     }
                                 }
 
