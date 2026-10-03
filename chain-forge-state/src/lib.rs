@@ -4,9 +4,8 @@
 ///
 /// What lives here:
 ///   - AccountState: balance + nonce per address
-///   - StateStore: the canonical in-memory state trie
-///   - MerkleNode / StateRoot: Jellyfish Merkle Tree (JMT) implementation
-///     sufficient for Phase 0 testnet (full JMT optimisations are a TODO)
+///   - StateStore: the canonical in-memory state trie backed by a
+///     production-grade Jellyfish Merkle Tree (see `jmt` module)
 ///   - GenesisState: seeds initial balances from the wizard's genesis config
 ///   - Snapshot: immutable state at a given block height for sync/rollback
 ///
@@ -16,10 +15,13 @@
 ///   - Section 7.6 (Chain Forge state layer, JMT)
 ///   - Open Question 4 (reserve strategy / stability backing)
 
+pub mod jmt;
+
 use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
-use chain_forge_core::{ChainHash, GenesisConfig, HashWidth};
+use chain_forge_core::{GenesisConfig, HashWidth};
 use chain_forge_identity::IntrinsicCharm;
+use crate::jmt::{NodeStore, JmtWriter, WriteAheadEntry};
 
 // -- Error --------------------------------------------------------------------
 
@@ -208,88 +210,61 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-// -- Merkle state tree (Phase 0 JMT) -----------------------------------------
+// -- Merkle state tree --------------------------------------------------------
+//
+// The canonical state trie is now a production-grade Jellyfish Merkle Tree
+// (see `jmt` module).  The `MerkleTree` name below is kept as a thin wrapper
+// so that the few tests that call `tree.upsert` / `tree.remove` / `root_hex`
+// directly continue to compile.  Internally it delegates to `NodeStore` and
+// `JmtWriter`.
 
-/// A Merkle leaf: the hash of one account's canonical bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MerkleLeaf {
-    pub key:  String,    // account address
-    pub hash: String,    // hex hash of leaf bytes
-}
-
-/// A Phase-0 Jellyfish Merkle Tree node.
-/// Full JMT uses prefix-compressed sparse tries; this implementation uses
-/// a simple sorted-leaf Merkle tree which gives correct state roots and
-/// proofs at the cost of O(n) updates. Good enough for testnet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A thin wrapper over `NodeStore` that exposes the old Phase-0 API.
+/// New code should use `JmtWriter` directly.
 pub struct MerkleTree {
-    pub leaves: Vec<MerkleLeaf>,   // sorted by key
-    pub root:   Option<String>,    // hex root hash; None for empty tree
-    pub width:  HashWidth,
+    store: NodeStore,
+    /// Cached root hex string; updated after every mutating call.
+    root:  Option<String>,
+    /// Width kept for API compatibility (the JMT always uses SHA3-256).
+    pub width: HashWidth,
 }
 
 impl MerkleTree {
     pub fn new(width: HashWidth) -> Self {
-        Self { leaves: Vec::new(), root: None, width }
+        Self { store: NodeStore::new(), root: None, width }
     }
 
-    /// Insert or update a leaf. Recomputes the root immediately.
+    /// Insert or update a leaf. O(log n) JMT update.
     pub fn upsert(&mut self, key: String, leaf_bytes: &[u8]) {
-        let hash = ChainHash::digest(leaf_bytes, self.width).to_hex();
-        match self.leaves.binary_search_by_key(&key.as_str(), |l| l.key.as_str()) {
-            Ok(idx)  => self.leaves[idx].hash = hash,
-            Err(idx) => self.leaves.insert(idx, MerkleLeaf { key, hash }),
-        }
-        self.recompute_root();
+        let mut w = JmtWriter::new(&mut self.store);
+        w.upsert(&key, leaf_bytes);
+        let h = w.flush();
+        self.root = if h.is_zero() { None } else { Some(h.to_hex()) };
     }
 
-    /// Remove a leaf. Recomputes root.
+    /// Remove a leaf. O(log n) JMT delete.
     pub fn remove(&mut self, key: &str) {
-        if let Ok(idx) = self.leaves.binary_search_by_key(&key, |l| l.key.as_str()) {
-            self.leaves.remove(idx);
-            self.recompute_root();
-        }
-    }
-
-    /// Recompute the Merkle root from current leaves.
-    /// Uses a standard binary Merkle tree reduction.
-    fn recompute_root(&mut self) {
-        if self.leaves.is_empty() {
-            self.root = None;
-            return;
-        }
-
-        // Start with leaf hashes
-        let mut level: Vec<Vec<u8>> = self.leaves
-            .iter()
-            .map(|l| ChainHash::from_hex(&l.hash).unwrap_or_else(|_| ChainHash::zero(self.width)).as_bytes().to_vec())
-            .collect();
-
-        // Reduce pairwise until we reach the root
-        while level.len() > 1 {
-            let mut next = Vec::new();
-            let mut i = 0;
-            while i < level.len() {
-                if i + 1 < level.len() {
-                    let combined = ChainHash::digest2(&level[i], &level[i+1], self.width);
-                    next.push(combined.as_bytes().to_vec());
-                } else {
-                    // Odd leaf: hash it with itself (standard practice)
-                    let combined = ChainHash::digest2(&level[i], &level[i], self.width);
-                    next.push(combined.as_bytes().to_vec());
-                }
-                i += 2;
-            }
-            level = next;
-        }
-
-        self.root = Some(ChainHash::from_hex(
-            &level[0].iter().map(|b| format!("{b:02x}")).collect::<String>()
-        ).unwrap_or_else(|_| ChainHash::zero(self.width)).to_hex());
+        let mut w = JmtWriter::new(&mut self.store);
+        w.delete(key);
+        let h = w.flush();
+        self.root = if h.is_zero() { None } else { Some(h.to_hex()) };
     }
 
     pub fn root_hex(&self) -> Option<&str> {
         self.root.as_deref()
+    }
+
+    /// Drain WAL entries (passed through to the underlying `NodeStore`).
+    pub fn drain_wal(&mut self) -> Vec<WriteAheadEntry> {
+        self.store.drain_wal()
+    }
+}
+
+impl std::fmt::Debug for MerkleTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MerkleTree")
+            .field("root", &self.root)
+            .field("version", &self.store.current_version())
+            .finish()
     }
 }
 
@@ -512,14 +487,25 @@ impl StateStore {
     /// Restore state from a snapshot (used during fast-sync).
     pub fn restore_snapshot(&mut self, snapshot: StateSnapshot) {
         self.accounts = snapshot.accounts.clone();
-        // Rebuild the Merkle tree from restored accounts
-        self.tree = MerkleTree::new(self.width);
-        for account in self.accounts.values() {
-            let leaf = account.to_leaf_bytes();
-            self.tree.upsert(account.address.clone(), &leaf);
+        // Rebuild the JMT from restored accounts in a single batch.
+        let mut new_tree = MerkleTree::new(self.width);
+        {
+            let mut w = JmtWriter::new(&mut new_tree.store);
+            for account in self.accounts.values() {
+                w.upsert(&account.address, &account.to_leaf_bytes());
+            }
+            let h = w.flush();
+            new_tree.root = if h.is_zero() { None } else { Some(h.to_hex()) };
         }
+        self.tree   = new_tree;
         self.height = snapshot.height;
         tracing::info!(height = snapshot.height, "state restored from snapshot");
+    }
+
+    /// Drain WAL entries accumulated since the last drain.
+    /// The persistence layer calls this after each block to flush WAL to disk.
+    pub fn drain_wal(&mut self) -> Vec<WriteAheadEntry> {
+        self.tree.drain_wal()
     }
 
     /// Export the current state as a snapshot for persistence to disk.
