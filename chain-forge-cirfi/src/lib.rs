@@ -1,3 +1,9 @@
+pub mod capacity_report;
+pub use capacity_report::{
+    AggregationMethod, CapacityEvidence, CapacityPhase, CapacityReport,
+    CapacityReportState, ResourceCapacityRecord, ResourceType,
+};
+
 /// chain-forge-cirfi
 ///
 /// The QCB monetary engine. Implements Whitepaper Sections 5.4 and 6.2:
@@ -665,7 +671,7 @@ mod tests {
     #[test]
     fn ubi_distribution_requires_verified_identity() {
         let mut engine = make_engine();
-        let mut state = StateStore::new(HashWidth::Bits256);
+        let state = StateStore::new(HashWidth::Bits256);
         let mut identity = make_identity_store();
 
         // Register but don't verify
