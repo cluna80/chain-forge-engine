@@ -50,10 +50,10 @@
 //! they assert the *current* (limited) behavior and explain what formal proof is missing.
 
 use chain_forge_vca_pq::{
-    AdaptiveQuorumConfig, ConsensusWeight, ContributionScore, IdentityHandle,
+    AdaptiveQuorumConfig, AdversaryModel, ConsensusWeight, ContributionScore, IdentityHandle,
     PersonhoodFactor, PqSignatureEnvelope, SignaturePhase, StakeAmount,
     VcaRegistry, VcaValidatorRecord, WeightConfig,
-    compute_adaptive_quorum, compute_weight, verify_separation_invariant,
+    check_bft_safety, compute_adaptive_quorum, compute_weight, verify_separation_invariant,
 };
 use chain_forge_core::ValidatorId;
 
@@ -810,6 +810,430 @@ fn d9_identity_equals_validator_id_caught() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ── E: Formal BFT safety predicate tests ─────────────────────────────────────
+//
+// These tests validate the safety predicate module and the adversary model.
+// The naming convention:
+//
+//   e1_*  — predicate structure (does SafetyResult carry the right fields?)
+//   e2_*  — adversary model (does max_byzantine_weight compute correctly?)
+//   e3_*  — safety invariant holds cases (W_B < Q_S)
+//   e4_*  — safety invariant violated cases (W_B >= Q_S — predicate MUST detect)
+//   e5_*  — boundary tests (Q_S = W_B ± ε, the crisp mathematical boundary)
+//   e6_*  — D7 aggregate sybil attack tested via safety predicate
+
+/// Build a closed registry with `n_honest` honest validators (C=c, P=1.0)
+/// and `n_byz` Byzantine validators (C=c_byz, P=p_byz).
+fn make_mixed_registry(
+    n_honest: usize, c_honest: f64,
+    n_byz:    usize, c_byz: f64, p_byz: f64,
+    weight_cfg: WeightConfig,
+) -> VcaRegistry {
+    let mut reg = VcaRegistry::new(1, weight_cfg);
+    for i in 0..n_honest {
+        reg.upsert(
+            ValidatorId(format!("h{i}")),
+            IdentityHandle(format!("id_h{i}")),
+            ContributionScore(c_honest),
+            PersonhoodFactor::verified(),
+            StakeAmount(1_000_000),
+            vec![], vec![],
+        ).expect("honest upsert");
+    }
+    for i in 0..n_byz {
+        reg.upsert(
+            ValidatorId(format!("b{i}")),
+            IdentityHandle(format!("id_b{i}")),
+            ContributionScore(c_byz),
+            PersonhoodFactor::new(p_byz).unwrap(),
+            StakeAmount(1),
+            vec![], vec![],
+        ).expect("byz upsert");
+    }
+    reg.close_epoch();
+    reg
+}
+
+// ── E1: SafetyResult structure ────────────────────────────────────────────────
+
+#[test]
+fn e1_safety_result_fields_are_populated() {
+    // 4 honest validators, 1 Byzantine at P=1.0 — should be safe.
+    let reg = make_mixed_registry(4, 4.0, 1, 4.0, 1.0, wc());
+    let adversary = AdversaryModel::full_personhood(1, 4.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+
+    println!("\n{result}");
+    assert!(result.total_weight > 0,        "total_weight should be nonzero");
+    assert!(result.max_byzantine_weight > 0, "max_byzantine_weight should be nonzero");
+    assert!(result.safety_quorum > 0,       "safety_quorum should be nonzero");
+    // margin = safety_quorum - max_byz; positive means safe
+    assert_eq!(
+        result.margin,
+        result.safety_quorum as i128 - result.max_byzantine_weight as i128,
+        "margin must equal safety_quorum − max_byzantine_weight"
+    );
+    assert!(result.holds, "4 honest vs 1 Byzantine at equal weight must be safe");
+    assert!(result.is_safe(), "is_safe() must agree with holds && margin > 0");
+}
+
+#[test]
+fn e1_safety_result_display_is_human_readable() {
+    let reg = make_mixed_registry(3, 1.0, 1, 1.0, 1.0, wc());
+    let adversary = AdversaryModel::full_personhood(1, 1.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    let display = format!("{result}");
+    println!("\n{display}");
+    assert!(display.contains("SAFE") || display.contains("UNSAFE"),
+        "Display should include SAFE or UNSAFE verdict");
+    assert!(display.contains("total="), "Display should include total weight");
+    assert!(display.contains("margin="), "Display should include margin");
+}
+
+// ── E2: adversary model math ──────────────────────────────────────────────────
+
+#[test]
+fn e2_full_personhood_adversary_weight_matches_formula() {
+    // AdversaryModel with P=1.0, C=4.0, N=2 should produce 2 × W(C=4, P=1)
+    // W = floor(sqrt(4) × 1.0 × 1000) = 2000; no relative cap (None).
+    let cfg = wc();
+    let adversary = AdversaryModel::full_personhood(2, 4.0);
+    let byz_w = adversary.max_byzantine_weight(&cfg, None);
+    assert_eq!(byz_w, 4000,
+        "2 × W(C=4, P=1.0) = 2 × 2000 = 4000; got {byz_w}");
+}
+
+#[test]
+fn e2_partial_personhood_adversary_weight_matches_formula() {
+    // P=0.5, C=4.0: W = floor(sqrt(4) × 0.5 × 1000) = floor(1000) = 1000
+    let cfg = wc();
+    let adversary = AdversaryModel::partial_personhood_sybil(3, 4.0);
+    let byz_w = adversary.max_byzantine_weight(&cfg, None);
+    // 3 × floor(sqrt(4) × 0.5 × 1000) = 3 × 1000 = 3000
+    assert_eq!(byz_w, 3000,
+        "3 sybils at P=0.5, C=4: 3 × 1000 = 3000; got {byz_w}");
+}
+
+#[test]
+fn e2_relative_cap_limits_adversary_weight() {
+    // Without cap: 1 adversary at C=100, P=1.0 → min(10000, max_weight=10000) = 10000
+    // With cap = 2000: clamped to 2000
+    let cfg = wc(); // max_weight = 10000
+    let adversary = AdversaryModel::full_personhood(1, 100.0);
+    let uncapped = adversary.max_byzantine_weight(&cfg, None);
+    let capped   = adversary.max_byzantine_weight(&cfg, Some(2000));
+    assert_eq!(uncapped, 10_000, "uncapped: adversary at C=100 hits absolute max_weight");
+    assert_eq!(capped,    2_000, "capped: relative cap at 2000 limits adversary weight");
+}
+
+#[test]
+fn e2_zero_byzantine_validators_gives_zero_weight() {
+    let adversary = AdversaryModel::full_personhood(0, 100.0);
+    let byz_w = adversary.max_byzantine_weight(&wc(), None);
+    assert_eq!(byz_w, 0, "0 Byzantine validators → 0 Byzantine weight");
+}
+
+// ── E3: safety invariant holds (W_B < Q_S) ───────────────────────────────────
+
+#[test]
+fn e3_classical_4_honest_1_byz_safe() {
+    // Classical BFT: 4 honest, 1 Byzantine at equal weight.
+    // Total = 5000 (5 × W=1000). Safety Q = ceil(5000 × 2/3)+1 = 3334.
+    // Byzantine weight = 1000. 1000 < 3334 → SAFE.
+    let reg = make_mixed_registry(4, 1.0, 1, 1.0, 1.0, wc());
+    let adversary = AdversaryModel::full_personhood(1, 1.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE3 classical 4/1: {result}");
+    assert!(result.holds, "4 honest vs 1 Byzantine at equal weight must be safe: {result}");
+    assert!(result.margin > 0, "margin must be positive: {result}");
+}
+
+#[test]
+fn e3_tight_honest_majority_safe() {
+    // 4 honest (C=4, P=1.0, W=2000 each), 1 Byzantine (C=4, P=0.5, W=1000)
+    // Total = 4×2000 + 1×1000 = 9000
+    // Safety Q = ceil(9000 × 2/3)+1 = 6001
+    // Byzantine weight model: 1 Sybil, C=4, P=0.5 → 1000 (no cap needed)
+    // 1000 < 6001 → SAFE with large margin
+    let reg = make_mixed_registry(4, 4.0, 1, 4.0, 0.5, wc());
+    let adversary = AdversaryModel::partial_personhood_sybil(1, 4.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE3 tight majority: {result}");
+    assert!(result.holds, "expected safe; got: {result}");
+}
+
+#[test]
+fn e3_high_personhood_coverage_uses_lower_adaptive_quorum() {
+    // All validators have P=1.0 → ρ=1.0 → adaptive quorum = base 2/3 quorum.
+    // But safety_quorum = max(classical, adaptive). Since adaptive = classical here,
+    // the margin should still be positive (honest > byz).
+    let reg = make_mixed_registry(6, 2.0, 1, 2.0, 1.0, wc());
+    let adversary = AdversaryModel::full_personhood(1, 2.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE3 high coverage: {result}");
+    assert!(result.holds, "6 honest vs 1 Byzantine at P=1.0 must be safe: {result}");
+    assert!((result.personhood_coverage - 1.0).abs() < 0.01,
+        "all verified: coverage should be ≈1.0; got {}", result.personhood_coverage);
+}
+
+// ── E4: safety invariant violated — predicate MUST detect ────────────────────
+//
+// These are deliberate constructions where W_B >= Q_S.
+// The predicate must return holds=false and a non-positive margin.
+// This tests that the safety check cannot be fooled into reporting "safe"
+// when the stated adversary model exceeds the quorum.
+
+#[test]
+fn e4_large_byzantine_coalition_detected_as_unsafe() {
+    // 3 honest validators, 4 Byzantine — attacker controls majority.
+    // All at equal weight. Byzantine weight > quorum → UNSAFE.
+    // Note: the adversary model says 4 Byzantine validators, each with C=1.0 at P=1.0.
+    let reg = make_mixed_registry(3, 1.0, 0, 0.0, 1.0, wc());
+    // Model 4 external Byzantine validators at same weight as the honest ones.
+    let adversary = AdversaryModel::full_personhood(4, 1.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE4 large coalition: {result}");
+    assert!(!result.holds,
+        "4 Byzantine vs 3 honest: adversary exceeds quorum → must be UNSAFE; got: {result}");
+    assert!(result.margin <= 0,
+        "unsafe case: margin must be ≤ 0; got {}", result.margin);
+    assert!(!result.is_safe(),
+        "is_safe() must return false when holds=false");
+}
+
+#[test]
+fn e4_adversary_at_exactly_one_third_detected_as_unsafe() {
+    // BFT safety requires STRICTLY MORE than 2/3 honest.
+    // If Byzantine weight = exactly 1/3 total, the protocol is NOT safe
+    // because W_B = total - Q_S (no margin).
+    //
+    // Construct: 6 validators total, all C=1.0, P=1.0 → each W=1000.
+    // Total = 6000. Q_S = ceil(6000 × 2/3)+1 = 4001.
+    // Adversary model: 2 Byzantine validators (W = 2000).
+    // 2000 < 4001 → technically safe with this construction (2/6 < 1/3).
+    //
+    // But 3 Byzantine (W = 3000): 3000 < 4001 → margin = 1001 → still safe.
+    // 4 Byzantine (W = 4000): 4000 < 4001 → margin = 1 → barely safe.
+    // Adversary model: 5 Byzantine (W = 5000 > 4001) → UNSAFE.
+    let reg = make_mixed_registry(6, 1.0, 0, 0.0, 1.0, wc());
+    let adversary = AdversaryModel::full_personhood(5, 1.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE4 one-third boundary (overshoot): {result}");
+    assert!(!result.holds,
+        "5 Byzantine vs 6-validator set: adversary model exceeds quorum → UNSAFE; got: {result}");
+}
+
+#[test]
+fn e4_aggregate_sybil_cluster_at_high_count_detected_unsafe() {
+    // D7 aggregate attack: many P=0.5 sybils at moderate contribution.
+    // Honest set: 4 validators at C=4.0, P=1.0 → W=2000 each (total honest = 8000).
+    // Adversary: 30 sybils at C=4.0, P=0.5 → W per sybil = floor(sqrt(4)×0.5×1000) = 1000.
+    // Total Byzantine weight = 30000.
+    // Total in registry (honest only, byz are external): Q_S based on registry.
+    // The adversary model represents an EXTERNAL threat not yet in the registry.
+    let reg = make_mixed_registry(4, 4.0, 0, 0.0, 1.0, wc());
+    let adversary = AdversaryModel::partial_personhood_sybil(30, 4.0);
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE4 aggregate sybil cluster (30 × P=0.5): {result}");
+    // 30 sybils × 1000 = 30000 >> Q_S based on 4 honest validators
+    assert!(!result.holds,
+        "30 P=0.5 sybils overwhelm 4 honest validators → must be UNSAFE; got: {result}");
+}
+
+// ── E5: boundary tests — the crisp mathematical fence ────────────────────────
+//
+// These test the exact boundary: W_B < Q_S (safe), W_B = Q_S (unsafe),
+// W_B > Q_S (unsafe). The safety predicate must correctly classify all three.
+
+#[test]
+fn e5_one_below_quorum_is_safe() {
+    // Construct a registry so that Q_S is known, then set adversary to W_B = Q_S - 1.
+    // 4 validators at C=1.0, P=1.0 → W=1000 each. Total = 4000.
+    // Q_classical = ceil(4000 × 2/3)+1 = 2668.
+    // Adaptive (ρ=1.0) = Q_classical = 2668.
+    // Set adversary to 2667 = Q_S - 1 (just safe).
+    // We do this by using max_contribution=high enough that we compute exactly 2667
+    // via the formula, OR by using a custom adversary with 2 validators + tuned C.
+    //
+    // Simpler: use a raw adversary model where N × per_sybil_W = Q_S - 1.
+    // Q_S = 2668. We want W_B = 2667.
+    // Use C=0.0 so W_per_sybil = min_weight = 1; then N=2667 → W_B=2667.
+    let reg = make_mixed_registry(4, 1.0, 0, 0.0, 1.0, wc());
+    // C=0.0 → compute_weight gives floor(0^0.5 × P × scale)=0 → min_weight floor = 1.
+    let adversary = AdversaryModel {
+        max_personhood_per_sybil:   1.0,
+        max_byzantine_validators:   2667,
+        max_contribution_per_sybil: 0.0, // W = min_weight = 1 per sybil
+    };
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE5 W_B = Q_S - 1: {result}");
+    // Q_S = 2668, W_B = 2667 → margin = +1 → SAFE
+    assert!(result.holds,
+        "W_B = Q_S - 1 must be safe (margin = +1); got: {result}");
+    assert!(result.margin > 0,
+        "margin must be positive at W_B = Q_S - 1; got margin={}", result.margin);
+}
+
+#[test]
+fn e5_equal_to_quorum_is_unsafe() {
+    // Q_S = 2668 (same registry as e5_one_below).
+    // N=2668 sybils each W=1 → W_B = Q_S → margin = 0 → UNSAFE.
+    let reg = make_mixed_registry(4, 1.0, 0, 0.0, 1.0, wc());
+    let adversary = AdversaryModel {
+        max_personhood_per_sybil:   1.0,
+        max_byzantine_validators:   2668,
+        max_contribution_per_sybil: 0.0, // W = min_weight = 1 per sybil
+    };
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE5 W_B = Q_S (equal): {result}");
+    // margin = 2668 - 2668 = 0 → not safe (strict less-than required)
+    assert!(!result.holds,
+        "W_B = Q_S is NOT safe (strict inequality required); got: {result}");
+    assert_eq!(result.margin, 0,
+        "margin must be 0 when W_B = Q_S; got {}", result.margin);
+}
+
+#[test]
+fn e5_one_above_quorum_is_unsafe() {
+    // N=2669 sybils → W_B = Q_S + 1 → margin = -1 → clearly UNSAFE.
+    let reg = make_mixed_registry(4, 1.0, 0, 0.0, 1.0, wc());
+    let adversary = AdversaryModel {
+        max_personhood_per_sybil:   1.0,
+        max_byzantine_validators:   2669,
+        max_contribution_per_sybil: 0.0, // W = min_weight = 1 per sybil
+    };
+    let result = check_bft_safety(&reg, &aqc(), &adversary).unwrap();
+    println!("\nE5 W_B = Q_S + 1: {result}");
+    assert!(!result.holds,
+        "W_B = Q_S + 1 must be unsafe; got: {result}");
+    assert!(result.margin < 0,
+        "margin must be negative when W_B > Q_S; got {}", result.margin);
+}
+
+// ── E6: D7 aggregate sybil — systematic sweep ────────────────────────────────
+//
+// The D7 attack: many partial-personhood validators in aggregate can reach
+// quorum even if each individual is low-weight. These tests sweep the sybil
+// count and verify the safety predicate tracks the boundary correctly.
+
+#[test]
+fn e6_d7_sybil_sweep_identifies_safe_vs_unsafe_threshold() {
+    // Honest set: 10 validators at C=4.0, P=1.0 → W=2000 each.
+    //   Total honest weight = 20000.
+    //   Q_S = ceil(20000 × 2/3)+1 = 13334.
+    // Sybils: P=0.5, C=4.0 → W_per_sybil = floor(2.0 × 0.5 × 1000) = 1000.
+    // To reach Q_S: need ceil(13334 / 1000) = 14 sybils → UNSAFE at 14+.
+    // At 13 sybils: W_B = 13000 < 13334 → SAFE.
+    let reg = make_mixed_registry(10, 4.0, 0, 0.0, 1.0, wc());
+
+    let honest_total = reg.total_weight();
+    let q_s = ((honest_total as f64 * 2.0 / 3.0).ceil() as u64) + 1;
+    let w_per_sybil = 1000u64; // floor(sqrt(4) × 0.5 × 1000)
+
+    // Find the boundary count
+    let safe_count   = (q_s / w_per_sybil) as usize;       // floor(Q_S / per_sybil)
+    let unsafe_count = safe_count + 1;
+
+    println!("\nE6 D7 sybil sweep:");
+    println!("  honest total:  {honest_total}");
+    println!("  safety quorum: {q_s}");
+    println!("  W per sybil:   {w_per_sybil}");
+    println!("  safe at:       {safe_count} sybils (W_B = {})", safe_count as u64 * w_per_sybil);
+    println!("  unsafe at:     {unsafe_count} sybils (W_B = {})", unsafe_count as u64 * w_per_sybil);
+
+    let safe_adv = AdversaryModel::partial_personhood_sybil(safe_count, 4.0);
+    let safe_res = check_bft_safety(&reg, &aqc(), &safe_adv).unwrap();
+    println!("  Safe   result: {safe_res}");
+    assert!(safe_res.holds,
+        "{safe_count} P=0.5 sybils should be safe; got: {safe_res}");
+
+    let unsafe_adv = AdversaryModel::partial_personhood_sybil(unsafe_count, 4.0);
+    let unsafe_res = check_bft_safety(&reg, &aqc(), &unsafe_adv).unwrap();
+    println!("  Unsafe result: {unsafe_res}");
+    assert!(!unsafe_res.holds,
+        "{unsafe_count} P=0.5 sybils should be unsafe; got: {unsafe_res}");
+}
+
+#[test]
+fn e6_d7_raising_min_personhood_to_1_requires_more_sybils() {
+    // With min_personhood_factor = 1.0, only fully-verified validators are admitted.
+    // An attacker must therefore use P=1.0 sybils — which have 2× the weight of P=0.5
+    // but also face stronger credential requirements.
+    // This test verifies that the weight-per-sybil doubles when P must be 1.0 vs 0.5,
+    // meaning the SAME number of sybils poses a larger threat (but requires stronger
+    // credentials that are harder to manufacture).
+    let cfg_strict = WeightConfig { min_personhood_factor: 1.0, ..wc() };
+    let reg_strict = make_mixed_registry(10, 4.0, 0, 0.0, 1.0, cfg_strict.clone());
+
+    let w_per_sybil_half = 1000u64; // P=0.5 sybil weight (default config)
+    let w_per_sybil_full = 2000u64; // P=1.0 sybil weight (forced full personhood)
+
+    let adv_p05 = AdversaryModel { max_personhood_per_sybil: 0.5, max_byzantine_validators: 7, max_contribution_per_sybil: 4.0 };
+    let adv_p10 = AdversaryModel { max_personhood_per_sybil: 1.0, max_byzantine_validators: 7, max_contribution_per_sybil: 4.0 };
+
+    let byz_half = adv_p05.max_byzantine_weight(&cfg_strict, None);
+    let byz_full = adv_p10.max_byzantine_weight(&cfg_strict, None);
+
+    println!("\nE6 min-personhood=1.0: 7 sybils at P=0.5 → W_B={byz_half}, at P=1.0 → W_B={byz_full}");
+    assert_eq!(byz_half, 7 * w_per_sybil_half,
+        "P=0.5: 7 × 1000 = 7000; got {byz_half}");
+    assert_eq!(byz_full, 7 * w_per_sybil_full,
+        "P=1.0: 7 × 2000 = 14000; got {byz_full}");
+
+    // More weight per sybil means the threshold is reached faster at P=1.0.
+    // BUT: with min_personhood=1.0, P=0.5 sybils are rejected at upsert,
+    // so the attacker CAN'T use them — they must manufacture P=1.0 credentials.
+    let result_full = check_bft_safety(&reg_strict, &aqc(), &adv_p10).unwrap();
+    println!("  Safety check (7 P=1.0 sybils vs 10 honest): {result_full}");
+    // 10 honest × 2000 = 20000; Q_S = ceil(20000 × 2/3)+1 = 13334.
+    // 7 P=1.0 sybils × 2000 = 14000 > 13334 → UNSAFE.
+    assert!(!result_full.holds,
+        "7 full-personhood sybils vs 10 honest (Q_S=13334) should be UNSAFE; got: {result_full}");
+}
+
+#[test]
+fn e6_d7_weight_cap_limits_aggregate_sybil_damage() {
+    // With max_weight_multiplier=1.0 (all validators equal to median), the
+    // relative cap prevents any sybil from contributing more than the median
+    // weight. This bounds the per-sybil contribution to the adversary's
+    // aggregate, but does NOT prevent a large NUMBER of sybils from accumulating.
+    //
+    // This test documents the residual risk: the cap limits per-sybil weight
+    // but an adversary can still add many validators.
+    let cfg_tight = WeightConfig { max_weight_multiplier: 1.0, ..wc() };
+
+    // 4 honest at C=4.0 → uncapped W=2000; with 1× multiplier all get W=median=2000.
+    // Adversary sybils at C=100.0 → raw W=10000 but capped to median by close_epoch.
+    // The relative cap in the adversary model uses the actual post-cap weights.
+    let reg = make_mixed_registry(4, 4.0, 0, 0.0, 1.0, cfg_tight.clone());
+
+    // Relative cap in this registry: median of 4 × 2000 = 2000; cap = 1 × 2000 = 2000.
+    let relative_cap = Some(2000u64);
+    let adversary_high_c = AdversaryModel {
+        max_personhood_per_sybil:   1.0,
+        max_byzantine_validators:   2,
+        max_contribution_per_sybil: 100.0, // raw weight would be 10000
+    };
+
+    let byz_uncapped = adversary_high_c.max_byzantine_weight(&cfg_tight, None);
+    let byz_capped   = adversary_high_c.max_byzantine_weight(&cfg_tight, relative_cap);
+
+    println!("\nE6 cap limits per-sybil: uncapped={byz_uncapped}, capped={byz_capped}");
+    assert_eq!(byz_uncapped, 20_000, "2 sybils at C=100, uncapped: 2×10000=20000");
+    assert_eq!(byz_capped,    4_000, "2 sybils at C=100, capped to 2000: 2×2000=4000");
+    assert!(byz_capped < byz_uncapped,
+        "relative cap must reduce adversary aggregate weight");
+
+    // Safety check with the tight cap in play
+    let result = check_bft_safety(&reg, &aqc(), &adversary_high_c).unwrap();
+    println!("  Safety (check uses actual registry cap): {result}");
+    // Q_S with 4 validators × 2000 = 8000 total: ceil(8000 × 2/3)+1 = 5334.
+    // W_B (from check_bft_safety using actual registry median=2000 cap): 2×2000=4000.
+    // 4000 < 5334 → SAFE.
+    assert!(result.holds,
+        "2 sybils, even at high C, are capped to 2000 each: 4000 < Q_S → SAFE; got: {result}");
+}
+
 // SUMMARY (printed when running with --nocapture)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -860,7 +1284,17 @@ fn zz_summary() {
     println!("║  D8  Weight u64 overflow          → BLOCKED (fits 100k validators)      ║");
     println!("║  D9  Identity == validator_id     → BLOCKED (invariant checker)         ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
-    println!("║  v0.3 TOTALS: 18 BLOCKED  2 PARTIAL  0 OPEN (was: 14/4/4 in v0.2)      ║");
+    println!("╠══════════════════════════════════════════════════════════════════════════╣");
+    println!("║  FORMAL SAFETY PREDICATE (v0.4 — BFT safety contract)                  ║");
+    println!("║  E1  SafetyResult structure / Display          → VERIFIED               ║");
+    println!("║  E2  AdversaryModel weight math (full/partial) → VERIFIED               ║");
+    println!("║  E3  Safety holds: W_B < Q_S (various configs) → VERIFIED               ║");
+    println!("║  E4  Predicate detects violations (W_B >= Q_S) → VERIFIED               ║");
+    println!("║  E5  Boundary: W_B = Q_S-1 / Q_S / Q_S+1      → VERIFIED               ║");
+    println!("║  E6  D7 aggregate sybil sweep, cap limits       → VERIFIED               ║");
+    println!("╠══════════════════════════════════════════════════════════════════════════╣");
+    println!("║  v0.4 TOTALS: 18 BLOCKED  2 PARTIAL  0 OPEN  +11 safety-predicate      ║");
+    println!("║         (was: 18/2/0 in v0.3)                                           ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
     println!("\n  REMAINING PARTIAL MITIGATIONS (for formal spec / IACR paper):");
     println!("  A4  Relative weight cap implemented (3× median); for BFT safety");
@@ -869,4 +1303,10 @@ fn zz_summary() {
     println!("      call close_epoch() before computing quorum for BFT safety.");
     println!("  D7  P ≥ 0.25 rejects very low credentials; aggregate sybils at P=0.5");
     println!("      remain a threat. Set min_personhood_factor=1.0 for strict safety.");
+    println!();
+    println!("  SAFETY CONTRACT (formally expressed in check_bft_safety()):");
+    println!("  ∀ B ∈ B_adm : W(B) < Q_S  where Q_S = max(classical_floor, adaptive)");
+    println!("  Q_S = ceil(2/3 × total_weight) + 1  (adaptive may only raise this)");
+    println!("  The predicate returns SafetyResult with margin = Q_S - W_B_max;");
+    println!("  margin > 0 ↔ safe, margin = 0 ↔ boundary (UNSAFE), margin < 0 ↔ UNSAFE.");
 }

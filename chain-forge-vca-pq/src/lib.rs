@@ -877,6 +877,268 @@ pub fn verify_separation_invariant(
     Ok(())
 }
 
+// ── BFT safety predicate ──────────────────────────────────────────────────────
+//
+// Formal safety module for VCA-PQ-BFT.
+//
+// The core invariant:
+//
+//   Safety(R, Q) ⟺ ∀ B ∈ B_adm : W(B) < Q_S
+//
+// where:
+//   R       = current VCA registry (closed epoch)
+//   B       = an admissible Byzantine coalition
+//   W(B)    = Σ_{i∈B} W_i
+//   B_adm   = coalitions permitted by the identity/personhood assumptions
+//   Q_S     = safety quorum (strict: must be > W(B), not merely ≥)
+//
+// The adaptive quorum may increase *progress* (liveness); it must never lower
+// the safety floor below 2/3 of total weight. This module expresses and
+// checks that contract explicitly.
+
+/// An explicit adversary model: the assumptions about what the attacker can do.
+///
+/// This replaces ad-hoc "what if P=0.5?" tests with a rigorous parameterized
+/// adversary that can be varied across the full attack space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdversaryModel {
+    /// Maximum personhood factor the adversary can achieve per Sybil identity.
+    /// At P=1.0 the adversary can create fully-verified identities (strongest).
+    /// At P=0.5 the adversary has partial-personhood Sybils.
+    /// The min_personhood_factor in WeightConfig acts as the gate.
+    pub max_personhood_per_sybil: f64,
+
+    /// Maximum number of adversarial validator slots the attacker controls.
+    pub max_byzantine_validators: usize,
+
+    /// Maximum contribution score the adversary can achieve per Sybil.
+    /// Contribution is assumed verifiable, so an unbounded C is not realistic;
+    /// this bounds the adversary's contribution-accumulation ability.
+    pub max_contribution_per_sybil: f64,
+}
+
+impl AdversaryModel {
+    /// Standard Sybil adversary: many partial-personhood validators.
+    /// Models an attacker who can manufacture P=0.5 credentials at scale.
+    pub fn partial_personhood_sybil(n: usize, max_c: f64) -> Self {
+        Self {
+            max_personhood_per_sybil:   0.5,
+            max_byzantine_validators:   n,
+            max_contribution_per_sybil: max_c,
+        }
+    }
+
+    /// Full-personhood adversary: controls validators with P=1.0.
+    /// Models a captured set of fully-verified validators.
+    pub fn full_personhood(n: usize, max_c: f64) -> Self {
+        Self {
+            max_personhood_per_sybil:   1.0,
+            max_byzantine_validators:   n,
+            max_contribution_per_sybil: max_c,
+        }
+    }
+
+    /// Compute the maximum aggregate weight this adversary can accumulate
+    /// under the given weight configuration and relative cap.
+    ///
+    /// The worst case is: `max_byzantine_validators` Sybils, each with
+    /// `max_contribution_per_sybil` and `max_personhood_per_sybil`, after the
+    /// relative cap `max_weight_multiplier × median` has been applied.
+    ///
+    /// `median_cap` is the pre-computed cap from a closed registry (e.g.,
+    /// from `registry.total_weight()` / validator count).  When `None`, no
+    /// relative cap is applied — this gives the worst-case raw bound.
+    pub fn max_byzantine_weight(
+        &self,
+        weight_config: &WeightConfig,
+        relative_cap:  Option<u64>,
+    ) -> u64 {
+        let p   = PersonhoodFactor(self.max_personhood_per_sybil.min(1.0).max(0.0));
+        let c   = ContributionScore(self.max_contribution_per_sybil.max(0.0));
+        let raw = compute_weight(c, p, weight_config);
+
+        // Apply relative cap if known
+        let per_sybil = match relative_cap {
+            Some(cap) => raw.0.min(cap),
+            None      => raw.0,
+        };
+
+        // Saturating multiply: total Byzantine weight
+        per_sybil.saturating_mul(self.max_byzantine_validators as u64)
+    }
+}
+
+/// The result of a BFT safety check.
+///
+/// Provides actionable numbers rather than a bare bool, so adversarial tests
+/// and monitoring can report precise margins:
+///
+/// ```text
+///   total validator weight:       10000
+///   max Byzantine coalition:       2900
+///   safety quorum:                 6701
+///   safety margin:                +3801   ← positive means SAFE
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyResult {
+    /// Whether the safety invariant holds for this registry + adversary model.
+    pub holds: bool,
+
+    /// Total weight of all validators in the (closed) registry.
+    pub total_weight: u64,
+
+    /// Maximum aggregate weight the adversary can accumulate under the model.
+    pub max_byzantine_weight: u64,
+
+    /// The safety quorum threshold that was checked against.
+    pub safety_quorum: u64,
+
+    /// `safety_quorum as i128 - max_byzantine_weight as i128`.
+    /// Positive → the quorum exceeds the adversary's max weight (safe).
+    /// Zero or negative → the adversary could block or capture quorum (unsafe).
+    pub margin: i128,
+
+    /// Personhood coverage ratio ρ = verified_weight / total_weight.
+    pub personhood_coverage: f64,
+}
+
+impl SafetyResult {
+    /// True iff the safety invariant is satisfied with a strictly positive margin.
+    pub fn is_safe(&self) -> bool { self.holds && self.margin > 0 }
+}
+
+impl std::fmt::Display for SafetyResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BFT Safety: {} | total={} byz_max={} quorum={} margin={:+} ρ={:.2}",
+            if self.holds { "SAFE" } else { "UNSAFE" },
+            self.total_weight,
+            self.max_byzantine_weight,
+            self.safety_quorum,
+            self.margin,
+            self.personhood_coverage,
+        )
+    }
+}
+
+/// Check whether the BFT safety invariant holds for a closed registry.
+///
+/// ## Safety contract
+///
+/// For every admissible Byzantine coalition B under `adversary`:
+///   W(B) < Q_S
+///
+/// The safety quorum Q_S is the STRICTER of:
+///   - The classically-required floor: ceil(total_weight × 2/3) + 1
+///   - The adaptive quorum from `compute_adaptive_quorum()` (may be higher)
+///
+/// Using max(classical, adaptive) ensures the adaptive mechanism can only
+/// *raise* the safety bar, never lower it below the BFT floor.
+///
+/// ## Relative cap
+///
+/// The cap from `close_epoch()` (max_weight_multiplier × median) bounds
+/// how much weight any single Sybil can accumulate. This function uses the
+/// registry's actual post-cap weights to compute `max_byzantine_weight`,
+/// so the adversary model operates on the same weights the consensus layer sees.
+///
+/// ## Usage
+///
+/// Call this:
+/// - After `registry.close_epoch()` (weights must be final)
+/// - Before `compute_adaptive_quorum()` is used to commit blocks
+/// - In monitoring / governance tooling to verify safety before epoch use
+///
+/// Returns `SafetyResult` in all cases; check `.holds` or `.is_safe()`.
+/// Returns `Err` only if `quorum_config` is structurally invalid.
+pub fn check_bft_safety(
+    registry:       &VcaRegistry,
+    quorum_config:  &AdaptiveQuorumConfig,
+    adversary:      &AdversaryModel,
+) -> VcaResult<SafetyResult> {
+    let total = registry.total_weight();
+
+    // Classical BFT safety floor: requires strict majority of total weight.
+    // ceil(2/3 × total) + 1 ensures W_honest > W_byz even at exactly 1/3 Byzantine.
+    let classical_floor = if total == 0 {
+        quorum_config.quorum_floor
+    } else {
+        ((total as f64 * 2.0 / 3.0).ceil() as u64).saturating_add(1)
+    };
+
+    // Adaptive quorum: may be higher than the classical floor when ρ is low.
+    // If all personhood is expired, we still use the classical floor for the
+    // safety check (the consensus layer would have halted with EmergencyQuorum,
+    // but the predicate still reports unsafe rather than erroring out).
+    let adaptive_q = match compute_adaptive_quorum(registry, quorum_config) {
+        Ok(q)                        => q,
+        Err(VcaError::EmergencyQuorum) => classical_floor, // degenerate but safe to evaluate
+        Err(e)                       => return Err(e),
+    };
+
+    // Safety quorum is the MAX — the adaptive mechanism may only raise the bar.
+    let safety_quorum = classical_floor.max(adaptive_q);
+
+    // Compute the relative cap from the actual post-close weights in the registry.
+    // We use the median of actual weights (same as close_epoch uses) so the
+    // adversary model operates on the real post-cap weight space.
+    let relative_cap: Option<u64> = {
+        let mut weights: Vec<u64> = registry.records.values()
+            .map(|r| r.weight.0)
+            .filter(|&w| w > 0)
+            .collect();
+        if weights.is_empty() {
+            None
+        } else {
+            weights.sort_unstable();
+            let median = if weights.len() % 2 == 0 {
+                (weights[weights.len() / 2 - 1] + weights[weights.len() / 2]) / 2
+            } else {
+                weights[weights.len() / 2]
+            };
+            Some((median as f64 * registry.weight_cfg.max_weight_multiplier).floor() as u64)
+        }
+    };
+
+    let max_byz = adversary.max_byzantine_weight(&registry.weight_cfg, relative_cap);
+
+    // Safety invariant: W(B) < Q_S  (strict less-than — equality is NOT safe)
+    let margin = safety_quorum as i128 - max_byz as i128;
+    let holds  = margin > 0;
+
+    let personhood_coverage = if total == 0 {
+        0.0
+    } else {
+        registry.verified_weight() as f64 / total as f64
+    };
+
+    let result = SafetyResult {
+        holds,
+        total_weight: total,
+        max_byzantine_weight: max_byz,
+        safety_quorum,
+        margin,
+        personhood_coverage,
+    };
+
+    if !holds {
+        tracing::warn!(
+            epoch = registry.epoch,
+            %result,
+            "BFT safety invariant VIOLATED — Byzantine coalition can reach quorum"
+        );
+    } else {
+        tracing::debug!(
+            epoch = registry.epoch,
+            %result,
+            "BFT safety invariant satisfied"
+        );
+    }
+
+    Ok(result)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
