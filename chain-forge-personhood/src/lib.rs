@@ -45,6 +45,13 @@ pub use governance_authority::{
     AuthorizedIssuerRegistry, AuthzError, GovernanceVote,
 };
 
+pub mod nullifier_circuit;
+pub use nullifier_circuit::{
+    NullifierLeaf, NullifierKeys, NullifierProver, NullifierVerifier,
+    SecretCommitHash, SecretCommitHashGadget, SecretCommitWindow,
+    nullifier_circuit_public_inputs,
+};
+
 // ── Pedersen hash windows ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -135,7 +142,7 @@ pub fn make_issuer_leaf(issuer_id: u32) -> Vec<u8> {
 /// resolves to `root_var` under the given hash parameters. Used for both the
 /// VRC-credential tree and the approved-issuers tree — they share the exact
 /// same Pedersen construction, just different leaf contents and roots.
-fn enforce_membership_generic(
+pub(crate) fn enforce_membership_generic(
     cs: ConstraintSystemRef<Fr>,
     leaf_var: &[UInt8<Fr>],
     path: VrcMembershipPath,
