@@ -333,7 +333,7 @@ The specific integer square root algorithm is an implementation decision. It MUS
 
 ## 7. Invariants and Consensus Validity
 
-### 7.1 Coverage invariant
+### 7.1 State Validity Invariant
 
 At every epoch boundary, the following MUST hold:
 
@@ -343,7 +343,7 @@ outstanding_e * CR_min_fixed <= capacity_e * D
 
 If this is false after applying the epoch boundary transition, the epoch boundary is invalid and MUST be rejected by all correct validators.
 
-### 7.2 Per-mint coverage check
+### 7.2 Transaction Validity Rule
 
 Before any CIRFI-minting transaction is accepted, the node MUST verify:
 
@@ -353,22 +353,49 @@ Before any CIRFI-minting transaction is accepted, the node MUST verify:
 
 If false, the transaction MUST be rejected regardless of all other authorization conditions. This check is the ultimate guard — it fires even when the circuit breaker is NORMAL and the epoch cap has not been reached.
 
-**Two-layer protection:**
+**Three enforcement layers (defense in depth):**
 
 ```
-Layer 1: Circuit breaker (mode_e)
-  → coarse: rejects all minting when CR < CR_halt
-  → implemented at transaction dispatch
+Layer 1 — Availability Guard (§7.3)
+  Condition:  CR < CR_halt  (i.e., outstanding * CR_halt_fixed > capacity * D)
+  Action:     mode_e = HALTED; all minting transactions rejected at dispatch
+  Scope:      issuance-wide; coarse fast-path rejection
 
-Layer 2: Coverage invariant check (§7.2)
-  → fine: rejects any individual mint that would push CR below CR_min
-  → implemented at state-update time
-  → fires even when mode_e == NORMAL
+Layer 2 — Transaction Validity Rule (this section)
+  Condition:  (outstanding + cirfi_out) * CR_min_fixed > capacity * D
+  Action:     individual mint rejected at state-update time
+  Scope:      per-transaction; fires even when mode_e == NORMAL
+  Catches:    any mint that would individually violate the invariant
+              even when aggregate CR is above CR_halt
+
+Layer 3 — State Validity Invariant (§7.1)
+  Condition:  outstanding_e * CR_min_fixed > capacity_e * D
+  Action:     entire epoch state rejected by validators
+  Scope:      epoch-level; the consensus-enforced floor
+  Catches:    any epoch state that violated the invariant regardless of
+              how it got there (implementation bug, replay, corruption)
 ```
 
-The circuit breaker is a fast-path rejection. The coverage invariant is the consensus-enforceable guarantee.
+This vocabulary — Availability Guard, Transaction Validity Rule, State Validity Invariant — SHOULD be used consistently in the Rust implementation, code review, and security audit documentation so that each enforcement point is independently identifiable and testable.
 
-### 7.3 Epoch counter monotonicity
+### 7.3 Availability Guard
+
+The Availability Guard is set at the epoch boundary (Step 5 of §4) and determines `mode_{e+1}`:
+
+```
+if outstanding_{e+1} * CR_halt_fixed > capacity_{e+1} * D:
+    mode_{e+1} = HALTED
+elif capacity_{e+1} * D >= outstanding_{e+1} * CR_resume_fixed:
+    mode_{e+1} = NORMAL
+else:
+    mode_{e+1} = mode_e          // hysteresis: preserve current mode
+```
+
+When `mode_e == HALTED`, the node MUST reject all `QcbToCirfi` and `ContributionToCirfi` transactions at dispatch, before reaching the Transaction Validity Rule check. This is a fast-path — it avoids performing the per-mint coverage calculation for every rejected transaction during a halt period.
+
+The Availability Guard does NOT halt `ConsumeCirfi` transactions. Consumption reduces `outstanding`, which improves CR. Blocking consumption during HALTED would extend the halt by preventing the natural recovery path.
+
+### 7.4 Epoch counter monotonicity
 
 ```
 epoch_{e+1} == epoch_e + 1
@@ -376,7 +403,7 @@ epoch_{e+1} == epoch_e + 1
 
 No epoch may be skipped. Epoch numbering is global and chain-ordered.
 
-### 7.4 Conversion counter reset
+### 7.5 Conversion counter reset
 
 ```
 conversion_volume_e == 0  at the start of every epoch
@@ -384,18 +411,18 @@ conversion_volume_e == 0  at the start of every epoch
 
 The counter MUST be reset before any transactions in the new epoch are processed (Step 7 of the epoch boundary sequence).
 
-### 7.5 HALTED semantics
+### 7.6 HALTED semantics
 
 When `mode_e == HALTED`:
 
-- `QcbToCirfi` transactions MUST be rejected
-- `ContributionToCirfi` transactions MUST be rejected
+- `QcbToCirfi` transactions MUST be rejected (Availability Guard)
+- `ContributionToCirfi` transactions MUST be rejected (Availability Guard)
 - `ConsumeCirfi` transactions MUST NOT be affected
 - Transfers of existing CIRFI balances MUST NOT be affected
 - Consensus participation MUST NOT be affected
 - Validator rewards MUST NOT be affected
 
-**The circuit breaker is issuance-local, not chain-global.**
+**The Availability Guard is issuance-local, not chain-global.**
 
 ---
 
@@ -403,17 +430,92 @@ When `mode_e == HALTED`:
 
 These questions MUST be resolved before the Rust implementation can be considered complete. They are listed in approximate dependency order.
 
-### 8.1 Capacity evidence adversarial model (CRITICAL)
+### 8.1 Capacity evidence adversarial model (CRITICAL — prerequisite for BFT correctness)
 
-The most important unresolved question. VCA attestation is a necessary condition for capacity reports, but not a sufficient one against a well-resourced adversary. The specification must define:
+This is the most important unresolved question in the specification. Its resolution is a prerequisite for the CIRFI economic state to participate in Byzantine fault tolerance — not just for economic accuracy, but for consensus correctness.
 
-- What constitutes admissible CapacityEvidence for each ResourceType
-- What fraction of validators must countersign a CapacityReport for it to be valid
-- What happens when providers submit inflated capacity reports (detection, slashing, cooldown)
-- Whether capacity can be challenged by other participants after the epoch boundary
-- The minimum sample size for a statistically valid capacity estimate
+**Why this is consensus-critical, not just economic:**
 
-Until this is resolved, `capacity_e` is a trust assumption, not a protocol guarantee.
+Capacity has been tied directly into the State Validity Invariant:
+
+```
+outstanding_e * CR_min_fixed <= capacity_e * D
+```
+
+This means `capacity_e` is no longer merely an economic parameter. It is consensus-critical state. If validator A sees `capacity_e = 10,000` while validator B sees `capacity_e = 6,000`, they reach different conclusions about whether the same `QcbToCirfi` transaction is valid. That is a potential consensus fork, not merely an inaccurate price. The capacity evidence model must therefore provide the same determinism guarantee as any other consensus-critical input.
+
+**The required separation of claims:**
+
+Three distinct claims must not be conflated:
+
+```
+VCA verifies contribution
+    ↓ (necessary but not sufficient for)
+CapacityEvidence verifies resource availability
+    ↓ (aggregated and signed by)
+Consensus verifies the resulting CapacityReport
+```
+
+VCA proves that a contributor performed work. CapacityEvidence proves that resources are available to service future claims. These are different claims: a provider who did work in the past may not have capacity available now. Consensus then establishes that the CapacityReport derived from that evidence is the canonical value all validators agree on. Each arrow in this chain requires its own trust model.
+
+**The ten questions this model must answer:**
+
+1. **What constitutes CapacityEvidence?**
+   For each ResourceType, what is the minimal proof that a claimed capacity unit actually exists? For compute: a benchmark result with a signed nonce? For storage: a proof-of-space challenge-response? For ZK proving: a timing attestation on a canonical circuit? Evidence requirements will differ per resource type and must be specified individually.
+
+2. **Who can submit CapacityEvidence?**
+   Must a submitter hold a VCA credential? Must they be a registered provider with staked collateral? The submission identity determines the adversarial surface — a permissionless submission model allows Sybil providers; a staked-collateral model introduces capital requirements that may exclude small providers.
+
+3. **How is contribution tied to the claimed resource?**
+   A provider who earned CIRFI through contribution (ContributionToCirfi) has demonstrated past work. Does that work automatically constitute CapacityEvidence? The safer model is: past work proves past contribution; present capacity requires a present proof. The spec should not assume they're the same.
+
+4. **How are multiple reports aggregated?**
+   If N providers each submit a CapacityReport for the same resource type, what is `capacity_e_r`? Options: sum (optimistic — assumes all reports are honest), median (Byzantine-robust — a minority of dishonest reporters cannot dominate), weighted average (stake-weighted — aligns reporting honesty with economic stake). The choice determines the adversarial tolerance of the aggregation.
+
+5. **What happens when reports conflict?**
+   If provider A claims 10,000 CU of compute and provider B disputes it, what is the resolution mechanism? Is there a challenge period before `capacity_e` is finalized? Who adjudicates? What evidence is required for a successful challenge? The spec currently states capacity carries over from the previous epoch if no valid report is received — this needs a conflict case too.
+
+6. **What quorum is required?**
+   The spec currently states a CapacityReport requires `> 2/3` of validators by weight to countersign. This is the standard BFT threshold and is correct for validator agreement, but it does not answer: what fraction of the registered provider set must contribute evidence for the report to be valid? A CapacityReport signed by 2/3 of validators but based on evidence from a single provider is formally valid but economically dangerous.
+
+7. **What prevents a provider from claiming nonexistent capacity?**
+   The Sybil-capacity attack: create many provider identities, each claiming moderate capacity, aggregate to large apparent `capacity_e`, enabling large `outstanding` without real resources. Defenses include: staked collateral (slashed if capacity is challenged and found false), challenge-response proofs that cannot be faked without real resources, and rate limits on capacity claims per identity. This attack vector is not addressed in the current spec.
+
+8. **What happens when capacity disappears between reports?**
+   Provider exodus (Scenario 3 in the v3 simulation) caused CR → 0.027 despite the circuit breaker. The simulation modeled this as a smooth decline. The real risk is a step discontinuity: a large provider exits between epoch boundaries, `capacity_{e+1}` drops sharply, and the Availability Guard fires before any mitigation is possible. The spec should define: what is the maximum permitted single-epoch capacity change? Is there a smoothing mechanism? Or is the circuit breaker the only protection?
+
+9. **How do capacity changes become deterministic across validators?**
+   Capacity evidence may be submitted during an epoch from multiple sources at different times. Validators must agree on which evidence is included in `capacity_e`. The epoch boundary sequence (§4, Step 2) specifies a deadline: evidence not finalized by the boundary is excluded. But the mechanism for achieving agreement on the evidence set itself — before it is aggregated — must be specified. This is likely a separate consensus sub-protocol (evidence collection → evidence set finalization → CapacityReport aggregation → validator countersignature).
+
+10. **What cryptographic evidence survives a dispute?**
+    If a provider later claims they were wrongly excluded from a CapacityReport, or a validator claims it signed a CapacityReport it never received, what on-chain record resolves the dispute? Evidence commitments should be anchored on-chain before the epoch boundary so that post-hoc disputes have a ground truth to appeal to.
+
+**Working recommendation for the next engineering phase:**
+
+Before implementing `QcbToCirfi` or `ContributionToCirfi` in Chain Forge, specify the capacity evidence model as a separate sub-protocol with its own state machine, transaction types, and consensus rules. Treat it as a peer to the CIRFI issuance protocol, not as a detail inside it. The CIRFI invariant is only as strong as the evidence model that feeds `capacity_e`.
+
+Until this is resolved, `capacity_e` is a trust assumption with a validator-signature wrapper, not a protocol guarantee. The invariant holds under honest validators; it does not hold under a Byzantine-validator + malicious-provider coalition.
+
+**Minimum viable evidence model for initial implementation:**
+
+A simplified model sufficient to start testing the state machine without closing all ten questions:
+
+```
+CapacityEvidence_v0 = {
+    provider_id:   ValidVCA credential (existing mechanism)
+    resource_type: ResourceType
+    capacity_claim: u128 (in CU)
+    challenge_nonce: [u8; 32]  // signed by provider, prevents replay
+    validator_set_epoch: u64   // evidence is epoch-scoped
+}
+
+CapacityReport_v0 aggregation:
+    capacity_e_r = median( capacity_claim_i for all valid evidence_i )
+    valid = len(evidence) >= MIN_PROVIDER_QUORUM
+             && validator_signatures >= 2/3 of validator set
+```
+
+This is Byzantine-resistant in aggregation (median), requires VCA credentials (existing protection against anonymous providers), but does not answer questions 7–10. It is labeled v0 to signal that it is a starting point for testing, not the final adversarial model.
 
 ### 8.2 CU↔ucirfi unit alignment
 
