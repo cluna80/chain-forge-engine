@@ -30,8 +30,9 @@ use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
 
 pub mod eligibility;
 pub use eligibility::{
-    EligibilityConfig, EligibilityError, EligibilityRegistry,
-    EpochCredential, EpochId, Nullifier, NullifierSet, PersonhoodBound,
+    CredentialSecret, EligibilityConfig, EligibilityError, EligibilityRegistry,
+    EpochCredential, EpochId, IssuanceAuthority, IssuanceError,
+    IssuanceRecord, Nullifier, NullifierSet, PersonhoodBound,
 };
 
 pub mod issuer_registry;

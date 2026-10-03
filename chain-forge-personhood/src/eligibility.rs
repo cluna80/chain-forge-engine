@@ -34,6 +34,130 @@
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
+// ── Credential secret & issuance authority (T2 -- A8) ────────────────────────
+
+/// The per-identity, per-epoch secret from which nullifiers are derived.
+///
+/// A `CredentialSecret` is 32 bytes sampled from a CSPRNG at issuance time.
+/// The issuance model (A8) guarantees that each eligible person receives at
+/// most one `CredentialSecret` per epoch. Secrets are never transmitted in
+/// the clear; only the nullifier `N = PRF_K(domain || epoch)` is published.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CredentialSecret(pub [u8; 32]);
+
+impl CredentialSecret {
+    /// Sample a fresh secret from a CSPRNG.
+    pub fn generate<R: rand::RngCore + rand::CryptoRng>(rng: &mut R) -> Self {
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
+    /// Derive the epoch nullifier: N = BLAKE3-keyed-hash(K, domain || epoch_be).
+    ///
+    /// This is the canonical T2.1 Variant A construction: deterministic per
+    /// (K, epoch), providing same-epoch uniqueness.  Cross-epoch presentations
+    /// are unlinkable as long as K is not observable.
+    pub fn derive_nullifier(&self, epoch: EpochId) -> Nullifier {
+        const DOMAIN: &[u8] = b"chain-forge:nullifier:v1";
+        // domain length prefix (2-byte BE) + domain + epoch (8-byte BE)
+        let domain_len = (DOMAIN.len() as u16).to_be_bytes();
+        let epoch_be   = epoch.0.to_be_bytes();
+        let mut msg = Vec::with_capacity(2 + DOMAIN.len() + 8);
+        msg.extend_from_slice(&domain_len);
+        msg.extend_from_slice(DOMAIN);
+        msg.extend_from_slice(&epoch_be);
+
+        let hash = blake3::keyed_hash(&self.0, &msg);
+        Nullifier(*hash.as_bytes())
+    }
+}
+
+// Omit Debug to avoid leaking secret material in log output.
+impl std::fmt::Debug for CredentialSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialSecret(***)")
+    }
+}
+
+/// Issuance record: proof that a `CredentialSecret` was assigned to a
+/// specific `(validator_id, epoch)` pair.  The `commitment` is a BLAKE3
+/// hash of the secret (not the secret itself) stored for audit purposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuanceRecord {
+    pub validator_id: u64,
+    pub epoch:        EpochId,
+    /// BLAKE3 hash of the CredentialSecret -- commitment without exposure.
+    pub commitment:   [u8; 32],
+}
+
+impl IssuanceRecord {
+    pub fn new(validator_id: u64, epoch: EpochId, secret: &CredentialSecret) -> Self {
+        let commitment = *blake3::hash(&secret.0).as_bytes();
+        Self { validator_id, epoch, commitment }
+    }
+}
+
+/// Issuance authority: enforces A8 (one CredentialSecret per person per epoch).
+///
+/// This is the minimal A8 implementation: an in-process registry that refuses
+/// to issue a second secret for the same `(validator_id, epoch)` pair.  A
+/// production deployment would replace this with a threshold-signed issuance
+/// ceremony backed by a ZK proof that the issuer has not previously committed
+/// to a different secret for this identity/epoch.
+#[derive(Debug, Default)]
+pub struct IssuanceAuthority {
+    /// Maps (validator_id, epoch) -> issuance record.
+    issued: HashMap<(u64, u64), IssuanceRecord>,
+}
+
+/// Error type for the issuance authority.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum IssuanceError {
+    #[error("validator {validator_id} has already been issued a credential for epoch {epoch}")]
+    AlreadyIssued { validator_id: u64, epoch: u64 },
+}
+
+impl IssuanceAuthority {
+    pub fn new() -> Self { Self::default() }
+
+    /// Issue a `CredentialSecret` for `(validator_id, epoch)`.
+    ///
+    /// Returns `Err(AlreadyIssued)` if this pair has already been issued,
+    /// enforcing A8: at most one K per person per epoch.
+    pub fn issue<R: rand::RngCore + rand::CryptoRng>(
+        &mut self,
+        validator_id: u64,
+        epoch:        EpochId,
+        rng:          &mut R,
+    ) -> Result<CredentialSecret, IssuanceError> {
+        let key = (validator_id, epoch.0);
+        if self.issued.contains_key(&key) {
+            return Err(IssuanceError::AlreadyIssued {
+                validator_id,
+                epoch: epoch.0,
+            });
+        }
+        let secret = CredentialSecret::generate(rng);
+        let record = IssuanceRecord::new(validator_id, epoch, &secret);
+        self.issued.insert(key, record);
+        Ok(secret)
+    }
+
+    /// Returns true if a credential has been issued for this (validator, epoch).
+    pub fn has_issued(&self, validator_id: u64, epoch: EpochId) -> bool {
+        self.issued.contains_key(&(validator_id, epoch.0))
+    }
+
+    /// Returns the issuance record for audit (does not expose the secret).
+    pub fn record(&self, validator_id: u64, epoch: EpochId) -> Option<&IssuanceRecord> {
+        self.issued.get(&(validator_id, epoch.0))
+    }
+
+    /// Number of credentials issued (for testing/audit).
+    pub fn issued_count(&self) -> usize { self.issued.len() }
+}
+
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// An epoch identifier. Epochs are monotonically increasing u64s.
@@ -57,8 +181,20 @@ impl std::fmt::Display for EpochId {
 pub struct Nullifier(pub [u8; 32]);
 
 impl Nullifier {
-    /// Derive a synthetic nullifier from a validator id + epoch (for tests).
-    /// Production systems must use a ZK-derived nullifier.
+    /// Canonical T2.1 Variant A construction: derive from a `CredentialSecret`.
+    ///
+    /// `N = BLAKE3-keyed-hash(K, domain_len || domain || epoch_be)`
+    ///
+    /// This is equivalent to `secret.derive_nullifier(epoch)` and provided here
+    /// for call sites that only have the secret and epoch in scope.
+    pub fn derive(secret: &CredentialSecret, epoch: EpochId) -> Self {
+        secret.derive_nullifier(epoch)
+    }
+
+    /// Synthetic nullifier for integration tests that do not use a real
+    /// `CredentialSecret`.  **Not cryptographically secure** -- uses DefaultHasher.
+    /// Must never be used outside of `#[cfg(test)]` contexts.
+    #[cfg(test)]
     pub fn from_validator_epoch(validator_id: u64, epoch: EpochId) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -489,6 +625,7 @@ impl PersonhoodBound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
     use chain_forge_core::ValidatorId;
     use chain_forge_vca_pq::{
         AdaptiveQuorumConfig, ContributionScore, IdentityHandle, PersonhoodFactor,
@@ -845,5 +982,163 @@ mod tests {
         // The bound's n_star tells us the identity constraint: with N*=1 and P=0.5,
         // the adversary needs real persons (not just identities).
         assert_eq!(bound.n_star, 1, "default config enforces one identity per person");
+    }
+
+    // ── T2 tests: BLAKE3 nullifier construction & issuance authority ──────────
+
+    /// T2.1 -- BLAKE3 nullifier is deterministic for fixed (K, epoch).
+    #[test]
+    fn t2_nullifier_deterministic_for_same_key_and_epoch() {
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([0u8; 32]);
+        let secret = CredentialSecret::generate(&mut rng);
+        let epoch  = EpochId(7);
+        let n1 = Nullifier::derive(&secret, epoch);
+        let n2 = Nullifier::derive(&secret, epoch);
+        assert_eq!(n1, n2, "same (K, epoch) must always produce the same nullifier");
+    }
+
+    /// T2.1 -- Different epochs produce different nullifiers (same K).
+    #[test]
+    fn t2_nullifier_distinct_across_epochs() {
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([1u8; 32]);
+        let secret = CredentialSecret::generate(&mut rng);
+        let n_e1 = Nullifier::derive(&secret, EpochId(1));
+        let n_e2 = Nullifier::derive(&secret, EpochId(2));
+        assert_ne!(n_e1, n_e2, "different epochs must yield different nullifiers");
+    }
+
+    /// T2.1 -- Different secrets produce different nullifiers (same epoch).
+    /// Validates A2: collision resistance across distinct credential holders.
+    #[test]
+    fn t2_nullifier_distinct_across_secrets() {
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([2u8; 32]);
+        let k1 = CredentialSecret::generate(&mut rng);
+        let k2 = CredentialSecret::generate(&mut rng);
+        let epoch = EpochId(5);
+        let n1 = Nullifier::derive(&k1, epoch);
+        let n2 = Nullifier::derive(&k2, epoch);
+        assert_ne!(n1, n2, "distinct secrets for same epoch must not collide");
+    }
+
+    /// T2.1 -- Nullifier output is full 32 bytes (not zero-padded).
+    #[test]
+    fn t2_nullifier_output_is_32_nonzero_bytes() {
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([3u8; 32]);
+        let secret = CredentialSecret::generate(&mut rng);
+        let n = Nullifier::derive(&secret, EpochId(0));
+        // With overwhelming probability a BLAKE3 output is not all-zero.
+        assert_ne!(n.0, [0u8; 32], "nullifier should not be all-zero");
+        assert_eq!(n.0.len(), 32, "nullifier must be exactly 32 bytes");
+    }
+
+    /// T2.2 -- Issuance authority issues exactly one secret per (validator, epoch).
+    /// Validates A8: one K per person per epoch.
+    #[test]
+    fn t2_issuance_authority_enforces_one_secret_per_epoch() {
+        let mut rng   = rand_chacha::ChaCha20Rng::from_seed([4u8; 32]);
+        let mut auth  = IssuanceAuthority::new();
+        let epoch     = EpochId(1);
+
+        // First issuance succeeds.
+        let result1 = auth.issue(42, epoch, &mut rng);
+        assert!(result1.is_ok(), "first issuance for (42, epoch=1) must succeed");
+
+        // Second issuance for the same (validator, epoch) is rejected.
+        let result2 = auth.issue(42, epoch, &mut rng);
+        assert_eq!(
+            result2.unwrap_err(),
+            IssuanceError::AlreadyIssued { validator_id: 42, epoch: 1 },
+            "A8 violation: second issuance for same (validator, epoch) must be rejected",
+        );
+    }
+
+    /// T2.2 -- Different validators in same epoch each get their own secret.
+    #[test]
+    fn t2_issuance_authority_allows_distinct_validators_same_epoch() {
+        let mut rng  = rand_chacha::ChaCha20Rng::from_seed([5u8; 32]);
+        let mut auth = IssuanceAuthority::new();
+        let epoch    = EpochId(3);
+
+        let s1 = auth.issue(1, epoch, &mut rng).expect("validator 1 issuance");
+        let s2 = auth.issue(2, epoch, &mut rng).expect("validator 2 issuance");
+
+        // Secrets are distinct (with overwhelming probability).
+        assert_ne!(s1.0, s2.0, "distinct validators must receive distinct secrets");
+        assert_eq!(auth.issued_count(), 2);
+    }
+
+    /// T2.2 -- Same validator can receive a fresh secret in a new epoch.
+    #[test]
+    fn t2_issuance_authority_allows_new_epoch_for_same_validator() {
+        let mut rng  = rand_chacha::ChaCha20Rng::from_seed([6u8; 32]);
+        let mut auth = IssuanceAuthority::new();
+
+        auth.issue(10, EpochId(1), &mut rng).expect("epoch 1");
+        // Must succeed for a different epoch.
+        let result = auth.issue(10, EpochId(2), &mut rng);
+        assert!(result.is_ok(), "same validator in a new epoch must be allowed");
+        assert_eq!(auth.issued_count(), 2);
+    }
+
+    /// T2.2 -- IssuanceRecord commitment does not expose the secret.
+    #[test]
+    fn t2_issuance_record_stores_commitment_not_secret() {
+        let mut rng  = rand_chacha::ChaCha20Rng::from_seed([7u8; 32]);
+        let mut auth = IssuanceAuthority::new();
+        let epoch    = EpochId(1);
+
+        let secret = auth.issue(99, epoch, &mut rng).expect("issued");
+        let record = auth.record(99, epoch).expect("record present");
+
+        // Commitment = BLAKE3(secret).  It must match but must not equal the
+        // secret bytes (probability 2^-256 of accidental equality).
+        let expected_commitment = *blake3::hash(&secret.0).as_bytes();
+        assert_eq!(record.commitment, expected_commitment, "commitment must be BLAKE3(K)");
+        assert_ne!(record.commitment, secret.0, "commitment must not equal raw secret");
+    }
+
+    /// T2 end-to-end: issue a secret, derive the nullifier, activate the credential.
+    /// Verifies the issuance -> nullifier -> activation pipeline is wired correctly.
+    #[test]
+    fn t2_issue_derive_activate_pipeline() {
+        let mut rng  = rand_chacha::ChaCha20Rng::from_seed([8u8; 32]);
+        let mut auth = IssuanceAuthority::new();
+        let mut reg  = EligibilityRegistry::new(EpochId(1), EligibilityConfig::default());
+
+        // Issue the credential secret.
+        let secret = auth.issue(1, EpochId(1), &mut rng).expect("issuance");
+
+        // Derive the nullifier from the secret.
+        let nullifier = Nullifier::derive(&secret, EpochId(1));
+
+        // Build and activate the epoch credential.
+        let cred = EpochCredential::new(1, EpochId(1), 1.0, nullifier, 100)
+            .expect("valid credential");
+        reg.activate(cred).expect("activation must succeed");
+
+        let bound = reg.close_epoch();
+        assert_eq!(bound.n_active_credentials, 1);
+        assert_eq!(bound.n_max_observed, 1);
+        assert!(bound.multiplicity_within_bound());
+    }
+
+    /// T2 -- SS-1: same secret, same epoch, same nonce => NullifierReplay on second call.
+    #[test]
+    fn t2_ss1_same_secret_same_epoch_replay_rejected() {
+        let mut rng  = rand_chacha::ChaCha20Rng::from_seed([9u8; 32]);
+        let mut auth = IssuanceAuthority::new();
+        let mut reg  = EligibilityRegistry::new(EpochId(1), EligibilityConfig::default());
+
+        let secret   = auth.issue(1, EpochId(1), &mut rng).expect("issuance");
+        let nullifier = Nullifier::derive(&secret, EpochId(1));
+
+        let cred1 = EpochCredential::new(1, EpochId(1), 1.0, nullifier.clone(), 100)
+            .expect("cred1");
+        let cred2 = EpochCredential::new(1, EpochId(1), 1.0, nullifier.clone(), 101)
+            .expect("cred2");
+
+        reg.activate(cred1).expect("first activation ok");
+        let err = reg.activate(cred2).unwrap_err();
+        assert_eq!(err, EligibilityError::NullifierReplay, "SS-1: replay must be rejected");
     }
 }
