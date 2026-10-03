@@ -1,785 +1,1016 @@
+//! # chain-forge-cirfi
+//!
+//! The QCB resource economy. Implements the CIRFI Economic Model v0.1.
+//!
+//! ## What $CIRFI is
+//!
+//! $CIRFI is a **resource consumption token**, not a UBI token.
+//! It is the unit of account for all network resource usage:
+//! compute, storage, ZK proving, bandwidth, oracle data, AI inference,
+//! and external verification.
+//!
+//! ## Two minting paths (fully independent)
+//!
+//! 1. **Purchase path**: QCB is permanently burned → CIRFI resource credits
+//!    are created at the algorithmic rate `Rt`. Rate adjusts with network load.
+//! 2. **Contribution path**: Verified resource providers earn CIRFI minted
+//!    directly when the VCA system confirms delivery. No QCB is involved.
+//!
+//! There is **no CIRFI → QCB conversion**. This is a constitutional constraint.
+//!
+//! ## Consumption split
+//!
+//! When CIRFI is consumed by an operation it splits:
+//!   ~60% → provider compensation
+//!   ~25% → permanent CIRFI burn (deflationary pressure)
+//!   ~15% → protocol reserve
+//!
+//! ## Demand loop
+//!
+//! Network usage grows → CIRFI demand rises → more QCB burned to obtain CIRFI
+//! → QCB supply contracts → QCB scarcity increases.
+//!
+//! ## Core supply equation
+//!
+//! M(t+1) = Mt + [Qt * Rt] + [sum Ei,t] - Bt - Pt
+//!
+//! Where Qt*Rt is the purchase-path mint, sum Ei,t is the contribution-path
+//! mint, Bt is the burn from consumption, and Pt is the protocol reserve take.
+//!
+//! ## What this module does NOT include
+//!
+//! - The old UBI/demurrage model (superseded by CIRFI Economic Model v0.1)
+//! - ZK proof of contribution verification (VCA layer, see chain-forge-personhood)
+//! - Cross-resource arbitrage constraints (deferred, Section 11)
+//! - Delegated budget mechanics (deferred, Section 11)
+//! - Bootstrap sequence (deferred, Section 11)
+
 pub mod capacity_report;
 pub use capacity_report::{
     AggregationMethod, CapacityEvidence, CapacityPhase, CapacityReport,
     CapacityReportState, ResourceCapacityRecord, ResourceType,
 };
 
-/// chain-forge-cirfi
-///
-/// The QCB monetary engine. Implements Whitepaper Sections 5.4 and 6.2:
-///
-///   - Tiered demurrage on idle $CIRFI balances
-///   - Decay-exemption credits from spending
-///   - UBI epoch distribution to verified humans
-///   - UBI pool: receives decayed tokens
-///   - Proactive UBI pool redirect (holder choice, triggers BME)
-///   - BME: merchant fees and redirects -> buy-and-burn $QCB
-///   - Two-token enforcement: only $CIRFI is the protocol currency
-///
-/// This crate reads from chain-forge-identity (verified count, claim gating)
-/// and writes to chain-forge-state (balance changes, burns).
-///
-/// Whitepaper refs: Sections 5.4, 6.1-6.6, Q25.
+use std::collections::BTreeMap;
+use thiserror::Error;
 
-use serde::{Deserialize, Serialize};
-use chain_forge_state::{AccountState, StateStore};
-use chain_forge_identity::IdentityStore;
+// ── Fixed-point denominator ───────────────────────────────────────────────────
 
-// -- Error --------------------------------------------------------------------
+/// Fixed-point denominator. All rates, fractions and weights are expressed
+/// as integers where the real value = integer / D.
+/// E.g. a 70% target is stored as 700_000.
+pub const D: u128 = 1_000_000;
 
-#[derive(Debug, thiserror::Error)]
+// ── Protocol constants ────────────────────────────────────────────────────────
+
+/// Target utilization per resource type (70%). When U-bar == U*, Rt == R0.
+pub const U_STAR: u128 = 700_000; // 0.70 × D
+
+/// EMA smoothing coefficient (10%). One block's spike decays over ~10 windows.
+pub const ALPHA: u128 = 100_000; // 0.10 × D
+
+/// Consumption split: provider share (60%).
+pub const PROVIDER_SHARE: u128 = 600_000;
+
+/// Consumption split: permanent burn share (25%).
+pub const BURN_SHARE: u128 = 250_000;
+
+/// Consumption split: protocol reserve share (15%).
+pub const RESERVE_SHARE: u128 = 150_000;
+
+// PROVIDER_SHARE + BURN_SHARE + RESERVE_SHARE must equal D. Verified by test.
+
+/// Hard floor on Rt: prevents CIRFI from becoming free during low demand.
+/// TBD via economic simulation; placeholder = 0.1 × R0.
+pub const R_MIN_FRACTION: u128 = 100_000; // 0.10 × D (10% of R0)
+
+/// Hard ceiling on Rt: prevents CIRFI from becoming unaffordable.
+/// TBD via economic simulation; placeholder = 10 × R0.
+pub const R_MAX_FRACTION: u128 = 10_000_000; // 10.0 × D (1000% of R0)
+
+/// Congestion sensitivity exponent γ (gamma). Higher = faster price response.
+/// TBD via simulation. Placeholder = 2.0 (quadratic response).
+pub const GAMMA_NUM: u128 = 2; // integer — used in integer exponentiation
+
+// ── ResourceKind ─────────────────────────────────────────────────────────────
+
+/// All network resource types that CIRFI prices.
+/// Extended resource types (oracle data, AI inference, external verification)
+/// are listed here for completeness but share the `Compute` billing tier
+/// until per-type weights are calibrated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ResourceKind {
+    Compute,
+    Storage,
+    ZkProving,
+    Bandwidth,
+    OracleData,
+    AiInference,
+    ExternalVerification,
+}
+
+impl ResourceKind {
+    pub fn all() -> &'static [ResourceKind] {
+        &[
+            ResourceKind::Compute,
+            ResourceKind::Storage,
+            ResourceKind::ZkProving,
+            ResourceKind::Bandwidth,
+            ResourceKind::OracleData,
+            ResourceKind::AiInference,
+            ResourceKind::ExternalVerification,
+        ]
+    }
+
+    /// Base CIRFI cost for one normalized unit of this resource (× D).
+    /// These are illustrative placeholders — must be calibrated by simulation.
+    pub fn base_cost_per_unit(self) -> u128 {
+        match self {
+            ResourceKind::Compute              =>   1_000, // 0.001 CIRFI/CU
+            ResourceKind::Storage              =>     100, // 0.0001 CIRFI/byte·epoch
+            ResourceKind::ZkProving            =>  10_000, // 0.01 CIRFI/proof-second
+            ResourceKind::Bandwidth            =>     500, // 0.0005 CIRFI/kB
+            ResourceKind::OracleData           =>   5_000, // 0.005 CIRFI/query
+            ResourceKind::AiInference          =>  50_000, // 0.05 CIRFI/inference
+            ResourceKind::ExternalVerification => 100_000, // 0.1 CIRFI/verification
+        }
+    }
+}
+
+// ── ResourceUtilization ───────────────────────────────────────────────────────
+
+/// Tracks demand and capacity for one resource type in one window,
+/// and carries the EMA-smoothed utilization across windows.
+#[derive(Debug, Clone)]
+pub struct ResourceUtilization {
+    /// Resource type.
+    pub kind: ResourceKind,
+    /// Raw utilization in this window: demand / capacity (fixed-point × D).
+    /// 0 if no capacity was reported.
+    pub u_raw: u128,
+    /// EMA-smoothed utilization (U-bar). Updated each window via ALPHA.
+    pub u_bar: u128,
+    /// Congestion ratio: U-bar / U* (fixed-point × D).
+    pub congestion: u128,
+    /// Demand units consumed this window.
+    pub demand_units: u128,
+    /// Capacity units available this window (from CapacityReport).
+    pub capacity_units: u128,
+}
+
+impl ResourceUtilization {
+    /// Create a new tracker seeded at the target utilization (no congestion).
+    pub fn new(kind: ResourceKind) -> Self {
+        Self {
+            kind,
+            u_raw:          U_STAR,
+            u_bar:          U_STAR,
+            congestion:     D,      // U* / U* = 1.0 × D
+            demand_units:   0,
+            capacity_units: 0,
+        }
+    }
+
+    /// Record demand and capacity for this window, then update the EMA.
+    pub fn record_window(&mut self, demand_units: u128, capacity_units: u128) {
+        self.demand_units   = demand_units;
+        self.capacity_units = capacity_units;
+
+        // U(r,t) = demand / capacity. Cap at 1.0 to avoid over-100% congestion
+        // signals gaming the formula. If no capacity, treat as 100% utilization.
+        self.u_raw = if capacity_units == 0 {
+            D // 100% — treat as fully congested
+        } else {
+            (demand_units.saturating_mul(D) / capacity_units).min(D)
+        };
+
+        // U-bar(r,t) = alpha * U(r,t) + (1 - alpha) * U-bar(r,t-1)
+        // All in fixed-point: multiply before dividing.
+        let alpha_contrib     = ALPHA.saturating_mul(self.u_raw) / D;
+        let prev_contrib      = (D - ALPHA).saturating_mul(self.u_bar) / D;
+        self.u_bar            = alpha_contrib + prev_contrib;
+
+        // C(r,t) = U-bar / U*
+        self.congestion = self.u_bar.saturating_mul(D) / U_STAR;
+    }
+
+    /// The congestion multiplier for CIRFI pricing.
+    /// congestion > 1.0 × D means above-target → operations cost more.
+    pub fn congestion_multiplier(&self) -> u128 {
+        self.congestion
+    }
+
+    /// CIRFI cost for `units` of this resource in the current window.
+    /// cost = base_cost_per_unit * congestion_multiplier * units / D
+    pub fn cost_for(&self, units: u128) -> u128 {
+        let base  = self.kind.base_cost_per_unit();
+        let adj   = base.saturating_mul(self.congestion_multiplier()) / D;
+        adj.saturating_mul(units)
+    }
+}
+
+// ── ConversionRate ────────────────────────────────────────────────────────────
+
+/// Algorithmic QCB → CIRFI conversion rate state.
+///
+/// Rt = R0 * (U* / U-bar_aggregate)^gamma
+/// Clamped to [Rmin, Rmax].
+///
+/// When utilization is below target, Rt > R0 (more CIRFI per QCB burned —
+/// cheaper to acquire capacity). When above target, Rt < R0 (CIRFI is scarce).
+#[derive(Debug, Clone)]
+pub struct ConversionRate {
+    /// Base rate R0: CIRFI units minted per QCB burned at target utilization.
+    /// Fixed-point × D. E.g. 1_000_000 = 1.0 CIRFI per QCB.
+    pub r0: u128,
+    /// Current rate Rt (fixed-point × D).
+    pub rt: u128,
+    /// Hard floor Rmin (fixed-point × D).
+    pub r_min: u128,
+    /// Hard ceiling Rmax (fixed-point × D).
+    pub r_max: u128,
+}
+
+impl ConversionRate {
+    pub fn new(r0: u128) -> Self {
+        let r_min = r0.saturating_mul(R_MIN_FRACTION) / D;
+        let r_max = r0.saturating_mul(R_MAX_FRACTION) / D;
+        Self { r0, rt: r0, r_min, r_max }
+    }
+
+    /// Recompute Rt from aggregate smoothed utilization.
+    ///
+    /// Formula: Rt = R0 * (U* / U-bar)^gamma, clamped to [Rmin, Rmax].
+    ///
+    /// `u_bar_aggregate` is the demand-weighted average U-bar across all
+    /// resource types (or a simple average for v0).
+    pub fn update(&mut self, u_bar_aggregate: u128) {
+        if u_bar_aggregate == 0 {
+            // No utilization data → use Rmax (generous, network is empty).
+            self.rt = self.r_max;
+            return;
+        }
+
+        // ratio = U* / U-bar (fixed-point).
+        // If U-bar < U* → ratio > 1 → Rt > R0 (more CIRFI per QCB).
+        // If U-bar > U* → ratio < 1 → Rt < R0 (less CIRFI per QCB).
+        let ratio = U_STAR.saturating_mul(D) / u_bar_aggregate;
+
+        // Rt = R0 * ratio^gamma.
+        // Integer exponentiation: ratio is fixed-point × D.
+        // ratio^2 = ratio * ratio / D (keeping fixed-point).
+        let ratio_pow = integer_pow_fp(ratio, GAMMA_NUM);
+        let rt_raw    = self.r0.saturating_mul(ratio_pow) / D;
+
+        self.rt = rt_raw.clamp(self.r_min, self.r_max);
+    }
+
+    /// CIRFI minted for `qcb_burned` QCB at the current rate.
+    /// cirfi_minted = qcb_burned * Rt / D
+    pub fn cirfi_for_qcb(&self, qcb_burned: u128) -> u128 {
+        qcb_burned.saturating_mul(self.rt) / D
+    }
+}
+
+/// Fixed-point integer exponentiation: base^exp where base is fixed-point (× D).
+/// Returns base^exp as fixed-point (× D).
+/// Uses repeated multiplication, keeping fixed-point scale.
+fn integer_pow_fp(base: u128, exp: u128) -> u128 {
+    if exp == 0 { return D; }
+    let mut result = D; // 1.0 in fixed-point
+    let mut b = base;
+    let mut e = exp;
+    // Binary exponentiation
+    while e > 0 {
+        if e & 1 == 1 {
+            result = result.saturating_mul(b) / D;
+        }
+        b = b.saturating_mul(b) / D;
+        e >>= 1;
+    }
+    result
+}
+
+// ── ConsumptionSplit ──────────────────────────────────────────────────────────
+
+/// Result of splitting a CIRFI consumption event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumptionSplit {
+    /// CIRFI routed to providers who served this operation.
+    pub to_providers: u128,
+    /// CIRFI permanently burned.
+    pub burned: u128,
+    /// CIRFI added to protocol reserve.
+    pub to_reserve: u128,
+}
+
+impl ConsumptionSplit {
+    /// Total consumed (sum of all three destinations).
+    pub fn total(&self) -> u128 {
+        self.to_providers + self.burned + self.to_reserve
+    }
+}
+
+/// Split `amount` of CIRFI according to the 60/25/15 consumption split.
+/// Rounding remainder goes to providers (minimizes burn/reserve drift).
+pub fn split_consumption(amount: u128) -> ConsumptionSplit {
+    let to_providers = amount.saturating_mul(PROVIDER_SHARE) / D;
+    let burned       = amount.saturating_mul(BURN_SHARE) / D;
+    let to_reserve   = amount.saturating_mul(RESERVE_SHARE) / D;
+    // Remainder (from rounding) goes to providers
+    let assigned     = to_providers + burned + to_reserve;
+    let remainder    = amount.saturating_sub(assigned);
+    ConsumptionSplit {
+        to_providers: to_providers + remainder,
+        burned,
+        to_reserve,
+    }
+}
+
+// ── ProviderEarning ───────────────────────────────────────────────────────────
+
+/// Contribution-path earning formula for one provider in one window.
+///
+/// E(i,t) = sum_r [ w(r) * C(i,r,t) * BaseCost(r) * CongestionMultiplier(r,t) ]
+///
+/// `contributions` maps resource kind → verified contribution units (from VCA).
+/// `utilization` carries the current congestion state per resource.
+///
+/// Returns CIRFI minted for this provider (fixed-point units).
+pub fn provider_earning(
+    contributions: &BTreeMap<ResourceKind, u128>,
+    utilization:   &BTreeMap<ResourceKind, ResourceUtilization>,
+    resource_weight: &BTreeMap<ResourceKind, u128>,
+) -> u128 {
+    contributions.iter().map(|(kind, &units)| {
+        if units == 0 { return 0u128; }
+
+        let base_cost = kind.base_cost_per_unit();
+
+        // CongestionMultiplier from current utilization state.
+        let congestion = utilization
+            .get(kind)
+            .map(|u| u.congestion_multiplier())
+            .unwrap_or(D); // 1.0 if no state tracked yet
+
+        // Resource weight (protocol-set, defaults to D if unset).
+        let weight = resource_weight
+            .get(kind)
+            .copied()
+            .unwrap_or(D);
+
+        // E(i,r,t) = weight * contribution * base_cost * congestion / D^2
+        // (two D divisions: weight/D and congestion/D)
+        let per_unit = base_cost.saturating_mul(congestion) / D;
+        let weighted  = weight.saturating_mul(per_unit) / D;
+        weighted.saturating_mul(units)
+    }).sum()
+}
+
+// ── OperationCost ─────────────────────────────────────────────────────────────
+
+/// A single operation's resource breakdown.
+#[derive(Debug, Clone)]
+pub struct OperationCost {
+    /// Resource requirements: kind → units consumed.
+    pub resources: BTreeMap<ResourceKind, u128>,
+}
+
+impl OperationCost {
+    pub fn new() -> Self {
+        Self { resources: BTreeMap::new() }
+    }
+
+    pub fn add(mut self, kind: ResourceKind, units: u128) -> Self {
+        *self.resources.entry(kind).or_insert(0) += units;
+        self
+    }
+}
+
+impl Default for OperationCost {
+    fn default() -> Self { Self::new() }
+}
+
+// ── CirfiEngine ───────────────────────────────────────────────────────────────
+
+/// The full CIRFI resource economy engine.
+///
+/// Tracks per-resource utilization, the conversion rate, cumulative supply
+/// metrics, and applies the economic formulas from CIRFI Economic Model v0.1.
+#[derive(Debug, Clone)]
+pub struct CirfiEngine {
+    // -- Per-resource utilization state --
+    pub utilization: BTreeMap<ResourceKind, ResourceUtilization>,
+
+    // -- Resource weights (per-resource earning weights w(r), fixed-point × D) --
+    pub resource_weights: BTreeMap<ResourceKind, u128>,
+
+    // -- Conversion rate state --
+    pub conversion_rate: ConversionRate,
+
+    // -- Supply metrics --
+    /// Total CIRFI in circulation (Mt).
+    pub total_supply: u128,
+    /// CIRFI minted via purchase path (sum of Qt*Rt over all windows).
+    pub total_purchase_minted: u128,
+    /// CIRFI minted via contribution path (sum of Ei,t over all windows).
+    pub total_contribution_minted: u128,
+    /// CIRFI permanently burned from consumption splits.
+    pub total_burned: u128,
+    /// CIRFI in protocol reserve.
+    pub protocol_reserve: u128,
+    /// QCB burned across all purchase conversions.
+    pub total_qcb_burned: u128,
+
+    // -- Window tracking --
+    pub current_window: u64,
+}
+
+impl CirfiEngine {
+    /// Create a new engine with the given base conversion rate R0.
+    /// `r0` is fixed-point × D: how many CIRFI units are minted per QCB
+    /// burned at target utilization.
+    pub fn new(r0: u128) -> Self {
+        let mut utilization = BTreeMap::new();
+        let mut resource_weights = BTreeMap::new();
+
+        for &kind in ResourceKind::all() {
+            utilization.insert(kind, ResourceUtilization::new(kind));
+            // Default weight = 1.0 (D) for all resources until calibrated.
+            resource_weights.insert(kind, D);
+        }
+
+        Self {
+            utilization,
+            resource_weights,
+            conversion_rate: ConversionRate::new(r0),
+            total_supply:               0,
+            total_purchase_minted:      0,
+            total_contribution_minted:  0,
+            total_burned:               0,
+            protocol_reserve:           0,
+            total_qcb_burned:           0,
+            current_window:             0,
+        }
+    }
+
+    // ── Purchase path ─────────────────────────────────────────────────────────
+
+    /// Burn `qcb_amount` QCB and mint CIRFI at the current rate Rt.
+    ///
+    /// Returns `(cirfi_minted, rt_used)`.
+    ///
+    /// Security: the no-CIRFI-to-QCB constraint is enforced at the protocol
+    /// level; this function only handles the QCB → CIRFI direction.
+    pub fn purchase_cirfi(&mut self, qcb_amount: u128) -> (u128, u128) {
+        let cirfi_minted = self.conversion_rate.cirfi_for_qcb(qcb_amount);
+        let rt_used      = self.conversion_rate.rt;
+
+        self.total_qcb_burned          += qcb_amount;
+        self.total_supply              += cirfi_minted;
+        self.total_purchase_minted     += cirfi_minted;
+
+        tracing::info!(
+            qcb_burned   = qcb_amount,
+            cirfi_minted,
+            rt           = rt_used,
+            window       = self.current_window,
+            "CIRFI purchase: QCB burned → CIRFI minted"
+        );
+
+        (cirfi_minted, rt_used)
+    }
+
+    // ── Contribution path ─────────────────────────────────────────────────────
+
+    /// Credit contribution-earned CIRFI to a verified provider.
+    ///
+    /// `contributions` maps resource kind → verified units (from VCA/CapacityReport).
+    /// Returns CIRFI minted for this provider.
+    pub fn credit_provider_earning(
+        &mut self,
+        provider_id: &[u8; 32],
+        contributions: &BTreeMap<ResourceKind, u128>,
+    ) -> u128 {
+        let earned = provider_earning(
+            contributions,
+            &self.utilization,
+            &self.resource_weights,
+        );
+
+        if earned > 0 {
+            self.total_supply                 += earned;
+            self.total_contribution_minted    += earned;
+
+            tracing::debug!(
+                provider  = hex::encode(provider_id),
+                earned,
+                window    = self.current_window,
+                "CIRFI contribution mint"
+            );
+        }
+
+        earned
+    }
+
+    // ── Consumption ───────────────────────────────────────────────────────────
+
+    /// Consume CIRFI for an operation and apply the 60/25/15 split.
+    ///
+    /// `amount` is the total CIRFI cost of the operation.
+    /// Returns the `ConsumptionSplit` (providers/burn/reserve amounts).
+    ///
+    /// Caller is responsible for:
+    /// 1. Verifying the consumer's CIRFI balance >= amount.
+    /// 2. Debiting the consumer's balance.
+    /// 3. Distributing `split.to_providers` to the serving providers.
+    pub fn consume(&mut self, amount: u128) -> ConsumptionSplit {
+        let split = split_consumption(amount);
+
+        // Apply burn and reserve to engine state.
+        // Provider share is distributed by caller (they know which providers served).
+        self.total_supply    = self.total_supply.saturating_sub(split.burned);
+        self.total_burned    += split.burned;
+        self.protocol_reserve += split.to_reserve;
+
+        tracing::debug!(
+            consumed     = amount,
+            to_providers = split.to_providers,
+            burned       = split.burned,
+            to_reserve   = split.to_reserve,
+            window       = self.current_window,
+            "CIRFI consumed"
+        );
+
+        split
+    }
+
+    /// Compute the CIRFI cost for an operation given its resource breakdown.
+    ///
+    /// `cost = sum_r [ base_cost(r) * congestion_multiplier(r) * units(r) ]`
+    pub fn operation_cost(&self, op: &OperationCost) -> u128 {
+        op.resources.iter().map(|(kind, &units)| {
+            self.utilization
+                .get(kind)
+                .map(|u| u.cost_for(units))
+                .unwrap_or_else(|| {
+                    // No utilization state: use base cost at no congestion.
+                    kind.base_cost_per_unit().saturating_mul(units)
+                })
+        }).sum()
+    }
+
+    // ── Window boundary ───────────────────────────────────────────────────────
+
+    /// Advance to the next window, updating utilization EMA and conversion rate.
+    ///
+    /// `demand_by_resource` — actual demand units consumed per resource this window.
+    /// `capacity_by_resource` — available capacity per resource (from CapacityReport).
+    ///
+    /// Call this at each epoch/window boundary before processing the next window's
+    /// transactions.
+    pub fn advance_window(
+        &mut self,
+        demand_by_resource:   &BTreeMap<ResourceKind, u128>,
+        capacity_by_resource: &BTreeMap<ResourceKind, u128>,
+    ) {
+        self.current_window += 1;
+
+        // Update per-resource utilization.
+        for (&kind, u) in self.utilization.iter_mut() {
+            let demand   = demand_by_resource.get(&kind).copied().unwrap_or(0);
+            let capacity = capacity_by_resource.get(&kind).copied().unwrap_or(0);
+            u.record_window(demand, capacity);
+        }
+
+        // Aggregate U-bar: simple average across all resource types.
+        // TODO: weight by resource importance for a better aggregate signal.
+        let u_bars: Vec<u128> = self.utilization.values().map(|u| u.u_bar).collect();
+        let u_bar_agg = if u_bars.is_empty() {
+            U_STAR
+        } else {
+            u_bars.iter().sum::<u128>() / u_bars.len() as u128
+        };
+
+        // Update conversion rate.
+        self.conversion_rate.update(u_bar_agg);
+
+        tracing::info!(
+            window       = self.current_window,
+            u_bar_agg,
+            rt           = self.conversion_rate.rt,
+            total_supply = self.total_supply,
+            total_burned = self.total_burned,
+            "CIRFI window advanced"
+        );
+    }
+
+    // ── Accessors ─────────────────────────────────────────────────────────────
+
+    /// Current conversion rate Rt (fixed-point × D).
+    pub fn rt(&self) -> u128 { self.conversion_rate.rt }
+
+    /// Current congestion multiplier for a resource type.
+    pub fn congestion_of(&self, kind: ResourceKind) -> u128 {
+        self.utilization.get(&kind).map(|u| u.congestion).unwrap_or(D)
+    }
+
+    /// Window summary for logging / explorer.
+    pub fn window_summary(&self) -> WindowSummary {
+        WindowSummary {
+            window:                    self.current_window,
+            rt:                        self.conversion_rate.rt,
+            total_supply:              self.total_supply,
+            total_purchase_minted:     self.total_purchase_minted,
+            total_contribution_minted: self.total_contribution_minted,
+            total_burned:              self.total_burned,
+            protocol_reserve:          self.protocol_reserve,
+            total_qcb_burned:          self.total_qcb_burned,
+            congestion_by_resource: self.utilization.iter()
+                .map(|(&k, u)| (k, u.congestion))
+                .collect(),
+        }
+    }
+}
+
+// ── WindowSummary ─────────────────────────────────────────────────────────────
+
+/// Snapshot of engine state at a window boundary.
+#[derive(Debug, Clone)]
+pub struct WindowSummary {
+    pub window:                    u64,
+    pub rt:                        u128,
+    pub total_supply:              u128,
+    pub total_purchase_minted:     u128,
+    pub total_contribution_minted: u128,
+    pub total_burned:              u128,
+    pub protocol_reserve:          u128,
+    pub total_qcb_burned:          u128,
+    pub congestion_by_resource:    BTreeMap<ResourceKind, u128>,
+}
+
+// ── Error types ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
 pub enum CirfiError {
-    #[error("account {0} not found")]
-    AccountNotFound(String),
+    #[error("insufficient CIRFI balance: have {have}, need {need}")]
+    InsufficientBalance { have: u128, need: u128 },
 
-    #[error("identity {0} not verified for UBI")]
-    NotVerified(String),
+    #[error("no CIRFI-to-QCB conversion path exists (constitutional constraint)")]
+    NoReverseConversion,
 
-    #[error("UBI already claimed by {0} this epoch")]
-    AlreadyClaimed(String),
+    #[error("resource kind {0:?} not tracked")]
+    UnknownResource(ResourceKind),
 
-    #[error("insufficient balance for redirect: have {have} ucirfi, need {need}")]
-    InsufficientForRedirect { have: u128, need: u128 },
-
-    #[error("BME error: {0}")]
-    BmeError(String),
-
-    #[error("internal CirFi error: {0}")]
+    #[error("internal error: {0}")]
     Internal(String),
 }
 
 pub type CirfiResult<T> = Result<T, CirfiError>;
 
-// -- Demurrage tiers ----------------------------------------------------------
+// ── External dependency shim ──────────────────────────────────────────────────
 
-/// Tiered demurrage schedule from Whitepaper Section 6.2.
-/// Balance is measured in days of UBI equivalent at the current daily rate.
-/// Decay rate is monthly percentage applied to the balance above each tier floor.
-///
-/// Balance Range         | Monthly Decay
-/// 0 - 30 days UBI      | 0%       (base exemption)
-/// 30 - 90 days UBI     | 0.5%
-/// 90 - 365 days UBI    | 1.0%
-/// 365+ days UBI        | 1.5%
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DemurrageTier {
-    /// Lower bound in ucirfi (balance at or above this floor is in this tier).
-    pub floor_ucirfi: u128,
-    /// Upper bound in ucirfi. u128::MAX for the top tier.
-    pub ceiling_ucirfi: u128,
-    /// Monthly decay rate as basis points (100 bp = 1%).
-    /// 0 = no decay, 50 = 0.5%, 100 = 1.0%, 150 = 1.5%.
-    pub monthly_bp: u32,
-}
-
-impl DemurrageTier {
-    /// Calculate the decay for a balance sitting in this tier for one epoch
-    /// (one day). Monthly rate is divided by 30 for daily application.
-    /// Returns the amount to decay (in ucirfi), rounded down.
-    pub fn daily_decay(&self, balance_in_tier: u128) -> u128 {
-        if self.monthly_bp == 0 || balance_in_tier == 0 {
-            return 0;
-        }
-        // daily_rate = monthly_bp / (30 * 10_000)
-        // decay = balance * monthly_bp / (30 * 10_000)
-        balance_in_tier * self.monthly_bp as u128 / (30 * 10_000)
+/// Minimal hex encoding for provider ID logging (no extra dep).
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
 
-/// Build the canonical demurrage tiers from the whitepaper.
-/// daily_ubi_rate_ucirfi is used to convert "days of UBI" to ucirfi amounts.
-pub fn demurrage_tiers(daily_ubi_rate_ucirfi: u128) -> Vec<DemurrageTier> {
-    vec![
-        DemurrageTier {
-            floor_ucirfi:   0,
-            ceiling_ucirfi: daily_ubi_rate_ucirfi * 30,   // 30 days UBI
-            monthly_bp:     0,                              // 0% - base exemption
-        },
-        DemurrageTier {
-            floor_ucirfi:   daily_ubi_rate_ucirfi * 30,
-            ceiling_ucirfi: daily_ubi_rate_ucirfi * 90,   // 90 days UBI
-            monthly_bp:     50,                             // 0.5%
-        },
-        DemurrageTier {
-            floor_ucirfi:   daily_ubi_rate_ucirfi * 90,
-            ceiling_ucirfi: daily_ubi_rate_ucirfi * 365,  // 365 days UBI
-            monthly_bp:     100,                            // 1.0%
-        },
-        DemurrageTier {
-            floor_ucirfi:   daily_ubi_rate_ucirfi * 365,
-            ceiling_ucirfi: u128::MAX,
-            monthly_bp:     150,                            // 1.5%
-        },
-    ]
-}
-
-/// Calculate total daily demurrage for a given balance across all tiers.
-/// Returns (total_decay_ucirfi, per_tier_breakdown).
-pub fn calculate_demurrage(
-    balance: u128,
-    tiers: &[DemurrageTier],
-    exemption_days: u32,
-) -> (u128, Vec<u128>) {
-    // Apply exemption: reduce effective balance by exemption_days * daily_rate
-    // The first tier (0-30 days) is always exempt anyway, so exemption
-    // credits reduce how much sits in the higher tiers.
-    // For simplicity in Phase 0: exemption_days reduce balance by that
-    // many days of UBI before calculating decay.
-    let daily_rate = tiers.first().map(|t| t.ceiling_ucirfi / 30).unwrap_or(0);
-    let exemption_reduction = (exemption_days as u128) * daily_rate;
-    let effective_balance = balance.saturating_sub(exemption_reduction);
-
-    let mut total_decay = 0u128;
-    let mut breakdown = Vec::new();
-    let mut remaining = effective_balance;
-
-    for tier in tiers {
-        if remaining == 0 { breakdown.push(0); continue; }
-
-        let tier_size = tier.ceiling_ucirfi.saturating_sub(tier.floor_ucirfi);
-        let balance_in_tier = remaining.min(tier_size);
-        let decay = tier.daily_decay(balance_in_tier);
-
-        total_decay += decay;
-        breakdown.push(decay);
-        remaining = remaining.saturating_sub(balance_in_tier);
-    }
-
-    (total_decay, breakdown)
-}
-
-// -- UBI pool -----------------------------------------------------------------
-
-/// The UBI pool receives decayed tokens and distributes them as UBI.
-/// Whitepaper 6.2: "decayed tokens flow into the UBI distribution pool
-/// -- not burned, not sent to the team."
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UbiPool {
-    /// Current balance of the pool in ucirfi.
-    pub balance_ucirfi: u128,
-    /// Total received from demurrage across all epochs.
-    pub total_received_from_decay: u128,
-    /// Total distributed as UBI across all epochs.
-    pub total_distributed: u128,
-}
-
-impl UbiPool {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Receive decayed tokens from a balance.
-    pub fn receive_decay(&mut self, amount: u128) {
-        self.balance_ucirfi += amount;
-        self.total_received_from_decay += amount;
-    }
-
-    /// Receive a proactive redirect from a holder.
-    pub fn receive_redirect(&mut self, amount: u128) {
-        self.balance_ucirfi += amount;
-        // Note: redirects are not counted in total_received_from_decay --
-        // they are a separate flow (voluntary vs. passive).
-    }
-
-    /// Distribute UBI to a verified human. Returns amount distributed.
-    pub fn distribute(&mut self, amount: u128) -> u128 {
-        let actual = self.balance_ucirfi.min(amount);
-        self.balance_ucirfi -= actual;
-        self.total_distributed += actual;
-        actual
-    }
-}
-
-// -- BME engine ---------------------------------------------------------------
-
-/// Burn-and-Mint Equilibrium engine (Whitepaper Section 6.3).
-/// Merchant fees and proactive redirects fund $QCB buy-and-burn.
-///
-/// Phase 0: burn tracking only (actual market buy is off-chain).
-/// Phase 1+: integrate with settlement layer to buy $QCB on-market.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BmeEngine {
-    /// Total ucirfi collected as BME fees (merchant + redirect).
-    pub total_fees_collected_ucirfi: u128,
-    /// Total uqcb burned across all epochs.
-    pub total_qcb_burned_uqcb: u128,
-    /// BME fee rate in basis points (50 = 0.5% per Section 8.1).
-    pub fee_bp: u32,
-    /// Whether BME is currently "live" vs "speculative" per Section 6.3.
-    /// Live = burns >= 1% of $QCB daily trading volume for 90 consecutive days.
-    pub is_live: bool,
-    /// Consecutive days meeting the "live" threshold.
-    pub consecutive_live_days: u32,
-}
-
-impl BmeEngine {
-    pub fn new(fee_bp: u32) -> Self {
-        Self { fee_bp, ..Default::default() }
-    }
-
-    /// Calculate BME fee on a transfer amount.
-    pub fn fee_on(&self, amount: u128) -> u128 {
-        amount * self.fee_bp as u128 / 10_000
-    }
-
-    /// Record a BME event (merchant settlement or proactive redirect).
-    /// Returns the fee amount collected in ucirfi.
-    pub fn collect_fee(&mut self, amount: u128, source: BmeSource) -> u128 {
-        let fee = self.fee_on(amount);
-        self.total_fees_collected_ucirfi += fee;
-        tracing::debug!(
-            fee_ucirfi = fee,
-            source = ?source,
-            "BME fee collected"
-        );
-        fee
-    }
-
-    /// Record $QCB burned (called after off-chain buy-and-burn).
-    pub fn record_burn(&mut self, uqcb_burned: u128) {
-        self.total_qcb_burned_uqcb += uqcb_burned;
-        tracing::info!(
-            burned = uqcb_burned,
-            total = self.total_qcb_burned_uqcb,
-            "QCB burned via BME"
-        );
-    }
-}
-
-/// Source of a BME event -- merchant settlement or proactive redirect.
-/// Affects classification toward "live" threshold (Q25).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BmeSource {
-    MerchantSettlement,
-    ProactiveRedirect,
-}
-
-// -- CirFi engine -------------------------------------------------------------
-
-/// The full CirFi monetary engine.
-/// Holds demurrage tiers, UBI pool, and BME engine.
-/// Called once per epoch by the node to process all accounts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CirfiEngine {
-    pub tiers:      Vec<DemurrageTier>,
-    pub ubi_pool:   UbiPool,
-    pub bme:        BmeEngine,
-    /// Base denom for $CIRFI (e.g. "ucirfi").
-    pub cirfi_denom: String,
-    /// Base denom for $QCB (e.g. "uqcb").
-    pub qcb_denom:  String,
-    /// Daily UBI rate per verified human in ucirfi.
-    pub daily_ubi_rate: u128,
-}
-
-impl CirfiEngine {
-    pub fn new(cirfi_denom: String, qcb_denom: String) -> Self {
-        let daily_ubi_rate = chain_forge_identity::DAILY_UBI_RATE_UCIRFI;
-        Self {
-            tiers:      demurrage_tiers(daily_ubi_rate),
-            ubi_pool:   UbiPool::new(),
-            bme:        BmeEngine::new(50), // 0.5% BME fee
-            cirfi_denom,
-            qcb_denom,
-            daily_ubi_rate,
-        }
-    }
-
-    /// Apply demurrage to one account for one epoch.
-    /// Decayed tokens flow to the UBI pool.
-    /// Returns the amount decayed.
-    pub fn apply_demurrage(
-        &mut self,
-        account: &mut AccountState,
-        exemption_days: u32,
-    ) -> u128 {
-        let balance = account.balance_of(&self.cirfi_denom);
-        if balance == 0 { return 0; }
-
-        let (decay, _) = calculate_demurrage(balance, &self.tiers, exemption_days);
-        if decay == 0 { return 0; }
-
-        // Debit from account (best-effort -- if balance changed since check, cap)
-        let actual_decay = decay.min(balance);
-        *account.balances
-            .entry(self.cirfi_denom.clone())
-            .or_insert(0) -= actual_decay;
-
-        // Credit UBI pool
-        self.ubi_pool.receive_decay(actual_decay);
-
-        tracing::debug!(
-            address = %account.address,
-            decay = actual_decay,
-            balance_after = account.balance_of(&self.cirfi_denom),
-            "demurrage applied"
-        );
-        actual_decay
-    }
-
-    /// Distribute UBI to one verified human account.
-    /// Source: identity store enforces one claim per epoch.
-    /// Returns the amount distributed (may be less if UBI pool is low).
-    pub fn distribute_ubi(
-        &mut self,
-        identity_id: &str,
-        account: &mut AccountState,
-        identity_store: &mut IdentityStore,
-    ) -> CirfiResult<u128> {
-        // Delegate claim gating to identity store.
-        // Checks in order: tier (must be Verified+), liveness, one-claim-per-epoch,
-        // and the earned-yield gate (must have on-chain activity this epoch).
-        let ubi_amount = identity_store.claim_ubi(identity_id)
-            .map_err(|e| CirfiError::NotVerified(format!("{identity_id}: {e}")))?;
-
-        // Draw from UBI pool (or mint fresh if pool is insufficient)
-        // Phase 0: mint fresh tokens; pool is topped up by demurrage over time.
-        let distributed = if self.ubi_pool.balance_ucirfi >= ubi_amount {
-            self.ubi_pool.distribute(ubi_amount)
-        } else {
-            // Pool insufficient -- mint the difference (population-linked issuance)
-            let from_pool = self.ubi_pool.distribute(self.ubi_pool.balance_ucirfi);
-            let minted = ubi_amount - from_pool;
-            tracing::debug!(minted, "UBI minted (pool insufficient)");
-            from_pool + minted
-        };
-
-        account.credit(&self.cirfi_denom, distributed);
-
-        // Record participation for liveness tracking (Q24)
-        account.increment_nonce();
-
-        tracing::debug!(
-            identity = identity_id,
-            amount   = distributed,
-            "UBI distributed"
-        );
-        Ok(distributed)
-    }
-
-    /// Process a $CIRFI transfer with BME fee collection.
-    /// Fee flows to BME (buy-and-burn $QCB).
-    /// Returns the net amount received by the recipient.
-    pub fn process_transfer(
-        &mut self,
-        sender:    &mut AccountState,
-        recipient: &mut AccountState,
-        amount:    u128,
-        source:    BmeSource,
-    ) -> CirfiResult<u128> {
-        let balance = sender.balance_of(&self.cirfi_denom);
-        if balance < amount {
-            return Err(CirfiError::InsufficientForRedirect {
-                have: balance,
-                need: amount,
-            });
-        }
-
-        // Collect BME fee from transfer amount
-        let fee = self.bme.collect_fee(amount, source);
-        let net_amount = amount - fee;
-
-        // Debit sender (full amount including fee)
-        *sender.balances
-            .entry(self.cirfi_denom.clone())
-            .or_insert(0) -= amount;
-        sender.increment_nonce();
-
-        // Credit recipient (net amount after fee)
-        recipient.credit(&self.cirfi_denom, net_amount);
-
-        // Earn decay exemption credit for the spend
-        // (handled by IntrinsicCharm in identity layer -- here we just note it)
-        tracing::debug!(
-            from    = %sender.address,
-            to      = %recipient.address,
-            amount,
-            fee,
-            net     = net_amount,
-            "CIRFI transfer with BME fee"
-        );
-
-        Ok(net_amount)
-    }
-
-    /// Proactive UBI pool redirect (Whitepaper Section 6.3 / Q25).
-    /// Holder voluntarily sends balance to UBI pool, triggering BME fee.
-    /// Better than passive decay: holder earns no negative, BME gets funded.
-    pub fn redirect_to_ubi_pool(
-        &mut self,
-        account: &mut AccountState,
-        amount:  u128,
-    ) -> CirfiResult<u128> {
-        let balance = account.balance_of(&self.cirfi_denom);
-        if balance < amount {
-            return Err(CirfiError::InsufficientForRedirect {
-                have: balance,
-                need: amount,
-            });
-        }
-
-        // Collect BME fee
-        let fee = self.bme.collect_fee(amount, BmeSource::ProactiveRedirect);
-        let net_to_pool = amount - fee;
-
-        // Debit account
-        *account.balances
-            .entry(self.cirfi_denom.clone())
-            .or_insert(0) -= amount;
-        account.increment_nonce();
-
-        // Credit UBI pool (net amount)
-        self.ubi_pool.receive_redirect(net_to_pool);
-
-        tracing::info!(
-            address     = %account.address,
-            amount,
-            fee,
-            to_pool     = net_to_pool,
-            "proactive UBI pool redirect"
-        );
-
-        Ok(net_to_pool)
-    }
-
-    /// Run a full epoch: apply demurrage to all accounts, then distribute
-    /// UBI to all verified humans who claim.
-    /// Returns an epoch summary.
-    pub fn process_epoch(
-        &mut self,
-        state:    &mut StateStore,
-        identity: &mut IdentityStore,
-    ) -> EpochSummary {
-        let epoch = identity.clock.current_epoch;
-        let mut summary = EpochSummary {
-            epoch,
-            accounts_charged:    0,
-            total_decayed:       0,
-            total_ubi_distributed: 0,
-            ubi_recipients:      0,
-        };
-
-        // Step 1: collect addresses and exemption days first (avoid borrow issues)
-        let account_data: Vec<(String, u32)> = state
-            .all_accounts()
-            .map(|a| {
-                let exemption_days = identity
-                    .get_by_address_opt(&a.address)
-                    .map(|r| r.charm.decay_exemption.days)
-                    .unwrap_or(0);
-                (a.address.clone(), exemption_days)
-            })
-            .collect();
-
-        // Step 2: apply demurrage to each account
-        for (address, exemption_days) in &account_data {
-            if let Ok(account) = state.get_account_mut(address) {
-                let decayed = self.apply_demurrage(account, *exemption_days);
-                if decayed > 0 {
-                    summary.accounts_charged += 1;
-                    summary.total_decayed += decayed;
-                }
-            }
-        }
-
-        // Step 3: CirFi yield is NOT auto-distributed.
-        //
-        // Yield claims are explicit tx submissions from each identity.
-        // The execution layer calls distribute_ubi() when it processes a
-        // ClaimYield transaction, after verifying that record_activity()
-        // has been called for this identity in the current epoch.
-        //
-        // This ensures CirFi is earned (participation-gated), not a
-        // passive UBI drip. Any identity that did not submit at least one
-        // on-chain action this epoch is simply ineligible — no exception
-        // in devnet mode either, so tests catch regressions early.
-
-        tracing::info!(
-            epoch                 = summary.epoch,
-            accounts_charged      = summary.accounts_charged,
-            total_decayed         = summary.total_decayed,
-            ubi_recipients        = summary.ubi_recipients,
-            total_ubi_distributed = summary.total_ubi_distributed,
-            "CirFi epoch processed"
-        );
-
-        summary
-    }
-}
-
-/// Summary of one CirFi epoch.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EpochSummary {
-    pub epoch:                 u64,
-    pub accounts_charged:      usize,
-    pub total_decayed:         u128,
-    pub total_ubi_distributed: u128,
-    pub ubi_recipients:        usize,
-}
-
-// -- Tests --------------------------------------------------------------------
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chain_forge_identity::{IdentityStore, PopAttestation, DAILY_UBI_RATE_UCIRFI};
-    use chain_forge_state::{AccountState, StateStore};
-    use chain_forge_core::HashWidth;
 
-    const CIRFI: &str = "ucirfi";
-    const QCB:   &str = "uqcb";
-
-    fn make_engine() -> CirfiEngine {
-        CirfiEngine::new(CIRFI.into(), QCB.into())
+    fn engine() -> CirfiEngine {
+        // R0 = 1.0 × D: 1 CIRFI minted per QCB burned at target utilization.
+        CirfiEngine::new(D)
     }
 
-    fn make_account(address: &str, cirfi_balance: u128) -> AccountState {
-        let mut a = AccountState::new(address.to_string(), "user".to_string());
-        a.credit(CIRFI, cirfi_balance);
-        a
-    }
-
-    fn make_identity_store() -> IdentityStore {
-        IdentityStore::new(0)
-    }
-
-    fn register_and_verify(store: &mut IdentityStore, id: &str, address: &str) {
-        let att = PopAttestation::genesis(id, 0);
-        store.register(id.to_string(), address.to_string(), att.clone()).unwrap();
-        store.verify_identity(id, att, None).unwrap();
-    }
-
-    // -- Demurrage tier tests -------------------------------------------------
+    // ── Protocol invariants ───────────────────────────────────────────────────
 
     #[test]
-    fn base_exemption_tier_has_zero_decay() {
-        let tiers = demurrage_tiers(DAILY_UBI_RATE_UCIRFI);
-        // Balance of 10 days UBI -- within base exemption (0-30 days)
-        let balance = DAILY_UBI_RATE_UCIRFI * 10;
-        let (decay, _) = calculate_demurrage(balance, &tiers, 0);
-        assert_eq!(decay, 0, "balance within base exemption should have zero decay");
+    fn consumption_split_sums_to_d() {
+        let sum = PROVIDER_SHARE + BURN_SHARE + RESERVE_SHARE;
+        assert_eq!(sum, D, "consumption split must sum to D");
     }
 
     #[test]
-    fn second_tier_decays_at_half_percent_monthly() {
-        let tiers = demurrage_tiers(DAILY_UBI_RATE_UCIRFI);
-        // Balance of 60 days UBI -- 30 in exempt tier, 30 in 0.5% tier
-        let balance = DAILY_UBI_RATE_UCIRFI * 60;
-        let (decay, breakdown) = calculate_demurrage(balance, &tiers, 0);
-        assert_eq!(breakdown[0], 0); // exempt tier: no decay
-        assert!(breakdown[1] > 0,   // 0.5% monthly tier: has decay
-            "second tier should decay at 0.5% monthly");
-        assert!(decay > 0);
+    fn split_consumption_no_leakage() {
+        let amount = 1_234_567_u128;
+        let split  = split_consumption(amount);
+        assert_eq!(split.total(), amount, "consumption split must account for all CIRFI");
     }
 
     #[test]
-    fn higher_tiers_decay_faster() {
-        let tiers = demurrage_tiers(DAILY_UBI_RATE_UCIRFI);
-        // Large balance spanning all tiers
-        let balance = DAILY_UBI_RATE_UCIRFI * 400;
-        let (_, breakdown) = calculate_demurrage(balance, &tiers, 0);
-        // Each tier's per-unit decay should be >= previous tier
-        // (we just verify the top tier is non-zero)
-        assert!(breakdown[3] > 0, "top tier (1.5% monthly) should have decay");
+    fn split_consumption_proportions() {
+        let amount = 1_000_000_u128; // exactly D
+        let split  = split_consumption(amount);
+        assert_eq!(split.to_providers, 600_000, "60% to providers");
+        assert_eq!(split.burned,       250_000, "25% burned");
+        assert_eq!(split.to_reserve,   150_000, "15% to reserve");
+    }
+
+    // ── Purchase path ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn purchase_at_target_utilization_uses_r0() {
+        let mut e = engine();
+        // U-bar == U* by default → Rt == R0 == D
+        let (cirfi, rt) = e.purchase_cirfi(D); // burn 1 QCB (×D)
+        assert_eq!(rt, D, "Rt should equal R0 at target utilization");
+        assert_eq!(cirfi, D, "1 QCB → 1 CIRFI at R0 = 1.0");
+        assert_eq!(e.total_supply, D);
+        assert_eq!(e.total_qcb_burned, D);
     }
 
     #[test]
-    fn decay_exemption_reduces_effective_balance() {
-        let tiers = demurrage_tiers(DAILY_UBI_RATE_UCIRFI);
-        // Balance of 60 days UBI with 30 days exemption
-        let balance = DAILY_UBI_RATE_UCIRFI * 60;
-        let (decay_no_exemption, _) = calculate_demurrage(balance, &tiers, 0);
-        let (decay_with_exemption, _) = calculate_demurrage(balance, &tiers, 30);
-        assert!(decay_with_exemption < decay_no_exemption,
-            "exemption should reduce decay");
+    fn purchase_burns_qcb_and_mints_cirfi() {
+        let mut e = engine();
+        let (minted, _) = e.purchase_cirfi(2 * D);
+        assert_eq!(e.total_qcb_burned, 2 * D);
+        assert_eq!(e.total_supply, minted);
+        assert_eq!(e.total_purchase_minted, minted);
+    }
+
+    // ── Utilization and EMA ───────────────────────────────────────────────────
+
+    #[test]
+    fn ema_decays_spike_over_windows() {
+        let mut u = ResourceUtilization::new(ResourceKind::Compute);
+        // One window at 100% utilization.
+        u.record_window(D, D);
+        let spike_u_bar = u.u_bar;
+        // 10 windows at 0% (no demand).
+        for _ in 0..10 {
+            u.record_window(0, D);
+        }
+        assert!(u.u_bar < spike_u_bar,
+            "EMA should decay toward 0 after spike clears");
+        // After 10 windows of 0 demand, u_bar should be well below the spike.
+        assert!(u.u_bar < D / 2,
+            "EMA should be below 50% utilization after 10 quiet windows");
     }
 
     #[test]
-    fn zero_balance_has_zero_decay() {
-        let tiers = demurrage_tiers(DAILY_UBI_RATE_UCIRFI);
-        let (decay, _) = calculate_demurrage(0, &tiers, 0);
-        assert_eq!(decay, 0);
-    }
-
-    // -- UBI pool tests -------------------------------------------------------
-
-    #[test]
-    fn ubi_pool_receives_and_distributes() {
-        let mut pool = UbiPool::new();
-        pool.receive_decay(1_000_000);
-        assert_eq!(pool.balance_ucirfi, 1_000_000);
-
-        let distributed = pool.distribute(400_000);
-        assert_eq!(distributed, 400_000);
-        assert_eq!(pool.balance_ucirfi, 600_000);
-        assert_eq!(pool.total_distributed, 400_000);
-        assert_eq!(pool.total_received_from_decay, 1_000_000);
+    fn utilization_capped_at_100_percent() {
+        let mut u = ResourceUtilization::new(ResourceKind::Compute);
+        // Demand > capacity is unusual but must not overflow.
+        u.record_window(100 * D, D);
+        assert_eq!(u.u_raw, D, "raw utilization capped at 100%");
     }
 
     #[test]
-    fn ubi_pool_caps_distribution_at_balance() {
-        let mut pool = UbiPool::new();
-        pool.receive_decay(100);
-
-        let distributed = pool.distribute(999_999);
-        assert_eq!(distributed, 100, "cannot distribute more than pool holds");
-        assert_eq!(pool.balance_ucirfi, 0);
+    fn zero_capacity_treated_as_full_congestion() {
+        let mut u = ResourceUtilization::new(ResourceKind::Compute);
+        u.record_window(1_000, 0); // demand but no capacity reported
+        assert_eq!(u.u_raw, D, "no capacity → 100% congestion");
     }
 
-    // -- BME engine tests -----------------------------------------------------
+    // ── Conversion rate ───────────────────────────────────────────────────────
 
     #[test]
-    fn bme_fee_calculation() {
-        let bme = BmeEngine::new(50); // 0.5%
-        let fee = bme.fee_on(1_000_000);
-        assert_eq!(fee, 5_000, "0.5% of 1M = 5K");
+    fn rt_equals_r0_at_target_utilization() {
+        let mut rate = ConversionRate::new(D);
+        rate.update(U_STAR);
+        assert_eq!(rate.rt, D, "Rt = R0 when U-bar = U*");
     }
 
     #[test]
-    fn bme_collects_and_tracks_fees() {
-        let mut bme = BmeEngine::new(50);
-        bme.collect_fee(2_000_000, BmeSource::MerchantSettlement);
-        assert_eq!(bme.total_fees_collected_ucirfi, 10_000);
+    fn rt_above_r0_when_underutilized() {
+        let mut rate = ConversionRate::new(D);
+        // U-bar = 35% (below 70% target → cheaper to acquire CIRFI)
+        rate.update(350_000);
+        assert!(rate.rt > D, "Rt > R0 when network is underutilized");
     }
 
-    // -- CirFi engine tests ---------------------------------------------------
+    #[test]
+    fn rt_below_r0_when_congested() {
+        let mut rate = ConversionRate::new(D);
+        // U-bar = 90% (above 70% target → CIRFI is scarcer)
+        rate.update(900_000);
+        assert!(rate.rt < D, "Rt < R0 when network is congested");
+    }
 
     #[test]
-    fn demurrage_applied_to_large_balance() {
-        let mut engine = make_engine();
-        let mut account = make_account("qcb1test", DAILY_UBI_RATE_UCIRFI * 100);
-        // Balance of 100 days UBI -- spans exempt + 0.5% tiers
-        let decayed = engine.apply_demurrage(&mut account, 0);
-        assert!(decayed > 0, "large balance should decay");
-        assert_eq!(
-            account.balance_of(CIRFI),
-            DAILY_UBI_RATE_UCIRFI * 100 - decayed
+    fn rt_clamped_to_rmin_at_extreme_congestion() {
+        let mut rate = ConversionRate::new(D);
+        rate.update(D); // 100% utilization
+        assert!(rate.rt >= rate.r_min, "Rt must not go below Rmin");
+    }
+
+    #[test]
+    fn rt_clamped_to_rmax_at_zero_utilization() {
+        let mut rate = ConversionRate::new(D);
+        rate.update(1); // near-zero utilization → rate would explode
+        assert!(rate.rt <= rate.r_max, "Rt must not exceed Rmax");
+    }
+
+    // ── Operation pricing ─────────────────────────────────────────────────────
+
+    #[test]
+    fn operation_cost_scales_with_congestion() {
+        let mut e = engine();
+
+        // Force high congestion on Compute: 90% demand.
+        {
+            let u = e.utilization.get_mut(&ResourceKind::Compute).unwrap();
+            u.record_window(900_000, D); // 90% utilization
+        }
+
+        let op = OperationCost::new().add(ResourceKind::Compute, D);
+        let cost_congested = e.operation_cost(&op);
+
+        // Reset to target utilization.
+        {
+            let u = e.utilization.get_mut(&ResourceKind::Compute).unwrap();
+            u.record_window(700_000, D);
+        }
+        let cost_normal = e.operation_cost(&op);
+
+        assert!(cost_congested > cost_normal,
+            "congested operations should cost more CIRFI");
+    }
+
+    #[test]
+    fn zk_proving_costs_more_than_state_read() {
+        let e = engine();
+        let read_op = OperationCost::new().add(ResourceKind::Storage, D);
+        let zk_op   = OperationCost::new().add(ResourceKind::ZkProving, D);
+
+        let read_cost = e.operation_cost(&read_op);
+        let zk_cost   = e.operation_cost(&zk_op);
+
+        assert!(zk_cost > read_cost,
+            "ZK proving should cost more than a state read at equal utilization");
+    }
+
+    // ── Provider earning ──────────────────────────────────────────────────────
+
+    #[test]
+    fn provider_earns_more_when_resource_is_scarce() {
+        let mut e = engine();
+
+        // Low congestion on Compute.
+        {
+            let u = e.utilization.get_mut(&ResourceKind::Compute).unwrap();
+            u.record_window(300_000, D); // 30% utilization
+        }
+        let mut contributions = BTreeMap::new();
+        contributions.insert(ResourceKind::Compute, D);
+        let earning_low = provider_earning(
+            &contributions, &e.utilization, &e.resource_weights
         );
-        assert_eq!(engine.ubi_pool.balance_ucirfi, decayed,
-            "decayed tokens should be in UBI pool");
+
+        // High congestion on Compute.
+        {
+            let u = e.utilization.get_mut(&ResourceKind::Compute).unwrap();
+            u.record_window(900_000, D); // 90% utilization
+        }
+        let earning_high = provider_earning(
+            &contributions, &e.utilization, &e.resource_weights
+        );
+
+        assert!(earning_high > earning_low,
+            "providers earn more when their resource is congested/scarce");
     }
 
     #[test]
-    fn small_balance_no_demurrage() {
-        let mut engine = make_engine();
-        // Balance within base exemption (10 days UBI)
-        let mut account = make_account("qcb1test", DAILY_UBI_RATE_UCIRFI * 10);
-        let decayed = engine.apply_demurrage(&mut account, 0);
-        assert_eq!(decayed, 0, "balance within base exemption should not decay");
+    fn zero_contribution_earns_zero() {
+        let e = engine();
+        let contributions = BTreeMap::new();
+        let earned = provider_earning(
+            &contributions, &e.utilization, &e.resource_weights
+        );
+        assert_eq!(earned, 0);
     }
 
     #[test]
-    fn ubi_distribution_requires_verified_identity() {
-        let mut engine = make_engine();
-        let state = StateStore::new(HashWidth::Bits256);
-        let mut identity = make_identity_store();
+    fn credit_provider_earning_updates_supply() {
+        let mut e = engine();
+        let provider = [1u8; 32];
+        let mut contributions = BTreeMap::new();
+        contributions.insert(ResourceKind::Compute, D);
 
-        // Register but don't verify
-        let att = PopAttestation::genesis("h1", 0);
-        identity.register("h1".into(), "qcb1h1".into(), att).unwrap();
+        let earned = e.credit_provider_earning(&provider, &contributions);
+        assert_eq!(e.total_supply, earned);
+        assert_eq!(e.total_contribution_minted, earned);
+    }
 
-        let mut account = make_account("qcb1h1", 0);
-        let result = engine.distribute_ubi("h1", &mut account, &mut identity);
-        assert!(result.is_err(), "unverified identity cannot claim UBI");
-        let _ = state; // suppress unused warning
+    // ── Consumption ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn consume_reduces_supply_by_burn_share() {
+        let mut e = engine();
+        // First mint some CIRFI.
+        let (minted, _) = e.purchase_cirfi(10 * D);
+        let supply_before = e.total_supply;
+
+        let split = e.consume(D); // consume 1 CIRFI (×D)
+        assert_eq!(e.total_burned, split.burned);
+        assert_eq!(e.protocol_reserve, split.to_reserve);
+        // Supply reduced by burned amount only (providers take the rest off-chain).
+        assert_eq!(e.total_supply, supply_before - split.burned);
+        let _ = minted;
+    }
+
+    // ── Window advance ────────────────────────────────────────────────────────
+
+    #[test]
+    fn advance_window_updates_conversion_rate() {
+        let mut e  = engine();
+        let rt_0   = e.rt();
+
+        // Advance with high demand on all resources → congestion → Rt drops.
+        let demand   : BTreeMap<ResourceKind, u128> =
+            ResourceKind::all().iter().map(|&k| (k, 900_000u128)).collect();
+        let capacity : BTreeMap<ResourceKind, u128> =
+            ResourceKind::all().iter().map(|&k| (k, D)).collect();
+        e.advance_window(&demand, &capacity);
+
+        assert_ne!(e.rt(), rt_0, "advance_window should update Rt");
+        assert!(e.rt() <= rt_0,
+            "high utilization should lower or maintain Rt");
     }
 
     #[test]
-    fn yield_distribution_requires_on_chain_activity() {
-        let mut engine = make_engine();
-        let mut identity = make_identity_store();
-        register_and_verify(&mut identity, "h1", "qcb1h1");
+    fn advance_window_increments_counter() {
+        let mut e = engine();
+        assert_eq!(e.current_window, 0);
+        let empty: BTreeMap<ResourceKind, u128> = BTreeMap::new();
+        e.advance_window(&empty, &empty);
+        assert_eq!(e.current_window, 1);
+    }
 
-        // Verified but NO activity recorded this epoch — must be rejected.
-        let mut account = make_account("qcb1h1", 0);
-        let result = engine.distribute_ubi("h1", &mut account, &mut identity);
-        assert!(result.is_err(), "CirFi yield requires on-chain activity; passive claim must fail");
+    // ── Full loop ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn demand_loop_qcb_burns_grow_with_usage() {
+        let mut e = engine();
+        let empty: BTreeMap<ResourceKind, u128> = BTreeMap::new();
+
+        // Low usage window: burn 1 QCB.
+        let low_demand: BTreeMap<_, _> =
+            ResourceKind::all().iter().map(|&k| (k, 100_000u128)).collect();
+        let capacity: BTreeMap<_, _> =
+            ResourceKind::all().iter().map(|&k| (k, D)).collect();
+        e.advance_window(&low_demand, &capacity);
+        let (minted_low, rt_low) = e.purchase_cirfi(D);
+
+        // Reset engine (manual) and simulate high usage.
+        let mut e2 = engine();
+        let high_demand: BTreeMap<_, _> =
+            ResourceKind::all().iter().map(|&k| (k, 950_000u128)).collect();
+        e2.advance_window(&high_demand, &capacity);
+        let (_minted_high, rt_high) = e2.purchase_cirfi(D);
+
+        // At high usage Rt is lower (fewer CIRFI per QCB → scarcer).
+        assert!(rt_high <= rt_low,
+            "high-demand network should yield fewer CIRFI per QCB burned");
+        let _ = (minted_low, empty);
     }
 
     #[test]
-    fn yield_distribution_credits_active_verified_human() {
-        let mut engine = make_engine();
-        let mut identity = make_identity_store();
-        register_and_verify(&mut identity, "h1", "qcb1h1");
+    fn supply_equation_components_tracked_independently() {
+        let mut e = engine();
+        let provider = [0u8; 32];
 
-        // Record on-chain activity this epoch (simulates tx submission).
-        identity.record_activity("h1");
+        // Purchase path.
+        let (purchase_minted, _) = e.purchase_cirfi(5 * D);
 
-        let mut account = make_account("qcb1h1", 0);
-        let amount = engine.distribute_ubi("h1", &mut account, &mut identity).unwrap();
+        // Contribution path.
+        let mut contributions = BTreeMap::new();
+        contributions.insert(ResourceKind::ZkProving, D);
+        let contrib_minted = e.credit_provider_earning(&provider, &contributions);
 
-        assert_eq!(amount, DAILY_UBI_RATE_UCIRFI);
-        assert_eq!(account.balance_of(CIRFI), DAILY_UBI_RATE_UCIRFI);
+        // Consume some.
+        let split = e.consume(D);
+
+        assert_eq!(e.total_purchase_minted, purchase_minted);
+        assert_eq!(e.total_contribution_minted, contrib_minted);
+        assert_eq!(e.total_burned, split.burned);
+        // Supply = purchase_minted + contrib_minted - burned.
+        assert_eq!(
+            e.total_supply,
+            purchase_minted + contrib_minted - split.burned
+        );
     }
 
     #[test]
-    fn yield_double_claim_rejected() {
-        let mut engine = make_engine();
-        let mut identity = make_identity_store();
-        register_and_verify(&mut identity, "h1", "qcb1h1");
-        identity.record_activity("h1");
-
-        let mut account = make_account("qcb1h1", 0);
-        engine.distribute_ubi("h1", &mut account, &mut identity).unwrap();
-        let second = engine.distribute_ubi("h1", &mut account, &mut identity);
-        assert!(second.is_err(), "cannot claim CirFi yield twice in same epoch");
+    fn integer_pow_fp_at_zero_exponent_is_one() {
+        assert_eq!(integer_pow_fp(D, 0), D);
     }
 
     #[test]
-    fn transfer_collects_bme_fee() {
-        let mut engine = make_engine();
-        let mut sender    = make_account("qcb1sender",    10_000_000);
-        let mut recipient = make_account("qcb1recipient", 0);
-
-        let net = engine.process_transfer(
-            &mut sender, &mut recipient, 1_000_000, BmeSource::MerchantSettlement
-        ).unwrap();
-
-        let expected_fee = engine.bme.fee_on(1_000_000); // 5_000
-        assert_eq!(net, 1_000_000 - expected_fee);
-        assert_eq!(recipient.balance_of(CIRFI), net);
-        assert_eq!(sender.balance_of(CIRFI), 10_000_000 - 1_000_000);
-        assert_eq!(engine.bme.total_fees_collected_ucirfi, expected_fee);
+    fn integer_pow_fp_at_one_exponent_is_base() {
+        assert_eq!(integer_pow_fp(2 * D, 1), 2 * D);
     }
 
     #[test]
-    fn proactive_redirect_funds_ubi_pool() {
-        let mut engine = make_engine();
-        let mut account = make_account("qcb1holder", 5_000_000);
-
-        let to_pool = engine.redirect_to_ubi_pool(&mut account, 1_000_000).unwrap();
-
-        let fee = engine.bme.fee_on(1_000_000);
-        assert_eq!(to_pool, 1_000_000 - fee,
-            "UBI pool receives amount minus BME fee");
-        assert_eq!(engine.ubi_pool.balance_ucirfi, to_pool,
-            "UBI pool balance updated");
-        assert_eq!(account.balance_of(CIRFI), 4_000_000,
-            "sender balance reduced by full redirect amount");
-        assert!(engine.bme.total_fees_collected_ucirfi > 0,
-            "BME collected fee from redirect");
-    }
-
-    #[test]
-    fn redirect_rejects_insufficient_balance() {
-        let mut engine = make_engine();
-        let mut account = make_account("qcb1poor", 100);
-        let result = engine.redirect_to_ubi_pool(&mut account, 999_999);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn two_token_model_qcb_unaffected_by_cirfi_ops() {
-        let mut engine = make_engine();
-        let mut account = make_account("qcb1mixed", DAILY_UBI_RATE_UCIRFI * 50);
-        // Give account some QCB too
-        account.credit(QCB, 1_000_000);
-
-        // Apply demurrage -- should only touch ucirfi
-        engine.apply_demurrage(&mut account, 0);
-
-        // QCB balance must be unchanged
-        assert_eq!(account.balance_of(QCB), 1_000_000,
-            "$QCB balance must not be affected by $CIRFI demurrage");
+    fn integer_pow_fp_squares_correctly() {
+        // (2.0)^2 = 4.0 in fixed-point
+        let result = integer_pow_fp(2 * D, 2);
+        assert_eq!(result, 4 * D);
     }
 }

@@ -5,25 +5,19 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# CirFi: the QCB monetary engine (Whitepaper Section 5.4 / 6.2).
+# CirFi: QCB resource economy — CIRFI Economic Model v0.1.
 # Implements:
-#   - Tiered demurrage on idle $CIRFI balances (0/0.5/1.0/1.5% monthly)
-#   - Decay-exemption credits from spending (1 day per spend, max 30)
-#   - UBI epoch distribution (1,000 $CIRFI per verified human per day)
-#   - UBI pool: decayed tokens flow here, not to burn
-#   - Proactive UBI pool redirect (triggers BME, Q25)
-#   - BME: merchant fees + redirects -> buy-and-burn $QCB
-#   - Two-token enforcement: $CIRFI circulates, $QCB captures value
+#   - $CIRFI as a resource consumption token (NOT UBI)
+#   - Two minting paths: purchase (QCB burned → CIRFI) and contribution (VCA-verified providers earn CIRFI)
+#   - Algorithmic conversion rate Rt = R0 * (U*/U-bar)^gamma (EMA-smoothed utilization)
+#   - Per-resource congestion pricing (7 resource types)
+#   - Consumption split: 60% providers / 25% burn / 15% reserve
+#   - CapacityEvidence_v0 sub-protocol (Byzantine-resistant median aggregation)
 #
-# Depends on chain-forge-identity for verified human count and claim gating.
-# Depends on chain-forge-state for balance reads and writes.
+# No dependency on chain-forge-identity or chain-forge-state (those were UBI-era).
 
 [dependencies]
 chain-forge-core     = { path = "../chain-forge-core" }
-chain-forge-identity = { path = "../chain-forge-identity" }
-chain-forge-state    = { path = "../chain-forge-state" }
-serde                = { workspace = true }
-serde_json           = { workspace = true }
 thiserror            = { workspace = true }
 tracing              = { workspace = true }
 
