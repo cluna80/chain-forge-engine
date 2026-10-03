@@ -580,6 +580,7 @@ pub fn apply_personhood_cap(
 ///   - The UNL is the verified-human validator set (personhood-gated)
 ///   - The 80% threshold is tunable via FbaConfig
 ///   - Personhood cap still applies (Section 3.3)
+///   - VCA weight adjustments apply the same way as Tendermint/HotStuff
 ///   - In Phase 0 a single global UNL is used (equivalent to the
 ///     Tendermint validator set); per-node UNLs are a Phase 1 feature
 ///
@@ -622,17 +623,35 @@ pub enum FbaPhase {
     Committed,
 }
 
+/// Equivocation evidence for the FBA engine: a validator voted for two
+/// different block hashes in the same (height, round).
+#[derive(Debug, Clone)]
+pub struct FbaEquivocation {
+    pub validator:  ValidatorId,
+    pub height:     BlockHeight,
+    pub round:      Round,
+    pub first_hash: BlockHash,
+    pub second_hash: BlockHash,
+}
+
 pub struct FbaEngine {
     config:      ConsensusConfig,
     fba:         FbaConfig,
     validators:  ValidatorSet,
     height:      BlockHeight,
     round:       Round,
-    phase:       FbaPhase,
+    pub phase:   FbaPhase,
     /// Votes received this round: block_hash -> (validator -> power).
     votes:       BTreeMap<BlockHash, BTreeMap<ValidatorId, u64>>,
+    /// Tracks which hash each validator has voted for this round (for equivocation detection).
+    /// validator -> block_hash
+    vote_index:  BTreeMap<ValidatorId, BlockHash>,
     /// The pending proposal (most-recent received).
     pending:     Option<BlockProposal>,
+    /// Equivocations detected this round, drained by the node layer.
+    pending_equivocations: Vec<tendermint::EquivocationDetected>,
+    /// Adaptive quorum from VCA integration (None = use threshold_power()).
+    vca_quorum:  Option<u64>,
 }
 
 impl FbaEngine {
@@ -654,18 +673,26 @@ impl FbaEngine {
             round:       0,
             phase:       FbaPhase::Open,
             votes:       BTreeMap::new(),
+            vote_index:  BTreeMap::new(),
             pending:     None,
+            pending_equivocations: vec![],
+            vca_quorum:  None,
         }
     }
 
     /// Minimum power needed to commit under the FBA threshold.
-    fn threshold_power(&self) -> u64 {
+    /// Uses VCA-computed adaptive quorum when available; otherwise
+    /// falls back to ceil(total * agreement_threshold).
+    pub fn threshold_power(&self) -> u64 {
+        if let Some(q) = self.vca_quorum {
+            return q;
+        }
         let total = self.validators.total_power() as f64;
         (total * self.fba.agreement_threshold).ceil() as u64
     }
 
     /// Check whether any candidate has crossed the threshold.
-    fn find_committed(&self) -> Option<BlockHash> {
+    pub(crate) fn find_committed(&self) -> Option<BlockHash> {
         let threshold = self.threshold_power();
         for (hash, vote_map) in &self.votes {
             let power: u64 = vote_map.values().sum();
@@ -677,12 +704,43 @@ impl FbaEngine {
     }
 
     /// Record a vote for a block hash.
-    fn record_vote(&mut self, validator: &ValidatorId, power: u64, hash: &BlockHash) {
+    /// Returns `true` if this is a new vote, `false` if duplicate,
+    /// and records an equivocation if the validator voted for a different hash.
+    fn record_vote(&mut self, validator: &ValidatorId, power: u64, hash: &BlockHash) -> bool {
+        // Equivocation detection: has this validator already voted for a different hash?
+        if let Some(prior_hash) = self.vote_index.get(validator) {
+            if prior_hash != hash {
+                // Equivocation! Validator voted for two different hashes.
+                let equiv = tendermint::EquivocationDetected {
+                    validator_id:   validator.clone(),
+                    height:         self.height,
+                    round:          self.round,
+                    vote_type_byte: 1, // 1 = Precommit (FBA uses precommit votes)
+                    block_hash_a:   prior_hash.clone(),
+                    block_hash_b:   hash.clone(),
+                    signature_a:    vec![],
+                    signature_b:    vec![],
+                };
+                tracing::warn!(
+                    validator = %validator.0,
+                    first     = %prior_hash,
+                    second    = %hash,
+                    "FBA: equivocation detected — validator voted for two different blocks"
+                );
+                self.pending_equivocations.push(equiv);
+                return false; // do not count the equivocating vote
+            }
+            // Duplicate vote — already recorded, skip.
+            return false;
+        }
+
+        // New vote: record it.
+        self.vote_index.insert(validator.clone(), hash.clone());
         self.votes
             .entry(hash.clone())
             .or_default()
-            .entry(validator.clone())
-            .or_insert(power);
+            .insert(validator.clone(), power);
+        true
     }
 
     /// Build a CommitCertificate for a winning hash.
@@ -705,6 +763,31 @@ impl FbaEngine {
             precommits,
         }
     }
+
+    /// Apply VCA weights and compute adaptive quorum. Shared by `init` and
+    /// `update_validator_set`.
+    fn apply_vca(&mut self, mut vs: ValidatorSet) -> ValidatorSet {
+        if let Some(ref vca_cfg) = self.config.vca.clone() {
+            let registry = build_vca_registry_from_validator_set(
+                self.height, &vs, vca_cfg.weight_config.clone()
+            );
+            match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
+                Ok(q) => {
+                    self.vca_quorum = Some(q);
+                    apply_vca_weights_to_validator_set(&mut vs, &registry);
+                    tracing::info!(
+                        vca_quorum = q,
+                        threshold_pct = self.fba.agreement_threshold,
+                        "FBA: VCA adaptive quorum applied"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("FBA: VCA quorum computation failed ({e}); using static threshold");
+                }
+            }
+        }
+        vs
+    }
 }
 
 impl Default for FbaEngine {
@@ -724,6 +807,7 @@ impl ConsensusEngine for FbaEngine {
         config:     ConsensusConfig,
         mut validators: ValidatorSet,
     ) -> ConsensusResult<()> {
+        // 1. Apply personhood cap first (before VCA, matching HotStuff/Tendermint pattern).
         if let Some(ref pc) = config.personhood {
             validators = apply_personhood_cap(validators, pc);
         }
@@ -733,15 +817,24 @@ impl ConsensusEngine for FbaEngine {
                 have:   validators.validators.len(),
             });
         }
+        self.config = config;
+
+        // 2. Apply VCA weights + compute adaptive quorum.
+        validators = self.apply_vca(validators);
+
         self.validators = validators;
-        self.config     = config;
         self.phase      = FbaPhase::Open;
+        self.votes.clear();
+        self.vote_index.clear();
+        self.pending_equivocations.clear();
+
         tracing::info!(
-            variant     = "XRPL-inspired FBA",
-            validators  = self.validators.validators.len(),
-            total_power = self.validators.total_power(),
-            threshold   = self.fba.agreement_threshold,
-            threshold_power = self.threshold_power(),
+            variant          = "XRPL-inspired FBA",
+            validators       = self.validators.validators.len(),
+            total_power      = self.validators.total_power(),
+            threshold        = self.fba.agreement_threshold,
+            threshold_power  = self.threshold_power(),
+            vca_active       = self.vca_quorum.is_some(),
             "FBA consensus engine initialised"
         );
         Ok(())
@@ -788,6 +881,7 @@ impl ConsensusEngine for FbaEngine {
         self.pending = Some(proposal.clone());
         self.phase   = FbaPhase::Open;
         self.votes.clear();
+        self.vote_index.clear();
         tracing::debug!(
             height = proposal.height,
             hash   = %proposal.block_hash,
@@ -820,10 +914,10 @@ impl ConsensusEngine for FbaEngine {
             self.phase = FbaPhase::Committed;
             let cert = self.make_certificate(&winning_hash);
             tracing::info!(
-                height = cert.height,
-                hash   = %cert.block_hash,
+                height    = cert.height,
+                hash      = %cert.block_hash,
                 threshold = self.fba.agreement_threshold,
-                "FBA: threshold reached -- block committed"
+                "FBA: threshold reached — block committed"
             );
             return Ok(Some(cert));
         }
@@ -839,6 +933,7 @@ impl ConsensusEngine for FbaEngine {
         self.round  = round + 1;
         self.phase  = FbaPhase::Open;
         self.votes.clear();
+        self.vote_index.clear();
         self.pending = None;
 
         Ok(Vote {
@@ -860,12 +955,15 @@ impl ConsensusEngine for FbaEngine {
         self.round   = 0;
         self.phase   = FbaPhase::Open;
         self.votes.clear();
+        self.vote_index.clear();
         self.pending = None;
+        self.pending_equivocations.clear();
 
         if let Some(mut new_set) = new_validator_set {
             if let Some(ref pc) = self.config.personhood.clone() {
                 new_set = apply_personhood_cap(new_set, pc);
             }
+            new_set = self.apply_vca(new_set);
             if new_set.validators.len() >= self.fba.min_unl_size {
                 self.validators = new_set;
             } else {
@@ -885,25 +983,90 @@ impl ConsensusEngine for FbaEngine {
         certificate:   &CommitCertificate,
         validator_set: &ValidatorSet,
     ) -> ConsensusResult<()> {
-        // Count voting power in the certificate
+        use std::collections::HashSet;
+
+        // 1. Reject duplicate validators.
+        let mut seen = HashSet::new();
+        for v in &certificate.precommits {
+            if !seen.insert(&v.validator) {
+                return Err(ConsensusError::InvalidVote {
+                    validator:  v.validator.clone(),
+                    block_hash: certificate.block_hash.clone(),
+                    reason:     "FBA: duplicate validator in commit certificate".into(),
+                });
+            }
+        }
+
+        // 2. Every vote must reference the committed block hash.
+        for v in &certificate.precommits {
+            if let Some(ref h) = v.block_hash {
+                if h != &certificate.block_hash {
+                    return Err(ConsensusError::InvalidVote {
+                        validator:  v.validator.clone(),
+                        block_hash: certificate.block_hash.clone(),
+                        reason:     format!(
+                            "FBA: vote block_hash {h} != certificate block_hash {}",
+                            certificate.block_hash
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 3. Count voting power (Precommit votes only).
         let power: u64 = certificate.precommits.iter()
             .filter(|v| v.vote_type == VoteType::Precommit)
             .map(|v| validator_set.power_of(&v.validator))
             .sum();
 
-        let total   = validator_set.total_power() as f64;
-        let needed  = (total * self.fba.agreement_threshold).ceil() as u64;
+        // 4. Threshold: VCA adaptive quorum if available, else static.
+        let total  = validator_set.total_power() as f64;
+        let needed = self.vca_quorum
+            .unwrap_or_else(|| (total * self.fba.agreement_threshold).ceil() as u64);
 
         if power < needed {
             return Err(ConsensusError::InvalidVote {
                 validator:  ValidatorId("quorum".into()),
                 block_hash: certificate.block_hash.clone(),
                 reason:     format!(
-                    "FBA: insufficient threshold power: {power} < {needed}                      ({:.0}% of {total})",
+                    "FBA: insufficient threshold power: {power} < {needed} \
+                     ({:.0}% of {total})",
                     self.fba.agreement_threshold * 100.0
                 ),
             });
         }
+        Ok(())
+    }
+
+    fn drain_equivocations(&mut self) -> Vec<tendermint::EquivocationDetected> {
+        std::mem::take(&mut self.pending_equivocations)
+    }
+
+    fn update_validator_set(&mut self, mut vs: ValidatorSet) -> Result<(), ConsensusError> {
+        // 1. Personhood cap.
+        if let Some(ref pc) = self.config.personhood.clone() {
+            vs = apply_personhood_cap(vs, pc);
+        }
+
+        // 2. VCA weights + adaptive quorum.
+        vs = self.apply_vca(vs);
+
+        // 3. Enforce minimum UNL size.
+        if vs.validators.len() < self.fba.min_unl_size {
+            tracing::warn!(
+                "FBA update_validator_set: new set has {} validators < min_unl_size {}; keeping current",
+                vs.validators.len(), self.fba.min_unl_size
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            old_count = self.validators.validators.len(),
+            new_count = vs.validators.len(),
+            vca_active = self.vca_quorum.is_some(),
+            "FBA: validator set updated"
+        );
+        self.validators = vs;
         Ok(())
     }
 }
@@ -3471,6 +3634,277 @@ mod tests {
         assert_eq!(t.variant(), ConsensusVariant::TendermintStyle);
         assert_eq!(h.variant(), ConsensusVariant::HotStuffStyle);
         assert_eq!(f.variant(), ConsensusVariant::XrplInspired);
+    }
+
+    // -- FbaEngine: equivocation detection ------------------------------------
+
+    #[tokio::test]
+    async fn fba_equivocation_detected_on_double_vote() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(5)).await.unwrap();
+
+        let proposal = engine.propose(0, 0, BlockHash("g".into()), vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        let hash_a = proposal.block_hash.clone();
+        let hash_b = BlockHash("fba_h0_r0_different".into());
+
+        // First vote from fba_val_1 for hash_a — accepted normally.
+        let vote_a = Vote {
+            vote_type: VoteType::Precommit, height: 0, round: 0,
+            validator: ValidatorId("fba_val_1".into()),
+            block_hash: Some(hash_a.clone()), signature: vec![],
+        };
+        assert!(engine.receive_vote(vote_a).await.unwrap().is_none());
+        assert!(engine.drain_equivocations().is_empty());
+
+        // Second vote from fba_val_1 for a different hash_b — equivocation.
+        let vote_b = Vote {
+            vote_type: VoteType::Precommit, height: 0, round: 0,
+            validator: ValidatorId("fba_val_1".into()),
+            block_hash: Some(hash_b.clone()), signature: vec![],
+        };
+        assert!(engine.receive_vote(vote_b).await.unwrap().is_none());
+
+        let evs = engine.drain_equivocations();
+        assert_eq!(evs.len(), 1, "one equivocation should have been detected");
+        assert_eq!(evs[0].validator_id, ValidatorId("fba_val_1".into()));
+        assert_eq!(evs[0].block_hash_a, hash_a);
+        assert_eq!(evs[0].block_hash_b, hash_b);
+
+        // drain_equivocations is cleared after drain.
+        assert!(engine.drain_equivocations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fba_duplicate_vote_not_counted_twice() {
+        let mut engine = FbaEngine::new();
+        // 5 validators, threshold = 4. Send the same vote twice.
+        engine.init(fba_config(), fba_validators(5)).await.unwrap();
+
+        let proposal = engine.propose(0, 0, BlockHash("g".into()), vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        let vote = Vote {
+            vote_type: VoteType::Precommit, height: 0, round: 0,
+            validator: ValidatorId("fba_val_1".into()),
+            block_hash: Some(proposal.block_hash.clone()), signature: vec![],
+        };
+
+        // Send same vote twice — should not count as 2 votes.
+        assert!(engine.receive_vote(vote.clone()).await.unwrap().is_none());
+        assert!(engine.receive_vote(vote).await.unwrap().is_none(),
+            "duplicate vote must not push past threshold");
+
+        // No equivocation — same hash, just duplicate.
+        assert!(engine.drain_equivocations().is_empty());
+
+        // Only 1 vote counted (not 2), so threshold (4) not yet reached.
+        assert_eq!(engine.phase, FbaPhase::Open);
+    }
+
+    #[tokio::test]
+    async fn fba_equivocation_vote_does_not_count_toward_threshold() {
+        // 5 validators, threshold = ceil(5 * 0.8) = 4.
+        // fba_val_1 votes for good_hash, then equivocates with bad_hash.
+        // After the equivocation the bad_hash vote must NOT be counted —
+        // total power for bad_hash stays 0, so threshold is not crossed.
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(5)).await.unwrap();
+
+        let proposal = engine.propose(0, 0, BlockHash("g".into()), vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        let good_hash = proposal.block_hash.clone();
+        let bad_hash  = BlockHash("fba_h0_r0_adversarial".into());
+
+        // fba_val_1 votes good first.
+        let vote_good = Vote {
+            vote_type: VoteType::Precommit, height: 0, round: 0,
+            validator: ValidatorId("fba_val_1".into()),
+            block_hash: Some(good_hash.clone()), signature: vec![],
+        };
+        assert!(engine.receive_vote(vote_good).await.unwrap().is_none());
+        assert!(engine.drain_equivocations().is_empty(), "no equivocation yet");
+
+        // fba_val_1 equivocates with bad_hash — vote must NOT be counted.
+        let vote_bad = Vote {
+            vote_type: VoteType::Precommit, height: 0, round: 0,
+            validator: ValidatorId("fba_val_1".into()),
+            block_hash: Some(bad_hash.clone()), signature: vec![],
+        };
+        assert!(engine.receive_vote(vote_bad).await.unwrap().is_none());
+
+        // One equivocation recorded.
+        let evs = engine.drain_equivocations();
+        assert_eq!(evs.len(), 1, "equivocation must be recorded");
+        assert_eq!(evs[0].block_hash_a, good_hash);
+        assert_eq!(evs[0].block_hash_b, bad_hash);
+
+        // bad_hash must have 0 power (equivocating vote was discarded).
+        // We verify by checking that bad_hash never appears as a winner.
+        // Two more honest votes for bad_hash should NOT commit — only 2 power (below 4).
+        for i in 2..=3 {
+            let vote = Vote {
+                vote_type: VoteType::Precommit, height: 0, round: 0,
+                validator: ValidatorId(format!("fba_val_{i}")),
+                block_hash: Some(bad_hash.clone()), signature: vec![],
+            };
+            assert!(engine.receive_vote(vote).await.unwrap().is_none(),
+                "bad_hash should need fba_val_1's discarded vote to reach threshold");
+        }
+        // Phase still open — bad_hash has 2 power, below threshold of 4.
+        assert_eq!(engine.phase, FbaPhase::Open,
+            "equivocating vote must not push bad_hash past threshold");
+    }
+
+    // -- FbaEngine: verify_commit improvements --------------------------------
+
+    #[tokio::test]
+    async fn fba_verify_commit_rejects_duplicate_validators() {
+        let mut engine = FbaEngine::new();
+        let validators = fba_validators(5);
+        engine.init(fba_config(), validators.clone()).await.unwrap();
+
+        let hash = BlockHash("test".into());
+        // Certificate with the same validator listed twice — should be rejected.
+        let cert_dup = CommitCertificate {
+            height: 0, round: 0,
+            block_hash: hash.clone(),
+            precommits: vec![
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_1".into()),
+                    block_hash: Some(hash.clone()), signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_1".into()), // duplicate
+                    block_hash: Some(hash.clone()), signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_2".into()),
+                    block_hash: Some(hash.clone()), signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_3".into()),
+                    block_hash: Some(hash.clone()), signature: vec![] },
+            ],
+        };
+        let result = engine.verify_commit(&cert_dup, &validators);
+        assert!(result.is_err(), "verify_commit must reject duplicate validators");
+    }
+
+    #[tokio::test]
+    async fn fba_verify_commit_rejects_wrong_block_hash_in_vote() {
+        let mut engine = FbaEngine::new();
+        let validators = fba_validators(5);
+        engine.init(fba_config(), validators.clone()).await.unwrap();
+
+        let cert_hash  = BlockHash("correct".into());
+        let wrong_hash = BlockHash("wrong".into());
+
+        let cert = CommitCertificate {
+            height: 0, round: 0,
+            block_hash: cert_hash.clone(),
+            precommits: vec![
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_1".into()),
+                    block_hash: Some(cert_hash.clone()), signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_2".into()),
+                    block_hash: Some(wrong_hash.clone()), // wrong hash
+                    signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_3".into()),
+                    block_hash: Some(cert_hash.clone()), signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                    validator: ValidatorId("fba_val_4".into()),
+                    block_hash: Some(cert_hash.clone()), signature: vec![] },
+            ],
+        };
+        let result = engine.verify_commit(&cert, &validators);
+        assert!(result.is_err(), "verify_commit must reject mismatched block hash in vote");
+    }
+
+    // -- FbaEngine: update_validator_set / VCA --------------------------------
+
+    #[tokio::test]
+    async fn fba_update_validator_set_applies_personhood_cap() {
+        let mut engine = FbaEngine::new();
+        let mut config = fba_config();
+        config.personhood = Some(PersonhoodConfig {
+            power_cap:          1,
+            reject_expired_pop: false,
+            min_verified_pct:   0,
+        });
+        engine.init(config, fba_validators(4)).await.unwrap();
+
+        // New set with one whale validator.
+        let new_vs = ValidatorSet {
+            height: 1,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("whale".into()),  voting_power: 100, pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("v2".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("v3".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("v4".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![] },
+            ],
+        };
+        engine.update_validator_set(new_vs).unwrap();
+
+        let whale = engine.validator_set().validators.iter()
+            .find(|v| v.id.0 == "whale").unwrap();
+        assert_eq!(whale.voting_power, 1, "update_validator_set must apply personhood cap");
+    }
+
+    #[tokio::test]
+    async fn fba_update_validator_set_rejects_below_min_unl() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(4)).await.unwrap();
+
+        // Try updating to a 2-validator set (below min_unl_size = 3).
+        let tiny_vs = ValidatorSet {
+            height: 1,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("v1".into()), voting_power: 1, pop_verified: true, public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("v2".into()), voting_power: 1, pop_verified: true, public_key: vec![] },
+            ],
+        };
+        engine.update_validator_set(tiny_vs).unwrap(); // Ok (not error), but silently keeps current
+
+        // Validator set unchanged (still 4).
+        assert_eq!(engine.validator_set().validators.len(), 4,
+            "validator set must not shrink below min_unl_size");
+    }
+
+    #[tokio::test]
+    async fn fba_receive_proposal_clears_votes() {
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(5)).await.unwrap();
+
+        let proposal = engine.propose(0, 0, BlockHash("g".into()), vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        // Cast 2 votes.
+        for i in 1..=2 {
+            let vote = Vote {
+                vote_type: VoteType::Precommit, height: 0, round: 0,
+                validator: ValidatorId(format!("fba_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()), signature: vec![],
+            };
+            engine.receive_vote(vote).await.unwrap();
+        }
+
+        // A new proposal (e.g., from a competing candidate) must clear vote state.
+        let proposal2 = BlockProposal {
+            height: 0, round: 0,
+            proposer:    ValidatorId("v2".into()),
+            block_hash:  BlockHash("fba_h0_r0_00000001".into()),
+            parent_hash: BlockHash("g".into()),
+            timestamp_ms: 0,
+            tx_data:     vec![1],
+            signature:   vec![],
+        };
+        engine.receive_proposal(proposal2).await.unwrap();
+
+        // After the new proposal, old votes should be gone.
+        assert!(engine.find_committed().is_none(), "vote state must reset on new proposal");
+        assert_eq!(engine.phase, FbaPhase::Open);
     }
 
     // -- HotStuffEngine tests -------------------------------------------------

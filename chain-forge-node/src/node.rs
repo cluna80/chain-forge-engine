@@ -10,7 +10,7 @@ use chain_forge_consensus::{
     ConsensusConfig, ConsensusVariant, PersonhoodConfig,
     ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, BlockProposal, Vote, VoteType,
     tendermint::{TendermintEngine, EquivocationDetected},
-    HotStuffEngine,
+    HotStuffEngine, FbaEngine,
     ConsensusEngine,
 };
 use chain_forge_state::StateStore;
@@ -455,7 +455,12 @@ impl Node {
                     .map_err(|e| NodeError::Consensus(e.to_string()))?;
                 Box::new(e)
             }
-            // TendermintStyle and XrplInspired (FBA stub) both route here.
+            ConsensusVariant::XrplInspired => {
+                let mut e = FbaEngine::new();
+                e.init(consensus_cfg, genesis_vs).await
+                    .map_err(|e| NodeError::Consensus(e.to_string()))?;
+                Box::new(e)
+            }
             _ => {
                 let mut e = TendermintEngine::new();
                 e.init(consensus_cfg, genesis_vs).await
