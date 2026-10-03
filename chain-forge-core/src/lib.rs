@@ -292,6 +292,12 @@ pub struct GenesisConsensus {
     /// "proof-of-stake", so any chain choosing PoS got it unknowingly.
     #[serde(default)]
     pub personhood_weighted: bool,
+    /// BFT algorithm variant to use for this chain.
+    /// One of: "tendermint" (default), "hotstuff", "xrpl".
+    /// Omitting this field uses TendermintStyle, preserving backward
+    /// compatibility with all existing genesis files.
+    #[serde(default)]
+    pub bft_variant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,7 +9,9 @@ use chain_forge_consensus::{proposal_signing_bytes, vote_signing_bytes};
 use chain_forge_consensus::{
     ConsensusConfig, ConsensusVariant, PersonhoodConfig,
     ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, BlockProposal, Vote, VoteType,
-    tendermint::{TendermintEngine, EquivocationDetected}, ConsensusEngine,
+    tendermint::{TendermintEngine, EquivocationDetected},
+    HotStuffEngine,
+    ConsensusEngine,
 };
 use chain_forge_state::StateStore;
 use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
@@ -425,8 +427,15 @@ impl Node {
             None
         };
 
+        // Read the desired variant from genesis config (default: TendermintStyle).
+        let desired_variant = match genesis.consensus.bft_variant.as_deref() {
+            Some("hotstuff") | Some("HotStuffStyle") => ConsensusVariant::HotStuffStyle,
+            Some("xrpl")    | Some("XrplInspired")   => ConsensusVariant::XrplInspired,
+            _                                          => ConsensusVariant::TendermintStyle,
+        };
+
         let consensus_cfg = ConsensusConfig {
-            variant:              ConsensusVariant::TendermintStyle,
+            variant:              desired_variant.clone(),
             chain_id:             genesis.chain_id.clone(),
             propose_timeout_ms:   genesis.consensus.block_time_ms * 2,
             prevote_timeout_ms:   genesis.consensus.block_time_ms,
@@ -436,9 +445,24 @@ impl Node {
             vca:                  None,
         };
 
-        let mut engine = TendermintEngine::new();
-        engine.init(consensus_cfg, genesis_vs).await
-            .map_err(|e| NodeError::Consensus(e.to_string()))?;
+        // Factory dispatch: select the BFT engine based on the variant.
+        // Factory dispatch: instantiate the BFT engine requested by genesis config.
+        // Node stores Box<dyn ConsensusEngine> so all variants are interchangeable.
+        let mut engine: Box<dyn ConsensusEngine> = match desired_variant {
+            ConsensusVariant::HotStuffStyle => {
+                let mut e = HotStuffEngine::new();
+                e.init(consensus_cfg, genesis_vs).await
+                    .map_err(|e| NodeError::Consensus(e.to_string()))?;
+                Box::new(e)
+            }
+            // TendermintStyle and XrplInspired (FBA stub) both route here.
+            _ => {
+                let mut e = TendermintEngine::new();
+                e.init(consensus_cfg, genesis_vs).await
+                    .map_err(|e| NodeError::Consensus(e.to_string()))?;
+                Box::new(e)
+            }
+        };
 
         // Build executor
         let exec_config = ExecutionConfig::from_genesis(&genesis);
@@ -662,7 +686,7 @@ impl Node {
 
         Ok(Self {
             genesis,
-            consensus: Box::new(engine),
+            consensus: engine,
             state,
             executor,
             network,

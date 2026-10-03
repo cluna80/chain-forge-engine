@@ -1874,23 +1874,90 @@ impl ConsensusEngine for TendermintEngine {
 /// properties hold, the communication pattern is simplified.
 ///
 /// Three phases per block:
-///   PREPARE:   Leader proposes block, collects 2f+1 PREPARE votes
-///   PRE-COMMIT: Leader aggregates PREPARE QC, collects 2f+1 PRE-COMMIT votes
-///   COMMIT:    Leader aggregates PRE-COMMIT QC, collects 2f+1 COMMIT votes
+///   PREPARE:    Leader proposes block extending locked_qc. Validators vote
+///               PREPARE if the proposal is safe (extends their lock or is
+///               endorsed by a higher-view prepare_qc).
+///   PRE-COMMIT: Leader broadcasts PREPARE QC. Validators vote PRE-COMMIT,
+///               updating their prepare_qc to this QC.
+///   COMMIT:     Leader broadcasts PRE-COMMIT QC. Validators vote COMMIT,
+///               locking on the block (locked_qc = PRE-COMMIT QC).
+///               On 2f+1 COMMIT votes, block is committed.
+///
+/// Safety invariant: a validator only votes for block b in PREPARE if
+///   b.parent == locked_qc.block_hash  OR  prepare_qc.view > locked_qc.view
+/// This ensures two blocks are never committed at the same height.
+///
+/// View-change: on timeout, validators broadcast a NewView message carrying
+/// their highest prepare_qc. The new leader waits for 2f+1 NewView messages,
+/// picks the highest-view prepare_qc among them, and proposes the block it
+/// extends (or a new block if that QC is nil). This is HotStuff's linear
+/// view-change protocol.
 ///
 /// Pipelining: COMMIT for block k happens in the PREPARE phase of block k+2,
 /// so the effective latency is one round-trip per block rather than three.
-/// Phase 0 implements the full three-phase logic without pipelining to keep
-/// the code straightforward; pipelining is a Phase 1 optimisation.
+/// This implementation performs non-pipelined three-phase logic per block to
+/// keep the code unambiguous; pipelining is a Phase 1 optimisation.
 ///
 /// Personhood weighting: applied identically to TendermintEngine via
 /// `apply_personhood_cap()`. The power cap is a QCB-specific constraint
 /// layered on top of HotStuff's standard quorum rules.
 ///
+/// VCA integration: when `ConsensusConfig.vca` is set, an adaptive quorum
+/// derived from the verified-personhood fraction ρ replaces the static
+/// 2n/3+1 threshold, matching the TendermintEngine integration.
+///
+/// Equivocation detection: the engine tracks one vote per validator per phase.
+/// A second conflicting vote from the same validator triggers an
+/// EquivocationDetected event, which the node routes to evidence handling.
+///
 /// Whitepaper ref: Section 3 / ConsensusVariant::HotStuffStyle.
 /// Open Question 2: which variant QCB ultimately uses depends on scale.
 
-/// Which phase of the HotStuff protocol we are in for the current height.
+// ── HotStuff-specific types ──────────────────────────────────────────────────
+
+/// A Quorum Certificate: evidence that 2f+1 validators voted for a specific
+/// (view, block) pair in a specific phase. In a real HotStuff implementation
+/// this would be a BLS threshold signature; here we carry the individual
+/// Vote structs and verify by summing voting power.
+#[derive(Debug, Clone)]
+pub struct QuorumCertificate {
+    /// The consensus view (height * MAX_ROUNDS + round) this QC was formed in.
+    pub view:       u64,
+    /// Block height.
+    pub height:     BlockHeight,
+    /// Round within height.
+    pub round:      Round,
+    /// The block hash this QC certifies.
+    pub block_hash: BlockHash,
+    /// The votes that form this QC (≥ 2f+1 by voting power).
+    pub votes:      Vec<Vote>,
+}
+
+impl QuorumCertificate {
+    /// Canonical view number: used for ordering QCs across heights and rounds.
+    pub fn view(height: BlockHeight, round: Round) -> u64 {
+        (height as u64) * 10_000 + (round as u64)
+    }
+
+    /// Total voting power represented in this QC.
+    pub fn power(&self, vs: &ValidatorSet) -> u64 {
+        self.votes.iter().map(|v| vs.power_of(&v.validator)).sum()
+    }
+}
+
+/// A NewView message sent on timeout.
+/// The new leader collects 2f+1 NewView messages and extracts the
+/// highest-view prepare_qc to determine the safe proposal.
+#[derive(Debug, Clone)]
+pub struct HotStuffNewView {
+    pub validator:  ValidatorId,
+    pub height:     BlockHeight,
+    pub new_round:  Round,
+    /// The highest prepare_qc this validator holds (None at genesis).
+    pub prepare_qc: Option<QuorumCertificate>,
+}
+
+/// Which phase of the HotStuff protocol we are in for the current (height, round).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HotStuffPhase {
     /// Waiting for the leader's PREPARE message (block proposal).
@@ -1905,28 +1972,129 @@ pub enum HotStuffPhase {
     Committed,
 }
 
+/// Per-phase vote accumulator tracking full Vote structs for equivocation
+/// detection and QC construction.
+#[derive(Debug, Default, Clone)]
+struct HsVoteAccum {
+    /// One entry per validator. Value = (first vote accepted, power).
+    votes: BTreeMap<ValidatorId, (Vote, u64)>,
+}
+
+impl HsVoteAccum {
+    fn clear(&mut self) { self.votes.clear(); }
+
+    /// Accept a vote. Returns:
+    ///   Ok(true)  — first vote from this validator, accepted.
+    ///   Ok(false) — duplicate of already-accepted vote, silently dropped.
+    ///   Err(equivoc) — conflicting vote (different block_hash): evidence returned.
+    fn accept(
+        &mut self,
+        vote: Vote,
+        power: u64,
+    ) -> Result<bool, crate::tendermint::EquivocationDetected> {
+        use std::collections::btree_map::Entry;
+        match self.votes.entry(vote.validator.clone()) {
+            Entry::Vacant(e) => {
+                e.insert((vote, power));
+                Ok(true)
+            }
+            Entry::Occupied(existing) => {
+                let (prev, _) = existing.get();
+                if prev.block_hash == vote.block_hash {
+                    Ok(false) // exact duplicate
+                } else {
+                    // Conflicting vote — emit equivocation evidence
+                    let vote_type_byte = match vote.vote_type {
+                        VoteType::Prevote   => 0,
+                        VoteType::Precommit => 1,
+                        VoteType::Nil       => 2,
+                    };
+                    let hash_a = prev.block_hash.clone()
+                        .unwrap_or_else(|| BlockHash("nil".into()));
+                    let hash_b = vote.block_hash.clone()
+                        .unwrap_or_else(|| BlockHash("nil".into()));
+                    Err(crate::tendermint::EquivocationDetected {
+                        validator_id:   vote.validator.clone(),
+                        height:         vote.height,
+                        round:          vote.round,
+                        vote_type_byte,
+                        block_hash_a:   hash_a,
+                        block_hash_b:   hash_b,
+                        signature_a:    prev.signature.clone(),
+                        signature_b:    vote.signature.clone(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Total voting power in the accumulator.
+    fn power(&self) -> u64 {
+        self.votes.values().map(|(_, p)| *p).sum()
+    }
+
+    fn has_quorum(&self, quorum: u64) -> bool {
+        self.power() >= quorum
+    }
+
+    /// Extract a QuorumCertificate once quorum is reached.
+    fn to_qc(&self, height: BlockHeight, round: Round, block_hash: BlockHash) -> QuorumCertificate {
+        QuorumCertificate {
+            view:  QuorumCertificate::view(height, round),
+            height,
+            round,
+            block_hash,
+            votes: self.votes.values().map(|(v, _)| v.clone()).collect(),
+        }
+    }
+
+    /// Extract vote list as CommitCertificate precommits.
+    fn to_precommits(&self) -> Vec<Vote> {
+        self.votes.values().map(|(v, _)| v.clone()).collect()
+    }
+}
+
 pub struct HotStuffEngine {
-    config:         ConsensusConfig,
-    validators:     ValidatorSet,
-    height:         BlockHeight,
-    round:          Round,
-    phase:          HotStuffPhase,
+    config:     ConsensusConfig,
+    validators: ValidatorSet,
+    height:     BlockHeight,
+    round:      Round,
+    phase:      HotStuffPhase,
+
     /// Current pending proposal (set on receive_proposal).
-    pending:        Option<BlockProposal>,
-    /// PREPARE votes accumulated for the pending block.
-    prepare_votes:  BTreeMap<ValidatorId, u64>,
-    /// PRE-COMMIT votes accumulated after PREPARE QC formed.
-    precommit_votes: BTreeMap<ValidatorId, u64>,
-    /// COMMIT votes accumulated after PRE-COMMIT QC formed.
-    commit_votes:   BTreeMap<ValidatorId, u64>,
-    /// Proposer index for round-robin rotation.
-    proposer_idx:   usize,
+    pending:    Option<BlockProposal>,
+
+    /// PREPARE votes for the pending block.
+    prepare_votes:   HsVoteAccum,
+    /// PRE-COMMIT votes after PREPARE QC formed.
+    precommit_votes: HsVoteAccum,
+    /// COMMIT votes after PRE-COMMIT QC formed.
+    commit_votes:    HsVoteAccum,
+
+    /// PREPARE QC from the most recent round where we observed 2f+1 PREPARE
+    /// votes. Used for the safe-block rule: in a new view the leader includes
+    /// this QC so replicas can verify the proposal is safe to vote for.
+    prepare_qc: Option<QuorumCertificate>,
+
+    /// The QC we are locked on (PRE-COMMIT QC for the most recently locked
+    /// block). Safety rule: we only vote PREPARE for b if
+    ///   b extends locked_qc.block_hash  OR  prepare_qc.view > locked_qc.view.
+    locked_qc: Option<QuorumCertificate>,
+
+    /// NewView messages collected during view-change (keyed by validator).
+    new_views: BTreeMap<ValidatorId, HotStuffNewView>,
+
+    /// Equivocation evidence pending draining by the node.
+    pending_equivocations: Vec<crate::tendermint::EquivocationDetected>,
+
+    /// VCA-derived quorum threshold (replaces static 2n/3+1 when set).
+    vca_quorum: Option<u64>,
 }
 
 impl HotStuffEngine {
     pub fn new() -> Self {
         Self {
-            config:          ConsensusConfig {
+            config: ConsensusConfig {
                 variant:              ConsensusVariant::HotStuffStyle,
                 chain_id:             String::new(),
                 propose_timeout_ms:   3_000,
@@ -1936,15 +2104,19 @@ impl HotStuffEngine {
                 personhood:           None,
                 vca:                  None,
             },
-            validators:      ValidatorSet { height: 0, validators: vec![] },
-            height:          0,
-            round:           0,
-            phase:           HotStuffPhase::WaitingForPrepare,
-            pending:         None,
-            prepare_votes:   BTreeMap::new(),
-            precommit_votes: BTreeMap::new(),
-            commit_votes:    BTreeMap::new(),
-            proposer_idx:    0,
+            validators:            ValidatorSet { height: 0, validators: vec![] },
+            height:                0,
+            round:                 0,
+            phase:                 HotStuffPhase::WaitingForPrepare,
+            pending:               None,
+            prepare_votes:         HsVoteAccum::default(),
+            precommit_votes:       HsVoteAccum::default(),
+            commit_votes:          HsVoteAccum::default(),
+            prepare_qc:            None,
+            locked_qc:             None,
+            new_views:             BTreeMap::new(),
+            pending_equivocations: Vec::new(),
+            vca_quorum:            None,
         }
     }
 
@@ -1956,42 +2128,64 @@ impl HotStuffEngine {
         Some(&self.validators.validators[idx].id)
     }
 
+    /// Active quorum threshold: VCA-derived when set, otherwise 2n/3+1.
     fn quorum(&self) -> u64 {
-        self.validators.quorum_power()
+        self.vca_quorum.unwrap_or_else(|| self.validators.quorum_power())
     }
 
-    fn voted_power(votes: &BTreeMap<ValidatorId, u64>) -> u64 {
-        votes.values().sum()
+    /// Safety check for the PREPARE phase (HotStuff Theorem 2).
+    ///
+    /// Returns true if it is safe to vote PREPARE for a block with the
+    /// given `parent_hash`:
+    ///   (a) the proposal extends our locked block, OR
+    ///   (b) our prepare_qc covers a view higher than our lock's view
+    ///       (meaning the network has already moved past our lock).
+    fn safe_to_vote(&self, parent_hash: &BlockHash) -> bool {
+        match (&self.locked_qc, &self.prepare_qc) {
+            (None, _) => true, // no lock yet — always safe
+            (Some(lock), _) if &lock.block_hash == parent_hash => true, // extends lock
+            (Some(lock), Some(prep)) if prep.view > lock.view => true,  // higher-view QC
+            _ => false,
+        }
     }
 
-    fn has_quorum(votes: &BTreeMap<ValidatorId, u64>, quorum: u64) -> bool {
-        Self::voted_power(votes) >= quorum
+    /// Reset all per-round vote state. Called on phase transitions and view change.
+    fn reset_round_state(&mut self) {
+        self.pending = None;
+        self.prepare_votes.clear();
+        self.precommit_votes.clear();
+        self.commit_votes.clear();
+        self.new_views.clear();
+        self.phase = HotStuffPhase::WaitingForPrepare;
     }
 
-    fn record_vote(
-        votes: &mut BTreeMap<ValidatorId, u64>,
-        validator: &ValidatorId,
-        power: u64,
-    ) {
-        votes.entry(validator.clone()).or_insert(power);
-    }
-
-    /// Build a CommitCertificate from the commit votes.
+    /// Build a CommitCertificate from accumulated COMMIT votes.
     fn make_certificate(&self, block_hash: BlockHash) -> CommitCertificate {
-        let precommits = self.commit_votes.keys().map(|id| Vote {
-            vote_type:  VoteType::Precommit,
-            height:     self.height,
-            round:      self.round,
-            validator:  id.clone(),
-            block_hash: Some(block_hash.clone()),
-            signature:  vec![],
-        }).collect();
         CommitCertificate {
             height:     self.height,
             round:      self.round,
             block_hash,
-            precommits,
+            precommits: self.commit_votes.to_precommits(),
         }
+    }
+
+    /// Record a NewView message (used during view-change).
+    /// Returns true when we've collected 2f+1 NewView messages from distinct
+    /// validators, meaning the new leader can safely propose.
+    pub fn record_new_view(&mut self, nv: HotStuffNewView) -> bool {
+        self.new_views.entry(nv.validator.clone()).or_insert(nv);
+        let total_power: u64 = self.new_views.keys()
+            .map(|id| self.validators.power_of(id))
+            .sum();
+        total_power >= self.quorum()
+    }
+
+    /// Among all collected NewView messages, find the highest-view prepare_qc.
+    /// The new leader uses this to determine the safe block to propose.
+    pub fn highest_new_view_qc(&self) -> Option<&QuorumCertificate> {
+        self.new_views.values()
+            .filter_map(|nv| nv.prepare_qc.as_ref())
+            .max_by_key(|qc| qc.view)
     }
 }
 
@@ -2001,7 +2195,7 @@ impl Default for HotStuffEngine {
 
 #[async_trait::async_trait]
 impl ConsensusEngine for HotStuffEngine {
-    fn name(&self) -> &str { "HotStuff-style BFT (Phase 0 — three-phase, no pipelining)" }
+    fn name(&self) -> &str { "HotStuff-style BFT (three-phase, QC-locked)" }
     fn variant(&self) -> ConsensusVariant { ConsensusVariant::HotStuffStyle }
 
     async fn init(
@@ -2016,14 +2210,46 @@ impl ConsensusEngine for HotStuffEngine {
         if genesis_validators.validators.is_empty() {
             return Err(ConsensusError::InsufficientValidators { needed: 1, have: 0 });
         }
-        self.validators = genesis_validators;
+
+        // VCA path: build registry, apply weights, derive adaptive quorum.
+        let vs = if let Some(vca_cfg) = &config.vca {
+            let registry = build_vca_registry_from_validator_set(
+                0, // genesis epoch
+                &genesis_validators,
+                vca_cfg.weight_config.clone(),
+            );
+            match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
+                Ok(q) => {
+                    self.vca_quorum = Some(q);
+                    let mut vs = genesis_validators;
+                    apply_vca_weights_to_validator_set(&mut vs, &registry);
+                    tracing::info!(
+                        epoch        = 0,
+                        validators   = vs.validators.len(),
+                        total_weight = vs.total_power(),
+                        vca_quorum   = q,
+                        "HotStuff-VCA genesis: weights and adaptive quorum set"
+                    );
+                    vs
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "HotStuff-VCA quorum computation failed, using static 2f+1");
+                    genesis_validators
+                }
+            }
+        } else {
+            genesis_validators
+        };
+
+        self.validators = vs;
         self.config     = config;
-        self.phase      = HotStuffPhase::WaitingForPrepare;
+        self.reset_round_state();
+
         tracing::info!(
-            variant    = "HotStuff-style BFT",
-            validators = self.validators.validators.len(),
-            total_power = self.validators.total_power(),
-            quorum_power = self.validators.quorum_power(),
+            variant      = "HotStuff-style BFT",
+            validators   = self.validators.validators.len(),
+            total_power  = self.validators.total_power(),
+            quorum_power = self.quorum(),
             "HotStuff consensus engine initialised"
         );
         Ok(())
@@ -2032,6 +2258,25 @@ impl ConsensusEngine for HotStuffEngine {
     fn validator_set(&self) -> &ValidatorSet { &self.validators }
     fn current_height(&self) -> BlockHeight  { self.height }
     fn current_round(&self)  -> Round        { self.round  }
+
+    fn update_validator_set(&mut self, mut vs: ValidatorSet) -> Result<(), ConsensusError> {
+        if let Some(ref pc) = self.config.personhood.clone() {
+            vs = apply_personhood_cap(vs, pc);
+        }
+        if let Some(vca_cfg) = &self.config.vca.clone() {
+            let registry = build_vca_registry_from_validator_set(
+                self.height,
+                &vs,
+                vca_cfg.weight_config.clone(),
+            );
+            if let Ok(q) = compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
+                self.vca_quorum = Some(q);
+                apply_vca_weights_to_validator_set(&mut vs, &registry);
+            }
+        }
+        self.validators = vs;
+        Ok(())
+    }
 
     async fn propose(
         &mut self,
@@ -2044,6 +2289,12 @@ impl ConsensusEngine for HotStuffEngine {
             .cloned()
             .unwrap_or_else(|| ValidatorId("solo".into()));
 
+        // If we have a highest NewView QC, propose the block it extends
+        // (safe proposal rule). Otherwise use the provided parent_hash.
+        let safe_parent = self.highest_new_view_qc()
+            .map(|qc| qc.block_hash.clone())
+            .unwrap_or(parent_hash);
+
         let block_hash = BlockHash(format!(
             "hs_h{height}_r{round}_{:08x}",
             tx_data.len() as u32
@@ -2054,7 +2305,7 @@ impl ConsensusEngine for HotStuffEngine {
             round,
             proposer,
             block_hash,
-            parent_hash,
+            parent_hash: safe_parent,
             timestamp_ms: 0,
             tx_data,
             signature: vec![],
@@ -2063,6 +2314,7 @@ impl ConsensusEngine for HotStuffEngine {
         tracing::debug!(
             height, round,
             leader = %proposal.proposer,
+            locked_qc = ?self.locked_qc.as_ref().map(|q| &q.block_hash),
             "HotStuff PREPARE: block proposed"
         );
         Ok(proposal)
@@ -2075,27 +2327,26 @@ impl ConsensusEngine for HotStuffEngine {
         if proposal.height < self.height {
             return Err(ConsensusError::StaleMessage(proposal.height, self.height));
         }
-        // Phase 0: accept any well-formed proposal from the expected leader
-        if self.phase != HotStuffPhase::WaitingForPrepare
-            && self.phase != HotStuffPhase::Committed
-        {
-            tracing::warn!(
-                phase = ?self.phase,
-                "HotStuff: received proposal in unexpected phase, resetting"
-            );
-            self.prepare_votes.clear();
-            self.precommit_votes.clear();
-            self.commit_votes.clear();
+
+        // Safety rule: only vote PREPARE for b if it is safe per locked_qc.
+        if !self.safe_to_vote(&proposal.parent_hash) {
+            return Err(ConsensusError::MalformedProposal(format!(
+                "LockViolation: proposal at h={} r={} extends {} but we are locked on {}",
+                proposal.height, proposal.round, proposal.parent_hash.0,
+                self.locked_qc.as_ref().map(|q| q.block_hash.0.as_str()).unwrap_or("none")
+            )));
         }
 
-        self.pending      = Some(proposal.clone());
-        self.phase        = HotStuffPhase::CollectingPrepareVotes;
+        // Accept: reset phase votes and start collecting PREPARE votes.
         self.prepare_votes.clear();
         self.precommit_votes.clear();
         self.commit_votes.clear();
+        self.pending = Some(proposal.clone());
+        self.phase   = HotStuffPhase::CollectingPrepareVotes;
 
         tracing::debug!(
             height = proposal.height,
+            round  = proposal.round,
             hash   = %proposal.block_hash,
             "HotStuff: PREPARE phase started"
         );
@@ -2111,8 +2362,8 @@ impl ConsensusEngine for HotStuffEngine {
             return Err(ConsensusError::UnknownValidator(vote.validator));
         }
 
-        let block_hash = match &vote.block_hash {
-            Some(h) => h.clone(),
+        let block_hash = match vote.block_hash.clone() {
+            Some(h) => h,
             None    => return Ok(None), // nil vote advances round, handled in on_timeout
         };
 
@@ -2120,40 +2371,70 @@ impl ConsensusEngine for HotStuffEngine {
 
         match self.phase {
             HotStuffPhase::CollectingPrepareVotes => {
-                Self::record_vote(&mut self.prepare_votes, &vote.validator, power);
-                if Self::has_quorum(&self.prepare_votes, quorum) {
-                    tracing::debug!(
-                        height = vote.height,
-                        "HotStuff: PREPARE QC formed -- advancing to PRE-COMMIT"
-                    );
+                match self.prepare_votes.accept(vote.clone(), power) {
+                    Err(ev) => { self.pending_equivocations.push(ev); }
+                    Ok(_) => {}
+                }
+                if self.prepare_votes.has_quorum(quorum) {
+                    // Form PREPARE QC and update prepare_qc (safe for higher-view rule).
+                    let qc = self.prepare_votes.to_qc(self.height, self.round, block_hash.clone());
+                    // Update prepare_qc if this QC is higher-view than what we hold.
+                    let update = match &self.prepare_qc {
+                        None     => true,
+                        Some(pq) => qc.view > pq.view,
+                    };
+                    if update { self.prepare_qc = Some(qc); }
                     self.phase = HotStuffPhase::CollectingPreCommitVotes;
+                    tracing::debug!(
+                        height = self.height, round = self.round,
+                        "HotStuff: PREPARE QC formed — advancing to PRE-COMMIT"
+                    );
                 }
             }
             HotStuffPhase::CollectingPreCommitVotes => {
-                Self::record_vote(&mut self.precommit_votes, &vote.validator, power);
-                if Self::has_quorum(&self.precommit_votes, quorum) {
-                    tracing::debug!(
-                        height = vote.height,
-                        "HotStuff: PRE-COMMIT QC formed -- advancing to COMMIT"
-                    );
+                match self.precommit_votes.accept(vote.clone(), power) {
+                    Err(ev) => { self.pending_equivocations.push(ev); }
+                    Ok(_) => {}
+                }
+                if self.precommit_votes.has_quorum(quorum) {
+                    // Form PRE-COMMIT QC — this becomes our locked_qc.
+                    let qc = self.precommit_votes.to_qc(self.height, self.round, block_hash.clone());
+                    // Lock rule: update locked_qc if this QC is higher-view.
+                    let update = match &self.locked_qc {
+                        None     => true,
+                        Some(lq) => qc.view > lq.view,
+                    };
+                    if update { self.locked_qc = Some(qc); }
                     self.phase = HotStuffPhase::CollectingCommitVotes;
+                    tracing::debug!(
+                        height = self.height, round = self.round,
+                        "HotStuff: PRE-COMMIT QC formed — locked, advancing to COMMIT"
+                    );
                 }
             }
             HotStuffPhase::CollectingCommitVotes => {
-                Self::record_vote(&mut self.commit_votes, &vote.validator, power);
-                if Self::has_quorum(&self.commit_votes, quorum) {
+                match self.commit_votes.accept(vote.clone(), power) {
+                    Err(ev) => { self.pending_equivocations.push(ev); }
+                    Ok(_) => {}
+                }
+                if self.commit_votes.has_quorum(quorum) {
                     self.phase = HotStuffPhase::Committed;
-                    let cert = self.make_certificate(block_hash);
+                    let cert = self.make_certificate(block_hash.clone());
                     tracing::info!(
                         height = cert.height,
+                        round  = cert.round,
                         block  = %cert.block_hash,
-                        "HotStuff: COMMIT QC formed -- block committed"
+                        "HotStuff: COMMIT QC formed — block committed"
                     );
                     return Ok(Some(cert));
                 }
             }
             HotStuffPhase::WaitingForPrepare | HotStuffPhase::Committed => {
-                tracing::debug!(phase = ?self.phase, "HotStuff: vote in unexpected phase, ignoring");
+                tracing::debug!(
+                    phase = ?self.phase,
+                    validator = %vote.validator,
+                    "HotStuff: vote in unexpected phase, ignoring"
+                );
             }
         }
         Ok(None)
@@ -2164,19 +2445,22 @@ impl ConsensusEngine for HotStuffEngine {
         height: BlockHeight,
         round:  Round,
     ) -> ConsensusResult<Vote> {
-        tracing::warn!(height, round, "HotStuff: round timed out, advancing");
-        self.round   = round + 1;
-        self.phase   = HotStuffPhase::WaitingForPrepare;
-        self.pending = None;
-        self.prepare_votes.clear();
-        self.precommit_votes.clear();
-        self.commit_votes.clear();
+        tracing::warn!(height, round, "HotStuff: round timed out — view change");
 
+        // Advance view.
+        self.round = round + 1;
+        self.reset_round_state();
+
+        // Broadcast NewView so the new leader can determine the safe block.
+        // In this Phase 0 implementation the NewView is encoded as a Nil vote;
+        // the full NewView type is available for out-of-band use by the node.
         let nil_vote = Vote {
             vote_type:  VoteType::Nil,
             height,
             round,
-            validator:  ValidatorId("self".into()),
+            validator:  self.current_leader()
+                .cloned()
+                .unwrap_or_else(|| ValidatorId("self".into())),
             block_hash: None,
             signature:  vec![],
         };
@@ -2188,23 +2472,20 @@ impl ConsensusEngine for HotStuffEngine {
         certificate:       CommitCertificate,
         new_validator_set: Option<ValidatorSet>,
     ) -> ConsensusResult<()> {
-        self.height      = certificate.height + 1;
-        self.round       = 0;
-        self.phase       = HotStuffPhase::WaitingForPrepare;
-        self.pending     = None;
-        self.prepare_votes.clear();
-        self.precommit_votes.clear();
-        self.commit_votes.clear();
+        self.height    = certificate.height + 1;
+        self.round     = 0;
+        // Unlock: locked_qc is cleared on successful commit so the next
+        // height's proposal is accepted without a stale height lock.
+        self.locked_qc = None;
+        self.reset_round_state();
 
-        if let Some(mut new_set) = new_validator_set {
-            if let Some(ref pc) = self.config.personhood.clone() {
-                new_set = apply_personhood_cap(new_set, pc);
-            }
-            self.validators = new_set;
+        if let Some(new_set) = new_validator_set {
+            self.update_validator_set(new_set)
+                .map_err(|e| ConsensusError::Internal(e.to_string()))?;
         }
 
         tracing::info!(
-            height     = self.height,
+            height = self.height,
             "HotStuff: committed, advancing to next height"
         );
         Ok(())
@@ -2215,8 +2496,10 @@ impl ConsensusEngine for HotStuffEngine {
         certificate:   &CommitCertificate,
         validator_set: &ValidatorSet,
     ) -> ConsensusResult<()> {
-        // Count power in the certificate's precommits
+        let threshold = self.vca_quorum.unwrap_or_else(|| validator_set.quorum_power());
         let mut power: u64 = 0;
+        let mut seen: std::collections::HashSet<&ValidatorId> = Default::default();
+
         for vote in &certificate.precommits {
             if vote.vote_type != VoteType::Precommit {
                 return Err(ConsensusError::InvalidVote {
@@ -2225,19 +2508,40 @@ impl ConsensusEngine for HotStuffEngine {
                     reason:     "non-precommit vote in HotStuff commit certificate".into(),
                 });
             }
+            if vote.block_hash.as_ref() != Some(&certificate.block_hash) {
+                return Err(ConsensusError::InvalidVote {
+                    validator:  vote.validator.clone(),
+                    block_hash: certificate.block_hash.clone(),
+                    reason:     format!(
+                        "vote block_hash {:?} does not match certificate block_hash {}",
+                        vote.block_hash, certificate.block_hash
+                    ),
+                });
+            }
+            if !seen.insert(&vote.validator) {
+                return Err(ConsensusError::InvalidVote {
+                    validator:  vote.validator.clone(),
+                    block_hash: certificate.block_hash.clone(),
+                    reason:     "duplicate validator in commit certificate".into(),
+                });
+            }
             power += validator_set.power_of(&vote.validator);
         }
-        if power < validator_set.quorum_power() {
+
+        if power < threshold {
             return Err(ConsensusError::InvalidVote {
                 validator:  ValidatorId("quorum".into()),
                 block_hash: certificate.block_hash.clone(),
                 reason:     format!(
-                    "insufficient commit power: {power} < {}",
-                    validator_set.quorum_power()
+                    "insufficient commit power: {power} < {threshold} (threshold)"
                 ),
             });
         }
         Ok(())
+    }
+
+    fn drain_equivocations(&mut self) -> Vec<crate::tendermint::EquivocationDetected> {
+        std::mem::take(&mut self.pending_equivocations)
     }
 }
 
@@ -3398,8 +3702,335 @@ mod tests {
             "HotStuff: personhood cap should be applied at init");
     }
 
+    // -- HotStuffEngine: safety-rule, locking, equivocation, verify_commit ----
+
+    /// Drive an engine from proposal → 3 PREPARE votes → 3 PRE-COMMIT votes,
+    /// returning (engine, proposal) so callers can continue to COMMIT.
+    async fn hotstuff_drive_to_precommit(
+        engine: &mut HotStuffEngine,
+        height: u64,
+        round:  u32,
+        parent: &str,
+    ) -> BlockProposal {
+        let proposal = engine
+            .propose(height, round, BlockHash(parent.into()), vec![])
+            .await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+
+        // PREPARE votes
+        for i in 1..=3 {
+            let v = Vote {
+                vote_type:  VoteType::Prevote,
+                height,
+                round,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            engine.receive_vote(v).await.unwrap();
+        }
+        assert_eq!(engine.phase, HotStuffPhase::CollectingPreCommitVotes);
+
+        // PRE-COMMIT votes
+        for i in 1..=3 {
+            let v = Vote {
+                vote_type:  VoteType::Precommit,
+                height,
+                round,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            engine.receive_vote(v).await.unwrap();
+        }
+        assert_eq!(engine.phase, HotStuffPhase::CollectingCommitVotes);
+        proposal
+    }
+
+    #[tokio::test]
+    async fn hotstuff_locked_qc_set_after_precommit_quorum() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        hotstuff_drive_to_precommit(&mut engine, 0, 0, "genesis").await;
+
+        // After PRE-COMMIT quorum, locked_qc must be set.
+        assert!(engine.locked_qc.is_some(), "locked_qc should be set after PRE-COMMIT QC");
+        let lqc = engine.locked_qc.as_ref().unwrap();
+        assert_eq!(lqc.height, 0);
+        assert_eq!(lqc.round, 0);
+    }
+
+    #[tokio::test]
+    async fn hotstuff_locked_qc_cleared_on_commit() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let proposal = hotstuff_drive_to_precommit(&mut engine, 0, 0, "genesis").await;
+
+        // Reach COMMIT quorum.
+        let mut cert = None;
+        for i in 1..=3 {
+            let v = Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                block_hash: Some(proposal.block_hash.clone()),
+                signature:  vec![],
+            };
+            cert = engine.receive_vote(v).await.unwrap();
+        }
+        let cert = cert.unwrap();
+
+        // on_commit should clear locked_qc so next height starts unlocked.
+        engine.on_commit(cert, None).await.unwrap();
+        assert!(engine.locked_qc.is_none(), "locked_qc must be cleared after on_commit");
+        assert_eq!(engine.height, 1);
+        assert_eq!(engine.round, 0);
+        assert_eq!(engine.phase, HotStuffPhase::WaitingForPrepare);
+    }
+
+    #[tokio::test]
+    async fn hotstuff_safety_rule_rejects_non_extending_proposal() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        // Set up a locked_qc manually (simulating having locked on block A).
+        engine.locked_qc = Some(QuorumCertificate {
+            view:       QuorumCertificate::view(0, 0),
+            height:     0,
+            round:      0,
+            block_hash: BlockHash("block_A".into()),
+            votes:      vec![],
+        });
+        // propose_qc is None (no higher-view QC seen).
+        engine.prepare_qc = None;
+
+        // A proposal that does NOT extend block_A and has no higher-view prepare_qc
+        // should be rejected.
+        let bad_proposal = BlockProposal {
+            height:      0,
+            round:       1,
+            proposer:    ValidatorId("hs_val_1".into()),
+            block_hash:  BlockHash("block_B".into()),
+            parent_hash: BlockHash("block_X".into()), // NOT block_A
+            timestamp_ms: 0,
+            tx_data:     vec![],
+            signature:   vec![],
+        };
+
+        let result = engine.receive_proposal(bad_proposal).await;
+        assert!(result.is_err(), "safety rule: must reject proposal that doesn't extend locked_qc");
+        match result.unwrap_err() {
+            ConsensusError::MalformedProposal(msg) => {
+                assert!(msg.contains("LockViolation"), "error message should mention LockViolation");
+            }
+            other => panic!("expected MalformedProposal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hotstuff_safety_rule_allows_proposal_with_higher_view_prepare_qc() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        // Lock on block_A at view 0.
+        engine.locked_qc = Some(QuorumCertificate {
+            view:       QuorumCertificate::view(0, 0),
+            height:     0,
+            round:      0,
+            block_hash: BlockHash("block_A".into()),
+            votes:      vec![],
+        });
+        // But we've seen a higher-view prepare_qc at view 1 (endorsing block_B).
+        engine.prepare_qc = Some(QuorumCertificate {
+            view:       QuorumCertificate::view(0, 1),
+            height:     0,
+            round:      1,
+            block_hash: BlockHash("block_B".into()),
+            votes:      vec![],
+        });
+
+        // A proposal extending block_B (the higher-view QC's block) should be safe.
+        let safe_proposal = BlockProposal {
+            height:      0,
+            round:       2,
+            proposer:    ValidatorId("hs_val_2".into()),
+            block_hash:  BlockHash("block_C".into()),
+            parent_hash: BlockHash("block_B".into()), // extends block_B
+            timestamp_ms: 0,
+            tx_data:     vec![],
+            signature:   vec![],
+        };
+
+        let result = engine.receive_proposal(safe_proposal).await;
+        assert!(result.is_ok(), "higher-view prepare_qc unlocks: should accept proposal");
+    }
+
+    #[tokio::test]
+    async fn hotstuff_equivocation_detected_in_prepare_phase() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let proposal = engine.propose(0, 0, BlockHash("genesis".into()), vec![]).await.unwrap();
+        engine.receive_proposal(proposal.clone()).await.unwrap();
+        assert_eq!(engine.phase, HotStuffPhase::CollectingPrepareVotes);
+
+        // First vote for block A.
+        let vote_a = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  ValidatorId("hs_val_1".into()),
+            block_hash: Some(proposal.block_hash.clone()),
+            signature:  vec![1],
+        };
+        engine.receive_vote(vote_a).await.unwrap();
+        assert!(engine.pending_equivocations.is_empty());
+
+        // Same validator, conflicting block hash.
+        let vote_b = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  ValidatorId("hs_val_1".into()),
+            block_hash: Some(BlockHash("other_block".into())),
+            signature:  vec![2],
+        };
+        engine.receive_vote(vote_b).await.unwrap();
+
+        let evs = engine.drain_equivocations();
+        assert_eq!(evs.len(), 1, "double-vote should produce one equivocation event");
+        assert_eq!(evs[0].validator_id, ValidatorId("hs_val_1".into()));
+        assert_eq!(evs[0].height, 0);
+        assert_eq!(evs[0].round, 0);
+
+        // drain_equivocations clears the buffer.
+        assert!(engine.drain_equivocations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hotstuff_verify_commit_rejects_duplicate_validators() {
+        let mut engine = HotStuffEngine::new();
+        let validators = hotstuff_validators(4);
+        engine.init(hotstuff_config(), validators.clone()).await.unwrap();
+
+        // Duplicate validator in the certificate.
+        let dup_cert = CommitCertificate {
+            height:     0,
+            round:      0,
+            block_hash: BlockHash("block_0".into()),
+            precommits: vec![
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                       validator: ValidatorId("hs_val_1".into()),
+                       block_hash: Some(BlockHash("block_0".into())), signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                       validator: ValidatorId("hs_val_1".into()), // duplicate!
+                       block_hash: Some(BlockHash("block_0".into())), signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                       validator: ValidatorId("hs_val_2".into()),
+                       block_hash: Some(BlockHash("block_0".into())), signature: vec![] },
+            ],
+        };
+        let result = engine.verify_commit(&dup_cert, &validators);
+        assert!(result.is_err(), "verify_commit must reject duplicate validators");
+    }
+
+    #[tokio::test]
+    async fn hotstuff_verify_commit_rejects_wrong_block_hash_in_vote() {
+        let mut engine = HotStuffEngine::new();
+        let validators = hotstuff_validators(4);
+        engine.init(hotstuff_config(), validators.clone()).await.unwrap();
+
+        // One vote has a mismatched block_hash.
+        let bad_cert = CommitCertificate {
+            height:     0,
+            round:      0,
+            block_hash: BlockHash("block_correct".into()),
+            precommits: vec![
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                       validator: ValidatorId("hs_val_1".into()),
+                       block_hash: Some(BlockHash("block_WRONG".into())), // mismatch
+                       signature: vec![] },
+                Vote { vote_type: VoteType::Precommit, height: 0, round: 0,
+                       validator: ValidatorId("hs_val_2".into()),
+                       block_hash: Some(BlockHash("block_correct".into())),
+                       signature: vec![] },
+            ],
+        };
+        let result = engine.verify_commit(&bad_cert, &validators);
+        assert!(result.is_err(), "verify_commit must reject votes for wrong block hash");
+    }
+
+    #[tokio::test]
+    async fn hotstuff_new_view_quorum_detection() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        // Advance round via timeout so engine is in round 1.
+        engine.on_timeout(0, 0).await.unwrap();
+        assert_eq!(engine.round, 1);
+
+        // Collect NewView messages from 3 of 4 validators (each with power=1;
+        // quorum = 3). No prepare_qc yet (genesis).
+        for i in 1..=2 {
+            let nv = HotStuffNewView {
+                validator:  ValidatorId(format!("hs_val_{i}")),
+                height:     0,
+                new_round:  1,
+                prepare_qc: None,
+            };
+            let reached = engine.record_new_view(nv);
+            assert!(!reached, "2 of 4 is not quorum yet");
+        }
+
+        let nv3 = HotStuffNewView {
+            validator:  ValidatorId("hs_val_3".into()),
+            height:     0,
+            new_round:  1,
+            prepare_qc: None,
+        };
+        let reached = engine.record_new_view(nv3);
+        assert!(reached, "3 of 4 NewView messages should satisfy quorum");
+
+        // highest_new_view_qc is None when all NewViews carry None.
+        assert!(engine.highest_new_view_qc().is_none());
+    }
+
+    #[tokio::test]
+    async fn hotstuff_update_validator_set_applies_personhood_cap() {
+        let mut engine = HotStuffEngine::new();
+        let mut config = hotstuff_config();
+        config.personhood = Some(PersonhoodConfig {
+            power_cap:          1,
+            reject_expired_pop: false,
+            min_verified_pct:   0,
+        });
+        engine.init(config, hotstuff_validators(4)).await.unwrap();
+
+        // Push a new validator set where one validator has huge power.
+        let mut new_vs = hotstuff_validators(4);
+        new_vs.validators[0].voting_power = 100;
+        new_vs.validators[0].pop_verified = true;
+
+        engine.update_validator_set(new_vs).unwrap();
+
+        // After update, the capped validator should be clamped to 1.
+        let capped = engine.validator_set().validators.iter()
+            .find(|v| v.id == ValidatorId("hs_val_1".into())).unwrap();
+        assert_eq!(capped.voting_power, 1,
+            "update_validator_set must apply personhood cap");
+    }
+
 }
 }
+
+// Re-export the BFT engine types at crate root so callers can import them
+// without knowing which sub-module they live in.
+pub use tendermint::{TendermintEngine, EquivocationDetected};
+pub use tendermint::{HotStuffEngine, HotStuffPhase, QuorumCertificate, HotStuffNewView};
+pub use tendermint::new_hotstuff;
 
 /// Compile-time assertion that `chain_forge_consensus::ValidatorId` and
 /// `chain_forge_core::ValidatorId` are exactly the same type.
