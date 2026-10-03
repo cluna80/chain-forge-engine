@@ -9,6 +9,7 @@ chain-forge-core      = { path = "../chain-forge-core" }
 chain-forge-consensus = { path = "../chain-forge-consensus" }
 chain-forge-crypto    = { path = "../chain-forge-crypto" }
 chain-forge-identity  = { path = "../chain-forge-identity" }
+chain-forge-vca-pq    = { path = "../chain-forge-vca-pq" }
 serde = { workspace = true }
 
 ark-ff = "0.4"

@@ -28,6 +28,12 @@ use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::prelude::*;
 use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
 
+pub mod eligibility;
+pub use eligibility::{
+    EligibilityConfig, EligibilityError, EligibilityRegistry,
+    EpochCredential, EpochId, Nullifier, NullifierSet, PersonhoodBound,
+};
+
 pub mod issuer_registry;
 pub use issuer_registry::{IssuerGovernanceError, IssuerRegistry, IssuerRegistrySnapshot};
 
