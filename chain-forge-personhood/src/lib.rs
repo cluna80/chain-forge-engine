@@ -58,6 +58,19 @@ pub use issuer_approval_circuit::{
     issuer_approval_public_inputs,
 };
 
+pub mod personhood_threshold_circuit;
+pub use personhood_threshold_circuit::{
+    PersonhoodProofError, PersonhoodScore, PersonhoodThresholdCircuit, PersonhoodThresholdKeys,
+    PersonhoodThresholdProver, PersonhoodThresholdVerifier, PERSONHOOD_D,
+    personhood_threshold_public_inputs,
+};
+
+pub mod eligibility_proof;
+pub use eligibility_proof::{
+    EligibilityKeys, EligibilityProof, EligibilityProver, EligibilityStatement,
+    EligibilityVerifier, EligibilityVerifyError,
+};
+
 // ── Pedersen hash windows ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
