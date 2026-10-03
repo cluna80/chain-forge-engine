@@ -701,7 +701,7 @@ Phase | Milestone | Rough Horizon | Status
 Phase 0 (Chain Forge) | Consensus engine design and implementation — pluggable BFT variants (Tendermint-style, HotStuff-style, XRPL-inspired); QRC resource economy crate (`chain-forge-qrc`) | 18–48 months | **In progress — Tendermint-style BFT operational and partition-tolerant on 4-node testnet as of September 2026 (live iptables partition test passing; f=1 BFT fault tolerance confirmed); QRC Economic Model v0.1 implemented in `chain-forge-qrc` (CIRFI rename complete, QrcEngine + contribution_settlement + CapacityEvidence_v0 sub-protocol, October 2026); HotStuff and XRPL variants pending. See Section 7.4 for detail.**
 Phase 0 (QCB) | Whitepaper, identity layer research — proceeds in parallel with Chain Forge Phase 0, dependent on it for a working consensus target | 18–48 months | **In progress — whitepaper complete (this document); attestation guard Phases A–D implemented in chain-forge-identity (65 tests passing, September 2026); QRC Economic Model v0.1 incorporated (October 2026); identity pilot parameters provisional.**
 Phase 1 | Personhood-weighted BFT consensus live on testnet; Charm Confinement + Intrinsic Charm implemented | 18–30 months following Phase 0 | Pending — prerequisite (pluggable BFT consensus) now has a working base; personhood-weighting overlay not yet built
-Phase 2 | Identity layer pilot (small integration test, then real-world pilot against cost/sybil targets); QRC module activation, activity reward claims open | 6–12 months following Phase 1 | Pending
+Phase 2 | Identity layer pilot (small integration test, then real-world pilot against cost/sybil targets); QRC module live — purchase path (QCB burn → QRC) and contribution path (VCA-verified providers earn QRC) open | 6–12 months following Phase 1 | Pending
 Phase 3 | Merchant API + Stripe-compatible integration, BME activation, first on-chain burns | 6–12 months following Phase 2 | Pending
 Phase 4 | Charmed Agents live, physical merchant expansion, 1 million verified humans | Multi-year, adoption-dependent | Pending
 Phase 5+ | Decentralized governance maturity; permissioned EVM layer (Section 7.2) activated once identity layer is proven at scale; interoperability reconsidered only if a PoP-preserving bridge design exists | — | Pending
@@ -720,7 +720,7 @@ Calibration questions — decisions needed before or shortly after launch:
 
 1. Final identity layer design — web-of-trust base plus live-challenge backstop, or a different hybrid; cost and sybil-rate results from pilot testing against the provisional targets named in Section 4 (sybil rate below 3%, verification cost below $5/human — both illustrative, to be revised as the pilot is designed)
 2. Final BFT variant selection for QCB specifically (Chain Forge will support multiple; QCB must pick one)
-3. Base exemption calibration — fixed at 30 days of activity rewards, or dynamic
+3. Base exemption calibration — no longer applicable to $QRC (no demurrage on QRC balances under QRC Economic Model v0.1); this question now applies only to any future $QCB staking-exemption mechanics if introduced
 4. Reserve strategy — what backs price stability, if anything
 5. Jurisdiction and legal entity structure, given activity rewards distribution and merchant payment processing
 6. Validator economics — staking incentives, slashing conditions, bounds on per-human validator power
