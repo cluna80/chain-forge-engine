@@ -52,6 +52,12 @@ pub use nullifier_circuit::{
     nullifier_circuit_public_inputs,
 };
 
+pub mod issuer_approval_circuit;
+pub use issuer_approval_circuit::{
+    IssuerApprovalCircuit, IssuerApprovalKeys, IssuerApprovalProver, IssuerApprovalVerifier,
+    issuer_approval_public_inputs,
+};
+
 // ── Pedersen hash windows ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
