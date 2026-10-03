@@ -243,7 +243,7 @@ pub const KNOWN_MODULES: &[(&str, &str)] = &[
     ("bank",     "accounts, transfers and burns (always on)"),
     ("staking",  "Stake transactions"),
     ("identity", "proof of personhood: RegisterIdentity and web-of-trust Attest"),
-    ("cirfi",    "UBI claims and the UBI pool (requires identity)"),
+    ("qrc",    "UBI claims and the UBI pool (requires identity)"),
     ("agents",   "sponsored agents (requires identity)"),
 ];
 
@@ -253,14 +253,14 @@ pub const KNOWN_MODULES: &[(&str, &str)] = &[
 pub struct EnabledModules {
     pub staking:  bool,
     pub identity: bool,
-    pub cirfi:    bool,
+    pub qrc:    bool,
     pub agents:   bool,
 }
 
 impl EnabledModules {
     /// Everything on -- the QCB module set.
     pub fn all() -> Self {
-        Self { staking: true, identity: true, cirfi: true, agents: true }
+        Self { staking: true, identity: true, qrc: true, agents: true }
     }
 }
 
@@ -383,7 +383,7 @@ impl GenesisConfig {
                 "bank"     => {}
                 "staking"  => m.staking = true,
                 "identity" => m.identity = true,
-                "cirfi"    => m.cirfi = true,
+                "qrc"    => m.qrc = true,
                 "agents"   => m.agents = true,
                 other => errors.push(format!(
                     "unknown module \"{other}\" (known modules: {})", known.join(", ")
@@ -395,8 +395,8 @@ impl GenesisConfig {
                 "custom module \"{name}\": Chain Forge does not support custom modules yet; remove it from custom_modules"
             ));
         }
-        if m.cirfi && !m.identity {
-            errors.push("module \"cirfi\" requires \"identity\": UBI is paid only to verified humans".into());
+        if m.qrc && !m.identity {
+            errors.push("module \"qrc\" requires \"identity\": UBI is paid only to verified humans".into());
         }
         if self.consensus.personhood_weighted && !m.identity {
             errors.push("consensus.personhood_weighted requires the \"identity\" module: personhood needs an identity layer".into());
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn qcb_module_set_enables_everything() {
-        let m = with_modules(&["bank", "staking", "identity", "cirfi", "agents"], &[]).enabled_modules().unwrap();
+        let m = with_modules(&["bank", "staking", "identity", "qrc", "agents"], &[]).enabled_modules().unwrap();
         assert_eq!(m, EnabledModules::all());
     }
 
@@ -629,8 +629,8 @@ mod tests {
 
     #[test]
     fn modules_that_need_identity_are_refused_without_it() {
-        let e = with_modules(&["bank", "cirfi", "agents"], &[]).enabled_modules().unwrap_err();
-        assert!(e.contains("\"cirfi\" requires \"identity\""));
+        let e = with_modules(&["bank", "qrc", "agents"], &[]).enabled_modules().unwrap_err();
+        assert!(e.contains("\"qrc\" requires \"identity\""));
         assert!(e.contains("\"agents\" requires \"identity\""));
     }
 
@@ -642,7 +642,7 @@ mod tests {
         let e = cfg.enabled_modules().unwrap_err();
         assert!(e.contains("personhood_weighted requires"));
 
-        let mut qcb = with_modules(&["bank", "staking", "identity", "cirfi", "agents"], &[]);
+        let mut qcb = with_modules(&["bank", "staking", "identity", "qrc", "agents"], &[]);
         qcb.consensus.personhood_weighted = true;
         assert!(qcb.enabled_modules().is_ok());
     }

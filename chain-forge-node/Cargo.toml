@@ -15,7 +15,7 @@ chain-forge-consensus = { path = "../chain-forge-consensus", features = ["real-c
 chain-forge-state     = { path = "../chain-forge-state" }
 chain-forge-execution = { path = "../chain-forge-execution" }
 chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network"] }
-chain-forge-cirfi     = { path = "../chain-forge-cirfi" }
+chain-forge-qrc     = { path = "../chain-forge-qrc" }
 chain-forge-identity  = { path = "../chain-forge-identity" }
 chain-forge-slashing  = { path = "../chain-forge-slashing" }
 chain-forge-validators = { path = "../chain-forge-validators" }

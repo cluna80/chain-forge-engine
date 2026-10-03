@@ -16,7 +16,7 @@ use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
 use chain_forge_slashing::{SlashingModule, EquivocationEvidence};
 use chain_forge_validators::ValidatorRegistry;
 use chain_forge_identity::IdentityStore;
-use chain_forge_cirfi::CirfiEngine;
+use chain_forge_qrc::QrcEngine;
 use chain_forge_p2p::{
     MockNetworkService, NetworkConfig, NetworkEvent, NetworkService,
     GossipTopic, OutboundMessage, PeerInfo,
@@ -101,33 +101,33 @@ pub const MAX_RECENT_BLOCKS: usize = 100;
 
 pub type SharedExplorer = Arc<Mutex<ExplorerState>>;
 
-// -- CirFi metrics (shared with the API, Section 9.1 / 5.4) -------------------
+// -- QRC metrics (shared with the API, Section 9.1 / 5.4) -------------------
 
-/// Live snapshot of CirFi monetary engine metrics.
-/// Updated on every epoch boundary. Read by /api/cirfi.
+/// Live snapshot of QRC monetary engine metrics.
+/// Updated on every epoch boundary. Read by /api/qrc.
 #[derive(Debug, Default, serde::Serialize, Clone)]
-pub struct CirfiMetrics {
-    /// Current UBI pool balance (ucirfi).
-    pub ubi_pool_balance_ucirfi:      u128,
-    /// Total ucirfi received into UBI pool from demurrage since genesis.
-    pub total_decayed_to_pool_ucirfi: u128,
-    /// Total ucirfi distributed as UBI since genesis.
-    pub total_ubi_distributed_ucirfi: u128,
-    /// Total BME fees collected (ucirfi) since genesis.
-    pub total_bme_fees_ucirfi:        u128,
+pub struct QrcMetrics {
+    /// Current UBI pool balance (uqrc).
+    pub ubi_pool_balance_uqrc:      u128,
+    /// Total uqrc received into UBI pool from demurrage since genesis.
+    pub total_decayed_to_pool_uqrc: u128,
+    /// Total uqrc distributed as UBI since genesis.
+    pub total_ubi_distributed_uqrc: u128,
+    /// Total BME fees collected (uqrc) since genesis.
+    pub total_bme_fees_uqrc:        u128,
     /// Total $QCB burned via BME (uqcb) since genesis.
     pub total_qcb_burned_uqcb:        u128,
     /// BME fee rate in basis points (50 = 0.5%).
     pub bme_fee_bps:                  u32,
     /// Whether BME is live (Section 6.3 threshold met).
     pub bme_is_live:                  bool,
-    /// Daily UBI rate per verified human (ucirfi).
-    pub daily_ubi_rate_ucirfi:        u128,
+    /// Daily UBI rate per verified human (uqrc).
+    pub daily_ubi_rate_uqrc:        u128,
     /// Epoch of most recent metrics update.
     pub last_updated_epoch:           u64,
 }
 
-pub type SharedCirfiMetrics = Arc<Mutex<CirfiMetrics>>;
+pub type SharedQrcMetrics = Arc<Mutex<QrcMetrics>>;
 
 /// Connected peers, updated from real network events (Section 7.4 / P2P layer).
 /// Read by /api/peers.
@@ -184,7 +184,7 @@ pub struct Node {
     network:   Box<dyn NetworkService>,
     status:         SharedStatus,
     explorer:       SharedExplorer,
-    cirfi_metrics:  SharedCirfiMetrics,
+    qrc_metrics:  SharedQrcMetrics,
     /// Connected peers, maintained from PeerConnected/PeerDisconnected/PeerList events.
     peers:          SharedPeers,
     /// This node's validator identity. None = observer node (no voting).
@@ -239,10 +239,10 @@ pub struct Node {
     /// verified-tier gate. Threaded through execute_block_with_identity()
     /// on every commit so identity state actually persists across blocks.
     identity: IdentityStore,
-    /// CirFi monetary engine (demurrage, UBI pool, BME) -- backs ClaimUbi
+    /// QRC monetary engine (demurrage, UBI pool, BME) -- backs ClaimUbi
     /// and RedirectToUbiPool. Threaded through execute_block_with_identity()
     /// alongside identity, for the same reason.
-    cirfi: CirfiEngine,
+    qrc: QrcEngine,
     /// Slashing enforcement module (equivocation + liveness).
     /// Detects double-sign evidence and computes stake burns routed to BME.
     slasher: SlashingModule,
@@ -338,7 +338,7 @@ impl Node {
         let modules = genesis.enabled_modules().map_err(NodeError::Genesis)?;
         info!(
             staking = modules.staking, identity = modules.identity,
-            cirfi = modules.cirfi, agents = modules.agents,
+            qrc = modules.qrc, agents = modules.agents,
             personhood_weighted = genesis.consensus.personhood_weighted,
             "modules enabled"
         );
@@ -433,6 +433,7 @@ impl Node {
             precommit_timeout_ms: genesis.consensus.block_time_ms,
             block_time_ms:        genesis.consensus.block_time_ms,
             personhood:           personhood_cfg,
+            vca:                  None,
         };
 
         let mut engine = TendermintEngine::new();
@@ -494,9 +495,9 @@ impl Node {
 
         let validator_id = validator_address.map(ValidatorId);
         let explorer       = Arc::new(Mutex::new(ExplorerState::default()));
-        let cirfi_metrics  = Arc::new(Mutex::new(CirfiMetrics {
+        let qrc_metrics  = Arc::new(Mutex::new(QrcMetrics {
             bme_fee_bps:          50,
-            daily_ubi_rate_ucirfi: chain_forge_identity::DAILY_UBI_RATE_UCIRFI,
+            daily_ubi_rate_uqrc: chain_forge_identity::DAILY_UBI_RATE_UQRC,
             ..Default::default()
         }));
 
@@ -577,7 +578,7 @@ impl Node {
             info!("no attestation_coordinator in genesis — ConfirmSybil/ReverseSybil disabled until set");
         }
 
-        let cirfi   = CirfiEngine::new("ucirfi".to_string(), "uqcb".to_string());
+        let qrc   = QrcEngine::new(chain_forge_qrc::D);
         let slasher = SlashingModule::with_qcb_defaults();
 
         // Seed the ValidatorRegistry with genesis validators, gated on
@@ -667,7 +668,7 @@ impl Node {
             network,
             status,
             explorer,
-            cirfi_metrics,
+            qrc_metrics,
             peers,
             data_dir: None,
             signing_key: None,
@@ -680,7 +681,7 @@ impl Node {
             round_watch_started: None,
             chain_store: std::collections::BTreeMap::new(),
             identity,
-            cirfi,
+            qrc,
             slasher,
             validator_registry,
             tx_queue,
@@ -714,8 +715,8 @@ impl Node {
         self.explorer.clone()
     }
 
-    pub fn cirfi_metrics(&self) -> SharedCirfiMetrics {
-        self.cirfi_metrics.clone()
+    pub fn qrc_metrics(&self) -> SharedQrcMetrics {
+        self.qrc_metrics.clone()
     }
 
     pub fn peers(&self) -> SharedPeers {
@@ -876,7 +877,7 @@ impl Node {
     }
 
     /// Write chain state to disk. Called after every committed block.
-    /// Writes three JSON files: state snapshot, identity store, CirFi engine.
+    /// Writes three JSON files: state snapshot, identity store, QRC engine.
     fn persist_state(&self) {
         let Some(ref dir) = self.data_dir else { return };
         let persist = dir.join("persist");
@@ -884,7 +885,7 @@ impl Node {
         for (name, value) in [
             ("state.json",    serde_json::to_string_pretty(&snap)        .ok()),
             ("identity.json", serde_json::to_string_pretty(&self.identity).ok()),
-            ("cirfi.json",    serde_json::to_string_pretty(&self.cirfi)   .ok()),
+            ("qrc.json",    serde_json::to_string_pretty(&self.qrc)   .ok()),
         ] {
             if let Some(json) = value {
                 let _ = std::fs::write(persist.join(name), json);
@@ -900,7 +901,7 @@ impl Node {
         let persist = dir.join("persist");
         let snap_path  = persist.join("state.json");
         let id_path    = persist.join("identity.json");
-        let cirfi_path = persist.join("cirfi.json");
+        let qrc_path = persist.join("qrc.json");
         if !snap_path.exists() { return false; }
 
         let mut load = || -> Result<(), Box<dyn std::error::Error>> {
@@ -912,8 +913,8 @@ impl Node {
             if id_path.exists() {
                 self.identity = serde_json::from_str(&std::fs::read_to_string(&id_path)?)?;
             }
-            if cirfi_path.exists() {
-                self.cirfi = serde_json::from_str(&std::fs::read_to_string(&cirfi_path)?)?;
+            if qrc_path.exists() {
+                self.qrc = serde_json::from_str(&std::fs::read_to_string(&qrc_path)?)?;
             }
             tracing::info!(height, "chain state loaded from disk");
             Ok(())
@@ -1629,13 +1630,13 @@ impl Node {
     /// because a gossiped vote from a peer did. This is the follower-safe
     /// counterpart to propose_block()'s inline commit tail: propose_block()
     /// Process equivocation evidence: slash the validator, burn the slashed
-    /// stake via the BME mechanism (Section 6.3), and update CirFi metrics.
+    /// stake via the BME mechanism (Section 6.3), and update QRC metrics.
     ///
     /// This is the BME routing entry point for equivocation slashing.
     /// The slashing module computes the burn amount; this method:
     ///   1. Calls `slasher.slash_equivocation` to tombstone + compute burn
     ///   2. Burns the slashed uqcb from the validator's account in StateStore
-    ///   3. Increments `cirfi_metrics.total_qcb_burned_uqcb` for the API
+    ///   3. Increments `qrc_metrics.total_qcb_burned_uqcb` for the API
     ///
     /// Returns the burn amount on success, or an error description.
     pub fn process_equivocation_evidence(
@@ -1668,8 +1669,8 @@ impl Node {
                     "BME burn failed; tombstone applied but tokens not burned"
                 );
             } else {
-                // Update the live CirFi metrics counter for /api/cirfi
-                let mut cm = self.cirfi_metrics.lock().unwrap();
+                // Update the live QRC metrics counter for /api/qrc
+                let mut cm = self.qrc_metrics.lock().unwrap();
                 cm.total_qcb_burned_uqcb =
                     cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
                 info!(
@@ -1781,7 +1782,7 @@ impl Node {
                                 "liveness slash: BME burn failed; jail applied but tokens not burned"
                             );
                         } else {
-                            let mut cm = self.cirfi_metrics.lock().unwrap();
+                            let mut cm = self.qrc_metrics.lock().unwrap();
                             cm.total_qcb_burned_uqcb =
                                 cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
                             warn!(
@@ -1877,17 +1878,17 @@ impl Node {
             }
         }
 
-        // Validator participation = on-chain activity for CirFi yield eligibility.
+        // Validator participation = on-chain activity for QRC yield eligibility.
         // Every validator who signed a precommit in this block's commit certificate
         // gets their activity stamped for this epoch. This means validators earn
-        // CirFi yield for doing their job — producing/signing blocks — without
+        // QRC yield for doing their job — producing/signing blocks — without
         // needing to submit separate Transfer or Stake txs.
         for vote in &cert.precommits {
             self.identity.record_activity(&vote.validator.0);
         }
 
         let exec_result = self.executor.execute_block_with_identity(
-            cert.height, txs, &mut self.state, &mut self.identity, &mut self.cirfi, now_ms,
+            cert.height, txs, &mut self.state, &mut self.identity, &mut self.qrc, now_ms,
         );
 
         info!(
@@ -2176,7 +2177,7 @@ impl Node {
         }
 
         let exec_result = self.executor.execute_block_with_identity(
-            height, txs, &mut self.state, &mut self.identity, &mut self.cirfi, now_ms,
+            height, txs, &mut self.state, &mut self.identity, &mut self.qrc, now_ms,
         );
 
         info!(
@@ -2254,15 +2255,15 @@ impl Node {
             }).collect();
         }
 
-        // Update CirFi metrics snapshot (Section 9.1 / 5.4)
-        // Phase 0: metrics come from the execution layer's CirFi engine.
+        // Update QRC metrics snapshot (Section 9.1 / 5.4)
+        // Phase 0: metrics come from the execution layer's QRC engine.
         // We update the daily UBI rate from identity constants; full per-epoch
-        // demurrage and BME stats wire in Phase 1 when CirFiEngine is plumbed
+        // demurrage and BME stats wire in Phase 1 when QRCEngine is plumbed
         // through the execution pipeline end-to-end.
         {
-            let mut cm = self.cirfi_metrics.lock().unwrap();
+            let mut cm = self.qrc_metrics.lock().unwrap();
             cm.last_updated_epoch     = exec_result.height;
-            cm.daily_ubi_rate_ucirfi  = chain_forge_identity::DAILY_UBI_RATE_UCIRFI;
+            cm.daily_ubi_rate_uqrc  = chain_forge_identity::DAILY_UBI_RATE_UQRC;
             // Count UBI claim events from this block's tx results
             let ubi_claims = exec_result.tx_results.iter()
                 .filter(|r| r.success)
@@ -2270,9 +2271,9 @@ impl Node {
                 .filter(|e| e.starts_with("ubi_claim:"))
                 .count();
             if ubi_claims > 0 {
-                cm.total_ubi_distributed_ucirfi = cm.total_ubi_distributed_ucirfi
+                cm.total_ubi_distributed_uqrc = cm.total_ubi_distributed_uqrc
                     .saturating_add(ubi_claims as u128
-                        * chain_forge_identity::DAILY_UBI_RATE_UCIRFI);
+                        * chain_forge_identity::DAILY_UBI_RATE_UQRC);
             }
             // Count BME redirect events
             let redirects = exec_result.tx_results.iter()
@@ -2282,8 +2283,8 @@ impl Node {
                 .count();
             if redirects > 0 {
                 // 0.5% BME fee on redirects (50bp)
-                cm.total_bme_fees_ucirfi = cm.total_bme_fees_ucirfi
-                    .saturating_add(redirects as u128 * 5_000); // approx 0.5% of 1M ucirfi
+                cm.total_bme_fees_uqrc = cm.total_bme_fees_uqrc
+                    .saturating_add(redirects as u128 * 5_000); // approx 0.5% of 1M uqrc
                 cm.bme_fee_bps = 50;
             }
         }
@@ -2311,7 +2312,7 @@ mod tests {
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
-        "modules": ["bank", "staking", "identity", "cirfi", "agents"],
+        "modules": ["bank", "staking", "identity", "qrc", "agents"],
         "custom_modules": [],
         "genesis_accounts": [
             { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator" },
@@ -2485,8 +2486,14 @@ mod tests {
         let alice = ex.accounts.get("qcb1alice").expect("alice snapshot");
         assert_eq!(alice.role, "validator");
         assert!(alice.balances.get("uqcb").copied().unwrap_or(0) > 0);
-        // Genesis accounts have no IntrinsicCharm attached in Phase 0
-        assert!(alice.tier.is_none());
+        // Genesis validators are seeded as Verified in the identity store and
+        // their charm is synced into StateStore during Node::new(), so the
+        // explorer shows "Verified" from block 1 onward.
+        assert_eq!(
+            alice.tier.as_deref(),
+            Some("Verified"),
+            "genesis validators must appear as Verified in the explorer"
+        );
         assert_eq!(alice.exemption_days, 0);
     }
 
@@ -2552,7 +2559,7 @@ mod tests {
     async fn plain_chain_seeds_no_identities() {
         let plain = GENESIS
             .replace(
-                r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
+                r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
                 r#""modules": ["bank", "staking"]"#,
             )
             .replace(r#""personhood_weighted": true"#, r#""personhood_weighted": false"#);
@@ -2564,7 +2571,7 @@ mod tests {
     #[tokio::test]
     async fn node_refuses_to_start_with_an_unknown_module() {
         let bad = GENESIS.replace(
-            r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
+            r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
             r#""modules": ["bank", "dex"]"#,
         );
         let err = Node::new(&bad, None).await.err().expect("must refuse to start");
@@ -2574,7 +2581,7 @@ mod tests {
     #[tokio::test]
     async fn node_refuses_personhood_consensus_without_identity() {
         let bad = GENESIS.replace(
-            r#""modules": ["bank", "staking", "identity", "cirfi", "agents"]"#,
+            r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
             r#""modules": ["bank", "staking"]"#,
         ); // fixture keeps personhood_weighted: true
         let err = Node::new(&bad, None).await.err().expect("must refuse to start");

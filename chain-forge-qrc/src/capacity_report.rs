@@ -1,7 +1,7 @@
 //! # capacity_report — CapacityEvidence_v0 State Machine
 //!
 //! Implements the CapacityReport sub-protocol specified in
-//! `cirfi_sim/CapacityReport-SubProtocol-v0.1.md`.
+//! `qrc_sim/CapacityReport-SubProtocol-v0.1.md`.
 //!
 //! ## What this module provides
 //!
@@ -26,7 +26,7 @@
 //! ## Fixed-point arithmetic
 //!
 //! All capacity values use D = 1_000_000 as denominator, consistent with the
-//! CIRFI spec. An integer value `x` represents `x / D` in real units.
+//! QRC spec. An integer value `x` represents `x / D` in real units.
 //! All arithmetic is integer; no floating point enters consensus-critical paths.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -34,7 +34,7 @@ use thiserror::Error;
 
 // ── Constants (§8) ────────────────────────────────────────────────────────────
 
-/// Fixed-point denominator, inherited from CIRFI spec. CONSTITUTIONAL.
+/// Fixed-point denominator, inherited from QRC spec. CONSTITUTIONAL.
 pub const D: u128 = 1_000_000;
 
 /// Minimum evidence items required for a valid (non-carry-forward) report.
@@ -261,7 +261,7 @@ pub enum AggregationMethod {
 pub struct CapacityReport {
     pub epoch:                u64,
     pub resource_reports:     BTreeMap<ResourceType, ResourceCapacityRecord>,
-    /// The weighted sum `capacity_e` consumed by the CIRFI epoch boundary.
+    /// The weighted sum `capacity_e` consumed by the QRC epoch boundary.
     pub capacity_total:       u128,
     /// Merkle root of sorted evidence per resource type (for dispute anchoring).
     pub evidence_roots:       BTreeMap<ResourceType, [u8; 32]>,
@@ -705,7 +705,7 @@ impl CapacityReportState {
         Ok(())
     }
 
-    /// The `capacity_e` value to hand to the CIRFI epoch boundary sequence.
+    /// The `capacity_e` value to hand to the QRC epoch boundary sequence.
     ///
     /// Returns the aggregated report's `capacity_total` if a report exists
     /// (FINALIZING or FINALIZED), or the weighted sum of prior-epoch values if

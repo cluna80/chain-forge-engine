@@ -122,11 +122,11 @@ impl Persona for HonestEarlyAdopter {
         }
         if epoch == 4 {
             if let Ok(Some(acct)) = ctx.get_account(self.id()).await {
-                let has_cirfi = acct.balances.get("ucirfi").copied().unwrap_or(0) > 0;
-                checks.push(if has_cirfi {
-                    CheckResult::pass("sim-alice: UBI claim credited ucirfi balance")
+                let has_qrc = acct.balances.get("uqrc").copied().unwrap_or(0) > 0;
+                checks.push(if has_qrc {
+                    CheckResult::pass("sim-alice: UBI claim credited uqrc balance")
                 } else {
-                    CheckResult::fail("sim-alice: UBI claim credited ucirfi balance", "balance is zero")
+                    CheckResult::fail("sim-alice: UBI claim credited uqrc balance", "balance is zero")
                 });
             }
         }

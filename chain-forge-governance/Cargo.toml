@@ -9,7 +9,7 @@ license.workspace = true
 #
 # Two tiers of governance, strictly separated:
 #
-#   ORDINARY — one-human-one-vote for $CIRFI parameters (decay rates,
+#   ORDINARY — one-human-one-vote for $QRC parameters (decay rates,
 #   UBI rate, exemption thresholds). Simple majority, >3% quorum.
 #
 #   CONSTITUTIONAL — two-thirds supermajority for changes to the

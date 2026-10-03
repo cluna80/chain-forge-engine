@@ -1,33 +1,33 @@
-//! # chain-forge-cirfi
+//! # chain-forge-qrc
 //!
-//! The QCB resource economy. Implements the CIRFI Economic Model v0.1.
+//! The QCB resource economy. Implements the QRC Economic Model v0.1.
 //!
-//! ## What $CIRFI is
+//! ## What $QRC is
 //!
-//! $CIRFI is a **resource consumption token**, not a UBI token.
+//! $QRC is a **resource consumption token**, not a UBI token.
 //! It is the unit of account for all network resource usage:
 //! compute, storage, ZK proving, bandwidth, oracle data, AI inference,
 //! and external verification.
 //!
 //! ## Two minting paths (fully independent)
 //!
-//! 1. **Purchase path**: QCB is permanently burned → CIRFI resource credits
+//! 1. **Purchase path**: QCB is permanently burned → QRC resource credits
 //!    are created at the algorithmic rate `Rt`. Rate adjusts with network load.
-//! 2. **Contribution path**: Verified resource providers earn CIRFI minted
+//! 2. **Contribution path**: Verified resource providers earn QRC minted
 //!    directly when the VCA system confirms delivery. No QCB is involved.
 //!
-//! There is **no CIRFI → QCB conversion**. This is a constitutional constraint.
+//! There is **no QRC → QCB conversion**. This is a constitutional constraint.
 //!
 //! ## Consumption split
 //!
-//! When CIRFI is consumed by an operation it splits:
+//! When QRC is consumed by an operation it splits:
 //!   ~60% → provider compensation
-//!   ~25% → permanent CIRFI burn (deflationary pressure)
+//!   ~25% → permanent QRC burn (deflationary pressure)
 //!   ~15% → protocol reserve
 //!
 //! ## Demand loop
 //!
-//! Network usage grows → CIRFI demand rises → more QCB burned to obtain CIRFI
+//! Network usage grows → QRC demand rises → more QCB burned to obtain QRC
 //! → QCB supply contracts → QCB scarcity increases.
 //!
 //! ## Core supply equation
@@ -39,7 +39,7 @@
 //!
 //! ## What this module does NOT include
 //!
-//! - The old UBI/demurrage model (superseded by CIRFI Economic Model v0.1)
+//! - The old UBI/demurrage model (superseded by QRC Economic Model v0.1)
 //! - ZK proof of contribution verification (VCA layer, see chain-forge-personhood)
 //! - Cross-resource arbitrage constraints (deferred, Section 11)
 //! - Delegated budget mechanics (deferred, Section 11)
@@ -86,11 +86,11 @@ pub const RESERVE_SHARE: u128 = 150_000;
 
 // PROVIDER_SHARE + BURN_SHARE + RESERVE_SHARE must equal D. Verified by test.
 
-/// Hard floor on Rt: prevents CIRFI from becoming free during low demand.
+/// Hard floor on Rt: prevents QRC from becoming free during low demand.
 /// TBD via economic simulation; placeholder = 0.1 × R0.
 pub const R_MIN_FRACTION: u128 = 100_000; // 0.10 × D (10% of R0)
 
-/// Hard ceiling on Rt: prevents CIRFI from becoming unaffordable.
+/// Hard ceiling on Rt: prevents QRC from becoming unaffordable.
 /// TBD via economic simulation; placeholder = 10 × R0.
 pub const R_MAX_FRACTION: u128 = 10_000_000; // 10.0 × D (1000% of R0)
 
@@ -100,11 +100,11 @@ pub const GAMMA_NUM: u128 = 2; // integer — used in integer exponentiation
 
 // ── ResourceKind ─────────────────────────────────────────────────────────────
 
-/// All network resource types that CIRFI prices.
+/// All network resource types that QRC prices.
 /// Extended resource types (oracle data, AI inference, external verification)
 /// are listed here for completeness but share the `Compute` billing tier
 /// until per-type weights are calibrated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum ResourceKind {
     Compute,
     Storage,
@@ -128,17 +128,17 @@ impl ResourceKind {
         ]
     }
 
-    /// Base CIRFI cost for one normalized unit of this resource (× D).
+    /// Base QRC cost for one normalized unit of this resource (× D).
     /// These are illustrative placeholders — must be calibrated by simulation.
     pub fn base_cost_per_unit(self) -> u128 {
         match self {
-            ResourceKind::Compute              =>   1_000, // 0.001 CIRFI/CU
-            ResourceKind::Storage              =>     100, // 0.0001 CIRFI/byte·epoch
-            ResourceKind::ZkProving            =>  10_000, // 0.01 CIRFI/proof-second
-            ResourceKind::Bandwidth            =>     500, // 0.0005 CIRFI/kB
-            ResourceKind::OracleData           =>   5_000, // 0.005 CIRFI/query
-            ResourceKind::AiInference          =>  50_000, // 0.05 CIRFI/inference
-            ResourceKind::ExternalVerification => 100_000, // 0.1 CIRFI/verification
+            ResourceKind::Compute              =>   1_000, // 0.001 QRC/CU
+            ResourceKind::Storage              =>     100, // 0.0001 QRC/byte·epoch
+            ResourceKind::ZkProving            =>  10_000, // 0.01 QRC/proof-second
+            ResourceKind::Bandwidth            =>     500, // 0.0005 QRC/kB
+            ResourceKind::OracleData           =>   5_000, // 0.005 QRC/query
+            ResourceKind::AiInference          =>  50_000, // 0.05 QRC/inference
+            ResourceKind::ExternalVerification => 100_000, // 0.1 QRC/verification
         }
     }
 }
@@ -147,7 +147,7 @@ impl ResourceKind {
 
 /// Tracks demand and capacity for one resource type in one window,
 /// and carries the EMA-smoothed utilization across windows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResourceUtilization {
     /// Resource type.
     pub kind: ResourceKind,
@@ -200,13 +200,13 @@ impl ResourceUtilization {
         self.congestion = self.u_bar.saturating_mul(D) / U_STAR;
     }
 
-    /// The congestion multiplier for CIRFI pricing.
+    /// The congestion multiplier for QRC pricing.
     /// congestion > 1.0 × D means above-target → operations cost more.
     pub fn congestion_multiplier(&self) -> u128 {
         self.congestion
     }
 
-    /// CIRFI cost for `units` of this resource in the current window.
+    /// QRC cost for `units` of this resource in the current window.
     /// cost = base_cost_per_unit * congestion_multiplier * units / D
     pub fn cost_for(&self, units: u128) -> u128 {
         let base  = self.kind.base_cost_per_unit();
@@ -217,17 +217,17 @@ impl ResourceUtilization {
 
 // ── ConversionRate ────────────────────────────────────────────────────────────
 
-/// Algorithmic QCB → CIRFI conversion rate state.
+/// Algorithmic QCB → QRC conversion rate state.
 ///
 /// Rt = R0 * (U* / U-bar_aggregate)^gamma
 /// Clamped to [Rmin, Rmax].
 ///
-/// When utilization is below target, Rt > R0 (more CIRFI per QCB burned —
-/// cheaper to acquire capacity). When above target, Rt < R0 (CIRFI is scarce).
-#[derive(Debug, Clone)]
+/// When utilization is below target, Rt > R0 (more QRC per QCB burned —
+/// cheaper to acquire capacity). When above target, Rt < R0 (QRC is scarce).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConversionRate {
-    /// Base rate R0: CIRFI units minted per QCB burned at target utilization.
-    /// Fixed-point × D. E.g. 1_000_000 = 1.0 CIRFI per QCB.
+    /// Base rate R0: QRC units minted per QCB burned at target utilization.
+    /// Fixed-point × D. E.g. 1_000_000 = 1.0 QRC per QCB.
     pub r0: u128,
     /// Current rate Rt (fixed-point × D).
     pub rt: u128,
@@ -258,8 +258,8 @@ impl ConversionRate {
         }
 
         // ratio = U* / U-bar (fixed-point).
-        // If U-bar < U* → ratio > 1 → Rt > R0 (more CIRFI per QCB).
-        // If U-bar > U* → ratio < 1 → Rt < R0 (less CIRFI per QCB).
+        // If U-bar < U* → ratio > 1 → Rt > R0 (more QRC per QCB).
+        // If U-bar > U* → ratio < 1 → Rt < R0 (less QRC per QCB).
         let ratio = U_STAR.saturating_mul(D) / u_bar_aggregate;
 
         // Rt = R0 * ratio^gamma.
@@ -271,9 +271,9 @@ impl ConversionRate {
         self.rt = rt_raw.clamp(self.r_min, self.r_max);
     }
 
-    /// CIRFI minted for `qcb_burned` QCB at the current rate.
-    /// cirfi_minted = qcb_burned * Rt / D
-    pub fn cirfi_for_qcb(&self, qcb_burned: u128) -> u128 {
+    /// QRC minted for `qcb_burned` QCB at the current rate.
+    /// qrc_minted = qcb_burned * Rt / D
+    pub fn qrc_for_qcb(&self, qcb_burned: u128) -> u128 {
         qcb_burned.saturating_mul(self.rt) / D
     }
 }
@@ -299,14 +299,14 @@ fn integer_pow_fp(base: u128, exp: u128) -> u128 {
 
 // ── ConsumptionSplit ──────────────────────────────────────────────────────────
 
-/// Result of splitting a CIRFI consumption event.
+/// Result of splitting a QRC consumption event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumptionSplit {
-    /// CIRFI routed to providers who served this operation.
+    /// QRC routed to providers who served this operation.
     pub to_providers: u128,
-    /// CIRFI permanently burned.
+    /// QRC permanently burned.
     pub burned: u128,
-    /// CIRFI added to protocol reserve.
+    /// QRC added to protocol reserve.
     pub to_reserve: u128,
 }
 
@@ -317,7 +317,7 @@ impl ConsumptionSplit {
     }
 }
 
-/// Split `amount` of CIRFI according to the 60/25/15 consumption split.
+/// Split `amount` of QRC according to the 60/25/15 consumption split.
 /// Rounding remainder goes to providers (minimizes burn/reserve drift).
 pub fn split_consumption(amount: u128) -> ConsumptionSplit {
     let to_providers = amount.saturating_mul(PROVIDER_SHARE) / D;
@@ -342,7 +342,7 @@ pub fn split_consumption(amount: u128) -> ConsumptionSplit {
 /// `contributions` maps resource kind → verified contribution units (from VCA).
 /// `utilization` carries the current congestion state per resource.
 ///
-/// Returns CIRFI minted for this provider (fixed-point units).
+/// Returns QRC minted for this provider (fixed-point units).
 pub fn provider_earning(
     contributions: &BTreeMap<ResourceKind, u128>,
     utilization:   &BTreeMap<ResourceKind, ResourceUtilization>,
@@ -397,14 +397,14 @@ impl Default for OperationCost {
     fn default() -> Self { Self::new() }
 }
 
-// ── CirfiEngine ───────────────────────────────────────────────────────────────
+// ── QrcEngine ───────────────────────────────────────────────────────────────
 
-/// The full CIRFI resource economy engine.
+/// The full QRC resource economy engine.
 ///
 /// Tracks per-resource utilization, the conversion rate, cumulative supply
-/// metrics, and applies the economic formulas from CIRFI Economic Model v0.1.
-#[derive(Debug, Clone)]
-pub struct CirfiEngine {
+/// metrics, and applies the economic formulas from QRC Economic Model v0.1.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QrcEngine {
     // -- Per-resource utilization state --
     pub utilization: BTreeMap<ResourceKind, ResourceUtilization>,
 
@@ -415,15 +415,15 @@ pub struct CirfiEngine {
     pub conversion_rate: ConversionRate,
 
     // -- Supply metrics --
-    /// Total CIRFI in circulation (Mt).
+    /// Total QRC in circulation (Mt).
     pub total_supply: u128,
-    /// CIRFI minted via purchase path (sum of Qt*Rt over all windows).
+    /// QRC minted via purchase path (sum of Qt*Rt over all windows).
     pub total_purchase_minted: u128,
-    /// CIRFI minted via contribution path (sum of Ei,t over all windows).
+    /// QRC minted via contribution path (sum of Ei,t over all windows).
     pub total_contribution_minted: u128,
-    /// CIRFI permanently burned from consumption splits.
+    /// QRC permanently burned from consumption splits.
     pub total_burned: u128,
-    /// CIRFI in protocol reserve.
+    /// QRC in protocol reserve.
     pub protocol_reserve: u128,
     /// QCB burned across all purchase conversions.
     pub total_qcb_burned: u128,
@@ -432,9 +432,9 @@ pub struct CirfiEngine {
     pub current_window: u64,
 }
 
-impl CirfiEngine {
+impl QrcEngine {
     /// Create a new engine with the given base conversion rate R0.
-    /// `r0` is fixed-point × D: how many CIRFI units are minted per QCB
+    /// `r0` is fixed-point × D: how many QRC units are minted per QCB
     /// burned at target utilization.
     pub fn new(r0: u128) -> Self {
         let mut utilization = BTreeMap::new();
@@ -462,37 +462,37 @@ impl CirfiEngine {
 
     // ── Purchase path ─────────────────────────────────────────────────────────
 
-    /// Burn `qcb_amount` QCB and mint CIRFI at the current rate Rt.
+    /// Burn `qcb_amount` QCB and mint QRC at the current rate Rt.
     ///
-    /// Returns `(cirfi_minted, rt_used)`.
+    /// Returns `(qrc_minted, rt_used)`.
     ///
-    /// Security: the no-CIRFI-to-QCB constraint is enforced at the protocol
-    /// level; this function only handles the QCB → CIRFI direction.
-    pub fn purchase_cirfi(&mut self, qcb_amount: u128) -> (u128, u128) {
-        let cirfi_minted = self.conversion_rate.cirfi_for_qcb(qcb_amount);
+    /// Security: the no-QRC-to-QCB constraint is enforced at the protocol
+    /// level; this function only handles the QCB → QRC direction.
+    pub fn purchase_qrc(&mut self, qcb_amount: u128) -> (u128, u128) {
+        let qrc_minted = self.conversion_rate.qrc_for_qcb(qcb_amount);
         let rt_used      = self.conversion_rate.rt;
 
         self.total_qcb_burned          += qcb_amount;
-        self.total_supply              += cirfi_minted;
-        self.total_purchase_minted     += cirfi_minted;
+        self.total_supply              += qrc_minted;
+        self.total_purchase_minted     += qrc_minted;
 
         tracing::info!(
             qcb_burned   = qcb_amount,
-            cirfi_minted,
+            qrc_minted,
             rt           = rt_used,
             window       = self.current_window,
-            "CIRFI purchase: QCB burned → CIRFI minted"
+            "QRC purchase: QCB burned → QRC minted"
         );
 
-        (cirfi_minted, rt_used)
+        (qrc_minted, rt_used)
     }
 
     // ── Contribution path ─────────────────────────────────────────────────────
 
-    /// Credit contribution-earned CIRFI to a verified provider.
+    /// Credit contribution-earned QRC to a verified provider.
     ///
     /// `contributions` maps resource kind → verified units (from VCA/CapacityReport).
-    /// Returns CIRFI minted for this provider.
+    /// Returns QRC minted for this provider.
     pub fn credit_provider_earning(
         &mut self,
         provider_id: &[u8; 32],
@@ -512,7 +512,7 @@ impl CirfiEngine {
                 provider  = hex::encode(provider_id),
                 earned,
                 window    = self.current_window,
-                "CIRFI contribution mint"
+                "QRC contribution mint"
             );
         }
 
@@ -521,13 +521,13 @@ impl CirfiEngine {
 
     // ── Consumption ───────────────────────────────────────────────────────────
 
-    /// Consume CIRFI for an operation and apply the 60/25/15 split.
+    /// Consume QRC for an operation and apply the 60/25/15 split.
     ///
-    /// `amount` is the total CIRFI cost of the operation.
+    /// `amount` is the total QRC cost of the operation.
     /// Returns the `ConsumptionSplit` (providers/burn/reserve amounts).
     ///
     /// Caller is responsible for:
-    /// 1. Verifying the consumer's CIRFI balance >= amount.
+    /// 1. Verifying the consumer's QRC balance >= amount.
     /// 2. Debiting the consumer's balance.
     /// 3. Distributing `split.to_providers` to the serving providers.
     pub fn consume(&mut self, amount: u128) -> ConsumptionSplit {
@@ -545,13 +545,13 @@ impl CirfiEngine {
             burned       = split.burned,
             to_reserve   = split.to_reserve,
             window       = self.current_window,
-            "CIRFI consumed"
+            "QRC consumed"
         );
 
         split
     }
 
-    /// Compute the CIRFI cost for an operation given its resource breakdown.
+    /// Compute the QRC cost for an operation given its resource breakdown.
     ///
     /// `cost = sum_r [ base_cost(r) * congestion_multiplier(r) * units(r) ]`
     pub fn operation_cost(&self, op: &OperationCost) -> u128 {
@@ -607,7 +607,7 @@ impl CirfiEngine {
             rt           = self.conversion_rate.rt,
             total_supply = self.total_supply,
             total_burned = self.total_burned,
-            "CIRFI window advanced"
+            "QRC window advanced"
         );
     }
 
@@ -658,11 +658,11 @@ pub struct WindowSummary {
 // ── Error types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
-pub enum CirfiError {
-    #[error("insufficient CIRFI balance: have {have}, need {need}")]
+pub enum QrcError {
+    #[error("insufficient QRC balance: have {have}, need {need}")]
     InsufficientBalance { have: u128, need: u128 },
 
-    #[error("no CIRFI-to-QCB conversion path exists (constitutional constraint)")]
+    #[error("no QRC-to-QCB conversion path exists (constitutional constraint)")]
     NoReverseConversion,
 
     #[error("resource kind {0:?} not tracked")]
@@ -672,7 +672,7 @@ pub enum CirfiError {
     Internal(String),
 }
 
-pub type CirfiResult<T> = Result<T, CirfiError>;
+pub type QrcResult<T> = Result<T, QrcError>;
 
 // ── External dependency shim ──────────────────────────────────────────────────
 
@@ -689,9 +689,9 @@ mod hex {
 mod tests {
     use super::*;
 
-    fn engine() -> CirfiEngine {
-        // R0 = 1.0 × D: 1 CIRFI minted per QCB burned at target utilization.
-        CirfiEngine::new(D)
+    fn engine() -> QrcEngine {
+        // R0 = 1.0 × D: 1 QRC minted per QCB burned at target utilization.
+        QrcEngine::new(D)
     }
 
     // ── Protocol invariants ───────────────────────────────────────────────────
@@ -706,7 +706,7 @@ mod tests {
     fn split_consumption_no_leakage() {
         let amount = 1_234_567_u128;
         let split  = split_consumption(amount);
-        assert_eq!(split.total(), amount, "consumption split must account for all CIRFI");
+        assert_eq!(split.total(), amount, "consumption split must account for all QRC");
     }
 
     #[test]
@@ -724,17 +724,17 @@ mod tests {
     fn purchase_at_target_utilization_uses_r0() {
         let mut e = engine();
         // U-bar == U* by default → Rt == R0 == D
-        let (cirfi, rt) = e.purchase_cirfi(D); // burn 1 QCB (×D)
+        let (qrc, rt) = e.purchase_qrc(D); // burn 1 QCB (×D)
         assert_eq!(rt, D, "Rt should equal R0 at target utilization");
-        assert_eq!(cirfi, D, "1 QCB → 1 CIRFI at R0 = 1.0");
+        assert_eq!(qrc, D, "1 QCB → 1 QRC at R0 = 1.0");
         assert_eq!(e.total_supply, D);
         assert_eq!(e.total_qcb_burned, D);
     }
 
     #[test]
-    fn purchase_burns_qcb_and_mints_cirfi() {
+    fn purchase_burns_qcb_and_mints_qrc() {
         let mut e = engine();
-        let (minted, _) = e.purchase_cirfi(2 * D);
+        let (minted, _) = e.purchase_qrc(2 * D);
         assert_eq!(e.total_qcb_burned, 2 * D);
         assert_eq!(e.total_supply, minted);
         assert_eq!(e.total_purchase_minted, minted);
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn rt_above_r0_when_underutilized() {
         let mut rate = ConversionRate::new(D);
-        // U-bar = 35% (below 70% target → cheaper to acquire CIRFI)
+        // U-bar = 35% (below 70% target → cheaper to acquire QRC)
         rate.update(350_000);
         assert!(rate.rt > D, "Rt > R0 when network is underutilized");
     }
@@ -794,7 +794,7 @@ mod tests {
     #[test]
     fn rt_below_r0_when_congested() {
         let mut rate = ConversionRate::new(D);
-        // U-bar = 90% (above 70% target → CIRFI is scarcer)
+        // U-bar = 90% (above 70% target → QRC is scarcer)
         rate.update(900_000);
         assert!(rate.rt < D, "Rt < R0 when network is congested");
     }
@@ -836,7 +836,7 @@ mod tests {
         let cost_normal = e.operation_cost(&op);
 
         assert!(cost_congested > cost_normal,
-            "congested operations should cost more CIRFI");
+            "congested operations should cost more QRC");
     }
 
     #[test]
@@ -909,11 +909,11 @@ mod tests {
     #[test]
     fn consume_reduces_supply_by_burn_share() {
         let mut e = engine();
-        // First mint some CIRFI.
-        let (minted, _) = e.purchase_cirfi(10 * D);
+        // First mint some QRC.
+        let (minted, _) = e.purchase_qrc(10 * D);
         let supply_before = e.total_supply;
 
-        let split = e.consume(D); // consume 1 CIRFI (×D)
+        let split = e.consume(D); // consume 1 QRC (×D)
         assert_eq!(e.total_burned, split.burned);
         assert_eq!(e.protocol_reserve, split.to_reserve);
         // Supply reduced by burned amount only (providers take the rest off-chain).
@@ -962,18 +962,18 @@ mod tests {
         let capacity: BTreeMap<_, _> =
             ResourceKind::all().iter().map(|&k| (k, D)).collect();
         e.advance_window(&low_demand, &capacity);
-        let (minted_low, rt_low) = e.purchase_cirfi(D);
+        let (minted_low, rt_low) = e.purchase_qrc(D);
 
         // Reset engine (manual) and simulate high usage.
         let mut e2 = engine();
         let high_demand: BTreeMap<_, _> =
             ResourceKind::all().iter().map(|&k| (k, 950_000u128)).collect();
         e2.advance_window(&high_demand, &capacity);
-        let (_minted_high, rt_high) = e2.purchase_cirfi(D);
+        let (_minted_high, rt_high) = e2.purchase_qrc(D);
 
-        // At high usage Rt is lower (fewer CIRFI per QCB → scarcer).
+        // At high usage Rt is lower (fewer QRC per QCB → scarcer).
         assert!(rt_high <= rt_low,
-            "high-demand network should yield fewer CIRFI per QCB burned");
+            "high-demand network should yield fewer QRC per QCB burned");
         let _ = (minted_low, empty);
     }
 
@@ -983,7 +983,7 @@ mod tests {
         let provider = [0u8; 32];
 
         // Purchase path.
-        let (purchase_minted, _) = e.purchase_cirfi(5 * D);
+        let (purchase_minted, _) = e.purchase_qrc(5 * D);
 
         // Contribution path.
         let mut contributions = BTreeMap::new();

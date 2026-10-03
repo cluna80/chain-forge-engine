@@ -1,13 +1,13 @@
-# CIRFI Resource Economy — Protocol Specification v0.1
+# QRC Resource Economy — Protocol Specification v0.1
 
 **Status:** Draft — normative  
 **Date:** 2026-10-03  
 **Supersedes:** Section 6.10 of QCB-Chain-Whitepaper-v2.md (explanatory)  
-**Evidence base:** cirfi_stress_test_v3.py (commit bb3d2d4), 15-scenario sweep + CR floor sweep + recovery test  
+**Evidence base:** qrc_stress_test_v3.py (commit bb3d2d4), 15-scenario sweep + CR floor sweep + recovery test  
 
 ---
 
-This document is the normative specification for the CIRFI Resource Economy protocol layer. It defines the state machine, transaction types, epoch boundary operations, invariants, and consensus rules that a correct Rust implementation must satisfy. It is not an explanation of the economic rationale — that lives in the whitepaper. Every statement here is either a definition, a MUST constraint, or a SHOULD recommendation. Simulation results are cited as the empirical basis for parameter choices, not as proofs of safety.
+This document is the normative specification for the QRC Resource Economy protocol layer. It defines the state machine, transaction types, epoch boundary operations, invariants, and consensus rules that a correct Rust implementation must satisfy. It is not an explanation of the economic rationale — that lives in the whitepaper. Every statement here is either a definition, a MUST constraint, or a SHOULD recommendation. Simulation results are cited as the empirical basis for parameter choices, not as proofs of safety.
 
 ---
 
@@ -21,8 +21,8 @@ All quantities that conceptually range over [0, ∞) are represented as non-nega
 
 | Symbol | Unit | Meaning |
 |--------|------|---------|
-| `capacity` | capacity-units (CU) | 1 CU = 1/D of one CIRFI-equivalent resource unit |
-| `outstanding` | ucirfi | 1 ucirfi = 10^-6 CIRFI |
+| `capacity` | capacity-units (CU) | 1 CU = 1/D of one QRC-equivalent resource unit |
+| `outstanding` | uqrc | 1 uqrc = 10^-6 QRC |
 | `qcb_burned` | uqcb | 1 uqcb = 10^-6 QCB |
 | `conversion_volume` | uqcb | cumulative QCB burned this epoch |
 | `epoch_cap` | uqcb | maximum QCB convertible per epoch |
@@ -47,16 +47,16 @@ where `CR_min_fixed = CR_min * D` expressed as an integer (e.g., CR_min = 0.75 �
 
 ## 2. Protocol State
 
-The CIRFI economic state for epoch `e` is the tuple:
+The QRC economic state for epoch `e` is the tuple:
 
 ```
 State_e = (
     capacity_e,          // u128: attested resource capacity in CU
-    outstanding_e,       // u128: outstanding CIRFI liability in ucirfi
-    conversion_volume_e, // u128: QCB converted to CIRFI this epoch, in uqcb
-    earn_volume_e,       // u128: CIRFI issued via contribution this epoch, in ucirfi
-    consumption_volume_e,// u128: CIRFI consumed this epoch, in ucirfi
-    burn_volume_e,       // u128: CIRFI permanently destroyed this epoch, in ucirfi
+    outstanding_e,       // u128: outstanding QRC liability in uqrc
+    conversion_volume_e, // u128: QCB converted to QRC this epoch, in uqcb
+    earn_volume_e,       // u128: QRC issued via contribution this epoch, in uqrc
+    consumption_volume_e,// u128: QRC consumed this epoch, in uqrc
+    burn_volume_e,       // u128: QRC permanently destroyed this epoch, in uqrc
     mode_e,              // MintMode: NORMAL | HALTED
     epoch_cap_e,         // u128: L_e for this epoch, in uqcb
     ema_utilization_e,   // u128: smoothed utilization in fixed-point [0, D]
@@ -65,7 +65,7 @@ State_e = (
 
 `mode_e` governs which issuance paths are open:
 
-| `mode_e` | `QcbToCirfi` | `ContributionToCirfi` |
+| `mode_e` | `QcbToQrc` | `ContributionToQrc` |
 |----------|--------------|----------------------|
 | `NORMAL` | allowed | allowed |
 | `HALTED` | rejected | rejected |
@@ -121,7 +121,7 @@ where `weight_r` is a governance-adjustable per-resource weight and `capacity_e_
 
 ## 4. Epoch Boundary Transition
 
-The epoch boundary transition is strictly ordered. No CIRFI issuance or conversion transactions are processed while the transition is in progress. The transition MUST be deterministic across all validators — identical inputs MUST produce identical outputs.
+The epoch boundary transition is strictly ordered. No QRC issuance or conversion transactions are processed while the transition is in progress. The transition MUST be deterministic across all validators — identical inputs MUST produce identical outputs.
 
 **Epoch boundary sequence for epoch `e → e+1`:**
 
@@ -165,24 +165,24 @@ The epoch boundary transition is strictly ordered. No CIRFI issuance or conversi
 8.  UPDATE_EMA_UTILIZATION
     ema_utilization_{e+1} =
         alpha * utilization_e + (1 - alpha) * ema_utilization_e
-    (utilization_e is total CIRFI consumed / total resource capacity this epoch)
+    (utilization_e is total QRC consumed / total resource capacity this epoch)
 
 9.  OPEN_EPOCH_{e+1}
     - State_{e+1} is now complete and valid
     - Issuance transactions for epoch e+1 may now be processed
 ```
 
-**Key timing constraint:** A `QcbToCirfi` or `ContributionToCirfi` transaction submitted during epoch `e` uses **epoch `e`'s already-finalized parameters** (mode_e, epoch_cap_e, rate_e). It MUST NOT be held in a queue and re-evaluated under epoch `e+1` parameters unless it was submitted after the epoch boundary and therefore belongs to `e+1`.
+**Key timing constraint:** A `QcbToQrc` or `ContributionToQrc` transaction submitted during epoch `e` uses **epoch `e`'s already-finalized parameters** (mode_e, epoch_cap_e, rate_e). It MUST NOT be held in a queue and re-evaluated under epoch `e+1` parameters unless it was submitted after the epoch boundary and therefore belongs to `e+1`.
 
-**Rejected transactions are rejected, not queued:** A `QcbToCirfi` transaction that arrives when `conversion_volume_e >= epoch_cap_e` MUST be rejected with a definitive error. It MUST NOT be queued for execution in the next epoch. The submitter resubmits if they wish to try again.
+**Rejected transactions are rejected, not queued:** A `QcbToQrc` transaction that arrives when `conversion_volume_e >= epoch_cap_e` MUST be rejected with a definitive error. It MUST NOT be queued for execution in the next epoch. The submitter resubmits if they wish to try again.
 
 ---
 
 ## 5. Transaction Types
 
-### 5.1 `QcbToCirfi` (QCB Conversion)
+### 5.1 `QcbToQrc` (QCB Conversion)
 
-Burns QCB and mints CIRFI at the current epoch conversion rate. This is the discretionary issuance path.
+Burns QCB and mints QRC at the current epoch conversion rate. This is the discretionary issuance path.
 
 **Authorization requirements (all MUST hold; any failure → reject):**
 
@@ -192,16 +192,16 @@ Burns QCB and mints CIRFI at the current epoch conversion rate. This is the disc
 3. mode_e == NORMAL
 4. conversion_volume_e + tx.qcb_amount <= epoch_cap_e
 5. tx.qcb_amount >= MIN_CONVERSION   // dust prevention, governance-set
-6. cirfi_out = floor(tx.qcb_amount * rate_e / D)
-7. (outstanding_e + cirfi_out) * CR_min_fixed <= capacity_e * D  // coverage check
+6. qrc_out = floor(tx.qcb_amount * rate_e / D)
+7. (outstanding_e + qrc_out) * CR_min_fixed <= capacity_e * D  // coverage check
 ```
 
 **State updates on acceptance:**
 
 ```
 qcb_supply         -= tx.qcb_amount
-outstanding_e      += cirfi_out
-cirfi_balance(tx.sender) += cirfi_out
+outstanding_e      += qrc_out
+qrc_balance(tx.sender) += qrc_out
 conversion_volume_e += tx.qcb_amount
 ```
 
@@ -217,9 +217,9 @@ rate_e = clamp(
 
 All values fixed-point with denominator D. Exponentiation uses integer approximation (see Section 6).
 
-### 5.2 `ContributionToCirfi` (Contribution Earn)
+### 5.2 `ContributionToQrc` (Contribution Earn)
 
-Issues CIRFI to a provider in proportion to their attested contribution. This is the non-discretionary issuance path — it compensates work already done.
+Issues QRC to a provider in proportion to their attested contribution. This is the non-discretionary issuance path — it compensates work already done.
 
 **Authorization requirements (all MUST hold; any failure → reject):**
 
@@ -228,54 +228,54 @@ Issues CIRFI to a provider in proportion to their attested contribution. This is
 2. valid_vca_proof(tx.contribution_proof, tx.epoch)
 3. tx.epoch == current_epoch_e
 4. !already_claimed(tx.contributor_id, tx.epoch)
-5. cirfi_out = compute_earn(tx.contribution_proof)
+5. qrc_out = compute_earn(tx.contribution_proof)
    // earn formula: governance-set, VCA-measured, per-resource-type
-6. (outstanding_e + cirfi_out) * CR_min_fixed <= capacity_e * D  // coverage check
+6. (outstanding_e + qrc_out) * CR_min_fixed <= capacity_e * D  // coverage check
 ```
 
 **State updates on acceptance:**
 
 ```
-outstanding_e      += cirfi_out
-cirfi_balance(tx.contributor) += cirfi_out
-earn_volume_e      += cirfi_out
+outstanding_e      += qrc_out
+qrc_balance(tx.contributor) += qrc_out
+earn_volume_e      += qrc_out
 mark_claimed(tx.contributor_id, tx.epoch)
 ```
 
-**Separation of attack surfaces:** `QcbToCirfi` attacks come from the conversion path (dump QCB at low utilization; epoch cap is the defense). `ContributionToCirfi` attacks come from the VCA path (Sybil farming; VCA attestation and the self-defeating burn dynamic are the defenses). These must remain separate transaction types so their authorization checks and rate limits can evolve independently.
+**Separation of attack surfaces:** `QcbToQrc` attacks come from the conversion path (dump QCB at low utilization; epoch cap is the defense). `ContributionToQrc` attacks come from the VCA path (Sybil farming; VCA attestation and the self-defeating burn dynamic are the defenses). These must remain separate transaction types so their authorization checks and rate limits can evolve independently.
 
-### 5.3 `ConsumeCirfi` (Resource Consumption)
+### 5.3 `ConsumeQrc` (Resource Consumption)
 
-Burns CIRFI to claim resource services from providers.
+Burns QRC to claim resource services from providers.
 
 **Authorization requirements:**
 
 ```
 1. valid_signature(tx.sender)
-2. cirfi_balance(tx.sender) >= tx.cirfi_amount
+2. qrc_balance(tx.sender) >= tx.qrc_amount
 3. valid_resource_request(tx.resource_type, tx.amount)
 ```
 
 **State updates on acceptance:**
 
 ```
-burned = floor(tx.cirfi_amount * p_burn_fixed / D)
-paid_to_provider = tx.cirfi_amount - burned
+burned = floor(tx.qrc_amount * p_burn_fixed / D)
+paid_to_provider = tx.qrc_amount - burned
 
-cirfi_balance(tx.sender)   -= tx.cirfi_amount
+qrc_balance(tx.sender)   -= tx.qrc_amount
 outstanding_e              -= burned          // permanent destruction
 burn_volume_e              += burned
-consumption_volume_e       += tx.cirfi_amount
+consumption_volume_e       += tx.qrc_amount
 // provider payment routing: separate settlement
 ```
 
-**Note:** `ConsumeCirfi` MUST NOT be blocked by `mode_e`. Consumption reduces `outstanding`, which improves CR. Blocking consumption during HALTED would prevent the natural recovery path.
+**Note:** `ConsumeQrc` MUST NOT be blocked by `mode_e`. Consumption reduces `outstanding`, which improves CR. Blocking consumption during HALTED would prevent the natural recovery path.
 
 ---
 
 ## 6. Protocol Parameters
 
-All parameters are governance-adjustable via the ordinary $CIRFI governance process (Whitepaper §6.6) unless marked [CONSTITUTIONAL].
+All parameters are governance-adjustable via the ordinary $QRC governance process (Whitepaper §6.6) unless marked [CONSTITUTIONAL].
 
 | Parameter | Symbol | Starting value | Unit | Notes |
 |-----------|--------|---------------|------|-------|
@@ -345,10 +345,10 @@ If this is false after applying the epoch boundary transition, the epoch boundar
 
 ### 7.2 Transaction Validity Rule
 
-Before any CIRFI-minting transaction is accepted, the node MUST verify:
+Before any QRC-minting transaction is accepted, the node MUST verify:
 
 ```
-(outstanding_e + cirfi_out) * CR_min_fixed <= capacity_e * D
+(outstanding_e + qrc_out) * CR_min_fixed <= capacity_e * D
 ```
 
 If false, the transaction MUST be rejected regardless of all other authorization conditions. This check is the ultimate guard — it fires even when the circuit breaker is NORMAL and the epoch cap has not been reached.
@@ -362,7 +362,7 @@ Layer 1 — Availability Guard (§7.3)
   Scope:      issuance-wide; coarse fast-path rejection
 
 Layer 2 — Transaction Validity Rule (this section)
-  Condition:  (outstanding + cirfi_out) * CR_min_fixed > capacity * D
+  Condition:  (outstanding + qrc_out) * CR_min_fixed > capacity * D
   Action:     individual mint rejected at state-update time
   Scope:      per-transaction; fires even when mode_e == NORMAL
   Catches:    any mint that would individually violate the invariant
@@ -391,9 +391,9 @@ else:
     mode_{e+1} = mode_e          // hysteresis: preserve current mode
 ```
 
-When `mode_e == HALTED`, the node MUST reject all `QcbToCirfi` and `ContributionToCirfi` transactions at dispatch, before reaching the Transaction Validity Rule check. This is a fast-path — it avoids performing the per-mint coverage calculation for every rejected transaction during a halt period.
+When `mode_e == HALTED`, the node MUST reject all `QcbToQrc` and `ContributionToQrc` transactions at dispatch, before reaching the Transaction Validity Rule check. This is a fast-path — it avoids performing the per-mint coverage calculation for every rejected transaction during a halt period.
 
-The Availability Guard does NOT halt `ConsumeCirfi` transactions. Consumption reduces `outstanding`, which improves CR. Blocking consumption during HALTED would extend the halt by preventing the natural recovery path.
+The Availability Guard does NOT halt `ConsumeQrc` transactions. Consumption reduces `outstanding`, which improves CR. Blocking consumption during HALTED would extend the halt by preventing the natural recovery path.
 
 ### 7.4 Epoch counter monotonicity
 
@@ -415,10 +415,10 @@ The counter MUST be reset before any transactions in the new epoch are processed
 
 When `mode_e == HALTED`:
 
-- `QcbToCirfi` transactions MUST be rejected (Availability Guard)
-- `ContributionToCirfi` transactions MUST be rejected (Availability Guard)
-- `ConsumeCirfi` transactions MUST NOT be affected
-- Transfers of existing CIRFI balances MUST NOT be affected
+- `QcbToQrc` transactions MUST be rejected (Availability Guard)
+- `ContributionToQrc` transactions MUST be rejected (Availability Guard)
+- `ConsumeQrc` transactions MUST NOT be affected
+- Transfers of existing QRC balances MUST NOT be affected
 - Consensus participation MUST NOT be affected
 - Validator rewards MUST NOT be affected
 
@@ -432,7 +432,7 @@ These questions MUST be resolved before the Rust implementation can be considere
 
 ### 8.1 Capacity evidence adversarial model (CRITICAL — prerequisite for BFT correctness)
 
-This is the most important unresolved question in the specification. Its resolution is a prerequisite for the CIRFI economic state to participate in Byzantine fault tolerance — not just for economic accuracy, but for consensus correctness.
+This is the most important unresolved question in the specification. Its resolution is a prerequisite for the QRC economic state to participate in Byzantine fault tolerance — not just for economic accuracy, but for consensus correctness.
 
 **Why this is consensus-critical, not just economic:**
 
@@ -442,7 +442,7 @@ Capacity has been tied directly into the State Validity Invariant:
 outstanding_e * CR_min_fixed <= capacity_e * D
 ```
 
-This means `capacity_e` is no longer merely an economic parameter. It is consensus-critical state. If validator A sees `capacity_e = 10,000` while validator B sees `capacity_e = 6,000`, they reach different conclusions about whether the same `QcbToCirfi` transaction is valid. That is a potential consensus fork, not merely an inaccurate price. The capacity evidence model must therefore provide the same determinism guarantee as any other consensus-critical input.
+This means `capacity_e` is no longer merely an economic parameter. It is consensus-critical state. If validator A sees `capacity_e = 10,000` while validator B sees `capacity_e = 6,000`, they reach different conclusions about whether the same `QcbToQrc` transaction is valid. That is a potential consensus fork, not merely an inaccurate price. The capacity evidence model must therefore provide the same determinism guarantee as any other consensus-critical input.
 
 **The required separation of claims:**
 
@@ -467,7 +467,7 @@ VCA proves that a contributor performed work. CapacityEvidence proves that resou
    Must a submitter hold a VCA credential? Must they be a registered provider with staked collateral? The submission identity determines the adversarial surface — a permissionless submission model allows Sybil providers; a staked-collateral model introduces capital requirements that may exclude small providers.
 
 3. **How is contribution tied to the claimed resource?**
-   A provider who earned CIRFI through contribution (ContributionToCirfi) has demonstrated past work. Does that work automatically constitute CapacityEvidence? The safer model is: past work proves past contribution; present capacity requires a present proof. The spec should not assume they're the same.
+   A provider who earned QRC through contribution (ContributionToQrc) has demonstrated past work. Does that work automatically constitute CapacityEvidence? The safer model is: past work proves past contribution; present capacity requires a present proof. The spec should not assume they're the same.
 
 4. **How are multiple reports aggregated?**
    If N providers each submit a CapacityReport for the same resource type, what is `capacity_e_r`? Options: sum (optimistic — assumes all reports are honest), median (Byzantine-robust — a minority of dishonest reporters cannot dominate), weighted average (stake-weighted — aligns reporting honesty with economic stake). The choice determines the adversarial tolerance of the aggregation.
@@ -492,7 +492,7 @@ VCA proves that a contributor performed work. CapacityEvidence proves that resou
 
 **Working recommendation for the next engineering phase:**
 
-Before implementing `QcbToCirfi` or `ContributionToCirfi` in Chain Forge, specify the capacity evidence model as a separate sub-protocol with its own state machine, transaction types, and consensus rules. Treat it as a peer to the CIRFI issuance protocol, not as a detail inside it. The CIRFI invariant is only as strong as the evidence model that feeds `capacity_e`.
+Before implementing `QcbToQrc` or `ContributionToQrc` in Chain Forge, specify the capacity evidence model as a separate sub-protocol with its own state machine, transaction types, and consensus rules. Treat it as a peer to the QRC issuance protocol, not as a detail inside it. The QRC invariant is only as strong as the evidence model that feeds `capacity_e`.
 
 Until this is resolved, `capacity_e` is a trust assumption with a validator-signature wrapper, not a protocol guarantee. The invariant holds under honest validators; it does not hold under a Byzantine-validator + malicious-provider coalition.
 
@@ -517,11 +517,11 @@ CapacityReport_v0 aggregation:
 
 This is Byzantine-resistant in aggregation (median), requires VCA credentials (existing protection against anonymous providers), but does not answer questions 7–10. It is labeled v0 to signal that it is a starting point for testing, not the final adversarial model.
 
-### 8.2 CU↔ucirfi unit alignment
+### 8.2 CU↔uqrc unit alignment
 
-The specification states `capacity_e * D` and `outstanding_e * CR_min_fixed` must be comparable. This requires that 1 CIRFI-equivalent CU represents the same "amount of resource" as 1 ucirfi represents "outstanding claims." The exact mapping — how many CU is one CIRFI "worth" at genesis — must be defined before the protocol can compute a meaningful CR.
+The specification states `capacity_e * D` and `outstanding_e * CR_min_fixed` must be comparable. This requires that 1 QRC-equivalent CU represents the same "amount of resource" as 1 uqrc represents "outstanding claims." The exact mapping — how many CU is one QRC "worth" at genesis — must be defined before the protocol can compute a meaningful CR.
 
-Concretely: if capacity_e = 1_000_000_000_000 CU and outstanding_e = 1_000_000_000_000 ucirfi, CR = 1.0. That only means something if the units are commensurable. The genesis calibration of CU/ucirfi is an economic decision, not just an engineering one.
+Concretely: if capacity_e = 1_000_000_000_000 CU and outstanding_e = 1_000_000_000_000 uqrc, CR = 1.0. That only means something if the units are commensurable. The genesis calibration of CU/uqrc is an economic decision, not just an engineering one.
 
 ### 8.3 Multi-resource capacity aggregation
 
@@ -531,8 +531,8 @@ The weight-setting mechanism, and who can propose weight changes, needs specific
 
 ### 8.4 Contribution earn formula
 
-`compute_earn(contribution_proof)` is referenced in §5.2 but not specified. The formula maps a VCA-attested contribution measurement to a ucirfi amount. This formula determines:
-- How much CIRFI providers earn per unit of real work
+`compute_earn(contribution_proof)` is referenced in §5.2 but not specified. The formula maps a VCA-attested contribution measurement to a uqrc amount. This formula determines:
+- How much QRC providers earn per unit of real work
 - Whether the earn rate can be gamed (over-reporting small contributions)
 - The equilibrium between total earn issuance and consumption burn
 
@@ -540,7 +540,7 @@ The simulation used a simplified model. The real formula needs to be defined per
 
 ### 8.5 Dust minimum `MIN_CONVERSION`
 
-The minimum QCB amount for a `QcbToCirfi` transaction needs to be set. Too low: spam; too high: excludes small conversions. Depends on the final QCB/CIRFI exchange rate regime.
+The minimum QCB amount for a `QcbToQrc` transaction needs to be set. Too low: spam; too high: excludes small conversions. Depends on the final QCB/QRC exchange rate regime.
 
 ### 8.6 Demand proxy for adaptive epoch cap
 
@@ -554,13 +554,13 @@ The simulation used `consumption_volume_e` as the demand proxy. On-chain, this c
 
 ### 8.7 Reserve pool routing
 
-`ConsumeCirfi` splits the consumed CIRFI into `burned` (p_burn) and `paid_to_provider` (p_prov). The remaining fraction (p_res) goes to a reserve pool. The reserve pool's governance, withdrawal conditions, and whether the reserve accumulates in CIRFI or is converted to QCB, are not specified here.
+`ConsumeQrc` splits the consumed QRC into `burned` (p_burn) and `paid_to_provider` (p_prov). The remaining fraction (p_res) goes to a reserve pool. The reserve pool's governance, withdrawal conditions, and whether the reserve accumulates in QRC or is converted to QCB, are not specified here.
 
 ---
 
 ## 9. Test Vectors
 
-The 15 simulation scenarios in `cirfi_stress_test_v3.py` (commit bb3d2d4) are the canonical economic test vectors. The Rust implementation MUST produce state transitions consistent with the simulation's outputs for each scenario, modulo fixed-point rounding differences.
+The 15 simulation scenarios in `qrc_stress_test_v3.py` (commit bb3d2d4) are the canonical economic test vectors. The Rust implementation MUST produce state transitions consistent with the simulation's outputs for each scenario, modulo fixed-point rounding differences.
 
 The following scenarios are the minimum required for implementation sign-off:
 
@@ -581,7 +581,7 @@ Zero invariant violations (no tick where minting was allowed while CR < 0.10) MU
 
 ## 10. Formal State Machine Summary
 
-The full CIRFI resource economy is the state machine:
+The full QRC resource economy is the state machine:
 
 ```
 S_{e+1} = T(S_e, I_e, R_e)

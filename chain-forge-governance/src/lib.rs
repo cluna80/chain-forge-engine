@@ -4,7 +4,7 @@
 ///
 /// Implements the two-tier governance model from Whitepaper Sections 6.6 and 7.3:
 ///
-/// ORDINARY GOVERNANCE — one-human-one-vote for $CIRFI parameters.
+/// ORDINARY GOVERNANCE — one-human-one-vote for $QRC parameters.
 ///   Who votes: verified humans (VerificationTier::Verified or Established).
 ///   What passes: simple majority of votes cast.
 ///   Quorum floor: >3% of verified population (derived from f/(p+f) < 0.5
@@ -84,9 +84,9 @@ pub type GovResult<T> = Result<T, GovError>;
 /// rules are enforced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalKind {
-    /// Change a $CIRFI monetary parameter (decay rate, UBI rate, etc.).
+    /// Change a $QRC monetary parameter (decay rate, UBI rate, etc.).
     /// Ordinary governance: simple majority, >3% quorum.
-    CirfiParameter {
+    QrcParameter {
         parameter: String,
         current_value: String,
         proposed_value: String,
@@ -147,7 +147,7 @@ impl ProposalKind {
 
     pub fn display_name(&self) -> &str {
         match self {
-            Self::CirfiParameter { .. }            => "CirFi Parameter Change",
+            Self::QrcParameter { .. }            => "QRC Parameter Change",
             Self::ChainParameter { .. }            => "Chain Parameter Change",
             Self::Constitutional { .. }            => "Constitutional Amendment",
             Self::IdentityPrimitiveReplacement { .. } => "Identity Primitive Replacement",
@@ -583,10 +583,10 @@ mod tests {
         GovernanceModule::with_qcb_defaults()
     }
 
-    fn cirfi_proposal(gov: &mut GovernanceModule, epoch: u64, humans: u64) -> u64 {
+    fn qrc_proposal(gov: &mut GovernanceModule, epoch: u64, humans: u64) -> u64 {
         gov.submit(
             "qcb1alice".into(),
-            ProposalKind::CirfiParameter {
+            ProposalKind::QrcParameter {
                 parameter:      "demurrage_rate_tier2".into(),
                 current_value:  "0.5%".into(),
                 proposed_value: "0.75%".into(),
@@ -625,8 +625,8 @@ mod tests {
     #[test]
     fn submit_returns_incrementing_ids() {
         let mut gov = gov();
-        let a = cirfi_proposal(&mut gov, 0, 100);
-        let b = cirfi_proposal(&mut gov, 0, 100);
+        let a = qrc_proposal(&mut gov, 0, 100);
+        let b = qrc_proposal(&mut gov, 0, 100);
         assert_eq!(a, 1);
         assert_eq!(b, 2);
     }
@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn new_proposal_is_in_voting_state() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         assert_eq!(gov.get(id).unwrap().status, ProposalStatus::Voting);
     }
 
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn vote_recorded_correctly() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         gov.vote(id, "qcb1alice".into(), VoteChoice::Yes, 1).unwrap();
         let p = gov.get(id).unwrap();
         assert_eq!(p.yes_count(), 1);
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn double_vote_rejected() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         gov.vote(id, "qcb1alice".into(), VoteChoice::Yes, 1).unwrap();
         assert!(gov.vote(id, "qcb1alice".into(), VoteChoice::No, 1).is_err());
     }
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn vote_after_voting_period_rejected() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         // voting_end = 0 + 14 = epoch 14
         assert!(gov.vote(id, "qcb1alice".into(), VoteChoice::Yes, 15).is_err());
     }
@@ -677,7 +677,7 @@ mod tests {
     fn abstain_counts_toward_quorum_not_approval() {
         let mut gov = gov();
         // 100 verified humans, need 4% = 4 voters for ordinary quorum
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         gov.vote(id, "qcb1a".into(), VoteChoice::Yes,     1).unwrap();
         gov.vote(id, "qcb1b".into(), VoteChoice::Abstain, 1).unwrap();
         gov.vote(id, "qcb1c".into(), VoteChoice::Abstain, 1).unwrap();
@@ -696,7 +696,7 @@ mod tests {
     fn ordinary_proposal_passes_with_quorum_and_majority() {
         let mut gov = gov();
         // 100 humans, need 4% = 4 voters, 51% approval
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         add_yes_votes(&mut gov, id, 5, 1); // 5 yes votes = 5% quorum, 100% approval
 
         let status = gov.tally(id, 15).unwrap(); // after voting_end=14
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn ordinary_proposal_fails_quorum() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 1000);
+        let id = qrc_proposal(&mut gov, 0, 1000);
         // Need 4% of 1000 = 40 voters. Only 3.
         add_yes_votes(&mut gov, id, 3, 1);
 
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn ordinary_proposal_fails_approval_threshold() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         // 5 yes, 6 no = 5/11 = 45.5% approval < 51%
         add_yes_votes(&mut gov, id, 5, 1);
         add_no_votes(&mut gov,  id, 6, 1);
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn tally_before_voting_ends_fails() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         add_yes_votes(&mut gov, id, 10, 1);
         // voting_end = 14, tally at epoch 10 should fail
         assert!(gov.tally(id, 10).is_err());
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn ordinary_proposal_executes_immediately_after_passing() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         add_yes_votes(&mut gov, id, 10, 1);
         gov.tally(id, 15).unwrap();
 
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn cannot_execute_twice() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 100);
+        let id = qrc_proposal(&mut gov, 0, 100);
         add_yes_votes(&mut gov, id, 10, 1);
         gov.tally(id, 15).unwrap();
         gov.execute(id, 16).unwrap();
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn cannot_execute_failed_proposal() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 1000);
+        let id = qrc_proposal(&mut gov, 0, 1000);
         add_yes_votes(&mut gov, id, 1, 1); // quorum fails
         gov.tally(id, 15).unwrap();
         assert!(gov.execute(id, 16).is_err());
@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn participation_pct_calculated_correctly() {
         let mut gov = gov();
-        let id = cirfi_proposal(&mut gov, 0, 200);
+        let id = qrc_proposal(&mut gov, 0, 200);
         add_yes_votes(&mut gov, id, 10, 1); // 10/200 = 5%
 
         let p = gov.get(id).unwrap();

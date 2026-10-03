@@ -8,7 +8,7 @@ license.workspace = true
 # Charmed Agents: native first-class autonomous agent representation (Section 5.3).
 # Implements:
 #   - AgentCapability: what an agent is authorized to do
-#   - SpendingLimits: per-epoch and lifetime $CIRFI caps
+#   - SpendingLimits: per-epoch and lifetime $QRC caps
 #   - AgentRecord: full on-chain state for one Charmed Agent
 #   - AgentStore: canonical registry of all agents
 #   - AgentLifecycle: register, authorize, suspend, revoke
@@ -16,7 +16,7 @@ license.workspace = true
 #   - AEI (Agent Economic Identity) spec: SponsorID + CapabilitySet + SpendingLimits + ParentAgentID
 #
 # Phase 0: agent registration, authorization checks, spending limit enforcement.
-# Phase 1+: agent-to-agent settlement in $CIRFI, external framework attestations.
+# Phase 1+: agent-to-agent settlement in $QRC, external framework attestations.
 #
 # Whitepaper refs: Sections 4.6 (Phase B), 5.3, 7.2 (Sponsored Contracts subclass).
 

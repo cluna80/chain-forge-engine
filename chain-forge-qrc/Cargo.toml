@@ -1,14 +1,14 @@
 [package]
-name    = "chain-forge-cirfi"
+name    = "chain-forge-qrc"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# CirFi: QCB resource economy — CIRFI Economic Model v0.1.
+# QRC: QCB resource economy — QRC Economic Model v0.1.
 # Implements:
-#   - $CIRFI as a resource consumption token (NOT UBI)
-#   - Two minting paths: purchase (QCB burned → CIRFI) and contribution (VCA-verified providers earn CIRFI)
+#   - $QRC as a resource consumption token (NOT UBI)
+#   - Two minting paths: purchase (QCB burned → QRC) and contribution (VCA-verified providers earn QRC)
 #   - Algorithmic conversion rate Rt = R0 * (U*/U-bar)^gamma (EMA-smoothed utilization)
 #   - Per-resource congestion pricing (7 resource types)
 #   - Consumption split: 60% providers / 25% burn / 15% reserve
@@ -18,6 +18,7 @@ license.workspace = true
 
 [dependencies]
 chain-forge-core     = { path = "../chain-forge-core" }
+serde                = { workspace = true }
 thiserror            = { workspace = true }
 tracing              = { workspace = true }
 

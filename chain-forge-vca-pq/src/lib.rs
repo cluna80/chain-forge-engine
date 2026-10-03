@@ -145,7 +145,7 @@ pub struct StakeAmount(pub u64);
 /// Computed by the execution layer from finalized, attributable work.
 /// The specific work types depend on the chain's module configuration.
 ///
-/// In QCB: CirFi transactions processed, identity attestations cosigned,
+/// In QCB: QRC transactions processed, identity attestations cosigned,
 /// governance participation, uptime-weighted block proposals, etc.
 ///
 /// Range: [0.0, ∞). A score of 0 means no verified contribution this epoch.

@@ -14,7 +14,7 @@
 /// (after they have been committed to a block) and applies them to state.
 ///
 /// Whitepaper refs:
-///   - Section 6.2 ($CIRFI transfers, demurrage)
+///   - Section 6.2 ($QRC transfers, demurrage)
 ///   - Section 6.3 ($QCB burns via BME)
 ///   - Section 6.6 (gas fees -> staking yield)
 ///   - Section 8 (merchant payment flow)
@@ -24,7 +24,7 @@ use chain_forge_core::{Address, EnabledModules, GenesisConfig, HashWidth};
 use chain_forge_crypto::{ClassicalScheme, KeyPair, SchemeId, Signature, SignatureScheme};
 use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
-use chain_forge_cirfi::CirfiEngine;
+use chain_forge_qrc::QrcEngine;
 
 // -- Error --------------------------------------------------------------------
 
@@ -143,7 +143,7 @@ pub enum TxBody {
         amount:    u128,
     },
     /// Custom operation -- opaque payload for module-specific logic.
-    /// Used by Charm Confinement, Intrinsic Charm, Charmed Agents, CirFi.
+    /// Used by Charm Confinement, Intrinsic Charm, Charmed Agents, QRC.
     Custom {
         module:  String,
         payload: Vec<u8>,
@@ -168,7 +168,7 @@ pub enum TxBody {
     ClaimUbi {
         identity_id: String,
     },
-    /// Proactive redirect of $CIRFI balance to the UBI pool (Section 6.3 / Q25).
+    /// Proactive redirect of $QRC balance to the UBI pool (Section 6.3 / Q25).
     /// Triggers BME fee. Holder voluntarily sends balance to pool.
     RedirectToUbiPool {
         amount: u128,
@@ -218,7 +218,7 @@ pub enum TxBody {
 ///
 /// Transfer, Burn and Stake advance the nonce inside StateStore::transfer /
 /// StateStore::burn, and ClaimUbi / RedirectToUbiPool advance it inside the
-/// CirfiEngine calls they make. Every other body type previously advanced
+/// QrcEngine calls they make. Every other body type previously advanced
 /// nothing -- which meant RegisterIdentity, Attest, SponsorAgent,
 /// RevokeAgent and Custom transactions left the sender's nonce unchanged
 /// on success. Consequences: the same signed transaction could be
@@ -596,7 +596,7 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::ConfirmSybil { .. }
         | TxBody::ReverseSybil { .. }
         | TxBody::ReportSuspectedSybil { .. } => Some("identity"),
-        TxBody::ClaimUbi { .. } | TxBody::RedirectToUbiPool { .. } => Some("cirfi"),
+        TxBody::ClaimUbi { .. } | TxBody::RedirectToUbiPool { .. } => Some("qrc"),
         TxBody::SponsorAgent { .. } | TxBody::RevokeAgent { .. } => Some("agents"),
     }
 }
@@ -608,7 +608,7 @@ pub fn module_check(tx: &Transaction, modules: &EnabledModules) -> Result<(), St
     let on = match name {
         "staking"  => modules.staking,
         "identity" => modules.identity,
-        "cirfi"    => modules.cirfi,
+        "qrc"    => modules.qrc,
         "agents"   => modules.agents,
         _ => false,
     };
@@ -649,7 +649,7 @@ fn bind_key_if_unbound(config: &ExecutionConfig, tx: &Transaction, state: &mut S
 /// Applies transactions to a StateStore.
 /// The node creates one Executor per block and calls execute_block().
 /// Identity-aware: CharmConfinement enforcement happens here via
-/// optional IdentityStore and CirfiEngine references.
+/// optional IdentityStore and QrcEngine references.
 pub struct Executor {
     config: ExecutionConfig,
 }
@@ -660,13 +660,13 @@ impl Executor {
     }
 
     /// Execute a single transaction with CharmConfinement enforcement.
-    /// Requires identity store and CirFi engine for identity-gated tx types.
+    /// Requires identity store and QRC engine for identity-gated tx types.
     pub fn execute_tx_with_identity(
         &self,
         tx:       &Transaction,
         state:    &mut StateStore,
         identity: &mut IdentityStore,
-        cirfi:    &mut CirfiEngine,
+        qrc:    &mut QrcEngine,
     ) -> TransactionResult {
         let gas_required = self.config.gas_model.calculate_gas(tx);
 
@@ -706,9 +706,9 @@ impl Executor {
                 let result = state.transfer(&tx.sender, to, denom, *amount)
                     .map(|_| events.push(format!("transfer: {} {} -> {}", amount, denom, to)))
                     .map_err(|e| e.to_string());
-                // CirFi earned-yield gate: a successful transfer counts as
+                // QRC earned-yield gate: a successful transfer counts as
                 // on-chain activity for the sender, making them eligible to
-                // claim CirFi yield this epoch. We use record_activity_by_address
+                // claim QRC yield this epoch. We use record_activity_by_address
                 // so the lookup goes through wallet address → identity record.
                 if result.is_ok() {
                     identity.record_activity_by_address(&tx.sender);
@@ -726,7 +726,7 @@ impl Executor {
                 let result = state.transfer(&tx.sender, validator, &self.config.native_denom, *amount)
                     .map(|_| events.push(format!("stake: {} -> {}", amount, validator)))
                     .map_err(|e| e.to_string());
-                // Staking is on-chain activity — record for CirFi yield eligibility.
+                // Staking is on-chain activity — record for QRC yield eligibility.
                 if result.is_ok() {
                     identity.record_activity_by_address(&tx.sender);
                 }
@@ -828,35 +828,26 @@ impl Executor {
                     );
                     state.upsert_account(new_acct);
                 }
-                match state.get_account_mut(&tx.sender) {
-                    Ok(account) => {
-                        cirfi.distribute_ubi(identity_id, account, identity)
-                            .map(|amount| {
-                                events.push(format!(
-                                    "ubi_claim: {} ucirfi -> {} (identity: {})",
-                                    amount, tx.sender, identity_id
-                                ));
-                            })
-                            .map_err(|e| e.to_string())
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
+                // UBI claim is a UBI-era tx type. The QRC engine (v0.1) does not
+                // distribute UBI — QRC is earned by resource contribution or
+                // purchased by burning QCB. This path is preserved in the tx
+                // enum for protocol continuity but is a no-op until the
+                // execution layer is upgraded to the resource-consumption model.
+                let _ = identity_id;
+                Err("ClaimUbi: deprecated in QRC Economic Model v0.1; use contribution-path earning or purchase_qrc".into())
             }
 
             TxBody::RedirectToUbiPool { amount } => {
                 // Proactive redirect: triggers BME fee (Section 6.3 / Q25)
                 let epoch = identity.clock.current_epoch;
                 match state.get_account_mut(&tx.sender) {
-                    Ok(account) => {
-                        account.record_spend_for_exemption(epoch);
-                        cirfi.redirect_to_ubi_pool(account, *amount)
-                            .map(|to_pool| {
-                                events.push(format!(
-                                    "ubi_redirect: {} ucirfi to pool (BME triggered)",
-                                    to_pool
-                                ));
-                            })
-                            .map_err(|e| e.to_string())
+                    Ok(_account) => {
+                        // RedirectToUbiPool is a UBI-era tx type, deprecated in
+                        // QRC Economic Model v0.1. The UBI pool concept does not
+                        // exist in the resource-consumption engine. Preserved for
+                        // protocol continuity; no-op until execution is upgraded.
+                        let _ = (epoch, amount);
+                        Err("RedirectToUbiPool: deprecated in QRC Economic Model v0.1".into())
                     }
                     Err(e) => Err(e.to_string()),
                 }
@@ -984,7 +975,7 @@ impl Executor {
             bind_key_if_unbound(&self.config, tx, state);
             // Every successfully committed transaction is on-chain activity.
             // Transfer and Stake already call this inside their match arms (so
-            // the CirFi yield comment lives next to the transfer logic), but
+            // the QRC yield comment lives next to the transfer logic), but
             // all other tx types — RegisterIdentity, Attest, SponsorAgent,
             // RevokeAgent, ClaimUbi, RedirectToUbiPool — also count: submitting
             // ANY committed tx proves liveness for this epoch. Duplicate calls
@@ -1080,7 +1071,7 @@ impl Executor {
             }
             TxBody::Custom { module, payload } => {
                 // Phase 0: custom module calls are recorded as events but not
-                // executed -- the module runtime (Charm Confinement, CirFi etc.)
+                // executed -- the module runtime (Charm Confinement, QRC etc.)
                 // is a later-phase addition.
                 events.push(format!(
                     "custom: module={} payload_bytes={}",
@@ -1179,11 +1170,11 @@ impl Executor {
     }
 
     /// Execute all transactions for one block, with identity- and
-    /// CirFi-gated transaction types (RegisterIdentity, Attest, ClaimUbi,
+    /// QRC-gated transaction types (RegisterIdentity, Attest, ClaimUbi,
     /// RedirectToUbiPool, SponsorAgent, RevokeAgent) actually processed
     /// instead of rejected. This is what a live node needs to call for
     /// those transaction types to work at all -- execute_block() above
-    /// always rejects them, by design, since it has no identity or CirFi
+    /// always rejects them, by design, since it has no identity or QRC
     /// state to process them against.
     pub fn execute_block_with_identity(
         &self,
@@ -1191,7 +1182,7 @@ impl Executor {
         transactions: Vec<Transaction>,
         state:        &mut StateStore,
         identity:     &mut IdentityStore,
-        cirfi:        &mut CirfiEngine,
+        qrc:        &mut QrcEngine,
         timestamp_ms: u64,
     ) -> BlockExecutionResult {
         let mut results        = Vec::new();
@@ -1219,7 +1210,7 @@ impl Executor {
                 continue;
             }
 
-            let result = self.execute_tx_with_identity(tx, state, identity, cirfi);
+            let result = self.execute_tx_with_identity(tx, state, identity, qrc);
             total_gas      += result.gas_used;
             fees_collected += result.gas_used;
             results.push(result);
@@ -1255,7 +1246,7 @@ mod tests {
     use chain_forge_core::{GenesisConfig, HashWidth};
     use chain_forge_state::StateStore;
     use chain_forge_identity::IdentityStore;
-    use chain_forge_cirfi::CirfiEngine;
+    use chain_forge_qrc::QrcEngine;
 
     fn genesis_json() -> &'static str {
         r#"{
@@ -1271,7 +1262,7 @@ mod tests {
             "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
             "network": { "network_id": "qcb-testnet-1-net", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "both", "max_peers": 50 },
             "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 5000, "mempool_ttl_seconds": 300 },
-            "modules": ["bank", "staking", "identity", "cirfi", "agents"],
+            "modules": ["bank", "staking", "identity", "qrc", "agents"],
             "custom_modules": [],
             "genesis_accounts": [
                 { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "user" },
@@ -1476,9 +1467,9 @@ mod tests {
 
     // -- CharmConfinement enforcement tests -----------------------------------
 
-    fn setup_with_identity() -> (Executor, StateStore, IdentityStore, CirfiEngine) {
+    fn setup_with_identity() -> (Executor, StateStore, IdentityStore, QrcEngine) {
         use chain_forge_identity::{IdentityStore, PopAttestation};
-        use chain_forge_cirfi::CirfiEngine;
+        use chain_forge_qrc::QrcEngine;
 
         let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
         let config  = ExecutionConfig::from_genesis(&genesis);
@@ -1490,78 +1481,71 @@ mod tests {
         identity.register("qcb1alice".into(), "qcb1alice".into(), att.clone()).unwrap();
         identity.verify_identity("qcb1alice", att, None).unwrap();
 
-        let cirfi = CirfiEngine::new("ucirfi".into(), "uqcb".into());
-        (Executor::new(config), state, identity, cirfi)
+        let qrc = QrcEngine::new(chain_forge_qrc::D);
+        (Executor::new(config), state, identity, qrc)
     }
 
+    // ── Deprecated UBI-era tx types (QRC Economic Model v0.1) ─────────────────
+    //
+    // ClaimUbi and RedirectToUbiPool were part of the old Circulating Finance
+    // engine. The QRC engine (v0.1) replaces UBI with resource-contribution
+    // earning and purchase-path minting. These tests document that the tx types
+    // are preserved in the enum (protocol continuity) but now return an error.
+    // They will be replaced with resource-consumption tx tests when the
+    // execution layer is upgraded.
+
     #[test]
-    fn claim_ubi_credits_verified_human() {
-        use chain_forge_identity::DAILY_UBI_RATE_UCIRFI;
-
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
-
-        // CirFi earned-yield gate: must record on-chain activity before claiming.
+    fn claim_ubi_deprecated_in_qrc_model() {
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
         identity.record_activity("qcb1alice");
 
         let tx = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
 
-        assert!(result.success, "UBI claim should succeed: {:?}", result.error);
-        assert!(result.events.iter().any(|e| e.contains("ubi_claim")));
-        let balance = state.get_account("qcb1alice").unwrap().balance_of("ucirfi");
-        assert_eq!(balance, DAILY_UBI_RATE_UCIRFI,
-            "alice's ucirfi balance should equal one UBI claim (genesis balance is uqcb)");
+        assert!(
+            !result.success,
+            "ClaimUbi must be rejected by QRC Economic Model v0.1 engine"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("deprecated"),
+            "error message should mention deprecation, got: {:?}", result.error
+        );
     }
 
     #[test]
-    fn charm_confinement_blocks_double_ubi_claim() {
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
-
+    fn redirect_to_ubi_pool_deprecated_in_qrc_model() {
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
         identity.record_activity("qcb1alice");
 
-        let tx1 = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
-        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut cirfi);
-        assert!(r1.success);
+        let tx = Transaction::redirect_to_ubi_pool("tx1", "qcb1alice", 1_000_000, 0);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
 
-        let tx2 = Transaction::claim_ubi("tx2", "qcb1alice", "qcb1alice", 1);
-        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut cirfi);
-        assert!(!r2.success, "second UBI claim in same epoch must fail");
-    }
-
-    #[test]
-    fn redirect_to_ubi_pool_triggers_bme() {
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
-
-        // Claim UBI first so alice has ucirfi to redirect
-        identity.record_activity("qcb1alice");
-        let claim = Transaction::claim_ubi("tx0", "qcb1alice", "qcb1alice", 0);
-        let r0 = exec.execute_tx_with_identity(&claim, &mut state, &mut identity, &mut cirfi);
-        assert!(r0.success, "{:?}", r0.error);
-
-        let tx = Transaction::redirect_to_ubi_pool("tx1", "qcb1alice", 1_000_000, 1);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
-
-        assert!(result.success, "{:?}", result.error);
-        assert!(result.events.iter().any(|e| e.contains("ubi_redirect")));
-        assert!(cirfi.bme.total_fees_collected_ucirfi > 0, "BME should collect fee");
+        assert!(
+            !result.success,
+            "RedirectToUbiPool must be rejected by QRC Economic Model v0.1 engine"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("deprecated"),
+            "error message should mention deprecation, got: {:?}", result.error
+        );
     }
 
     #[test]
     fn sponsor_agent_requires_verified_identity() {
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
 
         // Bob is not in identity store -- should fail
         let tx = Transaction::sponsor_agent("tx1", "qcb1bob", "qcb1agent1", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
         assert!(!result.success, "unverified identity cannot sponsor agents");
     }
 
     #[test]
     fn sponsor_agent_succeeds_for_verified_human() {
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
 
         let tx = Transaction::sponsor_agent("tx1", "qcb1alice", "qcb1agent1", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
 
         assert!(result.success, "{:?}", result.error);
         assert!(identity.is_agent_authorized("qcb1agent1", "qcb1alice"),
@@ -1570,7 +1554,7 @@ mod tests {
 
     #[test]
     fn spend_earns_decay_exemption() {
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
 
         // Attach charm to alice's account first
         let mut charm = chain_forge_identity::IntrinsicCharm::provisional(0);
@@ -1583,7 +1567,7 @@ mod tests {
 
         // Transfer triggers spend -> exemption credit
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0);
-        exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
 
         assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 1,
             "spending should earn 1 day of decay exemption");
@@ -1593,10 +1577,10 @@ mod tests {
 
     #[test]
     fn register_identity_tx_creates_provisional_account_with_charm() {
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
 
         let tx = Transaction::register_identity("tx1", "qcb1newbie", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
 
         assert!(result.success, "registration should succeed: {:?}", result.error);
         assert!(result.events.iter().any(|e| e.contains("register_identity")));
@@ -1614,7 +1598,7 @@ mod tests {
     fn attest_tx_reaches_quorum_and_upgrades_onchain_tier() {
         use chain_forge_identity::{PopAttestation, VerificationTier};
 
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
 
         // Bootstrap two more Verified attesters alongside alice (already
         // Verified via setup_with_identity's genesis path).
@@ -1626,13 +1610,13 @@ mod tests {
 
         // Register the real claimant via the actual transaction path.
         let reg_tx = Transaction::register_identity("tx0", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&reg_tx, &mut state, &mut identity, &mut cirfi);
+        exec.execute_tx_with_identity(&reg_tx, &mut state, &mut identity, &mut qrc);
 
         // Two attestations: still Provisional on-chain.
         let a1 = Transaction::attest("tx1", "qcb1alice", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut cirfi);
+        exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut qrc);
         let a2 = Transaction::attest("tx2", "qcb1bob", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut cirfi);
+        exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut qrc);
         assert_eq!(
             state.get_account("qcb1newbie").unwrap().verification_tier(),
             Some(&VerificationTier::Provisional)
@@ -1641,7 +1625,7 @@ mod tests {
         // Third distinct attestation crosses quorum -- both IdentityStore
         // AND the on-chain account must now show Verified.
         let a3 = Transaction::attest("tx3", "qcb1carol", "qcb1newbie", 0);
-        let result = exec.execute_tx_with_identity(&a3, &mut state, &mut identity, &mut cirfi);
+        let result = exec.execute_tx_with_identity(&a3, &mut state, &mut identity, &mut qrc);
         assert!(result.success);
         assert!(result.events.iter().any(|e| e.contains("now Verified")));
         assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Verified);
@@ -1673,7 +1657,7 @@ mod tests {
     fn identity_txs_advance_sender_nonce_and_block_replay() {
         use chain_forge_identity::PopAttestation;
 
-        let (exec, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
         for name in ["qcb1bob", "qcb1carol"] {
             let att = PopAttestation::genesis(name, 0);
             identity.register(name.into(), name.into(), att.clone()).unwrap();
@@ -1682,27 +1666,27 @@ mod tests {
 
         // Registration advances the new account's nonce 0 -> 1.
         let reg = Transaction::register_identity("r0", "qcb1newbie", 0);
-        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi).success);
+        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc).success);
         assert_eq!(state.get_account("qcb1newbie").unwrap().nonce, 1);
 
         // Replaying the exact same registration is now a nonce mismatch,
         // not a second trip into the identity logic.
-        let replay = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi);
+        let replay = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc);
         assert!(!replay.success);
         assert!(replay.error.as_deref().unwrap_or("").contains("nonce mismatch"));
 
         // An attester's first attest advances their nonce, so their second
         // transaction must use nonce 1 -- and does succeed with it.
         let a1 = Transaction::attest("a1", "qcb1alice", "qcb1newbie", 0);
-        assert!(exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut cirfi).success);
+        assert!(exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut qrc).success);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1);
 
         exec.execute_tx_with_identity(
             &Transaction::register_identity("r1", "qcb1other", 0),
-            &mut state, &mut identity, &mut cirfi,
+            &mut state, &mut identity, &mut qrc,
         );
         let a2 = Transaction::attest("a2", "qcb1alice", "qcb1other", 1);
-        let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut cirfi);
+        let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut qrc);
         assert!(r.success, "second attest with nonce 1 must succeed: {:?}", r.error);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 2);
     }
@@ -1792,7 +1776,7 @@ mod tests {
 
     #[test]
     fn key_derived_address_registers_and_binds_its_key() {
-        let (_, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (_, mut state, mut identity, mut qrc) = setup_with_identity();
         let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
         let mut config = ExecutionConfig::from_genesis(&genesis);
         config.require_signatures = true;
@@ -1802,7 +1786,7 @@ mod tests {
         let addr = Address::from_public_key(&user.public_key, "qcb", HashWidth::Bits256);
         let mut reg = Transaction::register_identity("r0", addr.as_str(), 0);
         reg.sign(&user, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi);
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc);
         assert!(r.success, "{:?}", r.error);
 
         let acct = state.get_account(addr.as_str()).unwrap();
@@ -1813,7 +1797,7 @@ mod tests {
         let other = key("someone-else");
         let mut hijack = Transaction::attest("h1", addr.as_str(), "qcb1alice", 1);
         hijack.sign(&other, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut cirfi);
+        let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut qrc);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("does not match the key bound"));
     }
@@ -1837,7 +1821,7 @@ mod tests {
         // use fresh addresses: qcb1newcomer as the claimant and qcb1alice
         // (already Verified) as one of the three attesters.
         use chain_forge_identity::{IdentityStore, PopAttestation};
-        use chain_forge_cirfi::CirfiEngine;
+        use chain_forge_qrc::QrcEngine;
 
         let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
         let config  = ExecutionConfig::from_genesis(&genesis);
@@ -1852,13 +1836,13 @@ mod tests {
             identity.register(name.into(), name.into(), att.clone()).unwrap();
             identity.verify_identity(name, att, None).unwrap();
         }
-        let mut cirfi = CirfiEngine::new("ucirfi".into(), "uqcb".into());
+        let mut qrc = QrcEngine::new(chain_forge_qrc::D);
 
         let root_before = state.commit(0, 0, false).root_hash;
 
         // Register newcomer -- should change the state root (Provisional charm attached).
         let reg = Transaction::register_identity("t-reg", "qcb1newcomer", 0);
-        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut cirfi);
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc);
         assert!(r.success, "registration failed: {:?}", r.error);
         let root_after_reg = state.commit(0, 0, false).root_hash;
         assert_ne!(root_before, root_after_reg,
@@ -1870,7 +1854,7 @@ mod tests {
             let attest = Transaction::attest(
                 &format!("t-attest-{i}"), attester, "qcb1newcomer", 0
             );
-            let r = exec.execute_tx_with_identity(&attest, &mut state, &mut identity, &mut cirfi);
+            let r = exec.execute_tx_with_identity(&attest, &mut state, &mut identity, &mut qrc);
             assert!(r.success, "attest {i} failed: {:?}", r.error);
         }
         let root_after_verify = state.commit(0, 0, false).root_hash;
@@ -1882,17 +1866,17 @@ mod tests {
     }
 
     #[test]
-    fn plain_chain_rejects_identity_cirfi_agent_and_stake_txs() {
-        let (_, mut state, mut identity, mut cirfi) = setup_with_identity();
+    fn plain_chain_rejects_identity_qrc_agent_and_stake_txs() {
+        let (_, mut state, mut identity, mut qrc) = setup_with_identity();
         let exec = plain_chain_exec();
         let cases = [
             (Transaction::register_identity("t1", "qcb1alice", 0), "identity"),
             (Transaction::attest("t2", "qcb1alice", "qcb1bob", 0), "identity"),
-            (Transaction::claim_ubi("t3", "qcb1alice", "qcb1alice", 0), "cirfi"),
+            (Transaction::claim_ubi("t3", "qcb1alice", "qcb1alice", 0), "qrc"),
             (Transaction::sponsor_agent("t4", "qcb1alice", "qcb1agent", 0), "agents"),
         ];
         for (tx, module) in cases {
-            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
             assert!(!r.success, "{} must be rejected on a plain chain", tx.id);
             assert!(r.error.unwrap().contains(&format!("module \"{module}\" is not enabled")));
         }
@@ -1901,10 +1885,10 @@ mod tests {
 
     #[test]
     fn plain_chain_still_allows_core_transfers() {
-        let (_, mut state, mut identity, mut cirfi) = setup_with_identity();
+        let (_, mut state, mut identity, mut qrc) = setup_with_identity();
         let exec = plain_chain_exec();
         let tx = Transaction::transfer("t1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut cirfi);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
         assert!(r.success, "{:?}", r.error);
     }
 

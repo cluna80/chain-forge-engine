@@ -20,7 +20,7 @@
 //! ## Fixed-point encoding
 //!
 //! Personhood scores are encoded as integers in `[0, D]` where
-//! `D = 1_000_000` (consistent with the CIRFI Protocol Spec §1).  A score of
+//! `D = 1_000_000` (consistent with the QRC Protocol Spec §1).  A score of
 //! 1.0 (fully-verified) encodes as `1_000_000`; a score of 0.25 encodes as
 //! `250_000`.
 //!

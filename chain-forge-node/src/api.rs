@@ -8,7 +8,7 @@
 /// key management, and a WebSocket feed for the explorer.
 
 use std::sync::{Arc, Mutex};
-use super::node::{NodeStatus, ExplorerState, CirfiMetrics};
+use super::node::{NodeStatus, ExplorerState, QrcMetrics};
 use chain_forge_p2p::PeerInfo;
 use chain_forge_execution::Transaction;
 
@@ -30,7 +30,7 @@ pub async fn serve(
     port: u16,
     status:        Arc<Mutex<NodeStatus>>,
     explorer:      Arc<Mutex<ExplorerState>>,
-    cirfi_metrics: Arc<Mutex<CirfiMetrics>>,
+    qrc_metrics: Arc<Mutex<QrcMetrics>>,
     peers:         Arc<Mutex<Vec<PeerInfo>>>,
     tx_queue:      Arc<Mutex<Vec<Transaction>>>,
     precheck:      TxPrecheck,
@@ -55,7 +55,7 @@ pub async fn serve(
                 tracing::debug!(peer = %peer, "HTTP connection");
                 let status        = status.clone();
                 let explorer      = explorer.clone();
-                let cirfi_metrics = cirfi_metrics.clone();
+                let qrc_metrics = qrc_metrics.clone();
                 let peers         = peers.clone();
                 let tx_queue      = tx_queue.clone();
                 let precheck      = precheck.clone();
@@ -260,9 +260,9 @@ pub async fn serve(
                         let mut accounts: Vec<_> = ex.accounts.values().collect();
                         accounts.sort_by(|a, b| a.address.cmp(&b.address));
                         http_200_json(&serde_json::to_string(&accounts).unwrap_or_default())
-                    } else if first_line.starts_with("GET /api/cirfi") {
-                        // GET /api/cirfi — CirFi monetary engine metrics (Section 9.1)
-                        let cm = cirfi_metrics.lock().unwrap();
+                    } else if first_line.starts_with("GET /api/qrc") {
+                        // GET /api/qrc — QRC monetary engine metrics (Section 9.1)
+                        let cm = qrc_metrics.lock().unwrap();
                         http_200_json(&serde_json::to_string(&*cm).unwrap_or_default())
                     } else if first_line.starts_with("GET /api/validators") {
                         // GET /api/validators — current validator set with voting powers.

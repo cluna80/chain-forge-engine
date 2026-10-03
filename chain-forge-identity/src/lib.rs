@@ -112,7 +112,7 @@ pub type IdResult<T> = Result<T, IdentityError>;
 /// Graduated from Section 4.5's "identity is the door" framing:
 /// more participation -> higher tier -> more rights.
 ///
-/// Provisional:   registered but not yet verified. Can receive $CIRFI
+/// Provisional:   registered but not yet verified. Can receive $QRC
 ///                at a reduced rate once pilot allows it. Cannot vote,
 ///                cannot sponsor agents, cannot validate.
 /// Verified:      passed PoP verification. Full UBI, governance, consensus.
@@ -127,7 +127,7 @@ pub enum VerificationTier {
 }
 
 impl VerificationTier {
-    /// Whether this tier grants full UBI (1,000 $CIRFI/day per Section 6.2).
+    /// Whether this tier grants full UBI (1,000 $QRC/day per Section 6.2).
     pub fn grants_full_ubi(&self) -> bool {
         matches!(self, Self::Verified | Self::Established)
     }
@@ -321,7 +321,7 @@ impl PopAttestation {
 /// Provisional identity needs before it graduates to Verified.
 /// Whitepaper Section 4 / Identity Pilot Design Section 3.1: "provisional
 /// target: 3 attestations." Provisional here means governance-adjustable,
-/// not fixed at the protocol layer -- Section 6.6 governs CirFi-adjacent
+/// not fixed at the protocol layer -- Section 6.6 governs QRC-adjacent
 /// parameters like this one the same way it governs decay rates.
 pub const ATTESTATION_QUORUM: usize = 3;
 
@@ -725,13 +725,13 @@ pub struct IdentityRecord {
     pub charm: IntrinsicCharm,
     /// The attestation that created or last renewed this record.
     pub attestation: PopAttestation,
-    /// Whether this identity has claimed CirFi yield in the current epoch.
+    /// Whether this identity has claimed QRC yield in the current epoch.
     pub claimed_this_epoch: bool,
-    /// Total CirFi yield claimed across all epochs (in ucirfi base units).
+    /// Total QRC yield claimed across all epochs (in uqrc base units).
     pub total_ubi_claimed: u128,
     /// The last epoch in which this identity performed on-chain activity
     /// (sent a tx, validated a block, processed a merchant settlement).
-    /// CirFi yield requires activity in the current epoch — this is the
+    /// QRC yield requires activity in the current epoch — this is the
     /// earned-yield gate. None = never active.
     pub last_active_epoch: Option<u64>,
     /// Agents sponsored by this identity (agent address -> authorized).
@@ -823,19 +823,19 @@ impl IdentityRecord {
 ///
 /// One epoch = one day (86,400 seconds) in production.
 /// Phase 0: epoch advances manually for testing.
-/// Daily UBI rate: 1,000 $CIRFI per verified human (Whitepaper 6.2).
+/// Daily UBI rate: 1,000 $QRC per verified human (Whitepaper 6.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UbiClock {
     pub current_epoch:    u64,
     pub epoch_start_ms:   u64,
     pub epoch_duration_ms: u64,
-    /// Total $CIRFI distributed across all epochs.
+    /// Total $QRC distributed across all epochs.
     pub total_distributed: u128,
 }
 
-/// Daily UBI rate per verified human in base ucirfi units.
-/// 1,000 $CIRFI = 1,000,000,000 ucirfi (assuming 6 decimal places).
-pub const DAILY_UBI_RATE_UCIRFI: u128 = 1_000_000_000;
+/// Daily UBI rate per verified human in base uqrc units.
+/// 1,000 $QRC = 1,000,000,000 uqrc (assuming 6 decimal places).
+pub const DAILY_UBI_RATE_UQRC: u128 = 1_000_000_000;
 
 impl UbiClock {
     pub fn new(genesis_time_ms: u64) -> Self {
@@ -873,7 +873,7 @@ impl UbiClock {
 
     /// Calculate UBI for one verified human for one epoch.
     pub fn ubi_per_epoch() -> u128 {
-        DAILY_UBI_RATE_UCIRFI
+        DAILY_UBI_RATE_UQRC
     }
 
     /// Total UBI to distribute to all verified humans this epoch.
@@ -1235,7 +1235,7 @@ impl IdentityStore {
 
     /// Claim UBI for a verified identity.
     /// Enforces: one claim per epoch, verified tier, liveness.
-    /// Returns the amount of ucirfi to credit to the account.
+    /// Returns the amount of uqrc to credit to the account.
     pub fn claim_ubi(&mut self, id: &str) -> IdResult<u128> {
         let epoch = self.clock.current_epoch;
         let record = self.records.get_mut(id)
@@ -1263,7 +1263,7 @@ impl IdentityStore {
             return Err(IdentityError::AlreadyClaimed(id.to_string(), epoch));
         }
 
-        // Earned-yield gate: CirFi is NOT a UBI drip — it must be earned.
+        // Earned-yield gate: QRC is NOT a UBI drip — it must be earned.
         // The identity must have performed at least one on-chain action this
         // epoch (tx submission, validator participation, merchant settlement).
         // record_activity() / record_activity_by_address() are called by the
@@ -1282,11 +1282,11 @@ impl IdentityStore {
         record.charm.record_participation(epoch);
         self.clock.total_distributed += amount;
 
-        tracing::debug!(id, epoch, amount_ucirfi = amount, "CirFi yield claimed");
+        tracing::debug!(id, epoch, amount_uqrc = amount, "QRC yield claimed");
         Ok(amount)
     }
 
-    /// Record on-chain activity for an identity, enabling CirFi yield claim
+    /// Record on-chain activity for an identity, enabling QRC yield claim
     /// for this epoch. Called by the execution layer whenever a verified
     /// identity submits a tx, participates as a validator, or processes a
     /// merchant settlement. No-op if the identity is not found.
@@ -1294,7 +1294,7 @@ impl IdentityStore {
         let epoch = self.clock.current_epoch;
         if let Some(record) = self.records.get_mut(id) {
             record.last_active_epoch = Some(epoch);
-            tracing::debug!(id, epoch, "on-chain activity recorded for CirFi yield eligibility");
+            tracing::debug!(id, epoch, "on-chain activity recorded for QRC yield eligibility");
         }
     }
 
@@ -1306,7 +1306,7 @@ impl IdentityStore {
         for record in self.records.values_mut() {
             if record.address == address {
                 record.last_active_epoch = Some(epoch);
-                tracing::debug!(address, epoch, "on-chain activity recorded for CirFi yield eligibility");
+                tracing::debug!(address, epoch, "on-chain activity recorded for QRC yield eligibility");
                 return;
             }
         }
@@ -1870,7 +1870,7 @@ mod tests {
 
         // Verified but no on-chain activity recorded — must fail.
         let result = store.claim_ubi("h1");
-        assert!(result.is_err(), "CirFi yield requires on-chain activity; passive claim must fail");
+        assert!(result.is_err(), "QRC yield requires on-chain activity; passive claim must fail");
     }
 
     #[test]
@@ -1882,7 +1882,7 @@ mod tests {
         store.record_activity("h1");
 
         let amount = store.claim_ubi("h1").unwrap();
-        assert_eq!(amount, DAILY_UBI_RATE_UCIRFI);
+        assert_eq!(amount, DAILY_UBI_RATE_UQRC);
     }
 
     #[test]
@@ -1994,7 +1994,7 @@ mod tests {
         store.claim_ubi("h1").unwrap();
         store.claim_ubi("h2").unwrap();
 
-        assert_eq!(store.clock.total_distributed, DAILY_UBI_RATE_UCIRFI * 2);
+        assert_eq!(store.clock.total_distributed, DAILY_UBI_RATE_UQRC * 2);
     }
 
     // -- Web-of-trust quorum (Phase 1 identity pilot mechanism) ----------------

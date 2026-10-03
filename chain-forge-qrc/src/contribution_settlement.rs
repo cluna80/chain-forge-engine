@@ -1,8 +1,8 @@
-//! # contribution_settlement — Finalized CapacityReport → CIRFI minting
+//! # contribution_settlement — Finalized CapacityReport → QRC minting
 //!
 //! This module bridges the `CapacityEvidence_v0` state machine (`capacity_report`)
-//! and the CIRFI resource economy engine (`CirfiEngine`), completing the
-//! contribution minting path described in CIRFI Economic Model v0.1 §4.2.
+//! and the QRC resource economy engine (`QrcEngine`), completing the
+//! contribution minting path described in QRC Economic Model v0.1 §4.2.
 //!
 //! ## Flow
 //!
@@ -15,7 +15,7 @@
 //!   └─► ContributionSettlement::settle()
 //!         │
 //!         │  maps ResourceType → ResourceKind (capacity_report subset)
-//!         │  calls CirfiEngine::credit_provider_earning() per provider
+//!         │  calls QrcEngine::credit_provider_earning() per provider
 //!         │
 //!         └─► Vec<SettlementRecord>  (audit trail for the epoch)
 //! ```
@@ -23,7 +23,7 @@
 //! ## ResourceType → ResourceKind mapping
 //!
 //! `capacity_report::ResourceType` covers the three capacity-provable resource
-//! types (Compute, Storage, ZkProving). `ResourceKind` in the CIRFI engine covers
+//! types (Compute, Storage, ZkProving). `ResourceKind` in the QRC engine covers
 //! seven types including Bandwidth, OracleData, AiInference, and
 //! ExternalVerification — these are consumption-priced but not yet
 //! capacity-reportable.  The mapping is 1-to-1 for the three overlapping types;
@@ -44,20 +44,20 @@
 //!   submitted and aggregated *this epoch* qualifies (`carry_forward == false`
 //!   per resource).
 //! - Each provider is settled exactly once per (epoch, resource_type) pair.
-//! - CIRFI is minted by `CirfiEngine` which applies the full earning formula
+//! - QRC is minted by `QrcEngine` which applies the full earning formula
 //!   including per-resource weights and congestion multipliers.
 
 use std::collections::BTreeMap;
 
 use crate::{
     capacity_report::{CapacityPhase, CapacityReportState, ResourceType},
-    CirfiEngine, ResourceKind,
+    QrcEngine, ResourceKind,
 };
 
 // ── ResourceType → ResourceKind bridge ───────────────────────────────────────
 
 /// Map a `capacity_report::ResourceType` to the corresponding `ResourceKind`
-/// in the CIRFI engine.
+/// in the QRC engine.
 ///
 /// Returns `None` for resource types not yet supported by the engine
 /// (none at present, but kept as an extension point).
@@ -86,7 +86,7 @@ pub fn kind_to_resource_type(kind: ResourceKind) -> Option<ResourceType> {
 
 // ── SettlementMode ────────────────────────────────────────────────────────────
 
-/// Controls when contribution CIRFI minting is triggered.
+/// Controls when contribution QRC minting is triggered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettlementMode {
     /// Mint only after the CapacityReport has been fully countersigned
@@ -101,18 +101,18 @@ pub enum SettlementMode {
 
 // ── SettlementRecord ──────────────────────────────────────────────────────────
 
-/// Audit record for one provider's CIRFI earning in one epoch.
+/// Audit record for one provider's QRC earning in one epoch.
 #[derive(Debug, Clone)]
 pub struct SettlementRecord {
-    /// Provider that earned CIRFI.
+    /// Provider that earned QRC.
     pub provider_id: [u8; 32],
     /// Epoch this record covers.
     pub epoch: u64,
     /// Per-resource contribution units used in the earning formula.
     /// Maps `ResourceKind` → verified `C(i,r,t)` from the CapacityReport.
     pub contributions: BTreeMap<ResourceKind, u128>,
-    /// CIRFI minted for this provider.
-    pub cirfi_minted: u128,
+    /// QRC minted for this provider.
+    pub qrc_minted: u128,
     /// Whether this was a provisional payout (Finalizing phase).
     pub provisional: bool,
 }
@@ -125,7 +125,7 @@ pub struct EpochSettlement {
     pub epoch: u64,
     /// Individual provider records.
     pub records: Vec<SettlementRecord>,
-    /// Total CIRFI minted this epoch via the contribution path.
+    /// Total QRC minted this epoch via the contribution path.
     pub total_minted: u128,
     /// Number of providers settled.
     pub provider_count: usize,
@@ -147,14 +147,14 @@ pub enum SettlementError {
     MissingReport,
 }
 
-/// Settle contribution-path CIRFI for all providers that submitted valid
+/// Settle contribution-path QRC for all providers that submitted valid
 /// evidence in the given `CapacityReportState`.
 ///
 /// # Arguments
 ///
 /// * `capacity_state` — the epoch's capacity report state machine, which must
 ///   be in `Finalizing` or `Finalized` phase.
-/// * `engine` — the `CirfiEngine` to mint into.  Its utilization must already
+/// * `engine` — the `QrcEngine` to mint into.  Its utilization must already
 ///   reflect the current epoch's demand/capacity (i.e., `advance_window` was
 ///   called before `settle()`).
 /// * `mode` — whether to require `Finalized` or accept `Finalizing`.
@@ -165,7 +165,7 @@ pub enum SettlementError {
 /// [`SettlementError`] if the state machine is not ready.
 pub fn settle(
     capacity_state: &CapacityReportState,
-    engine: &mut CirfiEngine,
+    engine: &mut QrcEngine,
     mode: SettlementMode,
 ) -> Result<EpochSettlement, SettlementError> {
     // Phase guard
@@ -231,23 +231,23 @@ pub fn settle(
     let mut total_minted = 0u128;
 
     for (provider_id, contributions) in &provider_contributions {
-        let cirfi_minted = engine.credit_provider_earning(provider_id, contributions);
+        let qrc_minted = engine.credit_provider_earning(provider_id, contributions);
 
         tracing::info!(
             epoch,
             provider  = hex::encode(provider_id),
-            cirfi_minted,
+            qrc_minted,
             provisional,
             resources = contributions.len(),
-            "contribution-path CIRFI settled"
+            "contribution-path QRC settled"
         );
 
-        total_minted += cirfi_minted;
+        total_minted += qrc_minted;
         records.push(SettlementRecord {
             provider_id: *provider_id,
             epoch,
             contributions: contributions.clone(),
-            cirfi_minted,
+            qrc_minted,
             provisional,
         });
     }
@@ -280,13 +280,13 @@ mod tests {
             CapacityEvidence, CapacityPhase, CapacityProof, CapacityReportState,
             ComputeProofV0, ResourceType, StorageProofV0, VcaCredential, ZkProvingProofV0,
         },
-        CirfiEngine, D,
+        QrcEngine, D,
     };
     use std::collections::BTreeMap;
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
-    const R0: u128 = D; // 1.0 × D = 1 CIRFI per QCB at target utilization
+    const R0: u128 = D; // 1.0 × D = 1 QRC per QCB at target utilization
 
     fn always_valid_sig(_id: &[u8; 32], _sig: &[u8; 64]) -> bool { true }
 
@@ -375,25 +375,25 @@ mod tests {
         state
     }
 
-    // ── T1: basic settle — mints CIRFI for all providers ─────────────────────
+    // ── T1: basic settle — mints QRC for all providers ─────────────────────
 
     #[test]
-    fn t1_settle_mints_cirfi_for_all_providers() {
+    fn t1_settle_mints_qrc_for_all_providers() {
         let n = 4u8;
         let state  = make_finalizing_state(n, 1);
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
 
         let result = settle(&state, &mut engine, SettlementMode::Provisional).unwrap();
 
         assert_eq!(result.epoch, 1);
         assert_eq!(result.provider_count, n as usize);
-        assert!(result.total_minted > 0, "should have minted CIRFI");
+        assert!(result.total_minted > 0, "should have minted QRC");
         assert_eq!(result.records.len(), n as usize);
         assert!(result.provisional);
 
-        // All providers got > 0 CIRFI
+        // All providers got > 0 QRC
         for r in &result.records {
-            assert!(r.cirfi_minted > 0, "provider {:?} got 0 CIRFI", &r.provider_id[0]);
+            assert!(r.qrc_minted > 0, "provider {:?} got 0 QRC", &r.provider_id[0]);
         }
     }
 
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn t2_authoritative_mode_rejected_in_finalizing() {
         let state      = make_finalizing_state(4, 1);
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
 
         let err = settle(&state, &mut engine, SettlementMode::Authoritative).unwrap_err();
         assert!(
@@ -417,7 +417,7 @@ mod tests {
     fn t3_collecting_phase_returns_not_yet_aggregated() {
         let nonce      = make_nonce(1);
         let state      = CapacityReportState::new(1, BTreeMap::new(), nonce, 0, 100);
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
 
         let err = settle(&state, &mut engine, SettlementMode::Provisional).unwrap_err();
         assert!(
@@ -431,10 +431,10 @@ mod tests {
     #[test]
     fn t4_total_minted_equals_sum_of_records() {
         let state      = make_finalizing_state(5, 2);
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
         let result     = settle(&state, &mut engine, SettlementMode::Provisional).unwrap();
 
-        let sum: u128 = result.records.iter().map(|r| r.cirfi_minted).sum();
+        let sum: u128 = result.records.iter().map(|r| r.qrc_minted).sum();
         assert_eq!(result.total_minted, sum);
     }
 
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn t5_engine_supply_increases_by_total_minted() {
         let state          = make_finalizing_state(4, 1);
-        let mut engine     = CirfiEngine::new(R0);
+        let mut engine     = QrcEngine::new(R0);
         let before_supply  = engine.total_supply;
 
         let result = settle(&state, &mut engine, SettlementMode::Provisional).unwrap();
@@ -461,7 +461,7 @@ mod tests {
     // ── T6: larger capacity claim → larger earning ────────────────────────────
 
     #[test]
-    fn t6_higher_claim_earns_more_cirfi() {
+    fn t6_higher_claim_earns_more_qrc() {
         let epoch       = 1u64;
         let nonce       = make_nonce(2);
         let mut state   = CapacityReportState::new(epoch, BTreeMap::new(), nonce, 0, 100);
@@ -484,18 +484,18 @@ mod tests {
         state.close_ecw(ecw).unwrap();
         state.aggregate().unwrap();
 
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
         let result = settle(&state, &mut engine, SettlementMode::Provisional).unwrap();
 
         // Find earnings for provider 0 (smallest) and provider 3 (largest).
         let earn_small = result.records.iter()
-            .find(|r| r.provider_id[0] == 0).unwrap().cirfi_minted;
+            .find(|r| r.provider_id[0] == 0).unwrap().qrc_minted;
         let earn_large = result.records.iter()
-            .find(|r| r.provider_id[0] == 3).unwrap().cirfi_minted;
+            .find(|r| r.provider_id[0] == 3).unwrap().qrc_minted;
 
         assert!(
             earn_large > earn_small,
-            "provider with 5× claim should earn more CIRFI (got {} vs {})",
+            "provider with 5× claim should earn more QRC (got {} vs {})",
             earn_large, earn_small
         );
     }
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn t7_contributions_use_correct_resource_kind() {
         let state      = make_finalizing_state(4, 1);
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
         let result     = settle(&state, &mut engine, SettlementMode::Provisional).unwrap();
 
         for record in &result.records {
@@ -541,11 +541,11 @@ mod tests {
         state.close_ecw(ecw).unwrap();
         state.aggregate().unwrap(); // transitions to Finalizing with all carry-forward
 
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
         let result = settle(&state, &mut engine, SettlementMode::Provisional).unwrap();
 
         // No providers settled (all resources are carry-forward; no fresh evidence).
-        assert_eq!(result.total_minted, 0, "carry-forward resources must not trigger CIRFI minting");
+        assert_eq!(result.total_minted, 0, "carry-forward resources must not trigger QRC minting");
         assert_eq!(result.provider_count, 0);
         assert_eq!(result.carry_forward_skips, 3, "all 3 resource types should be skipped");
     }
@@ -592,7 +592,7 @@ mod tests {
         state.close_ecw(ecw).unwrap();
         state.aggregate().unwrap();
 
-        let mut engine = CirfiEngine::new(R0);
+        let mut engine = QrcEngine::new(R0);
         let result = settle(&state, &mut engine, SettlementMode::Provisional).unwrap();
 
         assert_eq!(result.total_minted, 0);

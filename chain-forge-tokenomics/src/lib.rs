@@ -6,7 +6,7 @@
 ///
 ///   - SupplyRegistry: $QCB hard cap at 210,000,000 (in uqcb base units),
 ///     mint/burn accounting, cap enforcement at the protocol layer
-///   - $CIRFI uncapped, population-linked issuance tracking
+///   - $QRC uncapped, population-linked issuance tracking
 ///   - Genesis allocation per Section 6.7: UBI-majority by construction
 ///   - Staking: bond/unbond $QCB to validators, reward accounting
 ///   - Section 3.3 personhood bound: stake determines participation and
@@ -14,7 +14,7 @@
 ///
 /// The two-token separation is constitutional (Section 7.3). This crate is
 /// where the supply side of that separation is enforced in code:
-/// $QCB mints past the cap fail, and $CIRFI mints are tracked against
+/// $QCB mints past the cap fail, and $QRC mints are tracked against
 /// verified population so population-linked issuance is auditable.
 
 use std::collections::HashMap;
@@ -68,18 +68,18 @@ pub type TkResult<T> = Result<T, TokenomicsError>;
 /// Tracks total supply for both tokens and enforces $QCB's hard cap.
 ///
 /// $QCB: fixed cap, mint-limited, burn-reduced (BME).
-/// $CIRFI: uncapped, population-linked issuance, demurrage-recycled (not burned).
+/// $QRC: uncapped, population-linked issuance, demurrage-recycled (not burned).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupplyRegistry {
     /// Total $QCB ever minted (uqcb).
     pub qcb_minted_uqcb: u128,
     /// Total $QCB burned via BME (uqcb).
     pub qcb_burned_uqcb: u128,
-    /// Total $CIRFI ever minted (ucirfi). Uncapped by design.
-    pub cirfi_minted_ucirfi: u128,
-    /// Total $CIRFI recycled through demurrage into the UBI pool.
+    /// Total $QRC ever minted (uqrc). Uncapped by design.
+    pub qrc_minted_uqrc: u128,
+    /// Total $QRC recycled through demurrage into the UBI pool.
     /// NOT burned -- tracked separately to audit the recycle loop.
-    pub cirfi_recycled_ucirfi: u128,
+    pub qrc_recycled_uqrc: u128,
 }
 
 impl SupplyRegistry {
@@ -87,8 +87,8 @@ impl SupplyRegistry {
         Self {
             qcb_minted_uqcb:       0,
             qcb_burned_uqcb:       0,
-            cirfi_minted_ucirfi:   0,
-            cirfi_recycled_ucirfi: 0,
+            qrc_minted_uqrc:   0,
+            qrc_recycled_uqrc: 0,
         }
     }
 
@@ -138,15 +138,15 @@ impl SupplyRegistry {
         Ok(())
     }
 
-    /// Mint $CIRFI. Uncapped by design (population-linked issuance, Section 6.2).
+    /// Mint $QRC. Uncapped by design (population-linked issuance, Section 6.2).
     /// Only the protocol calls this -- currency issuance is reserved (7.2).
-    pub fn mint_cirfi(&mut self, amount: u128) {
-        self.cirfi_minted_ucirfi += amount;
+    pub fn mint_qrc(&mut self, amount: u128) {
+        self.qrc_minted_uqrc += amount;
     }
 
-    /// Record $CIRFI recycled through demurrage (flows to UBI pool, not burned).
-    pub fn record_cirfi_recycle(&mut self, amount: u128) {
-        self.cirfi_recycled_ucirfi += amount;
+    /// Record $QRC recycled through demurrage (flows to UBI pool, not burned).
+    pub fn record_qrc_recycle(&mut self, amount: u128) {
+        self.qrc_recycled_uqrc += amount;
     }
 }
 
@@ -483,22 +483,22 @@ mod tests {
     }
 
     #[test]
-    fn cirfi_mint_is_uncapped() {
+    fn qrc_mint_is_uncapped() {
         let mut reg = SupplyRegistry::new();
         // Mint a huge amount -- should never fail (population-linked, uncapped)
-        reg.mint_cirfi(u128::MAX / 2);
-        reg.mint_cirfi(u128::MAX / 4);
-        assert!(reg.cirfi_minted_ucirfi > 0);
+        reg.mint_qrc(u128::MAX / 2);
+        reg.mint_qrc(u128::MAX / 4);
+        assert!(reg.qrc_minted_uqrc > 0);
     }
 
     #[test]
-    fn cirfi_recycle_tracked_separately_from_burn() {
+    fn qrc_recycle_tracked_separately_from_burn() {
         let mut reg = SupplyRegistry::new();
-        reg.mint_cirfi(1_000_000);
-        reg.record_cirfi_recycle(50_000);
-        // Recycled CIRFI is NOT burned -- minted total unchanged
-        assert_eq!(reg.cirfi_minted_ucirfi, 1_000_000);
-        assert_eq!(reg.cirfi_recycled_ucirfi, 50_000);
+        reg.mint_qrc(1_000_000);
+        reg.record_qrc_recycle(50_000);
+        // Recycled QRC is NOT burned -- minted total unchanged
+        assert_eq!(reg.qrc_minted_uqrc, 1_000_000);
+        assert_eq!(reg.qrc_recycled_uqrc, 50_000);
     }
 
     // -- GenesisAllocation: Section 6.7 constraints ---------------------------

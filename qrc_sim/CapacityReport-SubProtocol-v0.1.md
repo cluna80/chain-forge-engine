@@ -1,14 +1,14 @@
 # CapacityReport Sub-Protocol Specification v0.1
 
-**Status**: Draft — prerequisite for CIRFI Rust implementation  
-**Depends on**: CIRFI-Protocol-Spec-v0.1.md (commit `1473a7d`)  
-**Answers**: CIRFI-Protocol-Spec §8.1 Open Question (CRITICAL)
+**Status**: Draft — prerequisite for QRC Rust implementation  
+**Depends on**: QRC-Protocol-Spec-v0.1.md (commit `1473a7d`)  
+**Answers**: QRC-Protocol-Spec §8.1 Open Question (CRITICAL)
 
 ---
 
 ## 0. Purpose and Scope
 
-The CIRFI State Validity Invariant is:
+The QRC State Validity Invariant is:
 
 ```
 outstanding_e * CR_min_fixed <= capacity_e * D
@@ -16,21 +16,21 @@ outstanding_e * CR_min_fixed <= capacity_e * D
 
 `capacity_e` is consensus-critical state. If two validators disagree on
 `capacity_e`, they may reach different conclusions about whether the same
-`QcbToCirfi` transaction is valid. That is a consensus fork, not an
+`QcbToQrc` transaction is valid. That is a consensus fork, not an
 economic error.
 
 This specification defines the **CapacityReport sub-protocol**: the
-peer-level protocol to CIRFI issuance that establishes `capacity_e` as a
+peer-level protocol to QRC issuance that establishes `capacity_e` as a
 deterministic, Byzantine-resistant, auditable value agreed upon by all
-validators before the CIRFI epoch boundary runs.
+validators before the QRC epoch boundary runs.
 
 ### What this spec does NOT do
 
 This spec does not define:
 - VCA contribution verification (separate protocol)
-- CIRFI issuance or consumption (see CIRFI-Protocol-Spec)
+- QRC issuance or consumption (see QRC-Protocol-Spec)
 - Validator set management (see chain consensus layer)
-- Economic calibration of CU/ucirfi ratio (see §8.2 of CIRFI spec)
+- Economic calibration of CU/uqrc ratio (see §8.2 of QRC spec)
 
 ### Required claim separation
 
@@ -121,7 +121,7 @@ CapacityEvidence = {
 ```
 
 `capacity_claim` is expressed as fixed-point with denominator D = 1_000_000
-(consistent with CIRFI spec §1). An evidence item claiming 1,000 CU of
+(consistent with QRC spec §1). An evidence item claiming 1,000 CU of
 Compute is encoded as `capacity_claim = 1_000 * D = 1_000_000_000`.
 
 ### 2.1 CapacityProof (resource-type specific)
@@ -285,7 +285,7 @@ been updated for `MAX_CARRY_FORWARD_EPOCHS` consecutive epochs, the chain
 MUST emit a protocol warning event. Implementations SHOULD alert operators.
 
 Carry-forward does NOT reduce capacity. Actual capacity may have declined.
-The circuit breaker (CIRFI-Protocol-Spec §7.3) is the backstop: if
+The circuit breaker (QRC-Protocol-Spec §7.3) is the backstop: if
 outstanding grows relative to stale carried-forward capacity, CR falls and
 the Availability Guard fires.
 
@@ -334,7 +334,7 @@ already signed.
 
 ### 6.3 Report finalization timing
 
-The `CapacityReport_e` is finalized as part of the CIRFI epoch boundary
+The `CapacityReport_e` is finalized as part of the QRC epoch boundary
 sequence, Step 2 ("ACCEPT_CAPACITY_REPORT"). It must be available on-chain
 before the epoch boundary block is finalized.
 
@@ -355,7 +355,7 @@ epoch_start_e
     │      CapacityReport_e must be countersigned and on-chain by this block
     │
     └── epoch_boundary_e
-           CIRFI epoch boundary sequence runs (uses finalized capacity_e)
+           QRC epoch boundary sequence runs (uses finalized capacity_e)
 ```
 
 ---
@@ -388,7 +388,7 @@ If the challenge succeeds (adjudicated by validators within `ADJUDICATION_WINDOW
 - Slashed collateral is distributed: 50% to challenger, 50% burned
 - The challenged evidence item is retroactively excluded and `capacity_e_r`
   is recomputed. If recomputation changes the capacity-invariant decision for
-  any finalized CIRFI transaction in that epoch, those transactions are
+  any finalized QRC transaction in that epoch, those transactions are
   flagged for governance review (the state transition cannot be reversed; the
   slash is the economic penalty)
 
@@ -429,7 +429,7 @@ All parameters are network-configurable via governance. Initial values
 are calibration estimates; the v3 simulation did not sweep them.
 
 ```
-// Fixed-point denominator (inherited from CIRFI spec)
+// Fixed-point denominator (inherited from QRC spec)
 D = 1_000_000                           // [CONSTITUTIONAL]
 
 // Provider registration
@@ -467,15 +467,15 @@ CAPACITY_STEP_WARN_THRESHOLD = 200_000  // 20% single-epoch change [fixed-point 
 
 ---
 
-## 9. Relationship to CIRFI Epoch Boundary
+## 9. Relationship to QRC Epoch Boundary
 
-The CIRFI epoch boundary sequence (CIRFI-Protocol-Spec §4) assumes a finalized
+The QRC epoch boundary sequence (QRC-Protocol-Spec §4) assumes a finalized
 `capacity_e` is available at Step 2. This sub-protocol provides that value.
 
 The integration contract is:
 
 ```
-// From CapacityReport sub-protocol → CIRFI issuance protocol
+// From CapacityReport sub-protocol → QRC issuance protocol
 capacity_e: u128 = finalized_CapacityReport_e.capacity_total
 ```
 
@@ -485,7 +485,7 @@ If no valid CapacityReport is finalized by `REPORT_DEADLINE_e`:
 capacity_e = capacity_{e-1}   // carry-forward (sub-protocol handles this)
 ```
 
-The CIRFI epoch boundary sequence proceeds regardless. A missing report does
+The QRC epoch boundary sequence proceeds regardless. A missing report does
 not halt consensus — it uses the last known capacity. The Availability Guard
 will fire if outstanding has grown relative to stale capacity.
 
@@ -562,7 +562,7 @@ Transitions:
 ## 12. Test Scenarios
 
 Before implementing this sub-protocol in Rust, the following scenarios MUST
-be tested against the spec (extending the CIRFI v3 test vectors):
+be tested against the spec (extending the QRC v3 test vectors):
 
 | # | Scenario | Expected outcome |
 |---|----------|-----------------|
@@ -580,5 +580,5 @@ be tested against the spec (extending the CIRFI v3 test vectors):
 
 ---
 
-*CapacityReport-SubProtocol-v0.1 — closes CIRFI-Protocol-Spec §8.1 Open Question*  
+*CapacityReport-SubProtocol-v0.1 — closes QRC-Protocol-Spec §8.1 Open Question*  
 *Next: implement CapacityEvidence_v0 state machine in Chain Forge; v0.2 adds stake-weighted aggregation and v1 proof types*

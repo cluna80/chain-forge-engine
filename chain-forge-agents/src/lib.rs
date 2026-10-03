@@ -5,7 +5,7 @@
 /// Implements Whitepaper Section 5.3 and the AEI specification from Section 4.6:
 ///
 ///   - AgentCapability: what a Charmed Agent is authorized to do
-///   - SpendingLimits: per-epoch and lifetime $CIRFI spending caps
+///   - SpendingLimits: per-epoch and lifetime $QRC spending caps
 ///   - AgentRecord: full on-chain identity for one agent (the AEI)
 ///   - AgentStore: canonical registry of all Charmed Agents
 ///   - Full lifecycle: register → authorize → (suspend) → revoke
@@ -69,13 +69,13 @@ pub type AgentResult<T> = Result<T, AgentError>;
 /// described in Section 5.3's scope note. The others are framework for Phase 1+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentCapability {
-    /// Accept $CIRFI payments on behalf of a merchant and trigger fiat settlement.
+    /// Accept $QRC payments on behalf of a merchant and trigger fiat settlement.
     MerchantSettlement,
-    /// Claim and distribute $CIRFI UBI to verified humans.
+    /// Claim and distribute $QRC UBI to verified humans.
     UbiDistribution,
-    /// Hold $CIRFI balance up to the agent's spending limit.
+    /// Hold $QRC balance up to the agent's spending limit.
     HoldBalance,
-    /// Transfer $CIRFI to other verified accounts (not agents, unless authorized).
+    /// Transfer $QRC to other verified accounts (not agents, unless authorized).
     Transfer,
     /// Interact with a Sponsored Contract (Section 7.2, Phase 5+).
     SponsoredContractCall,
@@ -120,69 +120,69 @@ impl std::fmt::Display for AgentCapability {
 
 // -- SpendingLimits -----------------------------------------------------------
 
-/// Per-epoch and lifetime $CIRFI spending caps for a Charmed Agent.
+/// Per-epoch and lifetime $QRC spending caps for a Charmed Agent.
 /// This is the SpendingLimits field from the AEI specification (Section 4.6).
 ///
 /// Phase 0: enforced in AgentStore::record_spend().
 /// The human sponsor sets these at registration time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendingLimits {
-    /// Maximum ucirfi this agent may spend in one epoch (daily cap).
+    /// Maximum uqrc this agent may spend in one epoch (daily cap).
     /// 0 means no limit.
-    pub epoch_limit_ucirfi: u128,
-    /// Maximum ucirfi this agent may spend across its lifetime.
+    pub epoch_limit_uqrc: u128,
+    /// Maximum uqrc this agent may spend across its lifetime.
     /// 0 means no limit.
-    pub lifetime_limit_ucirfi: u128,
-    /// Maximum ucirfi this agent may hold at any one time.
+    pub lifetime_limit_uqrc: u128,
+    /// Maximum uqrc this agent may hold at any one time.
     /// 0 means no limit.
-    pub max_balance_ucirfi: u128,
+    pub max_balance_uqrc: u128,
 }
 
 impl SpendingLimits {
     /// No spending limits (trusted agent).
     pub fn unlimited() -> Self {
         Self {
-            epoch_limit_ucirfi:    0,
-            lifetime_limit_ucirfi: 0,
-            max_balance_ucirfi:    0,
+            epoch_limit_uqrc:    0,
+            lifetime_limit_uqrc: 0,
+            max_balance_uqrc:    0,
         }
     }
 
     /// Merchant agent: high throughput, no lifetime cap.
-    pub fn merchant(epoch_limit_ucirfi: u128) -> Self {
+    pub fn merchant(epoch_limit_uqrc: u128) -> Self {
         Self {
-            epoch_limit_ucirfi,
-            lifetime_limit_ucirfi: 0,
-            max_balance_ucirfi:    epoch_limit_ucirfi * 2,
+            epoch_limit_uqrc,
+            lifetime_limit_uqrc: 0,
+            max_balance_uqrc:    epoch_limit_uqrc * 2,
         }
     }
 
     /// UBI distributor: bounded by daily issuance.
-    pub fn ubi_distributor(daily_issuance_ucirfi: u128, population: u64) -> Self {
-        let epoch = daily_issuance_ucirfi * population as u128;
+    pub fn ubi_distributor(daily_issuance_uqrc: u128, population: u64) -> Self {
+        let epoch = daily_issuance_uqrc * population as u128;
         Self {
-            epoch_limit_ucirfi:    epoch,
-            lifetime_limit_ucirfi: 0,
-            max_balance_ucirfi:    epoch,
+            epoch_limit_uqrc:    epoch,
+            lifetime_limit_uqrc: 0,
+            max_balance_uqrc:    epoch,
         }
     }
 
     /// Check if a spend of `amount` would exceed limits given current state.
     pub fn check_epoch(&self, epoch_spend: u128, amount: u128) -> AgentResult<()> {
-        if self.epoch_limit_ucirfi > 0 && epoch_spend + amount > self.epoch_limit_ucirfi {
+        if self.epoch_limit_uqrc > 0 && epoch_spend + amount > self.epoch_limit_uqrc {
             return Err(AgentError::EpochLimitExceeded {
-                epoch_spend, amount, epoch_limit: self.epoch_limit_ucirfi,
+                epoch_spend, amount, epoch_limit: self.epoch_limit_uqrc,
             });
         }
         Ok(())
     }
 
     pub fn check_lifetime(&self, lifetime_spend: u128, amount: u128) -> AgentResult<()> {
-        if self.lifetime_limit_ucirfi > 0
-            && lifetime_spend + amount > self.lifetime_limit_ucirfi
+        if self.lifetime_limit_uqrc > 0
+            && lifetime_spend + amount > self.lifetime_limit_uqrc
         {
             return Err(AgentError::LifetimeLimitExceeded {
-                lifetime_spend, amount, lifetime_limit: self.lifetime_limit_ucirfi,
+                lifetime_spend, amount, lifetime_limit: self.lifetime_limit_uqrc,
             });
         }
         Ok(())
@@ -245,7 +245,7 @@ pub struct AgentRecord {
     pub sponsor_id: String,
     /// AEI field 2: CapabilitySet -- what this agent is authorized to do.
     pub capabilities: Vec<AgentCapability>,
-    /// AEI field 3: SpendingLimits -- $CIRFI caps per epoch and lifetime.
+    /// AEI field 3: SpendingLimits -- $QRC caps per epoch and lifetime.
     pub spending_limits: SpendingLimits,
     /// AEI field 4: ParentAgentID -- if this is a sub-agent, its parent's ID.
     pub parent_agent_id: Option<String>,
@@ -259,10 +259,10 @@ pub struct AgentRecord {
     pub registered_epoch: u64,
     /// Epoch of the most recent authorization or status change.
     pub last_status_epoch: u64,
-    /// Total ucirfi spent this epoch (reset each epoch advance).
-    pub epoch_spend_ucirfi: u128,
-    /// Total ucirfi spent across the agent's lifetime.
-    pub lifetime_spend_ucirfi: u128,
+    /// Total uqrc spent this epoch (reset each epoch advance).
+    pub epoch_spend_uqrc: u128,
+    /// Total uqrc spent across the agent's lifetime.
+    pub lifetime_spend_uqrc: u128,
     /// Total transactions executed.
     pub tx_count: u64,
 }
@@ -291,8 +291,8 @@ impl AgentRecord {
             status:               AgentStatus::Pending,
             registered_epoch:     epoch,
             last_status_epoch:    epoch,
-            epoch_spend_ucirfi:   0,
-            lifetime_spend_ucirfi: 0,
+            epoch_spend_uqrc:   0,
+            lifetime_spend_uqrc: 0,
             tx_count:             0,
         }
     }
@@ -334,17 +334,17 @@ impl AgentRecord {
 
     /// Record a spend and validate it against limits.
     pub fn record_spend(&mut self, amount: u128) -> AgentResult<()> {
-        self.spending_limits.check_epoch(self.epoch_spend_ucirfi, amount)?;
-        self.spending_limits.check_lifetime(self.lifetime_spend_ucirfi, amount)?;
-        self.epoch_spend_ucirfi   += amount;
-        self.lifetime_spend_ucirfi += amount;
+        self.spending_limits.check_epoch(self.epoch_spend_uqrc, amount)?;
+        self.spending_limits.check_lifetime(self.lifetime_spend_uqrc, amount)?;
+        self.epoch_spend_uqrc   += amount;
+        self.lifetime_spend_uqrc += amount;
         self.tx_count              += 1;
         Ok(())
     }
 
     /// Reset epoch spend counter (called on each epoch advance).
     pub fn reset_epoch_spend(&mut self) {
-        self.epoch_spend_ucirfi = 0;
+        self.epoch_spend_uqrc = 0;
     }
 }
 
@@ -552,7 +552,7 @@ pub fn merchant_agent(
     agent_id:           &str,
     address:            &str,
     sponsor_id:         &str,
-    epoch_limit_ucirfi: u128,
+    epoch_limit_uqrc: u128,
     epoch:              u64,
 ) -> (String, String, String, Vec<AgentCapability>, SpendingLimits, Option<String>, String, AgentType) {
     (
@@ -565,7 +565,7 @@ pub fn merchant_agent(
             AgentCapability::Transfer,
             AgentCapability::ReadState,
         ],
-        SpendingLimits::merchant(epoch_limit_ucirfi),
+        SpendingLimits::merchant(epoch_limit_uqrc),
         None,
         format!("Merchant settlement agent for sponsor {sponsor_id}"),
         AgentType::Native,
@@ -650,9 +650,9 @@ mod tests {
     #[test]
     fn lifetime_limit_enforced() {
         let limits = SpendingLimits {
-            epoch_limit_ucirfi:    0,
-            lifetime_limit_ucirfi: 5_000_000,
-            max_balance_ucirfi:    0,
+            epoch_limit_uqrc:    0,
+            lifetime_limit_uqrc: 5_000_000,
+            max_balance_uqrc:    0,
         };
         assert!(limits.check_lifetime(4_999_999, 1).is_ok());
         assert!(limits.check_lifetime(5_000_000, 1).is_err());
@@ -714,8 +714,8 @@ mod tests {
         );
         record.authorize(0);
         record.record_spend(500_000).unwrap();
-        assert_eq!(record.epoch_spend_ucirfi, 500_000);
-        assert_eq!(record.lifetime_spend_ucirfi, 500_000);
+        assert_eq!(record.epoch_spend_uqrc, 500_000);
+        assert_eq!(record.lifetime_spend_uqrc, 500_000);
         assert_eq!(record.tx_count, 1);
 
         // Should fail: would exceed epoch limit
@@ -723,9 +723,9 @@ mod tests {
 
         // Reset epoch and try again
         record.reset_epoch_spend();
-        assert_eq!(record.epoch_spend_ucirfi, 0);
+        assert_eq!(record.epoch_spend_uqrc, 0);
         assert!(record.record_spend(600_000).is_ok());
-        assert_eq!(record.lifetime_spend_ucirfi, 1_100_000); // cumulative
+        assert_eq!(record.lifetime_spend_uqrc, 1_100_000); // cumulative
     }
 
     // -- AgentStore tests -----------------------------------------------------
@@ -897,13 +897,13 @@ mod tests {
 
     #[test]
     fn ubi_distributor_limits_match_population() {
-        use chain_forge_identity::DAILY_UBI_RATE_UCIRFI;
+        use chain_forge_identity::DAILY_UBI_RATE_UQRC;
         let (_, _, _, _, limits, _, _, _) =
             ubi_distributor_agent("ubi1", "qcb1ubi", "qcb1alice",
-                DAILY_UBI_RATE_UCIRFI, 1000, 0);
+                DAILY_UBI_RATE_UQRC, 1000, 0);
 
-        let expected_epoch = DAILY_UBI_RATE_UCIRFI * 1000;
-        assert_eq!(limits.epoch_limit_ucirfi, expected_epoch);
+        let expected_epoch = DAILY_UBI_RATE_UQRC * 1000;
+        assert_eq!(limits.epoch_limit_uqrc, expected_epoch);
     }
 
     #[test]

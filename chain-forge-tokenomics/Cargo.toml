@@ -8,14 +8,14 @@ license.workspace = true
 # Two-token supply enforcement (Whitepaper Sections 6.1-6.3, 6.7).
 # Implements:
 #   - SupplyRegistry: $QCB hard cap (210,000,000), mint/burn accounting
-#   - $CIRFI uncapped population-linked issuance tracking
+#   - $QRC uncapped population-linked issuance tracking
 #   - Genesis allocation per Section 6.7 (70/15/7/5/3 within UBI-majority ceiling)
 #   - Staking module: bond, unbond, per-validator stakes, reward accounting
 #   - Personhood bounds link: stake determines participation, not influence (3.3)
 #
 # The constitutional two-token separation (Section 7.3) is enforced here:
 # $QCB mints past the cap are rejected at the protocol layer, and only
-# the protocol can mint $CIRFI (currency issuance reserved -- Section 7.2).
+# the protocol can mint $QRC (currency issuance reserved -- Section 7.2).
 
 [dependencies]
 chain-forge-core     = { path = "../chain-forge-core" }

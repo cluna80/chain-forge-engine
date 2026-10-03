@@ -11,7 +11,7 @@
 ///   - Snapshot: immutable state at a given block height for sync/rollback
 ///
 /// Whitepaper refs:
-///   - Section 6.2 ($CIRFI balance tracking, demurrage)
+///   - Section 6.2 ($QRC balance tracking, demurrage)
 ///   - Section 6.3 ($QCB balance tracking, BME burns)
 ///   - Section 7.6 (Chain Forge state layer, JMT)
 ///   - Open Question 4 (reserve strategy / stability backing)
@@ -57,7 +57,7 @@ pub type StateResult<T> = Result<T, StateError>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
     pub address: String,
-    /// Balances keyed by token denom (e.g. "uqcb", "ucirfi").
+    /// Balances keyed by token denom (e.g. "uqcb", "uqrc").
     pub balances: BTreeMap<String, u128>,
     /// Transaction nonce. Prevents replay attacks.
     pub nonce: u64,
@@ -808,12 +808,12 @@ mod tests {
         let mut store = make_store();
         let mut acct = AccountState::new("qcb1multi".into(), "user".into());
         acct.credit("uqcb",   1_000_000);
-        acct.credit("ucirfi", 500_000);
+        acct.credit("uqrc", 500_000);
         store.upsert_account(acct);
 
         let a = store.get_account("qcb1multi").unwrap();
         assert_eq!(a.balance_of("uqcb"),   1_000_000);
-        assert_eq!(a.balance_of("ucirfi"), 500_000);
+        assert_eq!(a.balance_of("uqrc"), 500_000);
         assert_eq!(a.balance_of("uother"), 0);
     }
 
@@ -896,7 +896,7 @@ mod tests {
 
         let mut store = make_store();
         let mut acct = AccountState::new_human("qcb1h1".into(), "user".into(), 0);
-        acct.credit("ucirfi", 1_000_000);
+        acct.credit("uqrc", 1_000_000);
         store.upsert_account(acct);
         let root1 = store.commit(1, 1000, false).root_hash;
 
