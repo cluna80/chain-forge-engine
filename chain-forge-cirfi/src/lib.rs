@@ -51,6 +51,12 @@ pub use capacity_report::{
     CapacityReportState, ResourceCapacityRecord, ResourceType,
 };
 
+pub mod contribution_settlement;
+pub use contribution_settlement::{
+    kind_to_resource_type, resource_type_to_kind, settle, EpochSettlement,
+    SettlementError, SettlementMode, SettlementRecord,
+};
+
 use std::collections::BTreeMap;
 use thiserror::Error;
 
