@@ -389,6 +389,106 @@ Mechanism — verified humans who lock $CIRFI receive a proportional share of th
 
 What this is not: this section does not cover activity-based $QCB accrual — a related but distinct idea where $QCB is earned through measured $CIRFI economic activity rather than through locking a balance. That mechanism depends on unresolved questions this document is not yet in a position to answer, including — in one of its proposed forms — a dependency on Human Capacity Markets, which is itself unresolved. It is recorded as a named extension under Open Question 26, not specified here, and not treated as a second claim on this section's 4% allocation.
 
+6.10 CIRFI Resource Economy — Five-Control Architecture
+
+The $CIRFI model has two distinct issuance paths with separate controls. Section 6.2 describes the contribution path: verified humans earn $CIRFI through network participation, measured by the Verifiable Contribution Attestation (VCA) mechanism. This section describes the second path: QCB holders burn $QCB to convert it into $CIRFI. The two paths operate independently — $CIRFI earned through contribution and $CIRFI acquired through QCB conversion are identical once issued, but the minting controls governing each path differ.
+
+This section also introduces the resource economy framing that governs both paths: $CIRFI is not a monetary supply whose price must remain stable. It is a redeemable claim on network resources — compute, storage, ZK proving, oracle queries, AI inference, and bandwidth. The correct economic invariant is not price stability. It is resource solvency:
+
+CIRFI_outstanding ≤ Capacity / CR_min
+
+If the network has issued more $CIRFI than it can service at the target coverage ratio, the system is insolvent regardless of price. The five controls below enforce this invariant.
+
+Why this framing matters: a token-inflation lens (is $CIRFI supply growing too fast?) misses the failure mode that the v2 simulation uncovered — a scenario with only +1.5% supply growth and apparently stable monetary behavior, but a CoverageRatio of 0.005. The network had issued 200x more resource claims than it could service. Price and supply metrics showed nothing. Only the CoverageRatio showed the solvency collapse. The five-control architecture is designed to prevent exactly this.
+
+Control 1 — Dynamic Conversion Rate
+
+$QCB converts to $CIRFI at a rate R_t that responds to network utilization:
+
+R_t = R_0 × (U* / U_bar_t)^γ, clamped to [R_min, R_max]
+
+where U_bar_t is an exponential moving average of utilization (smoothing parameter α = 0.10 prevents rapid rate oscillations), U* = 0.70 is the target utilization level, and γ = 1.5 controls the price sensitivity to utilization deviations. When the network is near empty (U_bar → 0), the price ceiling R_max becomes the binding constraint, preventing the unlimited CIRFI creation that a pure utilization-based rate would allow at low utilization.
+
+Simulation-derived starting parameters: R_max = 2.0, R_min = 0.5. These values were determined empirically: stress tests showed that R_max = 5.0 allows +489% supply growth under a sustained adversarial QCB dump at near-zero utilization. R_max = 2.0 limits adversarial supply growth to under 6% — but the price ceiling alone is not the load-bearing safety mechanism. That role belongs to Control 2.
+
+Control 2 — Epoch Conversion Cap
+
+The maximum $QCB that any epoch may convert into $CIRFI is bounded independently of price:
+
+QCB_converted(epoch) ≤ L_e
+
+This is the dominant safety control. An adversary cannot manufacture large quantities of $CIRFI by exploiting low utilization and the price ceiling — the epoch cap limits total conversion volume regardless of the rate. Simulation confirmed that with L_e = 1,000 QCB/epoch, a sustained adversarial dump of 5,000 QCB/tick is fully contained (CR_min = 0.999 over 200 epochs).
+
+The epoch cap is adaptive by default:
+
+L_e = β_cap × Capacity_e + λ_cap × Demand_e
+
+where β_cap = 0.001 and λ_cap = 0.0005. The adaptive form automatically tightens when the network is empty: at near-zero utilization, Demand_e → 0, so L_e ≈ β_cap × Capacity — the cap scales with available resources rather than being fixed at a value that may be appropriate for one network size but wrong for another. This eliminates the adversarial exploit of dumping into an empty network, because an empty network produces a small cap.
+
+Control 3 — Capacity Tracking
+
+$CIRFI is a claim on network resources. If the measurement of available resources is wrong, the solvency invariant cannot be enforced. Control 3 requires on-chain, per-epoch measurement of total active provider capacity across all resource types: compute, storage, ZK proving, oracle, AI inference, bandwidth. Provider capacity is not self-reported without check — the VCA mechanism (Section 6.2) provides the attestation infrastructure for this measurement.
+
+This control is what makes CoverageRatio meaningful rather than circular: without independent capacity tracking, CR could be gamed by providers inflating their reported capacity. With it, outstanding CIRFI can be compared against real, attested resource availability.
+
+Control 4 — Consumption Burn
+
+Every unit of $CIRFI consumed — spent on actual network resource usage — destroys a fraction p_burn permanently:
+
+CIRFI_burned = p_burn × CIRFI_consumed
+
+At p_burn = 0.25, 25% of every resource-consumption event is destroyed. This creates a natural supply contraction proportional to usage: the more the network is used, the more $CIRFI is permanently removed from circulation. This prevents indefinite accumulation of outstanding claims even when the network is busy.
+
+Simulation result: at high utilization (U = 0.99) with p_burn = 0.25 and a moderate earn rate, the contribution path becomes nearly self-canceling — $CIRFI earned ≈ $CIRFI consumed, and the 25% burn permanently contracts supply over time. Sybil farming (creating fake contribution identities to accumulate $CIRFI) is self-defeating under this dynamic: at near-full utilization, earners burn through most of what they accumulate in normal resource consumption, and attempts to farm without consuming face the circuit breaker (Control 5).
+
+Control 5 — CoverageRatio Circuit Breaker (Resource Solvency Mechanism)
+
+The CoverageRatio measures network solvency in resource terms:
+
+CR_t = Capacity_t / CIRFI_outstanding_t
+
+This is not a monetary policy mechanism. It is a resource solvency mechanism. The distinction is important for QCB specifically: $CIRFI is a claim on actual network capacity, not a speculative token. CR < 1.0 means the network cannot service all outstanding $CIRFI claims simultaneously. CR → 0 means the network is economically insolvent — it has issued far more resource claims than it can honor.
+
+The circuit breaker enforces a minimum coverage ratio through a three-state hysteresis machine:
+
+State | Condition | Conversion | Contribution earn
+NORMAL | CR ≥ CR_resume | Open | Open
+RESTRICTED | CR_halt ≤ CR < CR_resume | Suspended | Open
+HALTED | CR < CR_halt | Suspended | Suspended
+
+The hysteresis band (CR_halt < CR_resume) prevents oscillation: without it, a single threshold would repeatedly switch minting on and off as CR hovers near the boundary. The contribution earn path remains open in RESTRICTED because providers should not be penalized for a capacity collapse they did not cause — only QCB conversion, the discretionary mint path, is suspended.
+
+Simulation-derived starting parameters: CR_halt = 0.75, CR_resume = 1.00.
+
+Why CR_halt = 1.00 was rejected: the recovery test (capacity collapses to 20% of baseline, then recovers to 100% over 400 epochs) showed that CR_halt = 1.00 / CR_resume = 1.25 results in minting never resuming within 400 ticks. The system cannot recover from realistic capacity shocks under those parameters. CR_halt = 0.75 / CR_resume = 1.00 resumes minting at t = 262, giving the system adequate headroom to recover from provider-exit scenarios without the circuit breaker becoming a permanent lock.
+
+What the circuit breaker cannot do: it can halt new minting when capacity falls, but it cannot restore capacity. Provider exodus scenarios (Scenario 3 in the v3 stress test) saw CR → 0.027 despite the circuit breaker halting minting at tick 23. The breaker buys time and prevents supply accumulation during a capacity collapse — it does not rebuild the network. Real recovery requires providers to return or new capacity to join. The circuit breaker is one layer of protection, not a substitute for capacity incentives.
+
+Architecture Summary
+
+The five controls form a layered defense with the following separation of concerns:
+
+Control | Mechanism | Protects against
+1 — Dynamic price | R_t ∈ [R_min, R_max] | Mispricing under congestion or low utilization
+2 — Epoch conversion cap | L_e = β_cap × Capacity + λ_cap × Demand | QCB conversion floods; adversarial dump at low U
+3 — Capacity tracking | On-chain VCA-attested resource measurement | Resource over-issuance; measurement gaming
+4 — Consumption burn | p_burn = 0.25 of every consumption event | Persistent CIRFI accumulation; sybil farming
+5 — CR circuit breaker | CR_halt = 0.75, CR_resume = 1.00, three-state hysteresis | Capacity collapse / provider exodus
+
+The economic architecture is:
+
+QCB → (burn) → CIRFI → Network Resources → (p_burn) → destroyed
+
+while the parallel contribution path is:
+
+VCA contribution → CIRFI earn → Resource consumption → (p_burn) → destroyed
+
+and the safety boundary is:
+
+CR < CR_halt ⟹ CIRFI issuance suspended
+
+Simulation basis: the five-control architecture was validated through three simulation passes totaling 135 scenario configurations (cirfi_stress_test.py, cirfi_stress_test_v2.py, cirfi_stress_test_v3.py in the chain-forge-engine repository). The parameters above are simulation-derived starting values, not immutable economic constants. The core protocol invariant — zero ticks where minting was allowed while CR < 0.10 — was verified across all 15 main scenarios in the v3 sweep. Governance may adjust all parameters in this section (Controls 1–5 thresholds) through the ordinary $CIRFI governance process described in Section 6.6.
+
 ---
 
 7. Sovereignty, Execution Environment, and the Constitutional Layer
