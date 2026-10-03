@@ -1122,6 +1122,87 @@ mod tests {
         assert!(bound.multiplicity_within_bound());
     }
 
+    /// T2.4 CA-1: Concurrent activation — `NullifierSet` is thread-safe.
+    ///
+    /// Two threads race to spend the same nullifier. Exactly one must succeed;
+    /// the other must see `NullifierReplay`. No data races or panics allowed.
+    ///
+    /// We wrap `NullifierSet` in `Arc<Mutex<_>>` as a production deployment
+    /// would, then spawn N threads each trying to `spend` the same nullifier.
+    #[test]
+    fn t2_ca1_concurrent_nullifier_spend_is_safe() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        const THREAD_COUNT: usize = 16;
+        let nullifier = Nullifier([0xCA; 32]);
+        let set = Arc::new(Mutex::new(NullifierSet::new()));
+
+        let handles: Vec<_> = (0..THREAD_COUNT)
+            .map(|_| {
+                let set = Arc::clone(&set);
+                let n   = nullifier.clone();
+                thread::spawn(move || {
+                    set.lock().unwrap().spend(n)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let replays   = results.iter().filter(|r| {
+            matches!(r, Err(EligibilityError::NullifierReplay))
+        }).count();
+
+        assert_eq!(
+            successes, 1,
+            "CA-1: exactly one thread must successfully spend the nullifier, got {successes}"
+        );
+        assert_eq!(
+            replays, THREAD_COUNT - 1,
+            "CA-1: all other threads must receive NullifierReplay, got {replays}"
+        );
+    }
+
+    /// T2.4 CA-1 (variant): concurrent activation of distinct nullifiers must all succeed.
+    ///
+    /// Verifies that the `Mutex` serialization does not incorrectly reject
+    /// distinct nullifiers when concurrent threads spend different ones.
+    #[test]
+    fn t2_ca1_concurrent_distinct_nullifiers_all_succeed() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        const THREAD_COUNT: usize = 16;
+        let set = Arc::new(Mutex::new(NullifierSet::new()));
+
+        let handles: Vec<_> = (0..THREAD_COUNT as u8)
+            .map(|i| {
+                let set = Arc::clone(&set);
+                // Each thread uses a unique nullifier (byte pattern = thread index)
+                let n = Nullifier([i; 32]);
+                thread::spawn(move || {
+                    set.lock().unwrap().spend(n)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures  = results.iter().filter(|r| r.is_err()).count();
+
+        assert_eq!(
+            successes, THREAD_COUNT,
+            "CA-1 variant: all distinct nullifiers must be accepted, got {successes}/{THREAD_COUNT}"
+        );
+        assert_eq!(
+            failures, 0,
+            "CA-1 variant: no concurrent spend of distinct nullifiers should fail"
+        );
+    }
+
     /// T2 -- SS-1: same secret, same epoch, same nonce => NullifierReplay on second call.
     #[test]
     fn t2_ss1_same_secret_same_epoch_replay_rejected() {
