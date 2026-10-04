@@ -101,22 +101,19 @@ if (-not $Resume) {
 # --- Build the command string for each node ----------------------------------
 
 function Get-NodeCmd($node) {
-    $bin     = (Resolve-Path $Binary).Path
-    $gen     = (Resolve-Path $Genesis).Path
-    $keyFlag = ""
+    $bin = (Resolve-Path $Binary).Path
+    $gen = (Resolve-Path $Genesis).Path
+
+    # Build the argument list as a plain string — no & '...' wrapper so that
+    # Windows Terminal (wt.exe) does not add a second quoting layer.
+    $nodeArgs = "--genesis `"$gen`" --validator $($node.Validator) --api-port $($node.ApiPort) --data-dir `"$($node.DataDir)`""
     if (-not $NoKeys) {
-        $keyPath = Resolve-Path "$KeysDir\$($node.Validator).key.json"
-        $keyFlag = "--key-file '$keyPath' "
+        $keyPath  = (Resolve-Path "$KeysDir\$($node.Validator).key.json").Path
+        $nodeArgs = "$nodeArgs --key-file `"$keyPath`""
     }
-    return (
-        "`$env:RUST_LOG='$LogLevel'; " +
-        "& '$bin' " +
-        "--genesis '$gen' " +
-        "--validator $($node.Validator) " +
-        "--api-port $($node.ApiPort) " +
-        "--data-dir '$($node.DataDir)' " +
-        $keyFlag
-    )
+
+    # Set RUST_LOG then invoke the binary by full path.
+    return "`$env:RUST_LOG='$LogLevel'; & `"$bin`" $nodeArgs"
 }
 
 # --- Launch each node --------------------------------------------------------
