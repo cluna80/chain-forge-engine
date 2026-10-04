@@ -1806,6 +1806,13 @@ impl Node {
             0
         };
 
+        // Update QRC metrics so the API and tests can observe the burn.
+        if actual_burn > 0 {
+            if let Ok(mut cm) = self.qrc_metrics.lock() {
+                cm.total_qcb_burned_uqcb = cm.total_qcb_burned_uqcb.saturating_add(actual_burn);
+            }
+        }
+
         Ok(actual_burn)
     }
 
