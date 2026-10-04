@@ -297,6 +297,9 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::CharmConfinementUpdate { .. }   => "charm_confinement_update",
         TxBody::IntrinsicCharmRecord { .. }     => "intrinsic_charm_record",
         TxBody::RegisterAgent { .. }            => "register_agent",
+        // QRC Economic Model v0.2 epoch boundary signals
+        TxBody::EpochOpen { .. }                => "epoch_open",
+        TxBody::EpochClose { .. }              => "epoch_close",
     }
 }
 

@@ -126,6 +126,9 @@ impl GasModel {
                     TxBody::IntrinsicCharmRecord { .. }  => op_multiplier * 3,
                     // RegisterAgent: writes AgentRecord + identity sponsorship + account.
                     TxBody::RegisterAgent { .. }         => op_multiplier * 8,
+                    // Epoch boundary: lightweight protocol signals.
+                    TxBody::EpochOpen { .. }             => op_multiplier * 4,
+                    TxBody::EpochClose { .. }            => op_multiplier * 4,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -367,6 +370,43 @@ pub enum TxBody {
         /// If this is a sub-agent, the parent's agent_id.
         parent_agent_id: Option<String>,
     },
+
+    // ── QRC Economic Model v0.2 — Epoch Accounting ────────────────────────────
+
+    /// Open a new QRC epoch (QRC Economic Model v0.2 §EpochOpen).
+    ///
+    /// Submitted by block producers at an epoch boundary.  Initialises the
+    /// per-epoch supply cap and seeds the epoch reserve from the protocol
+    /// reserve.  Only one epoch may be open at a time; attempting to open a
+    /// second epoch without closing the first is rejected.
+    ///
+    /// `verified_count` is the number of verified identities at epoch start,
+    /// snapshotted from the IdentityStore.  It drives the supply cap:
+    ///   `supply_cap = verified_count × UBI_RATE_PER_VERIFIED_PER_EPOCH`
+    ///
+    /// Enforced invariants:
+    ///   - No epoch is currently open in the QrcEngine.
+    ///   - Sender must be a block-producer / validator address (coordinator-gated).
+    EpochOpen {
+        /// The epoch number being opened.
+        epoch: u64,
+        /// Number of Verified-tier identities at epoch start.
+        verified_count: u64,
+    },
+
+    /// Close the current QRC epoch (QRC Economic Model v0.2 §EpochClose).
+    ///
+    /// Submitted by block producers at epoch end.  Sweeps unspent epoch
+    /// reserve back to the protocol reserve and finalises provider reward
+    /// accounting.  After this, a new epoch may be opened.
+    ///
+    /// Enforced invariants:
+    ///   - An epoch is currently open in the QrcEngine.
+    ///   - Sender must be a block-producer / validator address (coordinator-gated).
+    EpochClose {
+        /// The epoch number being closed.  Must match `QrcEngine::current_epoch`.
+        epoch: u64,
+    },
 }
 
 /// Events that affect the on-chain IntrinsicCharm record without going through
@@ -500,6 +540,9 @@ impl Transaction {
             TxBody::RegisterAgent { agent_id, agent_address, description, .. } => {
                 agent_id.len() + agent_address.len() + description.len() + 64
             }
+            // Epoch boundary signals: epoch number (u64) only.
+            TxBody::EpochOpen { .. }  => 24,
+            TxBody::EpochClose { .. } => 16,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -932,6 +975,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Phase 1 typed variants.
         TxBody::CharmConfinementUpdate { .. } | TxBody::IntrinsicCharmRecord { .. } => Some("identity"),
         TxBody::RegisterAgent { .. } => Some("agents"),
+        // QRC v0.2 epoch boundary signals require the QRC module.
+        TxBody::EpochOpen { .. } | TxBody::EpochClose { .. } => Some("qrc"),
     }
 }
 
@@ -1668,6 +1713,44 @@ impl Executor {
                 ));
                 Ok(())
             }
+
+            // ── QRC Economic Model v0.2 — Epoch Boundary ─────────────────────
+
+            TxBody::EpochOpen { epoch, verified_count } => {
+                match qrc.open_epoch(*epoch, *verified_count) {
+                    Ok(summary) => {
+                        events.push(format!(
+                            "epoch_open: epoch={} verified={} supply_cap={} reserve_seeded={}",
+                            epoch, verified_count, summary.supply_cap, summary.reserve_balance
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("EpochOpen: {e}")),
+                }
+            }
+
+            TxBody::EpochClose { epoch } => {
+                if qrc.current_epoch != *epoch {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "EpochClose: epoch mismatch — engine has {}, tx says {epoch}",
+                            qrc.current_epoch
+                        ),
+                    );
+                }
+                match qrc.close_epoch() {
+                    Ok(summary) => {
+                        events.push(format!(
+                            "epoch_close: epoch={} minted={} provider_rewards={} reserve_swept={}",
+                            epoch, summary.epoch_minted, summary.provider_rewards,
+                            summary.reserve_balance
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("EpochClose: {e}")),
+                }
+            }
         };
 
         if result.is_ok() {
@@ -1804,6 +1887,11 @@ impl Executor {
             | TxBody::IntrinsicCharmRecord { .. }
             | TxBody::RegisterAgent { .. } => {
                 Err("Phase 1 transaction requires identity- and agent-aware executor".to_string())
+            }
+            // QRC v0.2 epoch boundary requires the QRC engine.
+            TxBody::EpochOpen { .. }
+            | TxBody::EpochClose { .. } => {
+                Err("Epoch boundary transaction requires QRC-engine-aware executor".to_string())
             }
         };
 

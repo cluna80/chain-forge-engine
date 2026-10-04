@@ -39,7 +39,8 @@
 //!
 //! ## What this module does NOT include
 //!
-//! - The old UBI/demurrage model (superseded by QRC Economic Model v0.1)
+//! - Demurrage / time-value decay (deliberately excluded — QRC is a pure resource
+//!   consumption credit; idle credits do not decay)
 //! - ZK proof of contribution verification (VCA layer, see chain-forge-personhood)
 //! - Cross-resource arbitrage constraints (deferred, Section 11)
 //! - Delegated budget mechanics (deferred, Section 11)
@@ -97,6 +98,17 @@ pub const R_MAX_FRACTION: u128 = 10_000_000; // 10.0 × D (1000% of R0)
 /// Congestion sensitivity exponent γ (gamma). Higher = faster price response.
 /// TBD via simulation. Placeholder = 2.0 (quadratic response).
 pub const GAMMA_NUM: u128 = 2; // integer — used in integer exponentiation
+
+// ── Epoch accounting constants (QRC Economic Model v0.2) ─────────────────────
+
+/// QRC minted as the epoch supply cap per verified identity per epoch.
+/// Represents the maximum issuance pressure from the verified population.
+/// Unit: micro-QRC (fixed-point × D). Placeholder — calibrate via simulation.
+pub const UBI_RATE_PER_VERIFIED_PER_EPOCH: u128 = 10_000_000; // 10 QRC per verified per epoch
+
+/// Fraction of `protocol_reserve` seeded into `epoch_reserve_balance` at EpochOpen.
+/// Fixed-point × D. 100_000 = 10% of the reserve.
+pub const EPOCH_RESERVE_SEED_RATE: u128 = 100_000; // 10% of protocol_reserve
 
 // ── ResourceKind ─────────────────────────────────────────────────────────────
 
@@ -430,6 +442,32 @@ pub struct QrcEngine {
 
     // -- Window tracking --
     pub current_window: u64,
+
+    // ── Epoch accounting (QRC Economic Model v0.2) ────────────────────────────
+
+    /// The epoch currently open. 0 = no epoch open yet.
+    pub current_epoch: u64,
+
+    /// Whether an epoch is currently open (between EpochOpen and EpochClose).
+    pub epoch_open: bool,
+
+    /// Supply cap for the current epoch: maximum QRC that may be minted
+    /// (purchase + contribution paths combined) during this epoch.
+    /// Computed at EpochOpen as: `verified_count * UBI_RATE_PER_VERIFIED_PER_EPOCH`.
+    pub epoch_supply_cap: u128,
+
+    /// QRC minted so far in the current epoch (purchase + contribution).
+    /// Checked against `epoch_supply_cap` on every mint.
+    pub epoch_minted: u128,
+
+    /// Epoch reserve balance: QRC swept into the epoch reserve at EpochOpen
+    /// (seeded from `protocol_reserve`), disbursed to providers, excess swept
+    /// back at EpochClose.
+    pub epoch_reserve_balance: u128,
+
+    /// Per-epoch provider reward accumulator: total QRC earned by contribution-
+    /// path providers during this epoch. Finalized at EpochClose.
+    pub epoch_provider_rewards: u128,
 }
 
 impl QrcEngine {
@@ -457,6 +495,13 @@ impl QrcEngine {
             protocol_reserve:           0,
             total_qcb_burned:           0,
             current_window:             0,
+            // Epoch accounting (v0.2)
+            current_epoch:              0,
+            epoch_open:                 false,
+            epoch_supply_cap:           0,
+            epoch_minted:               0,
+            epoch_reserve_balance:      0,
+            epoch_provider_rewards:     0,
         }
     }
 
@@ -466,21 +511,46 @@ impl QrcEngine {
     ///
     /// Returns `(qrc_minted, rt_used)`.
     ///
+    /// When an epoch is open, minting is capped at `epoch_supply_cap -
+    /// epoch_minted`. If the full mint would exceed the cap, it is silently
+    /// truncated — the caller receives fewer QRC credits than requested.
+    /// Block producers must honour slippage guards (`min_qrc_out`) to protect
+    /// buyers in this case.
+    ///
     /// Security: the no-QRC-to-QCB constraint is enforced at the protocol
     /// level; this function only handles the QCB → QRC direction.
     pub fn purchase_qrc(&mut self, qcb_amount: u128) -> (u128, u128) {
-        let qrc_minted = self.conversion_rate.qrc_for_qcb(qcb_amount);
-        let rt_used      = self.conversion_rate.rt;
+        let qrc_raw  = self.conversion_rate.qrc_for_qcb(qcb_amount);
+        let rt_used  = self.conversion_rate.rt;
+
+        // Cap at epoch supply ceiling when an epoch is active.
+        let qrc_minted = if self.epoch_open && self.epoch_supply_cap > 0 {
+            let headroom = self.epoch_supply_cap.saturating_sub(self.epoch_minted);
+            let capped   = qrc_raw.min(headroom);
+            if capped < qrc_raw {
+                tracing::warn!(
+                    requested = qrc_raw,
+                    capped,
+                    epoch = self.current_epoch,
+                    "QRC purchase capped by epoch supply ceiling"
+                );
+            }
+            capped
+        } else {
+            qrc_raw
+        };
 
         self.total_qcb_burned          += qcb_amount;
         self.total_supply              += qrc_minted;
         self.total_purchase_minted     += qrc_minted;
+        if self.epoch_open { self.epoch_minted += qrc_minted; }
 
         tracing::info!(
             qcb_burned   = qcb_amount,
             qrc_minted,
             rt           = rt_used,
             window       = self.current_window,
+            epoch        = self.current_epoch,
             "QRC purchase: QCB burned → QRC minted"
         );
 
@@ -504,19 +574,32 @@ impl QrcEngine {
             &self.resource_weights,
         );
 
-        if earned > 0 {
-            self.total_supply                 += earned;
-            self.total_contribution_minted    += earned;
+        // Cap at epoch supply ceiling when an epoch is active.
+        let minted = if self.epoch_open && self.epoch_supply_cap > 0 {
+            let headroom = self.epoch_supply_cap.saturating_sub(self.epoch_minted);
+            earned.min(headroom)
+        } else {
+            earned
+        };
+
+        if minted > 0 {
+            self.total_supply                 += minted;
+            self.total_contribution_minted    += minted;
+            if self.epoch_open {
+                self.epoch_minted             += minted;
+                self.epoch_provider_rewards   += minted;
+            }
 
             tracing::debug!(
                 provider  = hex::encode(provider_id),
-                earned,
+                earned    = minted,
                 window    = self.current_window,
+                epoch     = self.current_epoch,
                 "QRC contribution mint"
             );
         }
 
-        earned
+        minted
     }
 
     // ── Consumption ───────────────────────────────────────────────────────────
@@ -611,6 +694,114 @@ impl QrcEngine {
         );
     }
 
+    // ── Epoch boundary (QRC Economic Model v0.2) ──────────────────────────────
+
+    /// Open a new epoch.
+    ///
+    /// # Parameters
+    /// - `epoch` — the epoch number being opened (must be current_epoch + 1,
+    ///   or 1 on first open; calling EpochOpen twice without EpochClose is an error).
+    /// - `verified_count` — number of verified identities at epoch start,
+    ///   used to compute the epoch supply cap.
+    ///
+    /// # Effects
+    /// - Sets `current_epoch = epoch`.
+    /// - Computes `epoch_supply_cap = verified_count * UBI_RATE_PER_VERIFIED_PER_EPOCH`.
+    /// - Seeds `epoch_reserve_balance` from `protocol_reserve`
+    ///   (up to `EPOCH_RESERVE_SEED_RATE` fraction of the reserve).
+    /// - Resets `epoch_minted`, `epoch_provider_rewards` to 0.
+    /// - Calls `advance_window` with zero demand/capacity to update utilization EMA.
+    ///
+    /// Returns `Err` if an epoch is already open.
+    pub fn open_epoch(
+        &mut self,
+        epoch:          u64,
+        verified_count: u64,
+    ) -> QrcResult<EpochSummary> {
+        if self.epoch_open {
+            return Err(QrcError::EpochAlreadyOpen(self.current_epoch));
+        }
+
+        // Compute supply cap: each verified human's UBI-equivalent issuance.
+        // UBI_RATE_PER_VERIFIED_PER_EPOCH is in micro-QRC (× D).
+        let supply_cap = (verified_count as u128)
+            .saturating_mul(UBI_RATE_PER_VERIFIED_PER_EPOCH);
+
+        // Seed epoch reserve from protocol_reserve (up to the seed rate).
+        let seed = self.protocol_reserve
+            .saturating_mul(EPOCH_RESERVE_SEED_RATE) / D;
+        self.protocol_reserve          = self.protocol_reserve.saturating_sub(seed);
+        self.epoch_reserve_balance     = seed;
+
+        // Reset per-epoch accumulators.
+        self.epoch_minted              = 0;
+        self.epoch_provider_rewards    = 0;
+        self.current_epoch             = epoch;
+        self.epoch_supply_cap          = supply_cap;
+        self.epoch_open                = true;
+
+        // Advance the utilization window (zero demand = startup signal).
+        let empty = BTreeMap::new();
+        self.advance_window(&empty, &empty);
+
+        tracing::info!(
+            epoch,
+            verified_count,
+            supply_cap,
+            epoch_reserve_seeded = seed,
+            "QRC epoch opened"
+        );
+
+        Ok(self.epoch_summary())
+    }
+
+    /// Close the current epoch.
+    ///
+    /// # Effects
+    /// - Finalizes provider reward totals.
+    /// - Sweeps unused `epoch_reserve_balance` back into `protocol_reserve`.
+    /// - Marks `epoch_open = false`.
+    ///
+    /// Returns `Err` if no epoch is currently open.
+    pub fn close_epoch(&mut self) -> QrcResult<EpochSummary> {
+        if !self.epoch_open {
+            return Err(QrcError::NoEpochOpen);
+        }
+
+        // Sweep unspent epoch reserve back to protocol reserve.
+        self.protocol_reserve              += self.epoch_reserve_balance;
+        let swept                           = self.epoch_reserve_balance;
+        self.epoch_reserve_balance         = 0;
+
+        let summary = self.epoch_summary();
+        self.epoch_open = false;
+
+        tracing::info!(
+            epoch          = self.current_epoch,
+            minted         = summary.epoch_minted,
+            provider_rewards = summary.provider_rewards,
+            reserve_swept  = swept,
+            total_supply   = self.total_supply,
+            "QRC epoch closed"
+        );
+
+        Ok(summary)
+    }
+
+    /// Snapshot of the current epoch's accounting state.
+    pub fn epoch_summary(&self) -> EpochSummary {
+        EpochSummary {
+            epoch:            self.current_epoch,
+            epoch_open:       self.epoch_open,
+            supply_cap:       self.epoch_supply_cap,
+            epoch_minted:     self.epoch_minted,
+            provider_rewards: self.epoch_provider_rewards,
+            reserve_balance:  self.epoch_reserve_balance,
+            total_supply:     self.total_supply,
+            total_burned:     self.total_burned,
+        }
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────────────
 
     /// Current conversion rate Rt (fixed-point × D).
@@ -655,6 +846,30 @@ pub struct WindowSummary {
     pub congestion_by_resource:    BTreeMap<ResourceKind, u128>,
 }
 
+// ── EpochSummary ──────────────────────────────────────────────────────────────
+
+/// Snapshot of epoch accounting state, returned by `open_epoch`, `close_epoch`,
+/// and `epoch_summary`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochSummary {
+    /// Epoch number.
+    pub epoch: u64,
+    /// Whether the epoch is currently open.
+    pub epoch_open: bool,
+    /// Maximum QRC that may be minted this epoch (purchase + contribution).
+    pub supply_cap: u128,
+    /// QRC minted so far (or total at close) in this epoch.
+    pub epoch_minted: u128,
+    /// QRC earned by contribution-path providers this epoch.
+    pub provider_rewards: u128,
+    /// Unspent epoch reserve balance (0 after close — swept to protocol_reserve).
+    pub reserve_balance: u128,
+    /// Total QRC in circulation at snapshot time.
+    pub total_supply: u128,
+    /// Cumulative QRC permanently burned at snapshot time.
+    pub total_burned: u128,
+}
+
 // ── Error types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -667,6 +882,12 @@ pub enum QrcError {
 
     #[error("resource kind {0:?} not tracked")]
     UnknownResource(ResourceKind),
+
+    #[error("epoch {0} is already open — close it before opening a new one")]
+    EpochAlreadyOpen(u64),
+
+    #[error("no epoch is currently open")]
+    NoEpochOpen,
 
     #[error("internal error: {0}")]
     Internal(String),
@@ -1018,5 +1239,150 @@ mod tests {
         // (2.0)^2 = 4.0 in fixed-point
         let result = integer_pow_fp(2 * D, 2);
         assert_eq!(result, 4 * D);
+    }
+
+    // ── Epoch boundary (v0.2) ─────────────────────────────────────────────────
+
+    #[test]
+    fn open_epoch_sets_supply_cap_from_verified_count() {
+        let mut e = engine();
+        let summary = e.open_epoch(1, 100).unwrap();
+        assert_eq!(summary.epoch, 1);
+        assert!(summary.epoch_open);
+        assert_eq!(summary.supply_cap, 100 * UBI_RATE_PER_VERIFIED_PER_EPOCH);
+        assert_eq!(summary.epoch_minted, 0);
+        assert_eq!(summary.provider_rewards, 0);
+    }
+
+    #[test]
+    fn open_epoch_seeds_reserve_from_protocol_reserve() {
+        let mut e = engine();
+        // Seed the protocol reserve first via consumption.
+        e.purchase_qrc(100 * D);
+        e.consume(50 * D); // 15% → reserve = 7.5 * D
+        let reserve_before = e.protocol_reserve;
+        assert!(reserve_before > 0, "protocol_reserve should be non-zero after consumption");
+
+        e.open_epoch(1, 10).unwrap();
+
+        let expected_seed = reserve_before.saturating_mul(EPOCH_RESERVE_SEED_RATE) / D;
+        assert_eq!(e.epoch_reserve_balance, expected_seed);
+        assert_eq!(e.protocol_reserve, reserve_before - expected_seed);
+    }
+
+    #[test]
+    fn double_open_epoch_returns_error() {
+        let mut e = engine();
+        e.open_epoch(1, 100).unwrap();
+        let err = e.open_epoch(2, 100).unwrap_err();
+        assert!(
+            matches!(err, QrcError::EpochAlreadyOpen(1)),
+            "opening a second epoch without closing should fail"
+        );
+    }
+
+    #[test]
+    fn close_without_open_returns_error() {
+        let mut e = engine();
+        let err = e.close_epoch().unwrap_err();
+        assert!(matches!(err, QrcError::NoEpochOpen));
+    }
+
+    #[test]
+    fn close_epoch_sweeps_reserve_back() {
+        let mut e = engine();
+        // Give the engine some reserve so open_epoch seeds something.
+        e.purchase_qrc(100 * D);
+        e.consume(100 * D);
+        let reserve_before_open = e.protocol_reserve;
+
+        e.open_epoch(1, 10).unwrap();
+        let seeded = e.epoch_reserve_balance;
+        assert!(seeded > 0);
+
+        let summary = e.close_epoch().unwrap();
+
+        // Reserve fully swept back (no disbursements in this test).
+        assert_eq!(summary.reserve_balance, 0);
+        assert_eq!(e.epoch_reserve_balance, 0);
+        assert_eq!(e.protocol_reserve, reserve_before_open);
+    }
+
+    #[test]
+    fn close_epoch_marks_epoch_closed() {
+        let mut e = engine();
+        e.open_epoch(1, 50).unwrap();
+        assert!(e.epoch_open);
+        e.close_epoch().unwrap();
+        assert!(!e.epoch_open);
+    }
+
+    #[test]
+    fn open_close_open_is_valid() {
+        let mut e = engine();
+        e.open_epoch(1, 50).unwrap();
+        e.close_epoch().unwrap();
+        // Should succeed — previous epoch is closed.
+        let summary = e.open_epoch(2, 60).unwrap();
+        assert_eq!(summary.epoch, 2);
+        assert_eq!(summary.supply_cap, 60 * UBI_RATE_PER_VERIFIED_PER_EPOCH);
+    }
+
+    #[test]
+    fn epoch_supply_cap_limits_purchase_minting() {
+        let mut e = engine();
+        // Open epoch with only 1 verified person → tiny supply cap.
+        e.open_epoch(1, 1).unwrap();
+        let cap = e.epoch_supply_cap;
+        assert!(cap > 0);
+
+        // Attempt to mint 10× the cap.
+        let (minted, _) = e.purchase_qrc(10 * cap);
+
+        // Minted must not exceed the cap.
+        assert!(
+            minted <= cap,
+            "purchase minting must not exceed epoch supply cap: minted={minted}, cap={cap}"
+        );
+        assert_eq!(e.epoch_minted, minted);
+    }
+
+    #[test]
+    fn epoch_supply_cap_limits_contribution_minting() {
+        let mut e = engine();
+        e.open_epoch(1, 1).unwrap();
+        let cap = e.epoch_supply_cap;
+
+        // Force high Compute congestion so one D-unit contribution earns a lot.
+        {
+            let u = e.utilization.get_mut(&ResourceKind::Compute).unwrap();
+            u.record_window(D, D); // 100% utilization → high earnings
+        }
+
+        let provider = [2u8; 32];
+        let mut contributions = BTreeMap::new();
+        // Contribute enormous Compute units — earnings should still be capped.
+        contributions.insert(ResourceKind::Compute, 1_000_000 * D);
+        let earned = e.credit_provider_earning(&provider, &contributions);
+
+        assert!(
+            earned <= cap,
+            "contribution minting must not exceed epoch supply cap: earned={earned}, cap={cap}"
+        );
+    }
+
+    #[test]
+    fn epoch_summary_reflects_provider_rewards() {
+        let mut e = engine();
+        e.open_epoch(1, 1000).unwrap();
+
+        let provider = [3u8; 32];
+        let mut contributions = BTreeMap::new();
+        contributions.insert(ResourceKind::Compute, D);
+        let earned = e.credit_provider_earning(&provider, &contributions);
+
+        let summary = e.epoch_summary();
+        assert_eq!(summary.provider_rewards, earned);
+        assert_eq!(summary.epoch_minted, earned);
     }
 }
