@@ -60,19 +60,22 @@
       "label": "Alice",
       "address": "qcb1alice",
       "balance": "100000000",
-      "role": "validator"
+      "role": "validator",
+      "public_key": "364417851cda8e94b5e70c19f49bcf08e5f2cafe87d0bc53c8afec3e61d3a19b"
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
       "balance": "100000000",
-      "role": "validator"
+      "role": "validator",
+      "public_key": "d7aef83a7b8b71e80586e40e31ebe3a6c7c0911c6978696616e260b580d3a29d"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
       "balance": "100000000",
-      "role": "validator"
+      "role": "validator",
+      "public_key": "4dd57bf9800b7376b63a3e20fcb783e84bbaaa370a3baaa760bc4a4ea48e62a6"
     }
   ],
   "attestation_coordinator": "qcb1alice"

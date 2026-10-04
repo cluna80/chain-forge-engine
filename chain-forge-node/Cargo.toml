@@ -9,6 +9,10 @@ license.workspace = true
 name = "chain-forge-node"
 path = "src/main.rs"
 
+[[bin]]
+name = "chain-forge-keygen"
+path = "src/keygen.rs"
+
 [dependencies]
 chain-forge-core      = { path = "../chain-forge-core" }
 chain-forge-consensus = { path = "../chain-forge-consensus", features = ["real-crypto"] }

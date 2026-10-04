@@ -7,18 +7,22 @@
 #   .\scripts\start-testnet.ps1              # fresh start (clears data dirs)
 #   .\scripts\start-testnet.ps1 -Resume      # restart from persisted state
 #   .\scripts\start-testnet.ps1 -LogLevel debug
+#   .\scripts\start-testnet.ps1 -NoKeys      # run unsigned (devnet only)
 #
 # Requirements:
 #   - Run from the repo root: cd C:\Dev\chain-forge-engine\chain-forge-engine
-#   - Binary must be built:   cargo build --release -p chain-forge-node
+#   - Binaries must be built: cargo build --release -p chain-forge-node
 #   - Windows Terminal is recommended (wt.exe); falls back to Start-Process
 
 param(
     [switch]$Resume,
+    [switch]$NoKeys,
     [string]$LogLevel  = "info",
     [string]$Genesis   = "genesis-3node.json",
+    [string]$KeysDir   = "keys",
     [string]$DataRoot  = "C:\tmp",
-    [string]$Binary    = ".\target\release\chain-forge-node.exe"
+    [string]$Binary    = ".\target\release\chain-forge-node.exe",
+    [string]$Keygen    = ".\target\release\chain-forge-keygen.exe"
 )
 
 Set-StrictMode -Version Latest
@@ -42,6 +46,44 @@ $nodes = @(
     @{ Name = "carol"; Validator = "qcb1carol"; ApiPort = 8082; DataDir = "$DataRoot\qcb-carol" }
 )
 
+# ── Key generation ────────────────────────────────────────────────────────────
+
+if (-not $NoKeys) {
+    if (-not (Test-Path $Keygen)) {
+        Write-Warning "Keygen binary not found: $Keygen — running unsigned (no --key-file)"
+        $NoKeys = $true
+    } else {
+        $anyMissing = $false
+        foreach ($n in $nodes) {
+            $keyPath = "$KeysDir\$($n.Validator).key.json"
+            if (-not (Test-Path $keyPath)) { $anyMissing = $true }
+        }
+
+        if ($anyMissing) {
+            Write-Host "Generating validator signing keys..." -ForegroundColor Yellow
+            New-Item -ItemType Directory -Force -Path $KeysDir | Out-Null
+            foreach ($n in $nodes) {
+                $keyPath = "$KeysDir\$($n.Validator).key.json"
+                if (-not (Test-Path $keyPath)) {
+                    & $Keygen --address $n.Validator --out $keyPath
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Error "Key generation failed for $($n.Validator)"
+                    }
+                } else {
+                    Write-Host "  Key already exists for $($n.Validator) — skipping"
+                }
+            }
+            Write-Host ""
+            Write-Host "IMPORTANT: Copy the public_key values above into genesis-3node.json" -ForegroundColor Magenta
+            Write-Host "           (genesis_accounts[*].public_key) before running this again." -ForegroundColor Magenta
+            Write-Host "           Keys are in: $KeysDir\" -ForegroundColor Magenta
+            Write-Host ""
+            Write-Host "Exiting so you can update genesis first." -ForegroundColor Yellow
+            exit 0
+        }
+    }
+}
+
 # ── Clear data dirs unless resuming ──────────────────────────────────────────
 
 if (-not $Resume) {
@@ -57,25 +99,31 @@ if (-not $Resume) {
 # ── Build the command string for each node ───────────────────────────────────
 
 function Get-NodeCmd($node) {
-    $bin  = (Resolve-Path $Binary).Path
-    $gen  = (Resolve-Path $Genesis).Path
-    # PowerShell command that sets RUST_LOG then runs the node
+    $bin     = (Resolve-Path $Binary).Path
+    $gen     = (Resolve-Path $Genesis).Path
+    $keyFlag = ""
+    if (-not $NoKeys) {
+        $keyPath = Resolve-Path "$KeysDir\$($node.Validator).key.json"
+        $keyFlag = "--key-file '$keyPath' "
+    }
     return (
         "`$env:RUST_LOG='$LogLevel'; " +
         "& '$bin' " +
         "--genesis '$gen' " +
         "--validator $($node.Validator) " +
         "--api-port $($node.ApiPort) " +
-        "--data-dir '$($node.DataDir)'"
+        "--data-dir '$($node.DataDir)' " +
+        $keyFlag
     )
 }
 
 # ── Launch each node ─────────────────────────────────────────────────────────
 
 $wtAvailable = $null -ne (Get-Command wt.exe -ErrorAction SilentlyContinue)
+$signed      = if ($NoKeys) { "UNSIGNED (devnet)" } else { "SIGNED (ed25519)" }
 
 Write-Host ""
-Write-Host "Starting 3-node QCB testnet" -ForegroundColor Cyan
+Write-Host "Starting 3-node QCB testnet  [$signed]" -ForegroundColor Cyan
 Write-Host "  Genesis : $Genesis"
 Write-Host "  Binary  : $Binary"
 Write-Host "  LogLevel: $LogLevel"
@@ -83,16 +131,14 @@ Write-Host "  Resume  : $Resume"
 Write-Host ""
 
 foreach ($node in $nodes) {
-    $cmd = Get-NodeCmd $node
+    $cmd   = Get-NodeCmd $node
     $title = "QCB-$($node.Name.ToUpper()) | api=:$($node.ApiPort)"
 
     if ($wtAvailable) {
-        # Open a new Windows Terminal tab for each node
         $wtArgs = "new-tab --title `"$title`" -- powershell.exe -NoExit -Command `"$cmd`""
         Start-Process wt.exe -ArgumentList $wtArgs
         Write-Host "  Launched $($node.Name) in new WT tab (api=:$($node.ApiPort))" -ForegroundColor Green
     } else {
-        # Fall back to a plain PowerShell window
         Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", $cmd `
             -WindowStyle Normal
         Write-Host "  Launched $($node.Name) in new window (api=:$($node.ApiPort))" -ForegroundColor Green
@@ -103,7 +149,8 @@ foreach ($node in $nodes) {
 }
 
 Write-Host ""
-Write-Host "All nodes launched. API endpoints:" -ForegroundColor Cyan
+Write-Host "All nodes launched  [$signed]" -ForegroundColor Cyan
+Write-Host "API endpoints:"
 foreach ($node in $nodes) {
     Write-Host "  $($node.Name.PadRight(6)) http://localhost:$($node.ApiPort)/status"
 }
