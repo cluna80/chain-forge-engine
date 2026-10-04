@@ -98,22 +98,35 @@ if (-not $Resume) {
     }
 }
 
-# --- Build the command string for each node ----------------------------------
+# --- Write per-node launcher scripts -----------------------------------------
+# wt.exe cannot safely pass complex PowerShell expressions as inline commands,
+# so we write a small .ps1 per node into the temp dir and tell wt/PS to run it.
 
-function Get-NodeCmd($node) {
-    $bin = (Resolve-Path $Binary).Path
-    $gen = (Resolve-Path $Genesis).Path
+$tmpDir = "$env:TEMP\qcb-testnet"
+New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
-    # Build the argument list as a plain string — no & '...' wrapper so that
-    # Windows Terminal (wt.exe) does not add a second quoting layer.
-    $nodeArgs = "--genesis `"$gen`" --validator $($node.Validator) --api-port $($node.ApiPort) --data-dir `"$($node.DataDir)`""
+$bin = (Resolve-Path $Binary).Path
+$gen = (Resolve-Path $Genesis).Path
+
+foreach ($node in $nodes) {
+    $lines = @()
+    $lines += "`$env:RUST_LOG = '$LogLevel'"
+    $lines += "& '$bin' ``"
+    $lines += "  --genesis '$gen' ``"
+    $lines += "  --validator $($node.Validator) ``"
+    $lines += "  --api-port $($node.ApiPort) ``"
+    $lines += "  --data-dir '$($node.DataDir)'"
+
     if (-not $NoKeys) {
-        $keyPath  = (Resolve-Path "$KeysDir\$($node.Validator).key.json").Path
-        $nodeArgs = "$nodeArgs --key-file `"$keyPath`""
+        $keyPath = (Resolve-Path "$KeysDir\$($node.Validator).key.json").Path
+        # Append --key-file to the last real arg line (replace trailing single-quote on data-dir line)
+        $lines[-1] = "  --data-dir '$($node.DataDir)' ``"
+        $lines     += "  --key-file '$keyPath'"
     }
 
-    # Set RUST_LOG then invoke the binary by full path.
-    return "`$env:RUST_LOG='$LogLevel'; & `"$bin`" $nodeArgs"
+    $script = $lines -join "`n"
+    $scriptPath = "$tmpDir\run-$($node.Name).ps1"
+    Set-Content -Path $scriptPath -Value $script -Encoding UTF8
 }
 
 # --- Launch each node --------------------------------------------------------
@@ -123,22 +136,23 @@ $signed      = if ($NoKeys) { "UNSIGNED (devnet)" } else { "SIGNED (ed25519)" }
 
 Write-Host ""
 Write-Host "Starting 3-node QCB testnet  [$signed]" -ForegroundColor Cyan
-Write-Host "  Genesis : $Genesis"
-Write-Host "  Binary  : $Binary"
+Write-Host "  Genesis : $gen"
+Write-Host "  Binary  : $bin"
 Write-Host "  LogLevel: $LogLevel"
 Write-Host "  Resume  : $Resume"
 Write-Host ""
 
 foreach ($node in $nodes) {
-    $cmd   = Get-NodeCmd $node
-    $title = "QCB-$($node.Name.ToUpper()) | api=:$($node.ApiPort)"
+    $scriptPath = "$tmpDir\run-$($node.Name).ps1"
+    $title      = "QCB-$($node.Name.ToUpper()) | api=:$($node.ApiPort)"
 
     if ($wtAvailable) {
-        $wtArgs = "new-tab --title `"$title`" -- powershell.exe -NoExit -Command `"$cmd`""
+        # Pass the script file path to wt.exe -- no inline quoting nightmares.
+        $wtArgs = "new-tab --title `"$title`" -- powershell.exe -NoExit -File `"$scriptPath`""
         Start-Process wt.exe -ArgumentList $wtArgs
         Write-Host "  Launched $($node.Name) in new WT tab (api=:$($node.ApiPort))" -ForegroundColor Green
     } else {
-        Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", $cmd `
+        Start-Process powershell.exe -ArgumentList "-NoExit", "-File", $scriptPath `
             -WindowStyle Normal
         Write-Host "  Launched $($node.Name) in new window (api=:$($node.ApiPort))" -ForegroundColor Green
     }
