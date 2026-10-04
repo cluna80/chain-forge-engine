@@ -131,8 +131,7 @@ foreach ($node in $nodes) {
 
 # --- Launch each node --------------------------------------------------------
 
-$wtAvailable = $null -ne (Get-Command wt.exe -ErrorAction SilentlyContinue)
-$signed      = if ($NoKeys) { "UNSIGNED (devnet)" } else { "SIGNED (ed25519)" }
+$signed = if ($NoKeys) { "UNSIGNED (devnet)" } else { "SIGNED (ed25519)" }
 
 Write-Host ""
 Write-Host "Starting 3-node QCB testnet  [$signed]" -ForegroundColor Cyan
@@ -146,16 +145,15 @@ foreach ($node in $nodes) {
     $scriptPath = "$tmpDir\run-$($node.Name).ps1"
     $title      = "QCB-$($node.Name.ToUpper()) | api=:$($node.ApiPort)"
 
-    if ($wtAvailable) {
-        # Pass the script file path to wt.exe -- no inline quoting nightmares.
-        $wtArgs = "new-tab --title `"$title`" -- powershell.exe -NoExit -File `"$scriptPath`""
-        Start-Process wt.exe -ArgumentList $wtArgs
-        Write-Host "  Launched $($node.Name) in new WT tab (api=:$($node.ApiPort))" -ForegroundColor Green
-    } else {
-        Start-Process powershell.exe -ArgumentList "-NoExit", "-File", $scriptPath `
-            -WindowStyle Normal
-        Write-Host "  Launched $($node.Name) in new window (api=:$($node.ApiPort))" -ForegroundColor Green
-    }
+    # Use Start-Process powershell.exe -File directly.
+    # wt.exe new-tab re-quotes the argument list and appends stray characters
+    # regardless of quoting style, so we skip it entirely. When Windows
+    # Terminal is the default terminal, new PowerShell windows open as WT tabs
+    # automatically. -File takes the path verbatim with no shell expansion.
+    Start-Process powershell.exe `
+        -ArgumentList "-NoExit", "-File", $scriptPath `
+        -WindowStyle Normal
+    Write-Host "  Launched $($node.Name) (api=:$($node.ApiPort))" -ForegroundColor Green
 
     # Small delay so alice is up before bob/carol try to peer
     if ($node.Name -eq "alice") { Start-Sleep -Milliseconds 500 }
