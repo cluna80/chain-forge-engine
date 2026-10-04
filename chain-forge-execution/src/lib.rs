@@ -25,6 +25,7 @@ use chain_forge_crypto::{ClassicalScheme, KeyPair, SchemeId, Signature, Signatur
 use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
 use chain_forge_qrc::QrcEngine;
+use chain_forge_agents::{AgentStore, AgentType, SpendingLimits};
 
 // -- Error --------------------------------------------------------------------
 
@@ -118,6 +119,13 @@ impl GasModel {
                     TxBody::QrcSpend { .. }             => op_multiplier * 5,
                     // Settle: verifies evidence + mints QRC — most expensive.
                     TxBody::QrcContributionSettle { .. }=> op_multiplier * 12,
+                    // Phase 1 Charm Confinement / Agent typed variants.
+                    // ConfinementUpdate: reads identity + writes charm + Merkle leaf.
+                    TxBody::CharmConfinementUpdate { .. } => op_multiplier * 4,
+                    // IntrinsicCharmRecord: single charm field update + leaf refresh.
+                    TxBody::IntrinsicCharmRecord { .. }  => op_multiplier * 3,
+                    // RegisterAgent: writes AgentRecord + identity sponsorship + account.
+                    TxBody::RegisterAgent { .. }         => op_multiplier * 8,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -284,6 +292,96 @@ pub enum TxBody {
     ReportSuspectedSybil {
         suspected_id: String,
     },
+
+    // ── Phase 1 typed tx variants (Charm Confinement + Agent Registration) ──
+
+    /// Sync the sender's on-chain IntrinsicCharm with the IdentityStore and
+    /// record participation for the given epoch (Phase 1 / Charm Confinement
+    /// 5.1). This is the "confinement heartbeat" transaction: once per epoch,
+    /// a Verified or Established identity submits this to prove liveness and
+    /// advance their `consecutive_active_epochs` counter.
+    ///
+    /// Effects:
+    ///   - `IntrinsicCharm::record_participation(epoch)` runs on the sender's
+    ///     identity record, potentially graduating them from Verified to
+    ///     Established if `consecutive_active_epochs` reaches 30.
+    ///   - The updated charm is synced to the on-chain AccountState and the
+    ///     Merkle leaf is refreshed.
+    ///
+    /// Enforced invariants:
+    ///   - Sender must be at least Verified tier.
+    ///   - `epoch` should be the current epoch (checked against identity clock).
+    CharmConfinementUpdate {
+        /// The epoch for which this confinement heartbeat is submitted.
+        epoch: u64,
+    },
+
+    /// Record an intrinsic charm lifecycle event for the sender's identity
+    /// (Phase 1 / Charm Confinement 5.2). Used for charm-layer bookkeeping
+    /// that does not map cleanly onto the standard participation heartbeat.
+    ///
+    /// `CharmEvent` captures the distinct events that affect the on-chain
+    /// charm record without going through the normal UBI/transfer paths.
+    ///
+    /// Effects:
+    ///   - The event is applied to the sender's `IntrinsicCharm` via the
+    ///     matching `IntrinsicCharm` method.
+    ///   - The updated charm is synced to on-chain AccountState.
+    ///
+    /// Enforced invariants:
+    ///   - Sender must be registered in the IdentityStore.
+    ///   - `CharmEvent::DecayTick` requires no minimum tier.
+    ///   - `CharmEvent::ExemptionCredit` also requires no minimum tier.
+    IntrinsicCharmRecord {
+        /// The charm lifecycle event to apply.
+        event: CharmEvent,
+    },
+
+    /// Register a Charmed Agent with full AEI fields (Phase 1 / Section 5.3).
+    /// This is the typed replacement for the legacy `SponsorAgent` variant,
+    /// which only recorded the agent_address in the IdentityStore.
+    ///
+    /// `RegisterAgent` registers the agent in the `AgentStore` (which carries
+    /// the full AEI: CapabilitySet, SpendingLimits, ParentAgentID) AND
+    /// also calls `identity.sponsor_agent()` so the IdentityStore's web-of-
+    /// trust sponsorship relationship is preserved.
+    ///
+    /// After registration the agent has status `AgentStatus::Pending`.  The
+    /// next step is a governance/coordinator `authorize()` call, not a tx.
+    ///
+    /// Enforced invariants:
+    ///   - Sender (sponsor) must be Verified or Established tier.
+    ///   - `agent_id` must be unique in the AgentStore.
+    ///   - If `parent_agent_id` is set, the parent must exist and be Active.
+    RegisterAgent {
+        /// Unique identifier for this agent on-chain (e.g. "merchant-alice-1").
+        agent_id: String,
+        /// The QCB address this agent controls.
+        agent_address: String,
+        /// What this agent is authorized to do.
+        capabilities: Vec<chain_forge_agents::AgentCapability>,
+        /// $QRC spending caps for this agent.
+        spending_limits: SpendingLimits,
+        /// Human-readable role description.
+        description: String,
+        /// If this is a sub-agent, the parent's agent_id.
+        parent_agent_id: Option<String>,
+    },
+}
+
+/// Events that affect the on-chain IntrinsicCharm record without going through
+/// the normal participation-heartbeat path. Used by `IntrinsicCharmRecord`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CharmEvent {
+    /// Demurrage decay tick (called each epoch the account does not transact).
+    /// Decrements the decay-exemption counter by one day if the account has
+    /// exemption credit; transitions to lapsed if exemptions are exhausted.
+    DecayTick,
+    /// Credit one day of decay exemption (earned by QRC spending activity).
+    /// This is normally triggered automatically by `Transfer` and `QrcSpend`
+    /// via `account.record_spend_for_exemption()`, but can be issued
+    /// explicitly (e.g. by a coordinator for a verified provider).
+    ExemptionCredit,
 }
 
 /// Advance the sender's nonce after a successful transaction, for the tx
@@ -395,6 +493,13 @@ impl Transaction {
             TxBody::QrcSpend { .. }                      => 24,
             // Evidence carries provider_id + proof bytes — treat as ~256 bytes.
             TxBody::QrcContributionSettle { .. }         => 256,
+            // Phase 1 typed variants.
+            TxBody::CharmConfinementUpdate { .. }        => 16,
+            TxBody::IntrinsicCharmRecord { .. }          => 16,
+            // RegisterAgent carries description + capabilities list.
+            TxBody::RegisterAgent { agent_id, agent_address, description, .. } => {
+                agent_id.len() + agent_address.len() + description.len() + 64
+            }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -615,6 +720,76 @@ impl Transaction {
             public_key: vec![],
         }
     }
+
+    // ── Phase 1 Charm Confinement / Agent typed tx constructors ──────────────
+
+    /// Confinement heartbeat: prove liveness and advance consecutive-epoch
+    /// counter for the sender's IntrinsicCharm (Phase 1 / Section 5.1).
+    ///
+    /// Sender must be Verified or Established tier.
+    pub fn charm_confinement_update(id: &str, sender: &str, epoch: u64, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::CharmConfinementUpdate { epoch },
+            gas_limit: 150_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Record a charm lifecycle event (decay tick, exemption credit) for the
+    /// sender's IntrinsicCharm (Phase 1 / Section 5.2).
+    pub fn intrinsic_charm_record(
+        id:    &str,
+        sender: &str,
+        event:  CharmEvent,
+        nonce:  u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::IntrinsicCharmRecord { event },
+            gas_limit: 100_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Register a Charmed Agent with full AEI fields (Phase 1 / Section 5.3).
+    ///
+    /// Sender is the human sponsor.  The agent starts in `Pending` status.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_agent(
+        id:              &str,
+        sender:          &str,
+        agent_id:        &str,
+        agent_address:   &str,
+        capabilities:    Vec<chain_forge_agents::AgentCapability>,
+        spending_limits: SpendingLimits,
+        description:     &str,
+        parent_agent_id: Option<String>,
+        nonce:           u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::RegisterAgent {
+                agent_id:        agent_id.to_string(),
+                agent_address:   agent_address.to_string(),
+                capabilities,
+                spending_limits,
+                description:     description.to_string(),
+                parent_agent_id,
+            },
+            gas_limit: 300_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
 }
 
 // -- Transaction result -------------------------------------------------------
@@ -754,6 +929,9 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::QrcSpend { .. }
         | TxBody::QrcContributionSettle { .. } => Some("qrc"),
         TxBody::SponsorAgent { .. } | TxBody::RevokeAgent { .. } => Some("agents"),
+        // Phase 1 typed variants.
+        TxBody::CharmConfinementUpdate { .. } | TxBody::IntrinsicCharmRecord { .. } => Some("identity"),
+        TxBody::RegisterAgent { .. } => Some("agents"),
     }
 }
 
@@ -816,13 +994,15 @@ impl Executor {
     }
 
     /// Execute a single transaction with CharmConfinement enforcement.
-    /// Requires identity store and QRC engine for identity-gated tx types.
+    /// Requires identity store, QRC engine, and agent store for identity-gated
+    /// and agent-registered tx types.
     pub fn execute_tx_with_identity(
         &self,
         tx:       &Transaction,
         state:    &mut StateStore,
         identity: &mut IdentityStore,
-        qrc:    &mut QrcEngine,
+        qrc:      &mut QrcEngine,
+        agents:   &mut AgentStore,
     ) -> TransactionResult {
         let gas_required = self.config.gas_model.calculate_gas(tx);
 
@@ -1339,6 +1519,155 @@ impl Executor {
                 ));
                 Ok(())
             }
+
+            // -- Phase 1 typed variants ---------------------------------------
+
+            TxBody::CharmConfinementUpdate { epoch } => {
+                // Charm Confinement: sender must be at least Verified tier.
+                let tier_ok = identity.get(&tx.sender)
+                    .map(|r| r.is_verified())
+                    .unwrap_or(false);
+                if !tier_ok {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "CharmConfinementUpdate: sender {} is not Verified \
+                             (Charm Confinement requires Verified or Established tier)",
+                            tx.sender
+                        ),
+                    );
+                }
+
+                // Record participation in the identity store. This bumps
+                // `consecutive_active_epochs` and may auto-promote to Established.
+                if let Some(record) = identity.get_mut(&tx.sender) {
+                    record.charm.record_participation(*epoch);
+                }
+
+                // Sync the updated charm to the on-chain account.
+                if let (Ok(record), Ok(acct)) = (
+                    identity.get(&tx.sender),
+                    state.get_account_mut(&tx.sender),
+                ) {
+                    acct.attach_charm(record.charm.clone());
+                }
+                state.refresh_leaf(&tx.sender);
+
+                let tier_name = identity.get(&tx.sender)
+                    .map(|r| format!("{:?}", r.tier()))
+                    .unwrap_or_else(|_| "Unknown".into());
+                events.push(format!(
+                    "charm_confinement_update: {} epoch={} tier={}",
+                    tx.sender, epoch, tier_name
+                ));
+                Ok(())
+            }
+
+            TxBody::IntrinsicCharmRecord { event } => {
+                // Sender must be registered in the identity store.
+                if identity.get(&tx.sender).is_err() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("IntrinsicCharmRecord: identity {} not found", tx.sender),
+                    );
+                }
+
+                let current_epoch = identity.clock.current_epoch;
+
+                match event {
+                    CharmEvent::DecayTick => {
+                        // Consume one decay-exemption day from the sender's
+                        // identity charm and sync the change to the on-chain
+                        // account leaf so the state root reflects it.
+                        if let Some(record) = identity.get_mut(&tx.sender) {
+                            record.charm.decay_exemption.consume(1);
+                            if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                                acct.attach_charm(record.charm.clone());
+                            }
+                        }
+                        state.refresh_leaf(&tx.sender);
+                        events.push(format!(
+                            "intrinsic_charm_record: decay_tick sender={}",
+                            tx.sender
+                        ));
+                    }
+                    CharmEvent::ExemptionCredit => {
+                        // Credit one exemption day to the sender's account.
+                        if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                            acct.record_spend_for_exemption(current_epoch);
+                        }
+                        state.refresh_leaf(&tx.sender);
+                        events.push(format!(
+                            "intrinsic_charm_record: exemption_credit sender={}",
+                            tx.sender
+                        ));
+                    }
+                }
+                Ok(())
+            }
+
+            TxBody::RegisterAgent {
+                agent_id,
+                agent_address,
+                capabilities,
+                spending_limits,
+                description,
+                parent_agent_id,
+            } => {
+                // Charm Confinement: sponsor must be Verified or Established tier.
+                let tier_ok = identity.get(&tx.sender)
+                    .map(|r| r.is_verified())
+                    .unwrap_or(false);
+                if !tier_ok {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "RegisterAgent: sponsor {} is not Verified \
+                             (Charm Confinement requires Verified or Established tier)",
+                            tx.sender
+                        ),
+                    );
+                }
+
+                // Also record the sponsorship in the IdentityStore so the
+                // web-of-trust relationship is visible to other modules.
+                if let Err(e) = identity.sponsor_agent(&tx.sender, agent_address) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("RegisterAgent: identity sponsor_agent failed: {e}"),
+                    );
+                }
+
+                let current_epoch = identity.clock.current_epoch;
+
+                // Register in the AgentStore with full AEI.
+                if let Err(e) = agents.register(
+                    agent_id.clone(),
+                    agent_address.clone(),
+                    tx.sender.clone(),
+                    capabilities.clone(),
+                    spending_limits.clone(),
+                    parent_agent_id.clone(),
+                    description.clone(),
+                    AgentType::Native,
+                    current_epoch,
+                ) {
+                    // Roll back the IdentityStore sponsorship.
+                    if let Some(r) = identity.get_mut(&tx.sender) {
+                        r.revoke_agent(agent_address);
+                    }
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("RegisterAgent: AgentStore.register failed: {e}"),
+                    );
+                }
+
+                events.push(format!(
+                    "register_agent: sponsor={} agent_id={} address={} status=Pending",
+                    tx.sender, agent_id, agent_address
+                ));
+                Ok(())
+            }
         };
 
         if result.is_ok() {
@@ -1470,6 +1799,12 @@ impl Executor {
             | TxBody::QrcContributionSettle { .. } => {
                 Err("QRC transaction requires QRC-engine-aware executor".to_string())
             }
+            // Phase 1 typed variants require identity + agent store.
+            TxBody::CharmConfinementUpdate { .. }
+            | TxBody::IntrinsicCharmRecord { .. }
+            | TxBody::RegisterAgent { .. } => {
+                Err("Phase 1 transaction requires identity- and agent-aware executor".to_string())
+            }
         };
 
         if result.is_ok() {
@@ -1546,20 +1881,22 @@ impl Executor {
         }
     }
 
-    /// Execute all transactions for one block, with identity- and
-    /// QRC-gated transaction types (RegisterIdentity, Attest, ClaimUbi,
-    /// RedirectToUbiPool, SponsorAgent, RevokeAgent) actually processed
-    /// instead of rejected. This is what a live node needs to call for
-    /// those transaction types to work at all -- execute_block() above
-    /// always rejects them, by design, since it has no identity or QRC
-    /// state to process them against.
+    /// Execute all transactions for one block, with identity-, QRC-, and
+    /// agent-gated transaction types (RegisterIdentity, Attest, ClaimUbi,
+    /// RedirectToUbiPool, SponsorAgent, RevokeAgent, CharmConfinementUpdate,
+    /// IntrinsicCharmRecord, RegisterAgent, and all QRC variants) actually
+    /// processed instead of rejected. This is what a live node needs to call
+    /// for those transaction types to work at all -- execute_block() above
+    /// always rejects them, by design, since it has no identity, QRC, or
+    /// agent state to process them against.
     pub fn execute_block_with_identity(
         &self,
         height:       u64,
         transactions: Vec<Transaction>,
         state:        &mut StateStore,
         identity:     &mut IdentityStore,
-        qrc:        &mut QrcEngine,
+        qrc:          &mut QrcEngine,
+        agents:       &mut AgentStore,
         timestamp_ms: u64,
     ) -> BlockExecutionResult {
         let mut results        = Vec::new();
@@ -1587,7 +1924,7 @@ impl Executor {
                 continue;
             }
 
-            let result = self.execute_tx_with_identity(tx, state, identity, qrc);
+            let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
             total_gas      += result.gas_used;
             fees_collected += result.gas_used;
             results.push(result);
@@ -1844,7 +2181,7 @@ mod tests {
 
     // -- CharmConfinement enforcement tests -----------------------------------
 
-    fn setup_with_identity() -> (Executor, StateStore, IdentityStore, QrcEngine) {
+    fn setup_with_identity() -> (Executor, StateStore, IdentityStore, QrcEngine, AgentStore) {
         use chain_forge_identity::{IdentityStore, PopAttestation};
         use chain_forge_qrc::QrcEngine;
 
@@ -1859,7 +2196,8 @@ mod tests {
         identity.verify_identity("qcb1alice", att, None).unwrap();
 
         let qrc = QrcEngine::new(chain_forge_qrc::D);
-        (Executor::new(config), state, identity, qrc)
+        let agents = AgentStore::new();
+        (Executor::new(config), state, identity, qrc, agents)
     }
 
     // ── Deprecated UBI-era tx types (QRC Economic Model v0.1) ─────────────────
@@ -1873,11 +2211,11 @@ mod tests {
 
     #[test]
     fn claim_ubi_deprecated_in_qrc_model() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         identity.record_activity("qcb1alice");
 
         let tx = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
 
         assert!(
             !result.success,
@@ -1891,11 +2229,11 @@ mod tests {
 
     #[test]
     fn redirect_to_ubi_pool_deprecated_in_qrc_model() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         identity.record_activity("qcb1alice");
 
         let tx = Transaction::redirect_to_ubi_pool("tx1", "qcb1alice", 1_000_000, 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
 
         assert!(
             !result.success,
@@ -1909,20 +2247,20 @@ mod tests {
 
     #[test]
     fn sponsor_agent_requires_verified_identity() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
         // Bob is not in identity store -- should fail
         let tx = Transaction::sponsor_agent("tx1", "qcb1bob", "qcb1agent1", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!result.success, "unverified identity cannot sponsor agents");
     }
 
     #[test]
     fn sponsor_agent_succeeds_for_verified_human() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
         let tx = Transaction::sponsor_agent("tx1", "qcb1alice", "qcb1agent1", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
 
         assert!(result.success, "{:?}", result.error);
         assert!(identity.is_agent_authorized("qcb1agent1", "qcb1alice"),
@@ -1931,7 +2269,7 @@ mod tests {
 
     #[test]
     fn spend_earns_decay_exemption() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
         // Attach charm to alice's account first
         let mut charm = chain_forge_identity::IntrinsicCharm::provisional(0);
@@ -1944,7 +2282,7 @@ mod tests {
 
         // Transfer triggers spend -> exemption credit
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0);
-        exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
 
         assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 1,
             "spending should earn 1 day of decay exemption");
@@ -1954,10 +2292,10 @@ mod tests {
 
     #[test]
     fn register_identity_tx_creates_provisional_account_with_charm() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
         let tx = Transaction::register_identity("tx1", "qcb1newbie", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
 
         assert!(result.success, "registration should succeed: {:?}", result.error);
         assert!(result.events.iter().any(|e| e.contains("register_identity")));
@@ -1975,7 +2313,7 @@ mod tests {
     fn attest_tx_reaches_quorum_and_upgrades_onchain_tier() {
         use chain_forge_identity::{PopAttestation, VerificationTier};
 
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
         // Bootstrap two more Verified attesters alongside alice (already
         // Verified via setup_with_identity's genesis path).
@@ -1987,13 +2325,13 @@ mod tests {
 
         // Register the real claimant via the actual transaction path.
         let reg_tx = Transaction::register_identity("tx0", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&reg_tx, &mut state, &mut identity, &mut qrc);
+        exec.execute_tx_with_identity(&reg_tx, &mut state, &mut identity, &mut qrc, &mut agents);
 
         // Two attestations: still Provisional on-chain.
         let a1 = Transaction::attest("tx1", "qcb1alice", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut qrc);
+        exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut qrc, &mut agents);
         let a2 = Transaction::attest("tx2", "qcb1bob", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut qrc);
+        exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut qrc, &mut agents);
         assert_eq!(
             state.get_account("qcb1newbie").unwrap().verification_tier(),
             Some(&VerificationTier::Provisional)
@@ -2002,7 +2340,7 @@ mod tests {
         // Third distinct attestation crosses quorum -- both IdentityStore
         // AND the on-chain account must now show Verified.
         let a3 = Transaction::attest("tx3", "qcb1carol", "qcb1newbie", 0);
-        let result = exec.execute_tx_with_identity(&a3, &mut state, &mut identity, &mut qrc);
+        let result = exec.execute_tx_with_identity(&a3, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(result.success);
         assert!(result.events.iter().any(|e| e.contains("now Verified")));
         assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Verified);
@@ -2034,7 +2372,7 @@ mod tests {
     fn identity_txs_advance_sender_nonce_and_block_replay() {
         use chain_forge_identity::PopAttestation;
 
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         for name in ["qcb1bob", "qcb1carol"] {
             let att = PopAttestation::genesis(name, 0);
             identity.register(name.into(), name.into(), att.clone()).unwrap();
@@ -2043,27 +2381,27 @@ mod tests {
 
         // Registration advances the new account's nonce 0 -> 1.
         let reg = Transaction::register_identity("r0", "qcb1newbie", 0);
-        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc).success);
+        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents).success);
         assert_eq!(state.get_account("qcb1newbie").unwrap().nonce, 1);
 
         // Replaying the exact same registration is now a nonce mismatch,
         // not a second trip into the identity logic.
-        let replay = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc);
+        let replay = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!replay.success);
         assert!(replay.error.as_deref().unwrap_or("").contains("nonce mismatch"));
 
         // An attester's first attest advances their nonce, so their second
         // transaction must use nonce 1 -- and does succeed with it.
         let a1 = Transaction::attest("a1", "qcb1alice", "qcb1newbie", 0);
-        assert!(exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut qrc).success);
+        assert!(exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut qrc, &mut agents).success);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1);
 
         exec.execute_tx_with_identity(
             &Transaction::register_identity("r1", "qcb1other", 0),
-            &mut state, &mut identity, &mut qrc,
+            &mut state, &mut identity, &mut qrc, &mut agents,
         );
         let a2 = Transaction::attest("a2", "qcb1alice", "qcb1other", 1);
-        let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "second attest with nonce 1 must succeed: {:?}", r.error);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 2);
     }
@@ -2153,7 +2491,7 @@ mod tests {
 
     #[test]
     fn key_derived_address_registers_and_binds_its_key() {
-        let (_, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (_, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
         let mut config = ExecutionConfig::from_genesis(&genesis);
         config.require_signatures = true;
@@ -2163,7 +2501,7 @@ mod tests {
         let addr = Address::from_public_key(&user.public_key, "qcb", HashWidth::Bits256);
         let mut reg = Transaction::register_identity("r0", addr.as_str(), 0);
         reg.sign(&user, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "{:?}", r.error);
 
         let acct = state.get_account(addr.as_str()).unwrap();
@@ -2174,7 +2512,7 @@ mod tests {
         let other = key("someone-else");
         let mut hijack = Transaction::attest("h1", addr.as_str(), "qcb1alice", 1);
         hijack.sign(&other, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("does not match the key bound"));
     }
@@ -2214,12 +2552,13 @@ mod tests {
             identity.verify_identity(name, att, None).unwrap();
         }
         let mut qrc = QrcEngine::new(chain_forge_qrc::D);
+        let mut agents = chain_forge_agents::AgentStore::new();
 
         let root_before = state.commit(0, 0, false).root_hash;
 
         // Register newcomer -- should change the state root (Provisional charm attached).
         let reg = Transaction::register_identity("t-reg", "qcb1newcomer", 0);
-        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "registration failed: {:?}", r.error);
         let root_after_reg = state.commit(0, 0, false).root_hash;
         assert_ne!(root_before, root_after_reg,
@@ -2231,7 +2570,7 @@ mod tests {
             let attest = Transaction::attest(
                 &format!("t-attest-{i}"), attester, "qcb1newcomer", 0
             );
-            let r = exec.execute_tx_with_identity(&attest, &mut state, &mut identity, &mut qrc);
+            let r = exec.execute_tx_with_identity(&attest, &mut state, &mut identity, &mut qrc, &mut agents);
             assert!(r.success, "attest {i} failed: {:?}", r.error);
         }
         let root_after_verify = state.commit(0, 0, false).root_hash;
@@ -2244,7 +2583,7 @@ mod tests {
 
     #[test]
     fn plain_chain_rejects_identity_qrc_agent_and_stake_txs() {
-        let (_, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (_, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let exec = plain_chain_exec();
         let cases = [
             (Transaction::register_identity("t1", "qcb1alice", 0), "identity"),
@@ -2253,7 +2592,7 @@ mod tests {
             (Transaction::sponsor_agent("t4", "qcb1alice", "qcb1agent", 0), "agents"),
         ];
         for (tx, module) in cases {
-            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
             assert!(!r.success, "{} must be rejected on a plain chain", tx.id);
             assert!(r.error.unwrap().contains(&format!("module \"{module}\" is not enabled")));
         }
@@ -2262,10 +2601,10 @@ mod tests {
 
     #[test]
     fn plain_chain_still_allows_core_transfers() {
-        let (_, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (_, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let exec = plain_chain_exec();
         let tx = Transaction::transfer("t1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "{:?}", r.error);
     }
 
@@ -2286,6 +2625,21 @@ mod tests {
             // QRC Economic Model v0.1 tx types
             TxBody::QrcPurchase { qcb_amount: 1, min_qrc_out: 0 },
             TxBody::QrcSpend { resource: chain_forge_qrc::ResourceKind::Compute, units: 1, amount: 1 },
+            TxBody::QrcContributionSettle {
+                epoch: 1,
+                evidence: make_evidence(1),
+            },
+            // Phase 1: IntrinsicCharm & AEI agent registration
+            TxBody::CharmConfinementUpdate { epoch: 1 },
+            TxBody::IntrinsicCharmRecord { event: CharmEvent::DecayTick },
+            TxBody::RegisterAgent {
+                agent_id:       "x".into(),
+                agent_address:  "x".into(),
+                capabilities:   vec![],
+                spending_limits: chain_forge_agents::SpendingLimits::unlimited(),
+                description:    "x".into(),
+                parent_agent_id: None,
+            },
         ];
         for body in bodies {
             let m = required_module(&body).expect("gated tx types name their module");
@@ -2319,12 +2673,12 @@ mod tests {
 
     #[test]
     fn qrc_purchase_burns_qcb_and_mints_qrc() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Alice starts with 5_000_000 uqcb and no uqrc.
         assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqrc"), 0);
 
         let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 1_000_000, 0, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "QrcPurchase failed: {:?}", r.error);
 
         // QCB must decrease.
@@ -2344,10 +2698,10 @@ mod tests {
 
     #[test]
     fn qrc_purchase_fails_on_insufficient_qcb() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Try to burn more than Alice's 5_000_000 uqcb balance.
         let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 999_000_000, 0, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "should fail with insufficient balance");
         // Balance unchanged.
         assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
@@ -2355,10 +2709,10 @@ mod tests {
 
     #[test]
     fn qrc_purchase_slippage_guard_rejects_low_output() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Demand an absurd min_qrc_out that can never be met.
         let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 1_000_000, u128::MAX, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "slippage guard must reject");
         let err = r.error.unwrap();
         assert!(err.contains("slippage exceeded"), "wrong error: {err}");
@@ -2368,11 +2722,11 @@ mod tests {
 
     #[test]
     fn qrc_spend_deducts_qrc_and_applies_split() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
         // First give Alice some QRC via purchase.
         let buy = Transaction::qrc_purchase("tx_buy", "qcb1alice", 5_000_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc);
+        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "setup purchase failed: {:?}", r.error);
 
         let qrc_before = state.get_account("qcb1alice").unwrap().balance_of("uqrc");
@@ -2388,7 +2742,7 @@ mod tests {
             qrc_before, // authorise up to the full balance
             1,
         );
-        let r = exec.execute_tx_with_identity(&spend, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&spend, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "QrcSpend failed: {:?}", r.error);
 
         let qrc_after = state.get_account("qcb1alice").unwrap().balance_of("uqrc");
@@ -2398,7 +2752,7 @@ mod tests {
 
     #[test]
     fn qrc_spend_fails_with_insufficient_qrc_balance() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Alice has 0 uqrc — any spend must fail.
         // Set amount=u128::MAX so the "amount < cost" gate passes; the
         // balance check then fires and produces the "insufficient uqrc" error.
@@ -2409,18 +2763,18 @@ mod tests {
             u128::MAX,      // authorise any cost — balance check is what fails
             0,
         );
-        let r = exec.execute_tx_with_identity(&spend, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&spend, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "spend with 0 uqrc balance must fail");
         assert!(r.error.unwrap().contains("insufficient uqrc"));
     }
 
     #[test]
     fn qrc_contribution_settle_mints_to_verified_provider() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // qcb1alice is already Verified via setup_with_identity.
         let ev = make_evidence(1);
         let tx = Transaction::qrc_contribution_settle("tx_settle", "qcb1alice", 1, ev, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "contribution settle failed: {:?}", r.error);
         // Alice must have received QRC.
         let qrc_bal = state.get_account("qcb1alice").unwrap().balance_of("uqrc");
@@ -2435,53 +2789,260 @@ mod tests {
 
     #[test]
     fn qrc_contribution_settle_rejected_for_provisional_sender() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Register a fresh provisional account.
         let reg = Transaction::register_identity("reg1", "qcb1carol", 0);
-        let r   = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc);
+        let r   = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success);
 
         let ev = make_evidence(1);
         let settle = Transaction::qrc_contribution_settle("tx_settle", "qcb1carol", 1, ev, 1);
-        let r = exec.execute_tx_with_identity(&settle, &mut state, &mut identity, &mut qrc);
+        let r = exec.execute_tx_with_identity(&settle, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "provisional identity must not be able to settle");
         assert!(r.error.unwrap().contains("Verified tier"));
     }
 
     #[test]
     fn qrc_contribution_settle_rejects_epoch_mismatch() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // evidence.epoch = 1 but tx.epoch = 99
         let mut ev = make_evidence(1);
         ev.epoch = 1;
         let tx = Transaction::qrc_contribution_settle("tx_settle", "qcb1alice", 99, ev, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("epoch"));
     }
 
     #[test]
     fn qrc_purchase_nonce_advances_on_success() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let tx0 = Transaction::qrc_purchase("tx0", "qcb1alice", 100_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&tx0, &mut state, &mut identity, &mut qrc);
+        let r   = exec.execute_tx_with_identity(&tx0, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1);
 
         let tx1 = Transaction::qrc_purchase("tx1", "qcb1alice", 100_000, 0, 1);
-        let r   = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut qrc);
+        let r   = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 2);
     }
 
     #[test]
     fn qrc_purchase_nonce_does_not_advance_on_failure() {
-        let (exec, mut state, mut identity, mut qrc) = setup_with_identity();
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Slippage rejection — should not advance nonce.
         let tx = Transaction::qrc_purchase("tx0", "qcb1alice", 100_000, u128::MAX, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 0,
             "failed tx must not advance nonce");
+    }
+
+    // ── Phase 1: CharmConfinementUpdate tests ─────────────────────────────────
+
+    #[test]
+    fn charm_confinement_update_requires_verified_tier() {
+        // An unregistered address (Provisional tier or absent) must be rejected.
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx = Transaction::charm_confinement_update("ccup1", "qcb1stranger", 1, 0);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "unregistered address must not pass confinement gate");
+        assert!(r.error.as_deref().unwrap_or("").contains("not Verified"),
+            "error must mention 'not Verified': {:?}", r.error);
+    }
+
+    #[test]
+    fn charm_confinement_update_advances_consecutive_epochs() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // alice is Verified in the identity store from setup_with_identity.
+        // First heartbeat: consecutive_active_epochs goes from 0 → 1.
+        let tx1 = Transaction::charm_confinement_update("ccup1", "qcb1alice", 1, 0);
+        let r1  = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r1.success, "first heartbeat must succeed: {:?}", r1.error);
+        assert!(r1.events.iter().any(|e| e.contains("charm_confinement_update")),
+            "must emit event");
+
+        let epochs_after_1 = identity.get("qcb1alice")
+            .unwrap()
+            .charm
+            .consecutive_active_epochs;
+        assert_eq!(epochs_after_1, 1, "consecutive_active_epochs must be 1 after first heartbeat");
+    }
+
+    #[test]
+    fn charm_confinement_update_syncs_to_state_root() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let root_before = state.commit(0, 0, false).root_hash;
+
+        let tx = Transaction::charm_confinement_update("ccup1", "qcb1alice", 1, 0);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        let root_after = state.commit(0, 0, false).root_hash;
+        assert_ne!(root_before, root_after,
+            "state root must change after a CharmConfinementUpdate");
+    }
+
+    #[test]
+    fn charm_confinement_update_auto_promotes_at_epoch_30() {
+        use chain_forge_identity::VerificationTier;
+
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Drive alice's consecutive_active_epochs to 29 directly in the identity store.
+        if let Some(r) = identity.get_mut("qcb1alice") {
+            r.charm.consecutive_active_epochs = 29;
+        }
+
+        // The 30th heartbeat should trigger auto-promotion to Established.
+        let tx = Transaction::charm_confinement_update("ccup30", "qcb1alice", 30, 0);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "30th heartbeat must succeed: {:?}", r.error);
+
+        let tier = identity.get("qcb1alice").unwrap().charm.tier.clone();
+        assert_eq!(tier, VerificationTier::Established,
+            "must auto-promote to Established after 30 consecutive epochs");
+    }
+
+    // ── Phase 1: IntrinsicCharmRecord tests ───────────────────────────────────
+
+    #[test]
+    fn intrinsic_charm_record_rejects_unknown_sender() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx = Transaction::intrinsic_charm_record(
+            "icr1", "qcb1nobody", CharmEvent::DecayTick, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "unregistered sender must be rejected");
+    }
+
+    #[test]
+    fn intrinsic_charm_record_decay_tick_consumes_exemption_day() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Give alice 3 days of exemption via her charm in the identity store.
+        if let Some(r) = identity.get_mut("qcb1alice") {
+            r.charm.decay_exemption.record_spend(1);
+            r.charm.decay_exemption.record_spend(1);
+            r.charm.decay_exemption.record_spend(1);
+        }
+        // Sync to on-chain account.
+        let charm = identity.get("qcb1alice").unwrap().charm.clone();
+        if let Ok(acct) = state.get_account_mut("qcb1alice") {
+            acct.attach_charm(charm);
+        }
+        state.refresh_leaf("qcb1alice");
+
+        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 3);
+
+        let tx = Transaction::intrinsic_charm_record(
+            "icr1", "qcb1alice", CharmEvent::DecayTick, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "DecayTick must succeed: {:?}", r.error);
+
+        // The charm on the identity record should now have 2 days.
+        let remaining = identity.get("qcb1alice").unwrap().charm.decay_exemption.has_exemption();
+        assert!(remaining, "should still have 2 days remaining");
+        // On-chain account should reflect 2 days.
+        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 2);
+        assert!(r.events.iter().any(|e| e.contains("decay_tick")));
+    }
+
+    #[test]
+    fn intrinsic_charm_record_exemption_credit_adds_day() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Give alice a charm on her account (0 days initially).
+        let charm = identity.get("qcb1alice").unwrap().charm.clone();
+        if let Ok(acct) = state.get_account_mut("qcb1alice") {
+            acct.attach_charm(charm);
+        }
+        state.refresh_leaf("qcb1alice");
+
+        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 0);
+
+        let tx = Transaction::intrinsic_charm_record(
+            "icr2", "qcb1alice", CharmEvent::ExemptionCredit, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "ExemptionCredit must succeed: {:?}", r.error);
+
+        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 1,
+            "exemption credit must add 1 day");
+        assert!(r.events.iter().any(|e| e.contains("exemption_credit")));
+    }
+
+    // ── Phase 1: RegisterAgent tests ──────────────────────────────────────────
+
+    #[test]
+    fn register_agent_requires_verified_sponsor() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // qcb1stranger has no identity record at all.
+        let tx = Transaction::register_agent(
+            "ra1", "qcb1stranger",
+            "agent-001", "qcb1agent001",
+            vec![chain_forge_agents::AgentCapability::ReadState],
+            chain_forge_agents::SpendingLimits::unlimited(),
+            "stranger's agent",
+            None,
+            0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "unverified sender must be rejected");
+        assert!(r.error.as_deref().unwrap_or("").contains("not Verified"),
+            "error must mention 'not Verified': {:?}", r.error);
+    }
+
+    #[test]
+    fn register_agent_creates_pending_agent_in_store() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // alice is Verified.
+        let tx = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "agent-001", "qcb1agent001",
+            vec![
+                chain_forge_agents::AgentCapability::ReadState,
+                chain_forge_agents::AgentCapability::Transfer,
+            ],
+            chain_forge_agents::SpendingLimits::merchant(1_000_000),
+            "alice's merchant agent",
+            None,
+            0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "RegisterAgent must succeed for Verified sponsor: {:?}", r.error);
+
+        // Agent must be in the AgentStore as Pending.
+        let agent = agents.get("agent-001").expect("agent must be registered");
+        assert_eq!(agent.status, chain_forge_agents::AgentStatus::Pending,
+            "newly registered agent must be Pending (requires explicit authorize())");
+        assert_eq!(agent.sponsor_id, "qcb1alice");
+        assert_eq!(agent.address, "qcb1agent001");
+
+        // IdentityStore must record the sponsorship.
+        assert!(identity.get("qcb1alice").unwrap().has_sponsored("qcb1agent001"),
+            "sponsor's identity record must list the agent address");
+
+        assert!(r.events.iter().any(|e| e.contains("register_agent")),
+            "must emit event");
+    }
+
+    #[test]
+    fn register_agent_nonce_advances_on_success() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "agent-002", "qcb1agent002",
+            vec![],
+            chain_forge_agents::SpendingLimits::unlimited(),
+            "test agent",
+            None,
+            0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1,
+            "nonce must advance after successful RegisterAgent");
     }
 }
