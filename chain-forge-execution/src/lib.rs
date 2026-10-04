@@ -388,7 +388,7 @@ pub enum TxBody {
     ///
     /// `verified_count` is the number of verified identities at epoch start,
     /// snapshotted from the IdentityStore.  It drives the supply cap:
-    ///   `supply_cap = verified_count × UBI_RATE_PER_VERIFIED_PER_EPOCH`
+    ///   `supply_cap = verified_count × EPOCH_ISSUANCE_CAP_PER_VERIFIED`
     ///
     /// Enforced invariants:
     ///   - No epoch is currently open in the QrcEngine.

@@ -106,26 +106,28 @@ pub type SharedExplorer = Arc<Mutex<ExplorerState>>;
 
 // -- QRC metrics (shared with the API, Section 9.1 / 5.4) -------------------
 
-/// Live snapshot of QRC monetary engine metrics.
+/// Live snapshot of QRC resource economy metrics.
+/// QRC is a data-consumption / resource-credit token (NOT a UBI coin):
+///   - Purchase path: QCB burned → QRC credits at algorithmic rate Rt
+///   - Contribution path: verified resource providers earn QRC directly
+///   - Consumption split: ~60% provider / ~25% permanent burn / ~15% protocol reserve
 /// Updated on every epoch boundary. Read by /api/qrc.
 #[derive(Debug, Default, serde::Serialize, Clone)]
 pub struct QrcMetrics {
-    /// Current UBI pool balance (uqrc).
-    pub ubi_pool_balance_uqrc:      u128,
-    /// Total uqrc received into UBI pool from demurrage since genesis.
-    pub total_decayed_to_pool_uqrc: u128,
-    /// Total uqrc distributed as UBI since genesis.
-    pub total_ubi_distributed_uqrc: u128,
-    /// Total BME fees collected (uqrc) since genesis.
-    pub total_bme_fees_uqrc:        u128,
-    /// Total $QCB burned via BME (uqcb) since genesis.
+    /// Total QRC currently in circulation (uqrc).
+    pub total_supply_uqrc:            u128,
+    /// Total QRC permanently burned from consumption splits since genesis (uqrc).
+    pub total_burned_uqrc:            u128,
+    /// Total QRC minted via purchase path (QCB → QRC) since genesis (uqrc).
+    pub total_purchase_minted_uqrc:   u128,
+    /// Total QRC minted via contribution path (provider earnings) since genesis (uqrc).
+    pub total_contribution_minted_uqrc: u128,
+    /// Total $QCB burned in QCB→QRC purchases since genesis (uqcb).
     pub total_qcb_burned_uqcb:        u128,
-    /// BME fee rate in basis points (50 = 0.5%).
-    pub bme_fee_bps:                  u32,
-    /// Whether BME is live (Section 6.3 threshold met).
-    pub bme_is_live:                  bool,
-    /// Daily UBI rate per verified human (uqrc).
-    pub daily_ubi_rate_uqrc:        u128,
+    /// Current conversion rate Rt (QRC per QCB burned, fixed-point × D).
+    pub conversion_rate_rt:           u128,
+    /// QRC held in protocol reserve (15% of every consumption event) (uqrc).
+    pub protocol_reserve_uqrc:        u128,
     /// Epoch of most recent metrics update.
     pub last_updated_epoch:           u64,
 }
@@ -242,9 +244,10 @@ pub struct Node {
     /// verified-tier gate. Threaded through execute_block_with_identity()
     /// on every commit so identity state actually persists across blocks.
     identity: IdentityStore,
-    /// QRC monetary engine (demurrage, UBI pool, BME) -- backs ClaimUbi
-    /// and RedirectToUbiPool. Threaded through execute_block_with_identity()
-    /// alongside identity, for the same reason.
+    /// QRC resource economy engine — tracks conversion rate Rt, per-resource
+    /// utilization EMAs, supply/burn/reserve accounting, and epoch minting caps.
+    /// Threaded through execute_block_with_identity() so economy state persists
+    /// across blocks (purchase path, contribution path, consumption splits).
     qrc: QrcEngine,
     /// AEI agent registry -- tracks registered agents, their capabilities,
     /// spending limits, and lifecycle status. Threaded through
@@ -546,11 +549,7 @@ impl Node {
 
         let validator_id = validator_address.map(ValidatorId);
         let explorer       = Arc::new(Mutex::new(ExplorerState::default()));
-        let qrc_metrics  = Arc::new(Mutex::new(QrcMetrics {
-            bme_fee_bps:          50,
-            daily_ubi_rate_uqrc: chain_forge_identity::DAILY_UBI_RATE_UQRC,
-            ..Default::default()
-        }));
+        let qrc_metrics  = Arc::new(Mutex::new(QrcMetrics::default()));
 
         let peers: SharedPeers = Arc::new(Mutex::new(Vec::new()));
 
@@ -1789,19 +1788,14 @@ impl Node {
                         validator = %evidence.validator_id,
                         burn_uqcb = capped,
                         error     = %e,
-                        "BME burn failed; tombstone applied but tokens not burned"
+                        "slash burn failed; tombstone applied but tokens not burned"
                     );
                     0
                 } else {
-                    // Update the live QRC metrics counter for /api/qrc
-                    let mut cm = self.qrc_metrics.lock().unwrap();
-                    cm.total_qcb_burned_uqcb =
-                        cm.total_qcb_burned_uqcb.saturating_add(capped);
                     info!(
                         validator = %evidence.validator_id,
                         burn_uqcb = capped,
-                        total_burned = cm.total_qcb_burned_uqcb,
-                        "equivocation slash burned via BME"
+                        "equivocation slash: QCB burned from validator stake"
                     );
                     capped
                 }
@@ -1909,18 +1903,14 @@ impl Node {
                                 validator = %vid,
                                 burn_uqcb = burn_amount,
                                 error     = %e,
-                                "liveness slash: BME burn failed; jail applied but tokens not burned"
+                                "liveness slash: burn failed; jail applied but tokens not burned"
                             );
                         } else {
-                            let mut cm = self.qrc_metrics.lock().unwrap();
-                            cm.total_qcb_burned_uqcb =
-                                cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
                             warn!(
-                                validator    = %vid,
+                                validator = %vid,
                                 height,
-                                burn_uqcb    = burn_amount,
-                                total_burned = cm.total_qcb_burned_uqcb,
-                                "liveness failure: validator jailed and stake burned via BME"
+                                burn_uqcb = burn_amount,
+                                "liveness failure: validator jailed and stake burned"
                             );
                         }
                     }
@@ -2385,38 +2375,19 @@ impl Node {
             }).collect();
         }
 
-        // Update QRC metrics snapshot (Section 9.1 / 5.4)
-        // Phase 0: metrics come from the execution layer's QRC engine.
-        // We update the daily UBI rate from identity constants; full per-epoch
-        // demurrage and BME stats wire in Phase 1 when QRCEngine is plumbed
-        // through the execution pipeline end-to-end.
+        // Update QRC resource economy metrics snapshot (Section 9.1 / 5.4)
+        // Mirror live QrcEngine state directly into the shared metrics struct
+        // so the /api/qrc endpoint always reflects the committed engine state.
         {
             let mut cm = self.qrc_metrics.lock().unwrap();
-            cm.last_updated_epoch     = exec_result.height;
-            cm.daily_ubi_rate_uqrc  = chain_forge_identity::DAILY_UBI_RATE_UQRC;
-            // Count UBI claim events from this block's tx results
-            let ubi_claims = exec_result.tx_results.iter()
-                .filter(|r| r.success)
-                .flat_map(|r| r.events.iter())
-                .filter(|e| e.starts_with("ubi_claim:"))
-                .count();
-            if ubi_claims > 0 {
-                cm.total_ubi_distributed_uqrc = cm.total_ubi_distributed_uqrc
-                    .saturating_add(ubi_claims as u128
-                        * chain_forge_identity::DAILY_UBI_RATE_UQRC);
-            }
-            // Count BME redirect events
-            let redirects = exec_result.tx_results.iter()
-                .filter(|r| r.success)
-                .flat_map(|r| r.events.iter())
-                .filter(|e| e.starts_with("ubi_redirect:"))
-                .count();
-            if redirects > 0 {
-                // 0.5% BME fee on redirects (50bp)
-                cm.total_bme_fees_uqrc = cm.total_bme_fees_uqrc
-                    .saturating_add(redirects as u128 * 5_000); // approx 0.5% of 1M uqrc
-                cm.bme_fee_bps = 50;
-            }
+            cm.last_updated_epoch               = exec_result.height;
+            cm.total_supply_uqrc                = self.qrc.total_supply;
+            cm.total_burned_uqrc                = self.qrc.total_burned;
+            cm.total_purchase_minted_uqrc       = self.qrc.total_purchase_minted;
+            cm.total_contribution_minted_uqrc   = self.qrc.total_contribution_minted;
+            cm.total_qcb_burned_uqcb            = self.qrc.total_qcb_burned;
+            cm.conversion_rate_rt               = self.qrc.conversion_rate.rt;
+            cm.protocol_reserve_uqrc            = self.qrc.protocol_reserve;
         }
 
         Ok(cert)

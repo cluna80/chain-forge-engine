@@ -101,10 +101,11 @@ pub const GAMMA_NUM: u128 = 2; // integer — used in integer exponentiation
 
 // ── Epoch accounting constants (QRC Economic Model v0.2) ─────────────────────
 
-/// QRC minted as the epoch supply cap per verified identity per epoch.
-/// Represents the maximum issuance pressure from the verified population.
+/// Maximum QRC that may be issued (purchase + contribution combined) per verified
+/// identity per epoch. Acts as the epoch-level supply cap, scaling with the
+/// verified population so minting pressure tracks real network participants.
 /// Unit: micro-QRC (fixed-point × D). Placeholder — calibrate via simulation.
-pub const UBI_RATE_PER_VERIFIED_PER_EPOCH: u128 = 10_000_000; // 10 QRC per verified per epoch
+pub const EPOCH_ISSUANCE_CAP_PER_VERIFIED: u128 = 10_000_000; // 10 QRC per verified per epoch
 
 /// Fraction of `protocol_reserve` seeded into `epoch_reserve_balance` at EpochOpen.
 /// Fixed-point × D. 100_000 = 10% of the reserve.
@@ -453,7 +454,7 @@ pub struct QrcEngine {
 
     /// Supply cap for the current epoch: maximum QRC that may be minted
     /// (purchase + contribution paths combined) during this epoch.
-    /// Computed at EpochOpen as: `verified_count * UBI_RATE_PER_VERIFIED_PER_EPOCH`.
+    /// Computed at EpochOpen as: `verified_count * EPOCH_ISSUANCE_CAP_PER_VERIFIED`.
     pub epoch_supply_cap: u128,
 
     /// QRC minted so far in the current epoch (purchase + contribution).
@@ -706,7 +707,7 @@ impl QrcEngine {
     ///
     /// # Effects
     /// - Sets `current_epoch = epoch`.
-    /// - Computes `epoch_supply_cap = verified_count * UBI_RATE_PER_VERIFIED_PER_EPOCH`.
+    /// - Computes `epoch_supply_cap = verified_count * EPOCH_ISSUANCE_CAP_PER_VERIFIED`.
     /// - Seeds `epoch_reserve_balance` from `protocol_reserve`
     ///   (up to `EPOCH_RESERVE_SEED_RATE` fraction of the reserve).
     /// - Resets `epoch_minted`, `epoch_provider_rewards` to 0.
@@ -722,10 +723,10 @@ impl QrcEngine {
             return Err(QrcError::EpochAlreadyOpen(self.current_epoch));
         }
 
-        // Compute supply cap: each verified human's UBI-equivalent issuance.
-        // UBI_RATE_PER_VERIFIED_PER_EPOCH is in micro-QRC (× D).
+        // Compute epoch supply cap from the verified population size.
+        // EPOCH_ISSUANCE_CAP_PER_VERIFIED is in micro-QRC (× D).
         let supply_cap = (verified_count as u128)
-            .saturating_mul(UBI_RATE_PER_VERIFIED_PER_EPOCH);
+            .saturating_mul(EPOCH_ISSUANCE_CAP_PER_VERIFIED);
 
         // Seed epoch reserve from protocol_reserve (up to the seed rate).
         let seed = self.protocol_reserve
@@ -1249,7 +1250,7 @@ mod tests {
         let summary = e.open_epoch(1, 100).unwrap();
         assert_eq!(summary.epoch, 1);
         assert!(summary.epoch_open);
-        assert_eq!(summary.supply_cap, 100 * UBI_RATE_PER_VERIFIED_PER_EPOCH);
+        assert_eq!(summary.supply_cap, 100 * EPOCH_ISSUANCE_CAP_PER_VERIFIED);
         assert_eq!(summary.epoch_minted, 0);
         assert_eq!(summary.provider_rewards, 0);
     }
@@ -1325,7 +1326,7 @@ mod tests {
         // Should succeed — previous epoch is closed.
         let summary = e.open_epoch(2, 60).unwrap();
         assert_eq!(summary.epoch, 2);
-        assert_eq!(summary.supply_cap, 60 * UBI_RATE_PER_VERIFIED_PER_EPOCH);
+        assert_eq!(summary.supply_cap, 60 * EPOCH_ISSUANCE_CAP_PER_VERIFIED);
     }
 
     #[test]
