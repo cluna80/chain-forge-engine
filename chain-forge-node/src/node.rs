@@ -929,31 +929,44 @@ impl Node {
     }
 
     /// Write chain state to disk. Called after every committed block.
-    /// Writes three JSON files: state snapshot, identity store, QRC engine.
+    /// Writes JSON files for all stateful subsystems so a restarted node
+    /// can resume at the exact committed height without replaying from genesis.
     fn persist_state(&self) {
         let Some(ref dir) = self.data_dir else { return };
         let persist = dir.join("persist");
         let snap    = self.state.export_snapshot();
+        let height  = snap.height;
         for (name, value) in [
-            ("state.json",    serde_json::to_string_pretty(&snap)        .ok()),
-            ("identity.json", serde_json::to_string_pretty(&self.identity).ok()),
-            ("qrc.json",    serde_json::to_string_pretty(&self.qrc)   .ok()),
+            ("state.json",      serde_json::to_string_pretty(&snap)                  .ok()),
+            ("identity.json",   serde_json::to_string_pretty(&self.identity)         .ok()),
+            ("qrc.json",        serde_json::to_string_pretty(&self.qrc)              .ok()),
+            ("validators.json", serde_json::to_string_pretty(&self.validator_registry).ok()),
+            ("agents.json",     serde_json::to_string_pretty(&self.agents)           .ok()),
+            ("slashing.json",   serde_json::to_string_pretty(&self.slasher)          .ok()),
+            ("chain_store.json",serde_json::to_string_pretty(&self.chain_store)      .ok()),
         ] {
             if let Some(json) = value {
                 let _ = std::fs::write(persist.join(name), json);
             }
         }
-        tracing::debug!(height = snap.height, "state persisted to disk");
+        tracing::debug!(height, "state persisted to disk");
     }
 
     /// Load chain state from disk. Returns true if state was found and loaded.
-    /// On success, the node resumes from the last persisted height.
+    /// On success, the node resumes from the last persisted height. All
+    /// stateful subsystems (state, identity, QRC, validators, agents, slasher,
+    /// block history) are restored so the node is fully caught-up immediately.
     pub fn load_persisted_state(&mut self) -> bool {
         let Some(ref dir) = self.data_dir else { return false };
         let persist = dir.join("persist");
-        let snap_path  = persist.join("state.json");
-        let id_path    = persist.join("identity.json");
-        let qrc_path = persist.join("qrc.json");
+        let snap_path        = persist.join("state.json");
+        let id_path          = persist.join("identity.json");
+        let qrc_path         = persist.join("qrc.json");
+        let validators_path  = persist.join("validators.json");
+        let agents_path      = persist.join("agents.json");
+        let slashing_path    = persist.join("slashing.json");
+        let chain_store_path = persist.join("chain_store.json");
+
         if !snap_path.exists() { return false; }
 
         let mut load = || -> Result<(), Box<dyn std::error::Error>> {
@@ -968,6 +981,42 @@ impl Node {
             if qrc_path.exists() {
                 self.qrc = serde_json::from_str(&std::fs::read_to_string(&qrc_path)?)?;
             }
+            if validators_path.exists() {
+                self.validator_registry =
+                    serde_json::from_str(&std::fs::read_to_string(&validators_path)?)?;
+                tracing::debug!("validator registry restored from disk");
+            }
+            if agents_path.exists() {
+                self.agents =
+                    serde_json::from_str(&std::fs::read_to_string(&agents_path)?)?;
+                tracing::debug!("agent store restored from disk");
+            }
+            if slashing_path.exists() {
+                self.slasher =
+                    serde_json::from_str(&std::fs::read_to_string(&slashing_path)?)?;
+                tracing::debug!("slashing module restored from disk");
+            }
+            if chain_store_path.exists() {
+                self.chain_store =
+                    serde_json::from_str(&std::fs::read_to_string(&chain_store_path)?)?;
+                tracing::debug!(
+                    blocks = self.chain_store.len(),
+                    "block history restored from disk"
+                );
+            }
+
+            // Rebuild the consensus engine's view of the current height and
+            // validator set so it does not re-propose already-committed blocks.
+            let vs = self.validator_registry.build_validator_set(height);
+            if let Err(e) = self.consensus.reset_to_height(height, vs) {
+                tracing::warn!(
+                    height,
+                    error = %e,
+                    "consensus engine could not fast-forward to persisted height; \
+                     some re-proposal may occur until peers catch this node up"
+                );
+            }
+
             tracing::info!(height, "chain state loaded from disk");
             Ok(())
         };

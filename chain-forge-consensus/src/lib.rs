@@ -557,6 +557,23 @@ pub trait ConsensusEngine: Send + Sync {
     fn drain_equivocations(&mut self) -> Vec<crate::tendermint::EquivocationDetected> {
         Vec::new()
     }
+
+    /// Fast-forward the engine's internal height counter to `height` using
+    /// the supplied validator set, without replaying any blocks. Called by
+    /// the node after loading persisted state so the engine starts proposing
+    /// and voting at the correct height rather than from genesis.
+    ///
+    /// Default impl is a no-op (returns Ok) so existing engines compile
+    /// without change. An engine that implements this can avoid the brief
+    /// catch-up period where it would otherwise re-propose already-committed
+    /// heights and have the proposals rejected by peers.
+    fn reset_to_height(
+        &mut self,
+        _height: BlockHeight,
+        _validator_set: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        Ok(())
+    }
 }
 
 // ── Personhood power cap enforcement ─────────────────────────────────────────
@@ -2033,6 +2050,26 @@ impl ConsensusEngine for TendermintEngine {
 
     fn drain_equivocations(&mut self) -> Vec<EquivocationDetected> {
         std::mem::take(&mut self.pending_equivocations)
+    }
+
+    fn reset_to_height(
+        &mut self,
+        height: BlockHeight,
+        validator_set: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        // Jump the height counter forward so the engine starts proposing and
+        // voting at `height + 1` rather than re-running already-committed
+        // heights.  Per-round state (votes, proposals, locks) is for the old
+        // height and is no longer valid, so clear it.
+        self.height           = height;
+        self.round            = 0;
+        self.validator_set    = Some(validator_set);
+        self.votes            = BTreeMap::new();
+        self.current_proposal = None;
+        self.locked_block     = None;
+        self.valid_block      = None;
+        tracing::info!(height, "Tendermint engine fast-forwarded to persisted height");
+        Ok(())
     }
 }
 

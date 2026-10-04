@@ -355,6 +355,7 @@ impl AgentRecord {
 /// This is what Section 5.3's "native first-class representation" means
 /// concretely: agents are not smart contracts or EOAs, they are entries
 /// in this registry with enforced lifecycle and spending constraints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStore {
     agents: HashMap<String, AgentRecord>,
     /// Index: address -> agent_id for fast lookup.

@@ -453,6 +453,7 @@ pub struct RegistrationRequest {
 /// The registry enforces QCB's core separation:
 ///   stake → reward share + tier
 ///   personhood → voting power (via consensus ValidatorSet)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorRegistry {
     validators:   HashMap<String, ValidatorRecord>,
     /// Index: consensus pubkey -> validator ID.

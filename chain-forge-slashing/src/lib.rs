@@ -281,6 +281,7 @@ impl SlashingConfig {
 /// Sits between the consensus/block-production layer (which detects violations)
 /// and the ValidatorRegistry (which applies status changes).
 /// Returns the amount to burn — the node routes this to the BME engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashingModule {
     config:   SlashingConfig,
     history:  Vec<SlashRecord>,
