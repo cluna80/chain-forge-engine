@@ -30,7 +30,45 @@
 //! All arithmetic is integer; no floating point enters consensus-critical paths.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+// ── Serde helper for [u8; 64] ─────────────────────────────────────────────────
+// serde's built-in derive only covers arrays up to [T; 32]. This module
+// serializes a 64-byte array as a fixed-length byte sequence so that
+// CapacityEvidence can implement Serialize/Deserialize without adding a
+// dependency on `serde_bytes` or `serde_with`.
+mod serde_bytes64 {
+    use serde::{Deserializer, Serializer};
+    use serde::de::{SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        let mut tup = s.serialize_tuple(64)?;
+        for b in v { tup.serialize_element(b)?; }
+        tup.end()
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        struct Arr64;
+        impl<'de> Visitor<'de> for Arr64 {
+            type Value = [u8; 64];
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a sequence of 64 bytes")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<[u8; 64], A::Error> {
+                let mut out = [0u8; 64];
+                for slot in &mut out {
+                    *slot = seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(0, &self)
+                    })?;
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(64, Arr64)
+    }
+}
 
 // ── Constants (§8) ────────────────────────────────────────────────────────────
 
@@ -84,7 +122,7 @@ pub const DOMAIN_SEP_CAPACITY: &[u8] = b"CAPACITY_EVIDENCE_NONCE_V0";
 // ── ResourceType ─────────────────────────────────────────────────────────────
 
 /// Enumerated resource categories. Additional types require a protocol upgrade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ResourceType {
     /// General-purpose compute in normalized FLOP-equivalents.
     Compute,
@@ -114,7 +152,7 @@ impl ResourceType {
 
 /// Compute benchmark proof (v0). Time-gates fabrication; does NOT verify
 /// correct execution. v1 will require a ZK proof of correct execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeProofV0 {
     /// Normalized operations completed.
     pub benchmark_result: u64,
@@ -125,7 +163,7 @@ pub struct ComputeProofV0 {
 }
 
 /// Storage proof (v0). Sector sampling driven by challenge_nonce.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageProofV0 {
     /// Merkle root of challenge-sampled stored data.
     pub merkle_root: [u8; 32],
@@ -134,7 +172,7 @@ pub struct StorageProofV0 {
 }
 
 /// ZK proving capacity proof (v0). Proves over the canonical test circuit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZkProvingProofV0 {
     /// Serialized proof bytes over the canonical test circuit.
     pub proof_bytes: Vec<u8>,
@@ -144,7 +182,7 @@ pub struct ZkProvingProofV0 {
 
 /// Resource-type-specific capacity proof. v0 proofs are structurally validated
 /// only; semantic validation (cryptographic binding) is deferred to v1.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CapacityProof {
     Compute(ComputeProofV0),
     Storage(StorageProofV0),
@@ -195,7 +233,7 @@ impl CapacityProof {
 // ── CapacityEvidence (§2) ────────────────────────────────────────────────────
 
 /// A VCA credential (opaque bytes at this layer; verified by the VCA protocol).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VcaCredential(pub Vec<u8>);
 
 /// A provider's public key (opaque bytes; signature verification is done by the
@@ -207,7 +245,7 @@ pub type Signature = [u8; 64];
 
 /// A signed, epoch-scoped claim by a registered provider asserting that it can
 /// service `capacity_claim` CU of `resource_type`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapacityEvidence {
     // Identity
     pub provider_id:     ProviderId,
@@ -228,7 +266,10 @@ pub struct CapacityEvidence {
     // Challenge-response proof
     pub proof:           CapacityProof,
 
-    // Signature over all fields above
+    // Signature over all fields above (64-byte Ed25519 or PQC signature).
+    // `[u8; 64]` exceeds serde's built-in array limit (32); the custom
+    // `serde_bytes64` module handles serialization without extra dependencies.
+    #[serde(with = "serde_bytes64")]
     pub signature:       Signature,
 }
 
