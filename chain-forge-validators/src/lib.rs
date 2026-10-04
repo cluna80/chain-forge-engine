@@ -310,6 +310,11 @@ pub struct ValidatorRecord {
     pub verification_tier: Option<VerificationTier>,
     /// Epoch of registration.
     pub registered_epoch: u64,
+    /// Monotonically increasing sequence number assigned at registration time.
+    /// Used as a stable tiebreaker when two validators share the same
+    /// `registered_epoch` (e.g. both registered at epoch 0): lower sequence =
+    /// registered first → gets priority for the per-human power cap.
+    pub registration_seq: u64,
     /// Epoch of last status change.
     pub last_status_epoch: u64,
     /// Blocks proposed by this validator (for performance tracking).
@@ -467,19 +472,23 @@ pub struct ValidatorRegistry {
     pub liveness_threshold: f64,
     /// How long a jailed validator must wait before unjailing (epochs).
     pub jail_duration_epochs: u64,
+    /// Monotonically increasing counter for registration order.
+    /// Incremented on every successful `register()` or `register_genesis()` call.
+    next_registration_seq: u64,
 }
 
 impl ValidatorRegistry {
     pub fn new(min_stake_uqcb: u128, personhood_config: PersonhoodConfig) -> Self {
         Self {
-            validators:          HashMap::new(),
-            by_pubkey:           HashMap::new(),
-            by_address:          HashMap::new(),
-            validators_by_human: HashMap::new(),
+            validators:             HashMap::new(),
+            by_pubkey:              HashMap::new(),
+            by_address:             HashMap::new(),
+            validators_by_human:    HashMap::new(),
             min_stake_uqcb,
             personhood_config,
-            liveness_threshold:  0.05, // >5% missed blocks triggers jail warning
-            jail_duration_epochs: 10,
+            liveness_threshold:     0.05, // >5% missed blocks triggers jail warning
+            jail_duration_epochs:   10,
+            next_registration_seq:  0,
         }
     }
 
@@ -526,6 +535,9 @@ impl ValidatorRegistry {
 
         let stake_tier = StakeTier::from_bonded(req.bonded_uqcb);
 
+        let seq = self.next_registration_seq;
+        self.next_registration_seq += 1;
+
         let record = ValidatorRecord {
             id:                req.id.clone(),
             keys:              req.keys.clone(),
@@ -536,6 +548,7 @@ impl ValidatorRegistry {
             pop_verified:      false,
             verification_tier: None,
             registered_epoch:  epoch,
+            registration_seq:  seq,
             last_status_epoch: epoch,
             blocks_proposed:   0,
             blocks_missed:     0,
@@ -599,6 +612,8 @@ impl ValidatorRegistry {
             return; // already registered, no-op
         }
         let validator_id = ValidatorId(id.to_string());
+        let seq = self.next_registration_seq;
+        self.next_registration_seq += 1;
         let record = ValidatorRecord {
             id:                validator_id.clone(),
             keys:              KeyBundle {
@@ -618,6 +633,7 @@ impl ValidatorRegistry {
             pop_verified:      false,
             verification_tier: None,
             registered_epoch:  0,
+            registration_seq:  seq,
             last_status_epoch: 0,
             blocks_proposed:   0,
             blocks_missed:     0,
@@ -809,10 +825,12 @@ impl ValidatorRegistry {
         let mut human_power_used: HashMap<String, u64> = HashMap::new();
 
         let validators: Vec<ValidatorInfo> = {
-            // Sort by registered_epoch so the first-registered validator for a
-            // given human gets priority for the cap allocation.
+            // Sort by (registered_epoch, registration_seq) so the first-registered
+            // validator for a given human always gets priority for the per-human
+            // power cap, even when two validators share the same epoch (e.g. both
+            // registered at epoch 0 during testing or genesis).
             let mut sorted = candidates;
-            sorted.sort_by_key(|r| r.registered_epoch);
+            sorted.sort_by_key(|r| (r.registered_epoch, r.registration_seq));
 
             sorted.iter().map(|r| {
                 // Effective owner key: explicit owner_identity_id or fall back to id.
