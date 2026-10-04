@@ -299,7 +299,13 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RegisterAgent { .. }            => "register_agent",
         // QRC Economic Model v0.2 epoch boundary signals
         TxBody::EpochOpen { .. }                => "epoch_open",
-        TxBody::EpochClose { .. }              => "epoch_close",
+        TxBody::EpochClose { .. }               => "epoch_close",
+        // AEI Phase 2 agent lifecycle
+        TxBody::AuthorizeAgent { .. }           => "authorize_agent",
+        TxBody::SuspendAgent { .. }             => "suspend_agent",
+        TxBody::RevokeAgentFull { .. }          => "revoke_agent_full",
+        TxBody::RecordAgentSpend { .. }         => "record_agent_spend",
+        TxBody::SpawnChildAgent { .. }          => "spawn_child_agent",
     }
 }
 

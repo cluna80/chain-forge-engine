@@ -129,6 +129,12 @@ impl GasModel {
                     // Epoch boundary: lightweight protocol signals.
                     TxBody::EpochOpen { .. }             => op_multiplier * 4,
                     TxBody::EpochClose { .. }            => op_multiplier * 4,
+                    // AEI Phase 2 lifecycle ops.
+                    TxBody::AuthorizeAgent { .. }        => op_multiplier * 4,
+                    TxBody::SuspendAgent { .. }          => op_multiplier * 3,
+                    TxBody::RevokeAgentFull { .. }       => op_multiplier * 6, // touches both stores
+                    TxBody::RecordAgentSpend { .. }      => op_multiplier * 2,
+                    TxBody::SpawnChildAgent { .. }       => op_multiplier * 8, // comparable to RegisterAgent
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -407,6 +413,77 @@ pub enum TxBody {
         /// The epoch number being closed.  Must match `QrcEngine::current_epoch`.
         epoch: u64,
     },
+
+    // ── Agent Lifecycle — AEI Phase 2 ─────────────────────────────────────────
+
+    /// Advance an agent from Pending → Active (or Suspended → Active).
+    ///
+    /// Only the agent's registered sponsor (or an authorized governance key)
+    /// may submit this transaction.  The `AgentStore::authorize()` method
+    /// enforces that the agent is in Pending or Suspended state.
+    AuthorizeAgent {
+        /// The unique agent identifier (same value used in `RegisterAgent`).
+        agent_id: String,
+    },
+
+    /// Temporarily suspend an Active agent.
+    ///
+    /// Agent state is preserved; the agent can be re-authorized later.
+    /// Caller must be the agent's sponsor or a governance identity.
+    SuspendAgent {
+        /// The agent to suspend.
+        agent_id: String,
+        /// Human-readable reason (logged as a block event; not enforced on-chain).
+        reason: String,
+    },
+
+    /// Permanently revoke an agent's registration.
+    ///
+    /// This is the Phase 2 complement to the legacy `RevokeAgent` variant:
+    ///   - `RevokeAgent` (Phase 0) only touches `IdentityStore`.
+    ///   - `RevokeAgentFull` touches BOTH `AgentStore` AND `IdentityStore`.
+    ///
+    /// After this tx the agent cannot be re-authorized; the `agent_id` is
+    /// effectively tombstoned in the AgentStore (status = Revoked).
+    RevokeAgentFull {
+        /// The agent to permanently revoke.
+        agent_id: String,
+    },
+
+    /// Record a QRC spend against an agent's epoch and lifetime limits.
+    ///
+    /// Submitted by the agent's executor on behalf of the agent when it
+    /// performs a metered action.  Enforces both `epoch_limit_uqrc` and
+    /// `lifetime_limit_uqrc` in the agent's `SpendingLimits`.
+    RecordAgentSpend {
+        /// The agent recording the spend.
+        agent_id: String,
+        /// Amount in micro-QRC (uQRC).
+        amount_uqrc: u128,
+    },
+
+    /// Spawn a child agent under an existing parent agent.
+    ///
+    /// Enforces:
+    ///   - Parent must exist and be Active.
+    ///   - Parent must hold the `SpawnChildAgent` capability.
+    ///   - Child's spending limits are capped at the parent's remaining limits
+    ///     (i.e. child cannot exceed what parent is allowed to spend).
+    ///   - Sponsor of both parent and child must be the same verified human.
+    SpawnChildAgent {
+        /// Unique identifier for the new child agent.
+        child_agent_id: String,
+        /// Address the child will act from.
+        child_agent_address: String,
+        /// The parent agent whose capability set gates this spawn.
+        parent_agent_id: String,
+        /// Capabilities granted to the child (must be a subset of parent's).
+        capabilities: Vec<chain_forge_agents::AgentCapability>,
+        /// Spending limits for the child (capped at parent remaining capacity).
+        spending_limits: SpendingLimits,
+        /// Human-readable description of the child agent's purpose.
+        description: String,
+    },
 }
 
 /// Events that affect the on-chain IntrinsicCharm record without going through
@@ -543,6 +620,15 @@ impl Transaction {
             // Epoch boundary signals: epoch number (u64) only.
             TxBody::EpochOpen { .. }  => 24,
             TxBody::EpochClose { .. } => 16,
+            // AEI Phase 2 lifecycle ops.
+            TxBody::AuthorizeAgent { agent_id }             => agent_id.len() + 8,
+            TxBody::SuspendAgent { agent_id, reason }       => agent_id.len() + reason.len() + 8,
+            TxBody::RevokeAgentFull { agent_id }            => agent_id.len() + 8,
+            TxBody::RecordAgentSpend { agent_id, .. }       => agent_id.len() + 24,
+            TxBody::SpawnChildAgent {
+                child_agent_id, child_agent_address, parent_agent_id, description, ..
+            } => child_agent_id.len() + child_agent_address.len()
+                + parent_agent_id.len() + description.len() + 64,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -977,6 +1063,12 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::RegisterAgent { .. } => Some("agents"),
         // QRC v0.2 epoch boundary signals require the QRC module.
         TxBody::EpochOpen { .. } | TxBody::EpochClose { .. } => Some("qrc"),
+        // AEI Phase 2 lifecycle operations all require the agents module.
+        TxBody::AuthorizeAgent { .. }
+        | TxBody::SuspendAgent { .. }
+        | TxBody::RevokeAgentFull { .. }
+        | TxBody::RecordAgentSpend { .. }
+        | TxBody::SpawnChildAgent { .. } => Some("agents"),
     }
 }
 
@@ -1751,6 +1843,238 @@ impl Executor {
                     Err(e) => Err(format!("EpochClose: {e}")),
                 }
             }
+
+            // ── AEI Phase 2 — Agent Lifecycle ────────────────────────────────
+
+            TxBody::AuthorizeAgent { agent_id } => {
+                // Caller must be the agent's registered sponsor.
+                let agent = match agents.get(agent_id) {
+                    Ok(a) => a,
+                    Err(e) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("AuthorizeAgent: {e}"),
+                    ),
+                };
+                if agent.sponsor_id != tx.sender {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "AuthorizeAgent: sender {} is not the registered sponsor of agent {}",
+                            tx.sender, agent_id
+                        ),
+                    );
+                }
+                let current_epoch = identity.clock.current_epoch;
+                match agents.authorize(agent_id, current_epoch) {
+                    Ok(()) => {
+                        events.push(format!(
+                            "authorize_agent: sponsor={} agent_id={} epoch={}",
+                            tx.sender, agent_id, current_epoch
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("AuthorizeAgent: {e}")),
+                }
+            }
+
+            TxBody::SuspendAgent { agent_id, reason } => {
+                // Caller must be the agent's registered sponsor.
+                let agent = match agents.get(agent_id) {
+                    Ok(a) => a,
+                    Err(e) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("SuspendAgent: {e}"),
+                    ),
+                };
+                if agent.sponsor_id != tx.sender {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SuspendAgent: sender {} is not the registered sponsor of agent {}",
+                            tx.sender, agent_id
+                        ),
+                    );
+                }
+                let current_epoch = identity.clock.current_epoch;
+                match agents.suspend(agent_id, current_epoch) {
+                    Ok(()) => {
+                        events.push(format!(
+                            "suspend_agent: sponsor={} agent_id={} reason={:?} epoch={}",
+                            tx.sender, agent_id, reason, current_epoch
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("SuspendAgent: {e}")),
+                }
+            }
+
+            TxBody::RevokeAgentFull { agent_id } => {
+                // Caller must be the agent's registered sponsor.
+                let agent = match agents.get(agent_id) {
+                    Ok(a) => a,
+                    Err(e) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("RevokeAgentFull: {e}"),
+                    ),
+                };
+                let agent_address = agent.address.clone();
+                if agent.sponsor_id != tx.sender {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "RevokeAgentFull: sender {} is not the registered sponsor of agent {}",
+                            tx.sender, agent_id
+                        ),
+                    );
+                }
+                let current_epoch = identity.clock.current_epoch;
+                // Step 1: revoke in AgentStore (tombstones the AEI record).
+                if let Err(e) = agents.revoke(agent_id, current_epoch) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("RevokeAgentFull: AgentStore.revoke failed: {e}"),
+                    );
+                }
+                // Step 2: remove the sponsorship link from IdentityStore so
+                //         the slot is freed and cannot be re-registered.
+                if let Some(record) = identity.get_mut(&tx.sender) {
+                    record.revoke_agent(&agent_address);
+                }
+                events.push(format!(
+                    "revoke_agent_full: sponsor={} agent_id={} address={} epoch={}",
+                    tx.sender, agent_id, agent_address, current_epoch
+                ));
+                Ok(())
+            }
+
+            TxBody::RecordAgentSpend { agent_id, amount_uqrc } => {
+                // Caller must be the agent's registered sponsor (or the agent
+                // address itself — sponsors gate agent actions in Phase 2).
+                let agent = match agents.get(agent_id) {
+                    Ok(a) => a,
+                    Err(e) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("RecordAgentSpend: {e}"),
+                    ),
+                };
+                let is_sponsor  = agent.sponsor_id   == tx.sender;
+                let is_agent    = agent.address       == tx.sender;
+                if !is_sponsor && !is_agent {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "RecordAgentSpend: sender {} is neither sponsor nor agent address for {}",
+                            tx.sender, agent_id
+                        ),
+                    );
+                }
+                match agents.record_spend(agent_id, *amount_uqrc) {
+                    Ok(()) => {
+                        events.push(format!(
+                            "record_agent_spend: agent_id={} amount_uqrc={} sender={}",
+                            agent_id, amount_uqrc, tx.sender
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("RecordAgentSpend: {e}")),
+                }
+            }
+
+            TxBody::SpawnChildAgent {
+                child_agent_id,
+                child_agent_address,
+                parent_agent_id,
+                capabilities,
+                spending_limits,
+                description,
+            } => {
+                // 1. Parent must exist and be Active.
+                let parent = match agents.get(parent_agent_id) {
+                    Ok(p) => p,
+                    Err(e) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("SpawnChildAgent: parent lookup failed: {e}"),
+                    ),
+                };
+                if !parent.is_active() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("SpawnChildAgent: parent agent {} is not Active", parent_agent_id),
+                    );
+                }
+                // 2. Parent must hold SpawnChildAgent capability.
+                use chain_forge_agents::AgentCapability;
+                if let Err(e) = agents.check_capability(
+                    parent_agent_id,
+                    &AgentCapability::SpawnChildAgent,
+                ) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("SpawnChildAgent: parent lacks SpawnChildAgent capability: {e}"),
+                    );
+                }
+                // 3. Caller must be the parent's sponsor (same verified human
+                //    must own both parent and child).
+                let sponsor_id = {
+                    let parent = agents.get(parent_agent_id).unwrap(); // already confirmed Ok
+                    parent.sponsor_id.clone()
+                };
+                if sponsor_id != tx.sender {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SpawnChildAgent: sender {} is not the sponsor of parent agent {}",
+                            tx.sender, parent_agent_id
+                        ),
+                    );
+                }
+                // 4. Sponsor must be Verified (same gate as RegisterAgent).
+                if !identity.get(&tx.sender).map(|r| r.is_verified()).unwrap_or(false) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SpawnChildAgent: sponsor {} is not Verified (Charm Confinement requires Verified or Established tier)",
+                            tx.sender
+                        ),
+                    );
+                }
+                // 5. Register the child with parent_agent_id set.
+                //    AgentStore::register checks parent is Active internally.
+                let current_epoch = identity.clock.current_epoch;
+                // Also record the sponsorship in IdentityStore.
+                if let Err(e) = identity.sponsor_agent(&tx.sender, child_agent_address) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("SpawnChildAgent: identity sponsor_agent failed: {e}"),
+                    );
+                }
+                match agents.register(
+                    child_agent_id.clone(),
+                    child_agent_address.clone(),
+                    tx.sender.clone(),
+                    capabilities.clone(),
+                    spending_limits.clone(),
+                    Some(parent_agent_id.clone()),
+                    description.clone(),
+                    chain_forge_agents::AgentType::Native,
+                    current_epoch,
+                ) {
+                    Ok(()) => {
+                        events.push(format!(
+                            "spawn_child_agent: sponsor={} parent={} child_id={} address={} status=Pending epoch={}",
+                            tx.sender, parent_agent_id, child_agent_id, child_agent_address, current_epoch
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Roll back the IdentityStore sponsorship.
+                        if let Some(record) = identity.get_mut(&tx.sender) {
+                            record.revoke_agent(child_agent_address);
+                        }
+                        Err(format!("SpawnChildAgent: AgentStore.register failed: {e}"))
+                    }
+                }
+            }
         };
 
         if result.is_ok() {
@@ -1892,6 +2216,14 @@ impl Executor {
             TxBody::EpochOpen { .. }
             | TxBody::EpochClose { .. } => {
                 Err("Epoch boundary transaction requires QRC-engine-aware executor".to_string())
+            }
+            // AEI Phase 2 lifecycle variants require the full agent-aware executor.
+            TxBody::AuthorizeAgent { .. }
+            | TxBody::SuspendAgent { .. }
+            | TxBody::RevokeAgentFull { .. }
+            | TxBody::RecordAgentSpend { .. }
+            | TxBody::SpawnChildAgent { .. } => {
+                Err("AEI Phase 2 transaction requires identity- and agent-aware executor".to_string())
             }
         };
 
@@ -2728,6 +3060,22 @@ mod tests {
                 description:    "x".into(),
                 parent_agent_id: None,
             },
+            // QRC v0.2 epoch boundary
+            TxBody::EpochOpen { epoch: 1, verified_count: 0 },
+            TxBody::EpochClose { epoch: 1 },
+            // AEI Phase 2 lifecycle
+            TxBody::AuthorizeAgent { agent_id: "x".into() },
+            TxBody::SuspendAgent { agent_id: "x".into(), reason: "x".into() },
+            TxBody::RevokeAgentFull { agent_id: "x".into() },
+            TxBody::RecordAgentSpend { agent_id: "x".into(), amount_uqrc: 1 },
+            TxBody::SpawnChildAgent {
+                child_agent_id:      "x".into(),
+                child_agent_address: "x".into(),
+                parent_agent_id:     "x".into(),
+                capabilities:        vec![],
+                spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
+                description:         "x".into(),
+            },
         ];
         for body in bodies {
             let m = required_module(&body).expect("gated tx types name their module");
@@ -3132,5 +3480,285 @@ mod tests {
         assert!(r.success);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1,
             "nonce must advance after successful RegisterAgent");
+    }
+
+    // ── Phase 2: AEI agent lifecycle tests ────────────────────────────────────
+
+    /// Register a basic agent as alice and return its agent_id.
+    fn register_alice_agent(
+        exec:     &Executor,
+        state:    &mut StateStore,
+        identity: &mut IdentityStore,
+        qrc:      &mut QrcEngine,
+        agents:   &mut AgentStore,
+        agent_id: &str,
+        address:  &str,
+        caps:     Vec<chain_forge_agents::AgentCapability>,
+        nonce:    u64,
+    ) {
+        let tx = Transaction::register_agent(
+            &format!("reg-{agent_id}"), "qcb1alice",
+            agent_id, address,
+            caps,
+            chain_forge_agents::SpendingLimits::unlimited(),
+            "test agent",
+            None,
+            nonce,
+        );
+        let r = exec.execute_tx_with_identity(&tx, state, identity, qrc, agents);
+        assert!(r.success, "register_alice_agent failed: {:?}", r.error);
+    }
+
+    #[test]
+    fn authorize_agent_moves_pending_to_active() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Register agent.
+        let tx_reg = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "agent-a1", "qcb1agentA1",
+            vec![chain_forge_agents::AgentCapability::ReadState],
+            chain_forge_agents::SpendingLimits::unlimited(),
+            "agent for auth test",
+            None, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        // Now authorize it.
+        let tx_auth = Transaction {
+            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::AuthorizeAgent { agent_id: "agent-a1".into() },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "AuthorizeAgent must succeed: {:?}", r.error);
+        assert_eq!(agents.get("agent-a1").unwrap().status, chain_forge_agents::AgentStatus::Active);
+        assert!(r.events.iter().any(|e| e.contains("authorize_agent")));
+    }
+
+    #[test]
+    fn authorize_agent_rejects_wrong_sponsor() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx_reg = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "agent-a2", "qcb1agentA2",
+            vec![], chain_forge_agents::SpendingLimits::unlimited(),
+            "agent", None, 0,
+        );
+        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // bob tries to authorize alice's agent — must fail.
+        let tx_auth = Transaction {
+            id: "auth2".into(), sender: "qcb1bob".into(), nonce: 0,
+            body: TxBody::AuthorizeAgent { agent_id: "agent-a2".into() },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "wrong sponsor must be rejected");
+        assert!(r.error.as_deref().unwrap_or("").contains("not the registered sponsor"),
+            "error must mention sponsor mismatch: {:?}", r.error);
+        // Agent must still be Pending.
+        assert_eq!(agents.get("agent-a2").unwrap().status, chain_forge_agents::AgentStatus::Pending);
+    }
+
+    #[test]
+    fn suspend_agent_moves_active_to_suspended() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Register + authorize.
+        let tx_reg = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "agent-s1", "qcb1agentS1",
+            vec![], chain_forge_agents::SpendingLimits::unlimited(),
+            "agent", None, 0,
+        );
+        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
+        let tx_auth = Transaction {
+            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::AuthorizeAgent { agent_id: "agent-s1".into() },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert_eq!(agents.get("agent-s1").unwrap().status, chain_forge_agents::AgentStatus::Active);
+
+        // Suspend.
+        let tx_sus = Transaction {
+            id: "sus1".into(), sender: "qcb1alice".into(), nonce: 2,
+            body: TxBody::SuspendAgent {
+                agent_id: "agent-s1".into(),
+                reason: "compliance review".into(),
+            },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx_sus, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "SuspendAgent must succeed: {:?}", r.error);
+        assert_eq!(agents.get("agent-s1").unwrap().status, chain_forge_agents::AgentStatus::Suspended);
+        assert!(r.events.iter().any(|e| e.contains("suspend_agent")));
+    }
+
+    #[test]
+    fn revoke_agent_full_tombstones_aei_and_identity() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx_reg = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "agent-r1", "qcb1agentR1",
+            vec![], chain_forge_agents::SpendingLimits::unlimited(),
+            "agent", None, 0,
+        );
+        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(identity.get("qcb1alice").unwrap().has_sponsored("qcb1agentR1"),
+            "identity store must have the sponsorship before revoke");
+
+        let tx_rev = Transaction {
+            id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::RevokeAgentFull { agent_id: "agent-r1".into() },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx_rev, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "RevokeAgentFull must succeed: {:?}", r.error);
+
+        // AgentStore must show Revoked.
+        assert_eq!(agents.get("agent-r1").unwrap().status, chain_forge_agents::AgentStatus::Revoked,
+            "AEI record must be Revoked");
+
+        // IdentityStore sponsorship must be cleared.
+        assert!(!identity.get("qcb1alice").unwrap().has_sponsored("qcb1agentR1"),
+            "identity sponsorship must be removed after full revoke");
+
+        assert!(r.events.iter().any(|e| e.contains("revoke_agent_full")));
+    }
+
+    #[test]
+    fn record_agent_spend_enforces_epoch_limit() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Register with a tight epoch limit.
+        let tx_reg = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "agent-sp1", "qcb1agentSP1",
+            vec![chain_forge_agents::AgentCapability::Transfer],
+            chain_forge_agents::SpendingLimits::merchant(500), // epoch limit = 500 uQRC
+            "spending test agent",
+            None, 0,
+        );
+        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
+        // Authorize it.
+        let tx_auth = Transaction {
+            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::AuthorizeAgent { agent_id: "agent-sp1".into() },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // First spend within limit must succeed.
+        let tx_spend = Transaction {
+            id: "sp1".into(), sender: "qcb1alice".into(), nonce: 2,
+            body: TxBody::RecordAgentSpend { agent_id: "agent-sp1".into(), amount_uqrc: 300 },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx_spend, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "spend within limit must succeed: {:?}", r.error);
+        assert_eq!(agents.get("agent-sp1").unwrap().epoch_spend_uqrc, 300);
+
+        // Second spend that would exceed limit must fail.
+        let tx_spend2 = Transaction {
+            id: "sp2".into(), sender: "qcb1alice".into(), nonce: 3,
+            body: TxBody::RecordAgentSpend { agent_id: "agent-sp1".into(), amount_uqrc: 300 },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+        };
+        let r2 = exec.execute_tx_with_identity(&tx_spend2, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r2.success, "spend exceeding epoch limit must fail");
+        assert!(r2.error.as_deref().unwrap_or("").contains("RecordAgentSpend"),
+            "error must mention RecordAgentSpend: {:?}", r2.error);
+    }
+
+    #[test]
+    fn spawn_child_agent_requires_spawn_capability() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Register and authorize parent WITHOUT SpawnChildAgent capability.
+        let tx_reg = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "parent-no-cap", "qcb1parent1",
+            vec![chain_forge_agents::AgentCapability::Transfer], // no SpawnChildAgent
+            chain_forge_agents::SpendingLimits::unlimited(),
+            "parent without spawn cap", None, 0,
+        );
+        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
+        let tx_auth = Transaction {
+            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::AuthorizeAgent { agent_id: "parent-no-cap".into() },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Attempt to spawn — must fail.
+        let tx_spawn = Transaction {
+            id: "spawn1".into(), sender: "qcb1alice".into(), nonce: 2,
+            body: TxBody::SpawnChildAgent {
+                child_agent_id:      "child-1".into(),
+                child_agent_address: "qcb1child1".into(),
+                parent_agent_id:     "parent-no-cap".into(),
+                capabilities:        vec![],
+                spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
+                description:         "child".into(),
+            },
+            gas_limit: 300_000, signature: vec![], public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx_spawn, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "spawn without capability must fail");
+        assert!(r.error.as_deref().unwrap_or("").contains("SpawnChildAgent"),
+            "error must mention SpawnChildAgent: {:?}", r.error);
+    }
+
+    #[test]
+    fn spawn_child_agent_succeeds_with_spawn_capability() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Register and authorize parent WITH SpawnChildAgent capability.
+        let tx_reg = Transaction::register_agent(
+            "ra1", "qcb1alice",
+            "parent-cap", "qcb1parent2",
+            vec![
+                chain_forge_agents::AgentCapability::SpawnChildAgent,
+                chain_forge_agents::AgentCapability::Transfer,
+            ],
+            chain_forge_agents::SpendingLimits::unlimited(),
+            "parent with spawn cap", None, 0,
+        );
+        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
+        let tx_auth = Transaction {
+            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::AuthorizeAgent { agent_id: "parent-cap".into() },
+            gas_limit: 100_000, signature: vec![], public_key: vec![],
+        };
+        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Spawn child.
+        let tx_spawn = Transaction {
+            id: "spawn2".into(), sender: "qcb1alice".into(), nonce: 2,
+            body: TxBody::SpawnChildAgent {
+                child_agent_id:      "child-2".into(),
+                child_agent_address: "qcb1child2".into(),
+                parent_agent_id:     "parent-cap".into(),
+                capabilities:        vec![chain_forge_agents::AgentCapability::ReadState],
+                spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
+                description:         "child agent".into(),
+            },
+            gas_limit: 300_000, signature: vec![], public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx_spawn, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "SpawnChildAgent must succeed: {:?}", r.error);
+
+        // Child must be registered as Pending with correct parent link.
+        let child = agents.get("child-2").expect("child must be in AgentStore");
+        assert_eq!(child.status, chain_forge_agents::AgentStatus::Pending,
+            "spawned child must start as Pending");
+        assert_eq!(child.parent_agent_id.as_deref(), Some("parent-cap"),
+            "child must link back to parent");
+        assert_eq!(child.sponsor_id, "qcb1alice",
+            "child must share sponsor with parent");
+
+        // IdentityStore must record the child's sponsorship.
+        assert!(identity.get("qcb1alice").unwrap().has_sponsored("qcb1child2"),
+            "IdentityStore must record child sponsorship");
+
+        assert!(r.events.iter().any(|e| e.contains("spawn_child_agent")));
     }
 }
