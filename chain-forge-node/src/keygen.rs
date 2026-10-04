@@ -19,7 +19,7 @@
 /// "public_key" field so that peer validators can verify signatures without
 /// an out-of-band key exchange.
 
-use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
+use chain_forge_crypto::ClassicalScheme;
 use std::path::PathBuf;
 
 fn hex_encode(bytes: &[u8]) -> String {

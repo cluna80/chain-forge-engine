@@ -28,7 +28,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Sanity checks ────────────────────────────────────────────────────────────
+# --- Sanity checks -----------------------------------------------------------
 
 if (-not (Test-Path $Binary)) {
     Write-Error "Binary not found: $Binary`nRun: cargo build --release -p chain-forge-node"
@@ -38,7 +38,7 @@ if (-not (Test-Path $Genesis)) {
     Write-Error "Genesis file not found: $Genesis`nRun from the repo root."
 }
 
-# ── Node definitions ─────────────────────────────────────────────────────────
+# --- Node definitions --------------------------------------------------------
 
 $nodes = @(
     @{ Name = "alice"; Validator = "qcb1alice"; ApiPort = 8080; DataDir = "$DataRoot\qcb-alice" },
@@ -46,17 +46,19 @@ $nodes = @(
     @{ Name = "carol"; Validator = "qcb1carol"; ApiPort = 8082; DataDir = "$DataRoot\qcb-carol" }
 )
 
-# ── Key generation ────────────────────────────────────────────────────────────
+# --- Key generation ----------------------------------------------------------
 
 if (-not $NoKeys) {
     if (-not (Test-Path $Keygen)) {
-        Write-Warning "Keygen binary not found: $Keygen — running unsigned (no --key-file)"
+        Write-Warning "Keygen binary not found: $Keygen -- running unsigned (no --key-file)"
         $NoKeys = $true
     } else {
         $anyMissing = $false
         foreach ($n in $nodes) {
             $keyPath = "$KeysDir\$($n.Validator).key.json"
-            if (-not (Test-Path $keyPath)) { $anyMissing = $true }
+            if (-not (Test-Path $keyPath)) {
+                $anyMissing = $true
+            }
         }
 
         if ($anyMissing) {
@@ -70,7 +72,7 @@ if (-not $NoKeys) {
                         Write-Error "Key generation failed for $($n.Validator)"
                     }
                 } else {
-                    Write-Host "  Key already exists for $($n.Validator) — skipping"
+                    Write-Host "  Key already exists for $($n.Validator) -- skipping"
                 }
             }
             Write-Host ""
@@ -84,7 +86,7 @@ if (-not $NoKeys) {
     }
 }
 
-# ── Clear data dirs unless resuming ──────────────────────────────────────────
+# --- Clear data dirs unless resuming -----------------------------------------
 
 if (-not $Resume) {
     Write-Host "Clearing data directories..." -ForegroundColor Yellow
@@ -96,7 +98,7 @@ if (-not $Resume) {
     }
 }
 
-# ── Build the command string for each node ───────────────────────────────────
+# --- Build the command string for each node ----------------------------------
 
 function Get-NodeCmd($node) {
     $bin     = (Resolve-Path $Binary).Path
@@ -117,7 +119,7 @@ function Get-NodeCmd($node) {
     )
 }
 
-# ── Launch each node ─────────────────────────────────────────────────────────
+# --- Launch each node --------------------------------------------------------
 
 $wtAvailable = $null -ne (Get-Command wt.exe -ErrorAction SilentlyContinue)
 $signed      = if ($NoKeys) { "UNSIGNED (devnet)" } else { "SIGNED (ed25519)" }
