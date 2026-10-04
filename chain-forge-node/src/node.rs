@@ -19,6 +19,7 @@ use chain_forge_slashing::{SlashingModule, EquivocationEvidence};
 use chain_forge_validators::ValidatorRegistry;
 use chain_forge_identity::IdentityStore;
 use chain_forge_qrc::QrcEngine;
+use chain_forge_agents::AgentStore;
 use chain_forge_p2p::{
     MockNetworkService, NetworkConfig, NetworkEvent, NetworkService,
     GossipTopic, OutboundMessage, PeerInfo,
@@ -245,6 +246,10 @@ pub struct Node {
     /// and RedirectToUbiPool. Threaded through execute_block_with_identity()
     /// alongside identity, for the same reason.
     qrc: QrcEngine,
+    /// AEI agent registry -- tracks registered agents, their capabilities,
+    /// spending limits, and lifecycle status. Threaded through
+    /// execute_block_with_identity() so agent state persists across blocks.
+    agents: AgentStore,
     /// Slashing enforcement module (equivocation + liveness).
     /// Detects double-sign evidence and computes stake burns routed to BME.
     slasher: SlashingModule,
@@ -280,10 +285,18 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RedirectToUbiPool { .. }   => "ubi_redirect",
         TxBody::SponsorAgent { .. }        => "sponsor_agent",
         TxBody::RevokeAgent { .. }         => "revoke_agent",
-        TxBody::RevokeAttestation { .. }   => "revoke_attestation",
-        TxBody::ConfirmSybil { .. }        => "confirm_sybil",
-        TxBody::ReverseSybil { .. }        => "reverse_sybil",
-        TxBody::ReportSuspectedSybil { .. }=> "report_suspected_sybil",
+        TxBody::RevokeAttestation { .. }        => "revoke_attestation",
+        TxBody::ConfirmSybil { .. }             => "confirm_sybil",
+        TxBody::ReverseSybil { .. }             => "reverse_sybil",
+        TxBody::ReportSuspectedSybil { .. }     => "report_suspected_sybil",
+        // QRC Economic Model v0.1
+        TxBody::QrcPurchase { .. }              => "qrc_purchase",
+        TxBody::QrcSpend { .. }                 => "qrc_spend",
+        TxBody::QrcContributionSettle { .. }    => "qrc_contribution_settle",
+        // Phase 1: IntrinsicCharm & AEI agent registration
+        TxBody::CharmConfinementUpdate { .. }   => "charm_confinement_update",
+        TxBody::IntrinsicCharmRecord { .. }     => "intrinsic_charm_record",
+        TxBody::RegisterAgent { .. }            => "register_agent",
     }
 }
 
@@ -711,6 +724,7 @@ impl Node {
             chain_store: std::collections::BTreeMap::new(),
             identity,
             qrc,
+            agents: AgentStore::new(),
             slasher,
             validator_registry,
             tx_queue,
@@ -1683,35 +1697,64 @@ impl Node {
 
         // Route burn_amount through BME: debit from the validator's account.
         // This permanently removes the tokens from supply (Section 6.3).
-        if burn_amount > 0 {
-            if let Err(e) = self.state.burn(
-                &evidence.validator_id,
-                "uqcb",
-                burn_amount,
-            ) {
-                // Log the burn failure but don't undo the tombstone --
-                // the validator is already removed from the active set.
+        //
+        // Cap the burn at the validator's actual liquid balance so devnet
+        // genesis validators (whose bonded_uqcb in the registry is the
+        // ENTRY_STAKE minimum, much larger than their token balance) don't
+        // silently fail the burn due to InsufficientBalance. In production,
+        // validators must bond tokens ≥ their registered stake, so this cap
+        // should rarely trigger. The validator is tombstoned regardless; only
+        // the burned amount differs.
+        let actual_burn = if burn_amount > 0 {
+            let available = self.state.get_account(&evidence.validator_id)
+                .map(|a| a.balance_of("uqcb"))
+                .unwrap_or(0);
+            let capped = burn_amount.min(available);
+            if capped < burn_amount {
                 warn!(
                     validator = %evidence.validator_id,
-                    burn_uqcb = burn_amount,
-                    error     = %e,
-                    "BME burn failed; tombstone applied but tokens not burned"
-                );
-            } else {
-                // Update the live QRC metrics counter for /api/qrc
-                let mut cm = self.qrc_metrics.lock().unwrap();
-                cm.total_qcb_burned_uqcb =
-                    cm.total_qcb_burned_uqcb.saturating_add(burn_amount);
-                info!(
-                    validator = %evidence.validator_id,
-                    burn_uqcb = burn_amount,
-                    total_burned = cm.total_qcb_burned_uqcb,
-                    "equivocation slash burned via BME"
+                    requested_burn = burn_amount,
+                    available,
+                    capped,
+                    "slash burn capped at available balance (bonded_uqcb > liquid balance)"
                 );
             }
-        }
+            if capped > 0 {
+                if let Err(e) = self.state.burn(
+                    &evidence.validator_id,
+                    "uqcb",
+                    capped,
+                ) {
+                    // Log the burn failure but don't undo the tombstone --
+                    // the validator is already removed from the active set.
+                    warn!(
+                        validator = %evidence.validator_id,
+                        burn_uqcb = capped,
+                        error     = %e,
+                        "BME burn failed; tombstone applied but tokens not burned"
+                    );
+                    0
+                } else {
+                    // Update the live QRC metrics counter for /api/qrc
+                    let mut cm = self.qrc_metrics.lock().unwrap();
+                    cm.total_qcb_burned_uqcb =
+                        cm.total_qcb_burned_uqcb.saturating_add(capped);
+                    info!(
+                        validator = %evidence.validator_id,
+                        burn_uqcb = capped,
+                        total_burned = cm.total_qcb_burned_uqcb,
+                        "equivocation slash burned via BME"
+                    );
+                    capped
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
-        Ok(burn_amount)
+        Ok(actual_burn)
     }
 
     /// Drain equivocations detected by the consensus engine and route each
@@ -1917,7 +1960,7 @@ impl Node {
         }
 
         let exec_result = self.executor.execute_block_with_identity(
-            cert.height, txs, &mut self.state, &mut self.identity, &mut self.qrc, now_ms,
+            cert.height, txs, &mut self.state, &mut self.identity, &mut self.qrc, &mut self.agents, now_ms,
         );
 
         info!(
@@ -2206,7 +2249,7 @@ impl Node {
         }
 
         let exec_result = self.executor.execute_block_with_identity(
-            height, txs, &mut self.state, &mut self.identity, &mut self.qrc, now_ms,
+            height, txs, &mut self.state, &mut self.identity, &mut self.qrc, &mut self.agents, now_ms,
         );
 
         info!(
@@ -2969,5 +3012,157 @@ mod tests {
         );
         assert_eq!(node.consensus.current_height(), 2,
             "chain must have advanced to height 2 after the post-lapse block");
+    }
+
+    // -- Equivocation → Slashing wire-up tests ---------------------------------
+
+    /// Double-vote (equivocation) detected via drain_equivocations() must be
+    /// routed through process_equivocation_evidence() → SlashingModule, which
+    /// tombstones the validator and burns 5% of their bonded stake.
+    ///
+    /// This test verifies the full pipeline:
+    ///   receive_vote() → drain_equivocations() → handle_drained_equivocations()
+    ///   → process_equivocation_evidence() → slasher.slash_equivocation()
+    ///
+    /// Note: `propose_block()` is the fastest way to exercise this in a unit
+    /// test because it calls the consensus engine in solo-devnet mode, where
+    /// Alice sends votes for all four validators internally. We inject a
+    /// manually-constructed EquivocationDetected directly into the consensus
+    /// engine's pending queue and then call handle_drained_equivocations() to
+    /// verify the slashing side effects (tombstone + stake burn + QRC metrics).
+    #[tokio::test]
+    async fn double_vote_triggers_slashing_and_tombstone() {
+        use chain_forge_consensus::tendermint::EquivocationDetected;
+        use chain_forge_consensus::{BlockHash, ValidatorId};
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        // Snapshot Alice's balance before slashing (5_000_000 uqcb from genesis).
+        let alice_balance_before = node.state.get_account("qcb1alice")
+            .expect("Alice must be in state")
+            .balance_of("uqcb");
+        assert_eq!(alice_balance_before, 5_000_000,
+            "Alice should start with 5_000_000 uqcb from genesis");
+
+        // Confirm Alice is active and NOT tombstoned before we start.
+        assert!(
+            node.validator_registry.get("qcb1alice")
+                .map(|r| r.status != chain_forge_validators::ValidatorStatus::Tombstoned)
+                .unwrap_or(false),
+            "Alice must NOT be tombstoned before equivocation"
+        );
+
+        // Construct a synthetic EquivocationDetected for Alice at height 0, round 0.
+        // The two conflicting block hashes represent a double-prevote.
+        //
+        // NOTE: signatures are empty here on purpose. Genesis validators are
+        // registered with an empty consensus_pubkey ("genesis-stub" scheme), so
+        // decode_hex("") in slash_equivocation would fail. Passing empty sigs
+        // triggers the "skipped when both sigs are empty" branch and lets the
+        // tombstone + burn logic run without real key material.
+        let eq_evidence = EquivocationDetected {
+            validator_id:   ValidatorId("qcb1alice".into()),
+            height:         0,
+            round:          0,
+            vote_type_byte: 1, // PREVOTE
+            block_hash_a:   BlockHash("hash_A_00000000".into()),
+            block_hash_b:   BlockHash("hash_B_11111111".into()),
+            signature_a:    vec![],
+            signature_b:    vec![],
+        };
+
+        // Drive the slashing pipeline directly: this is the same code path that
+        // handle_event() → receive_vote() → drain_equivocations() invokes.
+        let epoch = node.consensus.current_height();
+        node.handle_drained_equivocations(vec![eq_evidence], epoch);
+
+        // ── Assert tombstone ─────────────────────────────────────────────────
+        assert!(
+            node.validator_registry.get("qcb1alice")
+                .map(|r| r.status == chain_forge_validators::ValidatorStatus::Tombstoned)
+                .unwrap_or(false),
+            "Alice must be tombstoned after equivocation"
+        );
+
+        // ── Assert stake was burned ──────────────────────────────────────────────
+        // SlashingModule uses 500 bps (5%) of bonded stake. Genesis validators
+        // are registered with bonded_uqcb = ENTRY_STAKE_UQCB (1_000_000_000),
+        // so slash_amount = 50_000_000. But Alice's liquid balance is only
+        // 5_000_000 uqcb, so process_equivocation_evidence caps the burn at
+        // the available balance (5_000_000). The balance should drop to 0.
+        let alice_balance_after = node.state.get_account("qcb1alice")
+            .expect("Alice must still be in state after slashing")
+            .balance_of("uqcb");
+        assert!(
+            alice_balance_after < alice_balance_before,
+            "Alice's balance must decrease after equivocation slash (before={alice_balance_before}, after={alice_balance_after})"
+        );
+
+        // ── Assert QRC burn metrics were updated ─────────────────────────────
+        let burned_in_metrics = node.qrc_metrics.lock().unwrap().total_qcb_burned_uqcb;
+        let actual_burn = alice_balance_before - alice_balance_after;
+        assert_eq!(
+            burned_in_metrics, actual_burn,
+            "QRC metrics must reflect the exact slashed amount"
+        );
+    }
+
+    /// Equivocation slashing is idempotent: slashing Alice twice at the same
+    /// (height, round) must not double-tombstone or double-burn her stake.
+    #[tokio::test]
+    async fn double_slash_same_equivocation_is_idempotent() {
+        use chain_forge_consensus::tendermint::EquivocationDetected;
+        use chain_forge_consensus::{BlockHash, ValidatorId};
+        use chain_forge_slashing::EquivocationEvidence;
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        // NOTE: empty sigs — genesis validators have empty consensus_pubkey
+        // ("genesis-stub" scheme), so decode_hex("") would fail signature
+        // verification. Empty sigs trigger the skip-verify branch in
+        // slash_equivocation, letting the tombstone + burn logic run.
+        let evidence = EquivocationEvidence {
+            validator_id:   "qcb1alice".to_string(),
+            height:         0,
+            round:          0,
+            vote_type_byte: 1,
+            block_hash_a:   "hash_A".to_string(),
+            block_hash_b:   "hash_B".to_string(),
+            signature_a:    vec![],
+            signature_b:    vec![],
+        };
+
+        let epoch = node.consensus.current_height();
+
+        // First slash: should succeed and burn stake.
+        let first_result = node.process_equivocation_evidence(&evidence, epoch);
+        assert!(first_result.is_ok(), "first slash must succeed");
+        let first_burn = first_result.unwrap();
+        assert!(first_burn > 0, "first slash must burn some stake");
+
+        let balance_after_first = node.state.get_account("qcb1alice")
+            .unwrap().balance_of("uqcb");
+
+        // Second slash at same (height, round): idempotent — slasher rejects it.
+        let second_result = node.process_equivocation_evidence(&evidence, epoch);
+        // The slasher returns an error for a duplicate; process_equivocation_evidence
+        // propagates it as Err.
+        assert!(
+            second_result.is_err(),
+            "second slash at same (height, round) must be rejected by the slasher"
+        );
+
+        // Balance must be unchanged after the rejected second slash.
+        let balance_after_second = node.state.get_account("qcb1alice")
+            .unwrap().balance_of("uqcb");
+        assert_eq!(
+            balance_after_first, balance_after_second,
+            "no tokens burned on duplicate slash"
+        );
+
+        // QRC metrics reflect only the first burn.
+        let total_burned = node.qrc_metrics.lock().unwrap().total_qcb_burned_uqcb;
+        assert_eq!(total_burned, first_burn,
+            "QRC metrics must only count the first (accepted) slash");
     }
 }

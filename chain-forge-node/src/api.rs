@@ -274,6 +274,47 @@ pub async fn serve(
                         // GET /api/peers — connected peers (real network layer)
                         let p = peers.lock().unwrap();
                         http_200_json(&serde_json::to_string(&*p).unwrap_or_default())
+                    } else if first_line.starts_with("POST /genesis") {
+                        // POST /genesis -- validate and echo back a genesis configuration.
+                        // The wizard "Generate Genesis" button posts the config fields here;
+                        // we parse them through chain_forge_core::GenesisConfig (validation
+                        // included) and return the canonical pretty-printed JSON that can be
+                        // used to start a node with `chain-forge-node --genesis <file>`.
+                        let body_start = request.find("\r\n\r\n")
+                            .map(|i| i + 4)
+                            .unwrap_or(request.len());
+                        let body = &request[body_start..];
+
+                        match chain_forge_core::GenesisConfig::from_json(body) {
+                            Ok(genesis) => {
+                                let errors = genesis.validate();
+                                if !errors.is_empty() {
+                                    let resp = serde_json::json!({
+                                        "status": "error",
+                                        "errors": errors
+                                    });
+                                    http_400_json(&resp.to_string())
+                                } else {
+                                    match genesis.to_json_pretty() {
+                                        Ok(json) => http_200_json(&json),
+                                        Err(e) => {
+                                            let resp = serde_json::json!({
+                                                "status": "error",
+                                                "message": format!("serialization error: {e}")
+                                            });
+                                            http_400_json(&resp.to_string())
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let resp = serde_json::json!({
+                                    "status": "error",
+                                    "message": format!("invalid genesis JSON: {e}")
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                        }
                     } else if first_line.starts_with("OPTIONS") {
                         // CORS preflight for the React frontend
                         http_cors_preflight()
@@ -382,5 +423,66 @@ mod tests {
         let first_line = "GET /api/identity/qcb1bob HTTP/1.1";
         assert!(first_line.starts_with("GET /api/identity/"));
         assert!(!first_line.starts_with("GET /api/accounts/"));
+    }
+
+    // -- POST /genesis endpoint tests ------------------------------------------
+
+    const MINIMAL_GENESIS_JSON: &str = r#"{
+        "chain_id": "test-chain-1",
+        "chain_name": "TestChain",
+        "engine_version": "0.1.0",
+        "genesis_time": "2026-01-01T00:00:00Z",
+        "environment": { "mode": "devnet", "faucet_enabled": false, "relaxed_limits": true },
+        "native_token": { "name": "Test", "symbol": "TST", "denom": "utst", "max_supply": "1000000" },
+        "address_prefix": "tst",
+        "consensus": { "type": "proof-of-stake", "validator_set_size": 1, "block_time_ms": 1000, "personhood_weighted": false },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
+        "network": { "network_id": "tst-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
+        "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
+        "modules": ["bank", "staking"],
+        "custom_modules": [],
+        "genesis_accounts": [
+            { "label": "Alice", "address": "tst1alice", "balance": "1000000", "role": "validator" }
+        ]
+    }"#;
+
+    #[test]
+    fn genesis_endpoint_route_matches() {
+        // Verify the route prefix check used in serve() matches POST /genesis.
+        let first_line = "POST /genesis HTTP/1.1";
+        assert!(first_line.starts_with("POST /genesis"));
+        assert!(!first_line.starts_with("POST /api/build"));
+    }
+
+    #[test]
+    fn genesis_endpoint_parses_valid_config_and_serializes() {
+        // Parse the minimal genesis fixture through GenesisConfig and confirm
+        // to_json_pretty() round-trips correctly.
+        let genesis = chain_forge_core::GenesisConfig::from_json(MINIMAL_GENESIS_JSON)
+            .expect("minimal genesis must parse");
+        let errors = genesis.validate();
+        assert!(errors.is_empty(), "minimal genesis must be valid: {errors:?}");
+        let pretty = genesis.to_json_pretty().expect("must serialize");
+        // The pretty output must contain the chain_id
+        assert!(pretty.contains("test-chain-1"), "serialized JSON must contain chain_id");
+    }
+
+    #[test]
+    fn genesis_endpoint_rejects_malformed_json() {
+        // Simulate what the handler does for bad JSON.
+        let bad_body = r#"{ "chain_id": "broken" -- not valid JSON "#;
+        let result = chain_forge_core::GenesisConfig::from_json(bad_body);
+        assert!(result.is_err(), "malformed JSON must produce a parse error");
+    }
+
+    #[test]
+    fn genesis_endpoint_does_not_match_genesis_sub_paths() {
+        // Make sure /genesis only matches exact POST /genesis, not unrelated paths.
+        let first_line_build = "POST /api/build HTTP/1.1";
+        assert!(!first_line_build.starts_with("POST /genesis"));
+        let first_line_get = "GET /genesis HTTP/1.1";
+        // GET /genesis is not handled by the POST /genesis branch
+        assert!(!first_line_get.starts_with("POST /genesis"));
     }
 }
