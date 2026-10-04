@@ -32,6 +32,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use chain_forge_core::{ChainHash, HashWidth};
 
 // ── Serde helper for [u8; 64] ─────────────────────────────────────────────────
 // serde's built-in derive only covers arrays up to [T; 32]. This module
@@ -847,18 +848,59 @@ fn aggregate_resource(
     (capacity, n, true, false)
 }
 
-/// Compute a placeholder evidence root (XOR-fold of provider IDs, sorted).
-/// A production implementation uses the chain's Merkle tree.
+/// Compute the SHA3-256 binary Merkle root over sorted provider evidence.
+///
+/// Each leaf is `SHA3-256("LEAF|" || provider_id || epoch_le8)`.
+/// Internal nodes are `SHA3-256("NODE|" || left_child || right_child)`.
+/// An odd number of leaves promotes the last leaf (no duplication).
+/// Returns the 32-byte root, or all-zero bytes if there are no items.
 fn compute_evidence_root(items: &[CapacityEvidence]) -> [u8; 32] {
-    let mut ids: Vec<[u8; 32]> = items.iter().map(|e| e.provider_id).collect();
-    ids.sort_unstable();
-    let mut root = [0u8; 32];
-    for id in ids {
-        for (r, b) in root.iter_mut().zip(id.iter()) {
-            *r ^= b;
-        }
+    if items.is_empty() {
+        return [0u8; 32];
     }
-    root
+
+    // Build sorted leaves: SHA3-256("LEAF|" || provider_id || epoch_le)
+    let mut sorted: Vec<CapacityEvidence> = items.to_vec();
+    sorted.sort_unstable_by_key(|e| e.provider_id);
+
+    let mut layer: Vec<[u8; 32]> = sorted
+        .iter()
+        .map(|e| {
+            let mut preimage = Vec::with_capacity(4 + 32 + 8);
+            preimage.extend_from_slice(b"LEAF|");
+            preimage.extend_from_slice(&e.provider_id);
+            preimage.extend_from_slice(&e.epoch.to_le_bytes());
+            let h = ChainHash::digest(&preimage, HashWidth::Bits256);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(h.as_bytes());
+            out
+        })
+        .collect();
+
+    // Merge pairs upward until one root remains.
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        let mut i = 0;
+        while i < layer.len() {
+            if i + 1 < layer.len() {
+                let mut preimage = Vec::with_capacity(5 + 64);
+                preimage.extend_from_slice(b"NODE|");
+                preimage.extend_from_slice(&layer[i]);
+                preimage.extend_from_slice(&layer[i + 1]);
+                let h = ChainHash::digest(&preimage, HashWidth::Bits256);
+                let mut out = [0u8; 32];
+                out.copy_from_slice(h.as_bytes());
+                next.push(out);
+            } else {
+                // Odd leaf — promote without hashing (standard Merkle practice).
+                next.push(layer[i]);
+            }
+            i += 2;
+        }
+        layer = next;
+    }
+
+    layer[0]
 }
 
 // ── Challenge nonce derivation (§3.3) ────────────────────────────────────────
@@ -867,24 +909,18 @@ fn compute_evidence_root(items: &[CapacityEvidence]) -> [u8; 32] {
 ///
 /// `prev_block_hash` — hash of the last finalized block in epoch `e-1`.
 ///
-/// Uses a simple SHA-256-like XOR fold (placeholder; production uses the
-/// chain's hash function).
+/// Computed as SHA3-256(DOMAIN_SEP_CAPACITY || epoch_le8 || prev_block_hash).
+/// Domain-separated so the output cannot be confused with block hashes,
+/// transaction IDs, or any other hash in the system.
 pub fn derive_challenge_nonce(epoch: u64, prev_block_hash: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    // Mix epoch bytes
-    let epoch_bytes = epoch.to_le_bytes();
-    for (i, b) in epoch_bytes.iter().enumerate() {
-        buf[i] ^= b;
-    }
-    // Mix previous block hash
-    for (i, b) in prev_block_hash.iter().enumerate() {
-        buf[i % 32] ^= b;
-    }
-    // Mix domain separator
-    for (i, b) in DOMAIN_SEP_CAPACITY.iter().enumerate() {
-        buf[i % 32] ^= b;
-    }
-    buf
+    let mut preimage = Vec::with_capacity(DOMAIN_SEP_CAPACITY.len() + 8 + 32);
+    preimage.extend_from_slice(DOMAIN_SEP_CAPACITY);
+    preimage.extend_from_slice(&epoch.to_le_bytes());
+    preimage.extend_from_slice(prev_block_hash);
+    let h = ChainHash::digest(&preimage, HashWidth::Bits256);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.as_bytes());
+    out
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────

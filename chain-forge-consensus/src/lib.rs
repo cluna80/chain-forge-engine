@@ -15,6 +15,8 @@
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
+use chain_forge_core::{ChainHash, HashWidth};
+
 #[cfg(feature = "real-crypto")]
 use chain_forge_crypto::{ClassicalScheme, KeyPair, Signature, SchemeId, SignatureScheme};
 
@@ -169,6 +171,30 @@ pub struct Vote {
 // ── Commit certificate ────────────────────────────────────────────────────────
 
 // ── Signing bytes ──────────────────────────────────────────────────────────────────────
+
+/// Derive the canonical block hash from its contents: SHA3-256 over
+/// the domain tag, height, round, parent hash bytes, and tx payload.
+/// Using `chain-forge-core::ChainHash` (SHA3-256) — same hash function
+/// used everywhere else on the chain.
+pub fn compute_block_hash(
+    chain_id: &str,
+    height: BlockHeight,
+    round: Round,
+    parent_hash: &BlockHash,
+    tx_data: &[u8],
+) -> BlockHash {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"CFBH|"); // block-hash domain tag
+    preimage.extend_from_slice(chain_id.as_bytes());
+    preimage.push(b'|');
+    preimage.extend_from_slice(&height.to_le_bytes());
+    preimage.extend_from_slice(&round.to_le_bytes());
+    preimage.push(b'|');
+    preimage.extend_from_slice(parent_hash.0.as_bytes());
+    preimage.push(b'|');
+    preimage.extend_from_slice(tx_data);
+    BlockHash(ChainHash::digest(&preimage, HashWidth::Bits256).to_hex())
+}
 
 /// Bytes a proposer signs for `BlockProposal::signature`.
 /// Domain-separated with chain_id to prevent cross-chain replay.
@@ -852,11 +878,7 @@ impl ConsensusEngine for FbaEngine {
         tx_data:     Vec<u8>,
     ) -> ConsensusResult<BlockProposal> {
         // In FBA every validator proposes independently.
-        // Phase 0: the local node produces one canonical proposal.
-        let block_hash = BlockHash(format!(
-            "fba_h{height}_r{round}_{:08x}",
-            tx_data.len() as u32
-        ));
+        let block_hash = compute_block_hash(&self.config.chain_id, height, round, &parent_hash, &tx_data);
         let proposal = BlockProposal {
             height,
             round,
@@ -1518,13 +1540,7 @@ impl ConsensusEngine for TendermintEngine {
             .proposer_for(height, round)
             .ok_or_else(|| ConsensusError::Internal("empty validator set".into()))?;
 
-        // TODO: derive block_hash from tx_data + parent_hash + timestamp via
-        // the SHA3 hashing in chain-forge-core once that crate is wired up.
-        // For now, use a placeholder that encodes the inputs so tests can
-        // distinguish blocks.
-        let block_hash = BlockHash(format!(
-            "block_h{height}_r{round}_{}", &parent_hash.0[..4.min(parent_hash.0.len())]
-        ));
+        let block_hash = compute_block_hash(&self.chain_id, height, round, &parent_hash, &tx_data);
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

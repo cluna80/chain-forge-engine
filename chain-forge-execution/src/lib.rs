@@ -2139,8 +2139,6 @@ impl Executor {
             );
         }
 
-        // TODO: verify signature once crypto layer is wired up.
-
         // Execute the operation
         let mut events = Vec::new();
         let result = match &tx.body {

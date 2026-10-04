@@ -18,9 +18,9 @@ chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network
 chain-forge-qrc     = { path = "../chain-forge-qrc" }
 chain-forge-identity  = { path = "../chain-forge-identity" }
 chain-forge-agents    = { path = "../chain-forge-agents" }
-chain-forge-slashing  = { path = "../chain-forge-slashing" }
+chain-forge-slashing  = { path = "../chain-forge-slashing", features = ["real-crypto"] }
 chain-forge-validators = { path = "../chain-forge-validators" }
-chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto"] }
+chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto", "real-pqc"] }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 thiserror             = { workspace = true }
@@ -43,7 +43,7 @@ tokio             = { workspace = true }
 serde_json        = { workspace = true }
 chain-forge-consensus = { path = "../chain-forge-consensus", features = ["real-crypto"] }
 chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network"] }
-chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto"] }
+chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto", "real-pqc"] }
 chain-forge-vca-pq    = { path = "../chain-forge-vca-pq" }
 
 [[test]]
