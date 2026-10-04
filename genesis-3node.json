@@ -12,7 +12,7 @@
     "name": "QuarkCharm",
     "symbol": "QCB",
     "denom": "uqcb",
-    "max_supply": "210000000"
+    "max_supply": "21000000000000"
   },
   "address_prefix": "qcb",
   "consensus": {
@@ -59,19 +59,19 @@
     {
       "label": "Alice",
       "address": "qcb1alice",
-      "balance": "5000000",
+      "balance": "100000000",
       "role": "validator"
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
-      "balance": "5000000",
+      "balance": "100000000",
       "role": "validator"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
-      "balance": "5000000",
+      "balance": "100000000",
       "role": "validator"
     }
   ],
