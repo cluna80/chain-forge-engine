@@ -112,7 +112,7 @@ pub type SharedExplorer = Arc<Mutex<ExplorerState>>;
 ///   - Purchase path: QCB burned → QRC credits at algorithmic rate Rt
 ///   - Contribution path: verified resource providers earn QRC directly
 ///   - Consumption split: ~60% provider / ~25% permanent burn / ~15% protocol reserve
-/// Updated on every epoch boundary. Read by /api/qrc.
+/// Updated on every block commit. Read by /api/qrc.
 #[derive(Debug, Default, serde::Serialize, Clone)]
 pub struct QrcMetrics {
     /// Total QRC currently in circulation (uqrc).
@@ -131,6 +131,19 @@ pub struct QrcMetrics {
     pub protocol_reserve_uqrc:        u128,
     /// Epoch of most recent metrics update.
     pub last_updated_epoch:           u64,
+
+    // ── Control 5: CoverageRatio circuit breaker (Section 5.5) ───────────────
+    /// Current circuit-breaker minting state: "normal", "restricted", or "halted".
+    /// - normal:     CR ≥ 1.00 — both purchase and contribution paths open
+    /// - restricted: 0.75 ≤ CR < 1.00 — purchase suspended; contribution open
+    /// - halted:     CR < 0.75 — both minting paths suspended
+    pub minting_state:                String,
+    /// Verified network resource capacity last reported via RecordCapacity tx
+    /// (normalised units × D). Zero means no capacity report received yet.
+    pub tracked_capacity_fp:          u128,
+    /// Current coverage ratio (tracked_capacity / total_supply), fixed-point × D.
+    /// None (serialised as null) when total_supply == 0.
+    pub coverage_ratio_fp:            Option<u128>,
 }
 
 pub type SharedQrcMetrics = Arc<Mutex<QrcMetrics>>;
@@ -310,6 +323,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RevokeAgentFull { .. }          => "revoke_agent_full",
         TxBody::RecordAgentSpend { .. }         => "record_agent_spend",
         TxBody::SpawnChildAgent { .. }          => "spawn_child_agent",
+        // Control 5: network capacity reporting
+        TxBody::RecordCapacity { .. }           => "record_capacity",
     }
 }
 
@@ -2521,7 +2536,7 @@ impl Node {
             }).collect();
         }
 
-        // Update QRC resource economy metrics snapshot (Section 9.1 / 5.4)
+        // Update QRC resource economy metrics snapshot (Section 9.1 / 5.4 / 5.5)
         // Mirror live QrcEngine state directly into the shared metrics struct
         // so the /api/qrc endpoint always reflects the committed engine state.
         {
@@ -2534,6 +2549,10 @@ impl Node {
             cm.total_qcb_burned_uqcb            = self.qrc.total_qcb_burned;
             cm.conversion_rate_rt               = self.qrc.conversion_rate.rt;
             cm.protocol_reserve_uqrc            = self.qrc.protocol_reserve;
+            // Control 5: circuit-breaker state and coverage ratio
+            cm.minting_state                    = self.qrc.minting_state.as_str().to_string();
+            cm.tracked_capacity_fp              = self.qrc.tracked_capacity;
+            cm.coverage_ratio_fp                = self.qrc.coverage_ratio();
         }
 
         Ok(cert)
