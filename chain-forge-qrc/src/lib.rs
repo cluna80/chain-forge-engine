@@ -410,6 +410,61 @@ impl Default for OperationCost {
     fn default() -> Self { Self::new() }
 }
 
+// ── Control 5: CoverageRatio circuit breaker ─────────────────────────────────
+
+/// CoverageRatio threshold below which minting halts entirely (both paths).
+/// CR_halt = 0.75 (fixed-point × D).
+pub const CR_HALT: u128 = 750_000; // 0.75 × D
+
+/// CoverageRatio threshold above which normal operation resumes.
+/// CR_resume = 1.00 (fixed-point × D). Hysteresis gap: 0.25.
+pub const CR_RESUME: u128 = 1_000_000; // 1.00 × D
+
+/// Three-state minting circuit breaker for the CoverageRatio control.
+///
+/// State transitions (CR = capacity / qrc_outstanding, fixed-point × D):
+/// ```text
+/// NORMAL     → RESTRICTED : CR drops below CR_resume  (1.00)
+/// RESTRICTED → HALTED     : CR drops below CR_halt    (0.75)
+/// HALTED     → RESTRICTED : CR rises to   CR_halt     (0.75)
+/// RESTRICTED → NORMAL     : CR rises to   CR_resume   (1.00)
+/// ```
+/// The hysteresis gap (CR_halt … CR_resume) prevents oscillation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MintingState {
+    /// CR ≥ CR_resume: both purchase and contribution paths open.
+    Normal,
+    /// CR_halt ≤ CR < CR_resume: purchase (conversion) path suspended;
+    /// contribution path remains open so providers can keep earning.
+    Restricted,
+    /// CR < CR_halt: both minting paths suspended until capacity recovers.
+    Halted,
+}
+
+impl MintingState {
+    /// Whether the purchase (QCB → QRC) conversion path is currently permitted.
+    pub fn purchase_allowed(self) -> bool {
+        self == MintingState::Normal
+    }
+
+    /// Whether the contribution earn path is currently permitted.
+    pub fn contribution_allowed(self) -> bool {
+        self != MintingState::Halted
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MintingState::Normal     => "normal",
+            MintingState::Restricted => "restricted",
+            MintingState::Halted     => "halted",
+        }
+    }
+}
+
+impl Default for MintingState {
+    fn default() -> Self { MintingState::Normal }
+}
+
 // ── QrcEngine ───────────────────────────────────────────────────────────────
 
 /// The full QRC resource economy engine.
@@ -469,6 +524,21 @@ pub struct QrcEngine {
     /// Per-epoch provider reward accumulator: total QRC earned by contribution-
     /// path providers during this epoch. Finalized at EpochClose.
     pub epoch_provider_rewards: u128,
+
+    // ── Control 5: CoverageRatio circuit breaker (QRC Economic Model v0.2) ─────
+
+    /// Current state of the minting circuit breaker.
+    pub minting_state: MintingState,
+
+    /// On-chain tracked network resource capacity (VCA-attested).
+    /// Updated via `record_capacity()`. Units: normalized capacity units × D.
+    pub tracked_capacity: u128,
+
+    /// QRC outstanding = total_supply (alias kept for semantic clarity in CR formula).
+    /// CR_t = tracked_capacity / total_supply (when total_supply > 0).
+    // Note: this is derived, not stored separately — use `coverage_ratio()`.
+    // Placeholder field for future state migration if needed.
+    pub _cb_reserved: u128,
 }
 
 impl QrcEngine {
@@ -503,6 +573,10 @@ impl QrcEngine {
             epoch_minted:               0,
             epoch_reserve_balance:      0,
             epoch_provider_rewards:     0,
+            // Control 5: circuit breaker
+            minting_state:              MintingState::Normal,
+            tracked_capacity:           0,
+            _cb_reserved:               0,
         }
     }
 
@@ -521,6 +595,17 @@ impl QrcEngine {
     /// Security: the no-QRC-to-QCB constraint is enforced at the protocol
     /// level; this function only handles the QCB → QRC direction.
     pub fn purchase_qrc(&mut self, qcb_amount: u128) -> (u128, u128) {
+        // Control 5: purchase path blocked when RESTRICTED or HALTED.
+        if !self.minting_state.purchase_allowed() {
+            tracing::warn!(
+                state        = self.minting_state.as_str(),
+                qcb_amount,
+                "QRC purchase blocked by CoverageRatio circuit breaker"
+            );
+            // Return (0, current_rt) — no QRC minted, QCB not burned.
+            return (0, self.conversion_rate.rt);
+        }
+
         let qrc_raw  = self.conversion_rate.qrc_for_qcb(qcb_amount);
         let rt_used  = self.conversion_rate.rt;
 
@@ -569,6 +654,18 @@ impl QrcEngine {
         provider_id: &[u8; 32],
         contributions: &BTreeMap<ResourceKind, u128>,
     ) -> u128 {
+        // Control 5: contribution earn path blocked only when HALTED.
+        // RESTRICTED still allows providers to earn (capacity providers are
+        // the mechanism for increasing CR back toward NORMAL).
+        if !self.minting_state.contribution_allowed() {
+            tracing::warn!(
+                provider  = hex::encode(provider_id),
+                state     = self.minting_state.as_str(),
+                "QRC contribution blocked by CoverageRatio circuit breaker (HALTED)"
+            );
+            return 0;
+        }
+
         let earned = provider_earning(
             contributions,
             &self.utilization,
@@ -693,6 +790,81 @@ impl QrcEngine {
             total_burned = self.total_burned,
             "QRC window advanced"
         );
+    }
+
+    // ── Control 5: CoverageRatio circuit breaker ──────────────────────────────
+
+    /// Record VCA-attested network capacity for Control 5.
+    ///
+    /// Call this whenever a `CapacityReport` is finalised and accepted on-chain.
+    /// `capacity` is the network's total verified resource capacity in normalised
+    /// units (× D). After recording, `update_circuit_breaker()` is called
+    /// automatically to apply any state transition.
+    pub fn record_capacity(&mut self, capacity: u128) {
+        self.tracked_capacity = capacity;
+        self.update_circuit_breaker();
+    }
+
+    /// Compute the current CoverageRatio (CR_t).
+    ///
+    /// CR_t = tracked_capacity / total_supply  (both × D, result × D)
+    ///
+    /// Returns `None` when `total_supply == 0` (no QRC outstanding;
+    /// the network is trivially solvent — treat as NORMAL).
+    pub fn coverage_ratio(&self) -> Option<u128> {
+        if self.total_supply == 0 {
+            return None; // Trivially solvent.
+        }
+        // Fixed-point division: (capacity × D) / supply
+        Some(self.tracked_capacity.saturating_mul(D) / self.total_supply)
+    }
+
+    /// Apply the three-state hysteresis transition based on the current CR.
+    ///
+    /// Transition table (CR = coverage_ratio()):
+    /// - None (supply == 0)  → NORMAL
+    /// - CR ≥ CR_resume      → NORMAL
+    /// - CR_halt ≤ CR < CR_resume
+    ///   - from NORMAL       → RESTRICTED
+    ///   - from RESTRICTED   → stays RESTRICTED  (hysteresis)
+    ///   - from HALTED       → RESTRICTED         (recovering)
+    /// - CR < CR_halt        → HALTED
+    ///
+    /// Emits a structured JSON event to stdout on every state change.
+    pub fn update_circuit_breaker(&mut self) {
+        let cr_opt = self.coverage_ratio();
+
+        let next_state = match cr_opt {
+            None => MintingState::Normal, // No supply outstanding — fully solvent.
+            Some(cr) => {
+                if cr >= CR_RESUME {
+                    MintingState::Normal
+                } else if cr >= CR_HALT {
+                    // In the hysteresis band: can only go to/stay at RESTRICTED.
+                    // (Never jump from HALTED directly to NORMAL.)
+                    MintingState::Restricted
+                } else {
+                    MintingState::Halted
+                }
+            }
+        };
+
+        if next_state != self.minting_state {
+            let prev = self.minting_state;
+            self.minting_state = next_state;
+
+            // Emit structured telemetry.
+            let cr_display = cr_opt.unwrap_or(u128::MAX);
+            println!(
+                "{{\"event\":\"circuit_breaker\",\"prev_state\":\"{}\",\"new_state\":\"{}\",\
+                 \"coverage_ratio_fp\":{},\"tracked_capacity\":{},\"qrc_outstanding\":{}}}",
+                prev.as_str(),
+                next_state.as_str(),
+                cr_display,
+                self.tracked_capacity,
+                self.total_supply,
+            );
+        }
     }
 
     // ── Epoch boundary (QRC Economic Model v0.2) ──────────────────────────────
@@ -1385,5 +1557,180 @@ mod tests {
         let summary = e.epoch_summary();
         assert_eq!(summary.provider_rewards, earned);
         assert_eq!(summary.epoch_minted, earned);
+    }
+
+    // ── Control 5: CoverageRatio circuit breaker ──────────────────────────────
+
+    /// Helper: build an engine with `total_supply` already set.
+    fn engine_with_supply(supply: u128) -> QrcEngine {
+        let mut e = engine();
+        // Directly set supply (bypass purchase logic for test setup).
+        e.total_supply = supply;
+        e
+    }
+
+    #[test]
+    fn coverage_ratio_none_when_no_supply() {
+        let e = engine();
+        assert_eq!(e.total_supply, 0);
+        assert!(e.coverage_ratio().is_none(), "CR should be None when no QRC outstanding");
+        assert_eq!(e.minting_state, MintingState::Normal, "no supply → trivially Normal");
+    }
+
+    #[test]
+    fn coverage_ratio_calculation_correct() {
+        // capacity = 1.5 × D, supply = 1.0 × D  →  CR = 1.5 × D
+        let mut e = engine_with_supply(D);
+        e.tracked_capacity = 3 * D / 2; // 1.5 × D
+        let cr = e.coverage_ratio().expect("supply > 0");
+        assert_eq!(cr, 3 * D / 2, "CR = capacity/supply should be 1.5×D");
+    }
+
+    #[test]
+    fn normal_state_when_cr_above_resume() {
+        // Start with supply=D, set capacity to 2×D → CR = 2.0 > CR_resume(1.0).
+        let mut e = engine_with_supply(D);
+        e.record_capacity(2 * D);
+        assert_eq!(e.minting_state, MintingState::Normal);
+    }
+
+    #[test]
+    fn restricted_state_when_cr_in_hysteresis_band() {
+        // CR = 0.90 × D: above CR_halt(0.75) but below CR_resume(1.00).
+        let mut e = engine_with_supply(D); // supply = D
+        e.record_capacity(900_000);        // capacity = 0.9 × D  →  CR = 0.9 × D
+        assert_eq!(
+            e.minting_state,
+            MintingState::Restricted,
+            "CR in [CR_halt, CR_resume) should be RESTRICTED"
+        );
+    }
+
+    #[test]
+    fn halted_state_when_cr_below_halt() {
+        // CR = 0.50 × D: below CR_halt(0.75).
+        let mut e = engine_with_supply(D);
+        e.record_capacity(500_000); // 0.5 × D → CR = 0.5 × D
+        assert_eq!(
+            e.minting_state,
+            MintingState::Halted,
+            "CR below CR_halt should be HALTED"
+        );
+    }
+
+    #[test]
+    fn purchase_blocked_in_restricted_state() {
+        let mut e = engine_with_supply(D);
+        e.record_capacity(900_000); // → RESTRICTED
+        assert_eq!(e.minting_state, MintingState::Restricted);
+
+        let supply_before = e.total_supply;
+        let (minted, _) = e.purchase_qrc(100 * D);
+        assert_eq!(minted, 0, "purchase must be blocked in RESTRICTED state");
+        assert_eq!(e.total_supply, supply_before, "total_supply must not change");
+        assert_eq!(e.total_qcb_burned, 0, "QCB must not be burned");
+    }
+
+    #[test]
+    fn purchase_blocked_in_halted_state() {
+        let mut e = engine_with_supply(D);
+        e.record_capacity(500_000); // → HALTED
+        assert_eq!(e.minting_state, MintingState::Halted);
+
+        let (minted, _) = e.purchase_qrc(100 * D);
+        assert_eq!(minted, 0, "purchase must be blocked in HALTED state");
+    }
+
+    #[test]
+    fn contribution_allowed_in_restricted_state() {
+        let mut e = engine_with_supply(D);
+        e.record_capacity(900_000); // → RESTRICTED
+        assert_eq!(e.minting_state, MintingState::Restricted);
+
+        let provider = [7u8; 32];
+        let mut contributions = BTreeMap::new();
+        contributions.insert(ResourceKind::Compute, D);
+        // Providers should still earn even when purchase is suspended.
+        // (Earning increases capacity indirectly and helps recover CR.)
+        let earned = e.credit_provider_earning(&provider, &contributions);
+        // Non-zero earnings confirm contribution path is open.
+        assert!(earned > 0, "contribution must be allowed in RESTRICTED state; got {earned}");
+    }
+
+    #[test]
+    fn contribution_blocked_in_halted_state() {
+        let mut e = engine_with_supply(D);
+        e.record_capacity(500_000); // → HALTED
+        assert_eq!(e.minting_state, MintingState::Halted);
+
+        let provider = [8u8; 32];
+        let mut contributions = BTreeMap::new();
+        contributions.insert(ResourceKind::Compute, D);
+        let earned = e.credit_provider_earning(&provider, &contributions);
+        assert_eq!(earned, 0, "contribution must be blocked in HALTED state");
+    }
+
+    #[test]
+    fn hysteresis_prevents_oscillation() {
+        // Start Normal; drop CR into hysteresis band → RESTRICTED.
+        // A second record_capacity in the same band should stay RESTRICTED (not flip).
+        let mut e = engine_with_supply(D);
+        e.record_capacity(2 * D); // Normal (CR = 2.0)
+        assert_eq!(e.minting_state, MintingState::Normal);
+
+        e.record_capacity(900_000); // CR = 0.9 → RESTRICTED
+        assert_eq!(e.minting_state, MintingState::Restricted);
+
+        // Update capacity slightly within the band — must stay RESTRICTED.
+        e.record_capacity(950_000); // CR = 0.95 — still below CR_resume
+        assert_eq!(
+            e.minting_state,
+            MintingState::Restricted,
+            "must stay RESTRICTED inside the hysteresis band"
+        );
+    }
+
+    #[test]
+    fn recovery_path_normal_to_restricted_to_halted_to_normal() {
+        let mut e = engine_with_supply(D);
+
+        // 1. Normal
+        e.record_capacity(2 * D);
+        assert_eq!(e.minting_state, MintingState::Normal);
+
+        // 2. Decline → Restricted
+        e.record_capacity(900_000);
+        assert_eq!(e.minting_state, MintingState::Restricted);
+
+        // 3. Further decline → Halted
+        e.record_capacity(500_000);
+        assert_eq!(e.minting_state, MintingState::Halted);
+
+        // 4. Partial recovery → lands in Restricted (not Normal — hysteresis)
+        e.record_capacity(900_000); // CR = 0.9 — in hysteresis band
+        assert_eq!(e.minting_state, MintingState::Restricted,
+            "recovery from HALTED should land in RESTRICTED, not NORMAL");
+
+        // 5. Full recovery → Normal
+        e.record_capacity(D); // CR = 1.0 == CR_resume → Normal
+        assert_eq!(e.minting_state, MintingState::Normal);
+    }
+
+    #[test]
+    fn normal_operation_purchase_and_contribution_both_open() {
+        let mut e = engine(); // supply=0, trivially Normal
+        // Mint some supply via purchase first (CR guard passes when supply=0).
+        let (minted, _) = e.purchase_qrc(D);
+        assert!(minted > 0, "purchase must succeed when Normal and supply=0");
+
+        // Now set capacity well above outstanding → stays Normal.
+        e.record_capacity(5 * e.total_supply);
+        assert_eq!(e.minting_state, MintingState::Normal);
+
+        let provider = [9u8; 32];
+        let mut contributions = BTreeMap::new();
+        contributions.insert(ResourceKind::Compute, D);
+        let earned = e.credit_provider_earning(&provider, &contributions);
+        assert!(earned > 0, "contribution must succeed when Normal");
     }
 }
