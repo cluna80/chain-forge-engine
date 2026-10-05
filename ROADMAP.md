@@ -46,7 +46,7 @@
 | Liveness slashing — confirmed on live testnet | ✅ | >20% missed blocks in window → jail + 1,000,000 uQCB slash |
 | Equivocation → `SlashingModule::slash_equivocation()` wire | ✅ | `process_equivocation_evidence()` in `node.rs` routes consensus-detected equivocation to slasher |
 | Forged vote rejection (in-process test) | ✅ | Garbage-signature vote does not advance height |
-| **Adversarial libp2p gossip test** | ⬜ | Forged/equivocating messages over real TCP — **next adversarial milestone** |
+| **Adversarial libp2p gossip test** | ✅ | Three tests over real libp2p TCP (not in-process injection): `adversarial_unknown_validator` (UnknownValidator rejection confirmed); `adversarial_equivocation_over_gossip` (equivocation detected, asserted at correct validator + height in logs); `adversarial_garbage_signature` (garbage-sig vote actively rejected via real Ed25519 verification — KNOWN_ISSUES §3 resolved) |
 
 ### Cryptography
 
@@ -204,7 +204,7 @@
 
 These are the concrete engineering tasks to pick up next, roughly in priority order:
 
-1. **Adversarial libp2p gossip test** — forge/equivocate over real TCP, not in-process injection. This is the gap left after the in-process attack tests passed.
+1. **Node-layer CR exposure** — embed current CoverageRatio in block header or emit as a chain event so light clients and agents can react without running a full node. (Adversarial libp2p gossip tests shipped ✅ — moved up.)
 
 2. **Node-layer CR exposure** — embed current CoverageRatio in block header or emit as a chain event so light clients and agents can react without running a full node. (Header schema must stabilize first.)
 
