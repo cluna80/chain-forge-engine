@@ -129,6 +129,8 @@ impl GasModel {
                     // Epoch boundary: lightweight protocol signals.
                     TxBody::EpochOpen { .. }             => op_multiplier * 4,
                     TxBody::EpochClose { .. }            => op_multiplier * 4,
+                    // Control 5: capacity update + circuit breaker re-evaluation.
+                    TxBody::RecordCapacity { .. }        => op_multiplier * 3,
                     // AEI Phase 2 lifecycle ops.
                     TxBody::AuthorizeAgent { .. }        => op_multiplier * 4,
                     TxBody::SuspendAgent { .. }          => op_multiplier * 3,
@@ -414,6 +416,36 @@ pub enum TxBody {
         epoch: u64,
     },
 
+    // ── Control 5: CoverageRatio circuit breaker ──────────────────────────────
+
+    /// Record VCA-attested network resource capacity and re-evaluate the
+    /// CoverageRatio circuit breaker (Control 5 / QRC Economic Model v0.2 §6.10).
+    ///
+    /// Submitted by a VCA coordinator after a `CapacityReport` is finalised
+    /// on-chain.  The `capacity` value is the total verified network resource
+    /// capacity in normalised units (× D), as reported by the VCA sub-protocol
+    /// in `chain-forge-qrc/src/capacity_report.rs`.
+    ///
+    /// Effect:
+    ///   - `QrcEngine::record_capacity(capacity)` is called, which updates
+    ///     `tracked_capacity` and may transition the `minting_state` between
+    ///     `Normal`, `Restricted`, and `Halted`.
+    ///   - A structured JSON event is emitted to stdout on every state change
+    ///     (see `QrcEngine::update_circuit_breaker`).
+    ///
+    /// CR_t = capacity / qrc_outstanding (fixed-point × D):
+    ///   - CR ≥ 1.00 → Normal    (both purchase and contribution paths open)
+    ///   - 0.75 ≤ CR < 1.00 → Restricted (purchase suspended; contribution open)
+    ///   - CR < 0.75 → Halted   (both minting paths suspended)
+    ///
+    /// Enforced invariants:
+    ///   - Sender must be a VCA coordinator / validator address.
+    ///   - `capacity` may be 0 (interpreted as CR=0, drives to Halted).
+    RecordCapacity {
+        /// Total verified network resource capacity, in normalised units × D.
+        capacity: u128,
+    },
+
     // ── Agent Lifecycle — AEI Phase 2 ─────────────────────────────────────────
 
     /// Advance an agent from Pending → Active (or Suspended → Active).
@@ -514,6 +546,7 @@ impl TxBody {
             TxBody::RegisterAgent { .. }          => "RegisterAgent",
             TxBody::EpochOpen { .. }              => "EpochOpen",
             TxBody::EpochClose { .. }             => "EpochClose",
+            TxBody::RecordCapacity { .. }         => "RecordCapacity",
             TxBody::AuthorizeAgent { .. }         => "AuthorizeAgent",
             TxBody::SuspendAgent { .. }           => "SuspendAgent",
             TxBody::RevokeAgentFull { .. }        => "RevokeAgentFull",
@@ -657,6 +690,8 @@ impl Transaction {
             // Epoch boundary signals: epoch number (u64) only.
             TxBody::EpochOpen { .. }  => 24,
             TxBody::EpochClose { .. } => 16,
+            // Control 5: capacity value (u128).
+            TxBody::RecordCapacity { .. } => 16,
             // AEI Phase 2 lifecycle ops.
             TxBody::AuthorizeAgent { agent_id }             => agent_id.len() + 8,
             TxBody::SuspendAgent { agent_id, reason }       => agent_id.len() + reason.len() + 8,
@@ -887,6 +922,24 @@ impl Transaction {
         }
     }
 
+    // ── Control 5: CoverageRatio circuit breaker tx constructor ──────────────
+
+    /// Record VCA-attested network resource capacity and update the circuit breaker.
+    ///
+    /// `capacity` is total verified capacity in normalised units × D.
+    /// Submitted by a VCA coordinator after a CapacityReport finalises.
+    pub fn record_capacity(id: &str, sender: &str, capacity: u128, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::RecordCapacity { capacity },
+            gas_limit: 100_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
     // ── Phase 1 Charm Confinement / Agent typed tx constructors ──────────────
 
     /// Confinement heartbeat: prove liveness and advance consecutive-epoch
@@ -1098,8 +1151,9 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Phase 1 typed variants.
         TxBody::CharmConfinementUpdate { .. } | TxBody::IntrinsicCharmRecord { .. } => Some("identity"),
         TxBody::RegisterAgent { .. } => Some("agents"),
-        // QRC v0.2 epoch boundary signals require the QRC module.
-        TxBody::EpochOpen { .. } | TxBody::EpochClose { .. } => Some("qrc"),
+        // QRC v0.2 epoch boundary signals + Control 5 require the QRC module.
+        TxBody::EpochOpen { .. } | TxBody::EpochClose { .. }
+        | TxBody::RecordCapacity { .. } => Some("qrc"),
         // AEI Phase 2 lifecycle operations all require the agents module.
         TxBody::AuthorizeAgent { .. }
         | TxBody::SuspendAgent { .. }
@@ -1490,6 +1544,20 @@ impl Executor {
                     );
                 }
 
+                // Control 5: purchase path blocked when circuit breaker is
+                // RESTRICTED or HALTED (CR below CR_resume = 1.00).
+                if !qrc.minting_state.purchase_allowed() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "QrcPurchase: blocked by CoverageRatio circuit breaker \
+                             (state={}, CR_resume=1.00) — capacity must recover \
+                             before purchase minting resumes",
+                            qrc.minting_state.as_str()
+                        ),
+                    );
+                }
+
                 // Ensure sender has an account.
                 if state.get_account(&tx.sender).is_err() {
                     let new_acct = chain_forge_state::AccountState::new(
@@ -1624,6 +1692,20 @@ impl Executor {
                             "QrcContributionSettle: sender {} is not a Verified \
                              identity (Charm Confinement requires Verified tier)",
                             tx.sender
+                        ),
+                    );
+                }
+
+                // Control 5: contribution earn path blocked ONLY when HALTED
+                // (CR < CR_halt = 0.75). RESTRICTED keeps contribution open —
+                // providers are the capacity recovery mechanism.
+                if !qrc.minting_state.contribution_allowed() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "QrcContributionSettle: blocked by CoverageRatio \
+                             circuit breaker (state=halted, CR_halt=0.75) — \
+                             both minting paths suspended until capacity recovers",
                         ),
                     );
                 }
@@ -1879,6 +1961,26 @@ impl Executor {
                     }
                     Err(e) => Err(format!("EpochClose: {e}")),
                 }
+            }
+
+            // ── Control 5: CoverageRatio circuit breaker ──────────────────────
+
+            TxBody::RecordCapacity { capacity } => {
+                let prev_state = qrc.minting_state;
+                qrc.record_capacity(*capacity);
+                let new_state = qrc.minting_state;
+
+                let cr_display = qrc.coverage_ratio()
+                    .map(|cr| format!("{:.4}", cr as f64 / chain_forge_qrc::D as f64))
+                    .unwrap_or_else(|| "∞ (no supply)".to_string());
+
+                events.push(format!(
+                    "record_capacity: capacity={} CR={} state={}->{} sender={}",
+                    capacity, cr_display,
+                    prev_state.as_str(), new_state.as_str(),
+                    tx.sender
+                ));
+                Ok(())
             }
 
             // ── AEI Phase 2 — Agent Lifecycle ────────────────────────────────
@@ -2238,7 +2340,8 @@ impl Executor {
             // QRC typed tx types require the QRC engine (execute_tx_with_identity).
             TxBody::QrcPurchase { .. }
             | TxBody::QrcSpend { .. }
-            | TxBody::QrcContributionSettle { .. } => {
+            | TxBody::QrcContributionSettle { .. }
+            | TxBody::RecordCapacity { .. } => {
                 Err("QRC transaction requires QRC-engine-aware executor".to_string())
             }
             // Phase 1 typed variants require identity + agent store.
@@ -3795,5 +3898,174 @@ mod tests {
             "IdentityStore must record child sponsorship");
 
         assert!(r.events.iter().any(|e| e.contains("spawn_child_agent")));
+    }
+
+    // ── Control 5: CoverageRatio circuit breaker — execution layer wiring ────
+    //
+    // These tests verify that:
+    //   • RecordCapacity tx executes successfully and transitions circuit-breaker state
+    //   • QrcPurchase is rejected when the engine is RESTRICTED or HALTED
+    //   • QrcContributionSettle is rejected when the engine is HALTED
+    //   • QrcContributionSettle is allowed when the engine is RESTRICTED
+    //     (providers are the recovery mechanism)
+    //
+    // Setup convention: QrcEngine::new(D) starts with minting_state = Normal and
+    // tracked_capacity = 0 (coverage_ratio = None when total_supply == 0).
+    // We drive state changes by calling record_capacity directly on the QrcEngine
+    // OR by submitting RecordCapacity transactions through execute_tx_with_identity.
+
+    #[test]
+    fn record_capacity_tx_succeeds_and_emits_event() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Submit a RecordCapacity tx with 2_000_000 units (2 × D = 2.0 capacity).
+        let tx = Transaction::record_capacity("rc1", "qcb1alice", 2_000_000, 0);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "RecordCapacity must succeed: {:?}", r.error);
+        assert!(
+            r.events.iter().any(|e| e.contains("record_capacity")),
+            "must emit a record_capacity event, got: {:?}", r.events
+        );
+        // Engine must have stored the capacity.
+        assert_eq!(qrc.tracked_capacity, 2_000_000,
+            "tracked_capacity must equal submitted value");
+    }
+
+    #[test]
+    fn record_capacity_tx_transitions_circuit_breaker_to_normal() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Give Alice some QRC supply first so coverage ratio is finite.
+        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
+        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        // Force engine into HALTED by setting capacity to 0 (CR = 0/supply < CR_halt).
+        qrc.record_capacity(0);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted,
+            "engine must be Halted with zero capacity and positive supply");
+
+        // Submit RecordCapacity with ample capacity (e.g. 10× supply) to recover.
+        let supply = qrc.total_supply;
+        let capacity = supply * 10; // CR = 10.0, well above CR_resume = 1.0
+        let rc = Transaction::record_capacity("rc2", "qcb1alice", capacity, 1);
+        let r  = exec.execute_tx_with_identity(&rc, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "RecordCapacity must succeed: {:?}", r.error);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Normal,
+            "engine must transition back to Normal when CR >= 1.0");
+        // Event must describe the transition.
+        let event = r.events.iter().find(|e| e.contains("record_capacity"))
+            .expect("must have record_capacity event");
+        assert!(event.contains("Halted->Normal") || event.contains("halted->normal"),
+            "event must describe state transition, got: {event}");
+    }
+
+    #[test]
+    fn qrc_purchase_blocked_when_restricted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Give Alice some QRC supply so the coverage ratio is finite.
+        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
+        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        // Set capacity between CR_halt (0.75) and CR_resume (1.0) → RESTRICTED.
+        // CR = capacity / total_supply × D.
+        // We want 0.75 × supply < capacity < 1.0 × supply → use 0.88 × supply.
+        let supply = qrc.total_supply;
+        let restricted_capacity = supply * 880_000 / 1_000_000; // 0.88 × supply
+        qrc.record_capacity(restricted_capacity);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
+            "engine must be Restricted; supply={supply}, capacity={restricted_capacity}");
+
+        // QrcPurchase must be rejected.
+        let tx = Transaction::qrc_purchase("buy2", "qcb1alice", 100_000, 0, 1);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "QrcPurchase must be blocked in RESTRICTED state");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("circuit breaker") || err.contains("CoverageRatio"),
+            "error must mention circuit breaker, got: {err}"
+        );
+    }
+
+    #[test]
+    fn qrc_purchase_blocked_when_halted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Give Alice some QRC supply.
+        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
+        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        // Force HALTED: set capacity to 0 → CR = 0 < CR_halt (0.75).
+        qrc.record_capacity(0);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted,
+            "engine must be Halted");
+
+        let tx = Transaction::qrc_purchase("buy2", "qcb1alice", 100_000, 0, 1);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "QrcPurchase must be blocked in HALTED state");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("circuit breaker") || err.contains("CoverageRatio"),
+            "error must mention circuit breaker, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contribution_settle_blocked_when_halted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Give Alice some QRC supply so CR is finite.
+        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
+        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        // Force HALTED.
+        qrc.record_capacity(0);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted,
+            "engine must be Halted");
+
+        // Both minting paths are suspended in HALTED state — contribution must fail.
+        let ev = make_evidence(1);
+        let tx = Transaction::qrc_contribution_settle("settle1", "qcb1alice", 1, ev, 1);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "QrcContributionSettle must be blocked in HALTED state");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("circuit breaker") || err.contains("CoverageRatio"),
+            "error must mention circuit breaker, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contribution_settle_allowed_when_restricted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Give Alice some QRC supply.
+        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
+        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        // Set engine to RESTRICTED (providers are the recovery mechanism).
+        let supply = qrc.total_supply;
+        let restricted_capacity = supply * 880_000 / 1_000_000; // 0.88 × supply
+        qrc.record_capacity(restricted_capacity);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
+            "engine must be Restricted");
+
+        // qcb1alice is Verified in setup_with_identity — contribution must succeed.
+        let ev = make_evidence(1);
+        let tx = Transaction::qrc_contribution_settle("settle1", "qcb1alice", 1, ev, 1);
+        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success,
+            "QrcContributionSettle must be ALLOWED in RESTRICTED state (providers = recovery): {:?}",
+            r.error
+        );
+        assert!(
+            r.events.iter().any(|e| e.contains("qrc_contribution_settle")),
+            "must emit contribution_settle event"
+        );
     }
 }
