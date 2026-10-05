@@ -18,7 +18,9 @@
 
 ## Phase 0 — Chain Forge Engine Foundation
 
-**Goal**: A working, partition-tolerant BFT consensus engine with a real resource economy crate, hardened against known attack vectors, running on a live multi-node testnet.
+**Goal**: A working, partition-tolerant BFT consensus engine plus one complete, adversarially-verified, cross-machine resource purchase using QRC — Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios.
+
+**Architecture shift (October 2026)**: The original QRC model assumed resources are minted by providing capacity. The revised model is simpler and cleaner: **resources are purchased with existing QRC; providing resources does not automatically mint QRC.** Provider payment = releasing pre-escrowed QRC. This reorients `chain-forge-qrc` (handles money) and introduces `chain-forge-resource` (handles what was bought with the money). Existing engine work is not wasted — it is reclassified below.
 
 ### Consensus & Networking
 
@@ -56,22 +58,80 @@
 | Crypto-agility constitutional guarantee | 🔄 | Design captured in whitepaper §10 + §7.3; not yet protocol-enforced |
 | Signature scheme pluggability in `chain-forge-consensus` | ⬜ | Architectural requirement for PQ migration path |
 
-### QRC Resource Economy
+### QRC Money Layer (`chain-forge-qrc`) — Reclassified
+
+> **What changed**: `chain-forge-qrc` is now solely responsible for QRC as currency. It does not define jobs, match providers, or settle resource-specific receipts — that moves to `chain-forge-resource`. Each existing component is classified below.
+
+| Component | Status | Direction |
+|-----------|--------|-----------|
+| `QrcEngine`, `ResourceKind` (7 types), serde + persistence | ✅ | **Keep** — QRC account balances, conversion rate, pricing foundation |
+| Dynamic conversion rate (Control 1) | ✅ | **Keep** — congestion-based QCB→QRC rate; still valid pricing signal |
+| Epoch conversion cap (Control 2) | ✅ | **Keep** — prevents adversarial conversion flooding |
+| CoverageRatio circuit breaker (Control 5) | ✅ | **Re-evaluate** — designed for contribution-minting model; review after escrow settlement is wired |
+| Per-resource congestion pricing | ✅ | **Keep** — excellent marketplace signal; wires into resource discovery |
+| `PurchaseQrc` tx type | ✅ | **Keep** — QCB→QRC on-ramp; job-scoped buy-in path still needed |
+| `CapacityReport` / `CapacityEvidence_v0` | ✅ | **Evolve** → `ResourceExecutionReceipt` in `chain-forge-resource`; same Byzantine-resistant median, new meaning: "job fulfilled" not "capacity contributed" |
+| `CreditProvider` tx type | ✅ | **Legacy / under review** — minting-era primitive; not the right primitive for escrow release; do not build new dependencies on it |
+| `QrcContributionSettle` | ✅ | **Legacy / under review** — contribution-minting model artefact; defer pending revised issuance model |
+| Consumption burn (Control 4) — `p_burn = 0.25` | ✅ | **Re-evaluate** — burning the money providers expect to receive is wrong; suspend automatic burn until escrow/revenue-policy design settles |
+| On-chain capacity tracking (Control 3) | ✅ | **Keep for market health** — use for discovery pricing + CR; not for minting |
+| Node-layer CR exposure (block header / chain event) | ⬜ | **Keep** — light clients / agents need current CR; header schema must stabilize first |
+
+### Resource Market Layer (`chain-forge-resource`) — NEW CRATE
+
+> **Separation principle**: `chain-forge-qrc` handles money. `chain-forge-resource` handles what was bought with the money. This separation matters enormously when the market scales.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `chain-forge-qrc` crate | ✅ | `QrcEngine`, `ResourceKind` (7 types), `CapacityEvidence_v0` |
-| Dynamic conversion rate (Control 1) | ✅ | R_t = R_0 × (U*/U_bar)^γ, clamped [R_min, R_max] |
-| Epoch conversion cap (Control 2) | ✅ | Adaptive: L_e = β_cap × Capacity + λ_cap × Demand |
-| On-chain capacity tracking (Control 3) | ✅ | Byzantine-resistant median across 7 resource types |
-| Consumption burn (Control 4) | ✅ | p_burn = 0.25; 60% providers / 15% reserve |
-| CoverageRatio circuit breaker (Control 5) | ✅ | CR_halt=0.75 / CR_resume=1.00; NORMAL / RESTRICTED / HALTED hysteresis |
-| `QrcEngine` serde + persistence (`qrc.json`) | ✅ | Persists across node restarts |
-| `CapacityReport` sub-protocol | ✅ | `chain-forge-qrc::capacity_report` — median aggregation |
-| **`PurchaseQrc` tx type** | ✅ | Job-scoped QCB→QRC buy-in; slippage guard; blocked in RESTRICTED + HALTED |
-| **`CreditProvider` tx type** | ✅ | Coordinator-issued post-job credit; Verified-tier required; auto-creates provider account; blocked in HALTED only |
-| Per-resource congestion pricing | ✅ | Wired in `QrcEngine` |
-| Node-layer CR exposure (block header / chain event) | ⬜ | Light clients / agents need current CR without running full node; header schema must stabilize first |
+| `chain-forge-resource` crate scaffold | ⬜ | New workspace crate; `ResourceOffer`, `ResourceRequest`, `ResourceMatch`, `ResourceJob`, `ResourceReceipt`, `ResourceMeter`, `ResourceProof`, `ResourceSettlement` |
+| `ResourceCapabilityDescriptor` | ⬜ | Standardized vocabulary: `kind`, `architecture`, `cpu_cores`, `memory_bytes`, `gpu_model`, `gpu_memory`, `storage_bytes`, `bandwidth`, `runtime_types`, `price`, `max_job_duration`; agents use this to intelligently choose providers |
+| `ResourceJob` state machine | ⬜ | States: `CREATED → FUNDED → MATCHED → RUNNING → (COMPLETED / FAILED) → (VERIFIED / REFUND) → SETTLED`; plus `DISPUTED → RESOLUTION` branch; state machine must have room for future decentralized arbitration |
+| `ResourceExecutionReceipt` | ⬜ | Evolves from `CapacityEvidence_v0`; fields: `job_id`, `provider_id`, `requester_agent_id`, `resource_type`, `requested_units`, `measured_units`, `started_at`, `finished_at`, `input_hash`, `output_hash`, `provider_signature`, `requester_confirmation`, `verification_status` |
+| P2P resource discovery | ⬜ | Agents broadcast `ResourceRequest` over libp2p gossip; providers respond with `ResourceOffer`; live availability stays off-chain; only economically important commitments/results go on-chain |
+| QRC escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ⬜ | Agent locks QRC before job starts; provider receives only on verified completion; refund path for failure/timeout; `DisputeResourceJob` stub for Phase 1 |
+| `ResourceNode` prototype (Machine 2) | ⬜ | Machine 2 (Carol) advertises: `ProviderID`, `SponsorID`, `NodeID`, resource capabilities, `container_execution` + `python_execution` runtime types, availability, price, location/latency region, resource limits |
+| Secure workload sandbox (container) | ⬜ | Resource providers cannot execute arbitrary agent code on bare host; Docker/container prototype for Phase 0; note: production hostile multi-tenant workloads need stronger isolation — containers are a Phase 0 approximation only |
+| Job cancellation / failure / timeout handling | ⬜ | Explicit handling for: provider disappear mid-job, agent sends invalid workload, connection fails, provider produces wrong output, agent falsely claims failure, provider claims completion but result is unusable |
+
+### Agent Economic Identity (AEI) — Moved forward from Phase 4
+
+> Required to properly test the new QRC resource model. Without it you cannot prove Alice's agent cannot exceed Alice's authorization.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `AgentID` + `SponsorID` linkage primitive | ⬜ | `MachineID → ProviderID → SponsorID` for resource nodes; one verified human can operate multiple machines; machines have cryptographic identities tracing to human SponsorID |
+| `AgentTreasury` primitive | ⬜ | `{agent_id, sponsor_id, balance, daily_limit, per_job_limit, allowed_resource_types}`; Alice deposits QRC; agent can spend ≤ per_job_limit; agent cannot withdraw to arbitrary account |
+| `CapabilitySet` + `SpendingLimits` | ⬜ | Agent cannot exceed sponsor's authorization; Charm Confinement enforcement begins here |
+| `RevenuePolicy` primitive | ⬜ | Configurable destination for agent revenue; e.g. `Sponsor: 30% / AgentTreasury: 60% / Reserve: 10%`; successful service settles automatically |
+
+### Phase 0 Acceptance Test — Cross-Machine Resource Purchase
+
+> **The new Phase 0 completion criterion**: not merely "working BFT + resource economy crate" — but one real, adversarially-verified, cross-machine resource purchase using QRC.
+
+**Happy path**:
+```
+Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
+  → Agent-A requests computation → P2P resource discovery
+  → Machine 2 (Carol) Resource Node accepts job
+  → Job runs in sandboxed container → Carol returns result
+  → ResourceExecutionReceipt generated + verified
+  → QRC escrow releases → Carol receives QRC
+```
+
+**Attack scenarios** (must survive all ten before Phase 0 is complete):
+
+| # | Attack | Expected outcome |
+|---|--------|-----------------|
+| 1 | Fake completion (Carol claims done; job never ran) | Escrow not released; refund to Agent-A |
+| 2 | Duplicate settlement (Carol submits receipt twice) | Second settlement rejected |
+| 3 | Replayed receipt (old job receipt submitted for new job) | Receipt rejected (job_id + height scoped) |
+| 4 | Provider disconnect mid-job | Job → FAILED; escrow refunded after timeout |
+| 5 | Requester disconnect mid-job | Job continues; result held; no double-payment |
+| 6 | Tampered result (output_hash mismatch) | Verification fails; escrow refund |
+| 7 | Unauthorized agent spending (Agent-A tries to exceed Alice's limit) | Tx rejected at execution layer |
+| 8 | Spending-limit bypass attempt | SpendingLimits enforced; rejection confirmed in test |
+| 9 | Forged provider identity (unknown ProviderID submits receipt) | Unknown provider → receipt rejected |
+| 10 | Double payment (two settlement attempts for one job) | Second payment rejected; idempotency guard |
 
 ### Execution Layer
 
@@ -109,27 +169,52 @@
 
 ---
 
-## Phase 1 — Personhood-Weighted BFT on Testnet
+## Phase 1 — Personhood-Weighted BFT + Resource Market Foundation
 
-**Goal**: Consensus power tied to verified human identity, not raw stake. Charm Confinement and Intrinsic Charm implemented.
+**Goal**: Consensus power tied to verified human identity, not raw stake. Resource market hardened with provider reputation, dispute resolution skeleton, and multi-provider discovery. Charmed Agent identity/budget primitive live.
 
-**Prerequisite**: Phase 0 complete (Tendermint ✅; HotStuff ✅; XRPL-inspired FBA ✅ — all three BFT variants shipped).
+**Prerequisite**: Phase 0 complete — includes cross-machine resource purchase acceptance test passing.
+
+### Consensus — Personhood Weighting
 
 | Item | Status | Notes |
 |------|--------|-------|
 | Personhood-weighting overlay on TendermintEngine | ⬜ | Cap per-human validator influence regardless of stake |
 | `ValidatorInfo.pop_verified` gating in consensus | ⬜ | Only PoP-confirmed validators counted for quorum |
-| Charm Confinement (`chain-forge-identity` extension) | ⬜ | Identity-scoped state isolation; one claim per epoch |
-| Intrinsic Charm module | ⬜ | Verification tier + decay-exemption credits intrinsic to identity |
 | Stake → influence cap enforcement | ⬜ | See whitepaper §3.3 |
 | Validator liveness under partial-participation (Open Q14) | ❓ | How does finality behave if large fraction of verified humans go offline? |
 | Governance quorum floor enforcement | ⬜ | >3% turnout for ordinary QRC votes; >6% for constitutional (derived from §6.6) |
 
+### Identity — Charm Confinement
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Charm Confinement (`chain-forge-identity` extension) | ⬜ | Identity-scoped state isolation; one claim per epoch |
+| Intrinsic Charm module | ⬜ | Verification tier intrinsic to identity; **note: decay-exemption credits removed** — demurrage is out of QRC v3, so decay-exemption credits have no referent; drop this concept |
+
+### Resource Market — Phase 1 Hardening
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Provider reputation (minimal) | ⬜ | Track: `completed_jobs`, `failed_jobs`, `disputes`, `uptime`, `verification_failures`, `latency`; agents choose provider on price + reputation; reputation must resist self-dealing (Alice cannot manufacture reputation by hiring Alice's own node) |
+| `DisputeResourceJob` tx type | ⬜ | Phase 0 stubbed the state; Phase 1 wires the submission and resolution path; decentralized arbitration is Phase 2+ but the state machine must accept disputes now |
+| Multi-provider resource discovery | ⬜ | Agent broadcasts `ResourceRequest`; multiple `ResourceOffer` responses ranked by price + reputation; agent selects |
+| Provider-identity → SponsorID tracing | ⬜ | `MachineID → ProviderID → SponsorID`; one human can operate N resource nodes legitimately; prevents sybil inflation of reputation |
+| Sandboxed workload hardening | ⬜ | Move beyond basic container toward resource-limit enforcement (CPU, RAM, disk, network policy, runtime cap); document that Docker is a Phase 0 approximation |
+
+### Agent Economic Identity — Phase 1 Extension
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `CapabilitySet` enforcement on-chain | ⬜ | Agent's allowed resource types enforced at tx execution, not just client-side |
+| `RevenuePolicy` settlement automation | ⬜ | Successful service auto-settles to sponsor + agent treasury + reserve per configured policy |
+| Agent treasury → spending audit endpoint | ⬜ | Sponsor can query: what has my agent spent, on what, and to whom |
+
 ---
 
-## Phase 2 — Identity Pilot + QRC Paths Open
+## Phase 2 — Identity Pilot + QRC Issuance Model Finalized
 
-**Goal**: Real-world sybil-resistance pilot; both $QRC minting paths live (purchase + contribution).
+**Goal**: Real-world sybil-resistance pilot; QRC issuance model finalized (purchase path confirmed; contribution-minting model resolved as legacy or deliberately retired); resource market running at testnet scale.
 
 **Prerequisite**: Phase 1 complete.
 
@@ -138,8 +223,8 @@
 | Identity pilot design — cost/sybil targets finalized | ❓ | Provisional: <3% sybil rate, <$5/verification; see Open Q1 |
 | Red-team / adversarial sybil test | ⬜ | Phase A–D attacks: attestation-guard bypass attempts |
 | `PurchaseQrc` path open on testnet | ⬜ | Execution tx type ✅; needs live QrcEngine + identity gate |
-| `CreditProvider` path open — Verified-tier coordinators | ⬜ | Execution tx type ✅; needs VCA attestation pipeline live |
-| `QrcContributionSettle` — epoch-boundary settlement | ⬜ | Existing tx type; needs real CapacityEvidence reports |
+| QRC issuance model decision | ❓ | **Open Q**: does provider contribution ever mint new QRC, or is all QRC acquired via `PurchaseQrc` only? Until resolved, `CreditProvider` and `QrcContributionSettle` remain legacy/under-review — do not build new dependencies on them |
+| `CreditProvider` / `QrcContributionSettle` — resolve or retire | ❓ | If contribution-minting is confirmed retired: deprecate these tx types; if a narrow minting path survives, redesign it around the escrow-release model, not coordinator-issued credits |
 | Settlement layer cold-start reserve (Open Q22) | ❓ | Who funds initial reserves; legal form |
 | Settlement rate regime (Open Q19) | ❓ | Fixed / floating / managed float |
 
@@ -202,21 +287,37 @@
 
 ## Immediate Next Items (October 2026)
 
-These are the concrete engineering tasks to pick up next, roughly in priority order:
+These are the concrete engineering tasks to pick up next, in priority order. The architecture pivot is captured above — before touching code, confirm the ordering below against the new Phase 0 acceptance test goal.
 
-1. **Node-layer CR exposure** — embed current CoverageRatio in block header or emit as a chain event so light clients and agents can react without running a full node. (Adversarial libp2p gossip tests shipped ✅ — moved up.)
+### Code tasks (Phase 0 resource market foundation)
 
-2. **Node-layer CR exposure** — embed current CoverageRatio in block header or emit as a chain event so light clients and agents can react without running a full node. (Header schema must stabilize first.)
+1. **`chain-forge-resource` crate scaffold** — create the workspace crate with the eight core types (`ResourceOffer`, `ResourceRequest`, `ResourceMatch`, `ResourceJob`, `ResourceReceipt`, `ResourceMeter`, `ResourceProof`, `ResourceSettlement`) and the `ResourceJob` state machine. No business logic yet — just the types and state transitions that everything else will build on.
 
-3. **Explorer persistence deployment** — `write_explorer_persistence.py` is packaged; deploy it on the engine machine (Machine 1). (XRPL-inspired FBA variant shipped ✅ — moved up.)
+2. **`ResourceCapabilityDescriptor`** — standardized vocabulary struct; wire into Machine 2 (Carol) `ResourceNode` prototype so it can advertise capabilities over libp2p gossip.
 
-4. **Explorer persistence deployment** — `write_explorer_persistence.py` is packaged; deploy it on the engine machine (Machine 1).
+3. **QRC escrow primitives** — `LockQrcForJob`, `ReleaseQrcForJob`, `RefundQrcForJob` as new tx types in `chain-forge-execution`; wire into `QrcEngine` balance accounting; timeout/refund path must be explicit.
 
-5. **Personhood-weighting overlay** — per-human validator influence cap on `TendermintEngine`, using `ValidatorInfo.pop_verified` already in the registry.
+4. **`AgentTreasury` + `AgentID`/`SponsorID` primitives** — minimum needed to run the Phase 0 acceptance test; Alice can fund an agent treasury; agent cannot exceed `per_job_limit`; agent cannot withdraw to arbitrary account.
 
-6. **AI red-team Agent 1 (Phase A–D attestation guard bypass)** — strategy-search agent for adversarial attempts against the attestation guard. Backlogged from prior session.
+5. **`ResourceExecutionReceipt`** — evolve `CapacityEvidence_v0` toward the receipt model; provider signs receipt on job completion; requester confirms; verification triggers escrow release.
 
-7. **VCA attestation pipeline** — end-to-end `CapacityEvidence_v0` submission from a real provider node to the on-chain `QrcEngine`, so `CreditProvider` and `QrcContributionSettle` can run against real data rather than test fixtures.
+6. **Sandboxed container execution on Machine 2** — Docker-based prototype; Carol's resource node executes submitted workloads inside a container with CPU/RAM limits; returns result + receipt.
+
+7. **Cross-machine happy-path integration test** — Machine 1 agent purchases computation from Machine 2 Carol; full flow from `LockQrcForJob` → job runs in container → `ResourceExecutionReceipt` submitted → `ReleaseQrcForJob` completes.
+
+8. **Ten attack scenarios** (see Phase 0 acceptance test table above) — one test per scenario; all must pass before Phase 0 is declared complete.
+
+### Infrastructure tasks (can run in parallel)
+
+9. **Node-layer CR exposure** — embed CoverageRatio in block header or chain event; light clients / agents need it without running a full node.
+
+10. **Explorer persistence deployment** — `write_explorer_persistence.py` packaged; deploy on Machine 1.
+
+### Phase 1 prep (after Phase 0 acceptance test passes)
+
+11. **Personhood-weighting overlay** — per-human validator influence cap on `TendermintEngine`, using `ValidatorInfo.pop_verified` already in the registry.
+
+12. **AI red-team Agent 1 (Phase A–D attestation guard bypass)** — strategy-search agent for adversarial attestation guard bypass attempts. Backlogged from prior session.
 
 ---
 
