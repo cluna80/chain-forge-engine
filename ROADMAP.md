@@ -34,8 +34,8 @@
 | Equivocation detection | ✅ | Double-vote/double-precommit at same (height, round, type) → `ConsensusError::Equivocation` |
 | `verify_commit()` hardening | ✅ | Dedup stuffing blocked; mismatch checks; unknown-validator rejection |
 | Validator set governance | ✅ | `ValidatorSetChange`, epoch-delayed activation, personhood cap |
-| HotStuff-style BFT variant | ⬜ | Next consensus variant; pluggable architecture ready |
-| XRPL-inspired FBA variant | 🔲 | After HotStuff |
+| HotStuff-style BFT variant | ✅ | `HotStuffEngine` — three-phase (PREPARE/PRE-COMMIT/COMMIT), QC-locked, linear messaging; 17 dedicated tests passing; personhood cap + VCA weights applied at init; equivocation detection in PREPARE phase; safety rule (Theorem 2) enforced |
+| XRPL-inspired FBA variant | ⬜ | Next consensus variant — HotStuff now proves pluggability is real |
 
 ### Slashing & Safety
 
@@ -193,7 +193,8 @@
 | RWA issuance layer | 🔲 | Tokenized assets via permissioned EVM; QCB compliance-at-protocol-layer |
 | Governance succession (post-founder) | ❓ | Open Q10 |
 | Interoperability (PoP-preserving bridge only) | 🔲 | Forbidden until chain stable and identity proven; Open Q per §7.1 |
-| HotStuff / XRPL BFT variants shipping | ⬜ | Pluggable architecture ready; second variant proves pluggability is real |
+| HotStuff BFT variant | ✅ | Shipped — pluggability proven |
+| XRPL-inspired FBA variant | ⬜ | Next variant in sequence |
 | Production-grade JMT state tree | ⬜ | Replaces current state layer |
 | Chain Forge standalone whitepaper | ⬜ | Aimed at developers building their own chains on the engine |
 
@@ -207,7 +208,7 @@ These are the concrete engineering tasks to pick up next, roughly in priority or
 
 2. **Node-layer CR exposure** — embed current CoverageRatio in block header or emit as a chain event so light clients and agents can react without running a full node. (Header schema must stabilize first.)
 
-3. **HotStuff BFT variant** — second consensus engine running against the same application interface, proving the pluggable architecture is real and not a single-variant abstraction.
+3. **XRPL-inspired FBA variant** — third consensus engine; HotStuff ✅ already proved pluggability is real, so FBA is the next variant in the sequence.
 
 4. **Explorer persistence deployment** — `write_explorer_persistence.py` is packaged; deploy it on the engine machine (Machine 1).
 
