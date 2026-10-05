@@ -35,7 +35,7 @@
 | `verify_commit()` hardening | ✅ | Dedup stuffing blocked; mismatch checks; unknown-validator rejection |
 | Validator set governance | ✅ | `ValidatorSetChange`, epoch-delayed activation, personhood cap |
 | HotStuff-style BFT variant | ✅ | `HotStuffEngine` — three-phase (PREPARE/PRE-COMMIT/COMMIT), QC-locked, linear messaging; 17 dedicated tests passing; personhood cap + VCA weights applied at init; equivocation detection in PREPARE phase; safety rule (Theorem 2) enforced |
-| XRPL-inspired FBA variant | ⬜ | Next consensus variant — HotStuff now proves pluggability is real |
+| XRPL-inspired FBA variant | ✅ | `FbaEngine` — global UNL, 80% agreement threshold (tunable), single-phase (Open → Committed), no leader rotation; equivocation detection on double-vote; personhood cap + VCA adaptive quorum applied at init; min-UNL guard; 18 dedicated tests passing; all three BFT variants now confirm pluggable `ConsensusEngine` trait |
 
 ### Slashing & Safety
 
@@ -113,7 +113,7 @@
 
 **Goal**: Consensus power tied to verified human identity, not raw stake. Charm Confinement and Intrinsic Charm implemented.
 
-**Prerequisite**: Phase 0 complete (Tendermint base ✅; HotStuff variant pending).
+**Prerequisite**: Phase 0 complete (Tendermint ✅; HotStuff ✅; XRPL-inspired FBA ✅ — all three BFT variants shipped).
 
 | Item | Status | Notes |
 |------|--------|-------|
@@ -194,7 +194,7 @@
 | Governance succession (post-founder) | ❓ | Open Q10 |
 | Interoperability (PoP-preserving bridge only) | 🔲 | Forbidden until chain stable and identity proven; Open Q per §7.1 |
 | HotStuff BFT variant | ✅ | Shipped — pluggability proven |
-| XRPL-inspired FBA variant | ⬜ | Next variant in sequence |
+| XRPL-inspired FBA variant | ✅ | Shipped — global UNL, 80% threshold, 18 tests passing; all three pluggable BFT variants now confirmed |
 | Production-grade JMT state tree | ⬜ | Replaces current state layer |
 | Chain Forge standalone whitepaper | ⬜ | Aimed at developers building their own chains on the engine |
 
@@ -208,7 +208,7 @@ These are the concrete engineering tasks to pick up next, roughly in priority or
 
 2. **Node-layer CR exposure** — embed current CoverageRatio in block header or emit as a chain event so light clients and agents can react without running a full node. (Header schema must stabilize first.)
 
-3. **XRPL-inspired FBA variant** — third consensus engine; HotStuff ✅ already proved pluggability is real, so FBA is the next variant in the sequence.
+3. **Explorer persistence deployment** — `write_explorer_persistence.py` is packaged; deploy it on the engine machine (Machine 1). (XRPL-inspired FBA variant shipped ✅ — moved up.)
 
 4. **Explorer persistence deployment** — `write_explorer_persistence.py` is packaged; deploy it on the engine machine (Machine 1).
 
@@ -227,7 +227,7 @@ These are the concrete engineering tasks to pick up next, roughly in priority or
 | # | Topic | Urgency |
 |---|-------|---------|
 | Q1 | Final identity layer design; pilot cost/sybil targets | 🔴 High — gates everything |
-| Q2 | BFT variant selection for QCB | 🟡 Medium — after HotStuff ships |
+| Q2 | BFT variant selection for QCB | 🟡 Medium — all three variants shipped; selection decision now unblocked |
 | Q5 | Jurisdiction / legal entity | 🔴 High — needed before mainnet |
 | Q9 | Identity replacement constitutional mechanism | 🟡 Medium |
 | Q10 | Governance succession past founder control | 🟡 Medium |
