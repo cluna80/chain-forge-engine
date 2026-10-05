@@ -486,6 +486,43 @@ pub enum TxBody {
     },
 }
 
+impl TxBody {
+    /// Short string label identifying the variant, used by the explorer for
+    /// display and by load_persisted_state() when reconstructing TxSummary
+    /// records from committed block payloads.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            TxBody::Transfer { .. }               => "Transfer",
+            TxBody::Burn { .. }                   => "Burn",
+            TxBody::Stake { .. }                  => "Stake",
+            TxBody::Custom { .. }                 => "Custom",
+            TxBody::ClaimUbi { .. }               => "ClaimUbi",
+            TxBody::RedirectToUbiPool { .. }      => "RedirectToUbiPool",
+            TxBody::SponsorAgent { .. }           => "SponsorAgent",
+            TxBody::RevokeAgent { .. }            => "RevokeAgent",
+            TxBody::RegisterIdentity             => "RegisterIdentity",
+            TxBody::Attest { .. }                 => "Attest",
+            TxBody::RevokeAttestation { .. }      => "RevokeAttestation",
+            TxBody::ReportSuspectedSybil { .. }   => "ReportSuspectedSybil",
+            TxBody::ConfirmSybil { .. }           => "ConfirmSybil",
+            TxBody::ReverseSybil { .. }           => "ReverseSybil",
+            TxBody::QrcPurchase { .. }            => "QrcPurchase",
+            TxBody::QrcSpend { .. }               => "QrcSpend",
+            TxBody::QrcContributionSettle { .. }  => "QrcContributionSettle",
+            TxBody::CharmConfinementUpdate { .. } => "CharmConfinementUpdate",
+            TxBody::IntrinsicCharmRecord { .. }   => "IntrinsicCharmRecord",
+            TxBody::RegisterAgent { .. }          => "RegisterAgent",
+            TxBody::EpochOpen { .. }              => "EpochOpen",
+            TxBody::EpochClose { .. }             => "EpochClose",
+            TxBody::AuthorizeAgent { .. }         => "AuthorizeAgent",
+            TxBody::SuspendAgent { .. }           => "SuspendAgent",
+            TxBody::RevokeAgentFull { .. }        => "RevokeAgentFull",
+            TxBody::RecordAgentSpend { .. }       => "RecordAgentSpend",
+            TxBody::SpawnChildAgent { .. }        => "SpawnChildAgent",
+        }
+    }
+}
+
 /// Events that affect the on-chain IntrinsicCharm record without going through
 /// the normal participation-heartbeat path. Used by `IntrinsicCharmRecord`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

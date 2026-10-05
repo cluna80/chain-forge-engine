@@ -1004,6 +1004,79 @@ impl Node {
                 );
             }
 
+            // ── Rebuild ExplorerState from persisted chain_store + state ─────
+            // ExplorerState is not persisted separately; it is reconstructed
+            // here so that /api/blocks, /api/tx, /api/accounts, and
+            // /api/validators all return correct data immediately after restart.
+            {
+                let mut ex = self.explorer.lock().unwrap();
+
+                // Accounts: derive from the restored StateStore snapshot.
+                ex.accounts.clear();
+                for a in self.state.all_accounts() {
+                    ex.accounts.insert(a.address.clone(), AccountSummary {
+                        address:        a.address.clone(),
+                        role:           a.role.clone(),
+                        nonce:          a.nonce,
+                        balances:       a.balances.clone(),
+                        tier:           a.verification_tier().map(|t| t.to_string()),
+                        exemption_days: a.exemption_days(),
+                    });
+                }
+
+                // Validators: derive from the restored validator registry.
+                let vs = self.validator_registry.build_validator_set(height);
+                ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
+                    id:           v.id.0.clone(),
+                    voting_power: v.voting_power,
+                    pop_verified: v.pop_verified,
+                }).collect();
+
+                // Blocks + txs: walk chain_store in ascending height order so
+                // push_front leaves them newest-first (matching live behaviour).
+                // Only the last MAX_RECENT_BLOCKS entries are kept.
+                let entries: Vec<_> = self.chain_store.iter().collect();
+                let start = entries.len().saturating_sub(MAX_RECENT_BLOCKS);
+                for (_, (_cert, proposal)) in &entries[start..] {
+                    let txs: Vec<chain_forge_execution::Transaction> =
+                        serde_json::from_slice(&proposal.tx_data).unwrap_or_default();
+                    let mut tx_ids = Vec::with_capacity(txs.len());
+                    for tx in &txs {
+                        tx_ids.push(tx.id.clone());
+                        ex.txs.entry(tx.id.clone()).or_insert_with(|| TxSummary {
+                            id:       tx.id.clone(),
+                            height:   proposal.height,
+                            sender:   tx.sender.clone(),
+                            kind:     tx.body.variant_name().to_string(),
+                            // Results are not persisted; mark as succeeded
+                            // (they committed, so they were accepted).
+                            success:  true,
+                            gas_used: 0,
+                            events:   vec![],
+                            error:    None,
+                        });
+                    }
+                    ex.blocks.push_front(BlockSummary {
+                        height:       proposal.height,
+                        state_root:   proposal.block_hash.0.clone(),
+                        timestamp_ms: proposal.timestamp_ms,
+                        tx_count:     tx_ids.len(),
+                        tx_ids,
+                    });
+                }
+                // Ensure newest-first ordering after the loop.
+                let mut v: Vec<_> = ex.blocks.drain(..).collect();
+                v.sort_by(|a, b| b.height.cmp(&a.height));
+                ex.blocks.extend(v);
+
+                tracing::info!(
+                    accounts = ex.accounts.len(),
+                    blocks   = ex.blocks.len(),
+                    txs      = ex.txs.len(),
+                    "explorer state rebuilt from persisted chain"
+                );
+            }
+
             // Rebuild the consensus engine's view of the current height and
             // validator set so it does not re-propose already-committed blocks.
             let vs = self.validator_registry.build_validator_set(height);
