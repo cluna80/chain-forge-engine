@@ -23,6 +23,7 @@
 
 mod node;
 mod api;
+pub mod telemetry;
 
 use std::path::PathBuf;
 use tracing::info;

@@ -1,5 +1,6 @@
 /// Node: the core runtime that wires all five crates together.
 
+use crate::telemetry::emit_attestation_event;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn, error};
 
@@ -1886,6 +1887,17 @@ impl Node {
             }
         }
 
+        // Attestation guard telemetry — one JSON line per slash event.
+        // evidence_hash: block_hash_a is already a hex string (the first conflicting vote).
+        let ev_hash: &str = &evidence.block_hash_a;
+        emit_attestation_event(
+            &evidence.validator_id,
+            Some(evidence.height),
+            Some(evidence.round),
+            "slash",
+            &ev_hash,
+        );
+
         Ok(actual_burn)
     }
 
@@ -2087,6 +2099,18 @@ impl Node {
             self.identity.record_activity(&vote.validator.0);
         }
 
+        // Snapshot Attest tx metadata before txs is consumed by execute_block.
+        // (sender = attester, claimant = target identity)
+        let attest_senders: Vec<(String, String)> = txs.iter()
+            .filter_map(|t| {
+                if let chain_forge_execution::TxBody::Attest { claimant_id } = &t.body {
+                    Some((t.sender.clone(), claimant_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let exec_result = self.executor.execute_block_with_identity(
             cert.height, txs, &mut self.state, &mut self.identity, &mut self.qrc, &mut self.agents, now_ms,
         );
@@ -2100,6 +2124,48 @@ impl Node {
             state_root = %exec_result.state_root,
             "block executed and committed (multi-node quorum)"
         );
+
+        // Attestation guard telemetry — one JSON line per Attest tx.
+        // Zip the pre-captured (attester, claimant) pairs with the tx results
+        // that carry the execution events (e.g. "quorum reached").
+        {
+            let block_hash_str = format!("{}", cert.block_hash);
+            let attest_results: Vec<&chain_forge_execution::TransactionResult> = exec_result
+                .tx_results
+                .iter()
+                .filter(|r| {
+                    r.events.iter().any(|e| e.starts_with("attest:"))
+                })
+                .collect();
+
+            for (idx, (attester, claimant)) in attest_senders.iter().enumerate() {
+                let result = attest_results.get(idx);
+                let (verdict, success) = match result {
+                    Some(r) if r.success => {
+                        let is_quorum = r.events.iter()
+                            .any(|e| e.contains("quorum reached"));
+                        if is_quorum { ("quorum", true) } else { ("pass", true) }
+                    }
+                    Some(_) => ("fail", false),
+                    None    => ("pass", false), // no result mapped — treat as pass
+                };
+                let _ = success; // verdict string already encodes this
+                emit_attestation_event(
+                    attester,
+                    Some(cert.height),
+                    Some(cert.round.into()),
+                    verdict,
+                    &block_hash_str,
+                );
+                debug!(
+                    attester = %attester,
+                    claimant = %claimant,
+                    height   = cert.height,
+                    verdict  = verdict,
+                    "attestation telemetry emitted"
+                );
+            }
+        }
 
         // Refresh pop_verified in the live validator set from IdentityStore.
         //
