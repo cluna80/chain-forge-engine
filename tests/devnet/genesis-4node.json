@@ -49,7 +49,7 @@
     "mempool_size": 100,
     "mempool_ttl_seconds": 60
   },
-  "modules": ["bank", "staking", "identity", "cirfi", "agents"],
+  "modules": ["bank", "staking", "identity", "qrc", "agents"],
   "custom_modules": [],
   "genesis_accounts": [
     {
