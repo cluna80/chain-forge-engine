@@ -325,6 +325,9 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::SpawnChildAgent { .. }          => "spawn_child_agent",
         // Control 5: network capacity reporting
         TxBody::RecordCapacity { .. }           => "record_capacity",
+        // Resource Network v0.2 marketplace tx types
+        TxBody::PurchaseQrc { .. }              => "purchase_qrc",
+        TxBody::CreditProvider { .. }           => "credit_provider",
     }
 }
 

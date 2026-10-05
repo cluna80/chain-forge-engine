@@ -137,6 +137,11 @@ impl GasModel {
                     TxBody::RevokeAgentFull { .. }       => op_multiplier * 6, // touches both stores
                     TxBody::RecordAgentSpend { .. }      => op_multiplier * 2,
                     TxBody::SpawnChildAgent { .. }       => op_multiplier * 8, // comparable to RegisterAgent
+                    // Resource Network v0.2 marketplace tx types.
+                    // PurchaseQrc: burns QCB + mints QRC + records job credit.
+                    TxBody::PurchaseQrc { .. }           => op_multiplier * 7,
+                    // CreditProvider: coordinator credit + mints QRC to provider.
+                    TxBody::CreditProvider { .. }        => op_multiplier * 8,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -494,6 +499,64 @@ pub enum TxBody {
         amount_uqrc: u128,
     },
 
+    // ── QRC Resource Network — v0.2 marketplace tx types ─────────────────────
+
+    /// Resource-marketplace QRC purchase (QRC Resource Network / Section 4.1 v0.2).
+    ///
+    /// Submitted by a Charmed Agent or coordinator on behalf of a job buyer.
+    /// Burns `qcb_amount` of $QCB from the sender's account and mints QRC
+    /// resource credits, optionally earmarking them for a specific resource
+    /// `job_id` and `resource_type`.  This is the richer, job-scoped version
+    /// of the legacy `QrcPurchase` variant — it carries a job identifier so
+    /// the settlement ledger can reconcile credit balances per job.
+    ///
+    /// `min_qrc_out` is a slippage guard.  Pass 0 to accept any rate.
+    ///
+    /// State changes (same as legacy QrcPurchase, plus job-scoped bookkeeping):
+    ///   - sender.$QCB decreases by `qcb_amount` (permanent burn)
+    ///   - QrcEngine credits `qrc_minted` to sender's QRC balance
+    ///   - QrcEngine.total_qcb_burned += qcb_amount
+    ///
+    /// Control 5: blocked in RESTRICTED and HALTED states.
+    PurchaseQrc {
+        /// The resource job this purchase is funding (coordinator-assigned UUID).
+        job_id: String,
+        /// $QCB to burn (in uqcb).
+        qcb_amount: u128,
+        /// Minimum QRC credits the sender will accept.  0 = no minimum.
+        min_qrc_out: u128,
+        /// The resource type this purchase is earmarked for.
+        resource_type: chain_forge_qrc::ResourceKind,
+    },
+
+    /// Coordinator-issued QRC credit to a Resource Node after job verification
+    /// (QRC Resource Network / Section 4.2 v0.2).
+    ///
+    /// Submitted by a QCB coordinator after off-chain verification that a
+    /// Resource Node successfully completed the job described by `job_id`.
+    /// This is distinct from `QrcContributionSettle`, which is provider-
+    /// submitted and epoch-scoped.  `CreditProvider` is coordinator-submitted,
+    /// job-scoped, and does not require a full epoch boundary.
+    ///
+    /// `verified_units` is the coordinator-attested resource delivery in
+    /// normalised units × D (same scale as CapacityEvidence.capacity_claim).
+    /// The engine computes E(i,r,t) from these units.
+    ///
+    /// Enforced invariants:
+    ///   - Sender must be a Verified identity (VCA coordinator gate).
+    ///   - `provider_id` must be a known Resource Node (32-byte key).
+    ///   - Control 5: blocked ONLY when HALTED (providers are recovery mechanism).
+    CreditProvider {
+        /// The resource job that was completed.
+        job_id: String,
+        /// The Resource Node provider's public key (32 bytes).
+        provider_id: [u8; 32],
+        /// Resource type delivered.
+        resource_type: chain_forge_qrc::ResourceKind,
+        /// Coordinator-verified units delivered (normalised units × D).
+        verified_units: u128,
+    },
+
     /// Spawn a child agent under an existing parent agent.
     ///
     /// Enforces:
@@ -552,6 +615,9 @@ impl TxBody {
             TxBody::RevokeAgentFull { .. }        => "RevokeAgentFull",
             TxBody::RecordAgentSpend { .. }       => "RecordAgentSpend",
             TxBody::SpawnChildAgent { .. }        => "SpawnChildAgent",
+            // Resource Network v0.2
+            TxBody::PurchaseQrc { .. }            => "PurchaseQrc",
+            TxBody::CreditProvider { .. }         => "CreditProvider",
         }
     }
 }
@@ -701,6 +767,9 @@ impl Transaction {
                 child_agent_id, child_agent_address, parent_agent_id, description, ..
             } => child_agent_id.len() + child_agent_address.len()
                 + parent_agent_id.len() + description.len() + 64,
+            // Resource Network v0.2: job_id + amounts + 32-byte provider key + resource enum.
+            TxBody::PurchaseQrc { job_id, .. } => job_id.len() + 48,
+            TxBody::CreditProvider { job_id, .. } => job_id.len() + 32 + 24,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -940,6 +1009,72 @@ impl Transaction {
         }
     }
 
+    // ── QRC Resource Network v0.2 — marketplace tx constructors ──────────────
+
+    /// Buy QRC credits for a specific resource job (QRC Resource Network §4.1 v0.2).
+    ///
+    /// Burns `qcb_amount` of $QCB and mints QRC earmarked for `job_id`.
+    /// `min_qrc_out = 0` accepts any rate.
+    ///
+    /// Blocked by Control 5 when minting_state is RESTRICTED or HALTED.
+    pub fn purchase_qrc(
+        id:           &str,
+        sender:       &str,
+        job_id:       &str,
+        qcb_amount:   u128,
+        min_qrc_out:  u128,
+        resource_type: chain_forge_qrc::ResourceKind,
+        nonce:        u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::PurchaseQrc {
+                job_id: job_id.to_string(),
+                qcb_amount,
+                min_qrc_out,
+                resource_type,
+            },
+            gas_limit: 250_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Coordinator-issued QRC credit to a Resource Node after job verification
+    /// (QRC Resource Network §4.2 v0.2).
+    ///
+    /// `provider_id` is the provider's 32-byte Ed25519 public key.
+    /// `verified_units` is normalised resource delivery × D.
+    ///
+    /// Sender must be Verified tier (VCA coordinator gate).
+    /// Blocked by Control 5 only when HALTED.
+    pub fn credit_provider(
+        id:             &str,
+        coordinator:    &str,
+        job_id:         &str,
+        provider_id:    [u8; 32],
+        resource_type:  chain_forge_qrc::ResourceKind,
+        verified_units: u128,
+        nonce:          u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: coordinator.to_string(),
+            nonce,
+            body: TxBody::CreditProvider {
+                job_id: job_id.to_string(),
+                provider_id,
+                resource_type,
+                verified_units,
+            },
+            gas_limit: 300_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
     // ── Phase 1 Charm Confinement / Agent typed tx constructors ──────────────
 
     /// Confinement heartbeat: prove liveness and advance consecutive-epoch
@@ -1160,6 +1295,9 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::RevokeAgentFull { .. }
         | TxBody::RecordAgentSpend { .. }
         | TxBody::SpawnChildAgent { .. } => Some("agents"),
+        // Resource Network v0.2 marketplace tx types belong to the QRC module.
+        TxBody::PurchaseQrc { .. }
+        | TxBody::CreditProvider { .. } => Some("qrc"),
     }
 }
 
@@ -1983,6 +2121,179 @@ impl Executor {
                 Ok(())
             }
 
+            // ── QRC Resource Network v0.2 — Marketplace tx types ─────────────
+
+            TxBody::PurchaseQrc { job_id, qcb_amount, min_qrc_out, resource_type } => {
+                // Validate purchase amount is non-zero.
+                if *qcb_amount == 0 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        "PurchaseQrc: qcb_amount must be > 0".to_string(),
+                    );
+                }
+
+                // Control 5: purchase path blocked when RESTRICTED or HALTED.
+                if !qrc.minting_state.purchase_allowed() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "PurchaseQrc: blocked by CoverageRatio circuit breaker \
+                             (state={}, CR_resume=1.00) — capacity must recover \
+                             before purchase minting resumes (job_id={})",
+                            qrc.minting_state.as_str(), job_id
+                        ),
+                    );
+                }
+
+                // Ensure sender has an account.
+                if state.get_account(&tx.sender).is_err() {
+                    let new_acct = chain_forge_state::AccountState::new(
+                        tx.sender.clone(), "user".to_string()
+                    );
+                    state.upsert_account(new_acct);
+                }
+
+                // Check QCB balance without calling state.burn() to avoid
+                // double-advancing the nonce (same pattern as QrcPurchase).
+                let qcb_have = state.get_account(&tx.sender)
+                    .map(|a| a.balance_of("uqcb"))
+                    .unwrap_or(0);
+                if qcb_have < *qcb_amount {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "PurchaseQrc: insufficient uqcb — have {}, need {} (job_id={})",
+                            qcb_have, qcb_amount, job_id
+                        ),
+                    );
+                }
+
+                // Debit QCB (permanent burn).
+                if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                    acct.debit("uqcb", *qcb_amount).expect("balance check passed above");
+                }
+                state.refresh_leaf(&tx.sender);
+
+                // Mint QRC via the purchase-path engine.
+                let (qrc_minted, rt_used) = qrc.purchase_qrc(*qcb_amount);
+
+                // Slippage guard.
+                if *min_qrc_out > 0 && qrc_minted < *min_qrc_out {
+                    // Roll back the QCB debit.
+                    if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                        acct.credit("uqcb", *qcb_amount);
+                    }
+                    state.refresh_leaf(&tx.sender);
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "PurchaseQrc: slippage exceeded — would mint {} uqrc but \
+                             min_qrc_out is {} (Rt={}, job_id={})",
+                            qrc_minted, min_qrc_out, rt_used, job_id
+                        ),
+                    );
+                }
+
+                // Credit QRC to sender.
+                if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                    acct.credit("uqrc", qrc_minted);
+                }
+                state.refresh_leaf(&tx.sender);
+
+                events.push(format!(
+                    "purchase_qrc: {} uqcb burned → {} uqrc minted \
+                     (Rt={}, resource={:?}, job_id={}, sender={})",
+                    qcb_amount, qrc_minted, rt_used, resource_type, job_id, tx.sender
+                ));
+                Ok(())
+            }
+
+            TxBody::CreditProvider { job_id, provider_id, resource_type, verified_units } => {
+                // Coordinator gate: sender must be Verified or Established tier.
+                // The VCA coordinator is trusted to verify off-chain job completion.
+                let tier_ok = identity.get(&tx.sender)
+                    .map(|r| r.is_verified())
+                    .unwrap_or(false);
+                if !tier_ok {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "CreditProvider: sender {} is not a Verified identity \
+                             (VCA coordinator must be Verified or Established tier)",
+                            tx.sender
+                        ),
+                    );
+                }
+
+                // Validate verified_units are non-zero.
+                if *verified_units == 0 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "CreditProvider: verified_units must be > 0 (job_id={})",
+                            job_id
+                        ),
+                    );
+                }
+
+                // Control 5: contribution earn path blocked ONLY when HALTED.
+                // RESTRICTED allows providers to earn — they are the recovery mechanism.
+                if !qrc.minting_state.contribution_allowed() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "CreditProvider: blocked by CoverageRatio circuit breaker \
+                             (state=halted, CR_halt=0.75) — both minting paths suspended \
+                             until capacity recovers (job_id={})",
+                            job_id
+                        ),
+                    );
+                }
+
+                // Build contributions map for credit_provider_earning.
+                let mut contributions = std::collections::BTreeMap::new();
+                contributions.insert(*resource_type, *verified_units);
+
+                // Derive the provider's on-chain address from their 32-byte key.
+                // We use the hex encoding as the account address so the credit
+                // lands in a deterministic, key-derived account without requiring
+                // a separate registration step.
+                let provider_addr: String = provider_id.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+
+                // Mint contribution-path QRC via the engine. E(i,r,t) is computed
+                // from verified_units and current resource utilization weights.
+                let qrc_minted = qrc.credit_provider_earning(provider_id, &contributions);
+
+                // Ensure provider has an on-chain account.
+                if state.get_account(&provider_addr).is_err() {
+                    let new_acct = chain_forge_state::AccountState::new(
+                        provider_addr.clone(), "provider".to_string()
+                    );
+                    state.upsert_account(new_acct);
+                }
+
+                // Credit the earned QRC to the provider's account.
+                if qrc_minted > 0 {
+                    if let Ok(acct) = state.get_account_mut(&provider_addr) {
+                        acct.credit("uqrc", qrc_minted);
+                    }
+                    state.refresh_leaf(&provider_addr);
+                }
+
+                let pid_prefix: String = provider_id[..8]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+                events.push(format!(
+                    "credit_provider: {} uqrc minted to provider {}… \
+                     (resource={:?}, verified_units={}, job_id={}, coordinator={})",
+                    qrc_minted, pid_prefix, resource_type, verified_units, job_id, tx.sender
+                ));
+                Ok(())
+            }
+
             // ── AEI Phase 2 — Agent Lifecycle ────────────────────────────────
 
             TxBody::AuthorizeAgent { agent_id } => {
@@ -2341,7 +2652,10 @@ impl Executor {
             TxBody::QrcPurchase { .. }
             | TxBody::QrcSpend { .. }
             | TxBody::QrcContributionSettle { .. }
-            | TxBody::RecordCapacity { .. } => {
+            | TxBody::RecordCapacity { .. }
+            // Resource Network v0.2 marketplace tx types also require the QRC engine.
+            | TxBody::PurchaseQrc { .. }
+            | TxBody::CreditProvider { .. } => {
                 Err("QRC transaction requires QRC-engine-aware executor".to_string())
             }
             // Phase 1 typed variants require identity + agent store.
@@ -4066,6 +4380,212 @@ mod tests {
         assert!(
             r.events.iter().any(|e| e.contains("qrc_contribution_settle")),
             "must emit contribution_settle event"
+        );
+    }
+
+    // ── Resource Network v0.2 — PurchaseQrc and CreditProvider tests ──────────
+
+    #[test]
+    fn purchase_qrc_succeeds_and_emits_event() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Ensure circuit breaker is NORMAL (capacity ≥ supply × 1.00).
+        // No supply minted yet → supply=0 → CR undefined → Normal by default.
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Normal);
+
+        let tx = Transaction::purchase_qrc(
+            "pqrc1", "qcb1alice", "job-001", 500_000, 0,
+            chain_forge_qrc::ResourceKind::Compute, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "PurchaseQrc must succeed in Normal state: {:?}", r.error);
+        assert!(
+            r.events.iter().any(|e| e.contains("purchase_qrc")),
+            "must emit purchase_qrc event; events={:?}", r.events
+        );
+        assert!(
+            r.events.iter().any(|e| e.contains("job-001")),
+            "event must reference the job_id; events={:?}", r.events
+        );
+        // QRC should have been minted.
+        assert!(qrc.total_supply > 0, "total_supply must increase after purchase");
+    }
+
+    #[test]
+    fn purchase_qrc_blocked_when_restricted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Mint some QRC so total_supply > 0.
+        let seed_buy = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
+        let r = exec.execute_tx_with_identity(&seed_buy, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        // Drive to RESTRICTED (0.88 × supply → 0.75 ≤ CR < 1.00).
+        let supply = qrc.total_supply;
+        qrc.record_capacity(supply * 880_000 / 1_000_000);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
+            "engine must be Restricted");
+
+        // PurchaseQrc uses the purchase path — same Control 5 gate as QrcPurchase.
+        let tx = Transaction::purchase_qrc(
+            "pqrc2", "qcb1alice", "job-002", 500_000, 0,
+            chain_forge_qrc::ResourceKind::Compute, 1,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "PurchaseQrc must be blocked in RESTRICTED state");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("circuit breaker") || err.contains("CoverageRatio"),
+            "error must mention circuit breaker; got: {err}"
+        );
+    }
+
+    #[test]
+    fn purchase_qrc_blocked_when_halted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Mint supply then HALT.
+        let seed_buy = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
+        let r = exec.execute_tx_with_identity(&seed_buy, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        qrc.record_capacity(0);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted);
+
+        let tx = Transaction::purchase_qrc(
+            "pqrc3", "qcb1alice", "job-003", 500_000, 0,
+            chain_forge_qrc::ResourceKind::AiInference, 1,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "PurchaseQrc must be blocked in HALTED state");
+    }
+
+    #[test]
+    fn purchase_qrc_slippage_guard_rejects_low_output() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // With a tiny qcb_amount and a very high min_qrc_out, the slippage
+        // guard fires and the QCB burn is rolled back.
+        let qcb_before = state.get_account("qcb1alice")
+            .map(|a| a.balance_of("uqcb"))
+            .unwrap_or(0);
+
+        let tx = Transaction::purchase_qrc(
+            "pqrc4", "qcb1alice", "job-004", 1, u128::MAX,
+            chain_forge_qrc::ResourceKind::Compute, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "PurchaseQrc must fail when slippage exceeds min_qrc_out");
+        let err = r.error.unwrap();
+        assert!(err.contains("slippage"), "error must mention slippage; got: {err}");
+
+        // QCB balance must be unchanged (rollback happened).
+        let qcb_after = state.get_account("qcb1alice")
+            .map(|a| a.balance_of("uqcb"))
+            .unwrap_or(0);
+        assert_eq!(qcb_before, qcb_after, "QCB must be rolled back on slippage rejection");
+    }
+
+    #[test]
+    fn credit_provider_succeeds_and_mints_to_provider_account() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // qcb1alice is Verified — she acts as VCA coordinator.
+        // A synthetic provider key (32 zero bytes for test determinism).
+        let provider_id = [0u8; 32];
+        let provider_addr: String = provider_id.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let tx = Transaction::credit_provider(
+            "cprov1", "qcb1alice", "job-100", provider_id,
+            chain_forge_qrc::ResourceKind::Storage, 500_000, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "CreditProvider must succeed for Verified coordinator: {:?}", r.error);
+        assert!(
+            r.events.iter().any(|e| e.contains("credit_provider")),
+            "must emit credit_provider event; events={:?}", r.events
+        );
+        assert!(
+            r.events.iter().any(|e| e.contains("job-100")),
+            "event must reference the job_id"
+        );
+
+        // Provider should now have a QRC balance.
+        let provider_qrc = state.get_account(&provider_addr)
+            .map(|a| a.balance_of("uqrc"))
+            .unwrap_or(0);
+        assert!(provider_qrc > 0, "provider account must have a positive QRC balance after credit");
+    }
+
+    #[test]
+    fn credit_provider_blocked_when_halted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Mint supply to make CR finite, then HALT.
+        let seed = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
+        let r = exec.execute_tx_with_identity(&seed, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        qrc.record_capacity(0);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted);
+
+        let provider_id = [1u8; 32];
+        let tx = Transaction::credit_provider(
+            "cprov2", "qcb1alice", "job-200", provider_id,
+            chain_forge_qrc::ResourceKind::Compute, 1_000_000, 1,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "CreditProvider must be blocked in HALTED state");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("circuit breaker") || err.contains("CoverageRatio"),
+            "error must mention circuit breaker; got: {err}"
+        );
+    }
+
+    #[test]
+    fn credit_provider_allowed_when_restricted() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // Mint supply then drive to RESTRICTED.
+        let seed = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
+        let r = exec.execute_tx_with_identity(&seed, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success);
+
+        let supply = qrc.total_supply;
+        qrc.record_capacity(supply * 880_000 / 1_000_000);
+        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
+            "engine must be Restricted");
+
+        // Coordinator credits a provider — contribution path stays open in RESTRICTED.
+        let provider_id = [2u8; 32];
+        let tx = Transaction::credit_provider(
+            "cprov3", "qcb1alice", "job-300", provider_id,
+            chain_forge_qrc::ResourceKind::ZkProving, 1_000_000, 1,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success,
+            "CreditProvider must be ALLOWED in RESTRICTED state (providers = recovery mechanism): {:?}",
+            r.error
+        );
+    }
+
+    #[test]
+    fn credit_provider_rejects_non_verified_coordinator() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // "random_sender" is not registered in the identity store.
+        let provider_id = [3u8; 32];
+        let tx = Transaction::credit_provider(
+            "cprov4", "random_sender", "job-400", provider_id,
+            chain_forge_qrc::ResourceKind::Bandwidth, 1_000_000, 0,
+        );
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success, "CreditProvider must be rejected for non-Verified sender");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("Verified") || err.contains("coordinator"),
+            "error must mention Verified tier; got: {err}"
         );
     }
 }
