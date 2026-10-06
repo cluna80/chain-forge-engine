@@ -42,6 +42,22 @@ None of these are unsolved because physicists are not smart enough. They are uns
 
 QCB is building it — not as a product, but as a protocol-layer public good that belongs to no one organization and can be governed away from no one's control.
 
+The Name Is the Mission
+
+The Large Hadron Collider is the largest, most complex scientific instrument humanity has ever built. Thousands of scientists, dozens of countries, decades of construction — all pointed at the smallest things in existence. It found the Higgs boson. It mapped quark-gluon behavior at energies no other machine could reach. It answered questions that had been open for fifty years.
+
+But the LHC is centralized. CERN owns it. A handful of institutions control what gets studied. The data is vast but the governance is narrow. No individual scientist, no matter how brilliant, votes on what problem the collider works on next.
+
+QCB is the decentralized version of that ambition — not a physical collider, but a computational one. Instead of accelerating particles, it accelerates verified human and machine intelligence toward the hardest open problems. Instead of CERN governance, it has on-chain governance where every verified human has a voice in which challenges get activated next. Instead of a single facility in Geneva, it is distributed across machines worldwide — every one of them attested, every result verified, every discovery hash-committed on a ledger no single institution controls.
+
+The name carries that weight deliberately:
+
+· Quark — the smallest known constituent of matter; the frontier of what physics has reached
+· Charm — a quark flavor; and the agent coordination layer that directs work across the network
+· Bit — the fundamental unit of computation; what every machine in the network contributes
+
+QuarkCharmBit is not a name chosen for memorability. It is a statement of what the network intends to become: the first decentralized scientific instrument — a blockchain LHC, built from the ground up, owned by no one, and pointed at the hardest problems mankind has ever tried to solve.
+
 ---
 
 Equilibrium State: When the Network Becomes Alive
