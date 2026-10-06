@@ -44,6 +44,37 @@ QCB is building it — not as a product, but as a protocol-layer public good tha
 
 ---
 
+Equilibrium State: When the Network Becomes Alive
+
+Reaching equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. No single moment marks it. But there is a point at which the network stops being something that requires active maintenance to stay alive and becomes something that sustains itself.
+
+QCB defines Equilibrium State as the condition where:
+
+· The validator set is large and geographically distributed enough that no regional outage, no coordinated departure, and no single bad actor can halt block production or reverse finality
+· The machine population is deep enough that every active Grand Challenge track has sufficient independent verifier machines to confirm results without any track going dark for lack of participants
+· The resource market has enough competing providers that no provider or cartel can price-fix QRC or starve agents of capacity
+· The anti-farming defenses have been battle-tested under real adversarial load and the contribution score is trustworthy enough to govern uQCB distributions without manual oversight
+· The governance participation rate is high enough that protocol votes reflect the network's actual human base, not a mobilized minority
+
+How long this takes is honest: years, not months. Bitcoin took years to harden. Ethereum took years to reach the validator count where its consensus felt genuinely robust. QCB accepts the same timeline. The difference is that QCB's architecture is designed for equilibrium from the first block — the MachineID registry, the ResourceExecutionReceipt accountability layer, the Grand Challenge tracks, the hard safety boundary — none of these are retrofits. They are load-bearing from day one, so that when the network reaches scale, the capability is already there.
+
+What the Network Can Do Above Equilibrium That It Cannot Do Below It
+
+Below equilibrium, the Grand Challenge is a research layer with limited throughput. Results take longer to verify. Fewer tracks can run simultaneously. The physics problems — the ones that require thousands of parallel verified runs — are out of reach.
+
+Above equilibrium, the picture changes:
+
+· Multiple Grand Challenge tracks run simultaneously with full independent verifier coverage
+· Lattice QCD simulations, many-body quantum system modeling, and cosmological structure formation become tractable because the coordinated whole is large enough — not because any individual machine got faster
+· Discovery throughput increases: more machines in Contribution Mode means more parallel work, more verifications per day, faster iteration on hard problems
+· The network becomes genuinely self-healing: machines leave and rejoin without disrupting ongoing research jobs, because the redundancy is deep enough to absorb churn
+
+This is what no other blockchain can offer. Other chains offer decentralized finance, decentralized applications, decentralized storage. QCB — at equilibrium — offers decentralized scientific discovery: verifiable, accountable, governed by the humans who built and operate it, pointed at problems that matter to all of them.
+
+The scale required is large. The timeline is long. Both facts are stated here plainly, because the vision is only worth building toward if the foundation is honest about what it takes to get there.
+
+---
+
 1. What QCB Is
 
 QCB Chain is a from-scratch Layer-1 blockchain, built on Chain Forge — a purpose-built Rust blockchain engine — rather than an existing chain framework. It provides four things no general-purpose chain offers natively, together, at the protocol layer:
