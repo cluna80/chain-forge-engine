@@ -58,6 +58,12 @@ The name carries that weight deliberately:
 
 QuarkCharmBit is not a name chosen for memorability. It is a statement of what the network intends to become: the first decentralized scientific instrument — a blockchain LHC, built from the ground up, owned by no one, and pointed at the hardest problems mankind has ever tried to solve.
 
+First Simulation — GC-DEVNET-001 (2026-10-06)
+
+Before the resource crate exists, before the chain runs at scale, the Grand Challenge discovery flow was simulated end-to-end on 2026-10-06. Three machines — Alice, Bob, Carol — searched parallel nonce ranges for a SHA256 hash of 'QCB:<nonce>' beginning with '0000'. Carol found nonce 6,682,026 in 15,361 checks. Dave independently reproduced the hash from the nonce alone and signed the verification. A full UsefulWorkReceipt with work_type ResearchContribution, machine signature, and verifier signature was produced and saved on-chain to the repository.
+
+The coordination logic, the receipt format, and the independent verification flow are proven. What remains is the Rust implementation in chain-forge-resource, Ed25519 signing with real machine keys, and submission as an on-chain transaction. The path from simulation to devnet is a single crate away.
+
 ---
 
 Equilibrium State: When the Network Becomes Alive

@@ -1,0 +1,17 @@
+{
+  "receipt_id": "REC-GC-DEVNET-001-MACH-CAROL-003-6682026",
+  "challenge_id": "GC-DEVNET-001",
+  "work_type": "ResearchContribution",
+  "machine_id": "MACH-CAROL-003",
+  "input_hash": "000050f191ffc75beea3eda52095cb28da8028646673e4e159f88ca864c22b72",
+  "output_hash": "000050f191ffc75beea3eda52095cb28da8028646673e4e159f88ca864c22b72",
+  "methodology_ref": "SHA256 sequential nonce search; target prefix '0000'; input format 'QCB:<nonce>'",
+  "nonce": 6682026,
+  "checks_performed": 15361,
+  "elapsed_seconds": 0.0403,
+  "timestamp_utc": "2026-10-06T21:51:57Z",
+  "signature": "3bf8f8a3406c655ce8ba351529c501fa7d23732382afcc13df0f15001b0e3969",
+  "verified": true,
+  "verifier_id": "MACH-DAVE-VERIFIER-004",
+  "verifier_signature": "3afb1c7381500c4c467e0e3f0000c5c8c3afb77bc46b79ff13489ec3925e3815"
+}

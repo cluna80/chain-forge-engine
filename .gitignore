@@ -1,6 +1,7 @@
 ﻿/target
 *.py
 !cirfi_sim/*.py
+!grand-challenge/simulations/*.py
 qcb-genesis.json
 Cargo.lock
 

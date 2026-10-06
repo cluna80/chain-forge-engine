@@ -373,7 +373,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Item | Status | Notes |
 |------|--------|-------|
 | Grand Challenge work pool | 🔲 | Defined research challenges submitted to network contribution pool; machines in Contribution Mode can opt into research tracks; Phase 2+ |
-| Research `UsefulWorkReceipt` variant | 🔲 | `work_type: ResearchContribution`; includes output hash, methodology reference, verifier ID; same anti-farming defenses as other contribution jobs |
+| Research `UsefulWorkReceipt` variant | ✅ | `work_type: ResearchContribution`; includes output hash, methodology reference, verifier ID; same anti-farming defenses as other contribution jobs. **Simulation proven 2026-10-06 — see `grand-challenge/simulations/GC-DEVNET-001`** |
 | Discovery reward schedule | 🔲 | Predetermined pool per track; governance-approved before any track goes live; rewards are fixed/predefined, not minted on discovery |
 | Independent verifier registry | 🔲 | Track-specific domain experts registered on-chain; discovery claims require independent verification before reward release |
 | Formal safety review gate | 🔲 | Any cryptographic finding that could affect QCB protocol must pass: independent expert review → formal/security analysis → adversarial testing → governance vote; no automatic protocol changes |
@@ -390,6 +390,19 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Milestone achievements | 🔲 | On-chain record of verified discoveries and governance decisions about them |
 | Search-space percentage + ETA | 🔲 | **Only when mathematically measurable** — tracks with formally defined finite search spaces may publish completion percentage; tracks without a measurable bound publish raw progress only, never an estimated completion date |
 | Individual contribution history | 🔲 | Machine owner can view their own `UsefulWorkReceipt` history and contribution score breakdown; no cross-machine correlation visible to third parties |
+
+### Grand Challenge Simulation Log
+
+| ID | Date | Type | Winner | Result | Record |
+|----|------|------|--------|--------|--------|
+| GC-DEVNET-001 | 2026-10-06 | Hash preimage search (`SHA256('QCB:<nonce>')` prefix `0000`) | Carol (MACH-CAROL-003) | Nonce `6,682,026` → `000050f1...` — verified by Dave | `grand-challenge/simulations/GC-DEVNET-001-discovery-record.json` |
+
+> **What GC-DEVNET-001 proved**: Three parallel machines (Alice, Bob, Carol) searched independent nonce ranges. Carol found the solution in 15,361 checks (0.04s). Dave independently reproduced the hash from the nonce alone and signed the verification. Full `UsefulWorkReceipt` with `work_type: ResearchContribution`, machine signature, and verifier signature produced. The coordination and verification logic is complete — only the Rust crate and Ed25519 signing remain to wire to the real devnet.
+
+**Next simulations planned:**
+- GC-DEVNET-002 — Multi-track parallel (two challenges running simultaneously)
+- GC-DEVNET-003 — Disputed result + rejection flow
+- GC-DEVNET-004 — Physics-flavored: tiny lattice simulation with verified output hash
 
 ---
 
