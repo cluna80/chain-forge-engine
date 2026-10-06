@@ -86,10 +86,10 @@
 | `chain-forge-resource` crate scaffold | ⬜ | New workspace crate; `ResourceOffer`, `ResourceRequest`, `ResourceMatch`, `ResourceJob`, `ResourceReceipt`, `ResourceMeter`, `ResourceProof`, `ResourceSettlement` |
 | `ResourceCapabilityDescriptor` | ⬜ | Standardized vocabulary: `kind`, `architecture`, `cpu_cores`, `memory_bytes`, `gpu_model`, `gpu_memory`, `storage_bytes`, `bandwidth`, `runtime_types`, `price`, `max_job_duration`; agents use this to intelligently choose providers |
 | `ResourceJob` state machine | ⬜ | States: `CREATED → FUNDED → MATCHED → RUNNING → (COMPLETED / FAILED) → (VERIFIED / REFUND) → SETTLED`; plus `DISPUTED → RESOLUTION` branch; state machine must have room for future decentralized arbitration |
-| `ResourceExecutionReceipt` | ⬜ | Evolves from `CapacityEvidence_v0`; fields: `job_id`, `provider_id`, `requester_agent_id`, `resource_type`, `requested_units`, `measured_units`, `started_at`, `finished_at`, `input_hash`, `output_hash`, `provider_signature`, `requester_confirmation`, `verification_status` |
+| `ResourceExecutionReceipt` | ⬜ | Evolves from `CapacityEvidence_v0`; fields: `job_id`, `provider_id`, **`machine_id`**, `requester_agent_id`, `resource_type`, `requested_units`, `measured_units`, `started_at`, `finished_at`, `input_hash`, `output_hash`, `provider_signature`, `requester_confirmation`, `verification_status`; `machine_id` is essential later when one ProviderID covers many machines — you need to know which physical resource did the work |
 | P2P resource discovery | ⬜ | Agents broadcast `ResourceRequest` over libp2p gossip; providers respond with `ResourceOffer`; live availability stays off-chain; only economically important commitments/results go on-chain |
 | QRC escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ⬜ | Agent locks QRC before job starts; provider receives only on verified completion; refund path for failure/timeout; `DisputeResourceJob` stub for Phase 1 |
-| `ResourceNode` prototype (Machine 2) | ⬜ | Machine 2 (Carol) advertises: `ProviderID`, `SponsorID`, `NodeID`, resource capabilities, `container_execution` + `python_execution` runtime types, availability, price, location/latency region, resource limits |
+| `ResourceNode` prototype (Machine 2) | ⬜ | Machine 2 (Carol) advertises: `ProviderID`, `SponsorID`, **`MachineID`**, resource capabilities, `container_execution` + `python_execution` runtime types, availability, price, location/latency region, resource limits |
 | Secure workload sandbox (container) | ⬜ | Resource providers cannot execute arbitrary agent code on bare host; Docker/container prototype for Phase 0; note: production hostile multi-tenant workloads need stronger isolation — containers are a Phase 0 approximation only |
 | Job cancellation / failure / timeout handling | ⬜ | Explicit handling for: provider disappear mid-job, agent sends invalid workload, connection fails, provider produces wrong output, agent falsely claims failure, provider claims completion but result is unusable |
 
@@ -100,6 +100,8 @@
 | Item | Status | Notes |
 |------|--------|-------|
 | `AgentID` + `SponsorID` linkage primitive | ⬜ | `MachineID → ProviderID → SponsorID` for resource nodes; one verified human can operate multiple machines; machines have cryptographic identities tracing to human SponsorID |
+| **`MachineID` formalization** | ⬜ | `MachineRecord { machine_id, provider_id, owner: ProviderOwner, attestation_key, capability_descriptor, status }`; `MachineAttestationKey` is a separate signing key from the provider's identity key; `MachineStatus` (Active / Inactive / Suspended) |
+| **`ProviderOwner` enum** | ⬜ | `enum ProviderOwner { Individual(SponsorId), Enterprise(EnterpriseId) }` — Phase 0 uses `Individual(Carol)`; Phase 1 adds `Enterprise(Acme)` without ripping apart `ResourceJob`, escrow, reputation, or discovery; **define the enum now so Phase 0 code doesn't hard-assume `provider.sponsor_id` is the only ownership structure forever** |
 | `AgentTreasury` primitive | ⬜ | `{agent_id, sponsor_id, balance, daily_limit, per_job_limit, allowed_resource_types}`; Alice deposits QRC; agent can spend ≤ per_job_limit; agent cannot withdraw to arbitrary account |
 | `CapabilitySet` + `SpendingLimits` | ⬜ | Agent cannot exceed sponsor's authorization; Charm Confinement enforcement begins here |
 | `RevenuePolicy` primitive | ⬜ | Configurable destination for agent revenue; e.g. `Sponsor: 30% / AgentTreasury: 60% / Reserve: 10%`; successful service settles automatically |
@@ -201,6 +203,53 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Multi-provider resource discovery | ⬜ | Agent broadcasts `ResourceRequest`; multiple `ResourceOffer` responses ranked by price + reputation; agent selects |
 | Provider-identity → SponsorID tracing | ⬜ | `MachineID → ProviderID → SponsorID`; one human can operate N resource nodes legitimately; prevents sybil inflation of reputation |
 | Sandboxed workload hardening | ⬜ | Move beyond basic container toward resource-limit enforcement (CPU, RAM, disk, network policy, runtime cap); document that Docker is a Phase 0 approximation |
+| Machine-level reputation → Provider-level reputation aggregation | ⬜ | Reputation tracks at the machine level first; aggregated up to ProviderID; extends cleanly to EnterpriseID in Phase 1 without redesign |
+
+### Enterprise Authorization Tree — EAT-v0
+
+> **What this is**: An optional organizational layer that sits between verified humans and enterprise-controlled resources. `EnterpriseID` does not replace `SponsorID`, `MachineID`, `ProviderID`, or `AgentID` — it becomes a container above them for resources operated by organizations. Every enterprise-controlled machine or agent must resolve through an authorization path to at least one active verified `SponsorID`.
+>
+> **Identity hierarchy**:
+> ```
+>               VERIFIED HUMAN
+>                  SponsorID
+>                      │
+>        ┌─────────────┴─────────────┐
+>        │                           │
+> Individual Path             Enterprise Path
+>        │                           │
+>        │                    EnterpriseID
+>        │                           │
+>   ┌────┴────┐               ┌─────┴──────┐
+>   │         │               │            │
+> AgentID  MachineID       AgentID      MachineID
+>              │                           │
+>          ProviderID                  ProviderID
+>              └──────────┬────────────────┘
+>                         │
+>                   ResourceOffer
+>                         │
+>                   ResourceJob
+>                         │
+>          ResourceExecutionReceipt
+>                         │
+>                    QRC Settlement
+> ```
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `EnterpriseID` primitive | ⬜ | Organization container; does not replace SponsorID |
+| `ControllerBinding` | ⬜ | Connects one or more verified human `SponsorID`s to an `EnterpriseID`; every enterprise resource traces to at least one active human controller |
+| `EnterpriseCapabilitySet` | ⬜ | Limits what each controller can authorize within the enterprise |
+| `ResourcePool` | ⬜ | Groups multiple enterprise `MachineID`s under one `EnterpriseID`; agents purchase from the pool, not individual machines |
+| Enterprise → `MachineID` binding | ⬜ | `ProviderOwner::Enterprise(EnterpriseId)` activated (Phase 0 defines the enum; Phase 1 activates this variant) |
+| Enterprise → `AgentID` binding | ⬜ | Corporate agents sponsored by enterprise rather than individual `SponsorID` |
+| Controller revocation | ⬜ | An `EnterpriseID` controller can be removed; remaining controllers must still satisfy minimum `SponsorID` accountability |
+| Authorization subtree freeze | ⬜ | Emergency halt for a compromised enterprise authorization tree |
+| Enterprise reputation aggregation | ⬜ | Machine reputation → ProviderID reputation → enterprise resource reputation (separate track from individual human controller reputation) |
+| `PersonhoodMultisig` | ⬜ | M-of-N verified human controllers required to authorize high-value enterprise operations; implement *after* basic `EnterpriseID → ControllerBinding → CapabilitySet` works |
+
+> **Not in Phase 1**: corporate legal verification, incorporation documents, jurisdiction, tax status — those belong to the `Enterprise → Organization Attestation → Legal/KYC/RWA compliance` layer, which arrives with the Phase 5+ permissioned EVM and RWA work.
 
 ### Agent Economic Identity — Phase 1 Extension
 
@@ -299,7 +348,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 4. **`AgentTreasury` + `AgentID`/`SponsorID` primitives** — minimum needed to run the Phase 0 acceptance test; Alice can fund an agent treasury; agent cannot exceed `per_job_limit`; agent cannot withdraw to arbitrary account.
 
-5. **`ResourceExecutionReceipt`** — evolve `CapacityEvidence_v0` toward the receipt model; provider signs receipt on job completion; requester confirms; verification triggers escrow release.
+5. **`MachineID` + `ProviderOwner` + `ResourceExecutionReceipt`** — formalize `MachineRecord` and `ProviderOwner { Individual(SponsorId), Enterprise(EnterpriseId) }` while building the first resource types (don't wait — this small abstraction prevents a major refactor later); then evolve `CapacityEvidence_v0` into `ResourceExecutionReceipt` adding `machine_id` field; provider signs receipt on job completion; requester confirms; verification triggers escrow release.
 
 6. **Sandboxed container execution on Machine 2** — Docker-based prototype; Carol's resource node executes submitted workloads inside a container with CPU/RAM limits; returns result + receipt.
 
