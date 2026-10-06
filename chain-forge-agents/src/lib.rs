@@ -23,6 +23,8 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
+pub mod matchmaking;
+
 // -- Error --------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +87,12 @@ pub enum AgentCapability {
     ReadState,
     /// Execute RWA settlement transactions (Section 8.2, Phase 5+).
     RwaSettlement,
+    /// Purchase compute from a resource node via the resource market.
+    /// Locks QRC in escrow; released on verified job completion.
+    BuyCompute,
+    /// Contribute work to a governance-voted Grand Challenge.
+    /// A machine-side capability: the machine's agent registers contributions.
+    ContributeToChallenge,
 }
 
 impl AgentCapability {
@@ -99,6 +107,7 @@ impl AgentCapability {
             self,
             Self::MerchantSettlement | Self::UbiDistribution
             | Self::HoldBalance | Self::Transfer | Self::ReadState
+            | Self::BuyCompute | Self::ContributeToChallenge
         )
     }
 }
@@ -114,6 +123,8 @@ impl std::fmt::Display for AgentCapability {
             Self::SpawnChildAgent       => write!(f, "SpawnChildAgent"),
             Self::ReadState             => write!(f, "ReadState"),
             Self::RwaSettlement         => write!(f, "RwaSettlement"),
+            Self::BuyCompute            => write!(f, "BuyCompute"),
+            Self::ContributeToChallenge => write!(f, "ContributeToChallenge"),
         }
     }
 }

@@ -23,6 +23,7 @@ license.workspace = true
 [dependencies]
 chain-forge-core     = { path = "../chain-forge-core" }
 chain-forge-identity = { path = "../chain-forge-identity" }
+chain-forge-resource = { path = "../chain-forge-resource" }
 serde                = { workspace = true }
 serde_json           = { workspace = true }
 thiserror            = { workspace = true }
