@@ -251,6 +251,74 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 > **Not in Phase 1**: corporate legal verification, incorporation documents, jurisdiction, tax status — those belong to the `Enterprise → Organization Attestation → Legal/KYC/RWA compliance` layer, which arrives with the Phase 5+ permissioned EVM and RWA work.
 
+### Dual Resource Participation — Machine Modes
+
+> **What this is**: A machine running a QCB Resource Node is not required to sell capacity to commercial customers. It can contribute capacity directly to QCB network infrastructure instead — or do both simultaneously, subject to the owner's policy.
+
+```
+                         MACHINE
+                            │
+                ┌───────────┴───────────┐
+                │                       │
+         MARKETPLACE MODE        CONTRIBUTION MODE
+                │                       │
+       Customer workloads         Network workloads
+                │                       │
+       QRC compensation          Contribution credit
+                │                       │
+                └───────────┬───────────┘
+                            │
+                   UsefulWorkReceipt
+                            │
+                       Reputation
+                            │
+                  uQCB eligibility
+```
+
+> Machines can run both modes simultaneously. Owner policy controls resource allocation, hours, and which modes are active.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `MachineMode` flag on `MachineRecord` | ⬜ | `enum MachineMode { MarketplaceOnly, ContributionOnly, Both }`; persisted in machine registration |
+| Machine owner resource policy | ⬜ | Owner declares: GPU%, storage TB, bandwidth Mbps, hours window, allowed modes; respected by resource node at runtime |
+| `NetworkContributionJob` type | ⬜ | QCB-assigned workload submitted to a machine in Contribution Mode; structured as a well-defined task with verifiable output (storage proof, compute proof, etc.) — not open-ended execution |
+| `UsefulWorkReceipt` | ⬜ | Receipt for a completed `NetworkContributionJob`; shares shape with `ResourceExecutionReceipt` (job_id, machine_id, work_type, proof, verification_status) but payer is the QCB network contribution pool, not a customer agent; a `receipt_type` field distinguishes the two — avoid two entirely separate receipt types |
+| Network Contribution Pool coordinator | ⬜ | Assigns `NetworkContributionJob`s to available machines in Contribution Mode; defines what work is legitimately available; must be decentralized in Phase 2+ |
+
+### Useful Contribution / uQCB — Verified Network Work
+
+> **Economic rule**: machines earn contribution credit only for completing assigned, verifiable network work — not merely for being online. The flow is:
+> ```
+> machine online → capacity available → network assigns useful work
+>   → machine completes work → cryptographic proof/receipt
+>   → UsefulWorkReceipt → Contribution Score → uQCB epoch eligibility
+> ```
+> This is structurally different from a fake-customer self-dealing attack. The network itself has a legitimate need for the resource; the machine fulfills a real assigned task; an objective cryptographic proof demonstrates completion.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Contribution Score primitive | ⬜ | Per-machine tally of verified `UsefulWorkReceipt`s within an epoch; decays for inactivity; weighted by work type difficulty/verifiability |
+| uQCB epoch distribution | ⬜ | Predefined scarce QCB contribution pool distributed each epoch to machines above a Contribution Score threshold; **pool is fixed/predefined — uQCB is not newly minted QRC**; keeps uQCB separate from consensus entirely |
+| Contribution pool supply schedule | ❓ | **Open Q**: total pool size, epoch allocation rate, decay/halving schedule; must be defined before any uQCB distribution goes live |
+| Contribution Mode ↔ QRC settlement distinction | ⬜ | Commercial work (customer agent → QRC payment) and protocol contribution (network job → contribution credit) are distinct flows; QRC is not automatically issued for idle capacity or contribution-mode work; clarify whether certain protocol jobs can also earn QRC in Phase 2+ |
+| Self-dealing guard for Contribution Mode | ⬜ | Owner cannot submit jobs to their own machine from the contribution pool; pool coordinator must assign work independently |
+
+### Anti-Farming Architecture
+
+> Before uQCB distribution goes live, the following defenses must all be in place. None of these are optional — any one missing creates a farming vector.
+
+| Defense | Status | Notes |
+|---------|--------|-------|
+| SponsorID verification required | ⬜ | Machine must trace to a verified human `SponsorID` before Contribution Mode is active; unverified machines cannot earn contribution credit |
+| `MachineID` uniqueness enforcement | ⬜ | One `MachineID` per physical machine; attestation key bound at registration; cannot register multiple `MachineID`s from the same hardware fingerprint |
+| Execution receipts (not heartbeats) | ⬜ | Contribution credit requires `UsefulWorkReceipt` proving work completed — being online earns nothing |
+| Self-dealing detection | ⬜ | Machine's owner cannot be the entity assigning network jobs to that machine; coordinator independence required |
+| Consumer diversity requirement | ⬜ | Reputation and contribution credit must reflect work for independent parties — not circular self-transactions |
+| Resource proofs (not claims) | ⬜ | Storage: possession proofs over time (e.g., challenge-response on stored shards); compute: output hash + timing verifiable against known benchmark; bandwidth: relay measurement by independent nodes |
+| Reliability scoring | ⬜ | Machines that accept jobs and fail to deliver are penalized in Contribution Score; serial failure triggers `MachineStatus::Suspended` |
+| Integrity scoring | ⬜ | Tampered outputs, forged proofs, or disputed receipts reduce contribution score; extreme cases trigger SponsorID-level review |
+| Contribution Score gate before uQCB eligibility | ⬜ | Epoch distribution requires score above minimum threshold; newly registered machines cannot immediately claim distribution |
+
 ### Agent Economic Identity — Phase 1 Extension
 
 | Item | Status | Notes |
@@ -276,6 +344,51 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | `CreditProvider` / `QrcContributionSettle` — resolve or retire | ❓ | If contribution-minting is confirmed retired: deprecate these tx types; if a narrow minting path survives, redesign it around the escrow-release model, not coordinator-issued credits |
 | Settlement layer cold-start reserve (Open Q22) | ❓ | Who funds initial reserves; legal form |
 | Settlement rate regime (Open Q19) | ❓ | Fixed / floating / managed float |
+
+---
+
+## QCB Grand Challenge — Long-Term Distributed Research Compute
+
+> **What this is**: When commercial demand is absent, voluntarily contributed QCB resources can be directed toward objectively verifiable computational challenges intended to advance cryptography, mathematics, computational efficiency, and machine-assisted discovery. This is not consensus. Personhood-anchored BFT remains solely responsible for block production and finality. The Grand Challenge and network contribution sit above consensus as productive economic and research layers.
+>
+> **Long-term research principle**: QCB does not ask machines to compute meaningless hashes. When machines contribute capacity to the network, that capacity is directed toward useful, objectively verifiable work — including research challenges with real scientific or cryptographic value.
+>
+> **Safety boundary** (hard constraint): Discoveries never automatically change QCB protocol behavior. Any finding that could affect protocol cryptography must pass independent expert review, formal security analysis, adversarial testing, and explicit QCB governance approval before it influences any protocol parameter. Research and governance are entirely separate.
+
+### Grand Challenge Tracks
+
+| Track | Description | Verification method |
+|-------|-------------|---------------------|
+| Constructive / post-quantum cryptography | Finding new PQ candidates, analyzing existing schemes, searching for parameter weaknesses | Peer review + formal proof; independent cryptographer validation |
+| Privacy | ZK circuit optimization, proof system improvements, privacy-preserving computation research | Benchmark against known baselines; formal verification where applicable |
+| Computational efficiency | Algorithm improvements for QCB-relevant operations (hashing, proof generation, state trie ops) | Reproducible benchmark; independently confirmed speedup |
+| Verifiable mathematical research | Formally specified open problems with objective pass/fail criteria (e.g., known search spaces, conjectured bounds) | Formal verification tool output; mathematical proof |
+| AI-assisted computational discovery | Privacy-safe network telemetry analysis, capacity/demand modeling, protocol parameter research | Methodology review; reproducibility; no personal data |
+
+### Proof of Useful Discovery
+
+> Machines earn contribution credit for objectively verifiable research work, following the same `UsefulWorkReceipt` flow as other Network Contribution Mode jobs. Exceptional verified discoveries — a genuine cryptographic improvement, a formally verified mathematical result — can have separate, predetermined discovery rewards defined in advance by governance. No discovery reward is issued retroactively or by discretion.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Grand Challenge work pool | 🔲 | Defined research challenges submitted to network contribution pool; machines in Contribution Mode can opt into research tracks; Phase 2+ |
+| Research `UsefulWorkReceipt` variant | 🔲 | `work_type: ResearchContribution`; includes output hash, methodology reference, verifier ID; same anti-farming defenses as other contribution jobs |
+| Discovery reward schedule | 🔲 | Predetermined pool per track; governance-approved before any track goes live; rewards are fixed/predefined, not minted on discovery |
+| Independent verifier registry | 🔲 | Track-specific domain experts registered on-chain; discovery claims require independent verification before reward release |
+| Formal safety review gate | 🔲 | Any cryptographic finding that could affect QCB protocol must pass: independent expert review → formal/security analysis → adversarial testing → governance vote; no automatic protocol changes |
+
+### Public Discovery Dashboard
+
+> Transparency is a first-class requirement. All Grand Challenge metrics are publicly verifiable on-chain.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Verified compute contributed | 🔲 | Total and per-track; per-machine contribution history available to machine owner |
+| Active participants | 🔲 | Count of `MachineID`s currently in research contribution tracks |
+| Candidates tested / problems explored | 🔲 | Per-track progress against defined search space |
+| Milestone achievements | 🔲 | On-chain record of verified discoveries and governance decisions about them |
+| Search-space percentage + ETA | 🔲 | **Only when mathematically measurable** — tracks with formally defined finite search spaces may publish completion percentage; tracks without a measurable bound publish raw progress only, never an estimated completion date |
+| Individual contribution history | 🔲 | Machine owner can view their own `UsefulWorkReceipt` history and contribution score breakdown; no cross-machine correlation visible to third parties |
 
 ---
 
