@@ -364,6 +364,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Computational efficiency | Algorithm improvements for QCB-relevant operations (hashing, proof generation, state trie ops) | Reproducible benchmark; independently confirmed speedup |
 | Verifiable mathematical research | Formally specified open problems with objective pass/fail criteria (e.g., known search spaces, conjectured bounds) | Formal verification tool output; mathematical proof |
 | AI-assisted computational discovery | Privacy-safe network telemetry analysis, capacity/demand modeling, protocol parameter research | Methodology review; reproducibility; no personal data |
+| Physics & open science | Problems beyond what any single machine or quantum computer can reach today: lattice QCD simulations (quark-gluon behavior at high precision), many-body quantum systems, cosmological structure formation, dark matter candidate modeling, quantum gravity approximations. Results must be reproducible by an independent verifier machine; methodology must be published alongside the output hash. | Independent verifier reproduction; domain-expert quorum ratification; hash-committed methodology artifact |
 
 ### Proof of Useful Discovery
 

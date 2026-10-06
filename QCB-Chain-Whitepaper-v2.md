@@ -18,6 +18,32 @@ A note on dependency chains: the sections that follow trace a sequence of depend
 
 ---
 
+Vision: A Trustworthy Distributed Supercomputer for Humanity
+
+Distributed compute networks are not new. SETI@home pointed millions of machines at a single problem. Folding@home applied crowd-sourced cycles to protein simulation. Both produced real results. Both shared a fundamental limitation: a central organization decided the problem, collected the output, and published what it chose. Participants had no verifiable record of what their machine did, no accountability for results, and no say in what happened next.
+
+QCB's Grand Challenge architecture is a different thing entirely.
+
+Every machine on QCB is a first-class citizen on-chain — attested by a MachineID, with every ResourceExecutionReceipt cryptographically signed and hash-committed before any result is accepted. You cannot fake a discovery. You cannot claim credit for work you did not do. The network does not just solve a problem — it proves it solved it, in a form any independent machine can verify, on a ledger no single party controls.
+
+Discoveries pass through human review gates before any reward is issued or any acceptance is recorded. The Proof of Useful Discovery requirement — independent verifier reproduction, domain-expert quorum ratification — means the network cannot be gamed by volume. Every accepted result is something humans examined and confirmed.
+
+And the hard safety boundary is architectural, not policy: discoveries never automatically change QCB protocol behavior. The network could produce a result that rewrites a field of mathematics and it would still require a full governance vote before a single protocol parameter moved.
+
+This design points at the hardest open problems in science — not because they are tractable today, but because they will become tractable as the network grows:
+
+· Lattice QCD simulations that model quark-gluon behavior at precisions classical hardware cannot sustain
+· Many-body quantum systems where the interaction space grows faster than any single machine can track
+· Cosmological structure formation models that require more simulation fidelity than any national facility can provide
+· Dark matter and dark energy candidate modeling at scales that rule out whole classes of theory
+· Quantum gravity approximations that require sustained, verified compute across thousands of parallel runs
+
+None of these are unsolved because physicists are not smart enough. They are unsolved because the verified, coordinated compute does not exist yet.
+
+QCB is building it — not as a product, but as a protocol-layer public good that belongs to no one organization and can be governed away from no one's control.
+
+---
+
 1. What QCB Is
 
 QCB is a sovereign resource network anchored to verified human identity. Humans prove unique participation without exposing personal information, machines provide capacity, agents coordinate workloads, QRC settles payment, and QCB token holders govern the economy. QCB proves personhood without requiring public disclosure of the person's real-world identity.
