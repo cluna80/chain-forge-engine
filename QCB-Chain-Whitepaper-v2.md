@@ -20,7 +20,18 @@ A note on dependency chains: the sections that follow trace a sequence of depend
 
 1. What QCB Is
 
-QCB Chain is a from-scratch Layer-1 blockchain, built on Chain Forge — a purpose-built Rust blockchain engine — rather than an existing chain framework. It provides four things no general-purpose chain offers natively, together, at the protocol layer:
+QCB is a sovereign resource network anchored to verified human identity. Humans prove unique participation without exposing personal information, machines provide capacity, agents coordinate workloads, QRC settles payment, and QCB token holders govern the economy. QCB proves personhood without requiring public disclosure of the person's real-world identity.
+
+Six pillars underpin the system:
+
+1. **Verified human identity** — privacy-preserving proof of unique participation.
+2. **Human accountability** — every agent, machine, and provider traces ultimate responsibility to a verified human.
+3. **Machine capacity** — compute, storage, bandwidth, data, and other resources.
+4. **Agent coordination** — agents discover, purchase, and orchestrate workloads.
+5. **QRC settlement** — payment and accounting for verified resource consumption.
+6. **QCB governance** — QCB holders govern economic and protocol parameters, subject to QCB's personhood and constitutional constraints.
+
+As a from-scratch Layer-1 blockchain built on Chain Forge — a purpose-built Rust blockchain engine — QCB provides four things no general-purpose chain offers natively, together, at the protocol layer:
 
 1. Personhood-weighted BFT consensus — validator power tied to verified human identity, not stake or hashpower
 2. Charm-based state confinement and agent representation — identity-scoped state and native support for autonomous agents as first-class chain citizens
