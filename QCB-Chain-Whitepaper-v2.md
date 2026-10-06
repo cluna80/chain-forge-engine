@@ -66,6 +66,43 @@ The coordination logic, the receipt format, and the independent verification flo
 
 ---
 
+Useful Hash Commitments: Bitcoin's Energy, Pointed at Science
+
+Bitcoin mining is the largest coordinated computational effort in human history. Millions of machines, running SHA256 around the clock, producing hashes that — by design — go nowhere. The hashes are not the product. They are a proof-of-work mechanism, a way of making block production expensive so that no one can rewrite history cheaply. The computation itself produces nothing beyond consensus.
+
+QCB does not compete with Bitcoin's consensus model. It builds on the same hardware intuition — SHA256 ASICs and GPUs are abundant, widely distributed, and operated by people who understand hash rates, uptime, and work verification — and points that hardware at something real.
+
+The mechanism is a Useful Hash Commitment.
+
+When a machine completes a Grand Challenge contribution — a lattice simulation segment, a cryptographic search, a cosmological structure calculation — it needs to prove that it did the work and that the output has not been tampered with since. It does this by finding a nonce such that:
+
+    seal_hash = SHA256(nonce || output_hash || challenge_id)
+
+must begin with a target number of zero bits — a difficulty prefix. This is structurally identical to Bitcoin's mining loop. The same ASIC that finds a Bitcoin block can find a seal hash. The difference is what the hash seals: not an empty block header, but a scientific output.
+
+The hash is not the product. The science is the product. The hash is a tamper seal — a cryptographic commitment that the output existed, unchanged, at the moment the seal was computed. A verifier does not repeat the full computation. It re-hashes once, checks the difficulty prefix, and then performs domain verification of the output itself (reproducing the simulation segment, checking the mathematical result, or running the cryptographic check — whichever the challenge track requires). Verification is cheap; the work was real.
+
+The seal_hash field is added to UsefulWorkReceipt. Every Grand Challenge receipt carries it. Any independent party — another machine on the network, a domain expert, a light client — can verify both that the output was sealed at the right difficulty and that the seal matches the claimed output_hash.
+
+Why This Opens the Bitcoin Ecosystem
+
+Solo Bitcoin miners and small farms are structurally underserved by the current mining landscape. Pool consolidation has moved the economics toward large operators; a solo miner with a few ASICs earns erratically and with high variance. The SHA256 hardware sits idle between rare finds.
+
+QCB's Grand Challenge daemon changes that equation. A miner points existing SHA256 hardware at a Grand Challenge job. The machine does real science — runs the assigned computation — then finds a seal hash at the target difficulty. It submits a UsefulWorkReceipt. If the result is verified, it earns $QRC on top of whatever BTC mining it was already doing. The two are not in competition: a machine can run Bitcoin mining and a QCB Grand Challenge daemon simultaneously, allocating compute across both.
+
+The audiences this reaches:
+
+· Solo miners and small farms — SHA256 hardware earns a second income stream from verifiable science, not just block lottery tickets
+· BOINC veterans — people who already donate compute to SETI@home, Folding@home, and similar projects understand the model; QCB adds cryptographic accountability and economic reward
+· Pool operators — a Grand Challenge resource pool mode for enterprise operators, with $QRC settlement to the pool, distributed to participants by hash-rate contribution
+· The Bitcoin philosophy crowd — people who believe computational work should produce something real; the useful hash commitment is the answer to "what if mining did something"
+
+The onboarding path is a machine daemon: a lightweight process that runs alongside existing mining software, pulls Grand Challenge jobs from the network, executes them in a sandboxed environment, and handles seal hash computation and receipt submission. The community portal shows real-time hash rate contributing to active challenges, $QRC earnings per terahash per second, live challenge leaderboards, and individual machine contribution history.
+
+QCB is, in a meaningful sense, what Bitcoin would have been if Satoshi had known about the LHC. The proof-of-work loop — compute a hash until you find one with the right prefix — is the same. What changed is that the prefix is attached to something true.
+
+---
+
 Equilibrium State: When the Network Becomes Alive
 
 Reaching equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. No single moment marks it. But there is a point at which the network stops being something that requires active maintenance to stay alive and becomes something that sustains itself.

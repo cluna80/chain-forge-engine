@@ -331,7 +331,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 ## Phase 2 — Identity Pilot + QRC Issuance Model Finalized
 
-**Goal**: Real-world sybil-resistance pilot; QRC issuance model finalized (purchase path confirmed; contribution-minting model resolved as legacy or deliberately retired); resource market running at testnet scale.
+**Goal**: Real-world sybil-resistance pilot; QRC issuance model finalized (purchase path confirmed; contribution-minting model resolved as legacy or deliberately retired); resource market running at testnet scale; BTC miner community portal live with Grand Challenge pool mode.
 
 **Prerequisite**: Phase 1 complete.
 
@@ -344,6 +344,9 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | `CreditProvider` / `QrcContributionSettle` — resolve or retire | ❓ | If contribution-minting is confirmed retired: deprecate these tx types; if a narrow minting path survives, redesign it around the escrow-release model, not coordinator-issued credits |
 | Settlement layer cold-start reserve (Open Q22) | ❓ | Who funds initial reserves; legal form |
 | Settlement rate regime (Open Q19) | ❓ | Fixed / floating / managed float |
+| Grand Challenge pool mode live | ⬜ | Pool operators aggregate $QRC earnings across member machines; distribute by hash-rate share; supports BTC mining farms participating as a unit |
+| Community portal v1 — challenge dashboard | ⬜ | Public site: live challenge metrics, $QRC/TH/s earnings rate, leaderboards per track, individual machine history; the "point your rig at science" onboarding moment |
+| BTC miner outreach program | ⬜ | Documentation, daemon packaging, community presence in BTC mining forums and BOINC communities; first wave of SHA256 hardware directed at Grand Challenge tracks |
 
 ---
 
@@ -377,6 +380,23 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Discovery reward schedule | 🔲 | Predetermined pool per track; governance-approved before any track goes live; rewards are fixed/predefined, not minted on discovery |
 | Independent verifier registry | 🔲 | Track-specific domain experts registered on-chain; discovery claims require independent verification before reward release |
 | Formal safety review gate | 🔲 | Any cryptographic finding that could affect QCB protocol must pass: independent expert review → formal/security analysis → adversarial testing → governance vote; no automatic protocol changes |
+
+### Useful Hash Commitments — BTC Ecosystem Integration
+
+> **What this is**: Grand Challenge receipts carry a `seal_hash = SHA256(nonce || output_hash || challenge_id)` with a target difficulty prefix — structurally identical to Bitcoin's mining loop. The same SHA256 ASICs and GPUs used for Bitcoin mining can compute seal hashes. The hash is a tamper seal around a scientific output, not the product itself. Bitcoin mining and Grand Challenge work are not in competition; the machine daemon runs alongside existing mining software.
+>
+> **Who this reaches**: solo miners and small farms (second income stream on existing hardware), BOINC veterans (familiar model, now with cryptographic accountability and $QRC reward), pool operators (Grand Challenge pool mode), and the Bitcoin philosophy crowd (computational work that produces something real).
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `seal_hash` field on `UsefulWorkReceipt` | ⬜ | `seal_hash: String` — `SHA256(nonce \|\| output_hash \|\| challenge_id)` with target difficulty prefix; added to `chain-forge-resource` receipt types; Phase 1 |
+| Seal difficulty target per challenge track | ⬜ | Governance-settable difficulty for each active Grand Challenge track; stored in challenge config; Phase 1 |
+| Seal verification in receipt submission | ⬜ | Receipt submission path checks difficulty prefix before accepting `UsefulWorkReceipt`; verifier re-hashes from submitted `nonce + output_hash + challenge_id` — fast, one SHA256 call; Phase 1 |
+| Grand Challenge machine daemon (`gc-daemon`) | ⬜ | Lightweight process: pulls active challenge jobs from network, runs computation in sandboxed environment, finds seal nonce, submits `UsefulWorkReceipt`; runs alongside existing mining software without conflict; Phase 1 |
+| SHA256 hardware compatibility documentation | ⬜ | Document that standard Bitcoin mining ASICs and GPUs can compute seal hashes; include benchmark: TH/s → expected seals/hour at target difficulty; Phase 1 |
+| BTC miner onboarding guide | ⬜ | Step-by-step: install daemon, point at challenge, earn QRC alongside BTC mining; Phase 1 community milestone |
+| Grand Challenge resource pool mode | ⬜ | Pool operator mode: pool collects `UsefulWorkReceipt`s from member machines, aggregates $QRC earnings, distributes to members by hash-rate contribution share; Phase 2 |
+| Community portal — challenge dashboard | ⬜ | Live metrics: hash rate contributing to each active challenge, $QRC earnings per TH/s, challenge leaderboards, individual machine contribution history; Phase 2 |
 
 ### Public Discovery Dashboard
 
@@ -530,6 +550,10 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 11. **Personhood-weighting overlay** — per-human validator influence cap on `TendermintEngine`, using `ValidatorInfo.pop_verified` already in the registry.
 
 12. **AI red-team Agent 1 (Phase A–D attestation guard bypass)** — strategy-search agent for adversarial attestation guard bypass attempts. Backlogged from prior session.
+
+13. **`seal_hash` field on `UsefulWorkReceipt`** — add `seal_hash: String` and `seal_nonce: u64` to the receipt struct in `chain-forge-resource`; add seal difficulty verification to the receipt submission path; wire into Grand Challenge simulation scripts so GC-DEVNET-002+ generate sealed receipts.
+
+14. **Grand Challenge machine daemon skeleton** — `gc-daemon` binary: connects to devnet, polls for active challenge jobs, executes assigned computation in subprocess sandbox, runs seal-nonce search loop, submits completed `UsefulWorkReceipt`. First target: replicate GC-DEVNET-001 as a daemon invocation rather than a Python script.
 
 ---
 
