@@ -393,6 +393,42 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 ---
 
+## QCB Equilibrium State — When the Network Becomes Alive
+
+> Equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. Below equilibrium, QCB is a blockchain with a research layer. Above equilibrium, it is a trustworthy distributed supercomputer: self-sustaining, self-healing, and capable of scientific work no individual machine or centralized facility could reach.
+
+### Equilibrium Criteria
+
+All five conditions must hold simultaneously and sustain for a meaningful period before the network is considered to have reached Equilibrium State:
+
+| Criterion | Definition | Status |
+|-----------|------------|--------|
+| Validator depth | Validator set large and geographically distributed enough that no regional outage, coordinated departure, or single bad actor can halt block production or reverse finality | 🔲 Phase 3+ |
+| Machine population | Machine count deep enough that every active Grand Challenge track has sufficient independent verifier machines to confirm results without any track going dark for lack of participants | 🔲 Phase 4+ |
+| Resource market competition | Enough competing providers that no single provider or cartel can price-fix QRC or starve agents of capacity | 🔲 Phase 3+ |
+| Anti-farming maturity | All 9 anti-farming defenses battle-tested under real adversarial load; contribution score trustworthy enough to govern uQCB distributions without manual oversight | 🔲 Phase 2/3 |
+| Governance participation | Protocol vote participation rate reflects the network's actual human base, not a mobilized minority | 🔲 Phase 4+ |
+
+### What Changes Above Equilibrium
+
+| Capability | Below Equilibrium | Above Equilibrium |
+|------------|-------------------|-------------------|
+| Grand Challenge throughput | Limited — fewer tracks, slower verification | Multiple tracks run simultaneously with full independent verifier coverage |
+| Physics & open science problems | Out of reach — insufficient parallel verified runs | Tractable — coordinated scale enables lattice QCD, many-body quantum systems, cosmological simulation |
+| Network resilience | Requires active maintenance | Self-healing — machine churn absorbed without disrupting ongoing research jobs |
+| Discovery rate | Bottlenecked by verifier availability | Scales with machine population; faster iteration on hard problems |
+| Governance integrity | Vulnerable to minority mobilization | Reflects genuine human base of the network |
+
+### Timeline Honesty
+
+Reaching Equilibrium State will take years. Bitcoin took years to harden its consensus under real adversarial conditions. Ethereum took years to reach the validator depth where its consensus felt genuinely robust. QCB accepts the same timeline — and names it here rather than implying otherwise.
+
+The architectural commitment is different from the timeline: QCB is designed for equilibrium from the first block. The MachineID registry, ResourceExecutionReceipt accountability layer, Grand Challenge tracks, and hard safety boundary are not retrofits. They are load-bearing from day one, so that when the network reaches scale, the capability is already there waiting.
+
+> No specific machine count is required for Equilibrium State. Scale is a means, not the definition. The five criteria above — not any headcount target — determine when equilibrium is reached.
+
+---
+
 ## Phase 3 — Merchant API + BME Activation
 
 **Goal**: Stripe-compatible payment API live; first real QCB buyback-and-burn.
