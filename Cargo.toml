@@ -19,6 +19,7 @@ members = [
     "chain-forge-node",
     "chain-forge-personhood",
     "chain-forge-vca-pq",
+    "chain-forge-resource",
 ]
 
 [workspace.package]

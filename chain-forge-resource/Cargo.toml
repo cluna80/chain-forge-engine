@@ -1,0 +1,14 @@
+[package]
+name        = "chain-forge-resource"
+version     = "0.1.0"
+edition     = "2021"
+description = "Resource market: machine registry, job lifecycle, escrow, and verified work receipts for QCB Chain"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+sha3        = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+tokio       = { workspace = true }
+async-trait = { workspace = true }
