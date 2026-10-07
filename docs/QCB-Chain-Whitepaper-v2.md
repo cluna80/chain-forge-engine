@@ -184,6 +184,22 @@ This closes the economic loop between science and capital. A researcher with a g
 
 QRC is the language that turns scientific demand into compute supply. That is a funding mechanism no traditional research institution offers: more direct than grants, more transparent than contracts, accountable on-chain, and open to anyone with QRC to spend.
 
+Public Tracks and Private Commissions
+
+Grand Challenge work runs on two tiers, both on the same infrastructure, using the same machines, the same receipt format, and the same verification flow.
+
+Public tracks are governance-activated problems of humanity-scale importance — lattice QCD simulations, protein folding campaigns, cosmological structure modeling, dark matter candidate searches. They are funded by the protocol treasury and open sponsors. No single institution owns them. Any verified participant can contribute. Results belong to the public record.
+
+Private commissions are side quests. A biotech company has a specific molecule they need modeled. A university has a computation too large for their own cluster. An individual researcher has a problem they are willing to pay to get solved. They deposit QRC into a named challenge track, define the parameters, and the QCB distributed supercomputer picks it up. The network routes machines to the funded track. Machines complete assigned slices, submit UsefulWorkReceipts, and earn the same way they would on any public track.
+
+The distinction is who asked and why — not how the work is done.
+
+What private commissions provide that no cloud provider can match: the result comes back hash-committed, independently verified, and chain-of-custody accountable from assigned slice to confirmed receipt. A biotech company does not get an answer from a black box — they get a cryptographic proof that the computation ran as specified, that the output was not tampered with, and that an independent verifier machine reproduced it. Any auditor, regulator, or peer reviewer can validate the result from the on-chain receipt alone. AWS runs your computation. QCB proves it ran correctly.
+
+The two tiers reinforce each other. Private commissions bring QRC into the network from institutions and companies that need specific results. That QRC funds verifiers, builds discovery bonus pools, and weights priority routing — the same mechanisms that serve the public tracks. A well-funded private commission pulls more machines onto the network, which deepens verifier coverage for the public tracks running alongside it.
+
+The QCB distributed supercomputer does not choose between serving humanity and serving a paying client. It does both at once.
+
 ---
 
 Equilibrium State: When the Network Becomes Alive

@@ -405,6 +405,8 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | **Verifier QRC rewards** | ⬜ | Independent verifier machines earn QRC from the challenge's reward pool for confirmed `UsefulWorkReceipt` verification; separate from machine uQCB accumulation; Phase 2 |
 | **Discovery bonus pool (QRC)** | ⬜ | QRC bonus released to machine whose slice produces a confirmed breakthrough; paid on top of uQCB accumulation; lottery-style outcome, not guaranteed; Phase 2 |
 | **Priority queue weighting by QRC** | ⬜ | Challenge tracks with higher QRC pool balance attract more machines via priority routing; QRC as demand signal directing compute supply; Phase 2 |
+| **Private commission tracks** | ⬜ | Any individual or company deposits QRC to open a named private challenge track; same machine assignment, receipt format, and verification flow as public tracks; result returned as hash-committed, independently-verified on-chain proof; Phase 2 |
+| **Public vs. private track distinction on-chain** | ⬜ | `ChallengeKind { Public, Private }` flag on challenge config; public tracks governance-activated from treasury; private tracks sponsor-funded via QRC deposit tx; Phase 2 |
 | Community portal — challenge dashboard | ⬜ | Live metrics: hash rate contributing to each active challenge, $QRC earnings per TH/s, challenge leaderboards, individual machine contribution history; Phase 2 |
 
 ### Public Discovery Dashboard
