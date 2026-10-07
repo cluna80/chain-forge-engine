@@ -72,9 +72,11 @@ JOB_ID    = f"job-{_run_id}"
 ESCROW_ID = f"esc-{_run_id}"
 
 # Timing
-SUBMIT_TIMEOUT_SECS = 8            # per-request tx submission timeout
-STATUS_TIMEOUT_SECS = 5            # per-request status/balance check timeout
-PROPAGATION_WAIT_S  = 10           # seconds to wait for cross-node propagation
+SUBMIT_TIMEOUT_SECS  = 8    # per-request tx submission timeout
+STATUS_TIMEOUT_SECS  = 5    # per-request status/balance check timeout
+PROPAGATION_WAIT_S   = 10   # seconds to wait for cross-node propagation after all txs commit
+COMMIT_POLL_INTERVAL = 0.5  # seconds between block polls while waiting for a tx to commit
+COMMIT_TIMEOUT_S     = 30   # max seconds to wait for a single tx to appear in a block
 
 # ── Colour helpers ─────────────────────────────────────────────────────────
 
@@ -140,6 +142,43 @@ def node_ok(host: str, port: int) -> bool:
         return False
 
 
+# ── Nonce helper ───────────────────────────────────────────────────────────
+
+def get_live_nonce(host: str, port: int, address: str) -> int:
+    """
+    Fetch the current nonce for `address` from the node at host:port.
+    Returns 0 if the account doesn't exist yet (fresh account).
+    The node stores the NEXT expected nonce on the account after each
+    successful tx, so this is exactly what we pass in our next tx.
+    """
+    try:
+        data = get_json(host, port, f"/api/accounts/{address}")
+        if isinstance(data, dict):
+            return int(data.get("nonce", 0))
+        return 0
+    except Exception:
+        return 0   # account not yet created → nonce 0
+
+
+# ── Nonce state (populated from live node before tx building) ───────────────
+
+_nonce_counter: int = 0   # set by fetch_and_set_nonce() before first tx
+
+
+def fetch_and_set_nonce(host: str, port: int, address: str) -> int:
+    """Query the live nonce for address and initialise the global counter."""
+    global _nonce_counter
+    _nonce_counter = get_live_nonce(host, port, address)
+    return _nonce_counter
+
+
+def _nonce() -> int:
+    global _nonce_counter
+    n = _nonce_counter
+    _nonce_counter += 1
+    return n
+
+
 # ── Transaction builders ───────────────────────────────────────────────────
 #
 # Mirror the Rust Transaction constructors, producing the same JSON that
@@ -151,16 +190,6 @@ def node_ok(host: str, port: int) -> bool:
 #
 # TxBody uses default serde (externally-tagged), so:
 #   "body": { "QrcPurchase": { "qcb_amount": ..., "min_qrc_out": ... } }
-
-_nonce_counter = 0  # nonce starts at 0 for a fresh account; node expects nonce==account.nonce
-
-
-def _nonce() -> int:
-    global _nonce_counter
-    n = _nonce_counter
-    _nonce_counter += 1
-    return n
-
 
 def tx_qrc_purchase(sender: str, qcb_amount: int, min_qrc_out: int) -> dict:
     return {
@@ -233,6 +262,11 @@ def tx_deposit_to_treasury(sponsor: str, agent_id: str,
 
 def tx_lock_qrc_for_job(sender: str, escrow_id: str,
                          job_id: str, agent_wallet: str, amount: int) -> dict:
+    """
+    agent_wallet is the key used to derive the treasury address:
+    treasury:{agent_wallet}.  Must match the agent_id passed to
+    DepositToTreasury so the treasury lookup succeeds.
+    """
     return {
         "id":         f"tx-lock-{_run_id}",
         "sender":     sender,
@@ -266,14 +300,10 @@ class NodeReport:
     host:   str
     port:   int
     online: bool = False
-    checks: list[Check] = field(default_factory=list)
+    checks: list = field(default_factory=list)
 
     def add(self, passed: bool, desc: str, detail: str = "") -> None:
         self.checks.append(Check(passed, desc, detail))
-
-    @property
-    def all_pass(self) -> bool:
-        return self.online and all(c.passed for c in self.checks)
 
     @property
     def pass_count(self) -> int:
@@ -283,6 +313,8 @@ class NodeReport:
     def fail_count(self) -> int:
         return sum(1 for c in self.checks if not c.passed)
 
+
+# ── Block / tx helpers ─────────────────────────────────────────────────────
 
 def find_tx_in_blocks(host: str, port: int, tx_id: str) -> bool:
     """Return True if tx_id appears in any committed block on this node.
@@ -310,6 +342,34 @@ def find_tx_in_blocks(host: str, port: int, tx_id: str) -> bool:
         return False
 
 
+def get_tx_result(host: str, port: int, tx_id: str) -> Optional[dict]:
+    """Return the TxSummary for tx_id from /api/tx/{id}, or None if not found."""
+    try:
+        data = get_json(host, port, f"/api/tx/{tx_id}")
+        if isinstance(data, dict):
+            return data
+        return None
+    except Exception:
+        return None
+
+
+def wait_for_commit(host: str, port: int, tx_id: str,
+                    timeout: float = COMMIT_TIMEOUT_S,
+                    poll: float = COMMIT_POLL_INTERVAL) -> tuple[bool, Optional[dict]]:
+    """
+    Poll until tx_id appears in a committed block on host:port, or timeout.
+    Returns (found, tx_summary_or_None).
+    tx_summary has {success, error, events, …} from /api/tx/{id}.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if find_tx_in_blocks(host, port, tx_id):
+            result = get_tx_result(host, port, tx_id)
+            return True, result
+        time.sleep(poll)
+    return False, None
+
+
 def get_account_balance(host: str, port: int,
                          address: str, denom: str = "uqrc") -> Optional[int]:
     """Return the uqrc (or other denom) balance for address, or None on error."""
@@ -330,7 +390,7 @@ def get_account_balance(host: str, port: int,
 # ── Phase steps ────────────────────────────────────────────────────────────
 
 def step_submit(label: str, host: str, port: int, tx: dict) -> tuple[bool, str]:
-    """POST a transaction to Alice's node; return (success, status/error)."""
+    """POST a transaction to Alice's node; return (queued, status/error)."""
     print(f"  {info(label)} → Alice [{host}:{port}]", flush=True)
     try:
         resp = post_json(host, port, "/api/tx", tx)
@@ -346,6 +406,42 @@ def step_submit(label: str, host: str, port: int, tx: dict) -> tuple[bool, str]:
     except Exception as e:
         print(f"    {fail(str(e))}", flush=True)
         return False, str(e)
+
+
+def step_submit_and_wait(label: str, host: str, port: int, tx: dict) -> tuple[bool, bool]:
+    """
+    POST a tx, then poll until it commits.  Returns (queued, executed_ok).
+    If queuing fails, returns (False, False) immediately.
+    If the tx commits but execution failed (reverted), returns (True, False)
+    and prints the execution error — the caller should abort the sequence
+    because subsequent txs will have wrong nonces.
+    """
+    queued, _ = step_submit(label, host, port, tx)
+    if not queued:
+        return False, False
+
+    tx_id = tx["id"]
+    print(f"    {CYAN}waiting for commit …{RESET}", end="\r", flush=True)
+    found, result = wait_for_commit(host, port, tx_id)
+
+    if not found:
+        print(f"    {fail(f'timed out after {COMMIT_TIMEOUT_S}s — tx not in any block')}", flush=True)
+        return True, False
+
+    if result is None:
+        # Block has the tx but /api/tx/{id} not exposed — treat as committed-ok
+        print(f"    {ok('committed')}", flush=True)
+        return True, True
+
+    success = result.get("success", True)
+    if success:
+        events = result.get("events", [])
+        print(f"    {ok('committed  executed=ok')}  {CYAN}{events}{RESET}", flush=True)
+        return True, True
+    else:
+        error = result.get("error") or result.get("message") or str(result)
+        print(f"    {fail(f'committed but execution FAILED: {error}')}", flush=True)
+        return True, False
 
 
 # ── Main test ──────────────────────────────────────────────────────────────
@@ -380,41 +476,55 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
     if not all_nodes_up:
         print(f"\n  {warn('Some nodes offline — continuing, will mark those checks as SKIP')}")
 
+    # ─── Fetch Alice's live nonce ────────────────────────────────────────────
+    print(hdr("Step 0b — Fetch Alice's live nonce"))
+    live_nonce = fetch_and_set_nonce(alice_host, alice_port, ALICE_ADDRESS)
+    print(f"  {ok(f'Alice nonce = {live_nonce}  (txs will use nonces {live_nonce}–{live_nonce+4})')}")
+
+    # ─── Build all transactions now that nonce counter is initialised ────────
+    tx1 = tx_qrc_purchase(ALICE_ADDRESS, QCB_TO_BURN, MIN_QRC_OUT)
+    tx2 = tx_register_agent(ALICE_ADDRESS, AGENT_ID, AGENT_ADDRESS)
+    tx3 = tx_authorize_agent(ALICE_ADDRESS, AGENT_ID)
+    tx4 = tx_deposit_to_treasury(ALICE_ADDRESS, AGENT_ID, TREASURY_DEPOSIT, PER_JOB_LIMIT)
+    # agent_wallet = AGENT_ID so treasury key is treasury:{AGENT_ID},
+    # matching the key DepositToTreasury creates.
+    tx5 = tx_lock_qrc_for_job(ALICE_ADDRESS, ESCROW_ID, JOB_ID, AGENT_ID, ESCROW_AMOUNT)
+
+    submitted_tx_ids = [tx1["id"], tx2["id"], tx3["id"], tx4["id"], tx5["id"]]
+
     # ─── Step 1: QRC purchase ───────────────────────────────────────────────
     print(hdr("Step 1 — Alice buys QRC  (QrcPurchase)"))
-    tx1 = tx_qrc_purchase(ALICE_ADDRESS, QCB_TO_BURN, MIN_QRC_OUT)
-    ok1, _ = step_submit("QrcPurchase", alice_host, alice_port, tx1)
+    ok1, exec1 = step_submit_and_wait("QrcPurchase", alice_host, alice_port, tx1)
+    if not (ok1 and exec1):
+        print(f"\n  {fail('QrcPurchase failed — aborting sequence (nonces would cascade)')}")
+        return _run_verification(nodes, submitted_tx_ids, aborted=True)
 
     # ─── Step 2: Register agent ─────────────────────────────────────────────
     print(hdr("Step 2 — Register resource agent  (RegisterAgent)"))
-    tx2 = tx_register_agent(ALICE_ADDRESS, AGENT_ID, AGENT_ADDRESS)
-    ok2, _ = step_submit("RegisterAgent", alice_host, alice_port, tx2)
+    ok2, exec2 = step_submit_and_wait("RegisterAgent", alice_host, alice_port, tx2)
+    if not (ok2 and exec2):
+        print(f"\n  {fail('RegisterAgent failed — aborting sequence')}")
+        return _run_verification(nodes, submitted_tx_ids, aborted=True)
 
     # ─── Step 3: Authorize agent ────────────────────────────────────────────
     print(hdr("Step 3 — Authorize agent → Active  (AuthorizeAgent)"))
-    tx3 = tx_authorize_agent(ALICE_ADDRESS, AGENT_ID)
-    ok3, _ = step_submit("AuthorizeAgent", alice_host, alice_port, tx3)
+    ok3, exec3 = step_submit_and_wait("AuthorizeAgent", alice_host, alice_port, tx3)
+    if not (ok3 and exec3):
+        print(f"\n  {fail('AuthorizeAgent failed — aborting sequence')}")
+        return _run_verification(nodes, submitted_tx_ids, aborted=True)
 
     # ─── Step 4: Deposit to treasury ────────────────────────────────────────
     print(hdr("Step 4 — Fund agent treasury  (DepositToTreasury)"))
-    tx4 = tx_deposit_to_treasury(ALICE_ADDRESS, AGENT_ID, TREASURY_DEPOSIT, PER_JOB_LIMIT)
-    ok4, _ = step_submit("DepositToTreasury", alice_host, alice_port, tx4)
+    ok4, exec4 = step_submit_and_wait("DepositToTreasury", alice_host, alice_port, tx4)
+    if not (ok4 and exec4):
+        print(f"\n  {fail('DepositToTreasury failed — aborting sequence')}")
+        return _run_verification(nodes, submitted_tx_ids, aborted=True)
 
     # ─── Step 5: Lock QRC for job (draws from treasury) ─────────────────────
     print(hdr("Step 5 — Escrow QRC for job  (LockQrcForJob)"))
-    # agent_wallet here is ALICE_ADDRESS because the treasury key is
-    # `treasury:{agent_wallet}` — the execution handler looks up treasury by
-    # the agent_wallet field.  In Phase 0 devnet Alice is her own agent.
-    tx5 = tx_lock_qrc_for_job(ALICE_ADDRESS, ESCROW_ID, JOB_ID, ALICE_ADDRESS, ESCROW_AMOUNT)
-    ok5, _ = step_submit("LockQrcForJob", alice_host, alice_port, tx5)
-
-    submitted_tx_ids = [tx1["id"], tx2["id"], tx3["id"], tx4["id"], tx5["id"]]
-    submit_results   = [ok1, ok2, ok3, ok4, ok5]
-
-    if not all(submit_results):
-        failed_steps = [i+1 for i, r in enumerate(submit_results) if not r]
-        print(f"\n  {fail(f'Submission failed for step(s): {failed_steps}')}")
-        print(f"  {warn('Propagation checks may be unreliable — continuing anyway')}")
+    # agent_wallet = AGENT_ID → treasury key = treasury:{AGENT_ID}
+    # This matches the key DepositToTreasury wrote above.
+    ok5, exec5 = step_submit_and_wait("LockQrcForJob", alice_host, alice_port, tx5)
 
     # ─── Wait for propagation ────────────────────────────────────────────────
     print(hdr(f"Step 6 — Wait {PROPAGATION_WAIT_S}s for cross-node propagation …"))
@@ -423,11 +533,17 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
         time.sleep(1)
     print(f"  Done.{' ' * 20}")
 
+    return _run_verification(nodes, submitted_tx_ids, aborted=False)
+
+
+def _run_verification(nodes: list[tuple[str, str, int]],
+                      submitted_tx_ids: list[str],
+                      aborted: bool) -> int:
     # ─── Per-node verification ───────────────────────────────────────────────
     print(hdr("Step 7 — Verify state on all nodes"))
 
     reports: list[NodeReport] = []
-    # Treasury account key is treasury:{agent_id} — matches the DepositToTreasury handler
+    # Treasury account key is treasury:{AGENT_ID} — matches DepositToTreasury
     # which stores state under format!("treasury:{}", agent_id).
     treasury_key = f"treasury:{AGENT_ID}"
 
@@ -455,8 +571,16 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
             sym = ok(f"tx {tx_id[:20]}… in blocks") if found else fail(f"tx {tx_id[:20]}… NOT in blocks")
             print(f"    {sym}")
 
-        # Balance checks — Alice's QRC balance should have decreased from purchases
-        # (exact pre-test balance is unknown without genesis query, so we check > 0)
+            # If tx is committed, also show execution result (success/failure)
+            if found:
+                result = get_tx_result(host, port, tx_id)
+                if result is not None:
+                    exec_ok  = result.get("success", True)
+                    exec_err = result.get("error") or ""
+                    exec_sym = f"{GREEN}exec=ok{RESET}" if exec_ok else f"{RED}exec=FAIL: {exec_err}{RESET}"
+                    print(f"      {exec_sym}")
+
+        # Balance checks — Alice's QRC balance should be readable
         alice_bal = get_account_balance(host, port, ALICE_ADDRESS, "uqrc")
         if alice_bal is None:
             rep.add(False, "Alice uQRC balance readable")
@@ -475,27 +599,27 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
             match = treasury_bal == expected_treasury
             rep.add(match, f"Treasury balance = {expected_treasury:,} uQRC")
             sym = ok if match else fail
-            print(f"    {sym(f'Treasury {treasury_key!r} = {treasury_bal:,} uQRC')} "
+            print(f"    {sym(f'Treasury {treasury_key!r} = {treasury_bal:,} uQRC')}"
                   f"  (expected {expected_treasury:,})")
 
-        # Escrow virtual account should hold ESCROW_AMOUNT
+        # Escrow virtual account — soft check (some builds don't expose sub-accounts)
         escrow_key = f"escrow:{ESCROW_ID}"
         escrow_bal = get_account_balance(host, port, escrow_key, "uqrc")
         if escrow_bal is None:
-            # Some devnet builds don't expose escrow sub-accounts via /api/accounts
-            # Treat as a soft warning rather than a hard failure
             rep.add(True, "Escrow balance check (soft)")
             print(f"    {warn(f'Escrow account {escrow_key!r} not queryable (soft skip)')}")
         else:
             match = escrow_bal == ESCROW_AMOUNT
             rep.add(match, f"Escrow balance = {ESCROW_AMOUNT:,} uQRC")
             sym = ok if match else fail
-            print(f"    {sym(f'Escrow {escrow_key!r} = {escrow_bal:,} uQRC')} "
+            print(f"    {sym(f'Escrow {escrow_key!r} = {escrow_bal:,} uQRC')}"
                   f"  (expected {ESCROW_AMOUNT:,})")
 
     # ─── Summary ─────────────────────────────────────────────────────────────
     print(hdr("═══ Results ═══"))
-    overall_pass = True
+    if aborted:
+        print(f"  {YELLOW}Test aborted early — tx submission or execution failed{RESET}")
+    overall_pass = not aborted
 
     for rep in reports:
         if not rep.online:
