@@ -2,6 +2,7 @@
 *.py
 !cirfi_sim/*.py
 !grand-challenge/simulations/*.py
+!scripts/*.py
 qcb-genesis.json
 Cargo.lock
 

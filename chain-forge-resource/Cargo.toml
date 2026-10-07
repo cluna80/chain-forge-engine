@@ -7,7 +7,9 @@ description = "Resource market: machine registry, job lifecycle, escrow, and ver
 [dependencies]
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+sha2        = { workspace = true }
 sha3        = { workspace = true }
+hex         = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true }

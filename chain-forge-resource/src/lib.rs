@@ -41,4 +41,7 @@ pub use types::machine::{
     EnterpriseId, MachineAttestationKey, MachineId, MachineMode, MachineRecord, MachineStatus,
     ProviderOwner, SponsorId,
 };
-pub use types::receipt::{ResourceExecutionReceipt, UsefulWorkReceipt, WorkType};
+pub use types::receipt::{
+    ResourceExecutionReceipt, UsefulWorkReceipt, WorkType,
+    compute_seal_hash, find_seal_nonce, meets_difficulty, verify_seal,
+};

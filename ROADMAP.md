@@ -165,7 +165,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 |------|--------|-------|
 | Block explorer REST API (`/api/blocks`, `/api/txs`, `/api/accounts`, `/api/status`) | ✅ | Live on every block commit |
 | React frontend (`chain-forge-frontend`) | ✅ | At `C:\Dev\chain-forge-frontend`; vite dev server running |
-| Explorer persistence (`write_explorer_persistence.py`) | ⬜ | Packaged, not yet deployed on engine machine |
+| Explorer persistence (`write_explorer_persistence.py`) | ✅ | `scripts/write_explorer_persistence.py` + `scripts/start-explorer-persistence.sh` — deploy on Machine 1 after devnet is up |
 | VCA PQ (`chain-forge-vca-pq`) | ✅ | Post-quantum VCA attestation crate in workspace |
 | devnet scripts (`devnet/`) | ✅ | Start/stop scripts for Machine 1 (Alice/Bob/Dave); Machine 2 (Carol) via scp |
 
@@ -394,10 +394,10 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Item | Status | Notes |
 |------|--------|-------|
 | BTC block hash randomness beacon | ⬜ | Grand Challenge job slice assignment derived from recent BTC block hash: `job_seed = SHA256(btc_block_hash \|\| challenge_id \|\| machine_id)`; prevents QCB or any participant from steering which machine gets which problem slice; established technique (used by Chainlink VRF, drand, bitcoin anchors), applied here to research job fairness; Phase 1 |
-| `seal_hash` field on `UsefulWorkReceipt` | ⬜ | `seal_hash: String` — `SHA256(nonce \|\| output_hash \|\| challenge_id)` with target difficulty prefix; added to `chain-forge-resource` receipt types; Phase 1 |
+| `seal_hash` field on `UsefulWorkReceipt` | ✅ | `seal_nonce: u64`, `seal_hash: String`, `seal_difficulty_bits: u32` added; `compute_seal_hash()`, `find_seal_nonce()`, `verify_seal()`, `meets_difficulty()` helpers implemented and tested; 6 tests passing |
 | Seal difficulty target per challenge track | ⬜ | Governance-settable difficulty for each active Grand Challenge track; stored in challenge config; Phase 1 |
 | Seal verification in receipt submission | ⬜ | Receipt submission path checks difficulty prefix before accepting `UsefulWorkReceipt`; verifier re-hashes from submitted `nonce + output_hash + challenge_id` — fast, one SHA256 call; Phase 1 |
-| Grand Challenge machine daemon (`gc-daemon`) | ⬜ | Lightweight process: pulls active challenge jobs from network, runs computation in sandboxed environment, finds seal nonce, submits `UsefulWorkReceipt`; runs alongside existing mining software without conflict; Phase 1 |
+| Grand Challenge machine daemon (`gc-daemon`) | ✅ | `chain-forge-node/src/bin/gc-daemon.rs` — full 3-step cycle: hash preimage search → seal nonce search → `UsefulWorkReceipt` JSON; smoke-tested: GC-DEVNET-002 found nonce 80,468 + seal nonce 161 in <500ms; `cargo run --bin gc-daemon -- --dry-run` |
 | SHA256 hardware compatibility documentation | ⬜ | Document that standard Bitcoin mining ASICs and GPUs can compute seal hashes; include benchmark: TH/s → expected seals/hour at target difficulty; Phase 1 |
 | BTC miner onboarding guide | ⬜ | Step-by-step: install daemon, point at challenge, earn QRC alongside BTC mining; Phase 1 community milestone |
 | Grand Challenge resource pool mode | ⬜ | Pool operator mode: pool collects `UsefulWorkReceipt`s from member machines, aggregates $QRC earnings, distributes to members by hash-rate contribution share; Phase 2 |
@@ -427,13 +427,14 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | ID | Date | Type | Winner | Result | Record |
 |----|------|------|--------|--------|--------|
 | GC-DEVNET-001 | 2026-10-06 | Hash preimage search (`SHA256('QCB:<nonce>')` prefix `0000`) | Carol (MACH-CAROL-003) | Nonce `6,682,026` → `000050f1...` — verified by Dave | `grand-challenge/simulations/GC-DEVNET-001-discovery-record.json` |
+| GC-DEVNET-002 | 2026-10-07 | Hash preimage via `gc-daemon` binary (Rust) + seal hash | MACH-CAROL-003 (simulated) | Nonce `80,468` → `0000ce63...`; seal nonce `161`; `verify_seal` ✓; full `UsefulWorkReceipt` JSON produced | `gc-daemon --dry-run --seal-difficulty 8` |
 
 > **What GC-DEVNET-001 proved**: Three parallel machines (Alice, Bob, Carol) searched independent nonce ranges. Carol found the solution in 15,361 checks (0.04s). Dave independently reproduced the hash from the nonce alone and signed the verification. Full `UsefulWorkReceipt` with `work_type: ResearchContribution`, machine signature, and verifier signature produced. The coordination and verification logic is complete — only the Rust crate and Ed25519 signing remain to wire to the real devnet.
 
 **Next simulations planned:**
-- GC-DEVNET-002 — Multi-track parallel (two challenges running simultaneously)
-- GC-DEVNET-003 — Disputed result + rejection flow
-- GC-DEVNET-004 — Physics-flavored: tiny lattice simulation with verified output hash
+- GC-DEVNET-003 — Multi-track parallel (two challenges running simultaneously)
+- GC-DEVNET-004 — Disputed result + rejection flow
+- GC-DEVNET-005 — Physics-flavored: tiny lattice simulation with verified output hash
 
 ---
 
@@ -554,7 +555,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 9. **Node-layer CR exposure** — embed CoverageRatio in block header or chain event; light clients / agents need it without running a full node.
 
-10. **Explorer persistence deployment** — `write_explorer_persistence.py` packaged; deploy on Machine 1.
+10. ~~**Explorer persistence deployment**~~ **✅ DONE** — `scripts/write_explorer_persistence.py` + `scripts/start-explorer-persistence.sh` ready to deploy on Machine 1.
 
 ### Phase 1 prep (after Phase 0 acceptance test passes)
 
@@ -562,9 +563,17 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 12. **AI red-team Agent 1 (Phase A–D attestation guard bypass)** — strategy-search agent for adversarial attestation guard bypass attempts. Backlogged from prior session.
 
-13. **`seal_hash` field on `UsefulWorkReceipt`** — add `seal_hash: String` and `seal_nonce: u64` to the receipt struct in `chain-forge-resource`; add seal difficulty verification to the receipt submission path; wire into Grand Challenge simulation scripts so GC-DEVNET-002+ generate sealed receipts.
+13. ~~**`seal_hash` field on `UsefulWorkReceipt`**~~ **✅ DONE** — `seal_nonce`, `seal_hash`, `seal_difficulty_bits` fields live in `chain-forge-resource`; `find_seal_nonce()`, `verify_seal()` helpers; 6 tests passing.
 
-14. **Grand Challenge machine daemon skeleton** — `gc-daemon` binary: connects to devnet, polls for active challenge jobs, executes assigned computation in subprocess sandbox, runs seal-nonce search loop, submits completed `UsefulWorkReceipt`. First target: replicate GC-DEVNET-001 as a daemon invocation rather than a Python script.
+14. ~~**Grand Challenge machine daemon skeleton**~~ **✅ DONE** — `cargo run --bin gc-daemon -- --machine MACH-CAROL-003 --dry-run`; full 3-step cycle proven end-to-end; GC-DEVNET-002 logged.
+
+### Next up (Phase 0 cross-machine foundation)
+
+15. **Wire `/api/gc-receipt` endpoint** — add handler in `chain-forge-node/src/api.rs` to receive `UsefulWorkReceipt` JSON POSTs from `gc-daemon`; store in `ExplorerState`; expose via `/api/gc-receipts`.
+
+16. **QRC escrow primitives** — `LockQrcForJob`, `ReleaseQrcForJob`, `RefundQrcForJob` as tx types in `chain-forge-execution`; Alice can lock QRC before a job starts; Carol receives only on verified completion.
+
+17. **`AgentTreasury` + spending limits** — Alice deposits QRC; agent cannot exceed `per_job_limit`; foundational for the full cross-machine purchase acceptance test.
 
 ---
 

@@ -17,8 +17,13 @@ path = "src/keygen.rs"
 name = "chain-forge-tx"
 path = "src/tx.rs"
 
+[[bin]]
+name = "gc-daemon"
+path = "src/bin/gc-daemon.rs"
+
 [dependencies]
 chain-forge-core      = { path = "../chain-forge-core" }
+chain-forge-resource  = { path = "../chain-forge-resource" }
 chain-forge-consensus = { path = "../chain-forge-consensus", features = ["real-crypto"] }
 chain-forge-state     = { path = "../chain-forge-state" }
 chain-forge-execution = { path = "../chain-forge-execution" }
@@ -31,6 +36,8 @@ chain-forge-validators = { path = "../chain-forge-validators" }
 chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto", "real-pqc"] }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
+sha2                  = { workspace = true }
+hex                   = { workspace = true }
 thiserror             = { workspace = true }
 tracing               = { workspace = true }
 tokio                 = { workspace = true }
