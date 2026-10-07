@@ -88,7 +88,7 @@
 | `ResourceJob` state machine | ⬜ | States: `CREATED → FUNDED → MATCHED → RUNNING → (COMPLETED / FAILED) → (VERIFIED / REFUND) → SETTLED`; plus `DISPUTED → RESOLUTION` branch; state machine must have room for future decentralized arbitration |
 | `ResourceExecutionReceipt` | ⬜ | Evolves from `CapacityEvidence_v0`; fields: `job_id`, `provider_id`, **`machine_id`**, `requester_agent_id`, `resource_type`, `requested_units`, `measured_units`, `started_at`, `finished_at`, `input_hash`, `output_hash`, `provider_signature`, `requester_confirmation`, `verification_status`; `machine_id` is essential later when one ProviderID covers many machines — you need to know which physical resource did the work |
 | P2P resource discovery | ⬜ | Agents broadcast `ResourceRequest` over libp2p gossip; providers respond with `ResourceOffer`; live availability stays off-chain; only economically important commitments/results go on-chain |
-| QRC escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ⬜ | Agent locks QRC before job starts; provider receives only on verified completion; refund path for failure/timeout; `DisputeResourceJob` stub for Phase 1 |
+| QRC escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ✅ | Agent locks QRC before job starts; provider receives only on verified completion; refund path for failure/timeout; `DisputeResourceJob` stub for Phase 1; `RefundReason` enum covers all failure cases |
 | `ResourceNode` prototype (Machine 2) | ⬜ | Machine 2 (Carol) advertises: `ProviderID`, `SponsorID`, **`MachineID`**, resource capabilities, `container_execution` + `python_execution` runtime types, availability, price, location/latency region, resource limits |
 | Secure workload sandbox (container) | ⬜ | Resource providers cannot execute arbitrary agent code on bare host; Docker/container prototype for Phase 0; note: production hostile multi-tenant workloads need stronger isolation — containers are a Phase 0 approximation only |
 | Job cancellation / failure / timeout handling | ⬜ | Explicit handling for: provider disappear mid-job, agent sends invalid workload, connection fails, provider produces wrong output, agent falsely claims failure, provider claims completion but result is unusable |
@@ -102,8 +102,8 @@
 | `AgentID` + `SponsorID` linkage primitive | ⬜ | `MachineID → ProviderID → SponsorID` for resource nodes; one verified human can operate multiple machines; machines have cryptographic identities tracing to human SponsorID |
 | **`MachineID` formalization** | ⬜ | `MachineRecord { machine_id, provider_id, owner: ProviderOwner, attestation_key, capability_descriptor, status }`; `MachineAttestationKey` is a separate signing key from the provider's identity key; `MachineStatus` (Active / Inactive / Suspended) |
 | **`ProviderOwner` enum** | ⬜ | `enum ProviderOwner { Individual(SponsorId), Enterprise(EnterpriseId) }` — Phase 0 uses `Individual(Carol)`; Phase 1 adds `Enterprise(Acme)` without ripping apart `ResourceJob`, escrow, reputation, or discovery; **define the enum now so Phase 0 code doesn't hard-assume `provider.sponsor_id` is the only ownership structure forever** |
-| `AgentTreasury` primitive | ⬜ | `{agent_id, sponsor_id, balance, daily_limit, per_job_limit, allowed_resource_types}`; Alice deposits QRC; agent can spend ≤ per_job_limit; agent cannot withdraw to arbitrary account |
-| `CapabilitySet` + `SpendingLimits` | ⬜ | Agent cannot exceed sponsor's authorization; Charm Confinement enforcement begins here |
+| `AgentTreasury` primitive | ✅ | `treasury:{agent_id}` virtual account; credited by `DepositToTreasury` tx; debited by `LockQrcForJob` (treasury-first, fallback to agent wallet); `per_job_limit_uqrc` cap enforced at execution; sponsor gate on deposit |
+| `CapabilitySet` + `SpendingLimits` | ✅ | `SpendingLimits` struct (`epoch_limit`, `lifetime_limit`, `max_balance`, `per_job_limit`); `check_per_job()` enforcer; `resource_agent()` preset; agent cannot exceed sponsor's authorization |
 | `RevenuePolicy` primitive | ⬜ | Configurable destination for agent revenue; e.g. `Sponsor: 30% / AgentTreasury: 60% / Reserve: 10%`; successful service settles automatically |
 
 ### Phase 0 Acceptance Test — Cross-Machine Resource Purchase
@@ -571,9 +571,11 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 15. **Wire `/api/gc-receipt` endpoint** — add handler in `chain-forge-node/src/api.rs` to receive `UsefulWorkReceipt` JSON POSTs from `gc-daemon`; store in `ExplorerState`; expose via `/api/gc-receipts`.
 
-16. **QRC escrow primitives** — `LockQrcForJob`, `ReleaseQrcForJob`, `RefundQrcForJob` as tx types in `chain-forge-execution`; Alice can lock QRC before a job starts; Carol receives only on verified completion.
+16. ~~**QRC escrow primitives**~~ **✅ DONE** — `LockQrcForJob`, `ReleaseQrcForJob`, `RefundQrcForJob` wired as tx types in `chain-forge-execution` and `chain-forge-resource`; `tx_type_label()` exhaustive match updated; `RefundReason` enum (`Timeout`, `ExecutionFailure`, `VerificationFailed`, `DisputeResolution`, `CancelledBeforeStart`); all escrow types serialize/deserialize clean; build is green.
 
-17. **`AgentTreasury` + spending limits** — Alice deposits QRC; agent cannot exceed `per_job_limit`; foundational for the full cross-machine purchase acceptance test.
+17. ~~**`AgentTreasury` + spending limits**~~ **✅ DONE** — `DepositToTreasury` tx type live; `treasury:{agent_id}` virtual account credited on deposit; `LockQrcForJob` does treasury-first funding (falls back to agent wallet); `per_job_limit_uqrc` field on `SpendingLimits` (`#[serde(default)]` for backwards compat); `check_per_job()` enforces cap at execution; `SpendingLimits::resource_agent()` preset added; `AgentStore::get_mut_by_id/address()` mutable accessors added; 74 tests passing.
+
+18. ~~**Phase 0 cross-machine purchase acceptance test script**~~ **✅ DONE** — `scripts/phase0_acceptance_test.py`; submits all 5 txs (QrcPurchase → RegisterAgent → AuthorizeAgent → DepositToTreasury → LockQrcForJob) to Alice's node; waits for propagation; polls all 4 nodes (Alice/Bob/Dave/Carol) for tx commitment + treasury/escrow balance assertions; per-node PASS/FAIL output; `--skip-carol` flag for single-machine runs.
 
 ---
 
