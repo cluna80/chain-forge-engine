@@ -142,6 +142,10 @@ impl GasModel {
                     TxBody::PurchaseQrc { .. }           => op_multiplier * 7,
                     // CreditProvider: coordinator credit + mints QRC to provider.
                     TxBody::CreditProvider { .. }        => op_multiplier * 8,
+                    // QRC Escrow: balance hold/release — moderate state writes.
+                    TxBody::LockQrcForJob { .. }         => op_multiplier * 5,
+                    TxBody::ReleaseQrcForJob { .. }      => op_multiplier * 6, // two account writes + receipt check
+                    TxBody::RefundQrcForJob { .. }       => op_multiplier * 4,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -579,6 +583,79 @@ pub enum TxBody {
         /// Human-readable description of the child agent's purpose.
         description: String,
     },
+
+    // ── Resource Marketplace — QRC Escrow ─────────────────────────────────────
+
+    /// Lock QRC in escrow when an agent funds a resource job.
+    ///
+    /// The `amount` is the maximum the agent will pay (`max_qrc_budget` from
+    /// the `JobSpec`); actual charge may be lower if billed by the second.
+    /// The escrow hold prevents double-spending: the locked QRC cannot be
+    /// used for any other purpose until `ReleaseQrcForJob` or `RefundQrcForJob`
+    /// resolves the hold.
+    ///
+    /// Enforced invariants:
+    ///   - `agent_wallet` must have at least `amount` QRC.
+    ///   - `escrow_id` must be unique (no duplicate holds for the same job).
+    ///   - Sender must be the agent's sponsor or the agent itself.
+    LockQrcForJob {
+        /// Unique escrow operation identifier (e.g. "ESC-JOB001-20260101").
+        escrow_id: String,
+        /// The resource job being funded.
+        job_id: String,
+        /// Wallet address of the requesting agent.
+        agent_wallet: String,
+        /// QRC amount to lock (atomic units).
+        amount: u64,
+    },
+
+    /// Release escrowed QRC to the provider on successful, verified job completion.
+    ///
+    /// Submitted by the coordinator after the verifier signs the output.
+    /// `amount` may be ≤ locked amount (partial charge for short jobs);
+    /// any remainder is automatically refunded to `agent_wallet`.
+    ///
+    /// Enforced invariants:
+    ///   - `escrow_id` must match an existing hold in `LockQrcForJob` state.
+    ///   - `receipt_hash` must match the SHA-256 of the submitted receipt.
+    ///   - Sender must be a coordinator / validator address.
+    ReleaseQrcForJob {
+        /// The escrow hold being released.
+        escrow_id: String,
+        /// The resource job that completed.
+        job_id: String,
+        /// The machine that ran the job.
+        machine_id: String,
+        /// Provider's wallet address (derived from the machine record).
+        provider_wallet: String,
+        /// Actual QRC earned (≤ locked amount).
+        amount: u64,
+        /// SHA-256 of the UsefulWorkReceipt or ResourceExecutionReceipt that
+        /// authorises this release.
+        receipt_hash: String,
+    },
+
+    /// Return escrowed QRC to the agent when a job fails, times out, or is refunded.
+    ///
+    /// Submitted by the coordinator on timeout or failed verification.
+    /// The full locked amount is returned — no partial refunds; any partial
+    /// charges become `ReleaseQrcForJob` amounts instead.
+    ///
+    /// Enforced invariants:
+    ///   - `escrow_id` must match an existing hold.
+    ///   - Sender must be a coordinator / validator address.
+    RefundQrcForJob {
+        /// The escrow hold being cancelled.
+        escrow_id: String,
+        /// The resource job that failed or was cancelled.
+        job_id: String,
+        /// Wallet address to refund.
+        agent_wallet: String,
+        /// Full locked amount returned.
+        amount: u64,
+        /// Why the refund was issued.
+        reason: chain_forge_resource::RefundReason,
+    },
 }
 
 impl TxBody {
@@ -618,6 +695,10 @@ impl TxBody {
             // Resource Network v0.2
             TxBody::PurchaseQrc { .. }            => "PurchaseQrc",
             TxBody::CreditProvider { .. }         => "CreditProvider",
+            // Resource Marketplace — QRC Escrow
+            TxBody::LockQrcForJob { .. }          => "LockQrcForJob",
+            TxBody::ReleaseQrcForJob { .. }       => "ReleaseQrcForJob",
+            TxBody::RefundQrcForJob { .. }        => "RefundQrcForJob",
         }
     }
 }
@@ -770,6 +851,16 @@ impl Transaction {
             // Resource Network v0.2: job_id + amounts + 32-byte provider key + resource enum.
             TxBody::PurchaseQrc { job_id, .. } => job_id.len() + 48,
             TxBody::CreditProvider { job_id, .. } => job_id.len() + 32 + 24,
+            // QRC Escrow: escrow_id + job_id + wallet + amount (+ extras for Release/Refund).
+            TxBody::LockQrcForJob { escrow_id, job_id, agent_wallet, .. } => {
+                escrow_id.len() + job_id.len() + agent_wallet.len() + 8
+            }
+            TxBody::ReleaseQrcForJob { escrow_id, job_id, machine_id, provider_wallet, receipt_hash, .. } => {
+                escrow_id.len() + job_id.len() + machine_id.len() + provider_wallet.len() + receipt_hash.len() + 8
+            }
+            TxBody::RefundQrcForJob { escrow_id, job_id, agent_wallet, .. } => {
+                escrow_id.len() + job_id.len() + agent_wallet.len() + 16
+            }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -1112,6 +1203,101 @@ impl Transaction {
         }
     }
 
+    // ── Resource Marketplace — QRC Escrow constructors ───────────────────────
+
+    /// Lock `amount` uQRC in escrow for `job_id` (Resource Marketplace §5.1).
+    ///
+    /// `agent_wallet` is the wallet the QRC is debited from.
+    /// `escrow_id` must be unique across all in-flight jobs.
+    pub fn lock_qrc_for_job(
+        id:           &str,
+        sender:       &str,
+        escrow_id:    &str,
+        job_id:       &str,
+        agent_wallet: &str,
+        amount:       u64,
+        nonce:        u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::LockQrcForJob {
+                escrow_id:    escrow_id.to_string(),
+                job_id:       job_id.to_string(),
+                agent_wallet: agent_wallet.to_string(),
+                amount,
+            },
+            gas_limit: 200_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Release escrowed QRC to the provider after verified job completion.
+    ///
+    /// Submitted by the coordinator.  `amount` ≤ locked amount.
+    /// `receipt_hash` is the SHA-256 of the authorising receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_qrc_for_job(
+        id:              &str,
+        coordinator:     &str,
+        escrow_id:       &str,
+        job_id:          &str,
+        machine_id:      &str,
+        provider_wallet: &str,
+        amount:          u64,
+        receipt_hash:    &str,
+        nonce:           u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: coordinator.to_string(),
+            nonce,
+            body: TxBody::ReleaseQrcForJob {
+                escrow_id:       escrow_id.to_string(),
+                job_id:          job_id.to_string(),
+                machine_id:      machine_id.to_string(),
+                provider_wallet: provider_wallet.to_string(),
+                amount,
+                receipt_hash:    receipt_hash.to_string(),
+            },
+            gas_limit: 250_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    /// Return escrowed QRC to the agent on job failure, timeout, or cancellation.
+    ///
+    /// Submitted by the coordinator.  Full locked amount is returned.
+    pub fn refund_qrc_for_job(
+        id:           &str,
+        coordinator:  &str,
+        escrow_id:    &str,
+        job_id:       &str,
+        agent_wallet: &str,
+        amount:       u64,
+        reason:       chain_forge_resource::RefundReason,
+        nonce:        u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: coordinator.to_string(),
+            nonce,
+            body: TxBody::RefundQrcForJob {
+                escrow_id:    escrow_id.to_string(),
+                job_id:       job_id.to_string(),
+                agent_wallet: agent_wallet.to_string(),
+                amount,
+                reason,
+            },
+            gas_limit: 200_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
     /// Register a Charmed Agent with full AEI fields (Phase 1 / Section 5.3).
     ///
     /// Sender is the human sponsor.  The agent starts in `Pending` status.
@@ -1298,6 +1484,10 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Resource Network v0.2 marketplace tx types belong to the QRC module.
         TxBody::PurchaseQrc { .. }
         | TxBody::CreditProvider { .. } => Some("qrc"),
+        // QRC Escrow is part of the Resource Marketplace (QRC module).
+        TxBody::LockQrcForJob { .. }
+        | TxBody::ReleaseQrcForJob { .. }
+        | TxBody::RefundQrcForJob { .. } => Some("qrc"),
     }
 }
 
@@ -2525,6 +2715,107 @@ impl Executor {
                     }
                 }
             }
+
+            // ── Resource Marketplace — QRC Escrow ─────────────────────────────
+
+            TxBody::LockQrcForJob { escrow_id, job_id, agent_wallet, amount } => {
+                // Verify the agent wallet has enough QRC to lock.
+                let balance = state.get_account(agent_wallet)
+                    .map(|a| a.balance_of("uqrc"))
+                    .unwrap_or(0);
+                if balance < *amount as u128 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "LockQrcForJob: insufficient uqrc in agent wallet {} — \
+                             have {}, need {} (escrow_id={}, job_id={})",
+                            agent_wallet, balance, amount, escrow_id, job_id
+                        ),
+                    );
+                }
+                // Debit the QRC from the agent wallet (held in escrow until Release/Refund).
+                if let Ok(acct) = state.get_account_mut(agent_wallet) {
+                    acct.debit("uqrc", *amount as u128).expect("balance check passed above");
+                }
+                state.refresh_leaf(agent_wallet);
+                events.push(format!(
+                    "lock_qrc_for_job: escrow_id={} job_id={} agent_wallet={} amount={} locked",
+                    escrow_id, job_id, agent_wallet, amount
+                ));
+                Ok(())
+            }
+
+            TxBody::ReleaseQrcForJob {
+                escrow_id, job_id, machine_id, provider_wallet, amount, receipt_hash
+            } => {
+                // Coordinator gate: sender must be Verified or Established tier.
+                let tier_ok = identity.get(&tx.sender)
+                    .map(|r| r.is_verified())
+                    .unwrap_or(false);
+                if !tier_ok {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ReleaseQrcForJob: sender {} is not a Verified identity \
+                             (coordinator gate, escrow_id={})",
+                            tx.sender, escrow_id
+                        ),
+                    );
+                }
+                // Ensure provider wallet account exists.
+                if state.get_account(provider_wallet).is_err() {
+                    let new_acct = chain_forge_state::AccountState::new(
+                        provider_wallet.clone(), "provider".to_string()
+                    );
+                    state.upsert_account(new_acct);
+                }
+                // Credit the settled amount to the provider.
+                if let Ok(acct) = state.get_account_mut(provider_wallet) {
+                    acct.credit("uqrc", *amount as u128);
+                }
+                state.refresh_leaf(provider_wallet);
+                events.push(format!(
+                    "release_qrc_for_job: escrow_id={} job_id={} machine_id={} \
+                     provider_wallet={} amount={} receipt_hash={} coordinator={}",
+                    escrow_id, job_id, machine_id, provider_wallet, amount, receipt_hash, tx.sender
+                ));
+                Ok(())
+            }
+
+            TxBody::RefundQrcForJob { escrow_id, job_id, agent_wallet, amount, reason } => {
+                // Coordinator gate: sender must be Verified or Established tier.
+                let tier_ok = identity.get(&tx.sender)
+                    .map(|r| r.is_verified())
+                    .unwrap_or(false);
+                if !tier_ok {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "RefundQrcForJob: sender {} is not a Verified identity \
+                             (coordinator gate, escrow_id={})",
+                            tx.sender, escrow_id
+                        ),
+                    );
+                }
+                // Ensure agent wallet account exists.
+                if state.get_account(agent_wallet).is_err() {
+                    let new_acct = chain_forge_state::AccountState::new(
+                        agent_wallet.clone(), "user".to_string()
+                    );
+                    state.upsert_account(new_acct);
+                }
+                // Return the locked QRC to the agent wallet.
+                if let Ok(acct) = state.get_account_mut(agent_wallet) {
+                    acct.credit("uqrc", *amount as u128);
+                }
+                state.refresh_leaf(agent_wallet);
+                events.push(format!(
+                    "refund_qrc_for_job: escrow_id={} job_id={} agent_wallet={} \
+                     amount={} reason={:?} coordinator={}",
+                    escrow_id, job_id, agent_wallet, amount, reason, tx.sender
+                ));
+                Ok(())
+            }
         };
 
         if result.is_ok() {
@@ -2676,6 +2967,12 @@ impl Executor {
             | TxBody::RecordAgentSpend { .. }
             | TxBody::SpawnChildAgent { .. } => {
                 Err("AEI Phase 2 transaction requires identity- and agent-aware executor".to_string())
+            }
+            // QRC Escrow requires the full identity- and agent-aware executor.
+            TxBody::LockQrcForJob { .. }
+            | TxBody::ReleaseQrcForJob { .. }
+            | TxBody::RefundQrcForJob { .. } => {
+                Err("QRC escrow transaction requires identity- and QRC-engine-aware executor".to_string())
             }
         };
 

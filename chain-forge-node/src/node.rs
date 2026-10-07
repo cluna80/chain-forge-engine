@@ -333,6 +333,10 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         // Resource Network v0.2 marketplace tx types
         TxBody::PurchaseQrc { .. }              => "purchase_qrc",
         TxBody::CreditProvider { .. }           => "credit_provider",
+        // Resource Marketplace — QRC Escrow
+        TxBody::LockQrcForJob { .. }            => "lock_qrc_for_job",
+        TxBody::ReleaseQrcForJob { .. }         => "release_qrc_for_job",
+        TxBody::RefundQrcForJob { .. }          => "refund_qrc_for_job",
     }
 }
 
