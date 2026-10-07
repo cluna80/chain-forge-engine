@@ -84,6 +84,21 @@ The hash is not the product. The science is the product. The hash is a tamper se
 
 The seal_hash field is added to UsefulWorkReceipt. Every Grand Challenge receipt carries it. Any independent party — another machine on the network, a domain expert, a light client — can verify both that the output was sealed at the right difficulty and that the seal matches the claimed output_hash.
 
+BTC Block Hashes as a Randomness Beacon
+
+QCB makes one additional, specific use of the Bitcoin network: as an unpredictable randomness source for Grand Challenge job assignment.
+
+When a machine joins an active challenge track, it needs to be assigned a specific slice of the problem space — a nonce range to search, a simulation starting condition, a subproblem partition. That assignment has to be fair and tamper-resistant. If QCB itself picks the numbers, a malicious operator could steer easy slices to friendly machines or hard slices to competitors. If a machine picks its own slice, it can cherry-pick favorable regions of the search space.
+
+The solution is to derive the assignment from something neither QCB nor any participant controls: a recent Bitcoin block hash. No one knows in advance what the next BTC block hash will be. Once it is produced, it is publicly verifiable, tamper-evident, and permanent.
+
+    job_seed = SHA256(btc_block_hash || challenge_id || machine_id)
+    assigned_slice_start = job_seed[0..8] as u64
+
+This is not recycling Bitcoin's mining work — the discarded BTC hashes carry no information that can be repurposed. What QCB uses is the block hash as a public, unmanipulable beacon: a number that everyone can see, nobody predicted, and nobody influenced. The Bitcoin network produces it as a byproduct of its own consensus. QCB reads it as an entropy source.
+
+This technique — using an external blockchain's output as a randomness beacon — is established practice in the broader blockchain ecosystem. QCB's application of it to distributed scientific job assignment, where fairness of slice allocation directly affects research integrity, is the specific use case that makes it valuable here.
+
 Why This Opens the Bitcoin Ecosystem
 
 Solo Bitcoin miners and small farms are structurally underserved by the current mining landscape. Pool consolidation has moved the economics toward large operators; a solo miner with a few ASICs earns erratically and with high variance. The SHA256 hardware sits idle between rare finds.

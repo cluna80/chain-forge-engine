@@ -389,6 +389,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 | Item | Status | Notes |
 |------|--------|-------|
+| BTC block hash randomness beacon | ⬜ | Grand Challenge job slice assignment derived from recent BTC block hash: `job_seed = SHA256(btc_block_hash \|\| challenge_id \|\| machine_id)`; prevents QCB or any participant from steering which machine gets which problem slice; established technique (used by Chainlink VRF, drand, bitcoin anchors), applied here to research job fairness; Phase 1 |
 | `seal_hash` field on `UsefulWorkReceipt` | ⬜ | `seal_hash: String` — `SHA256(nonce \|\| output_hash \|\| challenge_id)` with target difficulty prefix; added to `chain-forge-resource` receipt types; Phase 1 |
 | Seal difficulty target per challenge track | ⬜ | Governance-settable difficulty for each active Grand Challenge track; stored in challenge config; Phase 1 |
 | Seal verification in receipt submission | ⬜ | Receipt submission path checks difficulty prefix before accepting `UsefulWorkReceipt`; verifier re-hashes from submitted `nonce + output_hash + challenge_id` — fast, one SHA256 call; Phase 1 |
