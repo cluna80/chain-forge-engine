@@ -337,6 +337,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::LockQrcForJob { .. }            => "lock_qrc_for_job",
         TxBody::ReleaseQrcForJob { .. }         => "release_qrc_for_job",
         TxBody::RefundQrcForJob { .. }          => "refund_qrc_for_job",
+        // Agent Treasury
+        TxBody::DepositToTreasury { .. }        => "deposit_to_treasury",
     }
 }
 

@@ -50,6 +50,9 @@ pub enum AgentError {
     #[error("lifetime spending limit exceeded: lifetime spend {lifetime_spend} + {amount} > limit {lifetime_limit}")]
     LifetimeLimitExceeded { lifetime_spend: u128, amount: u128, lifetime_limit: u128 },
 
+    #[error("per-job spending limit exceeded: single job amount {amount} > per-job limit {per_job_limit}")]
+    PerJobLimitExceeded { amount: u128, per_job_limit: u128 },
+
     #[error("parent agent {0} not found or not active")]
     ParentNotActive(String),
 
@@ -131,10 +134,11 @@ impl std::fmt::Display for AgentCapability {
 
 // -- SpendingLimits -----------------------------------------------------------
 
-/// Per-epoch and lifetime $QRC spending caps for a Charmed Agent.
+/// Per-epoch, lifetime, and per-job $QRC spending caps for a Charmed Agent.
 /// This is the SpendingLimits field from the AEI specification (Section 4.6).
 ///
-/// Phase 0: enforced in AgentStore::record_spend().
+/// Phase 0: epoch/lifetime enforced in AgentStore::record_spend().
+/// Phase 0: per_job_limit enforced in execution layer LockQrcForJob handler.
 /// The human sponsor sets these at registration time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendingLimits {
@@ -147,6 +151,10 @@ pub struct SpendingLimits {
     /// Maximum uqrc this agent may hold at any one time.
     /// 0 means no limit.
     pub max_balance_uqrc: u128,
+    /// Maximum uqrc any single LockQrcForJob may escrow on behalf of this agent.
+    /// 0 means no limit. Lets a sponsor cap blast-radius of a single bad job.
+    #[serde(default)]
+    pub per_job_limit_uqrc: u128,
 }
 
 impl SpendingLimits {
@@ -156,6 +164,7 @@ impl SpendingLimits {
             epoch_limit_uqrc:    0,
             lifetime_limit_uqrc: 0,
             max_balance_uqrc:    0,
+            per_job_limit_uqrc:  0,
         }
     }
 
@@ -165,6 +174,7 @@ impl SpendingLimits {
             epoch_limit_uqrc,
             lifetime_limit_uqrc: 0,
             max_balance_uqrc:    epoch_limit_uqrc * 2,
+            per_job_limit_uqrc:  0,
         }
     }
 
@@ -175,6 +185,18 @@ impl SpendingLimits {
             epoch_limit_uqrc:    epoch,
             lifetime_limit_uqrc: 0,
             max_balance_uqrc:    epoch,
+            per_job_limit_uqrc:  0,
+        }
+    }
+
+    /// Resource-marketplace agent: epoch budget + hard per-job cap.
+    /// Lets Alice fund an agent without risking the whole treasury on one bad job.
+    pub fn resource_agent(epoch_limit_uqrc: u128, per_job_limit_uqrc: u128) -> Self {
+        Self {
+            epoch_limit_uqrc,
+            lifetime_limit_uqrc: 0,
+            max_balance_uqrc:    epoch_limit_uqrc,
+            per_job_limit_uqrc,
         }
     }
 
@@ -194,6 +216,16 @@ impl SpendingLimits {
         {
             return Err(AgentError::LifetimeLimitExceeded {
                 lifetime_spend, amount, lifetime_limit: self.lifetime_limit_uqrc,
+            });
+        }
+        Ok(())
+    }
+
+    /// Check if a single job escrow would exceed the per-job cap.
+    pub fn check_per_job(&self, amount: u128) -> AgentResult<()> {
+        if self.per_job_limit_uqrc > 0 && amount > self.per_job_limit_uqrc {
+            return Err(AgentError::PerJobLimitExceeded {
+                amount, per_job_limit: self.per_job_limit_uqrc,
             });
         }
         Ok(())
@@ -551,6 +583,17 @@ impl AgentStore {
             .map(|r| r.is_active())
             .unwrap_or(false)
     }
+
+    /// Mutable lookup by agent_id (for in-place record updates, e.g. treasury deposits).
+    pub fn get_mut_by_id(&mut self, agent_id: &str) -> Option<&mut AgentRecord> {
+        self.agents.get_mut(agent_id)
+    }
+
+    /// Mutable lookup by agent wallet address.
+    pub fn get_mut_by_address(&mut self, address: &str) -> Option<&mut AgentRecord> {
+        let id = self.by_address.get(address)?.clone();
+        self.agents.get_mut(&id)
+    }
 }
 
 impl Default for AgentStore {
@@ -665,6 +708,7 @@ mod tests {
             epoch_limit_uqrc:    0,
             lifetime_limit_uqrc: 5_000_000,
             max_balance_uqrc:    0,
+            per_job_limit_uqrc:  0,
         };
         assert!(limits.check_lifetime(4_999_999, 1).is_ok());
         assert!(limits.check_lifetime(5_000_000, 1).is_err());

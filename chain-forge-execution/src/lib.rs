@@ -146,6 +146,8 @@ impl GasModel {
                     TxBody::LockQrcForJob { .. }         => op_multiplier * 5,
                     TxBody::ReleaseQrcForJob { .. }      => op_multiplier * 6, // two account writes + receipt check
                     TxBody::RefundQrcForJob { .. }       => op_multiplier * 4,
+                    // Agent Treasury: one debit + one credit + optional agent record update.
+                    TxBody::DepositToTreasury { .. }     => op_multiplier * 4,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -656,6 +658,34 @@ pub enum TxBody {
         /// Why the refund was issued.
         reason: chain_forge_resource::RefundReason,
     },
+
+    // ── Agent Treasury ─────────────────────────────────────────────────────
+    //
+    // A treasury is a virtual QRC wallet that a human sponsor pre-loads on
+    // behalf of an agent.  The agent draws on the treasury through
+    // LockQrcForJob rather than spending its own wallet balance, so the
+    // sponsor retains visibility and the per_job_limit cap applies.
+    //
+    // Treasury account key: `treasury:{agent_id}` — a deterministic address
+    // never held by any private key, only credited by DepositToTreasury and
+    // debited by LockQrcForJob.
+
+    /// Pre-load QRC into an agent's treasury account.
+    ///
+    /// Only the agent's registered sponsor may call this.  The sender's
+    /// wallet is debited and the treasury account is credited.
+    ///
+    /// The per_job_limit field is optional; if provided it replaces the
+    /// agent's current SpendingLimits.per_job_limit_uqrc in the AgentRecord
+    /// so the sponsor can tighten or relax the cap in the same tx.
+    DepositToTreasury {
+        /// Agent whose treasury receives the deposit.
+        agent_id: String,
+        /// uqrc to transfer from sender's wallet to `treasury:{agent_id}`.
+        amount: u64,
+        /// Optional new per-job cap (0 = leave current value unchanged).
+        per_job_limit_uqrc: u64,
+    },
 }
 
 impl TxBody {
@@ -699,6 +729,8 @@ impl TxBody {
             TxBody::LockQrcForJob { .. }          => "LockQrcForJob",
             TxBody::ReleaseQrcForJob { .. }       => "ReleaseQrcForJob",
             TxBody::RefundQrcForJob { .. }        => "RefundQrcForJob",
+            // Agent Treasury
+            TxBody::DepositToTreasury { .. }      => "DepositToTreasury",
         }
     }
 }
@@ -861,6 +893,8 @@ impl Transaction {
             TxBody::RefundQrcForJob { escrow_id, job_id, agent_wallet, .. } => {
                 escrow_id.len() + job_id.len() + agent_wallet.len() + 16
             }
+            // Agent Treasury: agent_id + amount + optional new per_job_limit.
+            TxBody::DepositToTreasury { agent_id, .. } => agent_id.len() + 16,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -1298,6 +1332,33 @@ impl Transaction {
         }
     }
 
+    /// Pre-load QRC into an agent's treasury account.
+    ///
+    /// `sponsor` is the human address paying for the deposit.
+    /// `per_job_limit_uqrc` = 0 means "leave current limit unchanged".
+    pub fn deposit_to_treasury(
+        id:                  &str,
+        sponsor:             &str,
+        agent_id:            &str,
+        amount:              u64,
+        per_job_limit_uqrc:  u64,
+        nonce:               u64,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sponsor.to_string(),
+            nonce,
+            body: TxBody::DepositToTreasury {
+                agent_id: agent_id.to_string(),
+                amount,
+                per_job_limit_uqrc,
+            },
+            gas_limit: 200_000,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
     /// Register a Charmed Agent with full AEI fields (Phase 1 / Section 5.3).
     ///
     /// Sender is the human sponsor.  The agent starts in `Pending` status.
@@ -1488,6 +1549,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::LockQrcForJob { .. }
         | TxBody::ReleaseQrcForJob { .. }
         | TxBody::RefundQrcForJob { .. } => Some("qrc"),
+        // Agent Treasury is part of the agents module (modifies agent records).
+        TxBody::DepositToTreasury { .. } => Some("agents"),
     }
 }
 
@@ -2719,28 +2782,64 @@ impl Executor {
             // ── Resource Marketplace — QRC Escrow ─────────────────────────────
 
             TxBody::LockQrcForJob { escrow_id, job_id, agent_wallet, amount } => {
-                // Verify the agent wallet has enough QRC to lock.
-                let balance = state.get_account(agent_wallet)
-                    .map(|a| a.balance_of("uqrc"))
+                // ── per-job spending limit check ──────────────────────────────
+                // If the agent has a registered record with a per_job_limit, enforce it.
+                // We look up by agent_wallet address (the agent's on-chain address).
+                let per_job_limit = agents
+                    .get_by_address(agent_wallet).ok()
+                    .map(|r| r.spending_limits.per_job_limit_uqrc)
                     .unwrap_or(0);
-                if balance < *amount as u128 {
+                if per_job_limit > 0 && (*amount as u128) > per_job_limit {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
                         format!(
-                            "LockQrcForJob: insufficient uqrc in agent wallet {} — \
-                             have {}, need {} (escrow_id={}, job_id={})",
-                            agent_wallet, balance, amount, escrow_id, job_id
+                            "LockQrcForJob: amount {} exceeds per-job limit {} for agent wallet {} \
+                             (escrow_id={}, job_id={})",
+                            amount, per_job_limit, agent_wallet, escrow_id, job_id
                         ),
                     );
                 }
-                // Debit the QRC from the agent wallet (held in escrow until Release/Refund).
-                if let Ok(acct) = state.get_account_mut(agent_wallet) {
+
+                // ── treasury-first funding ────────────────────────────────────
+                // Try to draw from the agent's treasury account first.
+                // Treasury address: `treasury:{agent_wallet}`.
+                // Falls back to the agent's own wallet if treasury is empty / absent.
+                let treasury_key = format!("treasury:{}", agent_wallet);
+                let treasury_balance = state.get_account(&treasury_key)
+                    .map(|a| a.balance_of("uqrc"))
+                    .unwrap_or(0);
+
+                let (debit_from, source_label) = if treasury_balance >= *amount as u128 {
+                    (treasury_key.clone(), "treasury")
+                } else {
+                    (agent_wallet.clone(), "wallet")
+                };
+
+                let source_balance = state.get_account(&debit_from)
+                    .map(|a| a.balance_of("uqrc"))
+                    .unwrap_or(0);
+
+                if source_balance < *amount as u128 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "LockQrcForJob: insufficient uqrc — treasury={} wallet={} need={} \
+                             (escrow_id={}, job_id={})",
+                            treasury_balance,
+                            state.get_account(agent_wallet).map(|a| a.balance_of("uqrc")).unwrap_or(0),
+                            amount, escrow_id, job_id
+                        ),
+                    );
+                }
+
+                // Debit from the chosen source (held in escrow until Release/Refund).
+                if let Ok(acct) = state.get_account_mut(&debit_from) {
                     acct.debit("uqrc", *amount as u128).expect("balance check passed above");
                 }
-                state.refresh_leaf(agent_wallet);
+                state.refresh_leaf(&debit_from);
                 events.push(format!(
-                    "lock_qrc_for_job: escrow_id={} job_id={} agent_wallet={} amount={} locked",
-                    escrow_id, job_id, agent_wallet, amount
+                    "lock_qrc_for_job: escrow_id={} job_id={} agent_wallet={} amount={} source={} locked",
+                    escrow_id, job_id, agent_wallet, amount, source_label
                 ));
                 Ok(())
             }
@@ -2813,6 +2912,77 @@ impl Executor {
                     "refund_qrc_for_job: escrow_id={} job_id={} agent_wallet={} \
                      amount={} reason={:?} coordinator={}",
                     escrow_id, job_id, agent_wallet, amount, reason, tx.sender
+                ));
+                Ok(())
+            }
+
+            // ── Agent Treasury ─────────────────────────────────────────────────
+            TxBody::DepositToTreasury { agent_id, amount, per_job_limit_uqrc } => {
+                // Sender is the sponsor; verify they are the registered sponsor
+                // for this agent (or Verified if acting as a coordinator deposit).
+                let agent_rec = agents.get(agent_id).ok().cloned();
+                if let Some(ref rec) = agent_rec {
+                    if rec.sponsor_id != tx.sender {
+                        let tier_ok = identity.get(&tx.sender)
+                            .map(|r| r.is_verified())
+                            .unwrap_or(false);
+                        if !tier_ok {
+                            return TransactionResult::err(
+                                tx.id.clone(), gas_required, tx.gas_limit,
+                                format!(
+                                    "DepositToTreasury: sender {} is neither the registered \
+                                     sponsor {} nor a Verified coordinator for agent {}",
+                                    tx.sender, rec.sponsor_id, agent_id
+                                ),
+                            );
+                        }
+                    }
+                }
+                // Verify sender has enough uqrc.
+                let sender_balance = state.get_account(&tx.sender)
+                    .map(|a| a.balance_of("uqrc"))
+                    .unwrap_or(0);
+                if sender_balance < *amount as u128 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "DepositToTreasury: sender {} has {} uqrc but tried to deposit {} \
+                             into treasury for agent {}",
+                            tx.sender, sender_balance, amount, agent_id
+                        ),
+                    );
+                }
+                // Debit sender.
+                if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                    acct.debit("uqrc", *amount as u128).expect("sender balance verified above");
+                }
+                state.refresh_leaf(&tx.sender);
+                // Credit treasury account (create if new).
+                let treasury_key = format!("treasury:{}", agent_id);
+                if state.get_account(&treasury_key).is_err() {
+                    let new_acct = chain_forge_state::AccountState::new(
+                        treasury_key.clone(), "treasury".to_string()
+                    );
+                    state.upsert_account(new_acct);
+                }
+                if let Ok(acct) = state.get_account_mut(&treasury_key) {
+                    acct.credit("uqrc", *amount as u128);
+                }
+                state.refresh_leaf(&treasury_key);
+                // Optionally update per_job_limit on the agent record.
+                let new_limit = *per_job_limit_uqrc as u128;
+                if new_limit > 0 {
+                    if let Some(rec) = agents.get_mut_by_id(agent_id.as_str()) {
+                        rec.spending_limits.per_job_limit_uqrc = new_limit;
+                    }
+                }
+                let treasury_new_bal = state.get_account(&treasury_key)
+                    .map(|a| a.balance_of("uqrc"))
+                    .unwrap_or(0);
+                events.push(format!(
+                    "deposit_to_treasury: agent_id={} sponsor={} amount={} \
+                     treasury_balance={} per_job_limit={}",
+                    agent_id, tx.sender, amount, treasury_new_bal, per_job_limit_uqrc
                 ));
                 Ok(())
             }
@@ -2973,6 +3143,10 @@ impl Executor {
             | TxBody::ReleaseQrcForJob { .. }
             | TxBody::RefundQrcForJob { .. } => {
                 Err("QRC escrow transaction requires identity- and QRC-engine-aware executor".to_string())
+            }
+            // Agent Treasury requires the full identity- and agent-aware executor.
+            TxBody::DepositToTreasury { .. } => {
+                Err("AgentTreasury transaction requires identity- and agent-aware executor".to_string())
             }
         };
 
@@ -3824,6 +3998,32 @@ mod tests {
                 capabilities:        vec![],
                 spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
                 description:         "x".into(),
+            },
+            TxBody::LockQrcForJob {
+                escrow_id:    "esc1".into(),
+                job_id:       "job1".into(),
+                agent_wallet: "qcb1alice".into(),
+                amount:       1_000,
+            },
+            TxBody::ReleaseQrcForJob {
+                escrow_id:       "esc1".into(),
+                job_id:          "job1".into(),
+                machine_id:      "machine1".into(),
+                provider_wallet: "qcb1bob".into(),
+                amount:          1_000,
+                receipt_hash:    "deadbeef".into(),
+            },
+            TxBody::RefundQrcForJob {
+                escrow_id:    "esc1".into(),
+                job_id:       "job1".into(),
+                agent_wallet: "qcb1alice".into(),
+                amount:       1_000,
+                reason:       chain_forge_resource::RefundReason::Timeout,
+            },
+            TxBody::DepositToTreasury {
+                agent_id:           "agent-a1".into(),
+                amount:             5_000,
+                per_job_limit_uqrc: 500,
             },
         ];
         for body in bodies {
