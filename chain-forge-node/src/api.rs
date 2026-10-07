@@ -8,9 +8,10 @@
 /// key management, and a WebSocket feed for the explorer.
 
 use std::sync::{Arc, Mutex};
-use super::node::{NodeStatus, ExplorerState, QrcMetrics};
+use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS};
 use chain_forge_p2p::PeerInfo;
 use chain_forge_execution::Transaction;
+use chain_forge_resource::UsefulWorkReceipt;
 
 /// Serve the HTTP API on the given port.
 /// Phase 0 implementation: a minimal hand-rolled HTTP server that handles
@@ -274,6 +275,83 @@ pub async fn serve(
                         // GET /api/peers — connected peers (real network layer)
                         let p = peers.lock().unwrap();
                         http_200_json(&serde_json::to_string(&*p).unwrap_or_default())
+                    } else if first_line.starts_with("POST /api/gc-receipt") {
+                        // POST /api/gc-receipt — receive a UsefulWorkReceipt from gc-daemon.
+                        // Validates with verify_seal(), stores in ExplorerState (newest-first,
+                        // capped at MAX_GC_RECEIPTS), and exposes via GET /api/gc-receipts.
+                        //
+                        // The gc-daemon wraps the receipt in:
+                        //   { "tx_type": "UsefulWorkReceipt", "payload": <receipt> }
+                        // We accept either shape for robustness.
+                        let body_start = request.find("\r\n\r\n")
+                            .map(|i| i + 4)
+                            .unwrap_or(request.len());
+                        let body = &request[body_start..];
+
+                        // Try both shapes: bare receipt or envelope with "payload" field.
+                        let receipt_result: Result<UsefulWorkReceipt, _> =
+                            serde_json::from_str(body)
+                            .or_else(|_| {
+                                serde_json::from_str::<serde_json::Value>(body)
+                                    .ok()
+                                    .and_then(|v| v.get("payload").cloned())
+                                    .ok_or_else(|| serde_json::from_str::<UsefulWorkReceipt>("").unwrap_err())
+                                    .and_then(|p| serde_json::from_value(p))
+                            });
+
+                        match receipt_result {
+                            Ok(receipt) => {
+                                if !chain_forge_resource::verify_seal(&receipt) {
+                                    let resp = serde_json::json!({
+                                        "status": "rejected",
+                                        "receipt_id": receipt.receipt_id,
+                                        "reason": "verify_seal failed — seal_hash does not meet difficulty target"
+                                    });
+                                    tracing::warn!(
+                                        receipt_id = %receipt.receipt_id,
+                                        "gc-receipt rejected: verify_seal failed"
+                                    );
+                                    http_400_json(&resp.to_string())
+                                } else {
+                                    let receipt_id = receipt.receipt_id.clone();
+                                    let challenge_id = receipt.challenge_id.clone();
+                                    let machine_id = receipt.machine_id.0.clone();
+                                    {
+                                        let mut ex = explorer.lock().unwrap();
+                                        ex.gc_receipts.push_front(receipt);
+                                        if ex.gc_receipts.len() > MAX_GC_RECEIPTS {
+                                            ex.gc_receipts.pop_back();
+                                        }
+                                    }
+                                    tracing::info!(
+                                        receipt_id,
+                                        challenge_id,
+                                        machine_id,
+                                        "gc-receipt accepted and stored"
+                                    );
+                                    let resp = serde_json::json!({
+                                        "status": "accepted",
+                                        "receipt_id": receipt_id,
+                                        "challenge_id": challenge_id,
+                                        "machine_id": machine_id
+                                    });
+                                    http_200_json(&resp.to_string())
+                                }
+                            }
+                            Err(e) => {
+                                let resp = serde_json::json!({
+                                    "status": "error",
+                                    "message": format!("invalid UsefulWorkReceipt JSON: {e}")
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                        }
+                    } else if first_line.starts_with("GET /api/gc-receipts") {
+                        // GET /api/gc-receipts — all stored Grand Challenge receipts, newest first.
+                        // Used by the React explorer to show live GC activity.
+                        let ex = explorer.lock().unwrap();
+                        let receipts: Vec<_> = ex.gc_receipts.iter().collect();
+                        http_200_json(&serde_json::to_string(&receipts).unwrap_or_default())
                     } else if first_line.starts_with("POST /genesis") {
                         // POST /genesis -- validate and echo back a genesis configuration.
                         // The wizard "Generate Genesis" button posts the config fields here;

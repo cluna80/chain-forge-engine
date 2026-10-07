@@ -99,7 +99,12 @@ pub struct ExplorerState {
     /// Current validator set with voting powers, as of the last committed block.
     /// Updated every block. Used by GET /api/validators.
     pub validator_powers: Vec<ValidatorPowerSummary>,
+    /// Grand Challenge receipts received via POST /api/gc-receipt.
+    /// Newest first, capped at MAX_GC_RECEIPTS.
+    pub gc_receipts: std::collections::VecDeque<chain_forge_resource::UsefulWorkReceipt>,
 }
+
+pub const MAX_GC_RECEIPTS: usize = 500;
 
 pub const MAX_RECENT_BLOCKS: usize = 100;
 

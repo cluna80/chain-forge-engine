@@ -18,12 +18,13 @@ The script polls all three node ports (Alice: 8080, Bob: 8081, Dave: 8082)
 and merges their views. The highest-height node wins for block data.
 
 Output files:
-    data/status.json   — node health + chain height
-    data/blocks.json   — recent blocks (last 50), newest first
-    data/accounts.json — all account balances + nonces
-    data/qrc.json      — QRC economic metrics
-    data/peers.json    — peer list
-    data/meta.json     — last-updated timestamp, which node responded
+    data/status.json      — node health + chain height
+    data/blocks.json      — recent blocks (last 50), newest first
+    data/accounts.json    — all account balances + nonces
+    data/qrc.json         — QRC economic metrics
+    data/peers.json       — peer list
+    data/gc_receipts.json — Grand Challenge receipts (newest first)
+    data/meta.json        — last-updated timestamp, which node responded
 """
 
 import argparse
@@ -130,6 +131,24 @@ def collect_peers(host: str, port: int) -> list:
     return []
 
 
+def collect_gc_receipts(host: str, ports: list[int]) -> list:
+    """
+    Collect Grand Challenge receipts from all responding nodes,
+    deduplicate by receipt_id, sort newest-first.
+    """
+    by_id: dict = {}
+    for port in ports:
+        receipts = fetch_json(host, port, "/api/gc-receipts")
+        if not isinstance(receipts, list):
+            continue
+        for r in receipts:
+            rid = r.get("receipt_id", "")
+            if rid and rid not in by_id:
+                by_id[rid] = r
+    # Sort by timestamp_utc descending (string sort works for ISO 8601)
+    return sorted(by_id.values(), key=lambda r: r.get("timestamp_utc", ""), reverse=True)
+
+
 # ── Main poll loop ────────────────────────────────────────────────────────
 
 def run(host: str, ports: list[int], out_dir: str, interval: float) -> None:
@@ -164,31 +183,35 @@ def run(host: str, ports: list[int], out_dir: str, interval: float) -> None:
             consecutive_failures = 0
             height = status.get("height", 0)
 
-            # Collect data from the best node (blocks: merge all nodes)
-            blocks   = collect_all_blocks(host, ports)
-            accounts = collect_accounts(host, port)
-            qrc      = collect_qrc(host, port)
-            peers    = collect_peers(host, port)
+            # Collect data from the best node (blocks + gc_receipts: merge all nodes)
+            blocks      = collect_all_blocks(host, ports)
+            accounts    = collect_accounts(host, port)
+            qrc         = collect_qrc(host, port)
+            peers       = collect_peers(host, port)
+            gc_receipts = collect_gc_receipts(host, ports)
 
             # Write snapshot files
-            write_json(os.path.join(out_dir, "status.json"),   status)
-            write_json(os.path.join(out_dir, "blocks.json"),   blocks)
-            write_json(os.path.join(out_dir, "accounts.json"), accounts)
-            write_json(os.path.join(out_dir, "qrc.json"),      qrc)
-            write_json(os.path.join(out_dir, "peers.json"),    peers)
+            write_json(os.path.join(out_dir, "status.json"),      status)
+            write_json(os.path.join(out_dir, "blocks.json"),      blocks)
+            write_json(os.path.join(out_dir, "accounts.json"),    accounts)
+            write_json(os.path.join(out_dir, "qrc.json"),         qrc)
+            write_json(os.path.join(out_dir, "peers.json"),       peers)
+            write_json(os.path.join(out_dir, "gc_receipts.json"), gc_receipts)
             write_json(os.path.join(out_dir, "meta.json"), {
-                "last_updated":   now(),
-                "status":         "online",
-                "best_port":      port,
-                "height":         height,
-                "block_count":    len(blocks),
-                "account_count":  len(accounts),
+                "last_updated":      now(),
+                "status":            "online",
+                "best_port":         port,
+                "height":            height,
+                "block_count":       len(blocks),
+                "account_count":     len(accounts),
+                "gc_receipt_count":  len(gc_receipts),
             })
 
             elapsed = time.monotonic() - t0
             print(
                 f"[{now()}] ✓  height={height}  blocks={len(blocks)}"
-                f"  accounts={len(accounts)}  ({elapsed*1000:.0f}ms)",
+                f"  accounts={len(accounts)}  gc_receipts={len(gc_receipts)}"
+                f"  ({elapsed*1000:.0f}ms)",
                 flush=True,
             )
 
