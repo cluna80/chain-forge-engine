@@ -401,6 +401,10 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | SHA256 hardware compatibility documentation | ⬜ | Document that standard Bitcoin mining ASICs and GPUs can compute seal hashes; include benchmark: TH/s → expected seals/hour at target difficulty; Phase 1 |
 | BTC miner onboarding guide | ⬜ | Step-by-step: install daemon, point at challenge, earn QRC alongside BTC mining; Phase 1 community milestone |
 | Grand Challenge resource pool mode | ⬜ | Pool operator mode: pool collects `UsefulWorkReceipt`s from member machines, aggregates $QRC earnings, distributes to members by hash-rate contribution share; Phase 2 |
+| **Challenge QRC reward pool** | ⬜ | Sponsors deposit QRC into a named challenge track's reward pool; funds three destinations: verifier rewards, discovery bonus pool, priority queue weight; on-chain deposit tx; Phase 2 |
+| **Verifier QRC rewards** | ⬜ | Independent verifier machines earn QRC from the challenge's reward pool for confirmed `UsefulWorkReceipt` verification; separate from machine uQCB accumulation; Phase 2 |
+| **Discovery bonus pool (QRC)** | ⬜ | QRC bonus released to machine whose slice produces a confirmed breakthrough; paid on top of uQCB accumulation; lottery-style outcome, not guaranteed; Phase 2 |
+| **Priority queue weighting by QRC** | ⬜ | Challenge tracks with higher QRC pool balance attract more machines via priority routing; QRC as demand signal directing compute supply; Phase 2 |
 | Community portal — challenge dashboard | ⬜ | Live metrics: hash rate contributing to each active challenge, $QRC earnings per TH/s, challenge leaderboards, individual machine contribution history; Phase 2 |
 
 ### Public Discovery Dashboard

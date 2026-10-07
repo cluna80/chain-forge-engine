@@ -168,6 +168,22 @@ QCB's role is network ownership and value capture — the asset you hold and acc
 
 QRC, by contrast, is designed for velocity. Its entire purpose is to move — buy compute, pay providers, flow through merchants, burn on consumption. The AMM is exactly where QRC belongs. High QRC velocity through the AMM is not a risk; it is the system working as intended.
 
+QRC as the Demand Signal Inside Grand Challenges
+
+QRC participates in the Grand Challenge on the demand side, not the earning side. Machines earn uQCB for doing the work. QRC is how external value — from sponsors who need the science done — flows into the network and directs where compute goes.
+
+Any participant can fund a Grand Challenge track with QRC: a university accelerating a protein fold study, a biotech company that needs drug discovery results, a research foundation backing a physics problem, or an individual who wants a specific challenge prioritized. QRC deposited into a challenge's reward pool is allocated across three destinations:
+
+· Verifier rewards — independent machines that confirm submitted UsefulWorkReceipts earn QRC for their verification work. This funds the accountability layer directly; verifiers are compensated by the sponsors who need accurate results, not by the protocol treasury.
+
+· Discovery bonus pool — if a machine's assigned slice produces a confirmed breakthrough, the QRC bonus is released on top of the earner's uQCB accumulation. The discovery bonus is a lottery ticket; the uQCB accumulation is the guaranteed return for doing verified assigned work.
+
+· Priority queue funding — a sponsor who needs results faster can put QRC behind a challenge track to attract more machines to it. QRC becomes the signal that tells the network which problems are most urgently demanded. The market routes compute toward the highest-funded tracks.
+
+This closes the economic loop between science and capital. A researcher with a grant, a company with a drug candidate, or a foundation with a mission can convert that external value into QRC on the AMM and point it directly at the problem they need solved. The network routes machines. The machines do the work. The results come back verified and hash-committed on-chain.
+
+QRC is the language that turns scientific demand into compute supply. That is a funding mechanism no traditional research institution offers: more direct than grants, more transparent than contracts, accountable on-chain, and open to anyone with QRC to spend.
+
 ---
 
 Equilibrium State: When the Network Becomes Alive
