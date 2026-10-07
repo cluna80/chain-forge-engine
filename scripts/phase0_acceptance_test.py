@@ -488,7 +488,7 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
     tx4 = tx_deposit_to_treasury(ALICE_ADDRESS, AGENT_ID, TREASURY_DEPOSIT, PER_JOB_LIMIT)
     # agent_wallet = AGENT_ID so treasury key is treasury:{AGENT_ID},
     # matching the key DepositToTreasury creates.
-    tx5 = tx_lock_qrc_for_job(ALICE_ADDRESS, ESCROW_ID, JOB_ID, AGENT_ID, ESCROW_AMOUNT)
+    tx5 = tx_lock_qrc_for_job(ALICE_ADDRESS, ESCROW_ID, JOB_ID, AGENT_ADDRESS, ESCROW_AMOUNT)
 
     submitted_tx_ids = [tx1["id"], tx2["id"], tx3["id"], tx4["id"], tx5["id"]]
 
@@ -522,8 +522,8 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
 
     # ─── Step 5: Lock QRC for job (draws from treasury) ─────────────────────
     print(hdr("Step 5 — Escrow QRC for job  (LockQrcForJob)"))
-    # agent_wallet = AGENT_ID → treasury key = treasury:{AGENT_ID}
-    # This matches the key DepositToTreasury wrote above.
+    # agent_wallet = AGENT_ADDRESS (the on-chain address of the agent).
+    # The execution layer resolves address → agent_id → treasury:{agent_id}.
     ok5, exec5 = step_submit_and_wait("LockQrcForJob", alice_host, alice_port, tx5)
 
     # ─── Wait for propagation ────────────────────────────────────────────────
@@ -533,7 +533,163 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
         time.sleep(1)
     print(f"  Done.{' ' * 20}")
 
-    return _run_verification(nodes, submitted_tx_ids, aborted=False)
+    rc = _run_verification(nodes, submitted_tx_ids, aborted=False)
+    _run_negative_tests(alice_host, alice_port)
+    return rc
+
+
+def _run_negative_tests(alice_host: str, alice_port: int) -> None:
+    """
+    Phase 0b — Negative-path tests.
+
+    Runs AFTER the happy-path sequence.  Each test submits a tx that MUST be
+    rejected by the execution layer and verifies balances are unchanged.
+
+      N1 — Over-cap lock: amount > per_job_limit (1,000,001 > 1,000,000) → FAIL
+      N2 — Duplicate escrow_id: re-use the happy-path escrow_id → FAIL (soft)
+    """
+    print("\n\n" + hdr("Phase 0b — Negative-path tests"))
+
+    # ── Setup: fresh agent for negative tests ─────────────────────────────────
+    # Re-fetch Alice's nonce so we start from the committed chain state.
+    print(f"  Setup: registering fresh agent for negative tests …")
+    neg_run        = _run_id
+    neg_agent_id   = f"neg-agent-{neg_run}"
+    neg_agent_addr = f"neg-addr-{neg_run}"
+    neg_treasury   = f"treasury:{neg_agent_id}"
+
+    live = get_live_nonce(alice_host, alice_port, ALICE_ADDRESS)
+    # Build setup txs with explicit nonces so the global counter isn't touched.
+    def _ntx(nonce_offset: int, body: dict, tx_label: str) -> dict:
+        return {
+            "id":         f"tx-neg-{tx_label}-{neg_run}",
+            "sender":     ALICE_ADDRESS,
+            "nonce":      live + nonce_offset,
+            "body":       body,
+            "gas_limit":  200_000,
+            "signature":  [],
+            "public_key": [],
+        }
+
+    tx_reg  = _ntx(0, {"RegisterAgent": {
+        "agent_id":      neg_agent_id,
+        "agent_address": neg_agent_addr,
+        "metadata":      "",
+        "parent_agent_id": None,
+    }}, "reg")
+    tx_auth = _ntx(1, {"AuthorizeAgent": {"agent_id": neg_agent_id}}, "auth")
+    tx_dep  = _ntx(2, {"DepositToTreasury": {
+        "agent_id":           neg_agent_id,
+        "amount":             5_000_000,
+        "per_job_limit_uqrc": PER_JOB_LIMIT,
+    }}, "dep")
+
+    print(f"  →  RegisterAgent → Alice [127.0.0.1:{alice_port}]")
+    ok_reg, _ = step_submit_and_wait("RegisterAgent (neg)", alice_host, alice_port, tx_reg)
+    if not ok_reg:
+        print(f"  {fail('Setup RegisterAgent failed — skipping negative tests')}")
+        return
+
+    print(f"  →  AuthorizeAgent → Alice [127.0.0.1:{alice_port}]")
+    ok_auth, _ = step_submit_and_wait("AuthorizeAgent (neg)", alice_host, alice_port, tx_auth)
+    if not ok_auth:
+        print(f"  {fail('Setup AuthorizeAgent failed — skipping negative tests')}")
+        return
+
+    print(f"  →  DepositToTreasury → Alice [127.0.0.1:{alice_port}]")
+    ok_dep, _ = step_submit_and_wait("DepositToTreasury (neg)", alice_host, alice_port, tx_dep)
+    if not ok_dep:
+        print(f"  {fail('Setup DepositToTreasury failed — skipping negative tests')}")
+        return
+
+    neg_pass = True
+
+    # ── N1: Over-cap lock ────────────────────────────────────────────────────
+    print(hdr("N1 — Over-cap lock (amount > per_job_limit → must fail)"))
+    over_cap_amount = PER_JOB_LIMIT + 1    # 1,000,001 uQRC
+    live2 = get_live_nonce(alice_host, alice_port, ALICE_ADDRESS)
+    tx_n1 = {
+        "id":         f"tx-lock-overcap-{neg_run}",
+        "sender":     ALICE_ADDRESS,
+        "nonce":      live2,
+        "body":       {"LockQrcForJob": {
+            "escrow_id":    f"esc-overcap-{neg_run}",
+            "job_id":       f"job-overcap-{neg_run}",
+            "agent_wallet": neg_agent_addr,
+            "amount":       over_cap_amount,
+        }},
+        "gas_limit":  200_000,
+        "signature":  [],
+        "public_key": [],
+    }
+
+    # Snapshot treasury before
+    treasury_before = get_account_balance(alice_host, alice_port, neg_treasury, "uqrc")
+
+    queued_n1, _ = step_submit(f"LockQrcForJob (over-cap {over_cap_amount:,} uQRC)",
+                                alice_host, alice_port, tx_n1)
+    if queued_n1:
+        found_n1, result_n1 = wait_for_commit(alice_host, alice_port, tx_n1["id"])
+        if not found_n1:
+            print(f"    {ok('tx not included in any block (rejected at mempool)')}")
+        else:
+            exec_ok_n1 = result_n1.get("success", True) if result_n1 else True
+            if exec_ok_n1:
+                print(f"    {fail('execution SUCCEEDED — cap not enforced!')}")
+                neg_pass = False
+            else:
+                err_n1 = result_n1.get("error", "") if result_n1 else ""
+                print(f"    {ok(f'execution failed as expected: {err_n1}')}")
+    else:
+        print(f"    {ok('tx rejected at submission (pre-mempool cap check)')}")
+
+    treasury_after_n1 = get_account_balance(alice_host, alice_port, neg_treasury, "uqrc")
+    if treasury_before is not None and treasury_after_n1 is not None:
+        if treasury_after_n1 == treasury_before:
+            print(f"    {ok(f'Treasury balance unchanged: {treasury_after_n1:,} uQRC')}")
+        else:
+            delta = treasury_after_n1 - treasury_before
+            print(f"    {fail(f'Treasury balance changed by {delta:+,} uQRC after over-cap lock!')}")
+            neg_pass = False
+
+    # ── N2: Duplicate escrow_id ──────────────────────────────────────────────
+    print(hdr("N2 — Duplicate escrow_id (re-use happy-path escrow → should fail)"))
+    live3 = get_live_nonce(alice_host, alice_port, ALICE_ADDRESS)
+    tx_n2 = {
+        "id":         f"tx-lock-dup-{neg_run}",
+        "sender":     ALICE_ADDRESS,
+        "nonce":      live3,
+        "body":       {"LockQrcForJob": {
+            "escrow_id":    ESCROW_ID,      # same as happy-path
+            "job_id":       JOB_ID,
+            "agent_wallet": AGENT_ADDRESS,
+            "amount":       ESCROW_AMOUNT,
+        }},
+        "gas_limit":  200_000,
+        "signature":  [],
+        "public_key": [],
+    }
+
+    queued_n2, _ = step_submit(f"LockQrcForJob (dup escrow_id={ESCROW_ID})",
+                                alice_host, alice_port, tx_n2)
+    if queued_n2:
+        found_n2, result_n2 = wait_for_commit(alice_host, alice_port, tx_n2["id"])
+        if not found_n2:
+            print(f"    {ok('tx not included (rejected at mempool)')}")
+        else:
+            exec_ok_n2 = result_n2.get("success", True) if result_n2 else True
+            if exec_ok_n2:
+                print(f"    {warn('execution SUCCEEDED — duplicate escrow not blocked (soft warn)')}")
+            else:
+                err_n2 = result_n2.get("error", "") if result_n2 else ""
+                print(f"    {ok(f'execution failed as expected: {err_n2}')}")
+    else:
+        print(f"    {ok('tx rejected at submission')}")
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    sym = f"{GREEN}{BOLD}✓  NEGATIVE TESTS PASS{RESET}" if neg_pass \
+          else f"{RED}{BOLD}✗  NEGATIVE TESTS FAIL{RESET}"
+    print(f"\n  {sym}\n")
 
 
 def _run_verification(nodes: list[tuple[str, str, int]],
