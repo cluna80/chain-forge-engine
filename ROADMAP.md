@@ -303,7 +303,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | **uQCB conversion — permissionless on-chain** | ✅ LOCKED | Operator calls conversion tx when balance ≥ 1,000,000; protocol burns uQCB, mints 1 QCB to registered address; no governance gate, no approval committee |
 | **uQCB non-transferable / non-AMM** | ✅ LOCKED | uQCB is bound to earning machine; cannot be bought, sold, or transferred; does not appear on AMM; only the earner can convert to QCB |
 | Contribution pool supply schedule | ❓ | **Open Q**: total pool size, epoch allocation rate, decay/halving schedule; must be defined before any uQCB distribution goes live |
-| **Native AMM (XRPL-style)** | ⬜ | On-chain AMM; QRC and QCB are AMM-tradeable; uQCB explicitly excluded; QRC/BTC and QRC/stablecoin pools for external asset inflow; LP fee rewards for liquidity providers; Phase 2 |
+| **Native AMM (XRPL-style)** | ⬜ | On-chain AMM; **QRC is the only AMM-tradeable token** — QCB and uQCB explicitly excluded; QRC/BTC and QRC/stablecoin pools for external asset inflow; LP fee rewards for liquidity providers; Phase 2 |
 | Contribution Mode ↔ QRC settlement distinction | ⬜ | Commercial work (customer agent → QRC payment) and protocol contribution (network job → contribution credit) are distinct flows; QRC is not automatically issued for idle capacity or contribution-mode work; clarify whether certain protocol jobs can also earn QRC in Phase 2+ |
 | Self-dealing guard for Contribution Mode | ⬜ | Owner cannot submit jobs to their own machine from the contribution pool; pool coordinator must assign work independently |
 

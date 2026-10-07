@@ -162,7 +162,11 @@ What the AMM enables:
 
 · Liquidity provider rewards — Machine operators who park QRC into AMM pools earn trading fees on top of marketplace earnings and Grand Challenge accumulation. Three revenue streams from the same hardware.
 
-uQCB does not participate in the AMM. Only QRC and QCB are AMM-tradeable. This boundary keeps the scientific issuance model clean: the AMM rewards capital and liquidity provision; the Grand Challenge track rewards verified scientific contribution. They are separate things and the protocol keeps them separate.
+QRC is the only token that trades on the AMM. QCB does not appear on the AMM, and uQCB does not appear on the AMM. This is a deliberate design boundary, not a limitation.
+
+QCB's role is network ownership and value capture — the asset you hold and accumulate, not the one you swap. Making QCB AMM-tradeable would invite arbitrage loops between the purchase path (QRC burn → QCB mint) and the AMM price, undermining both the scarcity signal and the intentional friction of QCB acquisition. The only legitimate paths to QCB are the purchase path and the Grand Challenge accumulation path. Both require real action. An AMM pair would shortcut that.
+
+QRC, by contrast, is designed for velocity. Its entire purpose is to move — buy compute, pay providers, flow through merchants, burn on consumption. The AMM is exactly where QRC belongs. High QRC velocity through the AMM is not a risk; it is the system working as intended.
 
 ---
 
