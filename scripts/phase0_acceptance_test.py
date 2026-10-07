@@ -152,7 +152,7 @@ def node_ok(host: str, port: int) -> bool:
 # TxBody uses default serde (externally-tagged), so:
 #   "body": { "QrcPurchase": { "qcb_amount": ..., "min_qrc_out": ... } }
 
-_nonce_counter = 1
+_nonce_counter = 0  # nonce starts at 0 for a fresh account; node expects nonce==account.nonce
 
 
 def _nonce() -> int:
