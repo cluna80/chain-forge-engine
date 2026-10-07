@@ -118,6 +118,54 @@ QCB is, in a meaningful sense, what Bitcoin would have been if Satoshi had known
 
 ---
 
+uQCB Accumulation and the Path to Full QCB
+
+Grand Challenge work earns uQCB — the micro-denomination of QCB issued as contribution credit. uQCB is the building block of the network's scientific issuance model: the only way to accumulate it is to do verified assigned work.
+
+The Conversion Model
+
+1,000,000 uQCB = 1 QCB
+
+This mirrors Satoshi's design for Bitcoin: a micro-unit accumulates into the full coin. The ratio is fixed at the protocol level. A participant earning contribution credit is always building toward something whole — not just accumulating fractions with no clear destination.
+
+Conversion is permissionless and on-chain. The moment a machine's uQCB balance reaches 1,000,000, the operator calls the conversion function. The protocol verifies the balance, burns the uQCB, and mints 1 QCB to the machine's registered address. No governance approval, no committee, no waiting period. The chain is the authority — if you earned it, you can convert it.
+
+This is intentional. A governance gate would introduce friction, a trust assumption, and a human bottleneck that breaks down at the scale QCB is built for. At 100,000 machines all accumulating uQCB, no approval process survives.
+
+uQCB Is Non-Tradeable
+
+uQCB does not appear on the AMM. It cannot be bought, sold, or transferred between addresses. It is bound to the machine that earned it and redeemable only by that machine's registered owner.
+
+This is a deliberate design constraint, not a limitation. If uQCB were AMM-tradeable, large holders could purchase accumulated contribution credit from small participants and convert it to QCB without doing any research. The scientific contribution — the actual thing the token is supposed to represent — would become a fiction. Non-transferability means the only path from uQCB to QCB is the one who earned it converting it themselves. The work and the reward stay with the same entity.
+
+The Three Economic Loops
+
+QCB's economic architecture has three interlocking revenue streams that reinforce rather than compete:
+
+· Resource Marketplace (QRC) — Machine operators list resources. Buyers purchase compute time with QRC. Operators earn QRC. QRC has utility; utility drives demand. The commercial layer works independently of research activity.
+
+· Grand Challenge (uQCB → QCB) — Machines contribute to assigned research slices. Verified UsefulWorkReceipts earn uQCB. At 1,000,000 uQCB accumulated, the operator converts permissionlessly to 1 QCB. The scientific layer issues QCB directly tied to research output — more QCB in circulation means more verified science was done.
+
+· Both Simultaneously (MachineMode::Both) — The same GPU runs marketplace jobs during peak commercial demand and gc-daemon during off-peak hours. The operator earns QRC and accumulates uQCB from the same hardware investment. Idle compute that would otherwise generate zero revenue is now generating research contributions and building toward a full QCB conversion.
+
+The flywheel: more machines → more research throughput and more marketplace supply → more buyers attracted by competitive pricing → more QRC flowing → more operators join → more machines. The Grand Challenge layer and the marketplace layer reinforce each other instead of competing.
+
+QRC and the Native AMM
+
+QRC is not only a payment token for compute — it is a trading asset with its own native liquidity layer. QCB includes an on-chain Automated Market Maker modeled on the XRPL's built-in DEX design: liquidity is native to the chain, not dependent on external exchanges or wrapped tokens.
+
+What the AMM enables:
+
+· Dynamic resource pricing — Market demand sets the price for compute slots automatically. High demand for GPU time shifts QRC pricing in real time; more operators list capacity to capture the premium. The market coordinates supply and demand without a central price oracle.
+
+· External asset inflow — QRC/BTC and QRC/stablecoin pools allow participants to arrive with external assets, swap into QRC natively, and immediately access the compute marketplace or join a liquidity pool. No bridge, no CEX, no wrapped tokens.
+
+· Liquidity provider rewards — Machine operators who park QRC into AMM pools earn trading fees on top of marketplace earnings and Grand Challenge accumulation. Three revenue streams from the same hardware.
+
+uQCB does not participate in the AMM. Only QRC and QCB are AMM-tradeable. This boundary keeps the scientific issuance model clean: the AMM rewards capital and liquidity provision; the Grand Challenge track rewards verified scientific contribution. They are separate things and the protocol keeps them separate.
+
+---
+
 Equilibrium State: When the Network Becomes Alive
 
 Reaching equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. No single moment marks it. But there is a point at which the network stops being something that requires active maintenance to stay alive and becomes something that sustains itself.
@@ -151,22 +199,11 @@ The scale required is large. The timeline is long. Both facts are stated here pl
 
 1. What QCB Is
 
-QCB is a sovereign resource network anchored to verified human identity. Humans prove unique participation without exposing personal information, machines provide capacity, agents coordinate workloads, QRC settles payment, and QCB token holders govern the economy. QCB proves personhood without requiring public disclosure of the person's real-world identity.
-
-Six pillars underpin the system:
-
-1. **Verified human identity** — privacy-preserving proof of unique participation.
-2. **Human accountability** — every agent, machine, and provider traces ultimate responsibility to a verified human.
-3. **Machine capacity** — compute, storage, bandwidth, data, and other resources.
-4. **Agent coordination** — agents discover, purchase, and orchestrate workloads.
-5. **QRC settlement** — payment and accounting for verified resource consumption.
-6. **QCB governance** — QCB holders govern economic and protocol parameters, subject to QCB's personhood and constitutional constraints.
-
-As a from-scratch Layer-1 blockchain built on Chain Forge — a purpose-built Rust blockchain engine — QCB provides four things no general-purpose chain offers natively, together, at the protocol layer:
+QCB Chain is a from-scratch Layer-1 blockchain, built on Chain Forge — a purpose-built Rust blockchain engine — rather than an existing chain framework. It provides four things no general-purpose chain offers natively, together, at the protocol layer:
 
 1. Personhood-weighted BFT consensus — validator power tied to verified human identity, not stake or hashpower
 2. Charm-based state confinement and agent representation — identity-scoped state and native support for autonomous agents as first-class chain citizens
-3. A working monetary engine — $QRC acquired primarily via QCB purchase (QCB holders burn $QCB to acquire $QRC); resource providers receive payment in existing QRC released from job escrow rather than through new minting; a five-control resource solvency architecture; and Burn-and-Mint Equilibrium (BME) burns, native to the protocol
+3. A working monetary engine — two $QRC minting paths (QCB holders burn $QCB to acquire $QRC; VCA-verified providers earn $QRC through contribution), a five-control resource solvency architecture, and Burn-and-Mint Equilibrium (BME) burns, native to the protocol
 4. Full sovereignty — no dependency on another chain's consensus engine, module framework, or governance assumptions
 
 QCB's purpose is to be the substrate for a charm-based agent economy where identity, state confinement, agent behavior, consensus power, and money circulation are all protocol-level concerns — not application-layer add-ons.
@@ -241,7 +278,7 @@ QCB offers four things no other chain offers, and every one of them requires ide
 
 Personhood-weighted consensus (Section 3) — validator power is bounded by verified human identity, not capital or compute. No other chain ties governance authority to verified personhood at the consensus layer. If you want to participate in a chain where one human's influence is structurally capped regardless of wealth, QCB is the only option, and it requires verifying as a human.
 
-Resource consumption token (Section 6.2) — QCB holders acquire $QRC by burning $QCB; verified resource providers are paid in existing $QRC released from job escrow when they fulfill a resource contract, rather than through new minting. $QRC is a redeemable claim on network compute, storage, ZK proving, oracle queries, AI inference, and bandwidth. No other chain implements a native resource consumption token whose solvency is enforced by an on-chain CoverageRatio circuit breaker backed by a full resource-market escrow layer. If you want to participate in a network where resource access is priced, rationed, and governed at the protocol layer — with provider economics tied directly to verifiable job execution — QCB is the only option, and resource provider status requires identity verification.
+Resource consumption token (Section 6.2) — verified resource providers earn $QRC through VCA-attested contribution, and QCB holders acquire $QRC by burning $QCB. $QRC is a redeemable claim on network compute, storage, ZK proving, oracle queries, AI inference, and bandwidth. No other chain implements a native resource consumption token whose solvency is enforced by an on-chain CoverageRatio circuit breaker. If you want to participate in a network where resource access is priced, rationed, and governed at the protocol layer — with provider economics tied directly to attested capacity — QCB is the only option, and the contribution path requires verified provider status.
 
 Charmed Agents with bounded authorization (Section 5.3) — autonomous agents are sponsored by verified humans, with cryptographic scoping of their economic footprint. No other chain has native agent identity with a human accountability chain. If you want to run an economic agent that a verified human is responsible for, QCB is the only option, and it requires a verified sponsor.
 
@@ -327,13 +364,13 @@ QCB has four native protocol-level components, implemented directly in the chain
 
 5.0 What "Charm" Means
 
-"Charm" is QCB's term for a bundle of protocol-enforced properties — identity verification tier, scope boundaries, and spending authorization constraints — that travel with a piece of state or an identity rather than being assigned or checked by an external application. A charm is intrinsic to what it's attached to, not a permission granted from outside it. The three modules below apply this concept in three different ways: confining state to its rightful context (5.1), attaching properties directly to identity (5.2), and extending first-class chain citizenship to autonomous agents (5.3).
+"Charm" is QCB's term for a bundle of protocol-enforced properties — identity verification tier, decay-exemption credits, scope boundaries — that travel with a piece of state or an identity rather than being assigned or checked by an external application. A charm is intrinsic to what it's attached to, not a permission granted from outside it. The three modules below apply this concept in three different ways: confining state to its rightful context (5.1), attaching properties directly to identity (5.2), and extending first-class chain citizenship to autonomous agents (5.3).
 
 5.1 Charm Confinement
 Scoped state isolation at the protocol layer. Ensures identity-linked claims (such as activity reward claim rights) and agent-controlled resources remain bound to their defined context — one verified identity, one claim per epoch, with no cross-context leakage.
 
 5.2 Intrinsic Charm
-Properties treated as inherent to a piece of state or identity, traveling with it rather than being externally assigned. Proof-of-personhood attestations, verification tier, and agent spending authorization scopes are encoded as intrinsic properties that persist with an identity across the chain. Note: decay-exemption credits are not part of Intrinsic Charm under QRC v3 — demurrage was removed from the $QRC model, making decay-exemption a concept without a referent.
+Properties treated as inherent to a piece of state or identity, traveling with it rather than being externally assigned. Proof-of-personhood attestations, verification tier, and decay-exemption credits are encoded as intrinsic properties that persist with an identity across the chain.
 
 5.3 Charmed Agents
 Native, first-class representation for autonomous agents on-chain. Merchants and activity reward distributors can operate as Charmed Agents — handling payment acceptance, fiat conversion, and daily distribution automatically, without being modeled as ordinary externally-owned accounts running arbitrary contract calls.
@@ -355,10 +392,10 @@ Both are additive engineering work on top of `chain-forge-agents` — a registry
 What this section deliberately does not resolve: whether a sponsor should be required to maintain their own minimum $QRC activity to keep sponsoring high-value agents is a real incentive-design question, but it overlaps directly with the activity-based $QCB accrual idea recorded as Open Question 26(d) — attaching a $QRC-activity requirement to agent sponsorship, and rewarding $QRC activity with $QCB accrual, are close enough in shape that designing one without the other risks two uncoordinated mechanisms measuring the same thing differently. This is left unresolved here and flagged at 26(d) rather than decided in this section.
 
 5.4 QRC — The Resource Consumption Token
-The chain's native resource token (QRC Economic Model v0.2, implemented across `chain-forge-qrc` and `chain-forge-execution`):
+The chain's native resource token (QRC Economic Model v0.1, implemented in `chain-forge-qrc`):
 
 · $QRC is a redeemable claim on network resources — compute, storage, ZK proving, oracle queries, AI inference, and bandwidth. It is not a UBI payment or a circulating currency in the demurrage sense. Its correct economic invariant is resource solvency: QRC_outstanding ≤ Capacity / CR_min.
-· Primary issuance path — QCB holders submit a `PurchaseQrc` transaction (job-scoped, with slippage guard) to burn $QCB and mint $QRC at the dynamic conversion rate R_t. This is the canonical way new $QRC enters circulation. A legacy contribution-minting path (`CreditProvider`) exists in the codebase but is classified as under review; under the October 2026 architecture pivot, resource providers are paid from job escrow (existing $QRC) rather than through new minting. See Section 6.2 for the full model.
+· Two minting paths operate independently: (1) Purchase path — QCB holders burn $QCB to mint $QRC at a dynamic conversion rate R_t; (2) Contribution path — VCA-verified resource providers earn $QRC for attested capacity contributed to the network.
 · There is no QRC→QCB reverse conversion and no demurrage on QRC balances. $QRC consumed in network resource usage triggers a 25% consumption burn (p_burn = 0.25), permanently removing that fraction from supply.
 · A five-control resource solvency architecture enforces the invariant — dynamic conversion rate, epoch conversion cap, on-chain capacity tracking, consumption burn, and a CoverageRatio circuit breaker. See Section 6.10 for the full architecture and simulation-derived parameters.
 
@@ -388,11 +425,11 @@ $QRC is a redeemable claim on network resources, not a circulating currency in t
 
 **What $QRC is not.** The earlier design for this token ("CIRFI — Circulating Finance") used demurrage, population-linked daily issuance, and activity rewards to drive spending. That model has been superseded. $QRC under the QRC Economic Model v0.1 (implemented in `chain-forge-qrc`) carries no demurrage, no daily issuance to verified humans, and no UBI component. The correct economic frame is resource solvency — not monetary velocity.
 
-**Primary issuance path.** $QRC enters circulation primarily through one mechanism: QCB holders submit a `PurchaseQrc` transaction. The protocol destroys the specified $QCB amount and mints $QRC at the current dynamic conversion rate R_t (see Section 6.10, Control 1). There is no reverse path: $QRC cannot be converted back to $QCB. Once acquired, $QRC is spent on network resources, placed in job escrow, or transferred; it has no guaranteed redemption price.
+**Two minting paths.** $QRC enters circulation through exactly two mechanisms:
 
-**Resource provider payment — escrow, not minting.** Under the October 2026 architecture pivot, resource providers do not receive newly-minted $QRC. Instead, an agent purchasing computation locks existing $QRC into a `ResourceEscrow` at job start. When the provider fulfills the contract and the result is verified (via `ResourceExecutionReceipt`), the escrowed $QRC is released to the provider. If the job fails, the $QRC is refunded to the requester. This cleanly separates the monetary supply question from the resource market: the supply of $QRC is determined entirely by `PurchaseQrc` activity; the resource market merely moves existing $QRC between parties. Escrow primitives: `LockQrcForJob`, `ReleaseQrcForJob`, `RefundQrcForJob` (future: `DisputeResourceJob`).
+1. **Purchase path (QCB → QRC).** A QCB holder submits a burn transaction. The protocol destroys the specified $QCB amount and mints $QRC at the current dynamic conversion rate R_t (see Section 6.10, Control 1). There is no reverse path: $QRC cannot be converted back to $QCB. Once acquired, $QRC is spent on network resources or transferred; it has no guaranteed redemption price.
 
-**Legacy contribution path — under review.** The codebase contains a `CreditProvider` transaction type and `contribution_settlement` mechanism from an earlier design where VCA-verified providers earned newly-minted $QRC proportional to attested capacity. This mechanism is classified as legacy/under review following the October 2026 pivot. `CreditProvider` and `QrcContributionSettle` should not be built upon further until the question of whether any contribution-minting path survives in the new model is resolved. See the ROADMAP for current classification.
+2. **Contribution path (VCA → QRC).** Verified resource providers — nodes that have submitted and passed a `CapacityEvidence_v0` report, attested by the VCA mechanism — earn $QRC through `contribution_settlement` events. The earned amount is proportional to attested capacity across the seven resource types (compute, storage, ZK, oracle, AI inference, bandwidth, and combined). The epoch cap (Control 2) applies across both paths in aggregate.
 
 **Consumption and burn.** When $QRC is spent on actual resource usage, 25% of the consumed amount (p_burn = 0.25) is permanently destroyed. The remaining 75% is split: 60% paid to the provider nodes that served the request, 15% added to a reserve. This creates a supply contraction proportional to network utilization — the more the network is used, the more $QRC is removed from circulation permanently.
 
@@ -402,7 +439,7 @@ $QRC is a redeemable claim on network resources, not a circulating currency in t
 
 **$QRC value.** $QRC's value is the value of the network capacity it redeems. The correct measure is not price stability but resource solvency: the CoverageRatio (Capacity / QRC_outstanding) must remain at or above CR_min. See Section 6.10 for the five-control architecture that enforces this.
 
-**VCA and resource verification.** The VCA (Verifiable Contribution Attestation) mechanism is evolving from a capacity-reporting oracle into the verification infrastructure for the resource market. Providers will submit `ResourceExecutionReceipt` records — the successor to `CapacityEvidence_v0` — attesting to actual job execution: CPU-core-minutes used, input and output hashes, start/end timestamps, and provider signature, confirmed by requester. The protocol uses these receipts to release job escrow (releasing $QRC to the provider on success) and to update on-chain capacity measurements that the CoverageRatio and epoch cap depend on (Controls 2 and 3). The `CapacityEvidence_v0` sub-protocol is the direct evolutionary predecessor; its PQ attestation infrastructure (ML-DSA signatures) is reused rather than discarded.
+**Contribution path and VCA.** The VCA (Verifiable Contribution Attestation) mechanism provides the attestation infrastructure for the contribution path. Providers submit `CapacityEvidence_v0` reports containing Byzantine-resistant median aggregation of resource measurements across the seven resource types. The protocol uses these reports both to credit provider earn (contribution path) and to update the on-chain capacity measurement that the CoverageRatio and epoch cap depend on (Controls 2 and 3). Gaming the capacity reports inflates the denominator of the CoverageRatio and tightens the epoch cap — making the contribution path less profitable, not more, which is a natural alignment between attestation honesty and provider economics.
 
 6.3 $QCB — The Value-Capture Asset
 
@@ -434,7 +471,7 @@ The reflexive risk: BME funded by speculative redirects is not the same as BME f
 
 6.4 Value Flow Between the Two Tokens
 
-The relationship is a one-directional value flow: $QRC is acquired (via QCB purchase path) → spent at merchants, consumed on network resources, or placed in resource-job escrow → the merchant or network charges a fee in fiat → that fee funds both buyback-and-burn of $QCB and staking yield to $QCB stakers → $QCB supply contracts, staking demand rises, and price appreciates. This flow describes the token movements that fund $QCB's value capture, not the sole mechanism that gives $QRC itself value — $QRC's value comes from the network resources it redeems (resource demand floor) and from the fiat settlement layer described in Section 8.2, which is the load-bearing piece that makes merchant acceptance possible.
+The relationship is a one-directional value flow: $QRC is acquired (via QCB purchase path or VCA contribution) → spent at merchants or consumed on network resources → the merchant or network charges a fee in fiat → that fee funds both buyback-and-burn of $QCB and staking yield to $QCB stakers → $QCB supply contracts, staking demand rises, and price appreciates. This flow describes the token movements that fund $QCB's value capture, not the sole mechanism that gives $QRC itself value — $QRC's value comes from the network resources it redeems (resource demand floor) and from the fiat settlement layer described in Section 8.2, which is the load-bearing piece that makes merchant acceptance possible.
 
 $QRC does not benefit directly from $QCB's appreciation, and $QRC holders do not receive $QCB. The engine is $QRC being consumed in the resource economy; the pool is $QCB deepening as a result. $QRC's job is to price and ration network resources. $QCB's job is to appreciate, not circulate.
 
@@ -472,7 +509,7 @@ Limits of this model: the f / (p + f) derivation assumes fraudulent identities a
 
 6.7 Distribution
 
-Clarification on scope: the QRC Economic Model v0.1 has no daily-issuance formula tied to verified-human count. $QRC enters circulation primarily through the QCB purchase path — controlled by the five-control architecture (Section 6.10). The legacy VCA contribution-minting path is under review following the October 2026 architecture pivot; see Section 6.2 for the current model. The table below describes a one-time genesis allocation, funded from the initial $QCB supply and/or a dedicated QRC seed reserve set aside at launch, used to bootstrap development, merchant incentives, validator participation, and a stability reserve before organic $QRC minting (from QCB burns and provider contributions) and merchant fee revenue are self-sustaining.
+Clarification on scope: the QRC Economic Model v0.1 has no daily-issuance formula tied to verified-human count. $QRC enters circulation only through the two minting paths — QCB purchase and VCA contribution (Section 6.2) — controlled by the five-control architecture (Section 6.10). The table below describes a one-time genesis allocation, funded from the initial $QCB supply and/or a dedicated QRC seed reserve set aside at launch, used to bootstrap development, merchant incentives, validator participation, and a stability reserve before organic $QRC minting (from QCB burns and provider contributions) and merchant fee revenue are self-sustaining.
 
 Allocation | Share | Illustrative % | Notes
 QRC liquidity seed (genesis reserve contribution) | Majority | ~70% | Seeds initial $QRC liquidity for the purchase path before QCB burn volume is self-sustaining; distributed through the settlement layer as initial conversion reserve
@@ -490,7 +527,7 @@ Distribution principle: this genesis allocation is designed so the QRC liquidity
 
 | $QRC | $QCB
 Purpose | Resource consumption (network capacity claims) | Capture value
-Supply | Minted via QCB purchase (primary); contribution-minting path under review | Fixed or capped
+Supply | Minted via QCB purchase or VCA contribution | Fixed or capped
 Demurrage | No (resource claims do not decay) | No
 Staking | No | Yes
 Value driver | Network resource demand; resource solvency (CoverageRatio ≥ CR_min) | Network activity (fees → burns)
@@ -522,7 +559,7 @@ What this is not: this section does not cover activity-based $QCB accrual — a 
 
 6.10 QRC Resource Economy — Five-Control Architecture
 
-The $QRC model uses one primary issuance path: QCB holders burn $QCB to convert it into $QRC. A legacy contribution-minting path (VCA-attested `CreditProvider`) exists in the codebase but is classified as under review following the October 2026 architecture pivot, under which resource providers receive payment from job escrow rather than through new issuance. The five controls below govern the primary purchase path. Section 6.2 describes the full issuance model, including the escrow-based provider payment mechanism and the status of the legacy contribution path.
+The $QRC model has two distinct issuance paths with separate controls. Section 6.2 describes the contribution path: verified humans earn $QRC through network participation, measured by the Verifiable Contribution Attestation (VCA) mechanism. This section describes the second path: QCB holders burn $QCB to convert it into $QRC. The two paths operate independently — $QRC earned through contribution and $QRC acquired through QCB conversion are identical once issued, but the minting controls governing each path differ.
 
 This section also introduces the resource economy framing that governs both paths: $QRC is not a monetary supply whose price must remain stable. It is a redeemable claim on network resources — compute, storage, ZK proving, oracle queries, AI inference, and bandwidth. The correct economic invariant is not price stability. It is resource solvency:
 
@@ -570,7 +607,7 @@ QRC_burned = p_burn × QRC_consumed
 
 At p_burn = 0.25, 25% of every resource-consumption event is destroyed. This creates a natural supply contraction proportional to usage: the more the network is used, the more $QRC is permanently removed from circulation. This prevents indefinite accumulation of outstanding claims even when the network is busy.
 
-Simulation result: at high utilization (U = 0.99) with p_burn = 0.25, the 25% burn permanently contracts supply over time. Attempts to accumulate $QRC without actual resource consumption face the circuit breaker (Control 5).
+Simulation result: at high utilization (U = 0.99) with p_burn = 0.25 and a moderate earn rate, the contribution path becomes nearly self-canceling — $QRC earned ≈ $QRC consumed, and the 25% burn permanently contracts supply over time. Sybil farming (creating fake contribution identities to accumulate $QRC) is self-defeating under this dynamic: at near-full utilization, earners burn through most of what they accumulate in normal resource consumption, and attempts to farm without consuming face the circuit breaker (Control 5).
 
 Control 5 — CoverageRatio Circuit Breaker (Resource Solvency Mechanism)
 
@@ -582,12 +619,12 @@ This is not a monetary policy mechanism. It is a resource solvency mechanism. Th
 
 The circuit breaker enforces a minimum coverage ratio through a three-state hysteresis machine:
 
-State | Condition | QCB→QRC Conversion | Resource escrow/payment
+State | Condition | Conversion | Contribution earn
 NORMAL | CR ≥ CR_resume | Open | Open
 RESTRICTED | CR_halt ≤ CR < CR_resume | Suspended | Open
 HALTED | CR < CR_halt | Suspended | Suspended
 
-The hysteresis band (CR_halt < CR_resume) prevents oscillation: without it, a single threshold would repeatedly switch minting on and off as CR hovers near the boundary. Resource escrow and provider payment remain available in RESTRICTED because providers should not be penalized for a capacity collapse they did not cause — only QCB conversion, the discretionary mint path, is suspended.
+The hysteresis band (CR_halt < CR_resume) prevents oscillation: without it, a single threshold would repeatedly switch minting on and off as CR hovers near the boundary. The contribution earn path remains open in RESTRICTED because providers should not be penalized for a capacity collapse they did not cause — only QCB conversion, the discretionary mint path, is suspended.
 
 Simulation-derived starting parameters: CR_halt = 0.75, CR_resume = 1.00.
 
@@ -610,9 +647,9 @@ The economic architecture is:
 
 QCB → (burn) → QRC → Network Resources → (p_burn) → destroyed
 
-while the resource market path (escrow model) is:
+while the parallel contribution path is:
 
-Agent $QRC → ResourceEscrow → (job verified) → Provider $QRC → Resource consumption → (p_burn) → destroyed
+VCA contribution → QRC earn → Resource consumption → (p_burn) → destroyed
 
 and the safety boundary is:
 
@@ -709,9 +746,7 @@ Chain Forge's current priority is its consensus module — building out multiple
 
 · **Liveness slashing confirmed working.** Stopping a validator mid-run produces the expected sequence: the slashing module detects >20% missed blocks within the liveness window, emits a jailed warning, applies a 1,000,000 uQCB slash, and records the event in slash history.
 
-· **Attack tests passing — in-process and over real libp2p TCP.** In-process scenarios: forged vote rejection, equivocation detection and slash, liveness slash (confirmed on live testnet). Over-gossip adversarial integration tests (September 2026): a real libp2p attacker peer opens a genuine TCP connection to the devnet and publishes malicious gossip — not in-process injection. Three tests: `adversarial_unknown_validator` (vote from `qcb1evil` not in genesis → UnknownValidator rejection confirmed, chain keeps advancing); `adversarial_equivocation_over_gossip` (two conflicting Prevotes for the same height/round from `qcb1alice` → equivocation detected, asserted at the correct validator + height in node logs); `adversarial_garbage_signature` (garbage-sig vote from `qcb1bob` → actively rejected via real Ed25519 verification after resolving KNOWN_ISSUES §3 — root cause was `TendermintEngine.chain_id` never initialised from genesis, now fixed). All three passing.
-
-· **ConsensusError::Equivocation → SlashingModule::slash_equivocation() fully wired.** `process_equivocation_evidence()` in `chain-forge-node` receives consensus-detected equivocation evidence (double vote / double precommit at the same height, round, and type) and routes it to `self.slasher.slash_equivocation()` in `chain-forge-slashing`. The `SlashingModule` is imported, instantiated at node startup, and integrated with the `ValidatorRegistry` (genesis validators activated and PoP-confirmed at block 0). Equivocation slash records are written to slash history and validator power is immediately reduced. Full round-trip: a validator that double-votes on-chain is detected by consensus, slashed by the slashing module, and its status reflected in the registry — no manual intervention.
+· **Attack tests passing (in-process).** Three adversarial scenarios covered by in-process integration tests: forged vote rejection (garbage-signature vote does not advance consensus height), equivocation detection and slash (two conflicting prevotes from same validator trigger a slash record), and liveness slash (confirmed on live testnet above). Note: these tests inject events directly into the consensus engine's internal event handler. The corresponding gap — a misbehaving peer sending forged or equivocating messages over real libp2p gossip — has not yet been exercised. That test is the next adversarial milestone.
 
 · **ML-DSA (Dilithium3) post-quantum crypto wired.** The `chain-forge-crypto` crate implements CRYSTALS-Dilithium3 (ML-DSA) as the validator signing scheme, addressing the post-quantum exposure described in Section 10.
 
@@ -719,15 +754,9 @@ Chain Forge's current priority is its consensus module — building out multiple
 
 · **State persistence.** Committed blocks are written to disk on every commit; restarted nodes resume from their last committed height.
 
-· **QRC Economic Model v0.1 implemented (`chain-forge-qrc`).** The token previously named CIRFI (Circulating Finance) has been renamed $QRC (Quark Resource Credit) throughout the codebase — Rust sources, TOML manifests, markdown docs, and simulation scripts. The `chain-forge-qrc` crate implements the full QRC Economic Model v0.1: `QrcEngine` (dynamic conversion rate, epoch conversion cap, CoverageRatio circuit breaker); `contribution_settlement` (VCA-verified provider earn path — legacy, under review); and the `CapacityEvidence_v0` sub-protocol (Byzantine-resistant median aggregation of provider capacity reports across 7 resource types). The consumption split (60% providers / 25% burn / 15% reserve) and per-resource congestion pricing are wired. `QrcEngine` is serde-serializable and persisted to `qrc.json` across node restarts. 65+ crate-level tests passing; adversarial over-gossip integration tests shipped separately in `chain-forge-node` (see attack tests above).
+· **QRC Economic Model v0.1 implemented (`chain-forge-qrc`).** The token previously named CIRFI (Circulating Finance) has been renamed $QRC (Quark Resource Credit) throughout the codebase — Rust sources, TOML manifests, markdown docs, and simulation scripts. The `chain-forge-qrc` crate implements the full QRC Economic Model v0.1: `QrcEngine` (dynamic conversion rate, epoch conversion cap, CoverageRatio circuit breaker); `contribution_settlement` (VCA-verified provider earn path); and the `CapacityEvidence_v0` sub-protocol (Byzantine-resistant median aggregation of provider capacity reports across 7 resource types). The consumption split (60% providers / 25% burn / 15% reserve) and per-resource congestion pricing are wired. `QrcEngine` is serde-serializable and persisted to `qrc.json` across node restarts. 65+ crate-level tests passing; three adversarial network integration tests remain pending live-TCP infrastructure.
 
-**QRC Architecture Pivot (October 2026).** Following extended design review, the economic assumption underlying provider payment has been revised: resources are primarily sold for existing $QRC rather than minting new $QRC through contribution. Provider nodes receive payment when job-escrowed $QRC is released on verified completion (`ResourceExecutionReceipt`), not when `CreditProvider` credits are applied. This keeps total supply controlled entirely by the purchase path and eliminates the inflationary pressure of contribution-minting. The `chain-forge-resource` crate (new, Phase 0) will implement the resource market layer — `ResourceOffer`, `ResourceRequest`, `ResourceMatch`, `ResourceJob`, `ResourceReceipt`, `ResourceMeter`, `ResourceProof`, `ResourceSettlement` — cleanly separated from `chain-forge-qrc`, which handles money. `CreditProvider` and `QrcContributionSettle` are classified as legacy/under review; `CapacityEvidence_v0` is evolving toward `ResourceExecutionReceipt`. See the ROADMAP Phase 0 section for the full component classification table and the Phase 0 acceptance test specification.
-
-What remains open at the Chain Forge layer: production-grade state tree (JMT-based); personhood-weighting overlay; dedicated Chain Forge whitepaper. All three planned BFT variants are now shipped (see below).
-
-**HotStuff-style BFT variant shipped (October 2026).** `HotStuffEngine` implements three-phase (PREPARE → PRE-COMMIT → COMMIT) QC-locked consensus with linear O(n) messaging per block. Key properties: safety rule (Theorem 2 — a new block must extend the highest locked QC or carry a higher-view PREPARE QC); locked QC set on PRE-COMMIT quorum and cleared on COMMIT; personhood cap and VCA weight adjustments applied at init; equivocation detection in the PREPARE phase; view-change via `record_new_view()`. 17 dedicated tests passing. This confirmed the pluggable architecture is real — two independent BFT variants (Tendermint-style and HotStuff-style) running against the same `ConsensusEngine` trait.
-
-**XRPL-inspired FBA variant shipped (October 2026).** `FbaEngine` implements Federated Byzantine Agreement with a global Unique Node List (UNL) and an 80% agreement threshold (tunable via `FbaConfig`). Key properties: no leader rotation — every validator proposes independently; single-phase (Open → Committed) rather than multi-phase like Tendermint or HotStuff; equivocation detection on double-vote (same height, different block); personhood cap and VCA adaptive quorum applied at init; min-UNL guard (consensus refuses to start with an undersized validator set). The design follows XRPL's proven model: safety requires only 80% UNL agreement rather than a 2/3 supermajority, and the system tolerates up to 20% Byzantine validators without forking. 18 dedicated tests passing. This completes the three-variant pluggable consensus suite — Tendermint-style, HotStuff-style, and XRPL-inspired FBA all implement the same `ConsensusEngine` trait and are switchable at node configuration time. BFT variant selection for QCB mainnet (Open Question 2) is now unblocked.
+What remains open at the Chain Forge layer: HotStuff-style and XRPL-inspired BFT variants; production-grade state tree (JMT-based); personhood-weighting overlay; dedicated Chain Forge whitepaper. The Tendermint-style implementation provides the working reference baseline for all of these.
 
 A dedicated Chain Forge whitepaper, aimed at the developer audience who would build their own chains on it, is expected once the engine is closer to a general release. For now, this document is the only public artifact and carries both the engine's story and the flagship chain's.
 
@@ -747,7 +776,7 @@ $QRC is designed to be spent, not held. But spending presupposes value: a mercha
 
 The mechanism is the fiat settlement layer. When a merchant accepts $QRC and opts for fiat settlement, the settlement layer buys that $QRC at a defined rate and pays the merchant in fiat. The settlement layer then holds the $QRC it purchased — or sells it on the open market — to replenish its reserves. This creates the value loop:
 
-$QRC acquired (via QCB burn) -> spent at merchants, consumed on network resources, or placed in resource-job escrow -> merchants settle to fiat via settlement layer -> settlement layer buys $QRC on the open market -> market price is discovered.
+$QRC acquired (via QCB burn or VCA contribution) -> spent at merchants or consumed on network resources -> merchants settle to fiat via settlement layer -> settlement layer buys $QRC on the open market -> market price is discovered.
 
 The market price that emerges from this loop is not the source of $QRC's value — it is the discovery mechanism. The source of value is merchant acceptance, which is enabled by the settlement layer, which is backed by reserves. $QRC's value is, precisely: whatever the settlement layer is willing to convert it for, backed by the reserves that fund that conversion. This is why the settlement layer is load-bearing: without it, merchant acceptance collapses, and without merchant acceptance, $QRC has no demand source and therefore no value, and therefore cannot function as a circulating currency regardless of how many verified humans receive it.
 
@@ -801,7 +830,7 @@ This is not unique to QCB — Bitcoin in 2009 had no market price, and the first
 
 9. Supporting Infrastructure
 
-9.1 React Explorer — a web-based block explorer for human users. Beyond standard chain data (blocks, transactions, addresses), it surfaces module-specific state that a generic Cosmos or Ethereum explorer wouldn't have anywhere to show: Charm Confinement boundaries (which identities hold which scoped claims), Intrinsic Charm attestations (verification tier, spending authorization scopes), Charmed Agent activity (which agents are operating and what they've executed), resource market state (active jobs, escrow balances, provider receipts), and QRC metrics (tokens purchased via burn, tokens in escrow, tokens burned via BME). Its primary users are verified humans checking their own claims and balances, merchants reviewing settlement history, and outside observers auditing the chain's economic activity.
+9.1 React Explorer — a web-based block explorer for human users. Beyond standard chain data (blocks, transactions, addresses), it surfaces module-specific state that a generic Cosmos or Ethereum explorer wouldn't have anywhere to show: Charm Confinement boundaries (which identities hold which scoped claims), Intrinsic Charm attestations (verification tier, decay-exemption credits), Charmed Agent activity (which agents are operating and what they've executed), and QRC metrics (activity rewards distributed to date, tokens burned via BME, decay collected). Its primary users are verified humans checking their own claims and balances, merchants reviewing settlement history, and outside observers auditing the chain's economic activity.
 
 9.2 Python Agent OS Backend — the runtime environment autonomous agents use to interact with QCB. It handles agent lifecycle (registration as a Charmed Agent, credential management, uptime), decision logic (the rules or models an agent executes — e.g., a merchant-settlement agent converting $QRC to fiat on a schedule, or an activity-rewards-distributor agent executing daily claims), and the actual chain interaction (submitting transactions, reading state) on the agent's behalf. It is deliberately separate from the human-facing Explorer, since agents and humans have different interfaces to the same underlying protocol state.
 
@@ -848,19 +877,17 @@ This tradeoff is real and worth stating plainly rather than deferring entirely: 
 Time horizons below are rough ranges, not commitments — appropriate for a multi-year infrastructure build where later phases depend on unresolved questions (identity layer design, consensus variant selection) that earlier phases must answer first. Phase 0's range for Chain Forge has been widened from an earlier draft: a from-scratch, safety-proofed, pluggable BFT engine is a materially harder problem than Bitcoin's original client, which itself took roughly two years of focused solo development for a simpler design (a single, non-pluggable consensus mechanism, no personhood-weighting layer). A small team building a harder problem should expect a longer, not shorter, timeline.
 
 Phase | Milestone | Rough Horizon | Status
-Phase 0 (Chain Forge) | Consensus engine design and implementation — pluggable BFT variants (Tendermint-style, HotStuff-style, XRPL-inspired); QRC resource economy crate (`chain-forge-qrc`); new `chain-forge-resource` crate (resource market layer); Agent Economic Identity (AEI) primitives; Phase 0 acceptance test: one complete adversarially-verified cross-machine resource purchase using QRC | 18–48 months | **In progress — Tendermint-style BFT operational and partition-tolerant on 4-node testnet (September 2026); HotStuff-style BFT variant shipped (October 2026) — three-phase QC-locked consensus, 17 tests passing; XRPL-inspired FBA variant shipped (October 2026) — global UNL, 80% threshold, 18 tests passing; all three pluggable BFT variants confirmed; QRC Economic Model v0.2 implemented in `chain-forge-qrc` and `chain-forge-execution` (PurchaseQrc + CreditProvider tx types, October 2026); QRC architecture pivot (October 2026) — resource market separated into `chain-forge-resource`, provider payment via escrow not minting, AEI pulled forward. See Section 7.4 for detail.**
+Phase 0 (Chain Forge) | Consensus engine design and implementation — pluggable BFT variants (Tendermint-style, HotStuff-style, XRPL-inspired); QRC resource economy crate (`chain-forge-qrc`) | 18–48 months | **In progress — Tendermint-style BFT operational and partition-tolerant on 4-node testnet as of September 2026 (live iptables partition test passing; f=1 BFT fault tolerance confirmed); QRC Economic Model v0.1 implemented in `chain-forge-qrc` (CIRFI rename complete, QrcEngine + contribution_settlement + CapacityEvidence_v0 sub-protocol, October 2026); HotStuff and XRPL variants pending. See Section 7.4 for detail.**
 Phase 0 (QCB) | Whitepaper, identity layer research — proceeds in parallel with Chain Forge Phase 0, dependent on it for a working consensus target | 18–48 months | **In progress — whitepaper complete (this document); attestation guard Phases A–D implemented in chain-forge-identity (65 tests passing, September 2026); QRC Economic Model v0.1 incorporated (October 2026); identity pilot parameters provisional.**
-Phase 1 | Personhood-weighted BFT consensus live on testnet; Charm Confinement + Intrinsic Charm implemented (decay-exemption credits removed — demurrage is out of QRC v3); Resource Market Foundation: provider reputation, dispute skeleton, multi-provider discovery | 18–30 months following Phase 0 | Pending — prerequisite (pluggable BFT consensus) now has a working base; personhood-weighting overlay not yet built
-Phase 2 | Identity layer pilot (small integration test, then real-world pilot against cost/sybil targets); QRC module live — purchase path (QCB burn → QRC) open; resource market escrow and provider payment live; `CreditProvider` / `QrcContributionSettle` resolved or retired before this milestone | 6–12 months following Phase 1 | Pending
+Phase 1 | Personhood-weighted BFT consensus live on testnet; Charm Confinement + Intrinsic Charm implemented | 18–30 months following Phase 0 | Pending — prerequisite (pluggable BFT consensus) now has a working base; personhood-weighting overlay not yet built
+Phase 2 | Identity layer pilot (small integration test, then real-world pilot against cost/sybil targets); QRC module activation, activity reward claims open | 6–12 months following Phase 1 | Pending
 Phase 3 | Merchant API + Stripe-compatible integration, BME activation, first on-chain burns | 6–12 months following Phase 2 | Pending
 Phase 4 | Charmed Agents live, physical merchant expansion, 1 million verified humans | Multi-year, adoption-dependent | Pending
 Phase 5+ | Decentralized governance maturity; permissioned EVM layer (Section 7.2) activated once identity layer is proven at scale; interoperability reconsidered only if a PoP-preserving bridge design exists | — | Pending
 
-**Phase 0 checkpoint (September–October 2026).** The Chain Forge engine has reached a significant internal milestone within Phase 0: all three planned BFT consensus variants are now functional. The Tendermint-style variant was operational end-to-end by September 2026 — multi-node quorum, liveness enforcement, and adversarial attack resistance confirmed. HotStuff-style (three-phase QC-locked) and XRPL-inspired FBA (global UNL, 80% threshold) both shipped in October 2026, with 17 and 18 dedicated tests passing respectively. This is not Phase 0 complete — the state layer is not production-grade, personhood-weighting is not yet overlaid, and the resource market layer (`chain-forge-resource`) is not yet built — but it conclusively validates the pluggable `ConsensusEngine` architecture: three independent BFT variants, built and tested against the same trait interface, switchable at node configuration time. BFT variant selection for QCB mainnet (Open Question 2) is now unblocked. Phase 0 completion requires the full acceptance test: one complete adversarially-verified cross-machine resource purchase (Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios — see ROADMAP Phase 0 Acceptance Test).
+**Phase 0 checkpoint (September 2026).** The Chain Forge engine has reached a meaningful internal milestone within Phase 0: the Tendermint-style consensus variant is functional end-to-end, from genesis block through multi-node quorum, liveness enforcement, and adversarial attack resistance. This is not Phase 0 complete — HotStuff and XRPL variants remain, the state layer is not production-grade, and personhood-weighting is not yet overlaid — but it confirms the pluggable architecture's core premise: the consensus module can be built, tested, and iterated on independently of the application layer above it. The next internal milestone within Phase 0 is a second BFT variant running against the same application interface, which will demonstrate that the pluggability is real rather than theoretical.
 
 **QRC Economic Model v0.1 implementation (October 2026).** The resource token formerly named CIRFI (Circulating Finance) has been renamed $QRC (Quark Resource Credit) and redesigned as a resource consumption token rather than a UBI/demurrage currency. The `chain-forge-qrc` crate implements: `QrcEngine` with dynamic conversion rate (R_t), epoch conversion cap (L_e), and CoverageRatio circuit breaker (CR_halt = 0.75, CR_resume = 1.00); `contribution_settlement` for VCA-verified provider earn; and the `CapacityEvidence_v0` sub-protocol for Byzantine-resistant median aggregation of capacity reports across 7 resource types. The consumption split (60% providers / 25% burn / 15% reserve) and per-resource congestion pricing are wired into the engine. `QrcEngine` serializes to `qrc.json` and persists across node restarts. The rename is complete across all Rust sources, TOML manifests, markdown docs, and simulation scripts — zero remaining CIRFI references verified by grep.
-
-**QRC Resource Network v0.2 marketplace tx types (October 2026).** Two first-class transaction types have been added to `chain-forge-execution` implementing the Resource Network v0.2 marketplace design: `PurchaseQrc` (job-scoped QCB→QRC buy-in: `job_id`, `qcb_amount`, `min_qrc_out`, `resource_type`; blocked by Control 5 in RESTRICTED and HALTED states; slippage guard rolls back the QCB debit if minted QRC falls below `min_qrc_out`) and `CreditProvider` (coordinator-issued post-job credit: `job_id`, `provider_id [u8;32]`, `resource_type`, `verified_units`; requires Verified-tier sender; blocked only in HALTED; auto-creates provider account on first credit via hex-encoded 32-byte key as on-chain address). Both variants are fully wired through gas accounting, `variant_name`, `payload_size_bytes`, `required_module`, and the exhaustive `tx_kind_label()` match in `chain-forge-node`. 74 execution-layer tests passing (8 new: happy-path, Control 5 state tests, slippage guard, non-verified-coordinator rejection, provider-account auto-creation). **Note:** `CreditProvider` is classified as legacy/under review following the October 2026 architecture pivot (see QRC Architecture Pivot note above); `PurchaseQrc` is the canonical active path.
 
 **Attestation guard implementation (September 2026).** The on-chain sybil-resistance layer for the identity pilot has been implemented through Phase D in the `chain-forge-identity` crate. The four phases cover: (A) quadratic-cost cap enforcement — hard limit of 3 outbound attestations per 90-epoch window per attester; (B) revocation with cost — `RevokeAttestation` at 10% CS deduction (1,000 bps), cap slot freed on revocation; (C) sybil confirmation with CS penalty — coordinator-gated `ConfirmSybil` applies 120% CS clawback to penalized attesters (12,000 bps), `ReportSuspectedSybil` logs a self-report with 50% penalty reduction on independent confirmation; (D) `ReverseSybil` — coordinator can reverse a confirmed sybil, crediting back CS penalties. Execution layer updated with four new `TxBody` variants. REST endpoint `/api/identity/{address}` added. Pilot parameters from `QCB-Attestation-Guard-Design.md` are implemented as compiled constants; governance-tunable parameterization is deferred to Phase 1. The coordinator role is a named temporary centralization — see `docs/QCB-Attestation-Guard-Design.md §Coordinator`.
 
@@ -872,7 +899,7 @@ Calibration questions — decisions needed before or shortly after launch:
 
 1. Final identity layer design — web-of-trust base plus live-challenge backstop, or a different hybrid; cost and sybil-rate results from pilot testing against the provisional targets named in Section 4 (sybil rate below 3%, verification cost below $5/human — both illustrative, to be revised as the pilot is designed)
 2. Final BFT variant selection for QCB specifically (Chain Forge will support multiple; QCB must pick one)
-3. Base exemption calibration — no longer applicable to $QRC (no demurrage on QRC balances under QRC Economic Model v0.1); this question now applies only to any future $QCB staking-exemption mechanics if introduced
+3. Base exemption calibration — fixed at 30 days of activity rewards, or dynamic
 4. Reserve strategy — what backs price stability, if anything
 5. Jurisdiction and legal entity structure, given activity rewards distribution and merchant payment processing
 6. Validator economics — staking incentives, slashing conditions, bounds on per-human validator power

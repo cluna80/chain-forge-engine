@@ -118,6 +118,54 @@ QCB is, in a meaningful sense, what Bitcoin would have been if Satoshi had known
 
 ---
 
+uQCB Accumulation and the Path to Full QCB
+
+Grand Challenge work earns uQCB — the micro-denomination of QCB issued as contribution credit. uQCB is the building block of the network's scientific issuance model: the only way to accumulate it is to do verified assigned work.
+
+The Conversion Model
+
+1,000,000 uQCB = 1 QCB
+
+This mirrors Satoshi's design for Bitcoin: a micro-unit accumulates into the full coin. The ratio is fixed at the protocol level. A participant earning contribution credit is always building toward something whole — not just accumulating fractions with no clear destination.
+
+Conversion is permissionless and on-chain. The moment a machine's uQCB balance reaches 1,000,000, the operator calls the conversion function. The protocol verifies the balance, burns the uQCB, and mints 1 QCB to the machine's registered address. No governance approval, no committee, no waiting period. The chain is the authority — if you earned it, you can convert it.
+
+This is intentional. A governance gate would introduce friction, a trust assumption, and a human bottleneck that breaks down at the scale QCB is built for. At 100,000 machines all accumulating uQCB, no approval process survives.
+
+uQCB Is Non-Tradeable
+
+uQCB does not appear on the AMM. It cannot be bought, sold, or transferred between addresses. It is bound to the machine that earned it and redeemable only by that machine's registered owner.
+
+This is a deliberate design constraint, not a limitation. If uQCB were AMM-tradeable, large holders could purchase accumulated contribution credit from small participants and convert it to QCB without doing any research. The scientific contribution — the actual thing the token is supposed to represent — would become a fiction. Non-transferability means the only path from uQCB to QCB is the one who earned it converting it themselves. The work and the reward stay with the same entity.
+
+The Three Economic Loops
+
+QCB's economic architecture has three interlocking revenue streams that reinforce rather than compete:
+
+· Resource Marketplace (QRC) — Machine operators list resources. Buyers purchase compute time with QRC. Operators earn QRC. QRC has utility; utility drives demand. The commercial layer works independently of research activity.
+
+· Grand Challenge (uQCB → QCB) — Machines contribute to assigned research slices. Verified UsefulWorkReceipts earn uQCB. At 1,000,000 uQCB accumulated, the operator converts permissionlessly to 1 QCB. The scientific layer issues QCB directly tied to research output — more QCB in circulation means more verified science was done.
+
+· Both Simultaneously (MachineMode::Both) — The same GPU runs marketplace jobs during peak commercial demand and gc-daemon during off-peak hours. The operator earns QRC and accumulates uQCB from the same hardware investment. Idle compute that would otherwise generate zero revenue is now generating research contributions and building toward a full QCB conversion.
+
+The flywheel: more machines → more research throughput and more marketplace supply → more buyers attracted by competitive pricing → more QRC flowing → more operators join → more machines. The Grand Challenge layer and the marketplace layer reinforce each other instead of competing.
+
+QRC and the Native AMM
+
+QRC is not only a payment token for compute — it is a trading asset with its own native liquidity layer. QCB includes an on-chain Automated Market Maker modeled on the XRPL's built-in DEX design: liquidity is native to the chain, not dependent on external exchanges or wrapped tokens.
+
+What the AMM enables:
+
+· Dynamic resource pricing — Market demand sets the price for compute slots automatically. High demand for GPU time shifts QRC pricing in real time; more operators list capacity to capture the premium. The market coordinates supply and demand without a central price oracle.
+
+· External asset inflow — QRC/BTC and QRC/stablecoin pools allow participants to arrive with external assets, swap into QRC natively, and immediately access the compute marketplace or join a liquidity pool. No bridge, no CEX, no wrapped tokens.
+
+· Liquidity provider rewards — Machine operators who park QRC into AMM pools earn trading fees on top of marketplace earnings and Grand Challenge accumulation. Three revenue streams from the same hardware.
+
+uQCB does not participate in the AMM. Only QRC and QCB are AMM-tradeable. This boundary keeps the scientific issuance model clean: the AMM rewards capital and liquidity provision; the Grand Challenge track rewards verified scientific contribution. They are separate things and the protocol keeps them separate.
+
+---
+
 Equilibrium State: When the Network Becomes Alive
 
 Reaching equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. No single moment marks it. But there is a point at which the network stops being something that requires active maintenance to stay alive and becomes something that sustains itself.
