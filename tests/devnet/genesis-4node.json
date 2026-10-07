@@ -49,7 +49,13 @@
     "mempool_size": 100,
     "mempool_ttl_seconds": 60
   },
-  "modules": ["bank", "staking", "identity", "qrc", "agents"],
+  "modules": [
+    "bank",
+    "staking",
+    "identity",
+    "qrc",
+    "agents"
+  ],
   "custom_modules": [],
   "genesis_accounts": [
     {
@@ -57,15 +63,15 @@
       "address": "qcb1alice",
       "balance": "500000000",
       "role": "validator",
-      "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8",
-      "_comment": "500 QCB = 500_000_000 uqcb; 10x the max equivocation slash (5% of 500 QCB = 25 QCB). Raised from 5 QCB to fix KNOWN_ISSUES §1. public_key = Ed25519 verifying key for tests/devnet/keys/alice.key.json (Phase 1 §3)."
+      "public_key": "7869474df5c3c7a4629ee8ed8b9d74b89ae2f07dad3938d5eaeb5d600ed51748",
+      "_comment": "500 QCB = 500_000_000 uqcb; 10x the max equivocation slash (5% of 500 QCB = 25 QCB). Raised from 5 QCB to fix KNOWN_ISSUES \u00a71. public_key = Ed25519 verifying key for tests/devnet/keys/alice.key.json (Phase 1 \u00a73)."
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
       "balance": "500000000",
       "role": "validator",
-      "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0",
+      "public_key": "e88d88dcfb29e249468eb7ecac131b3cfe6af53c6ebe7eb3d771ce4c2b0bbb02",
       "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/bob.key.json"
     },
     {
@@ -73,7 +79,7 @@
       "address": "qcb1carol",
       "balance": "500000000",
       "role": "validator",
-      "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692",
+      "public_key": "6a5d93dee87bc3b9a62476ec3ff1f6290c133e53fd86add16e4ef4327a5ff2fa",
       "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/carol.key.json"
     },
     {
@@ -81,7 +87,7 @@
       "address": "qcb1dave",
       "balance": "500000000",
       "role": "validator",
-      "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0",
+      "public_key": "fb352ea660f99ed2d977b53f94246469525afdeb34041fc3d54ff0a436935ee6",
       "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/dave.key.json"
     }
   ],
