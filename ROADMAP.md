@@ -577,6 +577,18 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 18. ~~**Phase 0 cross-machine purchase acceptance test script**~~ **✅ DONE** — `scripts/phase0_acceptance_test.py`; submits all 5 txs (QrcPurchase → RegisterAgent → AuthorizeAgent → DepositToTreasury → LockQrcForJob) to Alice's node; waits for propagation; polls all 4 nodes (Alice/Bob/Dave/Carol) for tx commitment + treasury/escrow balance assertions; per-node PASS/FAIL output; `--skip-carol` flag for single-machine runs.
 
+19. ~~**Phase 0 happy-path acceptance test — PASSING**~~ **✅ DONE** — Run ID `ad255b9f`; OVERALL PASS on Alice, Bob, Dave (8/8 checks each, height=17); Alice uQRC=5,000,000; treasury=4,200,000 (5M deposit − 800K lock); all 5 txs committed and replicated across all 3 nodes.
+
+20. ~~**Phase 0b negative-path tests — N1 PASSING**~~ **✅ DONE** — N1 (over-cap lock: 1,000,001 > per_job_limit 1,000,000) hard-fails correctly at execution layer; treasury balance verified unchanged at 5,000,000 uQRC after rejection.
+
+21. **Phase 0b N2 — duplicate escrow_id guard** 🔄 **NEXT** — N2 (re-use of existing `escrow_id`) currently soft-warns (execution succeeds when it should fail). Fix: add existence check in `LockQrcForJob` handler in `chain-forge-execution/src/lib.rs` — if `escrow:{escrow_id}` already exists in state, return execution error. Then upgrade N2 assertion in `phase0_acceptance_test.py` from soft-warn to hard-fail with treasury-balance unchanged check.
+
+22. **`ReleaseQrcForJob` + `RefundQrcForJob` happy-path tests** ⬜ — After N2 guard lands; submit release and refund txs; verify treasury/escrow balance changes correct on all nodes.
+
+23. **Escrow queryability** ⬜ — Wire `/api/accounts/escrow:{id}` so escrow balance is queryable; upgrade the soft-skip in the acceptance test to a hard assertion.
+
+24. **4-node test with Carol (Machine 2)** ⬜ — Drop `--skip-carol` flag; run full 4-node acceptance test with Carol participating in consensus and state verification.
+
 ---
 
 ## Open Questions Index
