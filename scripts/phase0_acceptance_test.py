@@ -182,7 +182,7 @@ def tx_register_agent(sender: str, agent_id: str, agent_address: str) -> dict:
             "RegisterAgent": {
                 "agent_id":        agent_id,
                 "agent_address":   agent_address,
-                "capabilities":    ["ResourceConsumer"],
+                "capabilities":    ["BuyCompute"],
                 "spending_limits": {
                     "epoch_limit_uqrc":    10_000_000,
                     "lifetime_limit_uqrc": 100_000_000,

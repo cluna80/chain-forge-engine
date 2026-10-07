@@ -1334,6 +1334,10 @@ impl Node {
 
                         if Self::is_proposer_for(&vs, height, round, &my_id)
                             && self.last_proposed != Some(key)
+                            && (!self.mempool.is_empty()
+                                || self.round_watch_started
+                                    .map(|t| t.elapsed().as_millis() >= 200)
+                                    .unwrap_or(true))
                         {
                             let parent = chain_forge_consensus::BlockHash(
                                 format!("genesis_h{height}")
