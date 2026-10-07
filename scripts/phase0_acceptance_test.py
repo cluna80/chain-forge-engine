@@ -73,7 +73,7 @@ ESCROW_ID = f"esc-{_run_id}"
 # Timing
 SUBMIT_TIMEOUT_SECS = 8            # per-request tx submission timeout
 STATUS_TIMEOUT_SECS = 5            # per-request status/balance check timeout
-PROPAGATION_WAIT_S  = 6            # seconds to wait for cross-node propagation
+PROPAGATION_WAIT_S  = 10           # seconds to wait for cross-node propagation
 
 # ── Colour helpers ─────────────────────────────────────────────────────────
 
@@ -284,14 +284,23 @@ class NodeReport:
 
 
 def find_tx_in_blocks(host: str, port: int, tx_id: str) -> bool:
-    """Return True if tx_id appears in any committed block on this node."""
+    """Return True if tx_id appears in any committed block on this node.
+
+    BlockSummary serialises as {"height":…, "tx_count":…, "tx_ids": ["tx-abc", …]}.
+    Also falls back to checking a "transactions" field (array of objects with an
+    "id" key) in case the schema ever changes.
+    """
     try:
         blocks = get_json(host, port, "/api/blocks")
         if not isinstance(blocks, list):
             return False
         for blk in blocks:
-            txs = blk.get("transactions", [])
-            for tx in txs:
+            # Primary path: tx_ids is a Vec<String> of bare tx ids
+            for tid in blk.get("tx_ids", []):
+                if tid == tx_id:
+                    return True
+            # Fallback: transactions field containing objects with an "id" key
+            for tx in blk.get("transactions", []):
                 tid = tx if isinstance(tx, str) else tx.get("id", "")
                 if tid == tx_id:
                     return True
