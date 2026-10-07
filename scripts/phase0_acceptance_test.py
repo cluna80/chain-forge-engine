@@ -52,8 +52,9 @@ NODES_MACHINE1 = [
 
 # ── Test parameters ────────────────────────────────────────────────────────
 
-# Alice's devnet address (from genesis alloc — adjust if your genesis differs)
-ALICE_ADDRESS = "alice"
+# Alice's devnet address (from genesis alloc — must match the genesis validator address)
+# The genesis-4node.json allocates QCB/QRC to "qcb1alice" (the validator's --validator flag).
+ALICE_ADDRESS = "qcb1alice"
 
 # Synthetic agent identity for this test run (unique per run)
 _run_id      = uuid.uuid4().hex[:8]
@@ -426,7 +427,9 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
     print(hdr("Step 7 — Verify state on all nodes"))
 
     reports: list[NodeReport] = []
-    treasury_key = f"treasury:{ALICE_ADDRESS}"
+    # Treasury account key is treasury:{agent_id} — matches the DepositToTreasury handler
+    # which stores state under format!("treasury:{}", agent_id).
+    treasury_key = f"treasury:{AGENT_ID}"
 
     for name, host, port in nodes:
         rep = NodeReport(name=name, host=host, port=port)
