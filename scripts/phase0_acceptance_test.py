@@ -546,7 +546,7 @@ def _run_negative_tests(alice_host: str, alice_port: int) -> None:
     rejected by the execution layer and verifies balances are unchanged.
 
       N1 — Over-cap lock: amount > per_job_limit (1,000,001 > 1,000,000) → FAIL
-      N2 — Duplicate escrow_id: re-use the happy-path escrow_id → FAIL (soft)
+      N2 — Duplicate escrow_id: re-use the happy-path escrow_id → FAIL (hard)
     """
     print("\n\n" + hdr("Phase 0b — Negative-path tests"))
 
@@ -679,19 +679,37 @@ def _run_negative_tests(alice_host: str, alice_port: int) -> None:
 
     queued_n2, _ = step_submit(f"LockQrcForJob (dup escrow_id={ESCROW_ID})",
                                 alice_host, alice_port, tx_n2)
+    n2_pass = False
     if queued_n2:
         found_n2, result_n2 = wait_for_commit(alice_host, alice_port, tx_n2["id"])
         if not found_n2:
             print(f"    {ok('tx not included (rejected at mempool)')}")
+            n2_pass = True
         else:
             exec_ok_n2 = result_n2.get("success", True) if result_n2 else True
             if exec_ok_n2:
-                print(f"    {warn('execution SUCCEEDED — duplicate escrow not blocked (soft warn)')}")
+                # Hard-fail: the execution layer MUST reject duplicate escrow_ids
+                print(f"    {fail('execution SUCCEEDED — duplicate escrow not blocked (HARD FAIL)')}")
+                neg_pass = False
             else:
                 err_n2 = result_n2.get("error", "") if result_n2 else ""
                 print(f"    {ok(f'execution failed as expected: {err_n2}')}")
+                n2_pass = True
     else:
         print(f"    {ok('tx rejected at submission')}")
+        n2_pass = True
+
+    # Verify treasury balance is unchanged after N2 attempt
+    if n2_pass:
+        bal_n2 = get_account_balance(alice_host, alice_port, neg_treasury, "uqrc")
+        # N1 failed (over-cap) so treasury was never debited; N2 must also fail.
+        # Expected: full deposit still intact.
+        exp_bal_n2 = TREASURY_DEPOSIT
+        if bal_n2 == exp_bal_n2:
+            print(f"    {ok(f'Treasury balance unchanged: {bal_n2:,} uQRC')}")
+        else:
+            print(f"    {fail(f'Treasury balance changed: got {bal_n2:,} expected {exp_bal_n2:,}')}")
+            neg_pass = False
 
     # ── Summary ──────────────────────────────────────────────────────────────
     sym = f"{GREEN}{BOLD}✓  NEGATIVE TESTS PASS{RESET}" if neg_pass \

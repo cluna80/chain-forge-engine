@@ -2810,10 +2810,22 @@ impl Executor {
                     );
                 }
 
-                // ── treasury-first funding ────────────────────────────────────
-                // Try to draw from the agent's treasury account first.
-                // Treasury address: `treasury:{agent_wallet}`.
-                // Falls back to the agent's own wallet if treasury is empty / absent.
+                // ── duplicate escrow guard ───────────────────────────────────
+                // Each escrow_id must be globally unique.  If an entry for this
+                // escrow_id already exists in state the tx is rejected so that a
+                // replayed or reused escrow_id can never double-debit a treasury.
+                let escrow_key = format!("escrow:{}", escrow_id);
+                if state.get_account(&escrow_key).is_ok() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "LockQrcForJob: escrow_id '{}' already exists \
+                             (job_id={}, agent_wallet={})",
+                            escrow_id, job_id, agent_wallet
+                        ),
+                    );
+                }
+
                 // ── treasury-first funding ────────────────────────────────────
                 // Treasury key is `treasury:{agent_id}` — the canonical agent ID,
                 // matching exactly what DepositToTreasury writes.  Falls back to
@@ -2855,6 +2867,21 @@ impl Executor {
                     acct.debit("uqrc", *amount as u128).expect("balance check passed above");
                 }
                 state.refresh_leaf(&debit_from);
+
+                // Credit the escrow account (create it — this is what makes
+                // the escrow_id queryable and what the duplicate-guard above
+                // detects on a second attempt with the same escrow_id).
+                {
+                    let new_escrow = chain_forge_state::AccountState::new(
+                        escrow_key.clone(), "escrow".to_string()
+                    );
+                    state.upsert_account(new_escrow);
+                }
+                if let Ok(acct) = state.get_account_mut(&escrow_key) {
+                    acct.credit("uqrc", *amount as u128);
+                }
+                state.refresh_leaf(&escrow_key);
+
                 events.push(format!(
                     "lock_qrc_for_job: escrow_id={} job_id={} agent_wallet={} amount={} source={} locked",
                     escrow_id, job_id, agent_wallet, amount, source_label
