@@ -581,13 +581,13 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 20. ~~**Phase 0b negative-path tests — N1 PASSING**~~ **✅ DONE** — N1 (over-cap lock: 1,000,001 > per_job_limit 1,000,000) hard-fails correctly at execution layer; treasury balance verified unchanged at 5,000,000 uQRC after rejection.
 
-21. **Phase 0b N2 — duplicate escrow_id guard** 🔄 **NEXT** — N2 (re-use of existing `escrow_id`) currently soft-warns (execution succeeds when it should fail). Fix: add existence check in `LockQrcForJob` handler in `chain-forge-execution/src/lib.rs` — if `escrow:{escrow_id}` already exists in state, return execution error. Then upgrade N2 assertion in `phase0_acceptance_test.py` from soft-warn to hard-fail with treasury-balance unchanged check.
+21. ~~**Phase 0b N2 — duplicate escrow_id guard**~~ **✅ DONE** — Run ID `b16e3bd6`; duplicate `escrow_id` now hard-fails at execution layer (`LockQrcForJob: escrow_id 'esc-…' already exists`); treasury balance verified unchanged at 5,000,000 uQRC after rejection; escrow account is now written to state on lock so `escrow:{id}` is queryable — Step 7 escrow check promoted from soft-skip ⚠ to hard assertion ✓ (9/9 checks per node); N1 + N2 + happy-path all PASS.
 
-22. **`ReleaseQrcForJob` + `RefundQrcForJob` happy-path tests** ⬜ — After N2 guard lands; submit release and refund txs; verify treasury/escrow balance changes correct on all nodes.
+22. **`ReleaseQrcForJob` + `RefundQrcForJob` happy-path tests** 🔄 **NEXT** — Submit release and refund txs after a successful lock; verify treasury/escrow balance changes on all nodes; confirm escrow account is debited and provider wallet credited on release.
 
-23. **Escrow queryability** ⬜ — Wire `/api/accounts/escrow:{id}` so escrow balance is queryable; upgrade the soft-skip in the acceptance test to a hard assertion.
+23. **4-node test with Carol (Machine 2)** ⬜ — Drop `--skip-carol` flag; run full 4-node acceptance test with Carol participating in consensus and state verification.
 
-24. **4-node test with Carol (Machine 2)** ⬜ — Drop `--skip-carol` flag; run full 4-node acceptance test with Carol participating in consensus and state verification.
+24. **`ReleaseQrcForJob` negative-path tests** ⬜ — N3: release from wrong sender; N4: release amount > escrow balance; N5: release on non-existent escrow.
 
 ---
 
