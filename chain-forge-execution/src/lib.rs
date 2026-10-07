@@ -2782,6 +2782,16 @@ impl Executor {
             // ── Resource Marketplace — QRC Escrow ─────────────────────────────
 
             TxBody::LockQrcForJob { escrow_id, job_id, agent_wallet, amount } => {
+                // ── resolve agent address → agent record ──────────────────────
+                // `agent_wallet` is the agent's registered on-chain ADDRESS (the
+                // `agent_address` field from RegisterAgent).  We look up the
+                // AgentRecord by address to get the canonical agent_id, which is
+                // what DepositToTreasury uses as the treasury key.  If no record
+                // exists we treat agent_wallet as a plain wallet (no treasury,
+                // no cap).
+                let agent_rec = agents.get_by_address(agent_wallet).ok().cloned();
+                let canonical_agent_id = agent_rec.as_ref().map(|r| r.agent_id.as_str());
+
                 // ── per-job spending limit check ──────────────────────────────
                 // If the agent has a registered record with a per_job_limit, enforce it.
                 // We look up by agent_wallet address (the agent's on-chain address).
@@ -2804,7 +2814,15 @@ impl Executor {
                 // Try to draw from the agent's treasury account first.
                 // Treasury address: `treasury:{agent_wallet}`.
                 // Falls back to the agent's own wallet if treasury is empty / absent.
-                let treasury_key = format!("treasury:{}", agent_wallet);
+                // ── treasury-first funding ────────────────────────────────────
+                // Treasury key is `treasury:{agent_id}` — the canonical agent ID,
+                // matching exactly what DepositToTreasury writes.  Falls back to
+                // `treasury:{agent_wallet}` when no AgentRecord was found (plain
+                // wallet mode), and ultimately to the agent's own wallet.
+                let treasury_key = match canonical_agent_id {
+                    Some(id) => format!("treasury:{}", id),
+                    None     => format!("treasury:{}", agent_wallet),
+                };
                 let treasury_balance = state.get_account(&treasury_key)
                     .map(|a| a.balance_of("uqrc"))
                     .unwrap_or(0);
