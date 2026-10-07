@@ -572,9 +572,16 @@ def _run_negative_tests(alice_host: str, alice_port: int) -> None:
         }
 
     tx_reg  = _ntx(0, {"RegisterAgent": {
-        "agent_id":      neg_agent_id,
-        "agent_address": neg_agent_addr,
-        "metadata":      "",
+        "agent_id":        neg_agent_id,
+        "agent_address":   neg_agent_addr,
+        "capabilities":    ["BuyCompute"],
+        "spending_limits": {
+            "epoch_limit_uqrc":    10_000_000,
+            "lifetime_limit_uqrc": 100_000_000,
+            "max_balance_uqrc":    50_000_000,
+            "per_job_limit_uqrc":  0,
+        },
+        "description":     f"Phase 0b negative test agent ({neg_run})",
         "parent_agent_id": None,
     }}, "reg")
     tx_auth = _ntx(1, {"AuthorizeAgent": {"agent_id": neg_agent_id}}, "auth")
