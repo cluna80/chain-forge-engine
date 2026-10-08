@@ -20,6 +20,7 @@ members = [
     "chain-forge-personhood",
     "chain-forge-vca-pq",
     "chain-forge-resource",
+    "chain-forge-pocd",
 ]
 
 [workspace.package]

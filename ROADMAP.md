@@ -591,6 +591,41 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 ---
 
+## Phase 0d — Proof of Cryptographic Discovery (PoCD) Scaffold
+
+**Goal**: Build the reusable `chain-forge-pocd` crate so any blockchain created with Chain Forge can opt into PoCD mining.  QCB Chain will be the first integrator.
+
+**Design principle**: The crate is fully chain-agnostic — no QRC, uQRC, or QCB hardcoding.  Chains wire in their own `RewardPolicy` implementation and `PoCDConfig`.
+
+### PoCD Crate (`chain-forge-pocd`)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `Cargo.toml` + workspace member | ✅ **DONE** | Added to `chain-forge-engine` workspace |
+| `PoCDConfig` struct | ✅ **DONE** | `enabled`, `chain_id`, `challenge_tracks`, `reward_epoch_blocks`, `require_verified_identity`, `min_seal_difficulty_bits` |
+| `ChallengeTrack` enum + `ChallengeStatus` | ✅ **DONE** | `Cryptography`, `Privacy`, `ComputationalEfficiency`, `Mathematics`, `PhysicsAndOpenScience`, `AiAssistedDiscovery`, `Custom(String)` |
+| `DiscoveryChallenge` struct | ✅ **DONE** | ID format `{chain_id}::{track}::{slug}`; cross-chain replay guard embedded in challenge_id |
+| `DiscoveryProof` struct + seal functions | ✅ **DONE** | `compute_seal_hash`, `find_seal_nonce`, `meets_difficulty`, `verify_seal` — Bitcoin-compatible SHA256 mining loop |
+| `DiscoveryReceipt` struct | ✅ **DONE** | Dual cross-chain guard: `chain_id` field + challenge_id prefix; `is_for_chain()` enforces both; `reward_distributed` flag prevents double-payment |
+| `PoCDError` enum | ✅ **DONE** | Full error taxonomy: seal, challenge, cross-chain, identity, registry, reward, track |
+| `DiscoveryRegistry` | ✅ **DONE** | In-memory ledger: active challenges, accepted receipts, proof deduplication, `pending_reward_receipts(from, to)` for epoch boundary |
+| `RewardPolicy` trait | ✅ **DONE** | `compute_rewards(&[&DiscoveryReceipt]) -> Vec<RewardGrant>`; `NullRewardPolicy` and `FlatRewardPolicy` provided |
+| `DiscoveryWorker` trait | ✅ **DONE** | `run_challenge` + `sign`; `build_proof` helper finds seal nonce and packages `DiscoveryProof` |
+| `DiscoveryVerifier` trait | ✅ **DONE** | `verify_result` (domain-specific) + `verify_identity` (optional); `build_receipt` helper |
+| `cargo build -p chain-forge-pocd` passes | ✅ **DONE (2026-10-08)** | Clean compile, zero warnings |
+
+### QCB PoCD Integration (next phase)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `QcbRewardPolicy` in `chain-forge-qrc` | ⬜ | Pays rewards in uQRC; implements `RewardPolicy` trait |
+| `QcbVerifier` adapter | ⬜ | Wraps identity layer + `chain-forge-resource` scientific receipt |
+| Wire `PoCDConfig` into QCB genesis | ⬜ | Min difficulty, enabled tracks, epoch length |
+| First live PoCD mining round on devnet | ⬜ | End-to-end: submit proof → receipt → reward distribution |
+| Migrate `chain-forge-resource` seal functions to delegate to `chain-forge-pocd` | ⬜ | Remove duplication; `UsefulWorkReceipt` becomes a wrapper |
+
+---
+
 ## Open Questions Index
 
 > See `QCB-Chain-Whitepaper-v2.md §12` for full descriptions. Listed here for quick reference.

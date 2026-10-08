@@ -1,0 +1,15 @@
+[package]
+name        = "chain-forge-pocd"
+description = "Proof of Cryptographic Discovery — reusable mining protocol for Chain Forge blockchains"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+thiserror  = { workspace = true }
