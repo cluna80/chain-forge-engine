@@ -618,10 +618,12 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `QcbRewardPolicy` in `chain-forge-qrc` | ⬜ | Pays rewards in uQRC; implements `RewardPolicy` trait |
-| `QcbVerifier` adapter | ⬜ | Wraps identity layer + `chain-forge-resource` scientific receipt |
-| Wire `PoCDConfig` into QCB genesis | ⬜ | Min difficulty, enabled tracks, epoch length |
-| First live PoCD mining round on devnet | ⬜ | End-to-end: submit proof → receipt → reward distribution |
+| `QcbRewardPolicy` in `chain-forge-qrc` | ✅ | Pays rewards in uQRC; implements `RewardPolicy` trait; difficulty + track multipliers; pro-rata epoch pool cap; full test suite |
+| Wire `PoCDConfig` into QCB genesis | ✅ | `genesis.pocd: Option<serde_json::Value>` in `chain-forge-core`; node parses at startup into `PoCDConfig`; `pocd_registry` Arc<Mutex> wired through to API |
+| PoCD API endpoints | ✅ | `GET /api/pocd/challenges`, `GET /api/pocd/receipts`, `POST /api/pocd/submit`; self-verifies seal in Phase 0; no external verifier sig required |
+| First live PoCD mining round on devnet | ✅ | `scripts/phase0_pocd_test.py` — mines 4-bit seal, submits proof, verifies receipt; runs against live devnet |
+| `QcbVerifier` adapter | ⬜ | Wraps identity layer + `chain-forge-resource` scientific receipt; Phase 1 |
+| Wire `QcbRewardPolicy` into epoch processing | ⬜ | Call `compute_rewards()` at epoch boundaries in `node.rs`; credit miner wallets via state |
 | Migrate `chain-forge-resource` seal functions to delegate to `chain-forge-pocd` | ⬜ | Remove duplication; `UsefulWorkReceipt` becomes a wrapper |
 
 ---

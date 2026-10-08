@@ -231,6 +231,27 @@ pub struct GenesisConfig {
     /// Temporary centralization: see QCB-Attestation-Guard-Design.md §Coordinator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_coordinator: Option<String>,
+
+    /// Optional Proof of Cryptographic Discovery configuration.
+    ///
+    /// When present and `enabled = true`, the node activates the PoCD mining
+    /// module.  Stored as a raw JSON value here so `chain-forge-core` does
+    /// not need to depend on `chain-forge-pocd`; the node deserialises it
+    /// into `chain_forge_pocd::PoCDConfig` at startup.
+    ///
+    /// Minimal example:
+    /// ```json
+    /// "pocd": {
+    ///   "enabled": true,
+    ///   "chain_id": "qcb-devnet-1",
+    ///   "challenge_tracks": ["Cryptography", "Mathematics"],
+    ///   "reward_epoch_blocks": 720,
+    ///   "require_verified_identity": false,
+    ///   "min_seal_difficulty_bits": 16
+    /// }
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pocd: Option<serde_json::Value>,
 }
 
 // -- Modules ----------------------------------------------------------------------

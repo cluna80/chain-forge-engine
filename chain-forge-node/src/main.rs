@@ -198,9 +198,10 @@ async fn main() {
         }
     }
 
+    let pocd_registry = node.pocd_registry();
     info!(require_signatures = precheck.require_signatures, "transaction signature enforcement");
     tokio::spawn(async move {
-        api::serve(api_port, status, explorer, qrc_metrics, peers, tx_queue, precheck).await;
+        api::serve(api_port, status, explorer, qrc_metrics, peers, tx_queue, precheck, pocd_registry).await;
     });
 
     // Give the API a moment to bind before the event loop starts.

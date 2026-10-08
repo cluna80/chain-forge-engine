@@ -29,6 +29,7 @@ chain-forge-state     = { path = "../chain-forge-state" }
 chain-forge-execution = { path = "../chain-forge-execution" }
 chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network"] }
 chain-forge-qrc     = { path = "../chain-forge-qrc" }
+chain-forge-pocd    = { path = "../chain-forge-pocd" }
 chain-forge-identity  = { path = "../chain-forge-identity" }
 chain-forge-agents    = { path = "../chain-forge-agents" }
 chain-forge-slashing  = { path = "../chain-forge-slashing", features = ["real-crypto"] }

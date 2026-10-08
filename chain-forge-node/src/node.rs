@@ -20,6 +20,7 @@ use chain_forge_slashing::{SlashingModule, EquivocationEvidence};
 use chain_forge_validators::ValidatorRegistry;
 use chain_forge_identity::IdentityStore;
 use chain_forge_qrc::QrcEngine;
+use chain_forge_pocd::DiscoveryRegistry;
 use chain_forge_agents::AgentStore;
 use chain_forge_p2p::{
     MockNetworkService, NetworkConfig, NetworkEvent, NetworkService,
@@ -286,6 +287,18 @@ pub struct Node {
     /// waits for real peer connections before attempting to participate in
     /// consensus. False means no peers are expected (solo devnet mode).
     has_bootstrap_peers: bool,
+
+    // ── PoCD (Proof of Cryptographic Discovery) ──────────────────────────────
+
+    /// Active PoCD configuration parsed from `genesis.pocd` at startup.
+    /// None when the genesis file has no `pocd` section.
+    pocd_config: Option<chain_forge_pocd::PoCDConfig>,
+
+    /// Runtime ledger of PoCD challenges and accepted discovery receipts.
+    /// Populated when a `pocd` section exists in genesis; None otherwise.
+    /// Behind a Mutex so the API handler thread can read it without holding
+    /// a &mut Node reference.
+    pocd_registry: Option<std::sync::Arc<Mutex<chain_forge_pocd::DiscoveryRegistry>>>,
 }
 
 /// Map a transaction body to a short string label for the explorer.
@@ -740,6 +753,33 @@ impl Node {
         // event loop can decide between solo-devnet and multi-node mode.
         let has_bootstrap_peers = !net_config.bootstrap_nodes.is_empty();
 
+        // ── PoCD: parse optional genesis.pocd section ─────────────────────
+        // `genesis.pocd` is stored as raw `serde_json::Value` in GenesisConfig
+        // (chain-forge-core must not depend on chain-forge-pocd).  Here in the
+        // node crate — which already depends on both — we deserialize it into
+        // PoCDConfig and seed an empty DiscoveryRegistry so the API endpoints
+        // and reward policy have something to operate on.
+        let (pocd_config, pocd_registry) = match &genesis.pocd {
+            Some(raw) => {
+                match serde_json::from_value::<chain_forge_pocd::PoCDConfig>(raw.clone()) {
+                    Ok(cfg) => {
+                        info!(
+                            chain_id = %cfg.chain_id,
+                            min_difficulty = cfg.min_seal_difficulty_bits,
+                            "PoCD enabled from genesis"
+                        );
+                        let reg = Arc::new(Mutex::new(DiscoveryRegistry::new()));
+                        (Some(cfg), Some(reg))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "genesis.pocd is present but failed to parse as PoCDConfig — PoCD disabled");
+                        (None, None)
+                    }
+                }
+            }
+            None => (None, None),
+        };
+
         Ok(Self {
             genesis,
             consensus: engine,
@@ -767,6 +807,8 @@ impl Node {
             validator_registry,
             tx_queue,
             has_bootstrap_peers,
+            pocd_config,
+            pocd_registry,
         })
     }
 
@@ -806,6 +848,16 @@ impl Node {
 
     pub fn tx_queue(&self) -> SharedTxQueue {
         self.tx_queue.clone()
+    }
+
+    /// PoCD registry shared with the API layer (None if PoCD not enabled).
+    pub fn pocd_registry(&self) -> Option<std::sync::Arc<Mutex<chain_forge_pocd::DiscoveryRegistry>>> {
+        self.pocd_registry.clone()
+    }
+
+    /// PoCD config (None if PoCD not enabled in genesis).
+    pub fn pocd_config(&self) -> Option<&chain_forge_pocd::PoCDConfig> {
+        self.pocd_config.as_ref()
     }
 
     /// Sign a Vote with this node's key, domain-separated by chain_id.

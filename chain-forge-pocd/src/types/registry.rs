@@ -174,6 +174,11 @@ impl DiscoveryRegistry {
             .collect()
     }
 
+    /// Iterate over all accepted receipts in the registry.
+    pub fn all_receipts(&self) -> impl Iterator<Item = &DiscoveryReceipt> {
+        self.receipts.values()
+    }
+
     /// Total number of accepted receipts in the registry.
     pub fn receipt_count(&self) -> usize {
         self.receipts.len()

@@ -18,6 +18,7 @@ license.workspace = true
 
 [dependencies]
 chain-forge-core     = { path = "../chain-forge-core" }
+chain-forge-pocd     = { path = "../chain-forge-pocd" }
 serde                = { workspace = true }
 thiserror            = { workspace = true }
 tracing              = { workspace = true }

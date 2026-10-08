@@ -12,6 +12,7 @@ use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS};
 use chain_forge_p2p::PeerInfo;
 use chain_forge_execution::Transaction;
 use chain_forge_resource::UsefulWorkReceipt;
+use chain_forge_pocd::{DiscoveryProof, DiscoveryRegistry};
 
 /// Serve the HTTP API on the given port.
 /// Phase 0 implementation: a minimal hand-rolled HTTP server that handles
@@ -35,6 +36,7 @@ pub async fn serve(
     peers:         Arc<Mutex<Vec<PeerInfo>>>,
     tx_queue:      Arc<Mutex<Vec<Transaction>>>,
     precheck:      TxPrecheck,
+    pocd_registry: Option<Arc<Mutex<DiscoveryRegistry>>>,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,6 +62,7 @@ pub async fn serve(
                 let peers         = peers.clone();
                 let tx_queue      = tx_queue.clone();
                 let precheck      = precheck.clone();
+                let pocd_registry = pocd_registry.clone();
 
                 tokio::spawn(async move {
                     // Read the WHOLE request: headers, then Content-Length
@@ -393,6 +396,131 @@ pub async fn serve(
                                 http_400_json(&resp.to_string())
                             }
                         }
+                    // ── PoCD endpoints ────────────────────────────────────────────
+
+                    } else if first_line.starts_with("GET /api/pocd/challenges") {
+                        // GET /api/pocd/challenges — list all active PoCD challenges.
+                        match &pocd_registry {
+                            Some(reg) => {
+                                let reg = reg.lock().unwrap();
+                                let challenges: Vec<_> = reg.active_challenges().collect();
+                                http_200_json(&serde_json::to_string(&challenges).unwrap_or_default())
+                            }
+                            None => {
+                                let resp = serde_json::json!({
+                                    "status": "disabled",
+                                    "message": "PoCD is not enabled in this chain's genesis"
+                                });
+                                http_200_json(&resp.to_string())
+                            }
+                        }
+
+                    } else if first_line.starts_with("GET /api/pocd/receipts") {
+                        // GET /api/pocd/receipts — list all accepted PoCD discovery receipts.
+                        match &pocd_registry {
+                            Some(reg) => {
+                                let reg = reg.lock().unwrap();
+                                let receipts: Vec<_> = reg.all_receipts().collect();
+                                http_200_json(&serde_json::to_string(&receipts).unwrap_or_default())
+                            }
+                            None => {
+                                let resp = serde_json::json!({
+                                    "status": "disabled",
+                                    "message": "PoCD is not enabled in this chain's genesis"
+                                });
+                                http_200_json(&resp.to_string())
+                            }
+                        }
+
+                    } else if first_line.starts_with("POST /api/pocd/submit") {
+                        // POST /api/pocd/submit — submit a DiscoveryProof for verification.
+                        // The node performs basic seal validation and stores an accepted receipt.
+                        // Full verifier integration (external verifier signatures) is Phase 1.
+                        let body_start = request.find("\r\n\r\n")
+                            .map(|i| i + 4)
+                            .unwrap_or(request.len());
+                        let body = &request[body_start..];
+
+                        match serde_json::from_str::<DiscoveryProof>(body) {
+                            Err(e) => {
+                                let resp = serde_json::json!({
+                                    "status": "error",
+                                    "message": format!("invalid DiscoveryProof JSON: {e}")
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            Ok(proof) => {
+                                match &pocd_registry {
+                                    None => {
+                                        let resp = serde_json::json!({
+                                            "status": "error",
+                                            "message": "PoCD is not enabled in this chain's genesis"
+                                        });
+                                        http_400_json(&resp.to_string())
+                                    }
+                                    Some(reg) => {
+                                        let mut reg = reg.lock().unwrap();
+                                        // Phase 0: node self-verifies the seal (no external verifier).
+                                        match proof.verify_seal() {
+                                            Ok(()) => {
+                                                let seal_hash = proof.seal_hash.clone();
+                                                // Extract chain_id from the challenge_id prefix
+                                                // (format: "{chain_id}::{track}::{slug}").
+                                                let chain_id = proof.challenge_id
+                                                    .splitn(3, "::")
+                                                    .next()
+                                                    .unwrap_or("unknown")
+                                                    .to_owned();
+                                                // Build a devnet receipt (no external verifier sig).
+                                                let receipt = chain_forge_pocd::build_receipt(
+                                                    format!("receipt-{}", proof.proof_id),
+                                                    &proof,
+                                                    chain_id,
+                                                    "self-verifier",
+                                                    "devnet-no-sig",
+                                                    0, // committed_at_block: updated on next block commit
+                                                );
+                                                match reg.add_receipt(receipt) {
+                                                    Ok(()) => {
+                                                        let resp = serde_json::json!({
+                                                            "status": "accepted",
+                                                            "proof_id": proof.proof_id,
+                                                            "seal_hash": seal_hash,
+                                                        });
+                                                        tracing::info!(
+                                                            proof_id = %proof.proof_id,
+                                                            machine_id = %proof.machine_id,
+                                                            "PoCD proof accepted"
+                                                        );
+                                                        http_200_json(&resp.to_string())
+                                                    }
+                                                    Err(e) => {
+                                                        let resp = serde_json::json!({
+                                                            "status": "rejected",
+                                                            "reason": e.to_string()
+                                                        });
+                                                        http_400_json(&resp.to_string())
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let resp = serde_json::json!({
+                                                    "status": "rejected",
+                                                    "reason": e.to_string()
+                                                });
+                                                tracing::warn!(
+                                                    proof_id = %proof.proof_id,
+                                                    error    = %e,
+                                                    "PoCD proof rejected: invalid seal"
+                                                );
+                                                http_400_json(&resp.to_string())
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                     } else if first_line.starts_with("OPTIONS") {
                         // CORS preflight for the React frontend
                         http_cors_preflight()
