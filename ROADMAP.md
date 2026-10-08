@@ -583,7 +583,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 21. ~~**Phase 0b N2 — duplicate escrow_id guard**~~ **✅ DONE** — Run ID `b16e3bd6`; duplicate `escrow_id` now hard-fails at execution layer (`LockQrcForJob: escrow_id 'esc-…' already exists`); treasury balance verified unchanged at 5,000,000 uQRC after rejection; escrow account is now written to state on lock so `escrow:{id}` is queryable — Step 7 escrow check promoted from soft-skip ⚠ to hard assertion ✓ (9/9 checks per node); N1 + N2 + happy-path all PASS.
 
-22. **`ReleaseQrcForJob` + `RefundQrcForJob` happy-path tests** 🔄 **NEXT** — Submit release and refund txs after a successful lock; verify treasury/escrow balance changes on all nodes; confirm escrow account is debited and provider wallet credited on release.
+22. **`ReleaseQrcForJob` + `RefundQrcForJob` happy-path tests** ✅ **DONE — three-node devnet verified (2026-10-08)** — Run `20eee23f`: 10 transactions checked on Alice, Bob, Dave. Release debited escrow and credited provider; refund restored original treasury; repeated full payouts rejected without balance changes. `scripts/phase0_settlement_test.py` committed. Carol node validation remains item 23; scientific receipt verification is separate.
 
 23. **4-node test with Carol (Machine 2)** ⬜ — Drop `--skip-carol` flag; run full 4-node acceptance test with Carol participating in consensus and state verification.
 
