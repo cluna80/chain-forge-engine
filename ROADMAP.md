@@ -208,7 +208,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Milestone | Technology | Status |
 |---|---|---|
 | **QCB-CS-001** | Cryptographic Survivability and Migration | ⬜ Phase 1 |
-| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | 🔄 Phase A in progress |
+| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A complete |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
 | **QSWIP-001** | Open Post-Quantum Wallet Identity Protocol | 🔲 Proposed standard |
@@ -254,11 +254,19 @@ User opens QCB app → QR challenge displayed
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | 🔄 In progress |
+| A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | ✅ Complete |
 | B — Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to QCB wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
 | E — Security testing | QR replay, phishing, session hijacking, key compromise, identity correlation, account recovery | 🔲 |
+
+**DIS-001 Phase A — ✅ COMPLETE (2026-10-09):**
+- **`chain-forge-node/src/auth.rs`** (NEW): `AuthChallenge` with 60-second TTL and 32-char hex ID; `ChallengeStore` with anti-replay `consume()` and capacity eviction at 1024 pending challenges; `verify_challenge_signature()` verifies ML-DSA-65 over SHA-256(challenge_json) and derives `"qcb1pq…"` address from double-SHA-256 of public key.
+- **`POST /api/auth/challenge`**: issues time-bounded challenge JSON; optional `scope` field (defaults to `"qcb-auth"`); challenge inserted into per-node `ChallengeStore`.
+- **`POST /api/auth/verify`**: consumes challenge (atomic anti-replay), verifies ML-DSA-65 signature, returns `{"status":"verified","address":"qcb1pq…","scope":…}` or 400 rejected.
+- **`chain-forge-wallet`: `sign_challenge()`** signs SHA-256(challenge_json) with ML-DSA-65 and returns `"mldsa65:<hex>"` tagged string; `qcb-wallet sign-challenge` CLI subcommand exposes it for scripting.
+- **13 node auth tests + 2 wallet sign_challenge tests** — all 59 tests passing (47 node, 12 wallet).
+- **`scripts/phase1_dis001_test.py`**: 5-scenario adversarial test (happy path, anti-replay, forged sig, wrong key, unknown challenge_id); run against live devnet.
 
 **First wallet objective — QCB-WALLET-001 (Four-Node PQ Transaction Test):** Build a native Rust wallet that generates and securely stores an ML-DSA key pair; signs a QCB transaction locally; submits only the signed transaction through `/api/tx`; has its signature verified by the protocol; achieves finality across Alice, Bob, Carol, and Dave; and rejects forged, modified, or replayed transactions.
 

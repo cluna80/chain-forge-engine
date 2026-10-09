@@ -1,8 +1,9 @@
 //! qcb-wallet — CLI for QCB-WALLET-001
 //!
 //! Subcommands:
-//!   generate --out <file> [--label <name>]
-//!       Generate a new ML-DSA-65 wallet.  Prompts for passphrase.
+//!   generate --path <file> [--name <label>] [--passphrase <pass>]
+//!       Generate a new ML-DSA-65 wallet.  Prompts for passphrase if omitted.
+//!       Aliases: --out for --path, --label for --name (backward compat).
 //!
 //!   address --wallet <file>
 //!       Print the wallet's QCB address (no passphrase needed).
@@ -13,6 +14,9 @@
 //!   sign-tx --wallet <file> --body <json>
 //!       Sign a transaction body JSON string. Prints hex signature.
 //!
+//!   sign-challenge --challenge <json> --path <file> [--passphrase <pass>]
+//!       Sign a DIS-001 auth challenge JSON string. Prints mldsa65:<hex> signature.
+//!
 //!   submit --wallet <file> --body <json> --node <host:port> [--dry-run]
 //!       Sign and submit a transaction to a QCB node.
 //!
@@ -20,7 +24,7 @@
 //! (useful for scripts and tests; keep secrets out of shell history).
 
 use chain_forge_wallet::{
-    generate_wallet, load_wallet, sign_transaction, submit_tx,
+    generate_wallet, load_wallet, sign_transaction, sign_challenge, submit_tx,
     SignedTxEnvelope,
 };
 
@@ -28,11 +32,12 @@ fn usage() -> ! {
     eprintln!("qcb-wallet — QCB-WALLET-001 post-quantum wallet");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  qcb-wallet generate --out <file> [--label <name>]");
-    eprintln!("  qcb-wallet address  --wallet <file>");
-    eprintln!("  qcb-wallet info     --wallet <file>");
-    eprintln!("  qcb-wallet sign-tx  --wallet <file> --body <json>");
-    eprintln!("  qcb-wallet submit   --wallet <file> --body <json> --node <host:port> [--dry-run]");
+    eprintln!("  qcb-wallet generate   --path <file> [--name <label>] [--passphrase <pass>]");
+    eprintln!("  qcb-wallet address    --wallet <file>");
+    eprintln!("  qcb-wallet info       --wallet <file>");
+    eprintln!("  qcb-wallet sign-tx    --wallet <file> --body <json>");
+    eprintln!("  qcb-wallet sign-challenge --challenge <json> --path <file> [--passphrase <pass>]");
+    eprintln!("  qcb-wallet submit     --wallet <file> --body <json> --node <host:port> [--dry-run]");
     eprintln!();
     eprintln!("Set QCB_WALLET_PASSPHRASE env var to skip the passphrase prompt.");
     std::process::exit(2);
@@ -55,12 +60,13 @@ fn main() {
     if args.len() < 2 { usage(); }
 
     match args[1].as_str() {
-        "generate" => cmd_generate(&args[2..]),
-        "address"  => cmd_address(&args[2..]),
-        "info"     => cmd_info(&args[2..]),
-        "sign-tx"  => cmd_sign_tx(&args[2..]),
-        "submit"   => cmd_submit(&args[2..]),
-        "--help" | "-h" => usage(),
+        "generate"       => cmd_generate(&args[2..]),
+        "address"        => cmd_address(&args[2..]),
+        "info"           => cmd_info(&args[2..]),
+        "sign-tx"        => cmd_sign_tx(&args[2..]),
+        "sign-challenge" => cmd_sign_challenge(&args[2..]),
+        "submit"         => cmd_submit(&args[2..]),
+        "--help" | "-h"  => usage(),
         other => {
             eprintln!("unknown subcommand: {other}");
             usage();
@@ -69,12 +75,18 @@ fn main() {
 }
 
 fn cmd_generate(args: &[String]) {
-    let mut out: Option<String>   = None;
-    let mut label = "my-wallet".to_string();
+    let mut out:        Option<String> = None;
+    let mut label                      = "my-wallet".to_string();
+    let mut pass_flag:  Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            // Primary flag names (DIS-001 test script uses these)
+            "--path"       => { i += 1; out        = args.get(i).cloned(); }
+            "--name"       => { i += 1; if let Some(l) = args.get(i) { label = l.clone(); } }
+            "--passphrase" => { i += 1; pass_flag  = args.get(i).cloned(); }
+            // Backward-compat aliases
             "--out"   => { i += 1; out   = args.get(i).cloned(); }
             "--label" => { i += 1; if let Some(l) = args.get(i) { label = l.clone(); } }
             other => { eprintln!("unknown flag: {other}"); usage(); }
@@ -82,8 +94,8 @@ fn cmd_generate(args: &[String]) {
         i += 1;
     }
 
-    let out = out.unwrap_or_else(|| { eprintln!("--out <file> is required"); usage(); });
-    let passphrase = passphrase();
+    let out = out.unwrap_or_else(|| { eprintln!("--path <file> is required"); usage(); });
+    let passphrase = pass_flag.unwrap_or_else(passphrase);
 
     println!("Generating ML-DSA-65 key pair…");
     match generate_wallet(&out, &label, &passphrase) {
@@ -167,6 +179,40 @@ fn cmd_sign_tx(args: &[String]) {
         }
         Err(e) => {
             eprintln!("signing failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_sign_challenge(args: &[String]) {
+    let mut path:      Option<String> = None;
+    let mut challenge: Option<String> = None;
+    let mut pass_flag: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--path"       | "--wallet" => { i += 1; path      = args.get(i).cloned(); }
+            "--challenge"              => { i += 1; challenge  = args.get(i).cloned(); }
+            "--passphrase"             => { i += 1; pass_flag  = args.get(i).cloned(); }
+            other => { eprintln!("unknown flag: {other}"); usage(); }
+        }
+        i += 1;
+    }
+
+    let path      = path.unwrap_or_else(||      { eprintln!("--path <file> is required"); usage(); });
+    let challenge = challenge.unwrap_or_else(|| { eprintln!("--challenge <json> is required"); usage(); });
+    let pass      = pass_flag.unwrap_or_else(passphrase);
+
+    let (_kf, kp) = load_wallet(&path, &pass).unwrap_or_else(|e| {
+        eprintln!("error loading wallet: {e}");
+        std::process::exit(1);
+    });
+
+    match sign_challenge(&challenge, &kp) {
+        Ok(sig) => println!("{sig}"),
+        Err(e)  => {
+            eprintln!("sign-challenge failed: {e}");
             std::process::exit(1);
         }
     }

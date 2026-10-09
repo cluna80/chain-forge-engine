@@ -23,6 +23,7 @@
 
 mod node;
 mod api;
+mod auth;
 pub mod telemetry;
 
 use std::path::PathBuf;
@@ -199,9 +200,19 @@ async fn main() {
     }
 
     let pocd_registry = node.pocd_registry();
+    // DIS-001 Phase A: in-memory challenge store for QR auth; one per node process.
+    let challenge_store = std::sync::Arc::new(std::sync::Mutex::new(
+        auth::ChallengeStore::new()
+    ));
+    // Node identifier for DIS-001 challenge context.
+    // Uses "chain_id:port" as a human-readable node descriptor.
+    let node_id = format!("{}:{}", node.chain_id(), args.api_port);
     info!(require_signatures = precheck.require_signatures, "transaction signature enforcement");
     tokio::spawn(async move {
-        api::serve(api_port, status, explorer, qrc_metrics, peers, tx_queue, precheck, pocd_registry).await;
+        api::serve(
+            api_port, status, explorer, qrc_metrics, peers, tx_queue,
+            precheck, pocd_registry, challenge_store, node_id,
+        ).await;
     });
 
     // Give the API a moment to bind before the event loop starts.

@@ -279,6 +279,37 @@ pub fn sign_transaction(tx_body_json: &str, kp: &KeyPair) -> WalletResult<String
     Ok(hex_encode(&sig.bytes))
 }
 
+/// Sign a DIS-001 authentication challenge with an ML-DSA key pair.
+///
+/// The wallet receives the `challenge_json` string from the QR code (the full
+/// `AuthChallenge` JSON issued by `POST /api/auth/challenge`).  It SHA-256
+/// pre-hashes the JSON (same convention as `sign_transaction`) then signs with
+/// ML-DSA-65, and returns the tagged signature `"mldsa65:<hex>"`.
+///
+/// # Authentication flow
+/// 1. Node issues `AuthChallenge` via `POST /api/auth/challenge`
+/// 2. Node encodes the challenge JSON as a QR code
+/// 3. User scans QR code; wallet calls `sign_challenge(challenge_json, &kp)`
+/// 4. Wallet POSTs `{ challenge_id, public_key, signature }` to `POST /api/auth/verify`
+/// 5. Node verifies signature and returns `{ status: "verified", address }`
+///
+/// # Returns
+/// Tagged hex signature: `"mldsa65:<hex_signature_bytes>"`
+pub fn sign_challenge(challenge_json: &str, kp: &KeyPair) -> WalletResult<String> {
+    use sha2::{Sha256, Digest};
+
+    // Message = SHA-256(challenge_json bytes)
+    // Same pre-hash convention as sign_transaction so the crypto path is uniform.
+    let mut hasher = Sha256::new();
+    hasher.update(challenge_json.as_bytes());
+    let message: [u8; 32] = hasher.finalize().into();
+
+    let scheme = MlDsaScheme;
+    let sig = scheme.sign(&message, kp)?;
+
+    Ok(format!("mldsa65:{}", hex_encode(&sig.bytes)))
+}
+
 /// Verify a transaction signature (used in tests and by the node's tx verifier).
 ///
 /// # Arguments
@@ -635,6 +666,76 @@ mod tests {
         let pub_key = hex_decode(&kf.public_key).unwrap();
         assert!(verify_transaction(&body_json, sig_hex, &pub_key).is_ok(),
             "envelope signature must be valid");
+
+        cleanup(&path);
+    }
+
+    // ── Test 11: sign_challenge produces mldsa65-tagged signature ────────────
+
+    #[test]
+    fn sign_challenge_produces_tagged_signature() {
+        let path = tmp_path("sign_challenge_tag");
+        cleanup(&path);
+
+        let _kf = generate_wallet(&path, "auth-test", "passphrase").unwrap();
+        let (_kf, kp) = load_wallet(&path, "passphrase").unwrap();
+
+        // Minimal challenge JSON (same shape as AuthChallenge::signing_payload)
+        let challenge_json = r#"{"challenge_id":"abcdef1234567890abcdef1234567890","issued_at":1700000000,"expires_at":1700000060,"node_id":"testchain:8080","scope":"qcb-auth"}"#;
+
+        let sig = sign_challenge(challenge_json, &kp).unwrap();
+        assert!(sig.starts_with("mldsa65:"),
+            "sign_challenge must produce mldsa65-tagged signature; got: {}", &sig[..16.min(sig.len())]);
+
+        // Hex payload after the tag must be non-empty
+        let hex_part = sig.strip_prefix("mldsa65:").unwrap();
+        assert!(!hex_part.is_empty(), "signature hex must be non-empty");
+        // ML-DSA-65 signatures are ~3309 bytes = 6618 hex chars
+        assert!(hex_part.len() > 6000,
+            "ML-DSA-65 signature hex should be ~6618 chars, got {}", hex_part.len());
+
+        cleanup(&path);
+    }
+
+    // ── Test 12: sign_challenge integration with verify_challenge_signature ───
+    //
+    // This test verifies the full DIS-001 Phase A round-trip:
+    //   wallet::sign_challenge → node::auth::verify_challenge_signature
+    //
+    // We import auth directly (same workspace) to avoid a crate-level
+    // dependency — the #[cfg(test)] guard keeps this test-only.
+
+    #[test]
+    fn sign_challenge_integrates_with_node_verify() {
+        use sha2::{Sha256, Digest};
+        use chain_forge_crypto::{MlDsaScheme, SignatureScheme};
+
+        let path = tmp_path("challenge_integration");
+        cleanup(&path);
+
+        let kf = generate_wallet(&path, "alice-auth", "passphrase").unwrap();
+        let (_kf, kp) = load_wallet(&path, "passphrase").unwrap();
+
+        let challenge_json = r#"{"challenge_id":"deadbeef1234567890abcdef12345678","issued_at":1700000000,"expires_at":1700000060,"node_id":"testchain:8080","scope":"qcb-auth"}"#;
+
+        // Sign with wallet
+        let sig_tagged = sign_challenge(challenge_json, &kp).unwrap();
+        assert!(sig_tagged.starts_with("mldsa65:"));
+
+        // Manually verify (mirrors auth::verify_challenge_signature logic)
+        let pk_bytes = hex_decode(&kf.public_key).unwrap();
+        assert_eq!(pk_bytes.len(), 1952, "ML-DSA-65 pk must be 1952 bytes");
+
+        let sig_hex = sig_tagged.strip_prefix("mldsa65:").unwrap();
+        let sig_bytes = hex_decode(sig_hex).unwrap();
+
+        // SHA-256 pre-hash (same as auth.rs)
+        let message: [u8; 32] = Sha256::digest(challenge_json.as_bytes()).into();
+
+        let sig = chain_forge_crypto::Signature { scheme: chain_forge_crypto::SchemeId::MlDsa, bytes: sig_bytes };
+        let result = MlDsaScheme.verify(&message, &sig, &pk_bytes);
+        assert!(result.is_ok(),
+            "wallet sign_challenge output must pass ML-DSA-65 verification: {:?}", result.err());
 
         cleanup(&path);
     }

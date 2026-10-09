@@ -479,13 +479,15 @@ pub fn main() {
     let tx_id = new_tx_id();
 
     let mut tx = Transaction {
-        id:         tx_id.clone(),
-        sender:     g.from.clone(),
+        id:            tx_id.clone(),
+        sender:        g.from.clone(),
         nonce,
         body,
-        gas_limit:  g.gas,
-        signature:  vec![],
-        public_key: vec![],
+        gas_limit:     g.gas,
+        signature:     vec![],
+        public_key:    vec![],
+        pq_signatures: vec![],
+        pq_public_key: vec![],
     };
 
     // Sign if a keypair was loaded

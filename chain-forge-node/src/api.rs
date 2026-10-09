@@ -9,6 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS};
+use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest,
+                  verify_challenge_signature};
 use chain_forge_p2p::PeerInfo;
 use chain_forge_execution::Transaction;
 use chain_forge_resource::UsefulWorkReceipt;
@@ -30,13 +32,15 @@ pub struct TxPrecheck {
 
 pub async fn serve(
     port: u16,
-    status:        Arc<Mutex<NodeStatus>>,
-    explorer:      Arc<Mutex<ExplorerState>>,
-    qrc_metrics: Arc<Mutex<QrcMetrics>>,
-    peers:         Arc<Mutex<Vec<PeerInfo>>>,
-    tx_queue:      Arc<Mutex<Vec<Transaction>>>,
-    precheck:      TxPrecheck,
-    pocd_registry: Option<Arc<Mutex<DiscoveryRegistry>>>,
+    status:          Arc<Mutex<NodeStatus>>,
+    explorer:        Arc<Mutex<ExplorerState>>,
+    qrc_metrics:     Arc<Mutex<QrcMetrics>>,
+    peers:           Arc<Mutex<Vec<PeerInfo>>>,
+    tx_queue:        Arc<Mutex<Vec<Transaction>>>,
+    precheck:        TxPrecheck,
+    pocd_registry:   Option<Arc<Mutex<DiscoveryRegistry>>>,
+    challenge_store: Arc<Mutex<ChallengeStore>>,
+    node_id:         String,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,13 +60,15 @@ pub async fn serve(
         match listener.accept().await {
             Ok((mut stream, peer)) => {
                 tracing::debug!(peer = %peer, "HTTP connection");
-                let status        = status.clone();
-                let explorer      = explorer.clone();
-                let qrc_metrics = qrc_metrics.clone();
-                let peers         = peers.clone();
-                let tx_queue      = tx_queue.clone();
-                let precheck      = precheck.clone();
-                let pocd_registry = pocd_registry.clone();
+                let status           = status.clone();
+                let explorer         = explorer.clone();
+                let qrc_metrics      = qrc_metrics.clone();
+                let peers            = peers.clone();
+                let tx_queue         = tx_queue.clone();
+                let precheck         = precheck.clone();
+                let pocd_registry    = pocd_registry.clone();
+                let challenge_store  = challenge_store.clone();
+                let node_id          = node_id.clone();
 
                 tokio::spawn(async move {
                     // Read the WHOLE request: headers, then Content-Length
@@ -513,6 +519,131 @@ pub async fn serve(
                                                     error    = %e,
                                                     "PoCD proof rejected: invalid seal"
                                                 );
+                                                http_400_json(&resp.to_string())
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                    // ── DIS-001 Phase A: QR Challenge/Response Authentication ──
+
+                    } else if first_line.starts_with("POST /api/auth/challenge") {
+                        // POST /api/auth/challenge — issue a time-bounded challenge.
+                        //
+                        // Body (optional JSON): { "scope": "qcb-auth" }
+                        // Response: AuthChallenge JSON including challenge_id + expires_at.
+                        //
+                        // The wallet signs the full challenge JSON (SHA-256 pre-hashed),
+                        // not just the challenge_id, so the signature covers temporal and
+                        // node context. The QR code encodes the challenge JSON for the
+                        // user's wallet app to scan.
+                        let body_start = request.find("\r\n\r\n")
+                            .map(|i| i + 4)
+                            .unwrap_or(request.len());
+                        let body = &request[body_start..];
+
+                        let scope = if body.trim().is_empty() {
+                            "qcb-auth".to_string()
+                        } else {
+                            serde_json::from_str::<ChallengeRequest>(body)
+                                .map(|r| r.scope)
+                                .unwrap_or_else(|_| "qcb-auth".to_string())
+                        };
+
+                        let challenge = AuthChallenge::new(&node_id, &scope);
+                        let ch_json = serde_json::to_string(&challenge).unwrap_or_default();
+                        tracing::info!(
+                            challenge_id = %challenge.challenge_id,
+                            expires_at   = challenge.expires_at,
+                            scope        = %scope,
+                            "auth challenge issued"
+                        );
+                        {
+                            let mut store = challenge_store.lock().unwrap();
+                            store.insert(challenge);
+                        }
+                        http_200_json(&ch_json)
+
+                    } else if first_line.starts_with("POST /api/auth/verify") {
+                        // POST /api/auth/verify — verify a wallet-signed challenge.
+                        //
+                        // Body JSON: {
+                        //   "challenge_id": "<32-char hex>",
+                        //   "public_key":   "<hex ML-DSA-65 public key, 3904 chars>",
+                        //   "signature":    "mldsa65:<hex signature>"
+                        // }
+                        //
+                        // On success:
+                        //   { "status": "verified", "address": "qcb1pq…", … }
+                        // On failure:
+                        //   HTTP 400  { "status": "rejected", "reason": "…" }
+                        //
+                        // Anti-replay: challenge_id is consumed on first success.
+                        // Expired challenges are rejected automatically.
+                        let body_start = request.find("\r\n\r\n")
+                            .map(|i| i + 4)
+                            .unwrap_or(request.len());
+                        let body = &request[body_start..];
+
+                        match serde_json::from_str::<VerifyRequest>(body) {
+                            Err(e) => {
+                                let resp = serde_json::json!({
+                                    "status": "error",
+                                    "reason": format!("invalid verify request JSON: {e}")
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            Ok(verify_req) => {
+                                // Consume the challenge (anti-replay + expiry in one step)
+                                let maybe_challenge = {
+                                    let mut store = challenge_store.lock().unwrap();
+                                    store.consume(&verify_req.challenge_id)
+                                };
+                                match maybe_challenge {
+                                    None => {
+                                        tracing::warn!(
+                                            challenge_id = %verify_req.challenge_id,
+                                            "auth verify: unknown or expired challenge"
+                                        );
+                                        let resp = serde_json::json!({
+                                            "status": "rejected",
+                                            "reason": format!(
+                                                "challenge '{}' not found or expired",
+                                                verify_req.challenge_id
+                                            )
+                                        });
+                                        http_400_json(&resp.to_string())
+                                    }
+                                    Some(challenge) => {
+                                        match verify_challenge_signature(&challenge, &verify_req) {
+                                            Ok(address) => {
+                                                tracing::info!(
+                                                    challenge_id = %challenge.challenge_id,
+                                                    address      = %address,
+                                                    scope        = %challenge.scope,
+                                                    "DIS-001: auth challenge verified"
+                                                );
+                                                let resp = serde_json::json!({
+                                                    "status":       "verified",
+                                                    "challenge_id": challenge.challenge_id,
+                                                    "address":      address,
+                                                    "scope":        challenge.scope,
+                                                    "issued_at":    challenge.issued_at,
+                                                });
+                                                http_200_json(&resp.to_string())
+                                            }
+                                            Err(reason) => {
+                                                tracing::warn!(
+                                                    challenge_id = %challenge.challenge_id,
+                                                    %reason,
+                                                    "DIS-001: auth challenge verification failed"
+                                                );
+                                                let resp = serde_json::json!({
+                                                    "status": "rejected",
+                                                    "reason": reason
+                                                });
                                                 http_400_json(&resp.to_string())
                                             }
                                         }
