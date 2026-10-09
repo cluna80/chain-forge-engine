@@ -53,7 +53,13 @@
     "mempool_size": 100,
     "mempool_ttl_seconds": 60
   },
-  "modules": ["bank", "staking", "identity", "qrc", "agents"],
+  "modules": [
+    "bank",
+    "staking",
+    "identity",
+    "qrc",
+    "agents"
+  ],
   "custom_modules": [],
   "genesis_accounts": [
     {
@@ -78,5 +84,18 @@
       "public_key": "7610e5974ca876a093d5e9a6a3fa1e64b6a4721e4d3073c2dc06a870ad0cbdc0"
     }
   ],
-  "attestation_coordinator": "qcb1alice"
+  "attestation_coordinator": "qcb1alice",
+  "pocd": {
+    "enabled": true,
+    "chain_id": "qcb-testnet-1",
+    "challenge_tracks": [
+      "Mathematics",
+      "Cryptography",
+      "ComputationalEfficiency",
+      "PhysicsAndOpenScience"
+    ],
+    "reward_epoch_blocks": 720,
+    "require_verified_identity": false,
+    "min_seal_difficulty_bits": 4
+  }
 }

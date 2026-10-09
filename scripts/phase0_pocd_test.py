@@ -48,7 +48,7 @@ SUBMIT_NODE = NODES[0]
 # PoCD challenge to use for the live round.
 # challenge_id format: "{chain_id}::{track}::{slug}"
 # The chain_id MUST match the running devnet's chain_id.
-CHAIN_ID     = "qcb-devnet-1"
+CHAIN_ID     = "qcb-testnet-1"
 CHALLENGE_ID = f"{CHAIN_ID}::Mathematics::phase0-pilot-1"
 MACHINE_ID   = "qcb1devminer"
 
