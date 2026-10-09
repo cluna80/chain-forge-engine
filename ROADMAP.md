@@ -495,7 +495,7 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 | BTC block hash randomness beacon | ⬜ | Grand Challenge job slice assignment derived from recent BTC block hash: `job_seed = SHA256(btc_block_hash \|\| challenge_id \|\| machine_id)`; prevents QCB or any participant from steering which machine gets which problem slice; established technique (used by Chainlink VRF, drand, bitcoin anchors), applied here to research job fairness; Phase 1 |
 | `seal_hash` field on `UsefulWorkReceipt` | ✅ | `seal_nonce: u64`, `seal_hash: String`, `seal_difficulty_bits: u32` added; `compute_seal_hash()`, `find_seal_nonce()`, `verify_seal()`, `meets_difficulty()` helpers implemented and tested; 6 tests passing |
 | Seal difficulty target per challenge track | ⬜ | Governance-settable difficulty for each active Grand Challenge track; stored in challenge config; Phase 1 |
-| Seal verification in receipt submission | ⬜ | Receipt submission path checks difficulty prefix before accepting `UsefulWorkReceipt`; verifier re-hashes from submitted `nonce + output_hash + challenge_id` — fast, one SHA256 call; Phase 1 |
+| Seal verification in receipt submission | ✅ | `SubmitUsefulWork` tx type calls `chain_forge_resource::verify_seal()` (single SHA256) at execution time; rejects invalid seals, trivial difficulty (< 8-bit absolute floor), duplicates, and wrong-owner submissions; 6 anti-farming guards enforced; 9 adversarial tests in `scripts/phase1_contribution_test.py` |
 | Grand Challenge machine daemon (`gc-daemon`) | ✅ | `chain-forge-node/src/bin/gc-daemon.rs` — full 3-step cycle: hash preimage search → seal nonce search → `UsefulWorkReceipt` JSON; smoke-tested: GC-DEVNET-002 found nonce 80,468 + seal nonce 161 in <500ms; `cargo run --bin gc-daemon -- --dry-run` |
 | SHA256 hardware compatibility documentation | ⬜ | Document that standard Bitcoin mining ASICs and GPUs can compute seal hashes; include benchmark: TH/s → expected seals/hour at target difficulty; Phase 1 |
 | BTC miner onboarding guide | ⬜ | Step-by-step: install daemon, point at challenge, earn QRC alongside BTC mining; Phase 1 community milestone |
@@ -724,7 +724,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 | PoCD API endpoints | ✅ | `GET /api/pocd/challenges`, `GET /api/pocd/receipts`, `POST /api/pocd/submit`; self-verifies seal in Phase 0; no external verifier sig required |
 | First live PoCD mining round on devnet | ✅ | `scripts/phase0_pocd_test.py` — mines 4-bit seal, submits proof, verifies receipt; runs against live devnet |
 | `QcbVerifier` adapter | ⬜ | Wraps identity layer + `chain-forge-resource` scientific receipt; Phase 1 |
-| Wire `QcbRewardPolicy` into epoch processing | ⬜ | Call `compute_rewards()` at epoch boundaries in `node.rs`; credit miner wallets via state |
+| Wire `QcbRewardPolicy` into epoch processing | ✅ | `EpochClose` handler scans `gc_receipt:*` state for unawarded receipts, converts to `DiscoveryReceipt`, calls `QcbRewardPolicy::compute_rewards()`, debits `treasury:pocd`, credits each machine wallet; `gc_reward_paid` sentinel prevents double-payment; non-fatal failure path retries next epoch |
 | Migrate `chain-forge-resource` seal functions to delegate to `chain-forge-pocd` | ⬜ | Remove duplication; `UsefulWorkReceipt` becomes a wrapper |
 
 ---
