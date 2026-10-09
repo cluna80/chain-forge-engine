@@ -58,6 +58,8 @@
 | Crypto-agility constitutional guarantee | 🔄 | Design captured in whitepaper §10 + §7.3; not yet protocol-enforced |
 | Signature scheme pluggability in `chain-forge-consensus` | ⬜ | Architectural requirement for PQ migration path |
 
+> **Security hardening milestones QCB-CS-001 and QCB-KR-001** are Phase 1 items that build directly on the work above. See Phase 1 → Cryptographic Security Hardening.
+
 ### QRC Money Layer (`chain-forge-qrc`) — Reclassified
 
 > **What changed**: `chain-forge-qrc` is now solely responsible for QRC as currency. It does not define jobs, match providers, or settle resource-specific receipts — that moves to `chain-forge-resource`. Each existing component is classified below.
@@ -193,6 +195,44 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 |------|--------|-------|
 | Charm Confinement (`chain-forge-identity` extension) | ⬜ | Identity-scoped state isolation; one claim per epoch |
 | Intrinsic Charm module | ⬜ | Verification tier intrinsic to identity; **note: decay-exemption credits removed** — demurrage is out of QRC v3, so decay-exemption credits have no referent; drop this concept |
+
+### Cryptographic Security Hardening
+
+> These are **Chain Forge modules** first — reusable by any sovereign chain built on Chain Forge. QCB is the first chain to enable and adversarially test them, exactly as with PoCD. Future chains can adopt cryptographic-agility and key-lifecycle capabilities independently of QCB's QRC economy or personhood rules.
+>
+> **Implementation order:** QCB-CS-001 first (defines the migration architecture); QCB-KR-001 implements account-level and multisig key management against that architecture.  
+> **Completion rule:** Neither milestone is ✅ until implementation **and** adversarial tests pass.
+
+#### QCB-CS-001 — Cryptographic Survivability and Migration
+
+*Goal: Ensure QCB can safely migrate to different cryptographic algorithms if an existing algorithm becomes vulnerable to AI-assisted cryptanalysis, quantum computing, or other attacks.*
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Complete cryptographic dependency inventory | ⬜ | Audit every hash function, signature scheme, and KDF used across all Chain Forge / QCB crates |
+| Public-key exposure audit across QCB | ⬜ | Identify every place a public key is stored on-chain or transmitted; classify exposure risk |
+| Post-quantum authentication for critical operations | ⬜ | Validator signing, treasury multisig, governance votes — must tolerate PQ threat model |
+| Pluggable signature algorithms (`chain-forge-crypto`) | ⬜ | `SignatureScheme` trait with versioned algorithm identifiers; builds on existing `chain-forge-consensus` pluggability work |
+| Safe cryptographic migration procedures | ⬜ | Documented + tested path: old algorithm → new algorithm without disrupting in-flight transactions or active multisig sets |
+| Emergency algorithm-deprecation mechanism | ⬜ | Governance tx to flag an algorithm as deprecated; grace period for key rotation; hard cutoff enforcement in consensus |
+| Simulated cryptographic compromise tests | ⬜ | Deliberately treat one scheme as "broken"; verify network migrates cleanly under simulated adversarial conditions |
+| Independent security review | 🔲 | Prerequisite: all above items pass; external review before mainnet |
+
+#### QCB-KR-001 — Post-Quantum Multisig Key Lifecycle
+
+*Goal: Protect QCB accounts, multisig treasuries, and authorized signers with secure key rotation, revocation, and recovery — without ever accidentally locking legitimate owners out of their assets.*
+
+Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise Authorization Tree.
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Post-quantum multisig authorization | ⬜ | Multisig threshold signing using ML-DSA keys; quorum threshold configurable per account type |
+| Configurable per-operation key rotation | ⬜ | Rotation policy settable per account: time-based, usage-count-based, or governance-triggered |
+| Off-chain signature collection | ⬜ | Signers collect partial signatures off-chain; only the aggregated authorization hits the chain |
+| Atomic key rotation and transaction execution | ⬜ | Rotate key and execute the protected operation in one atomic tx — no window where old key is revoked but new key isn't yet active |
+| Old-key revocation and replay protection | ⬜ | Revoked keys produce `InvalidSignature` on any subsequent use; revocation committed to chain state |
+| Secure recovery and emergency rotation | ⬜ | Social recovery (N-of-M guardians) + governance-assisted emergency rotation path for compromised accounts |
+| Adversarial tests for failed rotations | ⬜ | Scenarios: rotation interrupted mid-flight, guardian collusion, replayed old-key tx, double-rotation race condition |
 
 ### Resource Market — Phase 1 Hardening
 
