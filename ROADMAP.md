@@ -208,7 +208,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Milestone | Technology | Status |
 |---|---|---|
 | **QCB-CS-001** | Cryptographic Survivability and Migration | ⬜ Phase 1 |
-| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ⬜ Phase 1 |
+| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | 🔄 Phase A in progress |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
 | **QSWIP-001** | Open Post-Quantum Wallet Identity Protocol | 🔲 Proposed standard |
@@ -254,7 +254,7 @@ User opens QCB app → QR challenge displayed
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | ⬜ |
+| A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | 🔄 In progress |
 | B — Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to QCB wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
@@ -262,7 +262,10 @@ User opens QCB app → QR challenge displayed
 
 **First wallet objective — QCB-WALLET-001 (Four-Node PQ Transaction Test):** Build a native Rust wallet that generates and securely stores an ML-DSA key pair; signs a QCB transaction locally; submits only the signed transaction through `/api/tx`; has its signature verified by the protocol; achieves finality across Alice, Bob, Carol, and Dave; and rejects forged, modified, or replayed transactions.
 
-**Phase A status (crate scaffold + ML-DSA keygen) — ✅ DONE (2026-10-09):** `chain-forge-wallet` crate created; `generate_wallet()` produces ML-DSA-65 (Dilithium3) key pairs via `pqcrypto-dilithium`; private keys encrypted at rest with AES-256-GCM(Argon2id); `sign_transaction()` signs SHA-256(tx_body_json); `SignedTxEnvelope` with `"mldsa65:<hex>"` scheme tag; 10 adversarial tests passing (forge, tamper, replay, wrong-passphrase, overwrite guard); `*.wallet.json` gitignored; `qcb-wallet` CLI binary for generate/address/info/sign-tx/submit. **Remaining:** four-node devnet submission test + protocol-side signature verification wired into execution layer (Task #176).
+**QCB-WALLET-001 — ✅ COMPLETE (2026-10-09):**
+- **Phase A (crate scaffold + ML-DSA keygen):** `chain-forge-wallet` crate created; `generate_wallet()` produces ML-DSA-65 (Dilithium3) key pairs via `pqcrypto-dilithium`; private keys encrypted at rest with AES-256-GCM(Argon2id); `sign_transaction()` signs SHA-256(tx_body_json); `SignedTxEnvelope` with `"mldsa65:<hex>"` scheme tag; 10 adversarial tests passing (forge, tamper, replay, wrong-passphrase, overwrite guard); `*.wallet.json` gitignored; `qcb-wallet` CLI binary for generate/address/info/sign-tx/submit.
+- **Task #176 (protocol-side ML-DSA verification):** `chain-forge-execution` extended with `pq_signatures: Vec<String>` + `pq_public_key: Vec<u8>` fields (both `#[serde(default)]` for backward compat); `verify_mldsa_authorization()` verifies ML-DSA-65 over SHA-256(tx_body_json); `bind_key_if_unbound()` stores 1952-byte ML-DSA-65 public key in `AccountState.public_key` on first verified PQ tx; address namespace `"qcb1pq"` avoids collision with Ed25519 `"qcb1"` addresses; 74/74 execution tests still passing.
+- **Devnet test (Task #176 finality proof):** `scripts/phase1_wallet_test.py` — four scenarios: happy path accepted, forged sig rejected, tampered body rejected, replay rejected; propagation check across Bob/Dave; ephemeral wallet in `/tmp` (no key material in repo).
 
 **Prerequisite:** QCB-CS-001 complete (defines the underlying migration architecture that the wallet must be built on).
 
