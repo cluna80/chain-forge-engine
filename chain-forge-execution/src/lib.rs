@@ -4028,9 +4028,12 @@ impl Executor {
         let mut fees_collected = 0u64;
         let limit              = self.config.block_gas_limit;
 
-        // Track whether an EpochClose succeeded in this block so we can
+        // Track whether an EpochClose tx was present in this block so we can
         // distribute PoCD rewards from the registry afterwards.
-        let mut epoch_close_succeeded: Option<u64> = None;
+        // NOTE: PoCD reward distribution is independent of QRC epoch state —
+        // we trigger on the presence of the EpochClose tx, not its QRC success,
+        // because the QRC epoch may not be open (genesis never sends EpochOpen).
+        let mut epoch_close_seen: Option<u64> = None;
 
         for tx in &transactions {
             let gas_required = self.config.gas_model.calculate_gas(tx);
@@ -4052,28 +4055,22 @@ impl Executor {
                 continue;
             }
 
-            // Capture EpochClose epoch number before executing.
+            // Capture EpochClose epoch number — PoCD rewards fire regardless
+            // of whether the QRC close_epoch() call succeeds.
             if let TxBody::EpochClose { epoch } = &tx.body {
-                let epoch_num = *epoch;
-                let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
-                if result.success {
-                    epoch_close_succeeded = Some(epoch_num);
-                }
-                total_gas      += result.gas_used;
-                fees_collected += result.gas_used;
-                results.push(result);
-            } else {
-                let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
-                total_gas      += result.gas_used;
-                fees_collected += result.gas_used;
-                results.push(result);
+                epoch_close_seen = Some(*epoch);
             }
+            let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
+            total_gas      += result.gas_used;
+            fees_collected += result.gas_used;
+            results.push(result);
         }
 
         // ── PoCD epoch reward distribution ────────────────────────────────────
-        // When an EpochClose tx succeeded and the caller supplied a registry,
+        // When an EpochClose tx was present and the caller supplied a registry,
         // distribute uqcb rewards to each miner's wallet from treasury:pocd.
-        if let (Some(closed_epoch), Some(registry)) = (epoch_close_succeeded, pocd_registry) {
+        // This is independent of QRC epoch state.
+        if let (Some(closed_epoch), Some(registry)) = (epoch_close_seen, pocd_registry) {
             let pending = registry.pending_reward_receipts(0, height);
             if !pending.is_empty() {
                 use chain_forge_qrc::QcbRewardPolicy;
