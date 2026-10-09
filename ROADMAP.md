@@ -714,6 +714,10 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 25. **`RefundQrcForJob` negative-path tests** ✅ **DONE — three-node devnet verified (2026-10-09)** — N6/N7/N8/N9 guards all enforced. Happy path (lock + refund) + 4 adversarial cases passed on Alice/Bob/Carol devnet. `scripts/phase0_negative_refund_test.py` committed. Guards: N6 non-existent escrow, N7 wrong sender (attacker nonce 0 ≠ chain nonce, coordinator tier gate), N8 over-amount refund, N9 double-settlement after release. `RefundReason` enum fix: `"Timeout"` (not `"JobTimeout"`). Live nonce sync (`sync_nonce()`) added before each test case to prevent nonce-mismatch masking guard failures.
 
+26. ~~**PoCD epoch reward distribution bug fix + end-to-end devnet verification**~~ ✅ **DONE (2026-10-09)** — Commit `daf642b` (`chain-forge-execution/src/lib.rs`): renamed `epoch_close_succeeded → epoch_close_seen`; rewards now fire on *presence* of `EpochClose` tx unconditionally (no longer gated on QRC `close_epoch()` result). All three PoCD miners (alice/bob/dave) via `scripts/pocd_miner.py` confirmed running clean on Windows devnet (`failed=0`, ~3.6 kH/s each). At block 720 boundary: `rewarded_receipts: 8,586`, `pending_receipts: 0`. `qcb1devminer-alice` earned `719,996,202 uQCB`; `treasury:pocd` debited by exact same amount from 50,000,000,000 → 49,280,003,798 uQCB. **uQCB** (not QRC) accumulates toward QCB at 1,000,000 uQCB = 1 QCB.
+
+27. **Windows devnet process management** ✅ **DONE (2026-10-09)** — Established pattern: nodes run as foreground VS Code terminals; kill with PowerShell (not Git Bash) `Get-Process chain-forge-node | Stop-Process -Force` directly. Git Bash mangling of `$_` → `\_` in `powershell -Command "..."` confirmed as footgun; always open PowerShell directly for `Get-Process`/`Stop-Process`. Build lock (`Access is denied, os error 5`) clears after killing all node processes.
+
 ---
 
 ## Phase 0d — Proof of Cryptographic Discovery (PoCD) Scaffold
@@ -749,6 +753,8 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 | First live PoCD mining round on devnet | ✅ | `scripts/phase0_pocd_test.py` — mines 4-bit seal, submits proof, verifies receipt; runs against live devnet |
 | `QcbVerifier` adapter | ⬜ | Wraps identity layer + `chain-forge-resource` scientific receipt; Phase 1 |
 | Wire `QcbRewardPolicy` into epoch processing | ✅ | `EpochClose` handler scans `gc_receipt:*` state for unawarded receipts, converts to `DiscoveryReceipt`, calls `QcbRewardPolicy::compute_rewards()`, debits `treasury:pocd`, credits each machine wallet; `gc_reward_paid` sentinel prevents double-payment; non-fatal failure path retries next epoch |
+| **PoCD epoch reward distribution — end-to-end verified on Windows devnet (2026-10-09)** | ✅ | **Bug fix (commit `daf642b`)**: `epoch_close_seen` renamed from `epoch_close_succeeded`; PoCD rewards now fire on *presence* of `EpochClose` tx in block — decoupled from QRC `close_epoch()` success/failure. At block 720 epoch boundary: `rewarded_receipts: 8,586`, `pending_receipts: 0`. Miner wallet `qcb1devminer-alice` balance: `719,996,202 uQCB`. `treasury:pocd` debited from 50,000,000,000 → 49,280,003,798 uQCB (exact match — no double-payment, no leak). **uQCB accumulates toward QCB at 1,000,000 uQCB = 1 QCB**; miners earn uQCB, not QRC. |
+| **`scripts/pocd_miner.py` — PoCD mining client confirmed (2026-10-09)** | ✅ | Python 3.8+ stdlib-only script; `--node alice/bob/dave` targets ports 8080/8081/8082; `HASH_BATCH=4096`, `MAX_SEAL_ATTEMPTS=1,000,000`, `POLL_INTERVAL=15s`; polls `/api/pocd/challenges`, mines SHA256 seals, submits proofs via `/api/pocd/submit`; 3 miners (alice/bob/dave) run clean, `failed=0`, proven hashrate ~3.6 kH/s per miner; >44,000 proofs submitted across the session |
 | Migrate `chain-forge-resource` seal functions to delegate to `chain-forge-pocd` | ⬜ | Remove duplication; `UsefulWorkReceipt` becomes a wrapper |
 
 ---
