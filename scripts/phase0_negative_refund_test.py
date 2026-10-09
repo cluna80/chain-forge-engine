@@ -55,7 +55,7 @@ QRC_PURCHASE     = 10_000_000   # QCB units to swap for uQRC
 COMMIT_TIMEOUT = 30.0
 COMMIT_POLL    = 0.5
 
-_nonce_counter = random.randint(1000, 9999)
+_nonce_counter = 0   # seeded from chain at startup via sync_nonce()
 _run_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
 
 
@@ -85,6 +85,19 @@ def nonce() -> int:
     n = _nonce_counter
     _nonce_counter += 1
     return n
+
+
+def sync_nonce(sender: str = COORDINATOR) -> int:
+    """Fetch the live next nonce for `sender` from Alice and seed _nonce_counter."""
+    global _nonce_counter
+    host, port = ALICE
+    try:
+        data, _ = http_get(host, port, f"/api/accounts/{sender}")
+        live = int(data.get("nonce", data.get("next_nonce", 0)))
+        _nonce_counter = live
+        return live
+    except Exception:
+        return _nonce_counter
 
 
 def rand_id(prefix: str = "") -> str:
@@ -209,6 +222,7 @@ def lock_escrow(agent_id: str, label: str) -> tuple[str, str]:
 def setup() -> str:
     print("\n── Setup ────────────────────────────────────────────────────────")
     agent_id = f"agent-n6789-{_run_id}"
+    sync_nonce(COORDINATOR)
 
     ok = submit_and_wait(tx(
         {"QrcPurchase": {"qcb_amount": QRC_PURCHASE, "min_qrc_out": 0}},
@@ -267,6 +281,7 @@ def setup() -> str:
 def run_happy_path(agent_id: str) -> bool:
     """Happy path: lock → refund (full amount). Treasury must be restored."""
     print("\n── Happy path: lock + refund ─────────────────────────────────────")
+    sync_nonce(COORDINATOR)
     job_id, escrow_id = lock_escrow(agent_id, "happy")
 
     ref = tx({"RefundQrcForJob": {
@@ -285,6 +300,7 @@ def run_happy_path(agent_id: str) -> bool:
 def run_n6_nonexistent_escrow() -> bool:
     """N6: Refund on an escrow_id that was never locked."""
     print("\n── N6: refund on non-existent escrow ────────────────────────────")
+    sync_nonce(COORDINATOR)
     ghost = rand_id("esc-ghost-")
     ref = tx({"RefundQrcForJob": {
         "escrow_id":    ghost,
@@ -309,7 +325,11 @@ def run_n6_nonexistent_escrow() -> bool:
 def run_n7_wrong_sender(agent_id: str) -> bool:
     """N7: Attacker tries to refund an escrow they did not lock."""
     print("\n── N7: wrong sender attempts refund ─────────────────────────────")
+    sync_nonce(COORDINATOR)   # sync before the lock (Alice sends it)
     job_id, escrow_id = lock_escrow(agent_id, "n7")
+    # Attacker tx intentionally uses a random/unsynchronised nonce — they
+    # have never sent a tx and have no valid nonce.  Rejection at either
+    # nonce-mismatch or coordinator-tier gate is the correct outcome.
 
     # Attacker submits the refund
     ref = tx({"RefundQrcForJob": {
@@ -335,6 +355,7 @@ def run_n7_wrong_sender(agent_id: str) -> bool:
 def run_n8_over_amount(agent_id: str) -> bool:
     """N8: Refund amount exceeds escrow balance."""
     print("\n── N8: refund amount exceeds escrow balance ─────────────────────")
+    sync_nonce(COORDINATOR)
     job_id, escrow_id = lock_escrow(agent_id, "n8")
 
     ref = tx({"RefundQrcForJob": {
@@ -364,6 +385,7 @@ def run_n9_release_then_refund(agent_id: str) -> bool:
     the refund must be rejected.  This prevents double settlement.
     """
     print("\n── N9: release then refund same escrow (double-settlement guard) ─")
+    sync_nonce(COORDINATOR)
     job_id, escrow_id = lock_escrow(agent_id, "n9")
 
     # Step 1: release (should succeed)
