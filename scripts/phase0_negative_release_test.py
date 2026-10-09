@@ -72,6 +72,7 @@ def make_lock_tx(sender: str, job_id: str, escrow_id: str, amount: int) -> dict:
     return {
         "id":          rand_id("tx-lock-"),
         "sender":      sender,
+        "nonce":       random.randint(1, 2**32),
         "gas_limit":   10_000,
         "payload": {
             "type":       "LockQrcForJob",
@@ -88,6 +89,7 @@ def make_release_tx(sender: str, job_id: str, escrow_id: str,
     return {
         "id":         rand_id("tx-rel-"),
         "sender":     sender,
+        "nonce":      random.randint(1, 2**32),
         "gas_limit":  10_000,
         "payload": {
             "type":       "ReleaseQrcForJob",
