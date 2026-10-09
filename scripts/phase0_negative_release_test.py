@@ -142,7 +142,8 @@ def submit(payload: dict, label: str = "") -> tuple[dict, int]:
 
 def submit_and_wait(payload: dict, label: str) -> bool:
     data, status = submit(payload, label)
-    if status != 200 or data.get("status") != "ok":
+    accepted = status == 200 and data.get("status") in ("ok", "queued")
+    if not accepted:
         print(f"  ✗ Rejected: {data.get('message', data)}")
         return False
     return wait_for_commit(payload["id"], label)
