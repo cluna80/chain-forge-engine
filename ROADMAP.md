@@ -208,7 +208,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Milestone | Technology | Status |
 |---|---|---|
 | **QCB-CS-001** | Cryptographic Survivability and Migration | ⬜ Phase 1 |
-| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A complete |
+| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B complete |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
 | **QSWIP-001** | Open Post-Quantum Wallet Identity Protocol | 🔲 Proposed standard |
@@ -255,10 +255,20 @@ User opens QCB app → QR challenge displayed
 | Phase | Scope | Status |
 |-------|-------|--------|
 | A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | ✅ Complete |
-| B — Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
+| B — Security hardening (DIS-001 Phase B) | Chain-ID binding in ML-DSA sigs, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality | ✅ Complete |
+| B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to QCB wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
 | E — Security testing | QR replay, phishing, session hijacking, key compromise, identity correlation, account recovery | 🔲 |
+
+**DIS-001 Phase B — ✅ COMPLETE (2026-10-09):**
+- **B4 — Chain-ID binding in ML-DSA signatures:** `verify_mldsa_authorization()` now hashes `SHA-256("chain-forge/pq-tx/v1\n" + chain_id + "\n" + body_json)` — identical construction in both `chain-forge-execution` verifier and `chain-forge-wallet` signer. Cross-chain replay is cryptographically impossible: a valid sig for `qcb-chain-A` cannot be accepted by `qcb-chain-B`. Wallet CLI gains `--chain-id` flag on `sign-tx` and `submit` (default: `qcb-testnet-1`).
+- **B4 unit tests:** `b4_mldsa_correct_chain_id_accepted` + `b4_mldsa_wrong_chain_id_rejected` in `chain-forge-execution/src/lib.rs`; both use `require_signatures: true` executor and `MlDsaScheme.generate_keypair()` for deterministic keys. Both pass.
+- **B1–B3, B5–B6 regression tests:** `scripts/phase1_dis001_phase_b_test.py` — B1 nonce enforcement (duplicate + future nonce rejected), B2 balance enforcement (overdraft rejected), B3 gas cap (zero + absurd gas_limit rejected), B5 malformed tx (garbled JSON + missing fields rejected), B6 Phase A regression (challenge → sign → verify → anti-replay cycle).
+- **B7 — Restart + replay persistence test:** Test in Phase B script SIGKILLs Alice, restarts her from the same `--data-dir`, then replays the original tx (same nonce). The nonce is persisted in `state.json` (AccountState.nonce committed to disk on every block); the replay is rejected post-restart.
+- **B8 — 4-node finality (Carol receives funds):** Phase B script sends uQCB to Carol's address (genesis wallet, no running node) and asserts Alice, Bob, and Dave all report the same updated Carol balance. `tests/devnet/run_4node_devnet.sh` also exercises true 4-node BFT consensus (Alice/Bob/Carol/Dave all running) and is available for extended finality verification.
+- **Wallet test suite: 12/12 tests passing** after chain_id binding update.
+- **Execution test suite: 76/76 non-pre-existing tests passing** (2 pre-existing escrow-settlement failures unrelated to Phase B).
 
 **DIS-001 Phase A — ✅ COMPLETE (2026-10-09):**
 - **`chain-forge-node/src/auth.rs`** (NEW): `AuthChallenge` with 60-second TTL and 32-char hex ID; `ChallengeStore` with anti-replay `consume()` and capacity eviction at 1024 pending challenges; `verify_challenge_signature()` verifies ML-DSA-65 over SHA-256(challenge_json) and derives `"qcb1pq…"` address from double-SHA-256 of public key.

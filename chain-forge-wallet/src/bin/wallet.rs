@@ -11,14 +11,16 @@
 //!   info --wallet <file>
 //!       Print wallet metadata (scheme, address, public key prefix, created_at).
 //!
-//!   sign-tx --wallet <file> --body <json>
+//!   sign-tx --wallet <file> --body <json> [--chain-id <id>]
 //!       Sign a transaction body JSON string. Prints hex signature.
+//!       --chain-id defaults to "qcb-testnet-1" (devnet genesis default).
 //!
 //!   sign-challenge --challenge <json> --path <file> [--passphrase <pass>]
 //!       Sign a DIS-001 auth challenge JSON string. Prints mldsa65:<hex> signature.
 //!
-//!   submit --wallet <file> --body <json> --node <host:port> [--dry-run]
+//!   submit --wallet <file> --body <json> --node <host:port> [--chain-id <id>] [--dry-run]
 //!       Sign and submit a transaction to a QCB node.
+//!       --chain-id defaults to "qcb-testnet-1" (devnet genesis default).
 //!
 //! Environment variable: QCB_WALLET_PASSPHRASE — bypasses interactive prompt
 //! (useful for scripts and tests; keep secrets out of shell history).
@@ -35,9 +37,9 @@ fn usage() -> ! {
     eprintln!("  qcb-wallet generate   --path <file> [--name <label>] [--passphrase <pass>]");
     eprintln!("  qcb-wallet address    --wallet <file>");
     eprintln!("  qcb-wallet info       --wallet <file>");
-    eprintln!("  qcb-wallet sign-tx    --wallet <file> --body <json>");
+    eprintln!("  qcb-wallet sign-tx    --wallet <file> --body <json> [--chain-id <id>]");
     eprintln!("  qcb-wallet sign-challenge --challenge <json> --path <file> [--passphrase <pass>]");
-    eprintln!("  qcb-wallet submit     --wallet <file> --body <json> --node <host:port> [--dry-run]");
+    eprintln!("  qcb-wallet submit     --wallet <file> --body <json> --node <host:port> [--chain-id <id>] [--dry-run]");
     eprintln!();
     eprintln!("Set QCB_WALLET_PASSPHRASE env var to skip the passphrase prompt.");
     std::process::exit(2);
@@ -151,14 +153,16 @@ fn cmd_info(args: &[String]) {
 }
 
 fn cmd_sign_tx(args: &[String]) {
-    let mut wallet: Option<String> = None;
-    let mut body:   Option<String> = None;
+    let mut wallet:   Option<String> = None;
+    let mut body:     Option<String> = None;
+    let mut chain_id: String         = "qcb-testnet-1".to_string();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--wallet" => { i += 1; wallet = args.get(i).cloned(); }
-            "--body"   => { i += 1; body   = args.get(i).cloned(); }
+            "--wallet"   => { i += 1; wallet   = args.get(i).cloned(); }
+            "--body"     => { i += 1; body     = args.get(i).cloned(); }
+            "--chain-id" => { i += 1; if let Some(c) = args.get(i) { chain_id = c.clone(); } }
             other => { eprintln!("unknown flag: {other}"); usage(); }
         }
         i += 1;
@@ -173,7 +177,7 @@ fn cmd_sign_tx(args: &[String]) {
         std::process::exit(1);
     });
 
-    match sign_transaction(&body, &kp) {
+    match sign_transaction(&body, &chain_id, &kp) {
         Ok(sig_hex) => {
             println!("mldsa65:{sig_hex}");
         }
@@ -219,18 +223,20 @@ fn cmd_sign_challenge(args: &[String]) {
 }
 
 fn cmd_submit(args: &[String]) {
-    let mut wallet:  Option<String> = None;
-    let mut body:    Option<String> = None;
-    let mut node:    Option<String> = None;
+    let mut wallet:   Option<String> = None;
+    let mut body:     Option<String> = None;
+    let mut node:     Option<String> = None;
+    let mut chain_id: String         = "qcb-testnet-1".to_string();
     let mut dry_run = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--wallet"  => { i += 1; wallet  = args.get(i).cloned(); }
-            "--body"    => { i += 1; body    = args.get(i).cloned(); }
-            "--node"    => { i += 1; node    = args.get(i).cloned(); }
-            "--dry-run" => { dry_run = true; }
+            "--wallet"   => { i += 1; wallet   = args.get(i).cloned(); }
+            "--body"     => { i += 1; body     = args.get(i).cloned(); }
+            "--node"     => { i += 1; node     = args.get(i).cloned(); }
+            "--chain-id" => { i += 1; if let Some(c) = args.get(i) { chain_id = c.clone(); } }
+            "--dry-run"  => { dry_run = true; }
             other => { eprintln!("unknown flag: {other}"); usage(); }
         }
         i += 1;
@@ -251,8 +257,8 @@ fn cmd_submit(args: &[String]) {
         std::process::exit(1);
     });
 
-    // Sign the body
-    let sig_hex = sign_transaction(&body, &kp).unwrap_or_else(|e| {
+    // Sign the body (chain_id is bound into the signature — B4)
+    let sig_hex = sign_transaction(&body, &chain_id, &kp).unwrap_or_else(|e| {
         eprintln!("signing failed: {e}");
         std::process::exit(1);
     });

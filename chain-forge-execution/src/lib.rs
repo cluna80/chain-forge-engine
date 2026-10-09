@@ -867,8 +867,9 @@ pub struct Transaction {
     /// `"mldsa65:<3293-byte-sig-hex>"`.  Empty for unsigned or Ed25519-only txs.
     ///
     /// When present the executor verifies the ML-DSA signature over
-    /// SHA-256(serde_json::to_string(&self.body)).  This matches the signing
-    /// path in chain-forge-wallet::sign_transaction() exactly.
+    /// SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || body_json).
+    /// This matches the signing path in chain-forge-wallet::sign_transaction()
+    /// exactly, and binds the signature to the specific chain (B4).
     ///
     /// The `mldsa65:` tag is the only one enforced today; unknown tags are
     /// ignored (forward-compatibility).
@@ -1666,15 +1667,19 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
 
 /// Verify an ML-DSA-65 signature on a transaction.
 ///
-/// Signing message: SHA-256(serde_json::to_string(&tx.body))
-/// This matches chain-forge-wallet::sign_transaction() exactly.
+/// Signing message (B4 chain-ID binding):
+///   SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || canonical_body_json)
+///
+/// This domain-separated construction binds the signature to the specific chain,
+/// preventing cross-chain replay attacks.  It matches chain-forge-wallet::sign_transaction()
+/// exactly (wallet must pass the same chain_id used at signing time).
 ///
 /// Key lookup order:
 ///   1. Sender's account has a bound key → use it.
 ///   2. No bound key yet → use tx.pq_public_key (first-use registration).
 ///      The executor will bind this key via bind_pq_key_if_unbound() on success.
 fn verify_mldsa_authorization(
-    _config:  &ExecutionConfig,
+    config:   &ExecutionConfig,
     tx:       &Transaction,
     state:    &StateStore,
     sig_hex:  &str,
@@ -1686,10 +1691,14 @@ fn verify_mldsa_authorization(
     let sig_bytes = hex_decode_str(sig_hex)
         .map_err(|e| format!("mldsa65 signature hex decode failed: {e}"))?;
 
-    // Compute signing message = SHA-256(canonical body JSON)
+    // Compute signing message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || body_json)
+    // This domain separator binds the signature to this specific chain (B4).
     let body_json = serde_json::to_string(&tx.body)
         .map_err(|e| format!("cannot serialise tx.body for ML-DSA verification: {e}"))?;
     let mut hasher = Sha256::new();
+    hasher.update(b"chain-forge/pq-tx/v1\n");
+    hasher.update(config.chain_id.as_bytes());
+    hasher.update(b"\n");
     hasher.update(body_json.as_bytes());
     let message: [u8; 32] = hasher.finalize().into();
 
@@ -5906,6 +5915,130 @@ mod tests {
         assert!(
             err.contains("Verified") || err.contains("coordinator"),
             "error must mention Verified tier; got: {err}"
+        );
+    }
+
+    // ── B4: Chain-ID enforcement in ML-DSA signing path ──────────────────────
+    //
+    // chain-forge-execution always links chain-forge-crypto with real-pqc,
+    // so ML-DSA is always the real implementation here.  These tests verify
+    // that the execution layer binds chain_id into the ML-DSA signing message
+    // (DIS-001 Phase B, criterion B4).
+
+    /// Build a signed PQ transaction for testing.
+    ///
+    /// Constructs a TxBody::Transfer, serialises it to get the canonical JSON
+    /// that verify_mldsa_authorization will also produce, then signs over
+    /// SHA-256("chain-forge/pq-tx/v1\n{chain_id}\n{canonical_body_json}")
+    /// using ML-DSA-65 (same construction as chain-forge-wallet::sign_transaction).
+    ///
+    /// The public key is returned separately and placed in tx.pq_public_key
+    /// for first-use key registration (no pre-bound key in state needed).
+    fn make_pq_tx_with_chain(
+        chain_id: &str,
+        sender:   &str,
+        nonce:    u64,
+        seed:     &str,
+    ) -> (Transaction, Vec<u8>) {
+        use sha2::{Sha256, Digest};
+
+        let kp = MlDsaScheme.generate_keypair(seed).expect("ML-DSA keygen");
+        let pk = kp.public_key.clone();
+
+        // Build canonical body and serialise exactly as the executor will.
+        let body = TxBody::Transfer {
+            to:     "qcb1recv".to_string(),
+            denom:  "uqcb".to_string(),
+            amount: 100,
+        };
+        let body_json = serde_json::to_string(&body).expect("body serialise");
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"chain-forge/pq-tx/v1\n");
+        hasher.update(chain_id.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(body_json.as_bytes());
+        let message: [u8; 32] = hasher.finalize().into();
+
+        let sig = MlDsaScheme.sign(&message, &kp).expect("ML-DSA sign");
+        let sig_hex = sig.bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+        let tx = Transaction {
+            id:            format!("b4-tx-{nonce}"),
+            sender:        sender.to_string(),
+            nonce,
+            body,
+            gas_limit:     500_000,
+            signature:     vec![],
+            public_key:    vec![],
+            pq_signatures: vec![format!("mldsa65:{sig_hex}")],
+            pq_public_key: pk.clone(),
+        };
+        (tx, pk)
+    }
+
+    /// Set up an executor with require_signatures = true and a funded sender account.
+    ///
+    /// The sender's account has no pre-bound PQ key; the executor will accept
+    /// tx.pq_public_key for first-use registration (documented in verify_mldsa_authorization).
+    fn setup_signed(chain_id: &str, sender: &str) -> (Executor, StateStore) {
+        let genesis_json = format!(r#"{{
+            "chain_id": "{chain_id}",
+            "chain_name": "B4 test chain",
+            "engine_version": "0.1.0",
+            "genesis_time": "2026-10-09T00:00:00Z",
+            "environment": {{ "mode": "devnet", "faucet_enabled": true, "relaxed_limits": true }},
+            "native_token": {{ "name": "QC", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" }},
+            "address_prefix": "qcb",
+            "consensus": {{ "type": "proof-of-stake", "validator_set_size": 3, "block_time_ms": 500 }},
+            "execution": {{ "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": true }},
+            "cryptography": {{ "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "classical-ed25519" }},
+            "network": {{ "network_id": "b4-net", "p2p_port": 27000, "rpc_port": 27001, "bootstrap_nodes": [], "peer_discovery": "bootstrap", "max_peers": 10 }},
+            "limits": {{ "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 }},
+            "modules": ["bank"],
+            "custom_modules": [],
+            "genesis_accounts": [
+                {{ "label": "sender", "address": "{sender}", "balance": "5000000", "role": "user" }},
+                {{ "label": "recv",   "address": "qcb1recv",  "balance": "0",       "role": "user" }}
+            ]
+        }}"#);
+
+        let genesis = GenesisConfig::from_json(&genesis_json).expect("B4 genesis");
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+
+        (Executor::new(config), state)
+    }
+
+    /// B4 — Correct chain_id: signed TX must be accepted.
+    #[test]
+    fn b4_mldsa_correct_chain_id_accepted() {
+        const CHAIN: &str = "qcb-b4-test";
+        let (tx, _pk) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "b4-alice-seed");
+        let (exec, mut state) = setup_signed(CHAIN, "qcb1sender");
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(r.success,
+            "valid ML-DSA tx with correct chain_id must be accepted; error: {:?}", r.error);
+    }
+
+    /// B4 — Wrong chain_id: the same signature submitted to a different chain must fail.
+    #[test]
+    fn b4_mldsa_wrong_chain_id_rejected() {
+        const SIGNING_CHAIN: &str = "qcb-chain-A";
+        const WRONG_CHAIN:   &str = "qcb-chain-B";  // attacker submits to a different chain
+
+        // TX signed for chain A …
+        let (tx, _pk) = make_pq_tx_with_chain(SIGNING_CHAIN, "qcb1sender", 0, "b4-bob-seed");
+        // … but verified against chain B's executor (cross-chain replay attack)
+        let (exec, mut state) = setup_signed(WRONG_CHAIN, "qcb1sender");
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success,
+            "ML-DSA tx signed for chain '{SIGNING_CHAIN}' must be rejected on chain '{WRONG_CHAIN}'");
+        let err = r.error.unwrap_or_default();
+        assert!(
+            err.contains("ML-DSA") || err.contains("signature") || err.contains("verif"),
+            "error must indicate signature failure; got: {err}"
         );
     }
 }

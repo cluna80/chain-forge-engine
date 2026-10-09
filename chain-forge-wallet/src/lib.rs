@@ -4,7 +4,7 @@
 //!
 //!   1. ML-DSA-65 key generation (NIST FIPS 204 / CRYSTALS-Dilithium3)
 //!   2. Encrypted key file: AES-256-GCM(Argon2id(passphrase))
-//!   3. Transaction signing: SHA-256(tx_body_json) → ML-DSA signature
+//!   3. Transaction signing: SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || body_json) → ML-DSA signature
 //!   4. Devnet submission: POST /api/tx with signature bytes
 //!   5. Adversarial verification: forge / tamper / replay rejection
 //!
@@ -260,16 +260,28 @@ pub fn load_wallet(path: &str, passphrase: &str) -> WalletResult<(WalletKeyFile,
 
 /// Sign a transaction body JSON string with an ML-DSA key pair.
 ///
-/// The signing message is SHA-256(tx_body_json_bytes).
-/// This is the canonical QCB-WALLET-001 signing path.
+/// The signing message (B4 chain-ID binding) is:
+///   SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || tx_body_json)
+///
+/// This domain-separated construction binds the signature to the specific chain,
+/// preventing cross-chain replay attacks.  The verifier in chain-forge-execution
+/// uses the identical construction.
+///
+/// # Arguments
+/// * `tx_body_json` — canonical JSON of the transaction body
+/// * `chain_id`     — chain identifier from genesis (e.g. `"testchain"`)
+/// * `kp`           — ML-DSA-65 key pair
 ///
 /// # Returns
 /// Hex-encoded ML-DSA-65 detached signature (3293 bytes).
-pub fn sign_transaction(tx_body_json: &str, kp: &KeyPair) -> WalletResult<String> {
+pub fn sign_transaction(tx_body_json: &str, chain_id: &str, kp: &KeyPair) -> WalletResult<String> {
     use sha2::{Sha256, Digest};
 
-    // Message = SHA-256(tx_body_json bytes)
+    // Message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || tx_body_json)
     let mut hasher = Sha256::new();
+    hasher.update(b"chain-forge/pq-tx/v1\n");
+    hasher.update(chain_id.as_bytes());
+    hasher.update(b"\n");
     hasher.update(tx_body_json.as_bytes());
     let message: [u8; 32] = hasher.finalize().into();
 
@@ -314,17 +326,23 @@ pub fn sign_challenge(challenge_json: &str, kp: &KeyPair) -> WalletResult<String
 ///
 /// # Arguments
 /// * `tx_body_json` — the transaction body JSON that was signed
+/// * `chain_id`     — chain identifier from genesis (e.g. `"testchain"`)
 /// * `sig_hex`      — hex-encoded ML-DSA-65 signature
 /// * `public_key`   — ML-DSA-65 public key bytes
 pub fn verify_transaction(
     tx_body_json: &str,
+    chain_id:     &str,
     sig_hex:      &str,
     public_key:   &[u8],
 ) -> WalletResult<()> {
     use sha2::{Sha256, Digest};
     use chain_forge_crypto::Signature;
 
+    // Message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || tx_body_json)
     let mut hasher = Sha256::new();
+    hasher.update(b"chain-forge/pq-tx/v1\n");
+    hasher.update(chain_id.as_bytes());
+    hasher.update(b"\n");
     hasher.update(tx_body_json.as_bytes());
     let message: [u8; 32] = hasher.finalize().into();
 
@@ -357,11 +375,14 @@ pub struct SignedTxEnvelope {
 
 impl SignedTxEnvelope {
     /// Build a signed transfer transaction (for devnet testing).
+    ///
+    /// `chain_id` must match the genesis chain identifier used by the target node.
     pub fn transfer(
         sender:    &str,
         to:        &str,
         amount:    u64,
         denom:     &str,
+        chain_id:  &str,
         kp:        &KeyPair,
     ) -> WalletResult<Self> {
         let body = serde_json::json!({
@@ -371,7 +392,7 @@ impl SignedTxEnvelope {
             "denom":  denom,
         });
         let body_json = serde_json::to_string(&body)?;
-        let sig_hex = sign_transaction(&body_json, kp)?;
+        let sig_hex = sign_transaction(&body_json, chain_id, kp)?;
         let nonce = unix_now_millis();
 
         Ok(Self {
@@ -531,11 +552,11 @@ mod tests {
         let (_kf, kp) = load_wallet(&path, "pass123").unwrap();
 
         let tx_body = r#"{"type":"Transfer","to":"qcb1bob","amount":1000,"denom":"uqrc"}"#;
-        let sig_hex = sign_transaction(tx_body, &kp).unwrap();
+        let sig_hex = sign_transaction(tx_body, "testchain", &kp).unwrap();
         let pub_key = hex_decode(&kf.public_key).unwrap();
 
         // Correct verification must succeed
-        assert!(verify_transaction(tx_body, &sig_hex, &pub_key).is_ok(),
+        assert!(verify_transaction(tx_body, "testchain", &sig_hex, &pub_key).is_ok(),
             "valid signature must verify");
 
         cleanup(&path);
@@ -559,10 +580,10 @@ mod tests {
 
         let tx_body = r#"{"type":"Transfer","to":"qcb1eve","amount":9999,"denom":"uqrc"}"#;
         // Eve signs with her own key — verify against Alice's public key
-        let eve_sig = sign_transaction(tx_body, &kp2).unwrap();
+        let eve_sig = sign_transaction(tx_body, "testchain", &kp2).unwrap();
         let alice_pk = hex_decode(&kf1.public_key).unwrap();
 
-        assert!(verify_transaction(tx_body, &eve_sig, &alice_pk).is_err(),
+        assert!(verify_transaction(tx_body, "testchain", &eve_sig, &alice_pk).is_err(),
             "signature from wrong key must be rejected");
 
         cleanup(&path);
@@ -581,11 +602,11 @@ mod tests {
 
         let original_tx = r#"{"type":"Transfer","to":"qcb1bob","amount":100,"denom":"uqrc"}"#;
         let tampered_tx = r#"{"type":"Transfer","to":"qcb1eve","amount":100,"denom":"uqrc"}"#;
-        let sig_hex = sign_transaction(original_tx, &kp).unwrap();
+        let sig_hex = sign_transaction(original_tx, "testchain", &kp).unwrap();
         let pub_key = hex_decode(&kf.public_key).unwrap();
 
         // Signature of original must not verify against tampered message
-        assert!(verify_transaction(tampered_tx, &sig_hex, &pub_key).is_err(),
+        assert!(verify_transaction(tampered_tx, "testchain", &sig_hex, &pub_key).is_err(),
             "tampered tx body must fail signature verification");
 
         cleanup(&path);
@@ -604,12 +625,12 @@ mod tests {
 
         // Sign tx with nonce=1
         let tx_n1 = r#"{"type":"Transfer","nonce":1,"to":"qcb1bob","amount":100,"denom":"uqrc"}"#;
-        let sig_n1 = sign_transaction(tx_n1, &kp).unwrap();
-        assert!(verify_transaction(tx_n1, &sig_n1, &pub_key).is_ok());
+        let sig_n1 = sign_transaction(tx_n1, "testchain", &kp).unwrap();
+        assert!(verify_transaction(tx_n1, "testchain", &sig_n1, &pub_key).is_ok());
 
         // Replay: try to use nonce=1 signature for nonce=2 tx
         let tx_n2 = r#"{"type":"Transfer","nonce":2,"to":"qcb1bob","amount":100,"denom":"uqrc"}"#;
-        assert!(verify_transaction(tx_n2, &sig_n1, &pub_key).is_err(),
+        assert!(verify_transaction(tx_n2, "testchain", &sig_n1, &pub_key).is_err(),
             "signature from nonce=1 tx must not verify against nonce=2 tx");
 
         cleanup(&path);
@@ -652,7 +673,7 @@ mod tests {
         let (_kf, kp) = load_wallet(&path, "passphrase").unwrap();
 
         let env = SignedTxEnvelope::transfer(
-            &kf.address, "qcb1bob", 500, "uqrc", &kp
+            &kf.address, "qcb1bob", 500, "uqrc", "testchain", &kp
         ).unwrap();
 
         assert_eq!(env.sender, kf.address);
@@ -664,7 +685,7 @@ mod tests {
         let body_json = serde_json::to_string(&env.body).unwrap();
         let sig_hex = env.signature[0].strip_prefix("mldsa65:").unwrap();
         let pub_key = hex_decode(&kf.public_key).unwrap();
-        assert!(verify_transaction(&body_json, sig_hex, &pub_key).is_ok(),
+        assert!(verify_transaction(&body_json, "testchain", sig_hex, &pub_key).is_ok(),
             "envelope signature must be valid");
 
         cleanup(&path);
