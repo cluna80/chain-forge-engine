@@ -200,8 +200,18 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 > These are **Chain Forge modules** first — reusable by any sovereign chain built on Chain Forge. QCB is the first chain to enable and adversarially test them, exactly as with PoCD. Future chains can adopt cryptographic-agility and key-lifecycle capabilities independently of QCB's QRC economy or personhood rules.
 >
-> **Implementation order:** QCB-CS-001 first (defines the migration architecture); QCB-KR-001 implements account-level and multisig key management against that architecture.  
-> **Completion rule:** Neither milestone is ✅ until implementation **and** adversarial tests pass.
+> **Implementation order:** QCB-CS-001 first (defines the migration architecture); QCB-DIS-001 Phase A builds the wallet on top of that architecture; QCB-KR-001 implements account-level and multisig key management; QCB-PM-001 adds zero-knowledge identity privacy as a separate research layer.  
+> **Completion rule:** No milestone is ✅ until implementation **and** adversarial tests pass.
+
+**Post-Quantum Security Roadmap summary:**
+
+| Milestone | Technology | Status |
+|---|---|---|
+| **QCB-CS-001** | Cryptographic Survivability and Migration | ⬜ Phase 1 |
+| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ⬜ Phase 1 |
+| **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
+| **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
+| **QSWIP-001** | Open Post-Quantum Wallet Identity Protocol | 🔲 Proposed standard |
 
 #### QCB-CS-001 — Cryptographic Survivability and Migration
 
@@ -217,6 +227,55 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Emergency algorithm-deprecation mechanism | ⬜ | Governance tx to flag an algorithm as deprecated; grace period for key rotation; hard cutoff enforcement in consensus |
 | Simulated cryptographic compromise tests | ⬜ | Deliberately treat one scheme as "broken"; verify network migrates cleanly under simulated adversarial conditions |
 | Independent security review | 🔲 | Prerequisite: all above items pass; external review before mainnet |
+
+#### QCB-DIS-001 — Digital Identity Stone (QCB Native Wallet)
+
+*Goal: A scannable, post-quantum authentication protocol that lets users access QCB services without exposing private keys. The QR code is the doorway, not the key.*
+
+**Core architectural principles:**
+1. Private keys never leave the wallet — transactions are signed locally using ML-DSA.
+2. Scannable authentication — temporary QR challenges provide secure access without exposing signing secrets.
+3. Privacy-preserving identity — applications receive only the authorization or identity information they require.
+4. Post-quantum multisig — multiple owners can securely authorize treasury operations.
+5. Cryptographic adaptability — QCB can migrate to new algorithms if existing cryptography becomes vulnerable.
+6. Network-wide security — post-quantum protections extend beyond wallets to validators and other critical authorization paths.
+7. Open-standard ambitions — QSWIP can eventually provide reusable security specifications for other Chain Forge chains.
+
+**Authentication flow:**
+```
+User opens QCB app → QR challenge displayed
+  → User scans with QCB wallet on phone
+  → Wallet signs challenge using ML-DSA
+  → Service verifies signature → grants access
+  (Private key never leaves device; QR expires after use)
+```
+
+**Privacy guarantee** (plain ML-DSA limitation noted): ordinary ML-DSA signatures do not automatically hide the signing public key. If a service must learn only that *a* valid identity authorized a request — without identifying *which* identity — a zero-knowledge credential layer is required. That is QCB-PM-001.
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | ⬜ |
+| B — Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
+| C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
+| D — Integration | Connect to QCB wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
+| E — Security testing | QR replay, phishing, session hijacking, key compromise, identity correlation, account recovery | 🔲 |
+
+**First wallet objective — QCB-WALLET-001 (Four-Node PQ Transaction Test):** Build a native Rust wallet that generates and securely stores an ML-DSA key pair; signs a QCB transaction locally; submits only the signed transaction through `/api/tx`; has its signature verified by the protocol; achieves finality across Alice, Bob, Carol, and Dave; and rejects forged, modified, or replayed transactions.
+
+**Prerequisite:** QCB-CS-001 complete (defines the underlying migration architecture that the wallet must be built on).
+
+> **QSWIP-001 — Open Post-Quantum Wallet Identity Protocol**: Long-term open standard so other Chain Forge blockchains can reuse QCB's wallet identity and authentication infrastructure. Proposed; timing deferred until Phase B–D of QCB-DIS-001 is battle-tested.
+
+#### QCB-PM-001 — Private Post-Quantum Threshold Authorization
+
+*Goal: Allow QCB identity holders to prove they are authorized — without revealing which identity they hold — using zero-knowledge or threshold credential mechanisms.*
+
+| Item | Status | Notes |
+|---|---|---|
+| ZK credential research | ❓ | Research milestone; no implementation commitment yet |
+| Selective disclosure design | ❓ | What attributes a service may learn; what remains hidden |
+| Service-specific pseudonyms | 🔲 | Different credential per service; unlinkable across services |
+| Integration with QCB-DIS-001 Phase B | 🔲 | ZK layer added on top of Phase A authentication |
 
 #### QCB-KR-001 — Post-Quantum Multisig Key Lifecycle
 
