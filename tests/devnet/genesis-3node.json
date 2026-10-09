@@ -91,5 +91,53 @@
       "_comment": "Carol is not a validator in this genesis \u2014 she's an observer/provider wallet only"
     }
   ],
-  "attestation_coordinator": "qcb1alice"
+  "attestation_coordinator": "qcb1alice",
+  "pocd": {
+    "enabled": true,
+    "chain_id": "qcb-devnet-3node",
+    "challenge_tracks": [
+      "Mathematics",
+      "Cryptography",
+      "ComputationalEfficiency",
+      "PhysicsAndOpenScience"
+    ],
+    "reward_epoch_blocks": 720,
+    "require_verified_identity": false,
+    "min_seal_difficulty_bits": 4
+  },
+  "genesis_challenges": [
+    {
+      "challenge_id": "qcb-devnet-3node::Mathematics::devnet-pilot-1",
+      "chain_id": "qcb-devnet-3node",
+      "track": "Mathematics",
+      "name": "Devnet Pilot — Integer Sequence Search",
+      "verification_criteria": "Find next term in OEIS A000045 (Fibonacci) beyond index 100; submit SHA256 of decimal representation as output_hash.",
+      "seal_difficulty_bits": 4,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-3node::Cryptography::devnet-crypto-1",
+      "chain_id": "qcb-devnet-3node",
+      "track": "Cryptography",
+      "name": "Devnet Crypto — Hash Pre-image Search",
+      "verification_criteria": "Find an input x such that SHA256(x) starts with 0000; submit SHA256(x) as output_hash.",
+      "seal_difficulty_bits": 4,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-3node::ComputationalEfficiency::devnet-perf-1",
+      "chain_id": "qcb-devnet-3node",
+      "track": "ComputationalEfficiency",
+      "name": "Devnet Perf — Matrix Multiply Benchmark",
+      "verification_criteria": "Run 1024x1024 double-precision matrix multiply; submit SHA256 of result checksum as output_hash.",
+      "seal_difficulty_bits": 4,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    }
+  ]
 }

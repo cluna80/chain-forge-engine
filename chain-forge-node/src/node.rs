@@ -771,7 +771,33 @@ impl Node {
                             min_difficulty = cfg.min_seal_difficulty_bits,
                             "PoCD enabled from genesis"
                         );
-                        let reg = Arc::new(Mutex::new(DiscoveryRegistry::new()));
+                        let mut reg = DiscoveryRegistry::new();
+
+                        // Seed genesis_challenges into the registry so they are
+                        // immediately active when the node starts.  The field is
+                        // stored as raw JSON in GenesisConfig (same as `pocd`)
+                        // so we deserialize it here in the node crate.
+                        if let Some(raw_challenges) = &genesis.genesis_challenges {
+                            match serde_json::from_value::<Vec<chain_forge_pocd::DiscoveryChallenge>>(
+                                raw_challenges.clone(),
+                            ) {
+                                Ok(challenges) => {
+                                    let n = challenges.len();
+                                    for ch in challenges {
+                                        let id = ch.challenge_id.clone();
+                                        if let Err(e) = reg.add_challenge(ch) {
+                                            warn!(challenge_id = %id, error = %e, "skipping duplicate genesis challenge");
+                                        }
+                                    }
+                                    info!(count = n, "seeded genesis PoCD challenges");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "genesis_challenges present but failed to parse — no challenges seeded");
+                                }
+                            }
+                        }
+
+                        let reg = Arc::new(Mutex::new(reg));
                         (Some(cfg), Some(reg))
                     }
                     Err(e) => {

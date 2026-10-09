@@ -252,6 +252,29 @@ pub struct GenesisConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pocd: Option<serde_json::Value>,
+
+    /// Optional list of PoCD challenges to activate immediately at genesis.
+    ///
+    /// Stored as raw JSON so `chain-forge-core` does not depend on
+    /// `chain-forge-pocd`.  The node crate deserializes this into
+    /// `Vec<chain_forge_pocd::DiscoveryChallenge>` at startup.
+    ///
+    /// Example entry:
+    /// ```json
+    /// {
+    ///   "challenge_id": "qcb-devnet-3node::Mathematics::pilot-1",
+    ///   "chain_id": "qcb-devnet-3node",
+    ///   "track": "Mathematics",
+    ///   "name": "Pilot challenge",
+    ///   "verification_criteria": "...",
+    ///   "seal_difficulty_bits": 4,
+    ///   "search_space_size": null,
+    ///   "activated_at_block": null,
+    ///   "status": "Active"
+    /// }
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_challenges: Option<serde_json::Value>,
 }
 
 // -- Modules ----------------------------------------------------------------------
