@@ -627,7 +627,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 23. **4-node test with Carol (Machine 2)** ⬜ — Drop `--skip-carol` flag; run full 4-node acceptance test with Carol participating in consensus and state verification.
 
-24. **`ReleaseQrcForJob` negative-path tests** ⬜ — N3: release from wrong sender; N4: release amount > escrow balance; N5: release on non-existent escrow.
+24. **`ReleaseQrcForJob` negative-path tests** ✅ **DONE — three-node devnet verified (2026-10-09)** — N3/N4/N5 guards all enforced. Happy path + 3 adversarial cases passed on Alice/Bob/Carol devnet. `scripts/phase0_negative_release_test.py` committed. Escrow role encodes authorized coordinator (`escrow:authorized={sender}`); wrong sender, over-amount, and ghost escrow all correctly rejected.
 
 ---
 
