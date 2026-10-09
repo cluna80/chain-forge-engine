@@ -625,7 +625,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 22. **`ReleaseQrcForJob` + `RefundQrcForJob` happy-path tests** ✅ **DONE — three-node devnet verified (2026-10-08)** — Run `20eee23f`: 10 transactions checked on Alice, Bob, Dave. Release debited escrow and credited provider; refund restored original treasury; repeated full payouts rejected without balance changes. `scripts/phase0_settlement_test.py` committed. Carol node validation remains item 23; scientific receipt verification is separate.
 
-23. **4-node test with Carol (Machine 2)** ⬜ — Drop `--skip-carol` flag; run full 4-node acceptance test with Carol participating in consensus and state verification.
+23. **4-node test with Dave (Machine 2)** ✅ **DONE — cross-machine 4-node devnet verified (2026-10-09)** — Machine 1 (192.168.137.2): Alice :26656, Bob :26657, Carol :26658. Machine 2 (192.168.137.3): Dave :26659. Dave synced from genesis, reached height 111+, `precommit_count=3` (BFT quorum of 4). Full N3/N4/N5 negative release test suite passed on 4-node chain. `genesis-4node.json` committed with all 4 classical-ed25519 validator keys.
 
 24. **`ReleaseQrcForJob` negative-path tests** ✅ **DONE — three-node devnet verified (2026-10-09)** — N3/N4/N5 guards all enforced. Happy path + 3 adversarial cases passed on Alice/Bob/Carol devnet. `scripts/phase0_negative_release_test.py` committed. Escrow role encodes authorized coordinator (`escrow:authorized={sender}`); wrong sender, over-amount, and ghost escrow all correctly rejected.
 
