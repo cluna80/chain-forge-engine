@@ -274,7 +274,7 @@ def run_happy_path(agent_id: str) -> bool:
         "job_id":       job_id,
         "agent_wallet": COORDINATOR,
         "amount":       REFUND_AMOUNT,
-        "reason":       "JobTimeout",
+        "reason":       "Timeout",
     }}, tx_id=rand_id("tx-ref-happy-"))
     if not submit_and_wait(ref, "RefundQrcForJob"):
         print("  ✗ Refund failed"); return False
@@ -291,7 +291,7 @@ def run_n6_nonexistent_escrow() -> bool:
         "job_id":       rand_id("job-"),
         "agent_wallet": COORDINATOR,
         "amount":       REFUND_AMOUNT,
-        "reason":       "JobTimeout",
+        "reason":       "Timeout",
     }}, tx_id=rand_id("tx-n6-"))
     data, status = submit(ref, "RefundQrcForJob N6")
     if data.get("status") in ("ok", "queued"):
@@ -317,7 +317,7 @@ def run_n7_wrong_sender(agent_id: str) -> bool:
         "job_id":       job_id,
         "agent_wallet": ATTACKER,
         "amount":       REFUND_AMOUNT,
-        "reason":       "JobTimeout",
+        "reason":       "Timeout",
     }}, sender=ATTACKER, tx_id=rand_id("tx-n7-"))
     data, status = submit(ref, "RefundQrcForJob N7")
     if data.get("status") in ("ok", "queued"):
@@ -342,7 +342,7 @@ def run_n8_over_amount(agent_id: str) -> bool:
         "job_id":       job_id,
         "agent_wallet": COORDINATOR,
         "amount":       OVER_AMOUNT,   # LOCK_AMOUNT + 1
-        "reason":       "JobTimeout",
+        "reason":       "Timeout",
     }}, tx_id=rand_id("tx-n8-"))
     data, status = submit(ref, "RefundQrcForJob N8")
     if data.get("status") in ("ok", "queued"):
@@ -385,7 +385,7 @@ def run_n9_release_then_refund(agent_id: str) -> bool:
         "job_id":       job_id,
         "agent_wallet": COORDINATOR,
         "amount":       LOCK_AMOUNT,
-        "reason":       "JobTimeout",
+        "reason":       "Timeout",
     }}, tx_id=rand_id("tx-n9-ref-"))
     data, status = submit(ref, "RefundQrcForJob N9")
     if data.get("status") in ("ok", "queued"):
