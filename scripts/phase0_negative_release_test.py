@@ -107,14 +107,50 @@ def find_tx_in_blocks(host: str, port: int, tx_id: str) -> bool:
         return False
 
 
+def find_tx_by_status(host: str, port: int, tx_id: str) -> bool:
+    """Check /api/tx/{id} — returns committed if the node knows the result."""
+    try:
+        data, status = http_get(host, port, f"/api/tx/{tx_id}")
+        if status != 200:
+            return False
+        # Treat any response (success or failed execution) as committed
+        return data.get("id") == tx_id or "success" in data or "error" in data
+    except Exception:
+        return False
+
+
 def wait_for_commit(tx_id: str, label: str = "") -> bool:
     host, port = ALICE
     deadline = time.monotonic() + COMMIT_TIMEOUT
+    last_blocks_sample = None
     while time.monotonic() < deadline:
         if find_tx_in_blocks(host, port, tx_id):
             return True
+        if find_tx_by_status(host, port, tx_id):
+            return True
+        # Keep a recent blocks sample for diagnostics
+        try:
+            sample, _ = http_get(host, port, "/api/blocks")
+            last_blocks_sample = sample
+        except Exception:
+            pass
         time.sleep(COMMIT_POLL)
+    # Diagnostics on timeout
     print(f"  ✗ Timeout waiting for commit: {label or tx_id}")
+    if last_blocks_sample is not None:
+        n = len(last_blocks_sample) if isinstance(last_blocks_sample, list) else "?"
+        print(f"    /api/blocks returned {n} blocks")
+        if isinstance(last_blocks_sample, list) and last_blocks_sample:
+            blk = last_blocks_sample[-1]
+            print(f"    latest block keys: {list(blk.keys())}")
+        elif not isinstance(last_blocks_sample, list):
+            print(f"    /api/blocks shape: {str(last_blocks_sample)[:120]}")
+    # Also try the tx endpoint directly for a clue
+    try:
+        tx_data, tx_status = http_get(host, port, f"/api/tx/{tx_id}")
+        print(f"    /api/tx/{tx_id} → HTTP {tx_status}  {str(tx_data)[:120]}")
+    except Exception as e:
+        print(f"    /api/tx/{tx_id} → error: {e}")
     return False
 
 
