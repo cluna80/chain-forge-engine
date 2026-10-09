@@ -2871,9 +2871,15 @@ impl Executor {
                 // Credit the escrow account (create it — this is what makes
                 // the escrow_id queryable and what the duplicate-guard above
                 // detects on a second attempt with the same escrow_id).
+                //
+                // The escrow account's `role` encodes the authorized releaser
+                // (the coordinator who submitted LockQrcForJob).  ReleaseQrcForJob
+                // and RefundQrcForJob verify `tx.sender` matches this value, so
+                // a different coordinator cannot release or refund another party's escrow.
                 {
+                    let escrow_role = format!("escrow:authorized={}", tx.sender);
                     let new_escrow = chain_forge_state::AccountState::new(
-                        escrow_key.clone(), "escrow".to_string()
+                        escrow_key.clone(), escrow_role
                     );
                     state.upsert_account(new_escrow);
                 }
@@ -2906,6 +2912,60 @@ impl Executor {
                         ),
                     );
                 }
+
+                let escrow_key = format!("escrow:{}", escrow_id);
+
+                // N5 guard — escrow must exist.
+                let escrow_acct = match state.get_account(&escrow_key) {
+                    Ok(a) => a.clone(),
+                    Err(_) => {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "ReleaseQrcForJob: escrow_id '{}' does not exist \
+                                 (job_id={}, sender={})",
+                                escrow_id, job_id, tx.sender
+                            ),
+                        );
+                    }
+                };
+
+                // N3 guard — only the coordinator who locked the escrow may release it.
+                // The authorized address is encoded in the escrow account's role field
+                // as "escrow:authorized={address}" at LockQrcForJob time.
+                let authorized_sender = escrow_acct.role
+                    .strip_prefix("escrow:authorized=")
+                    .unwrap_or("");
+                if authorized_sender != tx.sender.as_str() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ReleaseQrcForJob: sender {} is not the authorized releaser \
+                             for escrow '{}' (authorized={}, job_id={})",
+                            tx.sender, escrow_id, authorized_sender, job_id
+                        ),
+                    );
+                }
+
+                // N4 guard — release amount must not exceed what is held in escrow.
+                let escrow_balance = escrow_acct.balance_of("uqrc");
+                if (*amount as u128) > escrow_balance {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ReleaseQrcForJob: release amount {} exceeds escrow balance {} \
+                             (escrow_id={}, job_id={})",
+                            amount, escrow_balance, escrow_id, job_id
+                        ),
+                    );
+                }
+
+                // Debit the escrow account.
+                if let Ok(acct) = state.get_account_mut(&escrow_key) {
+                    acct.debit("uqrc", *amount as u128).expect("balance verified above");
+                }
+                state.refresh_leaf(&escrow_key);
+
                 // Ensure provider wallet account exists.
                 if state.get_account(provider_wallet).is_err() {
                     let new_acct = chain_forge_state::AccountState::new(
