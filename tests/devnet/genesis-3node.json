@@ -88,7 +88,7 @@
       "balance": "500000000",
       "role": "observer",
       "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692",
-      "_comment": "Carol is not a validator in this genesis \u2014 she's an observer/provider wallet only"
+      "_comment": "Carol is not a validator in this genesis — she's an observer/provider wallet only"
     },
     {
       "label": "PoCD Treasury",
@@ -106,20 +106,21 @@
       "Mathematics",
       "Cryptography",
       "ComputationalEfficiency",
-      "PhysicsAndOpenScience"
+      "PhysicsAndOpenScience",
+      "AiAssistedDiscovery"
     ],
     "reward_epoch_blocks": 720,
     "require_verified_identity": false,
-    "min_seal_difficulty_bits": 4
+    "min_seal_difficulty_bits": 8
   },
   "genesis_challenges": [
     {
       "challenge_id": "qcb-devnet-3node::Mathematics::devnet-pilot-1",
       "chain_id": "qcb-devnet-3node",
       "track": "Mathematics",
-      "name": "Devnet Pilot — Integer Sequence Search",
-      "verification_criteria": "Find next term in OEIS A000045 (Fibonacci) beyond index 100; submit SHA256 of decimal representation as output_hash.",
-      "seal_difficulty_bits": 4,
+      "name": "Devnet Pilot — Fibonacci Discovery",
+      "verification_criteria": "Compute Fibonacci(n) for n derived from challenge_id seed (range 100-200). Submit SHA256 of decimal string representation as output_hash. Verifiers reproduce n = 100 + (SHA256(challenge_id+'fib')[0:16] as uint64) % 101, then check SHA256(str(fib(n)).encode()).",
+      "seal_difficulty_bits": 8,
       "search_space_size": null,
       "activated_at_block": null,
       "status": "Active"
@@ -129,8 +130,8 @@
       "chain_id": "qcb-devnet-3node",
       "track": "Cryptography",
       "name": "Devnet Crypto — Hash Pre-image Search",
-      "verification_criteria": "Find an input x such that SHA256(x) starts with 0000; submit SHA256(x) as output_hash.",
-      "seal_difficulty_bits": 4,
+      "verification_criteria": "Find an input x = 'qcb-preimage-{N}' such that SHA256(x) starts with nibble 0 (4 leading zero bits). Submit SHA256(x) as output_hash. Starting nonce N = SHA256(challenge_id+'preimage')[0:16] as uint64 & 0xFFFFFFFF. Verifiers check output_hash starts with '0'.",
+      "seal_difficulty_bits": 8,
       "search_space_size": null,
       "activated_at_block": null,
       "status": "Active"
@@ -140,8 +141,30 @@
       "chain_id": "qcb-devnet-3node",
       "track": "ComputationalEfficiency",
       "name": "Devnet Perf — Matrix Multiply Benchmark",
-      "verification_criteria": "Run 1024x1024 double-precision matrix multiply; submit SHA256 of result checksum as output_hash.",
-      "seal_difficulty_bits": 4,
+      "verification_criteria": "Run 16×16 integer matrix multiply (seeded from challenge_id). Seed = SHA256(challenge_id+'matmul')[0:16] as uint64 & 0xFFFF. Entries mod 997; compute diagonal sum of C=A×B mod 2^31. Submit SHA256('matmul-16x16-seed{S}-diag{D}') as output_hash.",
+      "seal_difficulty_bits": 8,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-3node::PhysicsAndOpenScience::devnet-lattice-1",
+      "chain_id": "qcb-devnet-3node",
+      "track": "PhysicsAndOpenScience",
+      "name": "Devnet Lattice — Shortest Vector Problem (4-dim)",
+      "verification_criteria": "Find shortest non-zero vector in the 4-dimensional integer lattice with basis B derived from challenge_id seed. Seed = SHA256(challenge_id+'lattice')[0:16] as uint64. Build 4×4 basis using LCG (mult=6364136223846793005, add=1442695040888963407, entries = (state>>32)%31 - 15). Exhaustively search coefficient vectors in [-6,6]^4; find minimum non-zero ||Bv||^2. Submit SHA256('svp-dim4-seed{S}-vec{V}-norm{N}') as output_hash. Any verifier can reproduce B and check the submitted vector is genuinely shortest.",
+      "seal_difficulty_bits": 8,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-3node::AiAssistedDiscovery::devnet-primes-1",
+      "chain_id": "qcb-devnet-3node",
+      "track": "AiAssistedDiscovery",
+      "name": "Devnet Primes — Prime Counting Function π(n)",
+      "verification_criteria": "Compute π(n) — number of primes ≤ n — for challenge-seeded n. n = 10000 + (SHA256(challenge_id+'primes')[0:16] as uint64) % 40001, so 10000 ≤ n ≤ 50000. Submit SHA256('pi(n)={count}') as output_hash. Verifiers run a sieve and check pi_n independently.",
+      "seal_difficulty_bits": 8,
       "search_space_size": null,
       "activated_at_block": null,
       "status": "Active"
