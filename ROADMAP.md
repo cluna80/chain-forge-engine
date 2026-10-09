@@ -262,6 +262,8 @@ User opens QCB app → QR challenge displayed
 
 **First wallet objective — QCB-WALLET-001 (Four-Node PQ Transaction Test):** Build a native Rust wallet that generates and securely stores an ML-DSA key pair; signs a QCB transaction locally; submits only the signed transaction through `/api/tx`; has its signature verified by the protocol; achieves finality across Alice, Bob, Carol, and Dave; and rejects forged, modified, or replayed transactions.
 
+**Phase A status (crate scaffold + ML-DSA keygen) — ✅ DONE (2026-10-09):** `chain-forge-wallet` crate created; `generate_wallet()` produces ML-DSA-65 (Dilithium3) key pairs via `pqcrypto-dilithium`; private keys encrypted at rest with AES-256-GCM(Argon2id); `sign_transaction()` signs SHA-256(tx_body_json); `SignedTxEnvelope` with `"mldsa65:<hex>"` scheme tag; 10 adversarial tests passing (forge, tamper, replay, wrong-passphrase, overwrite guard); `*.wallet.json` gitignored; `qcb-wallet` CLI binary for generate/address/info/sign-tx/submit. **Remaining:** four-node devnet submission test + protocol-side signature verification wired into execution layer (Task #176).
+
 **Prerequisite:** QCB-CS-001 complete (defines the underlying migration architecture that the wallet must be built on).
 
 > **QSWIP-001 — Open Post-Quantum Wallet Identity Protocol**: Long-term open standard so other Chain Forge blockchains can reuse QCB's wallet identity and authentication infrastructure. Proposed; timing deferred until Phase B–D of QCB-DIS-001 is battle-tested.
