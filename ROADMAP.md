@@ -208,7 +208,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Milestone | Technology | Status |
 |---|---|---|
 | **QCB-CS-001** | Cryptographic Survivability and Migration | ⬜ Phase 1 |
-| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ⬜ Phase 1 |
+| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A complete |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
 | **QSWIP-001** | Open Post-Quantum Wallet Identity Protocol | 🔲 Proposed standard |
@@ -254,13 +254,27 @@ User opens QCB app → QR challenge displayed
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | ⬜ |
+| A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | ✅ Complete |
 | B — Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to QCB wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
 | E — Security testing | QR replay, phishing, session hijacking, key compromise, identity correlation, account recovery | 🔲 |
 
+**DIS-001 Phase A — ✅ COMPLETE (2026-10-09):**
+- **`chain-forge-node/src/auth.rs`** (NEW): `AuthChallenge` with 60-second TTL and 32-char hex ID; `ChallengeStore` with anti-replay `consume()` and capacity eviction at 1024 pending challenges; `verify_challenge_signature()` verifies ML-DSA-65 over SHA-256(challenge_json) and derives `"qcb1pq…"` address from double-SHA-256 of public key.
+- **`POST /api/auth/challenge`**: issues time-bounded challenge JSON; optional `scope` field (defaults to `"qcb-auth"`); challenge inserted into per-node `ChallengeStore`.
+- **`POST /api/auth/verify`**: consumes challenge (atomic anti-replay), verifies ML-DSA-65 signature, returns `{"status":"verified","address":"qcb1pq…","scope":…}` or 400 rejected.
+- **`chain-forge-wallet`: `sign_challenge()`** signs SHA-256(challenge_json) with ML-DSA-65 and returns `"mldsa65:<hex>"` tagged string; `qcb-wallet sign-challenge` CLI subcommand exposes it for scripting.
+- **13 node auth tests + 2 wallet sign_challenge tests** — all 59 tests passing (47 node, 12 wallet).
+- **`scripts/phase1_dis001_test.py`**: 5-scenario adversarial test (happy path, anti-replay, forged sig, wrong key, unknown challenge_id); run against live devnet.
+- **Devnet verification (2026-10-09) — 12/12 checks passed:** Happy path: challenge issued, ML-DSA-65 signed, verified, `qcb1pq…` address derived ✓; Anti-replay: consumed challenge_id rejected on second use ✓; Forged signature: random 3309-byte payload rejected by ML-DSA verification ✓; Wrong key: Alice's signature rejected against Bob's public key ✓; Unknown challenge_id: fabricated ID not found in node store ✓.
+
 **First wallet objective — QCB-WALLET-001 (Four-Node PQ Transaction Test):** Build a native Rust wallet that generates and securely stores an ML-DSA key pair; signs a QCB transaction locally; submits only the signed transaction through `/api/tx`; has its signature verified by the protocol; achieves finality across Alice, Bob, Carol, and Dave; and rejects forged, modified, or replayed transactions.
+
+**QCB-WALLET-001 — ✅ COMPLETE (2026-10-09):**
+- **Phase A (crate scaffold + ML-DSA keygen):** `chain-forge-wallet` crate created; `generate_wallet()` produces ML-DSA-65 (Dilithium3) key pairs via `pqcrypto-dilithium`; private keys encrypted at rest with AES-256-GCM(Argon2id); `sign_transaction()` signs SHA-256(tx_body_json); `SignedTxEnvelope` with `"mldsa65:<hex>"` scheme tag; 10 adversarial tests passing (forge, tamper, replay, wrong-passphrase, overwrite guard); `*.wallet.json` gitignored; `qcb-wallet` CLI binary for generate/address/info/sign-tx/submit.
+- **Task #176 (protocol-side ML-DSA verification):** `chain-forge-execution` extended with `pq_signatures: Vec<String>` + `pq_public_key: Vec<u8>` fields (both `#[serde(default)]` for backward compat); `verify_mldsa_authorization()` verifies ML-DSA-65 over SHA-256(tx_body_json); `bind_key_if_unbound()` stores 1952-byte ML-DSA-65 public key in `AccountState.public_key` on first verified PQ tx; address namespace `"qcb1pq"` avoids collision with Ed25519 `"qcb1"` addresses; 74/74 execution tests still passing.
+- **Devnet test (Task #176 finality proof):** `scripts/phase1_wallet_test.py` — four scenarios: happy path accepted, forged sig rejected, tampered body rejected, replay rejected; propagation check across Bob/Dave; ephemeral wallet in `/tmp` (no key material in repo).
 
 **Prerequisite:** QCB-CS-001 complete (defines the underlying migration architecture that the wallet must be built on).
 
@@ -495,7 +509,7 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 | BTC block hash randomness beacon | ⬜ | Grand Challenge job slice assignment derived from recent BTC block hash: `job_seed = SHA256(btc_block_hash \|\| challenge_id \|\| machine_id)`; prevents QCB or any participant from steering which machine gets which problem slice; established technique (used by Chainlink VRF, drand, bitcoin anchors), applied here to research job fairness; Phase 1 |
 | `seal_hash` field on `UsefulWorkReceipt` | ✅ | `seal_nonce: u64`, `seal_hash: String`, `seal_difficulty_bits: u32` added; `compute_seal_hash()`, `find_seal_nonce()`, `verify_seal()`, `meets_difficulty()` helpers implemented and tested; 6 tests passing |
 | Seal difficulty target per challenge track | ⬜ | Governance-settable difficulty for each active Grand Challenge track; stored in challenge config; Phase 1 |
-| Seal verification in receipt submission | ⬜ | Receipt submission path checks difficulty prefix before accepting `UsefulWorkReceipt`; verifier re-hashes from submitted `nonce + output_hash + challenge_id` — fast, one SHA256 call; Phase 1 |
+| Seal verification in receipt submission | ✅ | `SubmitUsefulWork` tx type calls `chain_forge_resource::verify_seal()` (single SHA256) at execution time; rejects invalid seals, trivial difficulty (< 8-bit absolute floor), duplicates, and wrong-owner submissions; 6 anti-farming guards enforced; 9 adversarial tests in `scripts/phase1_contribution_test.py` |
 | Grand Challenge machine daemon (`gc-daemon`) | ✅ | `chain-forge-node/src/bin/gc-daemon.rs` — full 3-step cycle: hash preimage search → seal nonce search → `UsefulWorkReceipt` JSON; smoke-tested: GC-DEVNET-002 found nonce 80,468 + seal nonce 161 in <500ms; `cargo run --bin gc-daemon -- --dry-run` |
 | SHA256 hardware compatibility documentation | ⬜ | Document that standard Bitcoin mining ASICs and GPUs can compute seal hashes; include benchmark: TH/s → expected seals/hour at target difficulty; Phase 1 |
 | BTC miner onboarding guide | ⬜ | Step-by-step: install daemon, point at challenge, earn QRC alongside BTC mining; Phase 1 community milestone |
@@ -682,11 +696,13 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 21. ~~**Phase 0b N2 — duplicate escrow_id guard**~~ **✅ DONE** — Run ID `b16e3bd6`; duplicate `escrow_id` now hard-fails at execution layer (`LockQrcForJob: escrow_id 'esc-…' already exists`); treasury balance verified unchanged at 5,000,000 uQRC after rejection; escrow account is now written to state on lock so `escrow:{id}` is queryable — Step 7 escrow check promoted from soft-skip ⚠ to hard assertion ✓ (9/9 checks per node); N1 + N2 + happy-path all PASS.
 
-22. **\ReleaseQrcForJob\ + \RefundQrcForJob\ happy-path tests** ✅ **DONE — three-node devnet verified (2026-10-08)** — Run eee23f\: 10 transactions checked on Alice, Bob, Dave. Release debited escrow and credited provider; refund restored original treasury; repeated full payouts rejected without balance changes. 76 execution + 60 state tests passed. \scripts/phase0_settlement_test.py\ committed. Carol node validation remains item 23; scientific receipt verification is separate.
+22. **`ReleaseQrcForJob` + `RefundQrcForJob` happy-path tests** ✅ **DONE — three-node devnet verified (2026-10-08/09)** — Run `20eee23f` (initial), `24963a9f` (final): 10 transactions checked on Alice, Bob, Dave. Release debited escrow and credited provider; refund restored original treasury; repeated full payouts rejected without balance changes. `scripts/phase0_settlement_test.py` committed. Provider balance assertions now use relative baseline (persistent `qcb1carol` wallet accumulates across runs). Carol node validation remains item 23; scientific receipt verification is separate.
 
 23. **4-node test with Dave (Machine 2)** ✅ **DONE — cross-machine 4-node devnet verified (2026-10-09)** — Machine 1 (192.168.137.2): Alice :26656, Bob :26657, Carol :26658. Machine 2 (192.168.137.3): Dave :26659. Dave synced from genesis, reached height 111+, `precommit_count=3` (BFT quorum of 4). Full N3/N4/N5 negative release test suite passed on 4-node chain. `genesis-4node.json` committed with all 4 classical-ed25519 validator keys.
 
 24. **`ReleaseQrcForJob` negative-path tests** ✅ **DONE — three-node devnet verified (2026-10-09)** — N3/N4/N5 guards all enforced. Happy path + 3 adversarial cases passed on Alice/Bob/Carol devnet. `scripts/phase0_negative_release_test.py` committed. Escrow role encodes authorized coordinator (`escrow:authorized={sender}`); wrong sender, over-amount, and ghost escrow all correctly rejected.
+
+25. **`RefundQrcForJob` negative-path tests** ✅ **DONE — three-node devnet verified (2026-10-09)** — N6/N7/N8/N9 guards all enforced. Happy path (lock + refund) + 4 adversarial cases passed on Alice/Bob/Carol devnet. `scripts/phase0_negative_refund_test.py` committed. Guards: N6 non-existent escrow, N7 wrong sender (attacker nonce 0 ≠ chain nonce, coordinator tier gate), N8 over-amount refund, N9 double-settlement after release. `RefundReason` enum fix: `"Timeout"` (not `"JobTimeout"`). Live nonce sync (`sync_nonce()`) added before each test case to prevent nonce-mismatch masking guard failures.
 
 ---
 
@@ -722,7 +738,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 | PoCD API endpoints | ✅ | `GET /api/pocd/challenges`, `GET /api/pocd/receipts`, `POST /api/pocd/submit`; self-verifies seal in Phase 0; no external verifier sig required |
 | First live PoCD mining round on devnet | ✅ | `scripts/phase0_pocd_test.py` — mines 4-bit seal, submits proof, verifies receipt; runs against live devnet |
 | `QcbVerifier` adapter | ⬜ | Wraps identity layer + `chain-forge-resource` scientific receipt; Phase 1 |
-| Wire `QcbRewardPolicy` into epoch processing | ⬜ | Call `compute_rewards()` at epoch boundaries in `node.rs`; credit miner wallets via state |
+| Wire `QcbRewardPolicy` into epoch processing | ✅ | `EpochClose` handler scans `gc_receipt:*` state for unawarded receipts, converts to `DiscoveryReceipt`, calls `QcbRewardPolicy::compute_rewards()`, debits `treasury:pocd`, credits each machine wallet; `gc_reward_paid` sentinel prevents double-payment; non-fatal failure path retries next epoch |
 | Migrate `chain-forge-resource` seal functions to delegate to `chain-forge-pocd` | ⬜ | Remove duplication; `UsefulWorkReceipt` becomes a wrapper |
 
 ---
