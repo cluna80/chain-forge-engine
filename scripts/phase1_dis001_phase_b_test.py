@@ -334,7 +334,7 @@ def test_b1_nonce():
     if queued2:
         tx2 = wait_for_tx(ALICE, tid2, timeout=15)
         ok2 = tx2 is not None and tx2.get("success") is False
-        detail2 = f"executed: success={tx2.get('success')} err={tx2.get('error','')[:60]}" if tx2 else "timeout"
+        detail2 = f"executed: success={tx2.get('success')} err={str(tx2.get('error') or '')[:60]}" if tx2 else "timeout"
     else:
         ok2 = s2 == 400 or (isinstance(r2, dict) and r2.get("status") == "rejected")
         detail2 = f"status={s2} body={str(r2)[:60]}"
@@ -346,7 +346,7 @@ def test_b1_nonce():
     if queued3:
         tx3 = wait_for_tx(ALICE, tid3, timeout=15)
         ok3 = tx3 is not None and tx3.get("success") is False
-        detail3 = f"executed: success={tx3.get('success')} err={tx3.get('error','')[:60]}" if tx3 else "timeout"
+        detail3 = f"executed: success={tx3.get('success')} err={str(tx3.get('error') or '')[:60]}" if tx3 else "timeout"
     else:
         ok3 = s3 == 400 or (isinstance(r3, dict) and r3.get("status") == "rejected")
         detail3 = f"status={s3} body={str(r3)[:60]}"
@@ -373,7 +373,7 @@ def test_b2_balance():
     if s in (200, 201) or (isinstance(r, dict) and r.get("status") == "queued"):
         tx = wait_for_tx(ALICE, tid, timeout=15)
         ok = tx is not None and tx.get("success") is False
-        detail = f"executed: success={tx.get('success')} err={tx.get('error','')[:60]}" if tx else "timeout"
+        detail = f"executed: success={tx.get('success')} err={str(tx.get('error') or '')[:60]}" if tx else "timeout"
     else:
         ok = s == 400 or (isinstance(r, dict) and r.get("status") == "rejected")
         detail = f"status={s} body={str(r)[:80]}"
@@ -412,7 +412,7 @@ def test_b3_gas():
     if s0 in (200, 201) or (isinstance(r0, dict) and r0.get("status") == "queued"):
         tx0 = wait_for_tx(ALICE, "b3-zero-gas", timeout=15)
         ok0 = tx0 is not None and tx0.get("success") is False
-        detail0 = f"executed: success={tx0.get('success')} err={tx0.get('error','')[:60]}" if tx0 else "timeout"
+        detail0 = f"executed: success={tx0.get('success')} err={str(tx0.get('error') or '')[:60]}" if tx0 else "timeout"
     else:
         ok0 = s0 == 400 or (isinstance(r0, dict) and r0.get("status") == "rejected")
         detail0 = f"status={s0} body={str(r0)[:60]}"
@@ -432,7 +432,7 @@ def test_b3_gas():
     if s1 in (200, 201) or (isinstance(r1, dict) and r1.get("status") == "queued"):
         tx1 = wait_for_tx(ALICE, "b3-huge-gas", timeout=15)
         ok1 = tx1 is not None and tx1.get("success") is False
-        detail1 = f"executed: success={tx1.get('success')} err={tx1.get('error','')[:60]}" if tx1 else "timeout"
+        detail1 = f"executed: success={tx1.get('success')} err={str(tx1.get('error') or '')[:60]}" if tx1 else "timeout"
     else:
         ok1 = s1 == 400 or (isinstance(r1, dict) and r1.get("status") == "rejected")
         detail1 = f"status={s1} body={str(r1)[:60]}"
@@ -730,7 +730,7 @@ def test_b7_restart_replay():
     if s2 in (200, 201) or (isinstance(r2, dict) and r2.get("status") == "queued"):
         tx2 = wait_for_tx(ALICE, "b7-replay-tx", timeout=20)
         ok_rejected = tx2 is not None and tx2.get("success") is False
-        detail2 = f"executed: success={tx2.get('success')} err={tx2.get('error','')[:60]}" if tx2 else "timeout"
+        detail2 = f"executed: success={tx2.get('success')} err={str(tx2.get('error') or '')[:60]}" if tx2 else "timeout"
     else:
         ok_rejected = s2 == 400 or (isinstance(r2, dict) and r2.get("status") == "rejected")
         detail2 = f"status={s2} body={str(r2)[:80]}"
@@ -781,7 +781,7 @@ def test_b8_finality():
     tx = wait_for_tx(ALICE, tid, timeout=20)
     tx_ok = tx is not None and tx.get("success") is True
     result("B8 transfer executed successfully", tx_ok,
-           f"success={tx.get('success') if tx else 'timeout'} err={tx.get('error','') if tx else ''}")
+           f"success={tx.get('success') if tx else 'timeout'} err={str(tx.get('error') or '') if tx else ''}")
     if not tx_ok:
         return
 
