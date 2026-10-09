@@ -640,7 +640,7 @@ def test_b7_restart_replay():
         tx_orig = wait_for_tx(ALICE, "b7-original-tx", timeout=20)
         ok_original = tx_orig is not None and tx_orig.get("success") is True
         result("B7 original tx accepted", ok_original,
-               f"executed: success={tx_orig.get('success') if tx_orig else 'timeout'}")
+               f"executed: success={tx_orig.get('success') if tx_orig else 'timeout'} err={str((tx_orig.get('error') if tx_orig else None) or '')[:80]}")
     else:
         ok_original = False
         result("B7 original tx accepted", ok_original, f"status={s}")
