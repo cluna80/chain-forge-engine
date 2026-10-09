@@ -507,20 +507,11 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
                      ESCROW_ID_RELEASE, JOB_ID_RELEASE,
                      "machine-1", PROVIDER_WALLET, ESCROW_AMOUNT,
                      "sha256:0000000000000000000000000000000000000000000000000000000000000000")
-    tx_lock_ref  = tx_lock_qrc_for_job(
-                     ALICE_ADDRESS, "lock-refund",
-                     ESCROW_ID_REFUND, JOB_ID_REFUND,
-                     AGENT_ID, ESCROW_AMOUNT)
-    tx_refund    = tx_refund_qrc_for_job(
-                     ALICE_ADDRESS, "refund",
-                     ESCROW_ID_REFUND, JOB_ID_REFUND,
-                     AGENT_ADDRESS, ESCROW_AMOUNT,
-                     "Timeout")
-    tx_rep_ref   = tx_refund_qrc_for_job(
-                     ALICE_ADDRESS, "repeat-refund",
-                     ESCROW_ID_REFUND, JOB_ID_REFUND,
-                     AGENT_ADDRESS, ESCROW_AMOUNT,
-                     "Timeout")
+    # NOTE: tx_lock_ref, tx_refund, tx_rep_ref are built lazily after the
+    # repeat-release step, because repeat-release may or may not consume a
+    # nonce slot on-chain (it commits but fails execution — the chain still
+    # increments the nonce).  We re-fetch the live nonce at that point so
+    # the refund leg always uses the correct next nonce.
 
     overall_pass = True
 
@@ -580,6 +571,27 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
             overall_pass = False
 
     # ─── Refund path: lock → assert → refund → assert → repeat-refund ───────
+    # Re-fetch the live nonce now that the release path is fully settled.
+    # repeat-release commits on-chain but fails execution; the chain does NOT
+    # increment the sender nonce for a tx rejected at the execution layer, but
+    # to be safe we always re-fetch here so the refund leg uses the exact next
+    # expected nonce regardless of chain behaviour.
+    fetch_and_set_nonce(alice_host, alice_port, ALICE_ADDRESS)
+    tx_lock_ref = tx_lock_qrc_for_job(
+                    ALICE_ADDRESS, "lock-refund",
+                    ESCROW_ID_REFUND, JOB_ID_REFUND,
+                    AGENT_ID, ESCROW_AMOUNT)
+    tx_refund   = tx_refund_qrc_for_job(
+                    ALICE_ADDRESS, "refund",
+                    ESCROW_ID_REFUND, JOB_ID_REFUND,
+                    AGENT_ADDRESS, ESCROW_AMOUNT,
+                    "Timeout")
+    tx_rep_ref  = tx_refund_qrc_for_job(
+                    ALICE_ADDRESS, "repeat-refund",
+                    ESCROW_ID_REFUND, JOB_ID_REFUND,
+                    AGENT_ADDRESS, ESCROW_AMOUNT,
+                    "Timeout")
+
     print(hdr("Refund path — lock-refund"))
     q, e = step_submit_and_wait("lock-refund", alice_host, alice_port, tx_lock_ref)
     if not (q and e):
