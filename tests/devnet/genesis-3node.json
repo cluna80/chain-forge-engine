@@ -1,0 +1,95 @@
+{
+  "chain_id": "qcb-devnet-3node",
+  "chain_name": "QuarkCharmBit 3-Node Devnet",
+  "engine_version": "0.1.0",
+  "genesis_time": "2026-09-29T00:00:00Z",
+  "environment": {
+    "mode": "devnet",
+    "faucet_enabled": true,
+    "relaxed_limits": true
+  },
+  "native_token": {
+    "name": "QuarkCharm",
+    "symbol": "QCB",
+    "denom": "uqcb",
+    "max_supply": "210000000"
+  },
+  "address_prefix": "qcb",
+  "consensus": {
+    "type": "proof-of-stake",
+    "validator_set_size": 3,
+    "block_time_ms": 500,
+    "personhood_weighted": true
+  },
+  "execution": {
+    "state_model": "account",
+    "parallel_execution": false,
+    "gas_model": "dynamic",
+    "require_signatures": false
+  },
+  "cryptography": {
+    "signature_scheme": "hybrid",
+    "pqc_algorithm": "ml-dsa",
+    "migration_trigger": "nist-guidance",
+    "hash_width": 256,
+    "validator_scheme": "classical-ed25519"
+  },
+  "network": {
+    "network_id": "qcb-devnet-3node",
+    "p2p_port": 27000,
+    "rpc_port": 27001,
+    "bootstrap_nodes": [],
+    "peer_discovery": "bootstrap",
+    "max_peers": 10
+  },
+  "limits": {
+    "max_block_bytes": 1048576,
+    "max_tx_bytes": 65536,
+    "block_gas_limit": 10000000,
+    "mempool_size": 100,
+    "mempool_ttl_seconds": 60
+  },
+  "modules": [
+    "bank",
+    "staking",
+    "identity",
+    "qrc",
+    "agents"
+  ],
+  "custom_modules": [],
+  "genesis_accounts": [
+    {
+      "label": "Alice",
+      "address": "qcb1alice",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "7869474df5c3c7a4629ee8ed8b9d74b89ae2f07dad3938d5eaeb5d600ed51748",
+      "_comment": "Ed25519 verifying key for tests/devnet/keys/alice.key.json"
+    },
+    {
+      "label": "Bob",
+      "address": "qcb1bob",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "e88d88dcfb29e249468eb7ecac131b3cfe6af53c6ebe7eb3d771ce4c2b0bbb02",
+      "_comment": "Ed25519 verifying key for tests/devnet/keys/bob.key.json"
+    },
+    {
+      "label": "Dave",
+      "address": "qcb1dave",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "fb352ea660f99ed2d977b53f94246469525afdeb34041fc3d54ff0a436935ee6",
+      "_comment": "Ed25519 verifying key for tests/devnet/keys/dave.key.json"
+    },
+    {
+      "label": "Carol",
+      "address": "qcb1carol",
+      "balance": "500000000",
+      "role": "observer",
+      "public_key": "6a5d93dee87bc3b9a62476ec3ff1f6290c133e53fd86add16e4ef4327a5ff2fa",
+      "_comment": "Carol is not a validator in this genesis — she's an observer/provider wallet only"
+    }
+  ],
+  "attestation_coordinator": "qcb1alice"
+}
