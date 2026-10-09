@@ -148,6 +148,11 @@ impl GasModel {
                     TxBody::RefundQrcForJob { .. }       => op_multiplier * 4,
                     // Agent Treasury: one debit + one credit + optional agent record update.
                     TxBody::DepositToTreasury { .. }     => op_multiplier * 4,
+                    // Resource Network: Contribution layer.
+                    // RegisterMachine: writes MachineRecord to state (similar to RegisterAgent).
+                    TxBody::RegisterMachine { .. }       => op_multiplier * 6,
+                    // SubmitUsefulWork: verifies seal + writes receipt + updates contribution score.
+                    TxBody::SubmitUsefulWork { .. }      => op_multiplier * 8,
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -686,6 +691,53 @@ pub enum TxBody {
         /// Optional new per-job cap (0 = leave current value unchanged).
         per_job_limit_uqrc: u64,
     },
+
+    // ── Contribution Layer ─────────────────────────────────────────────────
+
+    /// Register a resource node (machine) operated by this sender.
+    ///
+    /// Sender must be a Verified or Established identity (SponsorID gate).
+    /// A MachineRecord is written to `machine:{machine_id}` in state.
+    /// Re-registering the same machine_id is rejected.
+    RegisterMachine {
+        /// Unique identifier for the machine (e.g. "MACH-CAROL-003").
+        machine_id: String,
+        /// Display name for the machine.
+        display_name: String,
+        /// Operating mode: "MarketplaceOnly", "ContributionOnly", or "Both".
+        mode: String,
+        /// Ed25519 attestation public key, base64-encoded (32 bytes).
+        attestation_key_b64: String,
+        /// Freeform capability description (JSON string for Phase 0;
+        /// will be a proper ResourceCapabilityDescriptor in Phase 1).
+        capabilities_json: String,
+    },
+
+    /// Submit a Grand Challenge work receipt for verification and scoring.
+    ///
+    /// Sender must own the registered machine referenced by `machine_id`.
+    /// The receipt's seal is verified on-chain; valid receipts increment
+    /// `contribution_score:{machine_id}` by 1 and store the receipt at
+    /// `gc_receipt:{receipt_id}`.
+    SubmitUsefulWork {
+        /// The receipt_id from the UsefulWorkReceipt.
+        receipt_id: String,
+        /// The machine that performed the work.
+        machine_id: String,
+        /// The Grand Challenge this work is credited to.
+        challenge_id: String,
+        /// SHA-256 hex of the output.
+        output_hash: String,
+        /// Seal nonce (PoW over output_hash + challenge_id).
+        seal_nonce: u64,
+        /// Hex-encoded seal hash — must meet `seal_difficulty_bits` prefix.
+        seal_hash: String,
+        /// Number of leading zero bits required in seal_hash.
+        seal_difficulty_bits: u32,
+        /// Minimum difficulty this chain accepts (checked at execution).
+        /// Set to 0 to use the chain's configured minimum.
+        min_difficulty_override: u32,
+    },
 }
 
 impl TxBody {
@@ -731,6 +783,9 @@ impl TxBody {
             TxBody::RefundQrcForJob { .. }        => "RefundQrcForJob",
             // Agent Treasury
             TxBody::DepositToTreasury { .. }      => "DepositToTreasury",
+            // Contribution Layer
+            TxBody::RegisterMachine { .. }         => "RegisterMachine",
+            TxBody::SubmitUsefulWork { .. }        => "SubmitUsefulWork",
         }
     }
 }
@@ -895,6 +950,14 @@ impl Transaction {
             }
             // Agent Treasury: agent_id + amount + optional new per_job_limit.
             TxBody::DepositToTreasury { agent_id, .. } => agent_id.len() + 16,
+            // Contribution Layer: machine_id + display_name + attestation_key_b64 + capabilities_json + 32
+            TxBody::RegisterMachine { machine_id, display_name, attestation_key_b64, capabilities_json, .. } => {
+                machine_id.len() + display_name.len() + attestation_key_b64.len() + capabilities_json.len() + 32
+            }
+            // receipt_id + machine_id + challenge_id + output_hash + seal_hash + 32
+            TxBody::SubmitUsefulWork { receipt_id, machine_id, challenge_id, output_hash, seal_hash, .. } => {
+                receipt_id.len() + machine_id.len() + challenge_id.len() + output_hash.len() + seal_hash.len() + 32
+            }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -1551,6 +1614,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::RefundQrcForJob { .. } => Some("qrc"),
         // Agent Treasury is part of the agents module (modifies agent records).
         TxBody::DepositToTreasury { .. } => Some("agents"),
+        // Contribution Layer belongs to the QRC module.
+        TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => Some("qrc"),
     }
 }
 
@@ -3091,6 +3156,201 @@ impl Executor {
                 ));
                 Ok(())
             }
+
+            // ── Contribution Layer ─────────────────────────────────────────
+            TxBody::RegisterMachine {
+                machine_id,
+                display_name,
+                mode,
+                attestation_key_b64,
+                capabilities_json: _,
+            } => {
+                // Sender must be Verified or Established tier.
+                let tier_ok = identity.get(&tx.sender)
+                    .map(|r| r.is_verified())
+                    .unwrap_or(false);
+                if !tier_ok {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "RegisterMachine: sender {} must be Verified or Established tier",
+                            tx.sender
+                        ),
+                    );
+                }
+                // Machine must not already exist.
+                let machine_key = format!("machine:{}", machine_id);
+                if state.get_account(&machine_key).is_ok() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("RegisterMachine: machine {} already registered", machine_id),
+                    );
+                }
+                // Parse mode string.
+                let machine_mode = match mode.as_str() {
+                    "MarketplaceOnly"  => chain_forge_resource::MachineMode::MarketplaceOnly,
+                    "ContributionOnly" => chain_forge_resource::MachineMode::ContributionOnly,
+                    "Both"             => chain_forge_resource::MachineMode::Both,
+                    other => {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "RegisterMachine: unknown mode '{}'; \
+                                 expected MarketplaceOnly | ContributionOnly | Both",
+                                other
+                            ),
+                        );
+                    }
+                };
+                // Build a MachineRecord with a placeholder capability descriptor
+                // (full descriptor arrives via capabilities_json in Phase 1B).
+                let capability_descriptor = chain_forge_resource::ResourceCapabilityDescriptor {
+                    compute_class:  chain_forge_resource::ComputeClass::Cpu,
+                    compute_units:  1,
+                    memory_tier:    chain_forge_resource::MemoryTier::Small,
+                    storage_tier:   chain_forge_resource::StorageTier::Ssd,
+                    isa_tags:       vec![],
+                    price_model:    chain_forge_resource::PriceModel::PerJob { qrc_flat: 0 },
+                    daemon_version: "0.1.0".to_string(),
+                    extra:          std::collections::HashMap::new(),
+                };
+                let record = chain_forge_resource::MachineRecord {
+                    machine_id: chain_forge_resource::MachineId(machine_id.clone()),
+                    owner: chain_forge_resource::ProviderOwner::Individual(
+                        chain_forge_resource::SponsorId(tx.sender.clone()),
+                    ),
+                    attestation_key: chain_forge_resource::MachineAttestationKey {
+                        public_key_b64: attestation_key_b64.clone(),
+                    },
+                    capability_descriptor,
+                    mode: machine_mode,
+                    status: chain_forge_resource::MachineStatus::Active,
+                };
+                // Serialize and store in a virtual state account.
+                // The JSON record is stored in the account's `role` field.
+                let record_json = serde_json::to_string(&record)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let mut acct = chain_forge_state::AccountState::new(
+                    machine_key.clone(), record_json,
+                );
+                // Credit a sentinel balance so the account is non-empty.
+                acct.credit("machine_registered", 1);
+                state.upsert_account(acct);
+                state.refresh_leaf(&machine_key);
+                events.push(format!(
+                    "register_machine: machine_id={} owner={} mode={:?} display_name={}",
+                    machine_id, tx.sender, machine_mode, display_name
+                ));
+                Ok(())
+            }
+
+            TxBody::SubmitUsefulWork {
+                receipt_id,
+                machine_id,
+                challenge_id,
+                output_hash,
+                seal_nonce,
+                seal_hash,
+                seal_difficulty_bits,
+                min_difficulty_override,
+            } => {
+                // Machine must be registered.
+                let machine_key = format!("machine:{}", machine_id);
+                if state.get_account(&machine_key).is_err() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SubmitUsefulWork: machine {} is not registered",
+                            machine_id
+                        ),
+                    );
+                }
+                // Reject duplicate receipts.
+                let receipt_key = format!("gc_receipt:{}", receipt_id);
+                if state.get_account(&receipt_key).is_ok() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SubmitUsefulWork: receipt {} already recorded (duplicate)",
+                            receipt_id
+                        ),
+                    );
+                }
+                // Enforce minimum difficulty when an override is set.
+                if *min_difficulty_override > 0 && seal_difficulty_bits < min_difficulty_override {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SubmitUsefulWork: seal_difficulty_bits {} is below \
+                             required minimum {}",
+                            seal_difficulty_bits, min_difficulty_override
+                        ),
+                    );
+                }
+                // Verify the seal (single SHA-256 call).
+                let dummy_receipt = chain_forge_resource::UsefulWorkReceipt {
+                    receipt_id:          receipt_id.clone(),
+                    work_type:           chain_forge_resource::WorkType::ResearchContribution,
+                    challenge_id:        challenge_id.clone(),
+                    machine_id:          chain_forge_resource::MachineId(machine_id.clone()),
+                    input_hash:          "0".repeat(64),
+                    output_hash:         output_hash.clone(),
+                    methodology_ref:     String::new(),
+                    nonce:               0,
+                    checks_performed:    0,
+                    elapsed_seconds:     0.0,
+                    timestamp_utc:       String::new(),
+                    machine_signature:   String::new(),
+                    verified:            false,
+                    verifier_id:         None,
+                    verifier_signature:  None,
+                    seal_nonce:          *seal_nonce,
+                    seal_hash:           seal_hash.clone(),
+                    seal_difficulty_bits: *seal_difficulty_bits,
+                };
+                if !chain_forge_resource::verify_seal(&dummy_receipt) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SubmitUsefulWork: seal verification failed for receipt {} \
+                             (challenge={}, difficulty={})",
+                            receipt_id, challenge_id, seal_difficulty_bits
+                        ),
+                    );
+                }
+                // Store the receipt in state.
+                // The JSON receipt is stored in the account's `role` field.
+                let receipt_json = serde_json::to_string(&dummy_receipt)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let mut receipt_acct = chain_forge_state::AccountState::new(
+                    receipt_key.clone(), receipt_json,
+                );
+                // Credit a sentinel balance so the account is non-empty.
+                receipt_acct.credit("gc_receipt_recorded", 1);
+                state.upsert_account(receipt_acct);
+                state.refresh_leaf(&receipt_key);
+                // Increment contribution score for this machine.
+                let score_key = format!("contribution_score:{}", machine_id);
+                if state.get_account(&score_key).is_err() {
+                    let score_acct = chain_forge_state::AccountState::new(
+                        score_key.clone(), "contribution_score".to_string(),
+                    );
+                    state.upsert_account(score_acct);
+                }
+                if let Ok(acct) = state.get_account_mut(&score_key) {
+                    acct.credit("score", 1);
+                }
+                state.refresh_leaf(&score_key);
+                let new_score = state.get_account(&score_key)
+                    .map(|a| a.balance_of("score"))
+                    .unwrap_or(0);
+                events.push(format!(
+                    "submit_useful_work: receipt_id={} machine_id={} challenge_id={} \
+                     seal_difficulty={} contribution_score={}",
+                    receipt_id, machine_id, challenge_id, seal_difficulty_bits, new_score
+                ));
+                Ok(())
+            }
         };
 
         if result.is_ok() {
@@ -3252,6 +3512,10 @@ impl Executor {
             // Agent Treasury requires the full identity- and agent-aware executor.
             TxBody::DepositToTreasury { .. } => {
                 Err("AgentTreasury transaction requires identity- and agent-aware executor".to_string())
+            }
+            // Contribution Layer requires identity- and state-aware executor.
+            TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => {
+                Err("Contribution layer transaction requires identity- and state-aware executor".to_string())
             }
         };
 

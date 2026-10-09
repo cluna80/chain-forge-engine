@@ -352,6 +352,9 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RefundQrcForJob { .. }          => "refund_qrc_for_job",
         // Agent Treasury
         TxBody::DepositToTreasury { .. }        => "deposit_to_treasury",
+        // Contribution Layer
+        TxBody::RegisterMachine { .. }          => "register_machine",
+        TxBody::SubmitUsefulWork { .. }         => "submit_useful_work",
     }
 }
 
