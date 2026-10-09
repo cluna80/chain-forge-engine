@@ -2413,6 +2413,128 @@ impl Executor {
                             epoch, summary.epoch_minted, summary.provider_rewards,
                             summary.reserve_balance
                         ));
+
+                        // ── Phase 1B: PoCD contribution reward distribution ──
+                        // Collect all gc_receipt accounts not yet rewarded.
+                        let receipt_accounts: Vec<(String, chain_forge_resource::UsefulWorkReceipt)> = {
+                            state.all_accounts()
+                                .filter(|a| a.address.starts_with("gc_receipt:") && a.balance_of("gc_receipt_recorded") > 0 && a.balance_of("gc_reward_paid") == 0)
+                                .filter_map(|a| {
+                                    serde_json::from_str::<chain_forge_resource::UsefulWorkReceipt>(&a.role)
+                                        .ok()
+                                        .map(|r| (a.address.clone(), r))
+                                })
+                                .collect()
+                        };
+
+                        if !receipt_accounts.is_empty() {
+                            // Convert UsefulWorkReceipt → DiscoveryReceipt for the reward policy.
+                            let discovery_receipts: Vec<chain_forge_pocd::DiscoveryReceipt> =
+                                receipt_accounts.iter().map(|(_, r)| {
+                                    chain_forge_pocd::DiscoveryReceipt {
+                                        receipt_id:           r.receipt_id.clone(),
+                                        chain_id:             "qcb-devnet-1".to_string(),
+                                        challenge_id:         r.challenge_id.clone(),
+                                        machine_id:           r.machine_id.0.clone(),
+                                        output_hash:          r.output_hash.clone(),
+                                        input_hash:           r.input_hash.clone(),
+                                        methodology_ref:      r.methodology_ref.clone(),
+                                        discovery_nonce:      r.nonce,
+                                        checks_performed:     r.checks_performed,
+                                        elapsed_seconds:      r.elapsed_seconds,
+                                        submitted_at:         r.timestamp_utc.clone(),
+                                        machine_signature:    r.machine_signature.clone(),
+                                        seal_nonce:           r.seal_nonce,
+                                        seal_hash:            r.seal_hash.clone(),
+                                        seal_difficulty_bits: r.seal_difficulty_bits,
+                                        verifier_id:          r.verifier_id.clone().unwrap_or_default(),
+                                        verifier_signature:   r.verifier_signature.clone().unwrap_or_default(),
+                                        committed_at_block:   state.current_height(),
+                                        reward_distributed:   false,
+                                        _proof_id:            r.receipt_id.clone(),
+                                    }
+                                }).collect();
+
+                            let refs: Vec<&chain_forge_pocd::DiscoveryReceipt> =
+                                discovery_receipts.iter().collect();
+
+                            let policy = chain_forge_qrc::QcbRewardPolicy::default_for_devnet(
+                                "treasury:pocd"
+                            );
+                            use chain_forge_pocd::RewardPolicy as _;
+                            match policy.compute_rewards(&refs) {
+                                Ok(grants) => {
+                                    let pocd_treasury = "treasury:pocd";
+                                    // Ensure treasury account exists.
+                                    if state.get_account(pocd_treasury).is_err() {
+                                        let ta = chain_forge_state::AccountState::new(
+                                            pocd_treasury.to_string(), "treasury".to_string(),
+                                        );
+                                        state.upsert_account(ta);
+                                    }
+                                    let treasury_bal = state.get_account(pocd_treasury)
+                                        .map(|a| a.balance_of("uqrc"))
+                                        .unwrap_or(0);
+
+                                    let total_grant: u64 = grants.iter().map(|g| g.amount).sum();
+                                    let disbursable = total_grant.min(treasury_bal as u64);
+
+                                    let mut paid: u64 = 0;
+                                    for grant in &grants {
+                                        if paid + grant.amount > disbursable { break; }
+                                        // Ensure recipient wallet exists.
+                                        if state.get_account(&grant.recipient_wallet).is_err() {
+                                            let wa = chain_forge_state::AccountState::new(
+                                                grant.recipient_wallet.clone(), "machine_wallet".to_string(),
+                                            );
+                                            state.upsert_account(wa);
+                                        }
+                                        if let Ok(acct) = state.get_account_mut(&grant.recipient_wallet) {
+                                            acct.credit("uqrc", grant.amount as u128);
+                                        }
+                                        state.refresh_leaf(&grant.recipient_wallet);
+                                        paid += grant.amount;
+                                        events.push(format!(
+                                            "pocd_reward: receipt_id={} machine_id={} wallet={} amount_uqrc={}",
+                                            grant.receipt_id, grant.machine_id,
+                                            grant.recipient_wallet, grant.amount
+                                        ));
+                                    }
+                                    // Debit PoCD treasury.
+                                    if paid > 0 {
+                                        if let Ok(ta) = state.get_account_mut(pocd_treasury) {
+                                            let _ = ta.debit("uqrc", paid as u128);
+                                        }
+                                        state.refresh_leaf(pocd_treasury);
+                                    }
+                                    // Mark receipts as rewarded.
+                                    for (addr, _) in &receipt_accounts {
+                                        if let Ok(ra) = state.get_account_mut(addr) {
+                                            ra.credit("gc_reward_paid", 1);
+                                        }
+                                        state.refresh_leaf(addr);
+                                    }
+                                    events.push(format!(
+                                        "pocd_epoch_distribution: epoch={} receipts={} total_granted_uqrc={} disbursed_uqrc={}",
+                                        epoch,
+                                        receipt_accounts.len(),
+                                        total_grant,
+                                        paid
+                                    ));
+                                }
+                                Err(e) => {
+                                    // Non-fatal: log and continue. Receipts stay un-rewarded
+                                    // until the next epoch close.
+                                    tracing::warn!(epoch=%epoch, error=%e,
+                                        "PoCD reward computation failed; receipts will retry next epoch");
+                                    events.push(format!(
+                                        "pocd_reward_error: epoch={} error={}",
+                                        epoch, e
+                                    ));
+                                }
+                            }
+                        }
+
                         Ok(())
                     }
                     Err(e) => Err(format!("EpochClose: {e}")),
