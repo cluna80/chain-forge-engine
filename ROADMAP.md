@@ -85,12 +85,12 @@
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `chain-forge-resource` crate scaffold | ⬜ | New workspace crate; `ResourceOffer`, `ResourceRequest`, `ResourceMatch`, `ResourceJob`, `ResourceReceipt`, `ResourceMeter`, `ResourceProof`, `ResourceSettlement` |
-| `ResourceCapabilityDescriptor` | ⬜ | Standardized vocabulary: `kind`, `architecture`, `cpu_cores`, `memory_bytes`, `gpu_model`, `gpu_memory`, `storage_bytes`, `bandwidth`, `runtime_types`, `price`, `max_job_duration`; agents use this to intelligently choose providers |
-| `ResourceJob` state machine | ⬜ | States: `CREATED → FUNDED → MATCHED → RUNNING → (COMPLETED / FAILED) → (VERIFIED / REFUND) → SETTLED`; plus `DISPUTED → RESOLUTION` branch; state machine must have room for future decentralized arbitration |
-| `ResourceExecutionReceipt` | ⬜ | Evolves from `CapacityEvidence_v0`; fields: `job_id`, `provider_id`, **`machine_id`**, `requester_agent_id`, `resource_type`, `requested_units`, `measured_units`, `started_at`, `finished_at`, `input_hash`, `output_hash`, `provider_signature`, `requester_confirmation`, `verification_status`; `machine_id` is essential later when one ProviderID covers many machines — you need to know which physical resource did the work |
+| `chain-forge-resource` crate scaffold | ✅ | `MachineRecord`, `ResourceCapabilityDescriptor`, `ResourceJob`, `ResourceExecutionReceipt`, `LockQrcForJob`/`ReleaseQrcForJob`/`RefundQrcForJob`; 23 unit tests passing |
+| `ResourceCapabilityDescriptor` | ✅ | `ComputeClass`, `MemoryTier`, `StorageTier`, `PriceModel`, ISA tags; `satisfies()` matcher lets agents check if provider meets job requirements; 8 unit tests |
+| `ResourceJob` state machine | ✅ | Full `CREATED→FUNDED→MATCHED→RUNNING→(COMPLETED/FAILED)→(VERIFIED/REFUND)→SETTLED` + `DISPUTED→RESOLUTION` branch; `is_terminal()` guard; 9 unit tests covering all paths + invalid-transition rejection |
+| `ResourceExecutionReceipt` | ✅ | `ResourceExecutionReceipt` + `UsefulWorkReceipt`; `compute_seal_hash`, `find_seal_nonce`, `meets_difficulty`, `verify_seal`; 6 unit tests |
 | P2P resource discovery | ⬜ | Agents broadcast `ResourceRequest` over libp2p gossip; providers respond with `ResourceOffer`; live availability stays off-chain; only economically important commitments/results go on-chain |
-| QRC escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ✅ | Agent locks QRC before job starts; provider receives only on verified completion; refund path for failure/timeout; `DisputeResourceJob` stub for Phase 1; `RefundReason` enum covers all failure cases |
+| QRC escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ✅ | Agent locks QRC before job starts; provider receives only on verified completion; refund path for failure/timeout; N3/N4/N5 guards tested; `DisputeResourceJob` stub for Phase 1; `RefundReason` enum covers all failure cases |
 | `ResourceNode` prototype (Machine 2) | ⬜ | Machine 2 (Carol) advertises: `ProviderID`, `SponsorID`, **`MachineID`**, resource capabilities, `container_execution` + `python_execution` runtime types, availability, price, location/latency region, resource limits |
 | Secure workload sandbox (container) | ⬜ | Resource providers cannot execute arbitrary agent code on bare host; Docker/container prototype for Phase 0; note: production hostile multi-tenant workloads need stronger isolation — containers are a Phase 0 approximation only |
 | Job cancellation / failure / timeout handling | ⬜ | Explicit handling for: provider disappear mid-job, agent sends invalid workload, connection fails, provider produces wrong output, agent falsely claims failure, provider claims completion but result is unusable |
@@ -101,9 +101,9 @@
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `AgentID` + `SponsorID` linkage primitive | ⬜ | `MachineID → ProviderID → SponsorID` for resource nodes; one verified human can operate multiple machines; machines have cryptographic identities tracing to human SponsorID |
-| **`MachineID` formalization** | ⬜ | `MachineRecord { machine_id, provider_id, owner: ProviderOwner, attestation_key, capability_descriptor, status }`; `MachineAttestationKey` is a separate signing key from the provider's identity key; `MachineStatus` (Active / Inactive / Suspended) |
-| **`ProviderOwner` enum** | ⬜ | `enum ProviderOwner { Individual(SponsorId), Enterprise(EnterpriseId) }` — Phase 0 uses `Individual(Carol)`; Phase 1 adds `Enterprise(Acme)` without ripping apart `ResourceJob`, escrow, reputation, or discovery; **define the enum now so Phase 0 code doesn't hard-assume `provider.sponsor_id` is the only ownership structure forever** |
+| `AgentID` + `SponsorID` linkage primitive | ✅ | `AgentId` in `chain-forge-resource`; `SponsorId` in `MachineRecord.owner`; `MachineID → ProviderID → SponsorID` hierarchy is expressed via `ProviderOwner` |
+| **`MachineID` formalization** | ✅ | `MachineRecord { machine_id, owner: ProviderOwner, attestation_key, capability_descriptor, mode, status }`; `MachineAttestationKey` (Ed25519 pubkey, base64); `MachineStatus` (Pending/Active/Inactive/Banned) |
+| **`ProviderOwner` enum** | ✅ | `enum ProviderOwner { Individual(SponsorId), Enterprise(EnterpriseId) }` — defined; Phase 0 uses `Individual(Carol)`; Phase 1 adds `Enterprise(Acme)` without ripping apart ResourceJob, escrow, or discovery |
 | `AgentTreasury` primitive | ✅ | `treasury:{agent_id}` virtual account; credited by `DepositToTreasury` tx; debited by `LockQrcForJob` (treasury-first, fallback to agent wallet); `per_job_limit_uqrc` cap enforced at execution; sponsor gate on deposit |
 | `CapabilitySet` + `SpendingLimits` | ✅ | `SpendingLimits` struct (`epoch_limit`, `lifetime_limit`, `max_balance`, `per_job_limit`); `check_per_job()` enforcer; `resource_agent()` preset; agent cannot exceed sponsor's authorization |
 | `RevenuePolicy` primitive | ⬜ | Configurable destination for agent revenue; e.g. `Sponsor: 30% / AgentTreasury: 60% / Reserve: 10%`; successful service settles automatically |

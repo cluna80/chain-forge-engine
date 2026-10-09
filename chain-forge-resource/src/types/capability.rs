@@ -76,3 +76,107 @@ pub struct ResourceCapabilityDescriptor {
     /// Arbitrary metadata the operator wants to advertise.
     pub extra: std::collections::HashMap<String, String>,
 }
+
+impl ResourceCapabilityDescriptor {
+    /// Returns `true` if this machine satisfies the minimum requirements
+    /// expressed in `requirement`.
+    ///
+    /// Rules:
+    /// - `compute_class` must match exactly.
+    /// - Provider must offer at least as many `compute_units`.
+    /// - Provider's `memory_tier` must be ≥ required tier.
+    /// - All required `isa_tags` must be present in the provider's list
+    ///   (provider may advertise more tags than required).
+    ///
+    /// `storage_tier`, `price_model`, `daemon_version`, and `extra` are
+    /// intentionally not checked here — matchmaking policy for those lives
+    /// in the marketplace layer, not in the descriptor itself.
+    pub fn satisfies(&self, requirement: &ResourceCapabilityDescriptor) -> bool {
+        self.compute_class == requirement.compute_class
+            && self.compute_units >= requirement.compute_units
+            && self.memory_tier  >= requirement.memory_tier
+            && requirement.isa_tags.iter().all(|tag| self.isa_tags.contains(tag))
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desc(
+        class: ComputeClass,
+        units: u32,
+        mem: MemoryTier,
+        tags: &[&str],
+    ) -> ResourceCapabilityDescriptor {
+        ResourceCapabilityDescriptor {
+            compute_class:  class,
+            compute_units:  units,
+            memory_tier:    mem,
+            storage_tier:   StorageTier::Ssd,
+            isa_tags:       tags.iter().map(|s| s.to_string()).collect(),
+            price_model:    PriceModel::PerJob { qrc_flat: 1_000 },
+            daemon_version: "0.1.0".into(),
+            extra:          Default::default(),
+        }
+    }
+
+    #[test]
+    fn satisfies_exact_match() {
+        let provider = desc(ComputeClass::Cpu, 8, MemoryTier::Medium, &["AVX2"]);
+        let req      = desc(ComputeClass::Cpu, 8, MemoryTier::Medium, &["AVX2"]);
+        assert!(provider.satisfies(&req));
+    }
+
+    #[test]
+    fn satisfies_superset_units_and_memory() {
+        let provider = desc(ComputeClass::Gpu, 64, MemoryTier::XLarge, &["CUDA12"]);
+        let req      = desc(ComputeClass::Gpu,  8, MemoryTier::Large,  &["CUDA12"]);
+        assert!(provider.satisfies(&req));
+    }
+
+    #[test]
+    fn satisfies_superset_isa_tags() {
+        // Provider advertises more tags than required — still satisfies.
+        let provider = desc(ComputeClass::Cpu, 16, MemoryTier::Large, &["AVX2", "AVX512", "AMX"]);
+        let req      = desc(ComputeClass::Cpu, 16, MemoryTier::Large, &["AVX2"]);
+        assert!(provider.satisfies(&req));
+    }
+
+    #[test]
+    fn rejects_wrong_compute_class() {
+        let provider = desc(ComputeClass::Cpu, 8, MemoryTier::Medium, &[]);
+        let req      = desc(ComputeClass::Gpu, 8, MemoryTier::Medium, &[]);
+        assert!(!provider.satisfies(&req));
+    }
+
+    #[test]
+    fn rejects_insufficient_units() {
+        let provider = desc(ComputeClass::Cpu, 4, MemoryTier::Large, &[]);
+        let req      = desc(ComputeClass::Cpu, 8, MemoryTier::Large, &[]);
+        assert!(!provider.satisfies(&req));
+    }
+
+    #[test]
+    fn rejects_insufficient_memory() {
+        let provider = desc(ComputeClass::Cpu, 8, MemoryTier::Small, &[]);
+        let req      = desc(ComputeClass::Cpu, 8, MemoryTier::Medium, &[]);
+        assert!(!provider.satisfies(&req));
+    }
+
+    #[test]
+    fn rejects_missing_isa_tag() {
+        let provider = desc(ComputeClass::Cpu, 8, MemoryTier::Large, &["AVX2"]);
+        let req      = desc(ComputeClass::Cpu, 8, MemoryTier::Large, &["AVX2", "AVX512"]);
+        assert!(!provider.satisfies(&req));
+    }
+
+    #[test]
+    fn no_required_isa_tags_always_ok() {
+        let provider = desc(ComputeClass::Gpu, 32, MemoryTier::Medium, &[]);
+        let req      = desc(ComputeClass::Gpu, 16, MemoryTier::Small,  &[]);
+        assert!(provider.satisfies(&req));
+    }
+}

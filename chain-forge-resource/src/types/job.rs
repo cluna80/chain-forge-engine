@@ -168,4 +168,187 @@ impl ResourceJob {
         self.updated_at = now.to_owned();
         Ok(())
     }
+
+    /// Returns true if the job has reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.state, JobState::Settled | JobState::Refunded)
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::capability::{
+        ComputeClass, MemoryTier, PriceModel, ResourceCapabilityDescriptor, StorageTier,
+    };
+
+    fn test_spec() -> JobSpec {
+        JobSpec {
+            description: "unit test job".into(),
+            workload_ref: "ipfs://Qm000".into(),
+            requirements: ResourceCapabilityDescriptor {
+                compute_class:  ComputeClass::Cpu,
+                compute_units:  4,
+                memory_tier:    MemoryTier::Small,
+                storage_tier:   StorageTier::Ssd,
+                isa_tags:       vec![],
+                price_model:    PriceModel::PerJob { qrc_flat: 1_000 },
+                daemon_version: "0.1.0".into(),
+                extra:          Default::default(),
+            },
+            timeout_seconds: 300,
+            max_qrc_budget:  5_000,
+        }
+    }
+
+    fn make_job() -> ResourceJob {
+        ResourceJob::new(
+            JobId("job-001".into()),
+            AgentId("agent-alice".into()),
+            test_spec(),
+            "2026-10-09T00:00:00Z",
+        )
+    }
+
+    // ── Happy path: Created → Funded → Matched → Running → Completed → Verified → Settled
+
+    #[test]
+    fn happy_path_success() {
+        let mut job = make_job();
+        assert_eq!(job.state, JobState::Created);
+        assert!(!job.is_terminal());
+
+        job.transition(JobState::Funded,    "t1", None).unwrap();
+        job.transition(JobState::Matched,   "t2", None).unwrap();
+        job.transition(JobState::Running,   "t3", None).unwrap();
+        job.transition(JobState::Completed, "t4", None).unwrap();
+        job.transition(JobState::Verified,  "t5", None).unwrap();
+        job.transition(JobState::Settled,   "t6", None).unwrap();
+
+        assert_eq!(job.state, JobState::Settled);
+        assert!(job.is_terminal());
+        assert_eq!(job.history.len(), 6);
+    }
+
+    // ── Failure path: Created → Funded → Matched → Running → Failed → Refunded
+
+    #[test]
+    fn failure_path_refund() {
+        let mut job = make_job();
+        job.transition(JobState::Funded,   "t1", None).unwrap();
+        job.transition(JobState::Matched,  "t2", None).unwrap();
+        job.transition(JobState::Running,  "t3", None).unwrap();
+        job.transition(JobState::Failed,   "t4", Some("machine timed out".into())).unwrap();
+        job.transition(JobState::Refunded, "t5", None).unwrap();
+
+        assert_eq!(job.state, JobState::Refunded);
+        assert!(job.is_terminal());
+        assert_eq!(job.history[3].note.as_deref(), Some("machine timed out"));
+    }
+
+    // ── Dispute path: Running → Disputed → Resolution → Settled
+
+    #[test]
+    fn dispute_path_settled() {
+        let mut job = make_job();
+        job.transition(JobState::Funded,     "t1", None).unwrap();
+        job.transition(JobState::Matched,    "t2", None).unwrap();
+        job.transition(JobState::Running,    "t3", None).unwrap();
+        job.transition(JobState::Disputed,   "t4", Some("requester claims no output".into())).unwrap();
+        job.transition(JobState::Resolution, "t5", None).unwrap();
+        job.transition(JobState::Settled,    "t6", None).unwrap();
+
+        assert_eq!(job.state, JobState::Settled);
+        assert!(job.is_terminal());
+    }
+
+    // ── Dispute path: Funded → Disputed → Resolution → Refunded
+
+    #[test]
+    fn dispute_from_funded_refund() {
+        let mut job = make_job();
+        job.transition(JobState::Funded,     "t1", None).unwrap();
+        job.transition(JobState::Disputed,   "t2", Some("no machine assigned".into())).unwrap();
+        job.transition(JobState::Resolution, "t3", None).unwrap();
+        job.transition(JobState::Refunded,   "t4", None).unwrap();
+
+        assert_eq!(job.state, JobState::Refunded);
+        assert!(job.is_terminal());
+    }
+
+    // ── Invalid transitions must be rejected ──────────────────────────────────
+
+    #[test]
+    fn reject_created_to_running() {
+        let mut job = make_job();
+        let err = job.transition(JobState::Running, "t1", None).unwrap_err();
+        assert!(matches!(err, crate::error::ResourceError::InvalidTransition { .. }));
+        assert_eq!(job.state, JobState::Created); // state unchanged
+        assert_eq!(job.history.len(), 0);         // no history entry
+    }
+
+    #[test]
+    fn reject_settled_to_any() {
+        let mut job = make_job();
+        for s in [JobState::Funded, JobState::Matched, JobState::Running,
+                   JobState::Completed, JobState::Verified] {
+            job.transition(s, "tx", None).unwrap_or_default();
+        }
+        job.transition(JobState::Settled, "tx", None).unwrap_or_default();
+        assert_eq!(job.state, JobState::Settled);
+
+        // From terminal Settled, no further transitions are allowed.
+        for next in [JobState::Funded, JobState::Disputed, JobState::Refunded,
+                      JobState::Created] {
+            let err = job.transition(next, "tx", None).unwrap_err();
+            assert!(matches!(err, crate::error::ResourceError::InvalidTransition { .. }));
+        }
+        assert_eq!(job.state, JobState::Settled); // still terminal
+    }
+
+    #[test]
+    fn reject_skip_funded_to_completed() {
+        let mut job = make_job();
+        job.transition(JobState::Funded,  "t1", None).unwrap();
+        job.transition(JobState::Matched, "t2", None).unwrap();
+        // Skip Running → directly to Completed is illegal
+        let err = job.transition(JobState::Completed, "t3", None).unwrap_err();
+        assert!(matches!(err, crate::error::ResourceError::InvalidTransition { .. }));
+        assert_eq!(job.state, JobState::Matched);
+    }
+
+    // ── History audit trail ───────────────────────────────────────────────────
+
+    #[test]
+    fn history_records_from_and_to() {
+        let mut job = make_job();
+        job.transition(JobState::Funded, "2026-10-09T00:01:00Z", Some("funded".into())).unwrap();
+        assert_eq!(job.history[0].from, JobState::Created);
+        assert_eq!(job.history[0].to,   JobState::Funded);
+        assert_eq!(job.history[0].timestamp_utc, "2026-10-09T00:01:00Z");
+        assert_eq!(job.history[0].note.as_deref(), Some("funded"));
+    }
+
+    // ── is_terminal covers all terminal states ────────────────────────────────
+
+    #[test]
+    fn is_terminal_only_settled_and_refunded() {
+        use JobState::*;
+        let non_terminal = [Created, Funded, Matched, Running, Completed,
+                             Failed, Verified, Disputed, Resolution];
+        let terminal     = [Settled, Refunded];
+
+        for s in non_terminal {
+            let mut job = make_job();
+            job.state = s;
+            assert!(!job.is_terminal(), "{s:?} should not be terminal");
+        }
+        for s in terminal {
+            let mut job = make_job();
+            job.state = s;
+            assert!(job.is_terminal(), "{s:?} should be terminal");
+        }
+    }
 }
