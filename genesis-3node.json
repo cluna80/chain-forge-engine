@@ -32,7 +32,7 @@
     "pqc_algorithm": "ml-dsa",
     "migration_trigger": "nist-guidance",
     "hash_width": 256,
-    "validator_scheme": "pqc-native"
+    "validator_scheme": "classical-ed25519"
   },
   "network": {
     "network_id": "qcb-testnet-3node",
@@ -67,21 +67,21 @@
       "address": "qcb1alice",
       "balance": "100000000",
       "role": "validator",
-      "public_key": "da0c2876278f30cab801c3ca16130a1bf7db0aa499f5616a52bab25c9f2632e1"
+      "public_key": "7869474df5c3c7a4629ee8ed8b9d74b89ae2f07dad3938d5eaeb5d600ed51748"
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
       "balance": "100000000",
       "role": "validator",
-      "public_key": "d31f6b7163f8544daf83767f2a2f7e94ab37ea97973be9b7f9141e161eafda95"
+      "public_key": "e88d88dcfb29e249468eb7ecac131b3cfe6af53c6ebe7eb3d771ce4c2b0bbb02"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
       "balance": "100000000",
       "role": "validator",
-      "public_key": "7610e5974ca876a093d5e9a6a3fa1e64b6a4721e4d3073c2dc06a870ad0cbdc0"
+      "public_key": "6a5d93dee87bc3b9a62476ec3ff1f6290c133e53fd86add16e4ef4327a5ff2fa"
     }
   ],
   "attestation_coordinator": "qcb1alice",
