@@ -3242,9 +3242,14 @@ impl Executor {
                 // a different coordinator cannot release or refund another party's escrow.
                 {
                     let escrow_role = format!("escrow:authorized={}", tx.sender);
-                    let new_escrow = chain_forge_state::AccountState::new(
+                    let mut new_escrow = chain_forge_state::AccountState::new(
                         escrow_key.clone(), escrow_role
                     );
+                    new_escrow.escrow = Some(chain_forge_state::EscrowBinding {
+                        job_id: job_id.clone(),
+                        agent_wallet: agent_wallet.clone(),
+                        funding_source: debit_from.clone(),
+                    });
                     state.upsert_account(new_escrow);
                 }
                 if let Ok(acct) = state.get_account_mut(&escrow_key) {
@@ -3365,18 +3370,34 @@ impl Executor {
                         ),
                     );
                 }
-                // Ensure agent wallet account exists.
-                if state.get_account(agent_wallet).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        agent_wallet.clone(), "user".to_string()
-                    );
-                    state.upsert_account(new_acct);
+                let escrow_key = format!("escrow:{}", escrow_id);
+                let escrow = match state.get_account(&escrow_key) {
+                    Ok(account) => account,
+                    Err(_) => return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
+                        "resource settlement: escrow does not exist".to_string()),
+                };
+                let binding = match escrow.escrow.as_ref() {
+                    Some(binding) if binding.job_id == *job_id => binding.clone(),
+                    _ => return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
+                        "resource settlement: missing or mismatched job binding".to_string()),
+                };
+                if *amount == 0 || escrow.balance_of("uqrc") < *amount as u128 {
+                    return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
+                        "resource settlement: zero amount or insufficient escrow balance".to_string());
                 }
-                // Return the locked QRC to the agent wallet.
-                if let Ok(acct) = state.get_account_mut(agent_wallet) {
-                    acct.credit("uqrc", *amount as u128);
+                if binding.agent_wallet != *agent_wallet || escrow.balance_of("uqrc") != *amount as u128 {
+                    return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
+                        "resource refund: wallet mismatch or refund must equal remaining escrow".to_string());
                 }
-                state.refresh_leaf(agent_wallet);
+                let destination = binding.funding_source;
+                if state.get_account(&destination).is_err() {
+                    return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
+                        "resource refund: original funding account missing".to_string());
+                }
+                state.get_account_mut(&escrow_key).unwrap().debit("uqrc", *amount as u128).unwrap();
+                state.get_account_mut(&destination).unwrap().credit("uqrc", *amount as u128);
+                state.refresh_leaf(&escrow_key);
+                state.refresh_leaf(&destination);
                 events.push(format!(
                     "refund_qrc_for_job: escrow_id={} job_id={} agent_wallet={} \
                      amount={} reason={:?} coordinator={}",
@@ -4284,6 +4305,65 @@ mod tests {
         let qrc = QrcEngine::new(chain_forge_qrc::D);
         let agents = AgentStore::new();
         (Executor::new(config), state, identity, qrc, agents)
+    }
+
+    #[test]
+    fn escrow_settlement_conserves_qrc_and_rejects_repeat_payouts() {
+        for treasury_funded in [false, true] {
+            for refund in [false, true] {
+                let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+                let source = if treasury_funded { "treasury:worker" } else { "worker" };
+                let mut account = chain_forge_state::AccountState::new(source.into(), "user".into());
+                account.credit("uqrc", 1_000);
+                state.upsert_account(account);
+                let lock = Transaction::lock_qrc_for_job("lock", "qcb1alice", "e", "j", "worker", 800, 0);
+                let result = exec.execute_tx_with_identity(&lock, &mut state, &mut identity, &mut qrc, &mut agents);
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(state.get_account(source).unwrap().balance_of("uqrc"), 200);
+                assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqrc"), 800);
+                let destination = if refund { source } else { "provider" };
+                let make_tx = |id: &str, nonce| if refund {
+                    Transaction::refund_qrc_for_job(id, "qcb1alice", "e", "j", "worker", 800,
+                        chain_forge_resource::RefundReason::Timeout, nonce)
+                } else {
+                    Transaction::release_qrc_for_job(id, "qcb1alice", "e", "j", "machine", "provider", 800, "receipt", nonce)
+                };
+                let result = exec.execute_tx_with_identity(&make_tx("settle", 1), &mut state, &mut identity, &mut qrc, &mut agents);
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqrc"), 0);
+                assert_eq!(state.get_account(destination).unwrap().balance_of("uqrc"), if refund { 1_000 } else { 800 });
+                let result = exec.execute_tx_with_identity(&make_tx("repeat", 2), &mut state, &mut identity, &mut qrc, &mut agents);
+                assert!(!result.success);
+                assert!(result.error.unwrap().contains("insufficient escrow"));
+                assert_eq!(state.get_account(destination).unwrap().balance_of("uqrc"), if refund { 1_000 } else { 800 });
+            }
+        }
+    }
+
+    #[test]
+    fn escrow_settlement_rejects_invalid_bindings_and_overpayment() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let mut account = chain_forge_state::AccountState::new("worker".into(), "user".into());
+        account.credit("uqrc", 1_000);
+        state.upsert_account(account);
+        let lock = Transaction::lock_qrc_for_job("lock", "qcb1alice", "e", "j", "worker", 800, 0);
+        assert!(exec.execute_tx_with_identity(&lock, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        let invalid = [
+            Transaction::release_qrc_for_job("missing", "qcb1alice", "missing", "j", "m", "provider", 800, "r", 1),
+            Transaction::release_qrc_for_job("wrong-job", "qcb1alice", "e", "wrong", "m", "provider", 800, "r", 1),
+            Transaction::release_qrc_for_job("over", "qcb1alice", "e", "j", "m", "provider", 801, "r", 1),
+            Transaction::release_qrc_for_job("zero", "qcb1alice", "e", "j", "m", "provider", 0, "r", 1),
+            Transaction::release_qrc_for_job("self", "qcb1alice", "e", "j", "m", "escrow:e", 800, "r", 1),
+            Transaction::refund_qrc_for_job("wrong-wallet", "qcb1alice", "e", "j", "other", 800, chain_forge_resource::RefundReason::Timeout, 1),
+            Transaction::refund_qrc_for_job("partial", "qcb1alice", "e", "j", "worker", 799, chain_forge_resource::RefundReason::Timeout, 1),
+        ];
+        for tx in invalid {
+            let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+            assert!(!result.success, "{} unexpectedly accepted", tx.id);
+            assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqrc"), 800);
+            assert_eq!(state.get_account("worker").unwrap().balance_of("uqrc"), 200);
+            assert!(state.get_account("provider").is_err());
+        }
     }
 
     // ── Deprecated UBI-era tx types (QRC Economic Model v0.1) ─────────────────

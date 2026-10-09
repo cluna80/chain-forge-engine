@@ -58,6 +58,9 @@ pub type StateResult<T> = Result<T, StateError>;
 /// The denom is stored per-account so multi-token chains work naturally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
+    /// Persistent job binding and original funding source for resource escrow.
+    #[serde(default)]
+    pub escrow: Option<EscrowBinding>,
     pub address: String,
     /// Balances keyed by token denom (e.g. "uqcb", "uqrc").
     pub balances: BTreeMap<String, u128>,
@@ -79,6 +82,13 @@ pub struct AccountState {
     pub public_key: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscrowBinding {
+    pub job_id: String,
+    pub agent_wallet: String,
+    pub funding_source: String,
+}
+
 impl AccountState {
     pub fn new(address: String, role: String) -> Self {
         Self {
@@ -88,6 +98,7 @@ impl AccountState {
             role,
             charm: None,
             public_key: None,
+            escrow: None,
         }
     }
 
@@ -102,6 +113,7 @@ impl AccountState {
             role,
             charm: Some(IntrinsicCharm::provisional(current_epoch)),
             public_key: None,
+            escrow: None,
         }
     }
 
@@ -196,6 +208,10 @@ impl AccountState {
         if let Some(pk) = &self.public_key {
             let hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
             parts.push(format!("pk={hex}"));
+        }
+        if let Some(binding) = &self.escrow {
+            // JSON string escaping prevents ambiguous job/source encodings.
+            parts.push(format!("escrow={}", serde_json::to_string(binding).unwrap()));
         }
         parts.join("|").into_bytes()
     }
@@ -571,6 +587,27 @@ mod tests {
 
     fn make_store() -> StateStore {
         StateStore::new(HashWidth::Bits256)
+    }
+
+    #[test]
+    fn escrow_binding_survives_serialization_and_affects_state_root() {
+        let mut account = AccountState::new("escrow:e".into(), "escrow".into());
+        let unbound = account.to_leaf_bytes();
+        account.escrow = Some(EscrowBinding {
+            job_id: "job".into(), agent_wallet: "agent".into(),
+            funding_source: "treasury:agent".into(),
+        });
+        assert_ne!(unbound, account.to_leaf_bytes());
+        let restored: AccountState = serde_json::from_str(&serde_json::to_string(&account).unwrap()).unwrap();
+        assert_eq!(restored.escrow.as_ref().unwrap().funding_source, "treasury:agent");
+        assert_eq!(restored.to_leaf_bytes(), account.to_leaf_bytes());
+        let mut changed = restored;
+        changed.escrow.as_mut().unwrap().job_id = "other".into();
+        assert_ne!(changed.to_leaf_bytes(), account.to_leaf_bytes());
+        let legacy: AccountState = serde_json::from_value(serde_json::json!({
+            "address": "legacy", "balances": {}, "nonce": 0, "role": "user", "charm": null
+        })).unwrap();
+        assert!(legacy.escrow.is_none());
     }
 
     #[test]
