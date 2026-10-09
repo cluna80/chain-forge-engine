@@ -1883,6 +1883,16 @@ impl Executor {
             );
         }
 
+        // Reject a tx whose gas_limit exceeds the block gas cap — such a tx
+        // can never be included in any block (B3: "absurd gas_limit rejected").
+        let block_gas_cap = self.config.block_gas_limit;
+        if tx.gas_limit > block_gas_cap {
+            return TransactionResult::err(
+                tx.id.clone(), gas_required, tx.gas_limit,
+                format!("gas limit {} exceeds block gas cap {}", tx.gas_limit, block_gas_cap),
+            );
+        }
+
         if let Err(e) = module_check(tx, &self.config.modules) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }

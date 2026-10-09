@@ -204,6 +204,22 @@ def wait_for_nonce(host: tuple, address: str, expected: int, timeout: int = 20) 
     return False
 
 
+def wait_for_tx(host: tuple, tx_id: str, timeout: int = 20) -> dict | None:
+    """Poll GET /api/tx/{id} until the tx appears in the explorer (executed).
+
+    Returns the TxSummary dict {"id", "height", "success", "error", ...}
+    or None on timeout.  A queued tx only appears after the block that
+    contains it is committed (block_time ~1 s), so allow a few seconds.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, body = get_json(host, f"/api/tx/{tx_id}")
+        if status == 200 and isinstance(body, dict) and "success" in body:
+            return body
+        time.sleep(0.5)
+    return None
+
+
 # Nonce tracker for the genesis sender used by funding helpers.
 # Each test gets its own fresh wallet, but funding all comes from ALICE_ADDR.
 # We track Alice's nonce here so parallel funding calls don't collide.
@@ -251,8 +267,12 @@ def fund_address(addr: str, amount: int = 2_000_000) -> bool:
 
 def submit_transfer(host: tuple, sender: str, wallet_path: str,
                     to: str, amount: int, nonce: int,
-                    chain_id: str | None = None) -> tuple[int, dict | str]:
-    """Sign and submit a transfer using the PQ wallet binary."""
+                    chain_id: str | None = None) -> tuple[int, dict | str, str]:
+    """Sign and submit a transfer using the PQ wallet binary.
+
+    Returns (http_status, response_body, tx_id).
+    Use wait_for_tx(host, tx_id) to get the execution result after queuing.
+    """
     if chain_id is None:
         chain_id = CHAIN_ID
     body_dict = make_transfer_body(to, amount)
@@ -263,16 +283,18 @@ def submit_transfer(host: tuple, sender: str, wallet_path: str,
         "--body",   body_json,
         "--chain-id", chain_id,
     )
+    tx_id = f"phase-b-{nonce}-{int(time.time()*1000)}"
     envelope = {
-        "id":           f"phase-b-{nonce}-{int(time.time()*1000)}",
-        "sender":       sender,
-        "nonce":        nonce,
-        "body":         body_dict,
-        "gas_limit":    500_000,
-        "signature":    [],          # Vec<u8> Ed25519 — empty (PQ wallet, no Ed25519 key)
-        "pq_signatures": [sig],      # Vec<String> — "mldsa65:<hex>"
+        "id":            tx_id,
+        "sender":        sender,
+        "nonce":         nonce,
+        "body":          body_dict,
+        "gas_limit":     500_000,
+        "signature":     [],          # Vec<u8> Ed25519 — empty (PQ wallet, no Ed25519 key)
+        "pq_signatures": [sig],       # Vec<String> — "mldsa65:<hex>"
     }
-    return post_json(host, "/api/tx", envelope)
+    s, r = post_json(host, "/api/tx", envelope)
+    return s, r, tx_id
 
 
 tmp_files: list[str] = []
@@ -292,23 +314,43 @@ def test_b1_nonce():
     time.sleep(1)  # let the funding tx commit and account appear
 
     # Valid tx (nonce=0) — should succeed
-    s1, r1 = submit_transfer(ALICE, addr, path, CAROL_ADDR, 100, nonce=0)
-    ok1 = s1 in (200, 201) or (isinstance(r1, dict) and r1.get("status") in ("accepted", "pending"))
-    result("B1 valid tx (nonce=0) accepted", ok1, f"status={s1} body={str(r1)[:60]}")
+    s1, r1, tid1 = submit_transfer(ALICE, addr, path, CAROL_ADDR, 100, nonce=0)
+    queued1 = s1 in (200, 201) or (isinstance(r1, dict) and r1.get("status") in ("accepted", "pending", "queued"))
+    if queued1:
+        tx1 = wait_for_tx(ALICE, tid1, timeout=15)
+        ok1 = tx1 is not None and tx1.get("success") is True
+        detail1 = f"executed: success={tx1.get('success')} err={tx1.get('error')}" if tx1 else "timeout waiting for execution"
+    else:
+        ok1 = False
+        detail1 = f"status={s1} body={str(r1)[:60]}"
+    result("B1 valid tx (nonce=0) accepted", ok1, detail1)
 
-    if ok1:
-        # Wait for nonce to advance before replaying
-        wait_for_nonce(ALICE, addr, 1, timeout=15)
+    # Wait for nonce to advance before replaying
+    wait_for_nonce(ALICE, addr, 1, timeout=15)
 
-    # Replay the same nonce — must be rejected
-    s2, r2 = submit_transfer(ALICE, addr, path, CAROL_ADDR, 100, nonce=0)
-    ok2 = s2 == 400 or (isinstance(r2, dict) and r2.get("status") == "rejected")
-    result("B1 replay nonce=0 rejected", ok2, f"status={s2} body={str(r2)[:60]}")
+    # Replay the same nonce — must be rejected at execution (success=false)
+    s2, r2, tid2 = submit_transfer(ALICE, addr, path, CAROL_ADDR, 100, nonce=0)
+    queued2 = s2 in (200, 201) or (isinstance(r2, dict) and r2.get("status") in ("queued",))
+    if queued2:
+        tx2 = wait_for_tx(ALICE, tid2, timeout=15)
+        ok2 = tx2 is not None and tx2.get("success") is False
+        detail2 = f"executed: success={tx2.get('success')} err={tx2.get('error','')[:60]}" if tx2 else "timeout"
+    else:
+        ok2 = s2 == 400 or (isinstance(r2, dict) and r2.get("status") == "rejected")
+        detail2 = f"status={s2} body={str(r2)[:60]}"
+    result("B1 replay nonce=0 rejected", ok2, detail2)
 
-    # Out-of-order nonce (skip ahead) — must be rejected
-    s3, r3 = submit_transfer(ALICE, addr, path, CAROL_ADDR, 100, nonce=99)
-    ok3 = s3 == 400 or (isinstance(r3, dict) and r3.get("status") == "rejected")
-    result("B1 future nonce=99 rejected", ok3, f"status={s3} body={str(r3)[:60]}")
+    # Out-of-order nonce (skip ahead) — must be rejected at execution (success=false)
+    s3, r3, tid3 = submit_transfer(ALICE, addr, path, CAROL_ADDR, 100, nonce=99)
+    queued3 = s3 in (200, 201) or (isinstance(r3, dict) and r3.get("status") in ("queued",))
+    if queued3:
+        tx3 = wait_for_tx(ALICE, tid3, timeout=15)
+        ok3 = tx3 is not None and tx3.get("success") is False
+        detail3 = f"executed: success={tx3.get('success')} err={tx3.get('error','')[:60]}" if tx3 else "timeout"
+    else:
+        ok3 = s3 == 400 or (isinstance(r3, dict) and r3.get("status") == "rejected")
+        detail3 = f"status={s3} body={str(r3)[:60]}"
+    result("B1 future nonce=99 rejected", ok3, detail3)
 
 
 # ── B2: Balance enforcement ───────────────────────────────────────────────────
@@ -326,10 +368,16 @@ def test_b2_balance():
 
     time.sleep(1)
 
-    # Try to send more than balance
-    s, r = submit_transfer(ALICE, addr, path, CAROL_ADDR, 1_000_000, nonce=0)
-    ok = s == 400 or (isinstance(r, dict) and r.get("status") == "rejected")
-    result("B2 overdraft rejected", ok, f"status={s} body={str(r)[:80]}")
+    # Try to send more than balance — queued then rejected at execution
+    s, r, tid = submit_transfer(ALICE, addr, path, CAROL_ADDR, 1_000_000, nonce=0)
+    if s in (200, 201) or (isinstance(r, dict) and r.get("status") == "queued"):
+        tx = wait_for_tx(ALICE, tid, timeout=15)
+        ok = tx is not None and tx.get("success") is False
+        detail = f"executed: success={tx.get('success')} err={tx.get('error','')[:60]}" if tx else "timeout"
+    else:
+        ok = s == 400 or (isinstance(r, dict) and r.get("status") == "rejected")
+        detail = f"status={s} body={str(r)[:80]}"
+    result("B2 overdraft rejected", ok, detail)
 
 
 # ── B3: Gas cap enforcement ───────────────────────────────────────────────────
@@ -350,7 +398,7 @@ def test_b3_gas():
     body_json = json.dumps(body_dict, separators=(",", ":"), sort_keys=True)
     sig = wallet("sign-tx", "--wallet", path, "--body", body_json, "--chain-id", CHAIN_ID)
 
-    # gas_limit = 0 — should be rejected
+    # gas_limit = 0 — rejected at execution (gas_limit < gas_required)
     env_zero = {
         "id":            "b3-zero-gas",
         "sender":        addr,
@@ -361,10 +409,16 @@ def test_b3_gas():
         "pq_signatures": [sig],
     }
     s0, r0 = post_json(ALICE, "/api/tx", env_zero)
-    ok0 = s0 == 400 or (isinstance(r0, dict) and r0.get("status") == "rejected")
-    result("B3 gas_limit=0 rejected", ok0, f"status={s0} body={str(r0)[:60]}")
+    if s0 in (200, 201) or (isinstance(r0, dict) and r0.get("status") == "queued"):
+        tx0 = wait_for_tx(ALICE, "b3-zero-gas", timeout=15)
+        ok0 = tx0 is not None and tx0.get("success") is False
+        detail0 = f"executed: success={tx0.get('success')} err={tx0.get('error','')[:60]}" if tx0 else "timeout"
+    else:
+        ok0 = s0 == 400 or (isinstance(r0, dict) and r0.get("status") == "rejected")
+        detail0 = f"status={s0} body={str(r0)[:60]}"
+    result("B3 gas_limit=0 rejected", ok0, detail0)
 
-    # gas_limit absurdly large — should be rejected
+    # gas_limit absurdly large (>block_gas_limit=10M) — skipped/rejected
     env_huge = {
         "id":            "b3-huge-gas",
         "sender":        addr,
@@ -375,8 +429,14 @@ def test_b3_gas():
         "pq_signatures": [sig],
     }
     s1, r1 = post_json(ALICE, "/api/tx", env_huge)
-    ok1 = s1 == 400 or (isinstance(r1, dict) and r1.get("status") == "rejected")
-    result("B3 gas_limit=10B rejected", ok1, f"status={s1} body={str(r1)[:60]}")
+    if s1 in (200, 201) or (isinstance(r1, dict) and r1.get("status") == "queued"):
+        tx1 = wait_for_tx(ALICE, "b3-huge-gas", timeout=15)
+        ok1 = tx1 is not None and tx1.get("success") is False
+        detail1 = f"executed: success={tx1.get('success')} err={tx1.get('error','')[:60]}" if tx1 else "timeout"
+    else:
+        ok1 = s1 == 400 or (isinstance(r1, dict) and r1.get("status") == "rejected")
+        detail1 = f"status={s1} body={str(r1)[:60]}"
+    result("B3 gas_limit=10B rejected", ok1, detail1)
 
 
 # ── B4: Chain-ID bound in signature ──────────────────────────────────────────
@@ -575,8 +635,15 @@ def test_b7_restart_replay():
         "pq_signatures": [sig],
     }
     s, r = post_json(ALICE, "/api/tx", envelope)
-    ok_original = s in (200, 201) or (isinstance(r, dict) and r.get("status") in ("accepted", "pending"))
-    result("B7 original tx accepted", ok_original, f"status={s}")
+    queued_original = s in (200, 201) or (isinstance(r, dict) and r.get("status") in ("accepted", "pending", "queued"))
+    if queued_original:
+        tx_orig = wait_for_tx(ALICE, "b7-original-tx", timeout=20)
+        ok_original = tx_orig is not None and tx_orig.get("success") is True
+        result("B7 original tx accepted", ok_original,
+               f"executed: success={tx_orig.get('success') if tx_orig else 'timeout'}")
+    else:
+        ok_original = False
+        result("B7 original tx accepted", ok_original, f"status={s}")
     if not ok_original:
         return
 
@@ -657,12 +724,17 @@ def test_b7_restart_replay():
         alice_proc.kill()
         return
 
-    # Replay the original tx (same nonce=0) — must be rejected
+    # Replay the original tx (same nonce=0) — must fail at execution after restart
     envelope_replay = {**envelope, "id": "b7-replay-tx"}
     s2, r2 = post_json(ALICE, "/api/tx", envelope_replay)
-    ok_rejected = s2 == 400 or (isinstance(r2, dict) and r2.get("status") == "rejected")
-    result("B7 replayed tx rejected after restart", ok_rejected,
-           f"status={s2} body={str(r2)[:80]}")
+    if s2 in (200, 201) or (isinstance(r2, dict) and r2.get("status") == "queued"):
+        tx2 = wait_for_tx(ALICE, "b7-replay-tx", timeout=20)
+        ok_rejected = tx2 is not None and tx2.get("success") is False
+        detail2 = f"executed: success={tx2.get('success')} err={tx2.get('error','')[:60]}" if tx2 else "timeout"
+    else:
+        ok_rejected = s2 == 400 or (isinstance(r2, dict) and r2.get("status") == "rejected")
+        detail2 = f"status={s2} body={str(r2)[:80]}"
+    result("B7 replayed tx rejected after restart", ok_rejected, detail2)
 
 
 # ── B8: 4-node finality (Carol receives funds, all nodes agree) ───────────────
@@ -699,14 +771,22 @@ def test_b8_finality():
     time.sleep(1)
 
     SEND_AMOUNT = 1_000
-    s, r = submit_transfer(ALICE, sender, path, CAROL_ADDR, SEND_AMOUNT, nonce=0)
-    submitted = s in (200, 201) or (isinstance(r, dict) and r.get("status") in ("accepted", "pending"))
-    result("B8 transfer to Carol submitted", submitted, f"status={s}")
-    if not submitted:
+    s, r, tid = submit_transfer(ALICE, sender, path, CAROL_ADDR, SEND_AMOUNT, nonce=0)
+    queued = s in (200, 201) or (isinstance(r, dict) and r.get("status") in ("accepted", "pending", "queued"))
+    result("B8 transfer to Carol submitted", queued, f"status={s}")
+    if not queued:
+        return
+
+    # Wait for tx execution to succeed
+    tx = wait_for_tx(ALICE, tid, timeout=20)
+    tx_ok = tx is not None and tx.get("success") is True
+    result("B8 transfer executed successfully", tx_ok,
+           f"success={tx.get('success') if tx else 'timeout'} err={tx.get('error','') if tx else ''}")
+    if not tx_ok:
         return
 
     # Wait for Carol's balance to change on Alice (confirm commit)
-    deadline = time.time() + 25
+    deadline = time.time() + 15
     carol_received = False
     while time.time() < deadline:
         b = get_balance(ALICE, CAROL_ADDR)
