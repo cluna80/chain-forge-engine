@@ -164,6 +164,11 @@ class MinerStats:
         self.total_hashes   = 0
         self.last_proof_ts  = None
         self.last_proof_id  = None
+        self._seq           = 0   # monotonic counter — guarantees unique proof IDs
+
+    def next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
 
     def runtime(self) -> float:
         return time.time() - self.start_time
@@ -238,7 +243,7 @@ def mine_one_proof(
     elapsed = time.time() - t0
     stats.total_hashes += attempts
 
-    proof_id = f"proof-{machine_id}-{int(time.time() * 1000)}"
+    proof_id = f"proof-{machine_id}-{int(time.time() * 1000)}-{stats.next_seq()}"
 
     proof = {
         "proof_id":             proof_id,
