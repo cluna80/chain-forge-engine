@@ -1,0 +1,48 @@
+[package]
+name    = "chain-forge-wallet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# QCB-WALLET-001 — Post-Quantum Wallet (NIST FIPS 204 / ML-DSA-65)
+#
+# Generates and encrypts an ML-DSA key pair on disk; signs QCB transactions
+# locally; submits only the signed bytes through /api/tx.
+# Never sends the private key over the network.
+#
+# Signing hierarchy (Section 10, QCB Whitepaper):
+#   Phase 1 (this crate): ML-DSA-65 (Dilithium3) via pqcrypto-dilithium
+#   Future: Hybrid Ed25519+ML-DSA once SchemeRegistry flags migration
+#
+# Key files: <name>.wallet.json — GITIGNORED (see .gitignore).
+# The private key field is AES-256-GCM encrypted with a passphrase-derived
+# key (Argon2id) so keys at rest are protected against offline attacks.
+
+[dependencies]
+chain-forge-core   = { path = "../chain-forge-core" }
+chain-forge-crypto = { path = "../chain-forge-crypto", features = ["real-pqc"] }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+
+# Argon2id for passphrase-derived key encryption (OWASP recommended)
+argon2   = "0.5"
+# AES-256-GCM for encrypted key storage at rest
+aes-gcm  = "0.10"
+# Secure random for nonce/salt generation
+rand     = "0.8"
+# SHA-256 for transaction message digest before signing
+sha2     = "0.10"
+# HTTP client for devnet tx submission (no async — keep deps lean)
+ureq     = { version = "2", features = ["json"] }
+
+[features]
+default = []
+# Enable integration test against live devnet (Alice:8080)
+devnet-test = []
+
+[[bin]]
+name = "qcb-wallet"
+path = "src/bin/wallet.rs"

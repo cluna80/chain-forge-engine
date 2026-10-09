@@ -21,6 +21,7 @@ members = [
     "chain-forge-vca-pq",
     "chain-forge-resource",
     "chain-forge-pocd",
+    "chain-forge-wallet",
 ]
 
 [workspace.package]
