@@ -264,12 +264,13 @@ def submit_transfer(host: tuple, sender: str, wallet_path: str,
         "--chain-id", chain_id,
     )
     envelope = {
-        "id":        f"phase-b-{nonce}-{int(time.time()*1000)}",
-        "sender":    sender,
-        "nonce":     nonce,
-        "body":      body_dict,
-        "gas_limit": 500_000,
-        "signature": [sig],
+        "id":           f"phase-b-{nonce}-{int(time.time()*1000)}",
+        "sender":       sender,
+        "nonce":        nonce,
+        "body":         body_dict,
+        "gas_limit":    500_000,
+        "signature":    [],          # Vec<u8> Ed25519 — empty (PQ wallet, no Ed25519 key)
+        "pq_signatures": [sig],      # Vec<String> — "mldsa65:<hex>"
     }
     return post_json(host, "/api/tx", envelope)
 
@@ -351,12 +352,13 @@ def test_b3_gas():
 
     # gas_limit = 0 — should be rejected
     env_zero = {
-        "id":        "b3-zero-gas",
-        "sender":    addr,
-        "nonce":     0,
-        "body":      body_dict,
-        "gas_limit": 0,
-        "signature": [sig],
+        "id":            "b3-zero-gas",
+        "sender":        addr,
+        "nonce":         0,
+        "body":          body_dict,
+        "gas_limit":     0,
+        "signature":     [],
+        "pq_signatures": [sig],
     }
     s0, r0 = post_json(ALICE, "/api/tx", env_zero)
     ok0 = s0 == 400 or (isinstance(r0, dict) and r0.get("status") == "rejected")
@@ -364,12 +366,13 @@ def test_b3_gas():
 
     # gas_limit absurdly large — should be rejected
     env_huge = {
-        "id":        "b3-huge-gas",
-        "sender":    addr,
-        "nonce":     0,
-        "body":      body_dict,
-        "gas_limit": 10_000_000_000,
-        "signature": [sig],
+        "id":            "b3-huge-gas",
+        "sender":        addr,
+        "nonce":         0,
+        "body":          body_dict,
+        "gas_limit":     10_000_000_000,
+        "signature":     [],
+        "pq_signatures": [sig],
     }
     s1, r1 = post_json(ALICE, "/api/tx", env_huge)
     ok1 = s1 == 400 or (isinstance(r1, dict) and r1.get("status") == "rejected")
@@ -420,12 +423,13 @@ def test_b4_chain_id():
     )
 
     env = {
-        "id":        "b4-wrong-chain-tx",
-        "sender":    addr,
-        "nonce":     0,
-        "body":      body_dict,
-        "gas_limit": 500_000,
-        "signature": [sig_wrong],
+        "id":            "b4-wrong-chain-tx",
+        "sender":        addr,
+        "nonce":         0,
+        "body":          body_dict,
+        "gas_limit":     500_000,
+        "signature":     [],
+        "pq_signatures": [sig_wrong],
     }
     s, r = post_json(ALICE, "/api/tx", env)
 
@@ -562,12 +566,13 @@ def test_b7_restart_replay():
     body_json = json.dumps(body_dict, separators=(",", ":"), sort_keys=True)
     sig = wallet("sign-tx", "--wallet", path, "--body", body_json, "--chain-id", CHAIN_ID)
     envelope = {
-        "id":        "b7-original-tx",
-        "sender":    sender,
-        "nonce":     0,
-        "body":      body_dict,
-        "gas_limit": 500_000,
-        "signature": [sig],
+        "id":            "b7-original-tx",
+        "sender":        sender,
+        "nonce":         0,
+        "body":          body_dict,
+        "gas_limit":     500_000,
+        "signature":     [],
+        "pq_signatures": [sig],
     }
     s, r = post_json(ALICE, "/api/tx", envelope)
     ok_original = s in (200, 201) or (isinstance(r, dict) and r.get("status") in ("accepted", "pending"))
