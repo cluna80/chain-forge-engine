@@ -26,6 +26,7 @@ use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
 use chain_forge_qrc::QrcEngine;
 use chain_forge_agents::{AgentStore, AgentType, SpendingLimits};
+use chain_forge_pocd::DiscoveryRegistry;
 
 // -- Error --------------------------------------------------------------------
 
@@ -4013,18 +4014,23 @@ impl Executor {
     /// agent state to process them against.
     pub fn execute_block_with_identity(
         &self,
-        height:       u64,
-        transactions: Vec<Transaction>,
-        state:        &mut StateStore,
-        identity:     &mut IdentityStore,
-        qrc:          &mut QrcEngine,
-        agents:       &mut AgentStore,
-        timestamp_ms: u64,
+        height:        u64,
+        transactions:  Vec<Transaction>,
+        state:         &mut StateStore,
+        identity:      &mut IdentityStore,
+        qrc:           &mut QrcEngine,
+        agents:        &mut AgentStore,
+        timestamp_ms:  u64,
+        pocd_registry: Option<&mut DiscoveryRegistry>,
     ) -> BlockExecutionResult {
         let mut results        = Vec::new();
         let mut total_gas      = 0u64;
         let mut fees_collected = 0u64;
         let limit              = self.config.block_gas_limit;
+
+        // Track whether an EpochClose succeeded in this block so we can
+        // distribute PoCD rewards from the registry afterwards.
+        let mut epoch_close_succeeded: Option<u64> = None;
 
         for tx in &transactions {
             let gas_required = self.config.gas_model.calculate_gas(tx);
@@ -4046,10 +4052,110 @@ impl Executor {
                 continue;
             }
 
-            let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
-            total_gas      += result.gas_used;
-            fees_collected += result.gas_used;
-            results.push(result);
+            // Capture EpochClose epoch number before executing.
+            if let TxBody::EpochClose { epoch } = &tx.body {
+                let epoch_num = *epoch;
+                let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
+                if result.success {
+                    epoch_close_succeeded = Some(epoch_num);
+                }
+                total_gas      += result.gas_used;
+                fees_collected += result.gas_used;
+                results.push(result);
+            } else {
+                let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
+                total_gas      += result.gas_used;
+                fees_collected += result.gas_used;
+                results.push(result);
+            }
+        }
+
+        // ── PoCD epoch reward distribution ────────────────────────────────────
+        // When an EpochClose tx succeeded and the caller supplied a registry,
+        // distribute uqcb rewards to each miner's wallet from treasury:pocd.
+        if let (Some(closed_epoch), Some(registry)) = (epoch_close_succeeded, pocd_registry) {
+            let pending = registry.pending_reward_receipts(0, height);
+            if !pending.is_empty() {
+                use chain_forge_qrc::QcbRewardPolicy;
+                use chain_forge_pocd::RewardPolicy as _;
+                let policy = QcbRewardPolicy::default_for_devnet("treasury:pocd");
+                match policy.compute_rewards(&pending) {
+                    Ok(grants) => {
+                        let pocd_treasury = "treasury:pocd";
+                        // Ensure treasury account exists (it should from genesis).
+                        if state.get_account(pocd_treasury).is_err() {
+                            let ta = chain_forge_state::AccountState::new(
+                                pocd_treasury.to_string(), "treasury".to_string(),
+                            );
+                            state.upsert_account(ta);
+                        }
+                        let treasury_bal = state.get_account(pocd_treasury)
+                            .map(|a| a.balance_of("uqcb"))
+                            .unwrap_or(0);
+
+                        let total_grant: u64 = grants.iter().map(|g| g.amount).sum();
+                        // Never distribute more than what the treasury holds.
+                        let disbursable = (total_grant as u128).min(treasury_bal);
+
+                        let mut paid_total: u128 = 0;
+                        let mut rewarded_ids: Vec<String> = Vec::new();
+
+                        for grant in &grants {
+                            let amt = grant.amount as u128;
+                            if paid_total + amt > disbursable { break; }
+                            // Ensure miner wallet exists.
+                            if state.get_account(&grant.recipient_wallet).is_err() {
+                                let wa = chain_forge_state::AccountState::new(
+                                    grant.recipient_wallet.clone(), "machine_wallet".to_string(),
+                                );
+                                state.upsert_account(wa);
+                            }
+                            if let Ok(acct) = state.get_account_mut(&grant.recipient_wallet) {
+                                acct.credit("uqcb", amt);
+                            }
+                            state.refresh_leaf(&grant.recipient_wallet);
+                            paid_total += amt;
+                            rewarded_ids.push(grant.receipt_id.clone());
+                            tracing::info!(
+                                epoch    = closed_epoch,
+                                receipt  = %grant.receipt_id,
+                                machine  = %grant.machine_id,
+                                wallet   = %grant.recipient_wallet,
+                                amount   = grant.amount,
+                                "pocd_reward distributed"
+                            );
+                        }
+
+                        // Debit treasury.
+                        if paid_total > 0 {
+                            if let Ok(ta) = state.get_account_mut(pocd_treasury) {
+                                let _ = ta.debit("uqcb", paid_total);
+                            }
+                            state.refresh_leaf(pocd_treasury);
+                        }
+
+                        // Mark rewarded receipts in the registry.
+                        for rid in &rewarded_ids {
+                            let _ = registry.mark_reward_distributed(rid);
+                        }
+
+                        tracing::info!(
+                            epoch         = closed_epoch,
+                            receipts      = rewarded_ids.len(),
+                            total_granted = total_grant,
+                            disbursed     = paid_total,
+                            "pocd_epoch_distribution complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            epoch = closed_epoch,
+                            error = %e,
+                            "PoCD reward computation failed; will retry next epoch"
+                        );
+                    }
+                }
+            }
         }
 
         let take_snapshot = height % 100 == 0;

@@ -82,6 +82,13 @@
       "balance": "100000000",
       "role": "validator",
       "public_key": "6a5d93dee87bc3b9a62476ec3ff1f6290c133e53fd86add16e4ef4327a5ff2fa"
+    },
+    {
+      "label": "PoCD Treasury",
+      "address": "treasury:pocd",
+      "balance": "50000000000",
+      "role": "treasury",
+      "_comment": "PoCD epoch reward treasury: 50 billion uqcb (50,000 QCB) for miner reward distribution"
     }
   ],
   "attestation_coordinator": "qcb1alice",

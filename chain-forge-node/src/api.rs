@@ -438,6 +438,56 @@ pub async fn serve(
                             }
                         }
 
+                    } else if first_line.starts_with("GET /api/pocd/rewards") {
+                        // GET /api/pocd/rewards — epoch reward distribution stats.
+                        // Returns receipt counts and per-machine wallet addresses.
+                        // To check wallet uqcb balances use GET /api/balance/{wallet_addr}.
+                        match &pocd_registry {
+                            Some(reg) => {
+                                let reg = reg.lock().unwrap();
+                                let total    = reg.receipt_count();
+                                let rewarded = reg.all_receipts()
+                                    .filter(|r| r.reward_distributed)
+                                    .count();
+                                let pending  = total - rewarded;
+
+                                // Collect unique machine_ids → wallet addresses.
+                                // QcbRewardPolicy maps machine_id → "wallet:{machine_id}".
+                                let mut machine_entries: std::collections::HashMap<String, String> =
+                                    std::collections::HashMap::new();
+                                for r in reg.all_receipts() {
+                                    machine_entries
+                                        .entry(r.machine_id.clone())
+                                        .or_insert_with(|| format!("wallet:{}", r.machine_id));
+                                }
+
+                                let miner_wallets: Vec<serde_json::Value> = machine_entries
+                                    .iter()
+                                    .map(|(machine_id, wallet_addr)| serde_json::json!({
+                                        "machine_id": machine_id,
+                                        "wallet":     wallet_addr,
+                                        "balance_endpoint": format!("/api/balance/{wallet_addr}"),
+                                    }))
+                                    .collect();
+
+                                let resp = serde_json::json!({
+                                    "total_receipts":    total,
+                                    "rewarded_receipts": rewarded,
+                                    "pending_receipts":  pending,
+                                    "miner_wallets":     miner_wallets,
+                                    "_note": "Use GET /api/balance/<wallet> to check uqcb balance after an epoch closes"
+                                });
+                                http_200_json(&resp.to_string())
+                            }
+                            None => {
+                                let resp = serde_json::json!({
+                                    "status": "disabled",
+                                    "message": "PoCD is not enabled in this chain's genesis"
+                                });
+                                http_200_json(&resp.to_string())
+                            }
+                        }
+
                     } else if first_line.starts_with("POST /api/pocd/submit") {
                         // POST /api/pocd/submit — submit a DiscoveryProof for verification.
                         // The node performs basic seal validation and stores an accepted receipt.

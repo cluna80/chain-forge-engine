@@ -89,6 +89,13 @@
       "role": "observer",
       "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692",
       "_comment": "Carol is not a validator in this genesis \u2014 she's an observer/provider wallet only"
+    },
+    {
+      "label": "PoCD Treasury",
+      "address": "treasury:pocd",
+      "balance": "50000000000",
+      "role": "treasury",
+      "_comment": "PoCD epoch reward treasury: 50 billion uqcb (50,000 QCB) for miner reward distribution"
     }
   ],
   "attestation_coordinator": "qcb1alice",

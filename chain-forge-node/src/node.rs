@@ -2225,9 +2225,18 @@ impl Node {
             })
             .collect();
 
-        let exec_result = self.executor.execute_block_with_identity(
-            cert.height, txs, &mut self.state, &mut self.identity, &mut self.qrc, &mut self.agents, now_ms,
-        );
+        let exec_result = if let Some(ref reg_arc) = self.pocd_registry {
+            let mut reg = reg_arc.lock().unwrap();
+            self.executor.execute_block_with_identity(
+                cert.height, txs, &mut self.state, &mut self.identity,
+                &mut self.qrc, &mut self.agents, now_ms, Some(&mut *reg),
+            )
+        } else {
+            self.executor.execute_block_with_identity(
+                cert.height, txs, &mut self.state, &mut self.identity,
+                &mut self.qrc, &mut self.agents, now_ms, None,
+            )
+        };
 
         info!(
             height     = cert.height,
@@ -2453,7 +2462,60 @@ impl Node {
         let round  = self.consensus.current_round();
 
         // Drain mempool into the block
-        let txs = std::mem::take(&mut self.mempool);
+        let mut txs = std::mem::take(&mut self.mempool);
+
+        // ── Epoch boundary: auto-inject EpochClose + EpochOpen ──────────────
+        // When PoCD is enabled and this block lands exactly on an epoch
+        // boundary, prepend a synthetic EpochClose for the epoch that just
+        // ended followed by an EpochOpen for the new epoch.  Both carry a
+        // zero gas_limit so they're fee-free system transactions.
+        if let Some(ref cfg) = self.pocd_config {
+            let epoch_len = cfg.reward_epoch_blocks;
+            if epoch_len > 0 && height > 0 && height % epoch_len == 0 {
+                use chain_forge_execution::{Transaction, TxBody};
+                let closing_epoch = height / epoch_len - 1;
+                let opening_epoch = height / epoch_len;
+
+                let close_tx = Transaction {
+                    id:           format!("sys-epoch-close-{}", closing_epoch),
+                    sender:       "system".to_string(),
+                    body:         TxBody::EpochClose { epoch: closing_epoch },
+                    gas_limit:    0,
+                    nonce:        0,
+                    signature:    vec![],
+                    public_key:   vec![],
+                    pq_signatures: vec![],
+                    pq_public_key: vec![],
+                };
+                let open_tx = Transaction {
+                    id:           format!("sys-epoch-open-{}", opening_epoch),
+                    sender:       "system".to_string(),
+                    body:         TxBody::EpochOpen {
+                        epoch:          opening_epoch,
+                        verified_count: 0,
+                    },
+                    gas_limit:    0,
+                    nonce:        0,
+                    signature:    vec![],
+                    public_key:   vec![],
+                    pq_signatures: vec![],
+                    pq_public_key: vec![],
+                };
+
+                // Prepend: close first, then open — so rewards are settled
+                // before the new epoch begins.
+                txs.insert(0, open_tx);
+                txs.insert(0, close_tx);
+
+                info!(
+                    height,
+                    closing_epoch,
+                    opening_epoch,
+                    "epoch boundary: injecting EpochClose + EpochOpen"
+                );
+            }
+        }
+
         let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
 
         // Produce a proposal
@@ -2556,9 +2618,20 @@ impl Node {
             }
         }
 
-        let exec_result = self.executor.execute_block_with_identity(
-            height, txs, &mut self.state, &mut self.identity, &mut self.qrc, &mut self.agents, now_ms,
-        );
+        // Pass the PoCD registry (if enabled) so the executor can distribute
+        // epoch rewards directly from the in-memory DiscoveryRegistry.
+        let exec_result = if let Some(ref reg_arc) = self.pocd_registry {
+            let mut reg = reg_arc.lock().unwrap();
+            self.executor.execute_block_with_identity(
+                height, txs, &mut self.state, &mut self.identity,
+                &mut self.qrc, &mut self.agents, now_ms, Some(&mut *reg),
+            )
+        } else {
+            self.executor.execute_block_with_identity(
+                height, txs, &mut self.state, &mut self.identity,
+                &mut self.qrc, &mut self.agents, now_ms, None,
+            )
+        };
 
         info!(
             height,
