@@ -3376,18 +3376,45 @@ impl Executor {
                 seal_difficulty_bits,
                 min_difficulty_override,
             } => {
-                // Machine must be registered.
+                // ── Anti-farming guard 1: Machine must be registered ──────────
                 let machine_key = format!("machine:{}", machine_id);
-                if state.get_account(&machine_key).is_err() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SubmitUsefulWork: machine {} is not registered",
-                            machine_id
-                        ),
-                    );
+                let machine_role_json = match state.get_account(&machine_key) {
+                    Ok(a) => a.role.clone(),
+                    Err(_) => {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "SubmitUsefulWork: machine {} is not registered",
+                                machine_id
+                            ),
+                        );
+                    }
+                };
+                // ── Anti-farming guard 2: Sender must be the machine's owner ─
+                // Parse the stored MachineRecord to verify ownership.
+                if let Ok(record) = serde_json::from_str::<chain_forge_resource::MachineRecord>(&machine_role_json) {
+                    let owner_id = match &record.owner {
+                        chain_forge_resource::ProviderOwner::Individual(s) => s.0.as_str(),
+                        chain_forge_resource::ProviderOwner::Enterprise(e) => e.0.as_str(),
+                    };
+                    if owner_id != tx.sender.as_str() {
+                        // Allow Verified coordinators as well.
+                        let tier_ok = identity.get(&tx.sender)
+                            .map(|r| r.is_verified())
+                            .unwrap_or(false);
+                        if !tier_ok {
+                            return TransactionResult::err(
+                                tx.id.clone(), gas_required, tx.gas_limit,
+                                format!(
+                                    "SubmitUsefulWork: sender {} is not the registered owner \
+                                     ({}) of machine {}",
+                                    tx.sender, owner_id, machine_id
+                                ),
+                            );
+                        }
+                    }
                 }
-                // Reject duplicate receipts.
+                // ── Anti-farming guard 3: Reject duplicate receipts ───────────
                 let receipt_key = format!("gc_receipt:{}", receipt_id);
                 if state.get_account(&receipt_key).is_ok() {
                     return TransactionResult::err(
@@ -3398,7 +3425,20 @@ impl Executor {
                         ),
                     );
                 }
-                // Enforce minimum difficulty when an override is set.
+                // ── Anti-farming guard 4: Absolute minimum difficulty (8 bits) ─
+                // This is always enforced; the tx-level override can only raise it.
+                const ABSOLUTE_MIN_DIFFICULTY: u32 = 8;
+                if *seal_difficulty_bits < ABSOLUTE_MIN_DIFFICULTY {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SubmitUsefulWork: seal_difficulty_bits {} is below the \
+                             absolute minimum {} — trivial seals cannot earn rewards",
+                            seal_difficulty_bits, ABSOLUTE_MIN_DIFFICULTY
+                        ),
+                    );
+                }
+                // ── Anti-farming guard 5: Per-tx override minimum difficulty ──
                 if *min_difficulty_override > 0 && seal_difficulty_bits < min_difficulty_override {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
@@ -3406,6 +3446,26 @@ impl Executor {
                             "SubmitUsefulWork: seal_difficulty_bits {} is below \
                              required minimum {}",
                             seal_difficulty_bits, min_difficulty_override
+                        ),
+                    );
+                }
+                // ── Anti-farming guard 6: Per-machine epoch receipt rate limit ─
+                // Max 100 receipts per machine per epoch prevents seal-spam.
+                const MAX_RECEIPTS_PER_MACHINE_PER_EPOCH: u128 = 100;
+                let epoch_rate_key = format!(
+                    "epoch_receipts:{}:{}",
+                    qrc.current_epoch, machine_id
+                );
+                let epoch_receipt_count = state.get_account(&epoch_rate_key)
+                    .map(|a| a.balance_of("count"))
+                    .unwrap_or(0);
+                if epoch_receipt_count >= MAX_RECEIPTS_PER_MACHINE_PER_EPOCH {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "SubmitUsefulWork: machine {} has reached the epoch receipt \
+                             limit ({} receipts in epoch {}); wait for next epoch",
+                            machine_id, MAX_RECEIPTS_PER_MACHINE_PER_EPOCH, qrc.current_epoch
                         ),
                     );
                 }
@@ -3451,6 +3511,17 @@ impl Executor {
                 receipt_acct.credit("gc_receipt_recorded", 1);
                 state.upsert_account(receipt_acct);
                 state.refresh_leaf(&receipt_key);
+                // Increment per-machine epoch receipt counter (rate-limit guard).
+                if state.get_account(&epoch_rate_key).is_err() {
+                    let rc = chain_forge_state::AccountState::new(
+                        epoch_rate_key.clone(), "epoch_rate".to_string(),
+                    );
+                    state.upsert_account(rc);
+                }
+                if let Ok(acct) = state.get_account_mut(&epoch_rate_key) {
+                    acct.credit("count", 1);
+                }
+                state.refresh_leaf(&epoch_rate_key);
                 // Increment contribution score for this machine.
                 let score_key = format!("contribution_score:{}", machine_id);
                 if state.get_account(&score_key).is_err() {
