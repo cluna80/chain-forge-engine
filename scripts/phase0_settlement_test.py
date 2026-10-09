@@ -487,6 +487,13 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
     live_nonce = fetch_and_set_nonce(alice_host, alice_port, ALICE_ADDRESS)
     print(hdr(f"Step 0b — Alice nonce = {live_nonce}"))
 
+    # ─── Snapshot provider-wallet starting balance ───────────────────────────
+    # qcb1carol may already hold QRC from prior test runs (balances are
+    # persistent on-chain).  We snapshot before touching anything and use it
+    # as the baseline so assertions are always relative to the run's own credit.
+    provider_baseline = get_account_balance(alice_host, alice_port, PROVIDER_WALLET) or 0
+    print(f"  Provider wallet baseline: {provider_baseline:,} uQRC")
+
     # ─── Build all transactions up-front (nonces must be contiguous) ─────────
     tx_purchase  = tx_qrc_purchase(ALICE_ADDRESS, QCB_TO_BURN, MIN_QRC_OUT)
     tx_register  = tx_register_agent(ALICE_ADDRESS, AGENT_ID, AGENT_ADDRESS)
@@ -538,9 +545,9 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
     print(f"\n  Checking balances after lock-release …")
     time.sleep(PROPAGATION_WAIT_S)
     after_lock_rel = {
-        treasury_key: TREASURY_DEPOSIT - ESCROW_AMOUNT,   # 4_200_000
-        escrow_rel:   ESCROW_AMOUNT,                       # 800_000
-        PROVIDER_WALLET: 0,
+        treasury_key: TREASURY_DEPOSIT - ESCROW_AMOUNT,          # 4_200_000
+        escrow_rel:   ESCROW_AMOUNT,                              # 800_000
+        PROVIDER_WALLET: provider_baseline,                       # unchanged baseline
     }
     if not assert_balances(nodes, after_lock_rel):
         overall_pass = False
@@ -554,9 +561,9 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
         print(f"\n  Checking balances after release …")
         time.sleep(PROPAGATION_WAIT_S)
         after_release = {
-            treasury_key: TREASURY_DEPOSIT - ESCROW_AMOUNT,  # unchanged
+            treasury_key: TREASURY_DEPOSIT - ESCROW_AMOUNT,          # unchanged 4_200_000
             escrow_rel:   0,
-            PROVIDER_WALLET: ESCROW_AMOUNT,                   # 800_000
+            PROVIDER_WALLET: provider_baseline + ESCROW_AMOUNT,       # baseline + 800_000
         }
         if not assert_balances(nodes, after_release):
             overall_pass = False
@@ -584,12 +591,12 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
     tx_refund   = tx_refund_qrc_for_job(
                     ALICE_ADDRESS, "refund",
                     ESCROW_ID_REFUND, JOB_ID_REFUND,
-                    AGENT_ADDRESS, ESCROW_AMOUNT,
+                    AGENT_ID, ESCROW_AMOUNT,
                     "Timeout")
     tx_rep_ref  = tx_refund_qrc_for_job(
                     ALICE_ADDRESS, "repeat-refund",
                     ESCROW_ID_REFUND, JOB_ID_REFUND,
-                    AGENT_ADDRESS, ESCROW_AMOUNT,
+                    AGENT_ID, ESCROW_AMOUNT,
                     "Timeout")
 
     print(hdr("Refund path — lock-refund"))
@@ -603,9 +610,9 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
         # treasury was at (TREASURY_DEPOSIT - ESCROW_AMOUNT) after release lock;
         # a second lock debits another ESCROW_AMOUNT from what remains.
         after_lock_ref = {
-            treasury_key: TREASURY_DEPOSIT - 2 * ESCROW_AMOUNT,  # 3_400_000
-            escrow_ref:   ESCROW_AMOUNT,                          # 800_000
-            PROVIDER_WALLET: ESCROW_AMOUNT,                       # unchanged 800_000
+            treasury_key: TREASURY_DEPOSIT - 2 * ESCROW_AMOUNT,       # 3_400_000
+            escrow_ref:   ESCROW_AMOUNT,                               # 800_000
+            PROVIDER_WALLET: provider_baseline + ESCROW_AMOUNT,        # unchanged from release
         }
         if not assert_balances(nodes, after_lock_ref):
             overall_pass = False
@@ -619,9 +626,9 @@ def run(nodes: list[tuple[str, str, int]]) -> int:
             print(f"\n  Checking balances after refund …")
             time.sleep(PROPAGATION_WAIT_S)
             after_refund = {
-                treasury_key: TREASURY_DEPOSIT - ESCROW_AMOUNT,  # restored to 4_200_000
+                treasury_key: TREASURY_DEPOSIT - ESCROW_AMOUNT,         # restored to 4_200_000
                 escrow_ref:   0,
-                PROVIDER_WALLET: ESCROW_AMOUNT,                  # unchanged 800_000
+                PROVIDER_WALLET: provider_baseline + ESCROW_AMOUNT,     # unchanged from release
             }
             if not assert_balances(nodes, after_refund):
                 overall_pass = False
