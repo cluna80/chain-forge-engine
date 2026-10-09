@@ -619,7 +619,26 @@ def test_b7_restart_replay():
         skip("B7 restart — funding failed", "")
         return
 
-    time.sleep(1)
+    # Wait for the B7 wallet account to appear with funded balance.
+    # fund_address waits for Alice's nonce to advance (funding tx executed)
+    # but the account state propagates asynchronously; poll for balance > 0.
+    deadline = time.time() + 15
+    b7_balance = None
+    while time.time() < deadline:
+        b7_balance = get_balance(ALICE, sender)
+        if b7_balance is not None and b7_balance > 0:
+            break
+        time.sleep(0.5)
+    if not b7_balance:
+        skip("B7 restart — sender account not funded after 15 s",
+             f"addr={sender[:20]} balance={b7_balance}")
+        return
+
+    actual_nonce = get_nonce(ALICE, sender)
+    if actual_nonce != 0:
+        skip("B7 restart — unexpected sender nonce before original tx",
+             f"addr={sender[:20]} nonce={actual_nonce} (expected 0) balance={b7_balance}")
+        return
 
     # Submit tx (nonce=0)
     body_dict = make_transfer_body(CAROL_ADDR, 100)

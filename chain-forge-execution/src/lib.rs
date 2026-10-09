@@ -6051,4 +6051,110 @@ mod tests {
             "error must indicate signature failure; got: {err}"
         );
     }
+
+    /// B3 — gas_limit=0 must be rejected (floor check: gas_limit < gas_required).
+    #[test]
+    fn b3_gas_limit_zero_rejected() {
+        const CHAIN: &str = "qcb-b3-test";
+        const SENDER: &str = "qcb1b3sender";
+        let genesis_json = format!(r#"{{
+            "chain_id": "{CHAIN}",
+            "chain_name": "B3 test",
+            "engine_version": "0.1.0",
+            "genesis_time": "2026-10-09T00:00:00Z",
+            "environment": {{ "mode": "devnet", "faucet_enabled": true, "relaxed_limits": true }},
+            "native_token": {{ "name": "QC", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" }},
+            "address_prefix": "qcb",
+            "consensus": {{ "type": "proof-of-stake", "validator_set_size": 3, "block_time_ms": 500 }},
+            "execution": {{ "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false }},
+            "cryptography": {{ "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "classical-ed25519" }},
+            "network": {{ "network_id": "b3-net", "p2p_port": 27000, "rpc_port": 27001, "bootstrap_nodes": [], "peer_discovery": "bootstrap", "max_peers": 10 }},
+            "limits": {{ "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 }},
+            "modules": ["bank"],
+            "custom_modules": [],
+            "genesis_accounts": [
+                {{ "label": "b3sender", "address": "{SENDER}", "balance": "5000000", "role": "user" }}
+            ]
+        }}"#);
+        let genesis = GenesisConfig::from_json(&genesis_json).expect("B3 genesis");
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let exec = Executor::new(config);
+
+        let tx = Transaction {
+            id:            "b3-zero-gas-unit".to_string(),
+            sender:        SENDER.to_string(),
+            nonce:         0,
+            body:          TxBody::Transfer { to: "qcb1carol".to_string(), denom: "uqcb".to_string(), amount: 100 },
+            gas_limit:     0,
+            signature:     vec![],
+            public_key:    vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(!r.success, "gas_limit=0 must be rejected; got success=true");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("gas limit") || err.contains("gas"),
+            "error must mention gas; got: {err}");
+    }
+
+    /// B3 — gas_limit > block_gas_limit must be rejected (ceiling check).
+    #[test]
+    fn b3_gas_limit_huge_rejected() {
+        const CHAIN: &str = "qcb-b3-huge-test";
+        const SENDER: &str = "qcb1b3hugesender";
+        let genesis_json = format!(r#"{{
+            "chain_id": "{CHAIN}",
+            "chain_name": "B3 huge test",
+            "engine_version": "0.1.0",
+            "genesis_time": "2026-10-09T00:00:00Z",
+            "environment": {{ "mode": "devnet", "faucet_enabled": true, "relaxed_limits": true }},
+            "native_token": {{ "name": "QC", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" }},
+            "address_prefix": "qcb",
+            "consensus": {{ "type": "proof-of-stake", "validator_set_size": 3, "block_time_ms": 500 }},
+            "execution": {{ "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false }},
+            "cryptography": {{ "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "classical-ed25519" }},
+            "network": {{ "network_id": "b3-net2", "p2p_port": 27002, "rpc_port": 27003, "bootstrap_nodes": [], "peer_discovery": "bootstrap", "max_peers": 10 }},
+            "limits": {{ "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 }},
+            "modules": ["bank"],
+            "custom_modules": [],
+            "genesis_accounts": [
+                {{ "label": "b3hugesender", "address": "{SENDER}", "balance": "5000000", "role": "user" }}
+            ]
+        }}"#);
+        let genesis = GenesisConfig::from_json(&genesis_json).expect("B3 huge genesis");
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let exec = Executor::new(config);
+
+        let tx = Transaction {
+            id:            "b3-huge-gas-unit".to_string(),
+            sender:        SENDER.to_string(),
+            nonce:         0,
+            body:          TxBody::Transfer { to: "qcb1carol".to_string(), denom: "uqcb".to_string(), amount: 100 },
+            gas_limit:     10_000_000_000,  // 10B — exceeds block_gas_limit of 10M
+            signature:     vec![],
+            public_key:    vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(!r.success, "gas_limit=10B must be rejected; got success=true");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("gas limit") || err.contains("exceeds"),
+            "error must mention gas cap; got: {err}");
+    }
 }
