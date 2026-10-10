@@ -316,11 +316,15 @@ def wait_committed(host: str, port: int, tx_id: str,
     while time.monotonic() < deadline:
         data = get_json(host, port, f"/api/tx/{tx_id}")
         if isinstance(data, dict):
-            if data.get("status") == "ok":
+            status = data.get("status")
+            if status == "ok":
                 return True
-            if data.get("status") == "error":
+            if status == "error":
+                err = data.get("error") or data.get("message") or data
+                print(warn(f"  tx {tx_id} failed on-chain: {err}"))
                 return False
         time.sleep(interval)
+    print(warn(f"  tx {tx_id} timed out after {timeout_s}s (never committed)"))
     return False
 
 
