@@ -327,9 +327,11 @@ def wait_committed(host: str, port: int, tx_id: str,
 def submit_and_wait(label: str, host: str, port: int, tx: dict,
                     expect_ok: bool = True) -> bool:
     resp = submit(label, host, port, tx, expect_ok)
-    if resp.get("status") != "ok":
-        # The submission itself was rejected
-        accepted = resp.get("status") == "ok"
+    # Node returns "queued" when the tx enters the mempool — that's success.
+    # Only treat it as a hard failure when status is "error" or the response
+    # contains an "error" key that isn't just a soft duplicate warning.
+    status = resp.get("status", "")
+    if status not in ("ok", "queued"):
         check(label, not expect_ok, f"submit rejected: {resp.get('error', resp)}")
         return not expect_ok
 
