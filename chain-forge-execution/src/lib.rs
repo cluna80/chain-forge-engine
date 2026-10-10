@@ -3354,7 +3354,7 @@ impl Executor {
                     None     => format!("treasury:{}", agent_wallet),
                 };
                 let treasury_balance = state.get_account(&treasury_key)
-                    .map(|a| a.balance_of("uqrc"))
+                    .map(|a| a.balance_of("uqcb"))
                     .unwrap_or(0);
 
                 let (debit_from, source_label) = if treasury_balance >= *amount as u128 {
@@ -3364,17 +3364,17 @@ impl Executor {
                 };
 
                 let source_balance = state.get_account(&debit_from)
-                    .map(|a| a.balance_of("uqrc"))
+                    .map(|a| a.balance_of("uqcb"))
                     .unwrap_or(0);
 
                 if source_balance < *amount as u128 {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
                         format!(
-                            "LockQrcForJob: insufficient uqrc — treasury={} wallet={} need={} \
+                            "LockQrcForJob: insufficient uqcb — treasury={} wallet={} need={} \
                              (escrow_id={}, job_id={})",
                             treasury_balance,
-                            state.get_account(agent_wallet).map(|a| a.balance_of("uqrc")).unwrap_or(0),
+                            state.get_account(agent_wallet).map(|a| a.balance_of("uqcb")).unwrap_or(0),
                             amount, escrow_id, job_id
                         ),
                     );
@@ -3382,7 +3382,7 @@ impl Executor {
 
                 // Debit from the chosen source (held in escrow until Release/Refund).
                 if let Ok(acct) = state.get_account_mut(&debit_from) {
-                    acct.debit("uqrc", *amount as u128).expect("balance check passed above");
+                    acct.debit("uqcb", *amount as u128).expect("balance check passed above");
                 }
                 state.refresh_leaf(&debit_from);
 
@@ -3407,8 +3407,8 @@ impl Executor {
                     state.upsert_account(new_escrow);
                 }
                 if let Ok(acct) = state.get_account_mut(&escrow_key) {
-                    acct.credit("locked_uqrc", *amount as u128);
-                    acct.credit("uqrc", *amount as u128);
+                    acct.credit("locked_uqcb", *amount as u128);
+                    acct.credit("uqcb", *amount as u128);
                 }
                 state.refresh_leaf(&escrow_key);
 
@@ -3471,8 +3471,32 @@ impl Executor {
                     );
                 }
 
-                // N4 guard — release amount must not exceed what is held in escrow.
-                let escrow_balance = escrow_acct.balance_of("uqrc");
+                // N6 guard — job_id must match the binding stored at lock time.
+                if let Some(ref binding) = escrow_acct.escrow {
+                    if binding.job_id != *job_id {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "ReleaseQrcForJob: job_id mismatch — escrow '{}' is bound to \
+                                 job '{}', not '{}'",
+                                escrow_id, binding.job_id, job_id
+                            ),
+                        );
+                    }
+                }
+
+                // N4 guard — release amount must be positive and not exceed escrow balance.
+                let escrow_balance = escrow_acct.balance_of("uqcb");
+                if *amount == 0 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ReleaseQrcForJob: release amount must be > 0 \
+                             (escrow_id={}, job_id={})",
+                            escrow_id, job_id
+                        ),
+                    );
+                }
                 if (*amount as u128) > escrow_balance {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
@@ -3484,9 +3508,21 @@ impl Executor {
                     );
                 }
 
+                // N7 guard — provider_wallet must not be the escrow account itself.
+                if provider_wallet == &escrow_key {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ReleaseQrcForJob: provider_wallet must not be the escrow account \
+                             itself (escrow_id={}, job_id={})",
+                            escrow_id, job_id
+                        ),
+                    );
+                }
+
                 // Debit the escrow account.
                 if let Ok(acct) = state.get_account_mut(&escrow_key) {
-                    acct.debit("uqrc", *amount as u128).expect("balance verified above");
+                    acct.debit("uqcb", *amount as u128).expect("balance verified above");
                 }
                 state.refresh_leaf(&escrow_key);
 
@@ -3499,7 +3535,7 @@ impl Executor {
                 }
                 // Credit the settled amount to the provider.
                 if let Ok(acct) = state.get_account_mut(provider_wallet) {
-                    acct.credit("uqrc", *amount as u128);
+                    acct.credit("uqcb", *amount as u128);
                 }
                 state.refresh_leaf(provider_wallet);
                 events.push(format!(
@@ -3536,11 +3572,11 @@ impl Executor {
                     _ => return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
                         "resource settlement: missing or mismatched job binding".to_string()),
                 };
-                if *amount == 0 || escrow.balance_of("uqrc") < *amount as u128 {
+                if *amount == 0 || escrow.balance_of("uqcb") < *amount as u128 {
                     return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
                         "resource settlement: zero amount or insufficient escrow balance".to_string());
                 }
-                if binding.agent_wallet != *agent_wallet || escrow.balance_of("uqrc") != *amount as u128 {
+                if binding.agent_wallet != *agent_wallet || escrow.balance_of("uqcb") != *amount as u128 {
                     return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
                         "resource refund: wallet mismatch or refund must equal remaining escrow".to_string());
                 }
@@ -3549,8 +3585,8 @@ impl Executor {
                     return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
                         "resource refund: original funding account missing".to_string());
                 }
-                state.get_account_mut(&escrow_key).unwrap().debit("uqrc", *amount as u128).unwrap();
-                state.get_account_mut(&destination).unwrap().credit("uqrc", *amount as u128);
+                state.get_account_mut(&escrow_key).unwrap().debit("uqcb", *amount as u128).unwrap();
+                state.get_account_mut(&destination).unwrap().credit("uqcb", *amount as u128);
                 state.refresh_leaf(&escrow_key);
                 state.refresh_leaf(&destination);
                 events.push(format!(
@@ -3583,15 +3619,15 @@ impl Executor {
                         }
                     }
                 }
-                // Verify sender has enough uqrc.
+                // Verify sender has enough uqcb.
                 let sender_balance = state.get_account(&tx.sender)
-                    .map(|a| a.balance_of("uqrc"))
+                    .map(|a| a.balance_of("uqcb"))
                     .unwrap_or(0);
                 if sender_balance < *amount as u128 {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
                         format!(
-                            "DepositToTreasury: sender {} has {} uqrc but tried to deposit {} \
+                            "DepositToTreasury: sender {} has {} uqcb but tried to deposit {} \
                              into treasury for agent {}",
                             tx.sender, sender_balance, amount, agent_id
                         ),
@@ -3599,7 +3635,7 @@ impl Executor {
                 }
                 // Debit sender.
                 if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                    acct.debit("uqrc", *amount as u128).expect("sender balance verified above");
+                    acct.debit("uqcb", *amount as u128).expect("sender balance verified above");
                 }
                 state.refresh_leaf(&tx.sender);
                 // Credit treasury account (create if new).
@@ -3611,7 +3647,7 @@ impl Executor {
                     state.upsert_account(new_acct);
                 }
                 if let Ok(acct) = state.get_account_mut(&treasury_key) {
-                    acct.credit("uqrc", *amount as u128);
+                    acct.credit("uqcb", *amount as u128);
                 }
                 state.refresh_leaf(&treasury_key);
                 // Optionally update per_job_limit on the agent record.
@@ -3622,7 +3658,7 @@ impl Executor {
                     }
                 }
                 let treasury_new_bal = state.get_account(&treasury_key)
-                    .map(|a| a.balance_of("uqrc"))
+                    .map(|a| a.balance_of("uqcb"))
                     .unwrap_or(0);
                 events.push(format!(
                     "deposit_to_treasury: agent_id={} sponsor={} amount={} \
@@ -4001,7 +4037,7 @@ impl Executor {
                             format!("VerifyJob: escrow '{}' not found", escrow_id),
                         ),
                     };
-                    let locked = escrow_acct.balance_of("locked_uqrc");
+                    let locked = escrow_acct.balance_of("locked_uqcb");
                     (escrow_acct.clone(), locked)
                 };
                 // Guard 4: amount must not exceed locked amount.
@@ -4023,30 +4059,24 @@ impl Executor {
                 }
                 // --- All guards passed. Execute settlement. ---
                 // 1. Debit escrow account.
-                let _ = updated_escrow.debit("locked_uqrc", *amount as u128);
-                let refund_amount = locked_amount.saturating_sub(*amount as u128);
-                if refund_amount > 0 && !requester_wallet.is_empty() {
-                    if state.get_account(&requester_wallet).is_err() {
-                        state.upsert_account(chain_forge_state::AccountState::new(
-                            requester_wallet.clone(), String::new()
-                        ));
-                    }
-                    if let Ok(acct) = state.get_account_mut(&requester_wallet) {
-                        acct.credit("uqrc", refund_amount);
-                    }
-                    state.refresh_leaf(&requester_wallet);
-                }
+                let _ = updated_escrow.debit("locked_uqcb", *amount as u128);
+                // UED-001 (QCB-ECON-001): any escrow residual (locked_amount - amount)
+                // flows to the provider rather than the requester for Phase 1 devnet.
+                // Rationale: simplest deterministic policy; revisit when revenue-split
+                // escrow redesign is complete.
+                let residual_amount = locked_amount.saturating_sub(*amount as u128);
                 updated_escrow.credit("escrow_settled", 1);
                 state.upsert_account(updated_escrow);
                 state.refresh_leaf(&escrow_key);
-                // 2. Credit provider wallet.
+                // 2. Credit provider wallet (settled amount + any residual per UED-001).
                 if state.get_account(provider_wallet).is_err() {
                     state.upsert_account(chain_forge_state::AccountState::new(
                         provider_wallet.clone(), String::new()
                     ));
                 }
+                let total_to_provider = (*amount as u128).saturating_add(residual_amount);
                 if let Ok(acct) = state.get_account_mut(provider_wallet) {
-                    acct.credit("uqrc", *amount as u128);
+                    acct.credit("uqcb", total_to_provider);
                 }
                 state.refresh_leaf(provider_wallet);
                 // 3. Transition job: Completed → Verified → Settled.
@@ -4929,13 +4959,13 @@ mod tests {
                 let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
                 let source = if treasury_funded { "treasury:worker" } else { "worker" };
                 let mut account = chain_forge_state::AccountState::new(source.into(), "user".into());
-                account.credit("uqrc", 1_000);
+                account.credit("uqcb", 1_000);
                 state.upsert_account(account);
                 let lock = Transaction::lock_qrc_for_job("lock", "qcb1alice", "e", "j", "worker", 800, 0);
                 let result = exec.execute_tx_with_identity(&lock, &mut state, &mut identity, &mut qrc, &mut agents);
                 assert!(result.success, "{:?}", result.error);
-                assert_eq!(state.get_account(source).unwrap().balance_of("uqrc"), 200);
-                assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqrc"), 800);
+                assert_eq!(state.get_account(source).unwrap().balance_of("uqcb"), 200);
+                assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqcb"), 800);
                 let destination = if refund { source } else { "provider" };
                 let make_tx = |id: &str, nonce| if refund {
                     Transaction::refund_qrc_for_job(id, "qcb1alice", "e", "j", "worker", 800,
@@ -4945,12 +4975,15 @@ mod tests {
                 };
                 let result = exec.execute_tx_with_identity(&make_tx("settle", 1), &mut state, &mut identity, &mut qrc, &mut agents);
                 assert!(result.success, "{:?}", result.error);
-                assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqrc"), 0);
-                assert_eq!(state.get_account(destination).unwrap().balance_of("uqrc"), if refund { 1_000 } else { 800 });
+                assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqcb"), 0);
+                assert_eq!(state.get_account(destination).unwrap().balance_of("uqcb"), if refund { 1_000 } else { 800 });
                 let result = exec.execute_tx_with_identity(&make_tx("repeat", 2), &mut state, &mut identity, &mut qrc, &mut agents);
                 assert!(!result.success);
-                assert!(result.error.unwrap().contains("insufficient escrow"));
-                assert_eq!(state.get_account(destination).unwrap().balance_of("uqrc"), if refund { 1_000 } else { 800 });
+                // Refund path: "insufficient escrow balance"; Release path: "exceeds escrow balance"
+                let err = result.error.unwrap();
+                assert!(err.contains("insufficient escrow") || err.contains("escrow balance"),
+                    "unexpected error on repeat: {}", err);
+                assert_eq!(state.get_account(destination).unwrap().balance_of("uqcb"), if refund { 1_000 } else { 800 });
             }
         }
     }
@@ -4959,7 +4992,7 @@ mod tests {
     fn escrow_settlement_rejects_invalid_bindings_and_overpayment() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let mut account = chain_forge_state::AccountState::new("worker".into(), "user".into());
-        account.credit("uqrc", 1_000);
+        account.credit("uqcb", 1_000);
         state.upsert_account(account);
         let lock = Transaction::lock_qrc_for_job("lock", "qcb1alice", "e", "j", "worker", 800, 0);
         assert!(exec.execute_tx_with_identity(&lock, &mut state, &mut identity, &mut qrc, &mut agents).success);
@@ -4975,8 +5008,8 @@ mod tests {
         for tx in invalid {
             let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
             assert!(!result.success, "{} unexpectedly accepted", tx.id);
-            assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqrc"), 800);
-            assert_eq!(state.get_account("worker").unwrap().balance_of("uqrc"), 200);
+            assert_eq!(state.get_account("escrow:e").unwrap().balance_of("uqcb"), 800);
+            assert_eq!(state.get_account("worker").unwrap().balance_of("uqcb"), 200);
             assert!(state.get_account("provider").is_err());
         }
     }
