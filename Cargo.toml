@@ -21,6 +21,7 @@ members = [
     "chain-forge-vca-pq",
     "chain-forge-resource",
     "chain-forge-pocd",
+    "chain-forge-research-db",
     "chain-forge-wallet",
 ]
 
@@ -41,4 +42,6 @@ hex         = "0.4"
 thiserror   = "1"
 async-trait = "0.1"
 tracing     = "0.1"
+uuid        = { version = "1", features = ["v4", "serde"] }
+chrono      = { version = "0.4", features = ["serde"] }
 

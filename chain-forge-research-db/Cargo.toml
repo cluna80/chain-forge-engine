@@ -1,0 +1,44 @@
+[package]
+name        = "chain-forge-research-db"
+description = "QCB Discovery Engine — PostgreSQL persistence layer for research microtasks and experimental evidence (Change Set D)"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+chain-forge-pocd = { path = "../chain-forge-pocd" }
+
+# Async runtime
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialisation
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+# Hashing / encoding
+sha2        = { workspace = true }
+hex         = { workspace = true }
+
+# Error handling
+thiserror   = { workspace = true }
+
+# Tracing
+tracing     = { workspace = true }
+
+# Database
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-native-tls", "migrate", "uuid", "json", "chrono"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio  = { workspace = true }
+# Tests that need a real DB are gated behind the `integration` feature.
+# Run with:  cargo test -p chain-forge-research-db --features integration
+
+[features]
+# Enable live PostgreSQL integration tests.
+# Requires TEST_DATABASE_URL to be set.
+integration = []
