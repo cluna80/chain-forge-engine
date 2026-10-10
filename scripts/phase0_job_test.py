@@ -187,7 +187,7 @@ def tx_register_machine(sender: str, machine_id: str) -> dict:
         "RegisterMachine": {
             "machine_id":          machine_id,
             "display_name":        f"Carol Phase0 Machine [{machine_id}]",
-            "mode":                "ResourceOnly",
+            "mode":                "ContributionOnly",
             "attestation_key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             "capabilities_json":   '{"workloads":["hash","sim"]}',
         }
@@ -343,9 +343,15 @@ def submit_and_wait(label: str, host: str, port: int, tx: dict,
     status = resp.get("status", "")
     if status not in ("ok", "queued"):
         check(label, not expect_ok, f"submit rejected: {resp.get('error', resp)}")
+        # Re-sync nonce so subsequent txs use the correct on-chain value
+        fetch_nonce(host, port, tx["sender"])
         return not expect_ok
 
     committed = wait_committed(host, port, tx["id"])
+    if not committed:
+        # The tx failed on-chain — nonce was NOT consumed; re-sync from chain
+        # so subsequent txs don't cascade-fail with nonce mismatch.
+        fetch_nonce(host, port, tx["sender"])
     ok_result = check(
         label,
         committed == expect_ok,
