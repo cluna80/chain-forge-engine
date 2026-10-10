@@ -564,10 +564,20 @@ pub mod real {
                 .mesh_n_high(8)
                 .mesh_outbound_min(1)
                 .message_id_fn(|msg: &gossipsub::Message| {
+                    // Include source peer + sequence number so that the same
+                    // content (e.g. an empty block proposal retransmitted across
+                    // multiple rounds) gets a unique message ID each time.
+                    // Content-only hashing caused "Duplicate" rejections when
+                    // the proposer re-broadcasts an identical payload in a new
+                    // consensus round, breaking liveness in the 3-node devnet.
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
                     let mut h = DefaultHasher::new();
                     msg.data.hash(&mut h);
+                    if let Some(src) = &msg.source {
+                        src.to_bytes().hash(&mut h);
+                    }
+                    msg.sequence_number.hash(&mut h);
                     MessageId::from(h.finish().to_be_bytes().to_vec())
                 })
                 .build()
