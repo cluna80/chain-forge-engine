@@ -361,6 +361,60 @@ pub async fn serve(
                         let ex = explorer.lock().unwrap();
                         let receipts: Vec<_> = ex.gc_receipts.iter().collect();
                         http_200_json(&serde_json::to_string(&receipts).unwrap_or_default())
+                    } else if first_line.starts_with("GET /api/jobs/") {
+                        // GET /api/jobs/{job_id} — single job record from on-chain state.
+                        let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                        let job_id = path.trim_start_matches("/api/jobs/");
+                        let account_key = format!("job:{}", job_id);
+                        let ex = explorer.lock().unwrap();
+                        match ex.accounts.get(&account_key) {
+                            Some(a) => {
+                                // Parse the role JSON, add address and balances.
+                                let mut jd: serde_json::Value =
+                                    serde_json::from_str(&a.role).unwrap_or_default();
+                                if jd.is_object() {
+                                    jd["_account"] = serde_json::Value::String(account_key.clone());
+                                    jd["_balances"] = serde_json::to_value(&a.balances).unwrap_or_default();
+                                }
+                                http_200_json(&jd.to_string())
+                            }
+                            None => http_404(),
+                        }
+                    } else if first_line.starts_with("GET /api/jobs") {
+                        // GET /api/jobs — list all job records (state accounts keyed job:{id}).
+                        // Accepts optional ?state= filter, e.g. /api/jobs?state=Created
+                        let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                        let state_filter = if let Some(q) = path.splitn(2, '?').nth(1) {
+                            q.split('&')
+                                .find(|p| p.starts_with("state="))
+                                .map(|p| p.trim_start_matches("state=").to_string())
+                        } else {
+                            None
+                        };
+                        let ex = explorer.lock().unwrap();
+                        let mut jobs: Vec<serde_json::Value> = ex.accounts.iter()
+                            .filter(|(k, _)| k.starts_with("job:"))
+                            .filter_map(|(k, a)| {
+                                let mut jd: serde_json::Value =
+                                    serde_json::from_str(&a.role).ok()?;
+                                if !jd.is_object() { return None; }
+                                // Apply optional state filter.
+                                if let Some(ref sf) = state_filter {
+                                    let job_state = jd.get("state")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !job_state.eq_ignore_ascii_case(sf) { return None; }
+                                }
+                                jd["_account"] = serde_json::Value::String(k.clone());
+                                jd["_balances"] = serde_json::to_value(&a.balances).unwrap_or_default();
+                                Some(jd)
+                            })
+                            .collect();
+                        jobs.sort_by(|a, b| {
+                            a.get("job_id").and_then(|v| v.as_str()).unwrap_or("")
+                                .cmp(b.get("job_id").and_then(|v| v.as_str()).unwrap_or(""))
+                        });
+                        http_200_json(&serde_json::to_string(&jobs).unwrap_or_default())
                     } else if first_line.starts_with("POST /genesis") {
                         // POST /genesis -- validate and echo back a genesis configuration.
                         // The wizard "Generate Genesis" button posts the config fields here;

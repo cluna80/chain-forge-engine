@@ -154,6 +154,11 @@ impl GasModel {
                     TxBody::RegisterMachine { .. }       => op_multiplier * 6,
                     // SubmitUsefulWork: verifies seal + writes receipt + updates contribution score.
                     TxBody::SubmitUsefulWork { .. }      => op_multiplier * 8,
+                    // Resource Job Lifecycle: 4 state-machine tx types.
+                    TxBody::CreateJob { .. }             => op_multiplier * 5, // escrow check + job record write
+                    TxBody::AcceptJob { .. }             => op_multiplier * 3, // job state update only
+                    TxBody::CompleteJob { .. }           => op_multiplier * 4, // receipt + job state update
+                    TxBody::VerifyJob { .. }             => op_multiplier * 7, // hash check + escrow release + two balance writes
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -714,6 +719,114 @@ pub enum TxBody {
         capabilities_json: String,
     },
 
+    // ── Resource Job Lifecycle ─────────────────────────────────────────────
+    //
+    // Four tx types cover the full happy path:
+    //
+    //   CreateJob   → agent posts spec + references pre-funded escrow
+    //   AcceptJob   → machine claims job; transitions Created → Running
+    //   CompleteJob → machine submits output_hash; transitions Running → Completed
+    //   VerifyJob   → verifier (or self in Phase 0) signs off;
+    //                 transitions Completed → Verified → triggers ReleaseQrcForJob
+    //
+    // Job state is stored at `job:{job_id}` in chain state.
+    // The escrow hold at `escrow:{escrow_id}` must already exist (created by
+    // LockQrcForJob) before CreateJob is submitted.
+
+    /// Post a resource job on-chain.
+    ///
+    /// The agent specifies the job spec, references an existing escrow hold, and
+    /// names the machine it wants to run the job (Phase 0: direct assignment;
+    /// Phase 1: open marketplace via P2P discovery).
+    ///
+    /// Enforced invariants:
+    ///   - `escrow_id` must reference an existing `LockQrcForJob` hold.
+    ///   - `job_id` must be unique.
+    ///   - `machine_id` must reference a registered, Active machine.
+    CreateJob {
+        /// Unique job identifier (e.g. "JOB-20261009-001").
+        job_id: String,
+        /// The escrow hold that funds this job.
+        escrow_id: String,
+        /// Machine being requested to run the job.
+        machine_id: String,
+        /// Human-readable description of the workload.
+        description: String,
+        /// Workload type tag, e.g. "python_script", "container", "gc_challenge".
+        workload_type: String,
+        /// Workload payload: inline script, container image ref, or challenge spec.
+        workload_payload: String,
+        /// Wall-clock deadline in seconds from acceptance.
+        timeout_seconds: u64,
+    },
+
+    /// Machine accepts and begins executing a job.
+    ///
+    /// Sender must be the owner of the referenced machine.
+    /// Transitions job state: Created → Running.
+    ///
+    /// Enforced invariants:
+    ///   - `job_id` must exist and be in Created state.
+    ///   - Sender must own `machine_id`.
+    AcceptJob {
+        /// The job being accepted.
+        job_id: String,
+        /// The machine accepting the job (must match job's assigned machine_id).
+        machine_id: String,
+    },
+
+    /// Machine reports successful job completion with a cryptographic output receipt.
+    ///
+    /// Sender must be the owner of the machine that accepted the job.
+    /// Transitions job state: Running → Completed.
+    ///
+    /// Enforced invariants:
+    ///   - `job_id` must exist and be in Running state.
+    ///   - Sender must own the machine that accepted the job.
+    ///   - `output_hash` must be a non-empty hex string (SHA-256 of output).
+    CompleteJob {
+        /// The job being completed.
+        job_id: String,
+        /// The machine that ran the job.
+        machine_id: String,
+        /// SHA-256 hex of the job's output (deterministic, reproducible by verifier).
+        output_hash: String,
+        /// Unique receipt identifier for this completion event.
+        receipt_id: String,
+        /// Optional execution stats (runtime_ms, etc.) stored as JSON string.
+        execution_stats_json: String,
+    },
+
+    /// Verify a completed job and release escrow to the provider.
+    ///
+    /// In Phase 0: self-verification — the coordinator (or the requesting agent's
+    /// sponsor) acts as verifier. The verifier re-computes or accepts the
+    /// `expected_output_hash` and confirms it matches the `CompleteJob` submission.
+    /// On success, triggers `ReleaseQrcForJob` internally: escrow debited,
+    /// provider wallet credited.
+    ///
+    /// Transitions job state: Completed → Verified → Settled.
+    ///
+    /// Enforced invariants:
+    ///   - `job_id` must exist and be in Completed state.
+    ///   - `expected_output_hash` must match the hash stored by `CompleteJob`.
+    ///   - `escrow_id` must match the escrow referenced in `CreateJob`.
+    ///   - `provider_wallet` must match the machine owner's wallet.
+    VerifyJob {
+        /// The job being verified.
+        job_id: String,
+        /// The escrow hold to release on success.
+        escrow_id: String,
+        /// Expected output hash — must match what CompleteJob submitted.
+        expected_output_hash: String,
+        /// Provider wallet to credit (machine owner's address).
+        provider_wallet: String,
+        /// QRC amount to release (≤ locked amount; remainder auto-refunded).
+        amount: u64,
+        /// Receipt hash for the audit trail.
+        receipt_hash: String,
+    },
+
     /// Submit a Grand Challenge work receipt for verification and scoring.
     ///
     /// Sender must own the registered machine referenced by `machine_id`.
@@ -787,6 +900,11 @@ impl TxBody {
             // Contribution Layer
             TxBody::RegisterMachine { .. }         => "RegisterMachine",
             TxBody::SubmitUsefulWork { .. }        => "SubmitUsefulWork",
+            // Resource Job Lifecycle
+            TxBody::CreateJob { .. }               => "CreateJob",
+            TxBody::AcceptJob { .. }               => "AcceptJob",
+            TxBody::CompleteJob { .. }             => "CompleteJob",
+            TxBody::VerifyJob { .. }               => "VerifyJob",
         }
     }
 }
@@ -975,6 +1093,17 @@ impl Transaction {
             // receipt_id + machine_id + challenge_id + output_hash + seal_hash + 32
             TxBody::SubmitUsefulWork { receipt_id, machine_id, challenge_id, output_hash, seal_hash, .. } => {
                 receipt_id.len() + machine_id.len() + challenge_id.len() + output_hash.len() + seal_hash.len() + 32
+            }
+            // Resource Job Lifecycle.
+            TxBody::CreateJob { job_id, escrow_id, machine_id, description, workload_type, workload_payload, .. } => {
+                job_id.len() + escrow_id.len() + machine_id.len() + description.len() + workload_type.len() + workload_payload.len() + 16
+            }
+            TxBody::AcceptJob { job_id, machine_id } => job_id.len() + machine_id.len() + 8,
+            TxBody::CompleteJob { job_id, machine_id, output_hash, receipt_id, execution_stats_json } => {
+                job_id.len() + machine_id.len() + output_hash.len() + receipt_id.len() + execution_stats_json.len() + 16
+            }
+            TxBody::VerifyJob { job_id, escrow_id, expected_output_hash, provider_wallet, receipt_hash, .. } => {
+                job_id.len() + escrow_id.len() + expected_output_hash.len() + provider_wallet.len() + receipt_hash.len() + 8
             }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
@@ -1784,6 +1913,11 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::DepositToTreasury { .. } => Some("agents"),
         // Contribution Layer belongs to the QRC module.
         TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => Some("qrc"),
+        // Resource Job Lifecycle belongs to the QRC module.
+        TxBody::CreateJob { .. }
+        | TxBody::AcceptJob { .. }
+        | TxBody::CompleteJob { .. }
+        | TxBody::VerifyJob { .. } => Some("qrc"),
     }
 }
 
@@ -3584,6 +3718,357 @@ impl Executor {
                 Ok(())
             }
 
+            // ── Resource Job Lifecycle ─────────────────────────────────────
+            TxBody::CreateJob {
+                job_id,
+                escrow_id,
+                machine_id,
+                description,
+                workload_type,
+                workload_payload,
+                timeout_seconds,
+            } => {
+                // Guard 1: job_id must be unique.
+                let job_key = format!("job:{}", job_id);
+                if state.get_account(&job_key).is_ok() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("CreateJob: job_id '{}' already exists", job_id),
+                    );
+                }
+                // Guard 2: escrow must exist.
+                let escrow_key = format!("escrow:{}", escrow_id);
+                if state.get_account(&escrow_key).is_err() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("CreateJob: escrow '{}' not found — submit LockQrcForJob first", escrow_id),
+                    );
+                }
+                // Guard 3: machine must be registered and Active.
+                let machine_key = format!("machine:{}", machine_id);
+                if state.get_account(&machine_key).is_err() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("CreateJob: machine '{}' is not registered", machine_id),
+                    );
+                }
+                // Write job record in Created state.
+                let job_json = serde_json::json!({
+                    "job_id": job_id,
+                    "requester": tx.sender,
+                    "escrow_id": escrow_id,
+                    "machine_id": machine_id,
+                    "description": description,
+                    "workload_type": workload_type,
+                    "workload_payload": workload_payload,
+                    "timeout_seconds": timeout_seconds,
+                    "state": "Created",
+                    "output_hash": null,
+                    "receipt_id": null,
+                    "execution_stats_json": null,
+                    "created_at": "",
+                }).to_string();
+                let mut acct = chain_forge_state::AccountState::new(job_key.clone(), job_json);
+                acct.credit("job_created", 1);
+                state.upsert_account(acct);
+                state.refresh_leaf(&job_key);
+                events.push(format!(
+                    "create_job: job_id={} escrow_id={} machine_id={} requester={} workload_type={}",
+                    job_id, escrow_id, machine_id, tx.sender, workload_type
+                ));
+                Ok(())
+            }
+
+            TxBody::AcceptJob { job_id, machine_id } => {
+                // Guard 1: job must exist and be in Created state.
+                let job_key = format!("job:{}", job_id);
+                let job_acct = match state.get_account(&job_key) {
+                    Ok(a) => a,
+                    Err(_) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("AcceptJob: job '{}' not found", job_id),
+                    ),
+                };
+                let mut job_data: serde_json::Value =
+                    serde_json::from_str(&job_acct.role).unwrap_or_default();
+                let current_state = job_data.get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if current_state != "Created" {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("AcceptJob: job '{}' is in state '{}', expected Created", job_id, current_state),
+                    );
+                }
+                // Guard 2: sender must own the machine.
+                let machine_key = format!("machine:{}", machine_id);
+                let machine_acct = match state.get_account(&machine_key) {
+                    Ok(a) => a,
+                    Err(_) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("AcceptJob: machine '{}' not registered", machine_id),
+                    ),
+                };
+                if let Ok(record) = serde_json::from_str::<chain_forge_resource::MachineRecord>(&machine_acct.role) {
+                    let owner_id = match &record.owner {
+                        chain_forge_resource::ProviderOwner::Individual(s) => s.0.clone(),
+                        chain_forge_resource::ProviderOwner::Enterprise(e) => e.0.clone(),
+                    };
+                    if owner_id != tx.sender {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!("AcceptJob: sender {} is not the owner of machine {}", tx.sender, machine_id),
+                        );
+                    }
+                }
+                // Guard 3: machine_id must match what CreateJob specified.
+                let assigned_machine = job_data.get("machine_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if assigned_machine != machine_id.as_str() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("AcceptJob: job '{}' was assigned to machine '{}', not '{}'",
+                            job_id, assigned_machine, machine_id),
+                    );
+                }
+                // Transition: Created → Running.
+                job_data["state"] = serde_json::Value::String("Running".to_string());
+                job_data["accepted_at"] = serde_json::Value::String(String::new());
+                let updated_json = job_data.to_string();
+                let mut updated_acct = chain_forge_state::AccountState::new(job_key.clone(), updated_json);
+                updated_acct.credit("job_created", job_acct.balance_of("job_created"));
+                updated_acct.credit("job_running", 1);
+                state.upsert_account(updated_acct);
+                state.refresh_leaf(&job_key);
+                events.push(format!(
+                    "accept_job: job_id={} machine_id={} acceptor={}",
+                    job_id, machine_id, tx.sender
+                ));
+                Ok(())
+            }
+
+            TxBody::CompleteJob {
+                job_id,
+                machine_id,
+                output_hash,
+                receipt_id,
+                execution_stats_json,
+            } => {
+                // Guard 1: job must exist and be in Running state.
+                let job_key = format!("job:{}", job_id);
+                let job_acct = match state.get_account(&job_key) {
+                    Ok(a) => a,
+                    Err(_) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("CompleteJob: job '{}' not found", job_id),
+                    ),
+                };
+                let mut job_data: serde_json::Value =
+                    serde_json::from_str(&job_acct.role).unwrap_or_default();
+                let current_state = job_data.get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if current_state != "Running" {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("CompleteJob: job '{}' is in state '{}', expected Running", job_id, current_state),
+                    );
+                }
+                // Guard 2: sender must own the machine.
+                let machine_key = format!("machine:{}", machine_id);
+                let machine_acct = match state.get_account(&machine_key) {
+                    Ok(a) => a,
+                    Err(_) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("CompleteJob: machine '{}' not registered", machine_id),
+                    ),
+                };
+                if let Ok(record) = serde_json::from_str::<chain_forge_resource::MachineRecord>(&machine_acct.role) {
+                    let owner_id = match &record.owner {
+                        chain_forge_resource::ProviderOwner::Individual(s) => s.0.clone(),
+                        chain_forge_resource::ProviderOwner::Enterprise(e) => e.0.clone(),
+                    };
+                    if owner_id != tx.sender {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!("CompleteJob: sender {} is not the owner of machine {}", tx.sender, machine_id),
+                        );
+                    }
+                }
+                // Guard 3: output_hash must be non-empty.
+                if output_hash.is_empty() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        "CompleteJob: output_hash must not be empty".to_string(),
+                    );
+                }
+                // Guard 4: receipt_id must be unique.
+                let receipt_key = format!("job_receipt:{}", receipt_id);
+                if state.get_account(&receipt_key).is_ok() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("CompleteJob: receipt_id '{}' already exists (duplicate)", receipt_id),
+                    );
+                }
+                // Transition: Running → Completed.
+                job_data["state"] = serde_json::Value::String("Completed".to_string());
+                job_data["output_hash"] = serde_json::Value::String(output_hash.clone());
+                job_data["receipt_id"] = serde_json::Value::String(receipt_id.clone());
+                job_data["execution_stats_json"] = serde_json::Value::String(execution_stats_json.clone());
+                job_data["completed_at"] = serde_json::Value::String(String::new());
+                let updated_json = job_data.to_string();
+                let mut updated_acct = chain_forge_state::AccountState::new(job_key.clone(), updated_json);
+                updated_acct.credit("job_created",   job_acct.balance_of("job_created"));
+                updated_acct.credit("job_running",   job_acct.balance_of("job_running"));
+                updated_acct.credit("job_completed", 1);
+                state.upsert_account(updated_acct);
+                state.refresh_leaf(&job_key);
+                // Write receipt record.
+                let receipt_json = serde_json::json!({
+                    "receipt_id": receipt_id,
+                    "job_id": job_id,
+                    "machine_id": machine_id,
+                    "output_hash": output_hash,
+                    "submitted_by": tx.sender,
+                    "submitted_at": "",
+                }).to_string();
+                let mut receipt_acct = chain_forge_state::AccountState::new(receipt_key.clone(), receipt_json);
+                receipt_acct.credit("receipt_recorded", 1);
+                state.upsert_account(receipt_acct);
+                state.refresh_leaf(&receipt_key);
+                events.push(format!(
+                    "complete_job: job_id={} machine_id={} output_hash={} receipt_id={}",
+                    job_id, machine_id, output_hash, receipt_id
+                ));
+                Ok(())
+            }
+
+            TxBody::VerifyJob {
+                job_id,
+                escrow_id,
+                expected_output_hash,
+                provider_wallet,
+                amount,
+                receipt_hash,
+            } => {
+                // Guard 1: job must exist and be in Completed state.
+                let job_key = format!("job:{}", job_id);
+                // Clone all needed data upfront to release the immutable borrow on state
+                // before we start mutating it.
+                let (mut job_data, job_bal_created, job_bal_running, job_bal_completed, requester_wallet) = {
+                    let job_acct = match state.get_account(&job_key) {
+                        Ok(a) => a,
+                        Err(_) => return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!("VerifyJob: job '{}' not found", job_id),
+                        ),
+                    };
+                    let jd: serde_json::Value =
+                        serde_json::from_str(&job_acct.role).unwrap_or_default();
+                    let current_state = jd.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let stored_hash   = jd.get("output_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let requester     = jd.get("requester").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let bc = job_acct.balance_of("job_created");
+                    let br = job_acct.balance_of("job_running");
+                    let bco = job_acct.balance_of("job_completed");
+                    if current_state != "Completed" {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!("VerifyJob: job '{}' is in state '{}', expected Completed", job_id, current_state),
+                        );
+                    }
+                    // Guard 2: output_hash must match what CompleteJob stored.
+                    if stored_hash != *expected_output_hash {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "VerifyJob: output_hash mismatch — stored='{}' expected='{}'",
+                                stored_hash, expected_output_hash
+                            ),
+                        );
+                    }
+                    (jd, bc, br, bco, requester)
+                };
+                // Guard 3: escrow must exist and match this job.
+                let escrow_key = format!("escrow:{}", escrow_id);
+                let (mut updated_escrow, locked_amount) = {
+                    let escrow_acct = match state.get_account(&escrow_key) {
+                        Ok(a) => a,
+                        Err(_) => return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!("VerifyJob: escrow '{}' not found", escrow_id),
+                        ),
+                    };
+                    let locked = escrow_acct.balance_of("locked_uqrc");
+                    (escrow_acct.clone(), locked)
+                };
+                // Guard 4: amount must not exceed locked amount.
+                if *amount > locked_amount as u64 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "VerifyJob: release amount {} exceeds locked amount {}",
+                            amount, locked_amount
+                        ),
+                    );
+                }
+                // Guard 5: provider_wallet must not be empty.
+                if provider_wallet.is_empty() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        "VerifyJob: provider_wallet must not be empty".to_string(),
+                    );
+                }
+                // --- All guards passed. Execute settlement. ---
+                // 1. Debit escrow account.
+                updated_escrow.debit("locked_uqrc", *amount as u128);
+                let refund_amount = locked_amount.saturating_sub(*amount as u128);
+                if refund_amount > 0 && !requester_wallet.is_empty() {
+                    if state.get_account(&requester_wallet).is_err() {
+                        state.upsert_account(chain_forge_state::AccountState::new(
+                            requester_wallet.clone(), String::new()
+                        ));
+                    }
+                    if let Ok(acct) = state.get_account_mut(&requester_wallet) {
+                        acct.credit("uqrc", refund_amount);
+                    }
+                    state.refresh_leaf(&requester_wallet);
+                }
+                updated_escrow.credit("escrow_settled", 1);
+                state.upsert_account(updated_escrow);
+                state.refresh_leaf(&escrow_key);
+                // 2. Credit provider wallet.
+                if state.get_account(provider_wallet).is_err() {
+                    state.upsert_account(chain_forge_state::AccountState::new(
+                        provider_wallet.clone(), String::new()
+                    ));
+                }
+                if let Ok(acct) = state.get_account_mut(provider_wallet) {
+                    acct.credit("uqrc", *amount as u128);
+                }
+                state.refresh_leaf(provider_wallet);
+                // 3. Transition job: Completed → Verified → Settled.
+                job_data["state"] = serde_json::Value::String("Settled".to_string());
+                job_data["verified_at"] = serde_json::Value::String(String::new());
+                job_data["verifier"] = serde_json::Value::String(tx.sender.clone());
+                job_data["receipt_hash"] = serde_json::Value::String(receipt_hash.clone());
+                job_data["settled_amount"] = serde_json::Value::Number(serde_json::Number::from(*amount));
+                let updated_json = job_data.to_string();
+                let mut updated_acct = chain_forge_state::AccountState::new(job_key.clone(), updated_json);
+                updated_acct.credit("job_created",   job_bal_created);
+                updated_acct.credit("job_running",   job_bal_running);
+                updated_acct.credit("job_completed", job_bal_completed);
+                updated_acct.credit("job_settled",   1);
+                state.upsert_account(updated_acct);
+                state.refresh_leaf(&job_key);
+                events.push(format!(
+                    "verify_job: job_id={} escrow_id={} provider={} amount={} receipt_hash={}",
+                    job_id, escrow_id, provider_wallet, amount, receipt_hash
+                ));
+                Ok(())
+            }
+
             TxBody::SubmitUsefulWork {
                 receipt_id,
                 machine_id,
@@ -3927,6 +4412,13 @@ impl Executor {
             // Contribution Layer requires identity- and state-aware executor.
             TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => {
                 Err("Contribution layer transaction requires identity- and state-aware executor".to_string())
+            }
+            // Resource Job Lifecycle requires the full identity- and agent-aware executor.
+            TxBody::CreateJob { .. }
+            | TxBody::AcceptJob { .. }
+            | TxBody::CompleteJob { .. }
+            | TxBody::VerifyJob { .. } => {
+                Err("Resource job lifecycle transaction requires identity- and agent-aware executor".to_string())
             }
         };
 

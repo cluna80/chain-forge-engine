@@ -355,6 +355,11 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         // Contribution Layer
         TxBody::RegisterMachine { .. }          => "register_machine",
         TxBody::SubmitUsefulWork { .. }         => "submit_useful_work",
+        // Resource Job Lifecycle
+        TxBody::CreateJob { .. }                => "create_job",
+        TxBody::AcceptJob { .. }                => "accept_job",
+        TxBody::CompleteJob { .. }              => "complete_job",
+        TxBody::VerifyJob { .. }                => "verify_job",
     }
 }
 
