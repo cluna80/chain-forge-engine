@@ -13,18 +13,22 @@ use uuid::Uuid;
 /// Database row for `research_objectives`.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ObjectiveRow {
-    pub objective_id:       String,
-    pub challenge_id:       String,
-    pub slug:               String,
-    pub track:              String,
-    pub algorithm_version:  String,
-    pub range_start:        i64,
-    pub range_end:          i64,
-    pub workload_class:     String,
-    pub status:             String,
-    pub verification_spec:  serde_json::Value,
-    pub created_at:         DateTime<Utc>,
-    pub updated_at:         DateTime<Utc>,
+    pub objective_id:         String,
+    pub challenge_id:         String,
+    pub slug:                 String,
+    pub track:                String,
+    pub algorithm_version:    String,
+    pub range_start:          i64,
+    pub range_end:            i64,
+    pub workload_class:       String,
+    pub status:               String,
+    pub verification_spec:    serde_json::Value,
+    /// Minimum number of independent `'reproduced'` verifications required
+    /// before a submitted result may transition to `'accepted'`.
+    /// Added in migration 008 (Change Set F). Default: 2.
+    pub verification_quorum:  i32,
+    pub created_at:           DateTime<Utc>,
+    pub updated_at:           DateTime<Utc>,
 }
 
 // ── research_tasks ────────────────────────────────────────────────────────────
@@ -137,16 +141,22 @@ pub struct ResearchArtifactRow {
 /// Input for inserting a new objective.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewObjective {
-    pub objective_id:       String,
-    pub challenge_id:       String,
-    pub slug:               String,
-    pub track:              String,
-    pub algorithm_version:  String,
-    pub range_start:        u64,
-    pub range_end:          u64,
-    pub workload_class:     String,
-    pub verification_spec:  serde_json::Value,
+    pub objective_id:        String,
+    pub challenge_id:        String,
+    pub slug:                String,
+    pub track:               String,
+    pub algorithm_version:   String,
+    pub range_start:         u64,
+    pub range_end:           u64,
+    pub workload_class:      String,
+    pub verification_spec:   serde_json::Value,
+    /// Required reproduced-verification quorum before a result is accepted.
+    /// Defaults to 2 when not supplied (matches the DB column default).
+    #[serde(default = "default_verification_quorum")]
+    pub verification_quorum: u32,
 }
+
+fn default_verification_quorum() -> u32 { 2 }
 
 /// Input for inserting a new task.
 #[derive(Debug, Clone, Serialize, Deserialize)]

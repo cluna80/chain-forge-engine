@@ -24,19 +24,22 @@ impl From<&ResearchObjective> for NewObjective {
             .to_string();
 
         NewObjective {
-            objective_id:      obj.objective_id.clone(),
-            challenge_id:      obj.challenge_id.clone(),
+            objective_id:        obj.objective_id.clone(),
+            challenge_id:        obj.challenge_id.clone(),
             slug,
             // track is not stored on ResearchObjective yet; use "unknown"
             // until Change Set E adds it.
-            track:             "unknown".to_string(),
-            algorithm_version: obj.algorithm_version.clone(),
-            range_start:       obj.range_start,
-            range_end:         obj.range_end,
+            track:               "unknown".to_string(),
+            algorithm_version:   obj.algorithm_version.clone(),
+            range_start:         obj.range_start,
+            range_end:           obj.range_end,
             // ResearchObjective has no workload_class field; default to "cpu".
             // The field on ResearchMicrotask carries the real value per task.
-            workload_class:    "cpu".to_string(),
-            verification_spec: serde_json::Value::String(obj.verification_spec.clone()),
+            workload_class:      "cpu".to_string(),
+            verification_spec:   serde_json::Value::String(obj.verification_spec.clone()),
+            // Use the DB column default (2) until ResearchObjective gains a
+            // verification_quorum field of its own.
+            verification_quorum: 2,
         }
     }
 }

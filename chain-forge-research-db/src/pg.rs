@@ -58,8 +58,9 @@ impl ResearchDb for PgResearchDb {
             r#"
             INSERT INTO research_objectives
                 (objective_id, challenge_id, slug, track, algorithm_version,
-                 range_start, range_end, workload_class, verification_spec)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 range_start, range_end, workload_class, verification_spec,
+                 verification_quorum)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING *
             "#,
         )
@@ -72,6 +73,7 @@ impl ResearchDb for PgResearchDb {
         .bind(obj.range_end as i64)
         .bind(&obj.workload_class)
         .bind(&obj.verification_spec)
+        .bind(obj.verification_quorum as i32)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -699,6 +701,96 @@ impl ResearchDb for PgResearchDb {
         .fetch_one(&self.pool)
         .await?;
         Ok(count as u64)
+    }
+
+    // ── verification (Change Set F) ──────────────────────────────────────────
+
+    async fn get_verification_quorum(
+        &self,
+        objective_id: &str,
+    ) -> Result<u32, ResearchDbError> {
+        let quorum: i32 = sqlx::query_scalar(
+            "SELECT verification_quorum FROM research_objectives WHERE objective_id = $1",
+        )
+        .bind(objective_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| ResearchDbError::NotFound(format!("objective_id={objective_id}")))?;
+        Ok(quorum as u32)
+    }
+
+    async fn count_reproduced_verifications(
+        &self,
+        result_id: Uuid,
+    ) -> Result<u64, ResearchDbError> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM   verification_records
+            WHERE  result_id = $1
+              AND  outcome   = 'reproduced'
+            "#,
+        )
+        .bind(result_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as u64)
+    }
+
+    async fn accept_task(
+        &self,
+        task_id:   &str,
+        result_id: Uuid,
+    ) -> Result<(), ResearchDbError> {
+        // Both updates run in a single transaction so they succeed or fail together.
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            UPDATE research_tasks
+            SET    status     = 'accepted',
+                   updated_at = now()
+            WHERE  task_id = $1
+              AND  status  = 'submitted'
+            "#,
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE experiment_results
+            SET    result_status = 'accepted',
+                   updated_at   = now()
+            WHERE  result_id = $1
+            "#,
+        )
+        .bind(result_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_submitted_tasks(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<TaskRow>, ResearchDbError> {
+        let rows = sqlx::query_as::<_, TaskRow>(
+            r#"
+            SELECT *
+            FROM   research_tasks
+            WHERE  objective_id = $1
+              AND  status       = 'submitted'
+            ORDER  BY updated_at
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }
 

@@ -233,6 +233,49 @@ pub trait ResearchDb: Send + Sync {
 
     /// Total task count for an objective.
     async fn count_tasks(&self, objective_id: &str) -> Result<u64, ResearchDbError>;
+
+    // ── verification (Change Set F) ──────────────────────────────────────────
+
+    /// Return the `verification_quorum` for an objective.
+    ///
+    /// This is the minimum number of independent `'reproduced'` verifications
+    /// required before a submitted result may be accepted.
+    async fn get_verification_quorum(
+        &self,
+        objective_id: &str,
+    ) -> Result<u32, ResearchDbError>;
+
+    /// Count the number of independent `'reproduced'` verifications for a
+    /// given result.
+    ///
+    /// Only verifications with `outcome = 'reproduced'` are counted.
+    /// Self-verifications are blocked at insert time (by the DB constraint and
+    /// `insert_verification`), so this count is always independent reproductions.
+    async fn count_reproduced_verifications(
+        &self,
+        result_id: Uuid,
+    ) -> Result<u64, ResearchDbError>;
+
+    /// Transition a task from `'submitted'` to `'accepted'`, and mark the
+    /// associated result as `'accepted'`.
+    ///
+    /// Called by `VerificationEngine` once the reproduced-verification count
+    /// meets or exceeds the objective's `verification_quorum`.
+    ///
+    /// This is the ONLY path by which a task reaches `'accepted'`.  No
+    /// other code should directly flip a task or result to `accepted`.
+    async fn accept_task(
+        &self,
+        task_id:   &str,
+        result_id: Uuid,
+    ) -> Result<(), ResearchDbError>;
+
+    /// List all tasks for an objective that are in `'submitted'` status
+    /// (i.e. awaiting independent verification).
+    async fn list_submitted_tasks(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<TaskRow>, ResearchDbError>;
 }
 
 // ── Provenance DTO ─────────────────────────────────────────────────────────────

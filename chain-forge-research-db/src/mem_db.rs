@@ -59,18 +59,19 @@ impl ResearchDb for MemResearchDb {
             )));
         }
         let row = ObjectiveRow {
-            objective_id:      obj.objective_id.clone(),
-            challenge_id:      obj.challenge_id,
-            slug:              obj.slug,
-            track:             obj.track,
-            algorithm_version: obj.algorithm_version,
-            range_start:       obj.range_start as i64,
-            range_end:         obj.range_end as i64,
-            workload_class:    obj.workload_class,
-            status:            "active".to_string(),
-            verification_spec: obj.verification_spec,
-            created_at:        now(),
-            updated_at:        now(),
+            objective_id:        obj.objective_id.clone(),
+            challenge_id:        obj.challenge_id,
+            slug:                obj.slug,
+            track:               obj.track,
+            algorithm_version:   obj.algorithm_version,
+            range_start:         obj.range_start as i64,
+            range_end:           obj.range_end as i64,
+            workload_class:      obj.workload_class,
+            status:              "active".to_string(),
+            verification_spec:   obj.verification_spec,
+            verification_quorum: obj.verification_quorum as i32,
+            created_at:          now(),
+            updated_at:          now(),
         };
         s.objectives.insert(obj.objective_id, row.clone());
         Ok(row)
@@ -599,6 +600,81 @@ impl ResearchDb for MemResearchDb {
             .filter(|t| t.objective_id == objective_id)
             .count();
         Ok(count as u64)
+    }
+
+    // ── verification (Change Set F) ──────────────────────────────────────────
+
+    async fn get_verification_quorum(
+        &self,
+        objective_id: &str,
+    ) -> Result<u32, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let quorum = s
+            .objectives
+            .get(objective_id)
+            .ok_or_else(|| ResearchDbError::NotFound(format!("objective_id={objective_id}")))?
+            .verification_quorum;
+        Ok(quorum as u32)
+    }
+
+    async fn count_reproduced_verifications(
+        &self,
+        result_id: Uuid,
+    ) -> Result<u64, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let count = s
+            .verifications
+            .values()
+            .filter(|v| v.result_id == result_id && v.outcome == "reproduced")
+            .count();
+        Ok(count as u64)
+    }
+
+    async fn accept_task(
+        &self,
+        task_id:   &str,
+        result_id: Uuid,
+    ) -> Result<(), ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+
+        // Transition task: submitted → accepted
+        let task = s
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ResearchDbError::NotFound(format!("task_id={task_id}")))?;
+        if task.status != "submitted" {
+            return Err(ResearchDbError::NotFound(format!(
+                "task_id={task_id} is not in 'submitted' status (got '{}')",
+                task.status
+            )));
+        }
+        task.status     = "accepted".to_string();
+        task.updated_at = now();
+
+        // Transition result: submitted → accepted
+        let result = s
+            .results
+            .get_mut(&result_id)
+            .ok_or_else(|| ResearchDbError::NotFound(format!("result_id={result_id}")))?;
+        result.result_status = "accepted".to_string();
+        result.updated_at    = now();
+
+        Ok(())
+    }
+
+    async fn list_submitted_tasks(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<TaskRow>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let mut rows: Vec<_> = s
+            .tasks
+            .values()
+            .filter(|t| t.objective_id == objective_id && t.status == "submitted")
+            .cloned()
+            .collect();
+        rows.sort_by_key(|t| t.updated_at);
+        Ok(rows)
     }
 }
 

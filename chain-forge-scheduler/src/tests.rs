@@ -24,15 +24,16 @@ mod tests {
 
     fn make_objective(slug: &str, n_tasks: u64) -> (NewObjective, Vec<NewTask>) {
         let obj = NewObjective {
-            objective_id:      format!("ch::obj::{slug}"),
-            challenge_id:      "ch".to_string(),
-            slug:              slug.to_string(),
-            track:             "hash".to_string(),
-            algorithm_version: "sha256_v1".to_string(),
-            range_start:       0,
-            range_end:         n_tasks * 1_000,
-            workload_class:    "cpu".to_string(),
-            verification_spec: json!({ "method": "sha256_preimage" }),
+            objective_id:        format!("ch::obj::{slug}"),
+            challenge_id:        "ch".to_string(),
+            slug:                slug.to_string(),
+            track:               "hash".to_string(),
+            algorithm_version:   "sha256_v1".to_string(),
+            range_start:         0,
+            range_end:           n_tasks * 1_000,
+            workload_class:      "cpu".to_string(),
+            verification_spec:   json!({ "method": "sha256_preimage" }),
+            verification_quorum: 2,
         };
         let tasks: Vec<NewTask> = (0..n_tasks)
             .map(|i| NewTask {

@@ -23,6 +23,7 @@ mod tests {
 
     use crate::{
         db::ResearchDb,
+        error::ResearchDbError,
         mem_db::MemResearchDb,
         models::*,
     };
@@ -31,15 +32,16 @@ mod tests {
 
     fn make_objective(challenge: &str, slug: &str, start: u64, end: u64) -> NewObjective {
         NewObjective {
-            objective_id:      format!("{challenge}::obj::{slug}"),
-            challenge_id:      challenge.to_string(),
-            slug:              slug.to_string(),
-            track:             "hash".to_string(),
-            algorithm_version: "sha256_v1".to_string(),
-            range_start:       start,
-            range_end:         end,
-            workload_class:    "cpu".to_string(),
-            verification_spec: json!({ "method": "sha256_preimage" }),
+            objective_id:        format!("{challenge}::obj::{slug}"),
+            challenge_id:        challenge.to_string(),
+            slug:                slug.to_string(),
+            track:               "hash".to_string(),
+            algorithm_version:   "sha256_v1".to_string(),
+            range_start:         start,
+            range_end:           end,
+            workload_class:      "cpu".to_string(),
+            verification_spec:   json!({ "method": "sha256_preimage" }),
+            verification_quorum: 2,
         }
     }
 
@@ -894,5 +896,154 @@ mod tests {
             !pending.contains(&obj_id),
             "fully submitted objective should not appear in pending work"
         );
+    }
+
+    // ── verification (Change Set F) ───────────────────────────────────────────
+
+    /// Helper: one submitted task with a result ready for verification.
+    async fn setup_for_verification(
+        quorum: u32,
+    ) -> (MemResearchDb, String, String, uuid::Uuid) {
+        let db = MemResearchDb::new();
+        let obj = NewObjective {
+            objective_id:        "ch::obj::v_obj".to_string(),
+            challenge_id:        "ch".to_string(),
+            slug:                "v_obj".to_string(),
+            track:               "hash".to_string(),
+            algorithm_version:   "sha256_v1".to_string(),
+            range_start:         0,
+            range_end:           1_000,
+            workload_class:      "cpu".to_string(),
+            verification_spec:   json!({ "method": "sha256_preimage" }),
+            verification_quorum: quorum,
+        };
+        let obj_id = obj.objective_id.clone();
+        db.insert_objective(obj).await.unwrap();
+
+        let task = NewTask {
+            task_id:        format!("{obj_id}::task::0000-0001"),
+            objective_id:   obj_id.clone(),
+            range_start:    0,
+            range_end:      1_000,
+            workload_class: "cpu".to_string(),
+            input_seed:     0,
+        };
+        let task_id = task.task_id.clone();
+        db.upsert_tasks(vec![task]).await.unwrap();
+
+        // Assign → submit
+        let exp = Utc::now() + Duration::seconds(120);
+        let assigned = db
+            .assign_task(&obj_id, "cpu", "miner_s", exp)
+            .await
+            .unwrap()
+            .unwrap();
+        db.submit_task_result(&assigned.task_id, "miner_s")
+            .await
+            .unwrap();
+
+        // Insert a result row
+        let result = db
+            .insert_result(NewExperimentResult {
+                task_id:           task_id.clone(),
+                receipt_id:        "rcpt_s".to_string(),
+                miner_id:          "miner_s".to_string(),
+                content_hash:      "hash_s".to_string(),
+                result_payload:    json!({ "nonce": 1 }),
+                algorithm_version: "sha256_v1".to_string(),
+                workload_version:  "1.0".to_string(),
+                seal_nonce:        Some(1),
+            })
+            .await
+            .unwrap();
+
+        (db, obj_id, task_id, result.result_id)
+    }
+
+    #[tokio::test]
+    async fn get_verification_quorum_returns_correct_value() {
+        let (db, obj_id, _task_id, _result_id) = setup_for_verification(3).await;
+        let q = db.get_verification_quorum(&obj_id).await.unwrap();
+        assert_eq!(q, 3);
+    }
+
+    #[tokio::test]
+    async fn count_reproduced_verifications_counts_only_reproduced() {
+        let (db, _obj_id, task_id, result_id) = setup_for_verification(2).await;
+
+        // Insert one 'reproduced' and one 'diverged'
+        db.insert_verification(NewVerificationRecord {
+            result_id,
+            task_id:              task_id.clone(),
+            verifier_id:          "v1".to_string(),
+            outcome:              "reproduced".to_string(),
+            verifier_content_hash: "h1".to_string(),
+            notes:                None,
+            verifier_receipt_id:  None,
+        })
+        .await
+        .unwrap();
+
+        db.insert_verification(NewVerificationRecord {
+            result_id,
+            task_id:              task_id.clone(),
+            verifier_id:          "v2".to_string(),
+            outcome:              "diverged".to_string(),
+            verifier_content_hash: "h2".to_string(),
+            notes:                None,
+            verifier_receipt_id:  None,
+        })
+        .await
+        .unwrap();
+
+        let count = db.count_reproduced_verifications(result_id).await.unwrap();
+        assert_eq!(count, 1, "diverged should not count toward reproduced tally");
+    }
+
+    #[tokio::test]
+    async fn accept_task_transitions_task_and_result() {
+        let (db, _obj_id, task_id, result_id) = setup_for_verification(1).await;
+
+        db.accept_task(&task_id, result_id).await.unwrap();
+
+        let t = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(t.status, "accepted");
+
+        let r = db.get_result(result_id).await.unwrap().unwrap();
+        assert_eq!(r.result_status, "accepted");
+    }
+
+    #[tokio::test]
+    async fn accept_task_on_non_submitted_fails() {
+        let (db, _obj_id, task_id, result_id) = setup_for_verification(1).await;
+
+        // Accept once — now it's 'accepted'
+        db.accept_task(&task_id, result_id).await.unwrap();
+
+        // Trying to accept again must fail (not 'submitted')
+        let err = db.accept_task(&task_id, result_id).await.unwrap_err();
+        assert!(
+            matches!(err, ResearchDbError::NotFound(_)),
+            "accepting an already-accepted task must fail; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_submitted_tasks_returns_submitted_only() {
+        let (db, obj_id, task_id, _result_id) = setup_for_verification(2).await;
+
+        let submitted = db.list_submitted_tasks(&obj_id).await.unwrap();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].task_id, task_id);
+        assert_eq!(submitted[0].status, "submitted");
+    }
+
+    #[tokio::test]
+    async fn list_submitted_tasks_excludes_accepted() {
+        let (db, obj_id, task_id, result_id) = setup_for_verification(1).await;
+        db.accept_task(&task_id, result_id).await.unwrap();
+
+        let submitted = db.list_submitted_tasks(&obj_id).await.unwrap();
+        assert!(submitted.is_empty(), "accepted task must not appear in submitted list");
     }
 }
