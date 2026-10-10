@@ -312,17 +312,23 @@ def submit(label: str, host: str, port: int, tx: dict,
 
 def wait_committed(host: str, port: int, tx_id: str,
                    timeout_s: int = 30, interval: float = 0.4) -> bool:
+    """
+    Poll GET /api/tx/{id} until TxSummary appears.
+    TxSummary shape: {id, height, sender, kind, success: bool, gas_used, events, error}
+    A 404 means the tx hasn't committed yet — keep polling.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         data = get_json(host, port, f"/api/tx/{tx_id}")
-        if isinstance(data, dict):
-            status = data.get("status")
-            if status == "ok":
+        if isinstance(data, dict) and "success" in data:
+            # TxSummary found — check execution result
+            if data.get("success"):
                 return True
-            if status == "error":
-                err = data.get("error") or data.get("message") or data
+            else:
+                err = data.get("error") or "(no error detail)"
                 print(warn(f"  tx {tx_id} failed on-chain: {err}"))
                 return False
+        # 404 or no body yet = still in mempool, keep waiting
         time.sleep(interval)
     print(warn(f"  tx {tx_id} timed out after {timeout_s}s (never committed)"))
     return False
