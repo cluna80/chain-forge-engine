@@ -63,3 +63,9 @@ pub use types::worker::{
     build_proof, build_receipt, DiscoveryVerifier, DiscoveryWorker, VerificationOutcome,
     WorkResult,
 };
+
+// ── Change Set C: Research Microtask Decomposition ────────────────────────────
+pub use types::microtask::{
+    decompose_objective, DecompositionConfig, MicrotaskCommitment, MicrotaskRegistry,
+    MicrotaskStatus, ObjectiveStatus, ResearchMicrotask, ResearchObjective, WorkloadClass,
+};
