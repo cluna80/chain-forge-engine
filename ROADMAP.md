@@ -720,6 +720,10 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 28. **PoCD miner hardening + 5-track challenge upgrade** ✅ **DONE (2026-10-09)** — `scripts/pocd_miner.py` fully rewritten: real per-track deterministic computation (Fibonacci, pre-image search, matrix multiply, lattice SVP, prime sieve); multi-threaded seal mining (`--threads N`); round-robin track selection by default (`--track all`). Genesis files upgraded: 3-node devnet → 8-bit seal difficulty across all 5 tracks; 4-node devnet gets full `pocd` block + `treasury:pocd` + 5 genesis challenges for the first time. All `verification_criteria` are fully specified and independently reproducible — any verifier can recompute the expected output_hash from challenge_id alone.
 
+29. **3-way PoCD epoch reward split — confirmed on 3-node devnet (2026-10-09)** ✅ **DONE** — All three miners (machine IDs: `qcb1devminer-alice`, `bob`, `dave`) running against Alice's node via `--machine` flag receive separate per-wallet uQCB credits at the block 720 epoch boundary. 100+ `pocd_reward distributed` log lines confirmed across all three wallets in a single epoch. Per-proof amounts: 29,259 / 36,574 / 48,765 / 60,957 / 73,148 uQCB (track-weighted). Confirmed devnet startup sequence: Alice node (no bootstrap) → Bob + Dave nodes (`--bootstrap /ip4/127.0.0.1/tcp/27000`) → all three miners pointing at Alice with distinct `--machine` flags. **Known gap**: PoCD proof pools are node-local — proofs submitted to Alice are not gossiped to Bob/Dave over P2P. See item 30 below.
+
+30. **PoCD proof pool P2P gossip** ⬜ **PENDING** — Each node's `DiscoveryRegistry` (proof store) is currently local-only. Proofs submitted to one node do not propagate to peers. Consequence: miners pointing at different nodes accumulate proofs in separate pools; only the node that received a proof awards it at epoch boundary. Phase 1 item: add `DiscoveryProof` gossip topic to the libp2p gossip layer so all nodes converge to the same proof pool before the epoch boundary fires.
+
 ---
 
 ## Phase 0d — Proof of Cryptographic Discovery (PoCD) Scaffold
