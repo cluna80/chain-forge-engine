@@ -3407,6 +3407,7 @@ impl Executor {
                     state.upsert_account(new_escrow);
                 }
                 if let Ok(acct) = state.get_account_mut(&escrow_key) {
+                    acct.credit("locked_uqrc", *amount as u128);
                     acct.credit("uqrc", *amount as u128);
                 }
                 state.refresh_leaf(&escrow_key);
@@ -4022,7 +4023,7 @@ impl Executor {
                 }
                 // --- All guards passed. Execute settlement. ---
                 // 1. Debit escrow account.
-                updated_escrow.debit("locked_uqrc", *amount as u128);
+                let _ = updated_escrow.debit("locked_uqrc", *amount as u128);
                 let refund_amount = locked_amount.saturating_sub(*amount as u128);
                 if refund_amount > 0 && !requester_wallet.is_empty() {
                     if state.get_account(&requester_wallet).is_err() {
