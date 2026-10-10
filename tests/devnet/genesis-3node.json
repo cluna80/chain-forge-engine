@@ -39,7 +39,7 @@
     "p2p_port": 27000,
     "rpc_port": 27001,
     "bootstrap_nodes": [],
-    "peer_discovery": "bootstrap",
+    "peer_discovery": "both",
     "max_peers": 10
   },
   "limits": {
