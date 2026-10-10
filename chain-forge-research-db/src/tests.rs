@@ -616,4 +616,283 @@ mod tests {
             assert_eq!(a.task_end, b.task_end);
         }
     }
+
+    // =========================================================================
+    // Change Set E — Continuous Scheduling (lease protocol)
+    // =========================================================================
+    //
+    // All tests use MemResearchDb and manual time values.
+    // The SKIP LOCKED atomicity guarantee is tested at the PostgreSQL layer
+    // (integration tests, gated behind --features integration).
+
+    use chrono::{Duration, Utc};
+
+    /// Helper: set up one objective with `n` tasks and return the db + obj id.
+    async fn setup_scheduled_objective(n: u64) -> (MemResearchDb, String) {
+        let db    = MemResearchDb::new();
+        let obj   = make_objective("sched_ch", "sched_obj", 0, n * 1_000);
+        db.insert_objective(obj.clone()).await.unwrap();
+
+        let tasks: Vec<_> = (0..n)
+            .map(|i| make_task(&obj.objective_id, i * 1_000, (i + 1) * 1_000))
+            .collect();
+        db.upsert_tasks(tasks).await.unwrap();
+
+        (db, obj.objective_id)
+    }
+
+    // ── assign_task ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn assign_task_returns_lowest_range_start() {
+        let (db, obj_id) = setup_scheduled_objective(5).await;
+        let exp = Utc::now() + Duration::seconds(30);
+
+        let row = db
+            .assign_task(&obj_id, "cpu", "miner_alice", exp)
+            .await
+            .unwrap()
+            .expect("should assign a task");
+
+        assert_eq!(row.status, "assigned");
+        assert_eq!(row.range_start, 0, "expected lowest range_start");
+        assert_eq!(row.assigned_to.as_deref(), Some("miner_alice"));
+        assert_eq!(row.lease_generation, 1, "first assignment increments to 1");
+        assert_eq!(row.attempt_count, 1);
+        assert!(row.lease_expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn assign_task_returns_none_when_no_available_tasks() {
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let exp = Utc::now() + Duration::seconds(30);
+
+        // Assign the only task
+        db.assign_task(&obj_id, "cpu", "miner_alice", exp)
+            .await
+            .unwrap()
+            .expect("first assign should succeed");
+
+        // No tasks left
+        let second = db
+            .assign_task(&obj_id, "cpu", "miner_bob", exp)
+            .await
+            .unwrap();
+        assert!(second.is_none(), "should return None when all tasks are assigned");
+    }
+
+    #[tokio::test]
+    async fn assign_task_advances_sequentially() {
+        let (db, obj_id) = setup_scheduled_objective(3).await;
+        let exp = Utc::now() + Duration::seconds(30);
+
+        let t1 = db.assign_task(&obj_id, "cpu", "m1", exp).await.unwrap().unwrap();
+        let t2 = db.assign_task(&obj_id, "cpu", "m2", exp).await.unwrap().unwrap();
+        let t3 = db.assign_task(&obj_id, "cpu", "m3", exp).await.unwrap().unwrap();
+
+        // Each successive assignment goes to the next range
+        assert!(t1.range_start < t2.range_start);
+        assert!(t2.range_start < t3.range_start);
+
+        // All generation counters start at 1 (first assignment each)
+        assert_eq!(t1.lease_generation, 1);
+        assert_eq!(t2.lease_generation, 1);
+        assert_eq!(t3.lease_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn assign_task_generation_increments_on_reassign() {
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let past = Utc::now() - Duration::seconds(5);
+        let future = Utc::now() + Duration::seconds(60);
+
+        // Assign with a past deadline, then expire it, then reassign
+        let row = db.assign_task(&obj_id, "cpu", "miner_a", past).await.unwrap().unwrap();
+        assert_eq!(row.lease_generation, 1);
+
+        // Expire
+        let expired = db.expire_stale_leases(Utc::now()).await.unwrap();
+        assert_eq!(expired, 1);
+
+        // Reassign — generation must increment to 2
+        let row2 = db.assign_task(&obj_id, "cpu", "miner_b", future).await.unwrap().unwrap();
+        assert_eq!(row2.lease_generation, 2, "generation increments on reassign, not reset");
+        assert_eq!(row2.attempt_count, 2);
+        assert_eq!(row2.assigned_to.as_deref(), Some("miner_b"));
+    }
+
+    // ── submit_task_result ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_task_result_transitions_to_submitted() {
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let exp = Utc::now() + Duration::seconds(30);
+
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+        db.submit_task_result(&row.task_id, "miner_alice").await.unwrap();
+
+        let updated = db.get_task(&row.task_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, "submitted");
+        assert!(
+            updated.lease_expires_at.is_none(),
+            "lease_expires_at must be cleared on submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_task_result_rejects_wrong_miner() {
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let exp = Utc::now() + Duration::seconds(30);
+
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+
+        // Wrong miner tries to submit
+        let err = db.submit_task_result(&row.task_id, "miner_bob").await;
+        assert!(err.is_err(), "wrong miner must be rejected");
+    }
+
+    #[tokio::test]
+    async fn submit_task_result_rejects_after_expiry_and_reassign() {
+        // Simulate the full stale-submission scenario:
+        //   1. miner_a gets the lease (generation 1)
+        //   2. miner_a goes silent; expiry runs → task returns to available
+        //   3. miner_b gets the lease (generation 2)
+        //   4. miner_a comes back and tries to submit
+        //
+        // At the DB layer miner_a is no longer `assigned_to`, so submit_task_result
+        // returns an error.  The scheduler layer additionally checks lease_generation,
+        // but this test covers the DB-layer guard on miner identity.
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let past   = Utc::now() - Duration::seconds(5);
+        let future = Utc::now() + Duration::seconds(60);
+
+        let row_a = db.assign_task(&obj_id, "cpu", "miner_a", past).await.unwrap().unwrap();
+
+        // Expire
+        db.expire_stale_leases(Utc::now()).await.unwrap();
+
+        // miner_b takes over
+        db.assign_task(&obj_id, "cpu", "miner_b", future).await.unwrap().unwrap();
+
+        // miner_a submits with its stale task_id → rejected
+        let err = db.submit_task_result(&row_a.task_id, "miner_a").await;
+        assert!(err.is_err(), "stale miner_a submission must be rejected by the DB layer");
+    }
+
+    // ── expire_stale_leases ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn expire_stale_leases_returns_nothing_when_no_expired_tasks() {
+        let (db, obj_id) = setup_scheduled_objective(3).await;
+        let future = Utc::now() + Duration::seconds(60);
+
+        // Assign all tasks with a far-future deadline
+        for miner in &["m1", "m2", "m3"] {
+            db.assign_task(&obj_id, "cpu", miner, future).await.unwrap().unwrap();
+        }
+
+        let count = db.expire_stale_leases(Utc::now()).await.unwrap();
+        assert_eq!(count, 0, "no tasks should expire when deadline is in the future");
+    }
+
+    #[tokio::test]
+    async fn expire_stale_leases_returns_expired_tasks_to_available() {
+        let (db, obj_id) = setup_scheduled_objective(4).await;
+        let past   = Utc::now() - Duration::seconds(1);
+        let future = Utc::now() + Duration::seconds(60);
+
+        // Assign 2 tasks with a past deadline (stale) and 2 with a future deadline
+        db.assign_task(&obj_id, "cpu", "stale_1", past).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "stale_2", past).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "live_1", future).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "live_2", future).await.unwrap().unwrap();
+
+        let count = db.expire_stale_leases(Utc::now()).await.unwrap();
+        assert_eq!(count, 2, "exactly the two stale tasks should be returned to available");
+
+        // Verify the returned tasks are actually available again
+        let available = db.list_tasks_by_status(&obj_id, "available").await.unwrap();
+        assert_eq!(available.len(), 2);
+        for t in &available {
+            assert!(t.lease_expires_at.is_none());
+            assert!(t.assigned_to.is_none());
+            // generation must NOT have been reset
+            assert_eq!(t.lease_generation, 1, "generation preserved after expiry");
+        }
+    }
+
+    #[tokio::test]
+    async fn expire_stale_leases_does_not_reset_lease_generation() {
+        // After expiry the task is re-assigned.  The new generation must be 2,
+        // not 1.  This ensures an evicted miner's generation value (1) is always
+        // stale relative to the new holder's generation value (2).
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let past   = Utc::now() - Duration::seconds(1);
+        let future = Utc::now() + Duration::seconds(60);
+
+        db.assign_task(&obj_id, "cpu", "miner_a", past).await.unwrap().unwrap();
+        db.expire_stale_leases(Utc::now()).await.unwrap();
+        let row = db.assign_task(&obj_id, "cpu", "miner_b", future).await.unwrap().unwrap();
+
+        assert_eq!(row.lease_generation, 2, "generation is 2 after first expiry + reassign");
+    }
+
+    // ── full lease cycle ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn full_lease_cycle_available_assigned_submitted() {
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let exp = Utc::now() + Duration::seconds(30);
+
+        // Phase 1: available → assigned
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+        assert_eq!(row.status, "assigned");
+
+        // Phase 2: insert the experiment result (simulates miner work)
+        let result_dto = make_result(&row.task_id, "miner_alice", "hash_001");
+        db.insert_result(result_dto).await.unwrap();
+
+        // Phase 3: assigned → submitted
+        db.submit_task_result(&row.task_id, "miner_alice").await.unwrap();
+        let final_row = db.get_task(&row.task_id).await.unwrap().unwrap();
+        assert_eq!(final_row.status, "submitted");
+        assert!(final_row.lease_expires_at.is_none());
+
+        // Phase 4: the result is persisted and retrievable
+        let results = db.list_results_for_task(&row.task_id).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].miner_id, "miner_alice");
+    }
+
+    // ── recovery after restart ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn recovery_includes_assigned_tasks_with_expired_leases() {
+        // After a scheduler restart, objectives_with_pending_work() must
+        // return objectives that still have 'assigned' tasks (even with
+        // expired leases) so the new scheduler can pick up the expiry sweep.
+        let (db, obj_id) = setup_scheduled_objective(2).await;
+        let past = Utc::now() - Duration::seconds(1);
+
+        db.assign_task(&obj_id, "cpu", "m1", past).await.unwrap().unwrap();
+        // task 2 stays available
+
+        let pending = db.objectives_with_pending_work().await.unwrap();
+        assert!(pending.contains(&obj_id));
+    }
+
+    #[tokio::test]
+    async fn recovery_excludes_fully_submitted_objectives() {
+        let (db, obj_id) = setup_scheduled_objective(1).await;
+        let exp = Utc::now() + Duration::seconds(30);
+
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+        db.submit_task_result(&row.task_id, "miner_alice").await.unwrap();
+
+        let pending = db.objectives_with_pending_work().await.unwrap();
+        assert!(
+            !pending.contains(&obj_id),
+            "fully submitted objective should not appear in pending work"
+        );
+    }
 }

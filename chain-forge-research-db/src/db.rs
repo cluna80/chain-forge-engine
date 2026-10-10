@@ -12,6 +12,7 @@
 //! A database outage must never prevent the chain from reaching consensus.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::error::ResearchDbError;
@@ -171,6 +172,55 @@ pub trait ResearchDb: Send + Sync {
     /// Return the full provenance chain for a task:
     /// objective → task → results → verifications → findings → artifacts.
     async fn task_provenance(&self, task_id: &str) -> Result<TaskProvenance, ResearchDbError>;
+
+    // ── scheduling (Change Set E) ────────────────────────────────────────────
+
+    /// Atomically assign the next available task for the given objective and
+    /// workload class to a miner, returning the full `TaskRow` (including the
+    /// new `lease_generation` the miner must present on submission).
+    ///
+    /// Uses `SELECT … FOR UPDATE SKIP LOCKED` + `UPDATE` inside a single
+    /// implicit database transaction, so two concurrent scheduler instances
+    /// can never assign the same row.
+    ///
+    /// Returns `None` when no task with `status = 'available'` exists for
+    /// that objective / workload combination.
+    async fn assign_task(
+        &self,
+        objective_id:     &str,
+        workload_class:   &str,
+        miner_id:         &str,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<TaskRow>, ResearchDbError>;
+
+    /// Transition a task from `'assigned'` to `'submitted'`.
+    ///
+    /// The **caller** (i.e. `ResearchScheduler`) is responsible for
+    /// validating that `miner_id` matches `assigned_to` AND that
+    /// `submitted_generation` equals the stored `lease_generation` BEFORE
+    /// calling this method.  A generation mismatch at the scheduler layer
+    /// returns `SchedulerError::LeaseSuperseded`; this method is called only
+    /// after those checks pass.
+    ///
+    /// Clears `lease_expires_at` and `assigned_to` as part of the transition.
+    async fn submit_task_result(
+        &self,
+        task_id:  &str,
+        miner_id: &str,
+    ) -> Result<(), ResearchDbError>;
+
+    /// Bulk-return all `'assigned'` tasks whose `lease_expires_at < now` back
+    /// to `'available'`.
+    ///
+    /// `lease_generation` is intentionally NOT reset — the next `assign_task()`
+    /// call increments it, ensuring evicted miners' old generation values can
+    /// never match any future assignment.
+    ///
+    /// Returns the number of rows that were returned to `'available'`.
+    async fn expire_stale_leases(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, ResearchDbError>;
 
     // ── recovery ────────────────────────────────────────────────────────────
 

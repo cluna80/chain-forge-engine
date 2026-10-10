@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::db::{ResearchDb, TaskProvenance};
@@ -127,6 +127,9 @@ impl ResearchDb for MemResearchDb {
                 status:             "available".to_string(),
                 assigned_to:        None,
                 settled_receipt_id: None,
+                lease_expires_at:   None,
+                lease_generation:   0,
+                attempt_count:      0,
                 created_at:         now(),
                 updated_at:         now(),
             };
@@ -468,6 +471,100 @@ impl ResearchDb for MemResearchDb {
             findings,
             artifacts,
         })
+    }
+
+    // ── scheduling (Change Set E) ────────────────────────────────────────────
+
+    async fn assign_task(
+        &self,
+        objective_id:     &str,
+        workload_class:   &str,
+        miner_id:         &str,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<TaskRow>, ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+
+        // Find the available task with the smallest range_start.
+        // Mimics the PostgreSQL `ORDER BY range_start LIMIT 1` selection.
+        // The in-memory version cannot use `SKIP LOCKED`, but a real
+        // concurrent-scheduler test should use `PgResearchDb`.
+        let task_id = s
+            .tasks
+            .values()
+            .filter(|t| {
+                t.objective_id   == objective_id
+                    && t.workload_class == workload_class
+                    && t.status         == "available"
+            })
+            .min_by_key(|t| t.range_start)
+            .map(|t| t.task_id.clone());
+
+        let task_id = match task_id {
+            Some(id) => id,
+            None     => return Ok(None),
+        };
+
+        let row = s.tasks.get_mut(&task_id).unwrap();
+        row.status           = "assigned".to_string();
+        row.assigned_to      = Some(miner_id.to_string());
+        row.lease_expires_at = Some(lease_expires_at);
+        row.lease_generation += 1;
+        row.attempt_count    += 1;
+        row.updated_at        = now();
+
+        Ok(Some(row.clone()))
+    }
+
+    async fn submit_task_result(
+        &self,
+        task_id:  &str,
+        miner_id: &str,
+    ) -> Result<(), ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+        let row = s
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ResearchDbError::NotFound(format!("task_id={task_id}")))?;
+
+        if row.status != "assigned" || row.assigned_to.as_deref() != Some(miner_id) {
+            return Err(ResearchDbError::NotFound(format!(
+                "task_id={task_id} assigned_to={miner_id} status=assigned"
+            )));
+        }
+
+        row.status           = "submitted".to_string();
+        row.lease_expires_at = None;
+        // assigned_to intentionally kept so provenance is preserved.
+        row.updated_at       = now();
+        Ok(())
+    }
+
+    async fn expire_stale_leases(
+        &self,
+        now_ts: DateTime<Utc>,
+    ) -> Result<u64, ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+        let mut count = 0u64;
+
+        for row in s.tasks.values_mut() {
+            if row.status != "assigned" {
+                continue;
+            }
+            let expired = row
+                .lease_expires_at
+                .map(|exp| exp < now_ts)
+                .unwrap_or(false);
+            if expired {
+                row.status           = "available".to_string();
+                row.assigned_to      = None;
+                row.lease_expires_at = None;
+                // lease_generation is intentionally NOT reset.
+                row.updated_at       = now();
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 
     async fn objectives_with_pending_work(&self) -> Result<Vec<String>, ResearchDbError> {

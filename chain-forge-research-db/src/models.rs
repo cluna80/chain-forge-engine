@@ -30,6 +30,14 @@ pub struct ObjectiveRow {
 // ── research_tasks ────────────────────────────────────────────────────────────
 
 /// Database row for `research_tasks`.
+///
+/// Three fields were added in migration 007 (Change Set E) to support
+/// the atomic lease protocol used by `chain-forge-scheduler`:
+///
+/// * `lease_expires_at`  — wall-clock deadline; `None` when not assigned.
+/// * `lease_generation`  — monotonic counter; incremented by every `assign_task()`.
+///   A miner's submission must carry the exact generation it received.
+/// * `attempt_count`     — total number of assignments ever issued for this task.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct TaskRow {
     pub task_id:            String,
@@ -41,6 +49,16 @@ pub struct TaskRow {
     pub status:             String,
     pub assigned_to:        Option<String>,
     pub settled_receipt_id: Option<String>,
+    // ── lease fields (migration 007) ────────────────────────────────────────
+    /// Wall-clock expiry of the current assignment lease.  `None` when
+    /// `status` is `'available'` or `'submitted'`.
+    pub lease_expires_at:   Option<DateTime<Utc>>,
+    /// Monotonically increasing assignment counter.  Never reset, only
+    /// incremented.  Miners must present this value when submitting results.
+    pub lease_generation:   i64,
+    /// Total number of times `assign_task()` has fired for this task.
+    pub attempt_count:      i32,
+    // ────────────────────────────────────────────────────────────────────────
     pub created_at:         DateTime<Utc>,
     pub updated_at:         DateTime<Utc>,
 }

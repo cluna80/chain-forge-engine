@@ -9,6 +9,7 @@
 //! `Send + Sync` and safe to share across async tasks as `Arc<PgResearchDb>`.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::{debug, info};
@@ -532,6 +533,136 @@ impl ResearchDb for PgResearchDb {
             findings,
             artifacts,
         })
+    }
+
+    // ── scheduling (Change Set E) ────────────────────────────────────────────
+
+    async fn assign_task(
+        &self,
+        objective_id:     &str,
+        workload_class:   &str,
+        miner_id:         &str,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<TaskRow>, ResearchDbError> {
+        debug!(
+            objective_id, workload_class, miner_id,
+            lease_expires_at = %lease_expires_at,
+            "assign_task: selecting next available row"
+        );
+
+        // CTE selects the lowest range_start available task; UPDATE fires
+        // atomically in the same implicit transaction.  SKIP LOCKED ensures
+        // a concurrent scheduler instance picks a different row instead of
+        // blocking, preventing double-assignment.
+        let row = sqlx::query_as::<_, TaskRow>(
+            r#"
+            WITH candidate AS (
+                SELECT task_id
+                FROM   research_tasks
+                WHERE  objective_id   = $1
+                  AND  workload_class = $2
+                  AND  status         = 'available'
+                ORDER  BY range_start
+                LIMIT  1
+                FOR    UPDATE SKIP LOCKED
+            )
+            UPDATE research_tasks
+            SET    status           = 'assigned',
+                   assigned_to      = $3,
+                   lease_expires_at = $4,
+                   lease_generation = lease_generation + 1,
+                   attempt_count    = attempt_count    + 1,
+                   updated_at       = now()
+            FROM   candidate
+            WHERE  research_tasks.task_id = candidate.task_id
+            RETURNING research_tasks.*
+            "#,
+        )
+        .bind(objective_id)
+        .bind(workload_class)
+        .bind(miner_id)
+        .bind(lease_expires_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(ref t) = row {
+            debug!(
+                task_id = %t.task_id,
+                lease_generation = t.lease_generation,
+                "assign_task: assigned"
+            );
+        } else {
+            debug!(objective_id, workload_class, "assign_task: no available task");
+        }
+
+        Ok(row)
+    }
+
+    async fn submit_task_result(
+        &self,
+        task_id:  &str,
+        miner_id: &str,
+    ) -> Result<(), ResearchDbError> {
+        debug!(task_id, miner_id, "submit_task_result");
+
+        let affected = sqlx::query(
+            r#"
+            UPDATE research_tasks
+            SET    status           = 'submitted',
+                   lease_expires_at = NULL,
+                   updated_at       = now()
+            WHERE  task_id    = $1
+              AND  assigned_to = $2
+              AND  status      = 'assigned'
+            "#,
+        )
+        .bind(task_id)
+        .bind(miner_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        if affected == 0 {
+            // Either the task_id doesn't exist, the miner_id doesn't match,
+            // or the status is no longer 'assigned'.  The caller (scheduler)
+            // should have performed the lease-generation check before calling
+            // this, so a 0-rows result here is a logical inconsistency.
+            return Err(ResearchDbError::NotFound(format!(
+                "task_id={task_id} assigned_to={miner_id} status=assigned"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn expire_stale_leases(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, ResearchDbError> {
+        // lease_generation is intentionally NOT reset here.
+        // The next assign_task() will increment it, ensuring the evicted
+        // miner's old generation value can never match the new assignment.
+        let affected = sqlx::query(
+            r#"
+            UPDATE research_tasks
+            SET    status           = 'available',
+                   assigned_to      = NULL,
+                   lease_expires_at = NULL,
+                   updated_at       = now()
+            WHERE  status           = 'assigned'
+              AND  lease_expires_at < $1
+            "#,
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        if affected > 0 {
+            debug!(count = affected, "expire_stale_leases: returned tasks to available");
+        }
+
+        Ok(affected)
     }
 
     // ── recovery ────────────────────────────────────────────────────────────
