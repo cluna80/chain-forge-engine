@@ -18,7 +18,7 @@
   "consensus": {
     "type": "proof-of-stake",
     "validator_set_size": 3,
-    "block_time_ms": 500,
+    "block_time_ms": 3000,
     "personhood_weighted": true
   },
   "execution": {

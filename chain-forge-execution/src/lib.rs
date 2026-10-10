@@ -4059,7 +4059,10 @@ impl Executor {
                 }
                 // --- All guards passed. Execute settlement. ---
                 // 1. Debit escrow account.
-                let _ = updated_escrow.debit("locked_uqcb", *amount as u128);
+                // locked_uqcb tracks the logical lock; uqcb is the shadow balance
+                // credited by LockQrcForJob — both must be drained on settlement.
+                let _ = updated_escrow.debit("locked_uqcb", locked_amount);
+                let _ = updated_escrow.debit("uqcb", locked_amount);
                 // UED-001 (QCB-ECON-001): any escrow residual (locked_amount - amount)
                 // flows to the provider rather than the requester for Phase 1 devnet.
                 // Rationale: simplest deterministic policy; revisit when revenue-split

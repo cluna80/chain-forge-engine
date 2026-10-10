@@ -1422,7 +1422,7 @@ impl Node {
                             && self.last_proposed != Some(key)
                             && (!self.mempool.is_empty()
                                 || self.round_watch_started
-                                    .map(|t| t.elapsed().as_millis() >= 200)
+                                    .map(|t| t.elapsed().as_millis() >= 2000)
                                     .unwrap_or(true))
                         {
                             let parent = chain_forge_consensus::BlockHash(
