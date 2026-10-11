@@ -359,6 +359,97 @@ pub trait ResearchDb: Send + Sync {
         &self,
         objective_id: &str,
     ) -> Result<Option<IntelligenceReportRow>, ResearchDbError>;
+
+    // ── canonical-result enforcement (Change Set L) ──────────────────────────
+
+    /// Atomically promote one result to canonical for a task.
+    ///
+    /// This is the ONLY path that sets `canonical_result_id` on a task row.
+    ///
+    /// The implementation MUST execute the following steps in a single
+    /// serializable transaction:
+    ///   1. `UPDATE research_tasks SET canonical_result_id = $result_id
+    ///      WHERE task_id = $task_id AND canonical_result_id IS NULL`
+    ///      → returns `ResearchDbError::CanonicalAlreadySet` if 0 rows updated
+    ///   2. `UPDATE experiment_results SET result_status = 'accepted'
+    ///      WHERE result_id = $result_id`
+    ///   3. `UPDATE experiment_results SET result_status = 'superseded'
+    ///      WHERE task_id = $task_id AND result_id != $result_id`
+    ///   4. `UPDATE research_tasks SET task_status = 'accepted'
+    ///      WHERE task_id = $task_id`
+    ///
+    /// The UNIQUE constraint on `canonical_result_id` acts as a second-layer
+    /// guard against concurrent transactions that bypass step 1's WHERE clause.
+    ///
+    /// Returns `ResearchDbError::CanonicalAlreadySet` when the task already
+    /// has a canonical result — callers must treat this as idempotent (safe to
+    /// ignore on retry, fatal on first-time conflict).
+    async fn accept_task_canonical(
+        &self,
+        task_id:   &str,
+        result_id: Uuid,
+    ) -> Result<(), ResearchDbError>;
+
+    // ── reward claims (Change Set L) ─────────────────────────────────────────
+
+    /// Persist a new reward claim with status `'pending'`.
+    ///
+    /// Returns `ResearchDbError::Duplicate` when a claim for the same
+    /// `(task_id, reward_kind)` already exists.  The deterministic `claim_id`
+    /// provides idempotency across crash-recovery re-submissions.
+    async fn insert_reward_claim(
+        &self,
+        claim: NewResearchRewardClaim,
+    ) -> Result<ResearchRewardClaim, ResearchDbError>;
+
+    /// Fetch a reward claim by its deterministic `claim_id`.
+    async fn get_reward_claim(
+        &self,
+        claim_id: &str,
+    ) -> Result<Option<ResearchRewardClaim>, ResearchDbError>;
+
+    /// List all reward claims for an objective, ordered by `submitted_at`.
+    async fn list_reward_claims_for_objective(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<ResearchRewardClaim>, ResearchDbError>;
+
+    /// List reward claims by status.  Used by the finality-polling background
+    /// job to find claims that need chain-state reconciliation.
+    async fn list_reward_claims_by_status(
+        &self,
+        status: ClaimStatus,
+    ) -> Result<Vec<ResearchRewardClaim>, ResearchDbError>;
+
+    /// Mark a pending claim as submitted (tx constructed and posted to node).
+    ///
+    /// Sets `claim_status = 'submitted'` and `tx_id = $tx_id`.
+    /// Only transitions from `'pending'`; returns `ResearchDbError::InvalidStatus`
+    /// if the current status is not `'pending'`.
+    async fn mark_claim_submitted(
+        &self,
+        claim_id: &str,
+        tx_id:    &str,
+    ) -> Result<(), ResearchDbError>;
+
+    /// Mark a submitted claim as finalized (tx confirmed on-chain).
+    ///
+    /// Sets `claim_status = 'finalized'` and `finalized_at = now()`.
+    /// Only transitions from `'submitted'`.
+    async fn mark_claim_finalized(
+        &self,
+        claim_id: &str,
+    ) -> Result<(), ResearchDbError>;
+
+    /// Mark a submitted claim as rejected (tx invalid or node rejected it).
+    ///
+    /// Sets `claim_status = 'rejected'` and `rejection_reason`.
+    /// Only transitions from `'submitted'`.
+    async fn mark_claim_rejected(
+        &self,
+        claim_id:         &str,
+        rejection_reason: &str,
+    ) -> Result<(), ResearchDbError>;
 }
 
 // ── Provenance DTO ─────────────────────────────────────────────────────────────

@@ -30,6 +30,24 @@ pub enum ResearchDbError {
     #[error("invalid state transition: {0}")]
     InvalidTransition(String),
 
+    /// `accept_task_canonical` was called for a task that already has a
+    /// canonical result set.  Callers must treat this as idempotent on retry
+    /// and as a fatal conflict on first-time invocation.
+    #[error("canonical result already set for task {task_id}: existing result_id={existing_result_id}")]
+    CanonicalAlreadySet {
+        task_id:            String,
+        existing_result_id: uuid::Uuid,
+    },
+
+    /// A reward-claim status transition is invalid given the current status
+    /// (e.g. trying to mark a 'finalized' claim as 'submitted').
+    #[error("invalid claim status transition for claim {claim_id}: current={current}, attempted={attempted}")]
+    InvalidStatus {
+        claim_id: String,
+        current:  String,
+        attempted: String,
+    },
+
     /// Underlying database error.
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),

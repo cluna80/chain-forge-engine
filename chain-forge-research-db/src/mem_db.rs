@@ -27,6 +27,8 @@ struct MemState {
     findings:               HashMap<Uuid, ResearchFindingRow>,
     artifacts:              HashMap<Uuid, ResearchArtifactRow>,
     intelligence_reports:   HashMap<Uuid, IntelligenceReportRow>,
+    /// key: claim_id (deterministic text)
+    reward_claims:          HashMap<String, ResearchRewardClaim>,
 }
 
 /// In-memory test double for `ResearchDb`.
@@ -135,11 +137,12 @@ impl ResearchDb for MemResearchDb {
                 phase:              t.phase as i32,
                 parent_hash:        t.parent_hash,
                 phase1_miner_id:    t.phase1_miner_id,
-                task_kind:          t.task_kind,
-                avl_seed_index:     t.avl_seed_index.map(|v| v as i32),
-                avl_bit_index:      t.avl_bit_index.map(|v| v as i32),
-                created_at:         now(),
-                updated_at:         now(),
+                task_kind:           t.task_kind,
+                avl_seed_index:      t.avl_seed_index.map(|v| v as i32),
+                avl_bit_index:       t.avl_bit_index.map(|v| v as i32),
+                canonical_result_id: None,
+                created_at:          now(),
+                updated_at:          now(),
             };
             s.tasks.insert(t.task_id, row);
             inserted += 1;
@@ -923,6 +926,221 @@ impl ResearchDb for MemResearchDb {
 
     // ── two-phase cascade (Change Set J) ────────────────────────────────────
 
+    // ── canonical-result enforcement (Change Set L) ──────────────────────────
+
+    async fn accept_task_canonical(
+        &self,
+        task_id:   &str,
+        result_id: Uuid,
+    ) -> Result<(), ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+
+        // Step 1: Check and set canonical_result_id atomically (under the lock).
+        {
+            let task = s
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ResearchDbError::NotFound(format!("task_id={task_id}")))?;
+
+            if let Some(existing) = task.canonical_result_id {
+                return Err(ResearchDbError::CanonicalAlreadySet {
+                    task_id:            task_id.to_string(),
+                    existing_result_id: existing,
+                });
+            }
+        }
+
+        // Verify the result exists and belongs to this task.
+        {
+            let result = s
+                .results
+                .get(&result_id)
+                .ok_or_else(|| ResearchDbError::NotFound(format!("result_id={result_id}")))?;
+            if result.task_id != task_id {
+                return Err(ResearchDbError::InvalidTransition(format!(
+                    "result {result_id} does not belong to task {task_id}"
+                )));
+            }
+        }
+
+        // Step 2: Mark canonical result as 'accepted'.
+        {
+            let r = s.results.get_mut(&result_id).unwrap();
+            r.result_status = "accepted".to_string();
+            r.updated_at    = now();
+        }
+
+        // Step 3: Mark all other results for this task as 'superseded'.
+        let task_results_ids: Vec<Uuid> = s
+            .results
+            .values()
+            .filter(|r| r.task_id == task_id && r.result_id != result_id)
+            .filter(|r| r.result_status != "superseded" && r.result_status != "rejected")
+            .map(|r| r.result_id)
+            .collect();
+        for rid in task_results_ids {
+            let r = s.results.get_mut(&rid).unwrap();
+            r.result_status = "superseded".to_string();
+            r.updated_at    = now();
+        }
+
+        // Step 4: Set canonical_result_id and transition task to 'accepted'.
+        {
+            let task = s.tasks.get_mut(task_id).unwrap();
+            task.canonical_result_id = Some(result_id);
+            task.status              = "accepted".to_string();
+            task.updated_at          = now();
+        }
+
+        Ok(())
+    }
+
+    // ── reward claims (Change Set L) ─────────────────────────────────────────
+
+    async fn insert_reward_claim(
+        &self,
+        claim: NewResearchRewardClaim,
+    ) -> Result<ResearchRewardClaim, ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+
+        // Enforce unique (task_id, reward_kind) — mirrors pg idx_reward_claims_task_kind.
+        let duplicate = s.reward_claims.values().any(|c| {
+            c.task_id == claim.task_id
+                && c.reward_kind == claim.reward_kind.as_str()
+        });
+        if duplicate {
+            return Err(ResearchDbError::Duplicate(format!(
+                "reward claim already exists for task {} kind {}",
+                claim.task_id,
+                claim.reward_kind.as_str(),
+            )));
+        }
+
+        let row = ResearchRewardClaim {
+            claim_id:         claim.claim_id.clone(),
+            objective_id:     claim.objective_id,
+            task_id:          claim.task_id,
+            result_id:        claim.result_id,
+            contribution_hash: claim.contribution_hash,
+            recipient:        claim.recipient,
+            amount_uqcb:      claim.amount_uqcb as i64,
+            policy_version:   claim.policy_version,
+            reward_kind:      claim.reward_kind.as_str().to_string(),
+            tx_id:            None,
+            claim_status:     "pending".to_string(),
+            rejection_reason: None,
+            submitted_at:     now(),
+            finalized_at:     None,
+            updated_at:       now(),
+        };
+        s.reward_claims.insert(claim.claim_id, row.clone());
+        Ok(row)
+    }
+
+    async fn get_reward_claim(
+        &self,
+        claim_id: &str,
+    ) -> Result<Option<ResearchRewardClaim>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        Ok(s.reward_claims.get(claim_id).cloned())
+    }
+
+    async fn list_reward_claims_for_objective(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<ResearchRewardClaim>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let mut rows: Vec<_> = s
+            .reward_claims
+            .values()
+            .filter(|c| c.objective_id == objective_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|c| c.submitted_at);
+        Ok(rows)
+    }
+
+    async fn list_reward_claims_by_status(
+        &self,
+        status: ClaimStatus,
+    ) -> Result<Vec<ResearchRewardClaim>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let status_str = status.as_str();
+        let mut rows: Vec<_> = s
+            .reward_claims
+            .values()
+            .filter(|c| c.claim_status == status_str)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|c| c.submitted_at);
+        Ok(rows)
+    }
+
+    async fn mark_claim_submitted(
+        &self,
+        claim_id: &str,
+        tx_id:    &str,
+    ) -> Result<(), ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+        let claim = s.reward_claims.get_mut(claim_id).ok_or_else(|| {
+            ResearchDbError::NotFound(format!("claim_id={claim_id}"))
+        })?;
+        if claim.claim_status != "pending" {
+            return Err(ResearchDbError::InvalidStatus {
+                claim_id:  claim_id.to_string(),
+                current:   claim.claim_status.clone(),
+                attempted: "submitted".to_string(),
+            });
+        }
+        claim.claim_status = "submitted".to_string();
+        claim.tx_id        = Some(tx_id.to_string());
+        claim.updated_at   = now();
+        Ok(())
+    }
+
+    async fn mark_claim_finalized(
+        &self,
+        claim_id: &str,
+    ) -> Result<(), ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+        let claim = s.reward_claims.get_mut(claim_id).ok_or_else(|| {
+            ResearchDbError::NotFound(format!("claim_id={claim_id}"))
+        })?;
+        if claim.claim_status != "submitted" {
+            return Err(ResearchDbError::InvalidStatus {
+                claim_id:  claim_id.to_string(),
+                current:   claim.claim_status.clone(),
+                attempted: "finalized".to_string(),
+            });
+        }
+        claim.claim_status = "finalized".to_string();
+        claim.finalized_at = Some(now());
+        claim.updated_at   = now();
+        Ok(())
+    }
+
+    async fn mark_claim_rejected(
+        &self,
+        claim_id:         &str,
+        rejection_reason: &str,
+    ) -> Result<(), ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+        let claim = s.reward_claims.get_mut(claim_id).ok_or_else(|| {
+            ResearchDbError::NotFound(format!("claim_id={claim_id}"))
+        })?;
+        if claim.claim_status != "submitted" {
+            return Err(ResearchDbError::InvalidStatus {
+                claim_id:  claim_id.to_string(),
+                current:   claim.claim_status.clone(),
+                attempted: "rejected".to_string(),
+            });
+        }
+        claim.claim_status    = "rejected".to_string();
+        claim.rejection_reason = Some(rejection_reason.to_string());
+        claim.updated_at      = now();
+        Ok(())
+    }
+
     async fn spawn_phase2_task(
         &self,
         parent_task_id:  &str,
@@ -978,11 +1196,12 @@ impl ResearchDb for MemResearchDb {
             phase:              2,
             parent_hash:        Some(parent_hash.to_string()),
             phase1_miner_id:    Some(phase1_miner_id.to_string()),
-            task_kind:          "pocd_phase2".to_string(),
-            avl_seed_index:     None,
-            avl_bit_index:      None,
-            created_at:         now(),
-            updated_at:         now(),
+            task_kind:           "pocd_phase2".to_string(),
+            avl_seed_index:      None,
+            avl_bit_index:       None,
+            canonical_result_id: None,
+            created_at:          now(),
+            updated_at:          now(),
         };
 
         let mut s = self.state.lock().unwrap();

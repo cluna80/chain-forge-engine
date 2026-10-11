@@ -139,6 +139,12 @@ pub struct TaskRow {
     pub avl_seed_index:     Option<i32>,
     /// Avalanche only: input bit position to flip (0..255).
     pub avl_bit_index:      Option<i32>,
+    // ── canonical-result enforcement (Change Set L, migration 011) ──────────
+    /// The single accepted result for this task.  `None` until a result is
+    /// accepted via `accept_task_canonical()`.  Once set, competing results are
+    /// marked 'superseded'.  Backed by a UNIQUE constraint in Postgres so no
+    /// two tasks can share a canonical result.
+    pub canonical_result_id: Option<Uuid>,
     // ────────────────────────────────────────────────────────────────────────
     pub created_at:         DateTime<Utc>,
     pub updated_at:         DateTime<Utc>,
@@ -411,4 +417,121 @@ pub struct NewResearchArtifact {
     pub size_bytes:             u64,
     pub storage_uri:            String,
     pub supersedes_artifact_id: Option<Uuid>,
+}
+
+// ── research_reward_claims (Change Set L) ─────────────────────────────────────
+
+/// Reward kind for a research contribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardKind {
+    /// Primary experiment result (avalanche_experiment task kind).
+    Primary,
+    /// Cross-machine replication result (avalanche_replication task kind).
+    Replication,
+}
+
+impl RewardKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RewardKind::Primary     => "primary",
+            RewardKind::Replication => "replication",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "primary"     => Some(RewardKind::Primary),
+            "replication" => Some(RewardKind::Replication),
+            _             => None,
+        }
+    }
+}
+
+/// Settlement lifecycle for a reward claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimStatus {
+    /// Claim computed and persisted; tx not yet submitted to node.
+    Pending,
+    /// Tx submitted to node; waiting for finality confirmation.
+    Submitted,
+    /// Tx confirmed in canonical chain state; reward paid.
+    Finalized,
+    /// Tx rejected by node or finality check failed.
+    Rejected,
+}
+
+impl ClaimStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClaimStatus::Pending   => "pending",
+            ClaimStatus::Submitted => "submitted",
+            ClaimStatus::Finalized => "finalized",
+            ClaimStatus::Rejected  => "rejected",
+        }
+    }
+}
+
+/// Database row for `research_reward_claims`.
+///
+/// ## Deterministic claim_id
+///
+/// `claim_id` is NOT a random UUID.  It is derived as:
+///
+/// ```text
+/// hex( SHA-256( "qcb-claim-v1" || "\x00" || chain_id || "\x00"
+///               || objective_id || "\x00" || task_id || "\x00"
+///               || reward_kind ) )
+/// ```
+///
+/// This makes re-submission after a crash idempotent: the settle endpoint can
+/// re-derive the same claim_id and detect the existing row rather than creating
+/// a duplicate.
+///
+/// ## Consensus separation
+///
+/// This table is NOT on the consensus critical path.  Double-payment protection
+/// is enforced on-chain by the `claim:{claim_id}` state key in
+/// `chain-forge-execution`.  This table is the scheduler-side audit log.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ResearchRewardClaim {
+    /// Deterministic claim ID (hex-SHA-256 of domain-separated fields).
+    pub claim_id:           String,
+    pub objective_id:       String,
+    pub task_id:            String,
+    pub result_id:          Uuid,
+    /// Content hash of the canonical result (denormalized).
+    pub contribution_hash:  String,
+    /// Reward recipient: miner wallet address / public key hex.
+    pub recipient:          String,
+    /// Reward amount in micro-QCB (uqcb).  1 QCB = 1_000_000 uqcb.
+    pub amount_uqcb:        i64,
+    /// Policy version string, e.g. `"QcbResearchRewardPolicy-v1"`.
+    pub policy_version:     String,
+    /// Reward kind: `"primary"` | `"replication"`.
+    pub reward_kind:        String,
+    /// On-chain tx_id, populated after submission.
+    pub tx_id:              Option<String>,
+    pub claim_status:       String,
+    pub rejection_reason:   Option<String>,
+    pub submitted_at:       DateTime<Utc>,
+    pub finalized_at:       Option<DateTime<Utc>>,
+    pub updated_at:         DateTime<Utc>,
+}
+
+/// Input for inserting a new reward claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewResearchRewardClaim {
+    /// Pre-computed deterministic claim ID.
+    pub claim_id:           String,
+    pub objective_id:       String,
+    pub task_id:            String,
+    pub result_id:          Uuid,
+    pub contribution_hash:  String,
+    pub recipient:          String,
+    /// Reward amount in uqcb.
+    pub amount_uqcb:        u64,
+    pub policy_version:     String,
+    pub reward_kind:        String,
 }

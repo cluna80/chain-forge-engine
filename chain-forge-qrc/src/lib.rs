@@ -60,7 +60,12 @@ pub use contribution_settlement::{
 
 /// PoCD reward policy for QCB Chain — pays miners in uQRC.
 pub mod pocd_reward;
-pub use pocd_reward::{QcbRewardPolicy, DEFAULT_BASE_REWARD_UQRC, DEFAULT_EPOCH_POOL_UQRC};
+pub use pocd_reward::{
+    QcbRewardPolicy, DEFAULT_BASE_REWARD_UQRC, DEFAULT_EPOCH_POOL_UQRC,
+    // Change Set L: research reward policy
+    QcbResearchRewardPolicy, ResearchRewardOutput, ResearchRewardError,
+    RESEARCH_POLICY_VERSION,
+};
 
 use std::collections::BTreeMap;
 use thiserror::Error;

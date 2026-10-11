@@ -154,6 +154,10 @@ impl GasModel {
                     TxBody::RegisterMachine { .. }       => op_multiplier * 6,
                     // SubmitUsefulWork: verifies seal + writes receipt + updates contribution score.
                     TxBody::SubmitUsefulWork { .. }      => op_multiplier * 8,
+                    // ClaimResearchReward (Change Set L): settlement_operators check +
+                    // replay-key write + treasury debit + recipient credit.
+                    // Comparable to QrcContributionSettle (also 12×).
+                    TxBody::ClaimResearchReward { .. }   => op_multiplier * 12,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                     TxBody::CreateJob { .. }             => op_multiplier * 5, // escrow check + job record write
                     TxBody::AcceptJob { .. }             => op_multiplier * 3, // job state update only
@@ -852,6 +856,72 @@ pub enum TxBody {
         /// Set to 0 to use the chain's configured minimum.
         min_difficulty_override: u32,
     },
+
+    // ── PoCD Research Reward Settlement (Change Set L) ────────────────────────
+    //
+    // Settlement operators (a recognized account set in genesis) submit this
+    // transaction after the research DB records a canonical result with the
+    // required verification quorum.  The execution layer enforces:
+    //
+    //   1. Sender must be in `settlement_operators` (DIS-backed; operator's
+    //      ML-DSA-65 signature is checked by `verify_signature` on every tx).
+    //   2. `claim:{claim_id}` state key must NOT exist (replay prevention).
+    //   3. `recipient` is bound at claim-creation time; no substitution allowed.
+    //   4. `treasury:pocd-research` is debited; `recipient` is credited.
+    //
+    // The claim_id is deterministic:
+    //   hex( SHA-256( "qcb-claim-v1\x00" || chain_id || "\x00"
+    //                 || objective_id || "\x00" || task_id || "\x00"
+    //                 || reward_kind ) )
+    // so a re-submission after a crash uses the same ID and hits the replay guard.
+    //
+    // Scientific constraints (preserved verbatim):
+    //   "No result is automatically classified as a cryptographic breakthrough."
+    //   "No experimental result is automatically classified as a cryptographic
+    //    anomaly or scientific discovery."
+    //   "Do not introduce AI inference, new token economics, or automatic
+    //    scientific discovery claims."
+    //   "Keep blockchain consensus unchanged."
+
+    /// Settle a verified PoCD research result as a uqcb reward payment.
+    ///
+    /// Only a `settlement_operators` address (from genesis) may submit this.
+    /// The operator's ML-DSA-65 key must be registered in the DIS; chain-ID
+    /// replay protection is enforced unconditionally by `verify_signature`.
+    ///
+    /// Enforced invariants:
+    ///   - Sender must be in `config.settlement_operators`.
+    ///   - `claim:{claim_id}` state key must not exist (replay / double-payment
+    ///     prevention).
+    ///   - `amount_uqcb` must be > 0.
+    ///   - `treasury:pocd-research` must hold at least `amount_uqcb`.
+    ///   - On success: `claim:{claim_id}` is written (idempotency key),
+    ///     `treasury:pocd-research` is debited, `recipient` is credited.
+    ClaimResearchReward {
+        /// Deterministic claim identifier (prevents replay and enables idempotent
+        /// re-submission after operator crash).
+        claim_id: String,
+        /// Parent research objective.
+        objective_id: String,
+        /// Task this result was produced for.
+        task_id: String,
+        /// UUID of the canonical experiment_results row.
+        result_id: String,
+        /// Content hash of the canonical result (denormalized; audit trail only).
+        contribution_hash: String,
+        /// Wallet address that will receive the reward.
+        /// Bound to the canonical result's `miner_id` at claim creation;
+        /// the execution layer does not re-verify this binding — the operator
+        /// is responsible for deriving `recipient` from the authenticated machine
+        /// owner recorded in the DIS.
+        recipient: String,
+        /// Reward amount in micro-QCB (uqcb). 1 QCB = 1_000_000 uqcb.
+        amount_uqcb: u64,
+        /// Policy version (e.g. `"QcbResearchRewardPolicy-v1"`).
+        policy_version: String,
+        /// Reward kind: `"primary"` | `"replication"`.
+        reward_kind: String,
+    },
 }
 
 impl TxBody {
@@ -905,6 +975,8 @@ impl TxBody {
             TxBody::AcceptJob { .. }               => "AcceptJob",
             TxBody::CompleteJob { .. }             => "CompleteJob",
             TxBody::VerifyJob { .. }               => "VerifyJob",
+            // PoCD Research Reward Settlement (Change Set L)
+            TxBody::ClaimResearchReward { .. }     => "ClaimResearchReward",
         }
     }
 }
@@ -1104,6 +1176,15 @@ impl Transaction {
             }
             TxBody::VerifyJob { job_id, escrow_id, expected_output_hash, provider_wallet, receipt_hash, .. } => {
                 job_id.len() + escrow_id.len() + expected_output_hash.len() + provider_wallet.len() + receipt_hash.len() + 8
+            }
+            // ClaimResearchReward: all string fields + 16 for amount/overhead.
+            TxBody::ClaimResearchReward {
+                claim_id, objective_id, task_id, result_id,
+                contribution_hash, recipient, policy_version, reward_kind, ..
+            } => {
+                claim_id.len() + objective_id.len() + task_id.len() + result_id.len()
+                    + contribution_hash.len() + recipient.len() + policy_version.len()
+                    + reward_kind.len() + 16
             }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
@@ -1721,6 +1802,10 @@ pub struct ExecutionConfig {
     /// Optional modules this chain runs. Transactions belonging to a
     /// module that is off are rejected before anything else happens.
     pub modules: EnabledModules,
+
+    /// Addresses authorized to submit `ClaimResearchReward` (Change Set L).
+    /// Derived from `GenesisConfig::settlement_operators`.
+    pub settlement_operators: Vec<String>,
 }
 
 impl ExecutionConfig {
@@ -1737,6 +1822,7 @@ impl ExecutionConfig {
             // Fail closed: a genesis with an invalid module list gets no
             // optional modules. (The node refuses to start on one anyway.)
             modules: genesis.enabled_modules().unwrap_or_default(),
+            settlement_operators: genesis.settlement_operators.clone(),
         }
     }
 }
@@ -1918,6 +2004,10 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::AcceptJob { .. }
         | TxBody::CompleteJob { .. }
         | TxBody::VerifyJob { .. } => Some("qrc"),
+        // ClaimResearchReward (Change Set L): requires both QRC module (balance
+        // ops) and identity module (settlement_operators are DIS identities).
+        // Guard on QRC since that also gates the treasury and balance transfers.
+        TxBody::ClaimResearchReward { .. } => Some("qrc"),
     }
 }
 
@@ -4281,6 +4371,143 @@ impl Executor {
                 ));
                 Ok(())
             }
+
+            // ── PoCD Research Reward Settlement (Change Set L) ────────────────
+            TxBody::ClaimResearchReward {
+                claim_id,
+                objective_id,
+                task_id,
+                result_id,
+                contribution_hash,
+                recipient,
+                amount_uqcb,
+                policy_version,
+                reward_kind,
+            } => {
+                // ── Guard 1: Sender must be a settlement operator ─────────────
+                // Settlement operators are a recognized account set in genesis,
+                // analogous to the pilot-phase coordinator that gates ConfirmSybil.
+                // Their ML-DSA-65 signatures are already verified unconditionally
+                // by `verify_signature(tx, chain_id)` before this arm is reached.
+                if !self.config.settlement_operators.contains(&tx.sender) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ClaimResearchReward: sender {} is not a recognized \
+                             settlement operator (claim_id={}, objective_id={})",
+                            tx.sender, claim_id, objective_id
+                        ),
+                    );
+                }
+
+                // ── Guard 2: Replay / double-payment prevention ───────────────
+                // The claim_id is deterministic (hex-SHA-256 of domain-separated
+                // fields), so a re-submission after an operator crash re-derives
+                // the same ID and hits this guard — idempotent on the second call,
+                // rejected as a replay attack on subsequent calls.
+                let claim_key = format!("claim:{}", claim_id);
+                if state.get_account(&claim_key).is_ok() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ClaimResearchReward: claim {} already settled (replay \
+                             or duplicate submission); objective_id={} task_id={}",
+                            claim_id, objective_id, task_id
+                        ),
+                    );
+                }
+
+                // ── Guard 3: Amount must be positive ──────────────────────────
+                if *amount_uqcb == 0 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ClaimResearchReward: amount_uqcb must be > 0 \
+                             (claim_id={}, reward_kind={})",
+                            claim_id, reward_kind
+                        ),
+                    );
+                }
+
+                // ── Guard 4: Treasury must be solvent ─────────────────────────
+                // Rewards are sourced from `treasury:pocd-research`.
+                // This is a named account that governance must keep funded.
+                let treasury = "treasury:pocd-research";
+                let treasury_balance = state.get_account(treasury)
+                    .map(|a| a.balance_of("uqcb"))
+                    .unwrap_or(0);
+                if treasury_balance < *amount_uqcb as u128 {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "ClaimResearchReward: treasury {} has insufficient uqcb \
+                             balance (have={}, need={}) for claim_id={} recipient={}",
+                            treasury, treasury_balance, amount_uqcb, claim_id, recipient
+                        ),
+                    );
+                }
+
+                // ── Execute: debit treasury, credit recipient ─────────────────
+                // Debit treasury:pocd-research
+                if state.get_account(treasury).is_err() {
+                    let ta = chain_forge_state::AccountState::new(
+                        treasury.to_string(), "pocd-research-treasury".to_string(),
+                    );
+                    state.upsert_account(ta);
+                }
+                if let Ok(acct) = state.get_account_mut(treasury) {
+                    acct.debit("uqcb", *amount_uqcb as u128);
+                }
+                state.refresh_leaf(treasury);
+
+                // Credit recipient
+                if state.get_account(recipient).is_err() {
+                    let ra = chain_forge_state::AccountState::new(
+                        recipient.clone(), "miner".to_string(),
+                    );
+                    state.upsert_account(ra);
+                }
+                if let Ok(acct) = state.get_account_mut(recipient) {
+                    acct.credit("uqcb", *amount_uqcb as u128);
+                }
+                state.refresh_leaf(recipient);
+
+                // ── Write idempotency key ─────────────────────────────────────
+                // `claim:{claim_id}` is a write-once state key that prevents
+                // any future re-execution of this claim (replay protection).
+                // The stored JSON is an audit record; consensus only cares that
+                // the key exists.
+                let claim_record = serde_json::json!({
+                    "claim_id":         claim_id,
+                    "objective_id":     objective_id,
+                    "task_id":          task_id,
+                    "result_id":        result_id,
+                    "contribution_hash": contribution_hash,
+                    "recipient":        recipient,
+                    "amount_uqcb":      amount_uqcb,
+                    "policy_version":   policy_version,
+                    "reward_kind":      reward_kind,
+                    "settled_by":       &tx.sender,
+                    "tx_id":            &tx.id,
+                });
+                let claim_record_json = serde_json::to_string(&claim_record)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let mut claim_acct = chain_forge_state::AccountState::new(
+                    claim_key.clone(), claim_record_json,
+                );
+                claim_acct.credit("settled", 1);
+                state.upsert_account(claim_acct);
+                state.refresh_leaf(&claim_key);
+
+                events.push(format!(
+                    "claim_research_reward: claim_id={} objective_id={} task_id={} \
+                     result_id={} recipient={} amount_uqcb={} reward_kind={} \
+                     policy_version={} settled_by={}",
+                    claim_id, objective_id, task_id, result_id,
+                    recipient, amount_uqcb, reward_kind, policy_version, tx.sender
+                ));
+                Ok(())
+            }
         };
 
         if result.is_ok() {
@@ -4453,6 +4680,10 @@ impl Executor {
             | TxBody::CompleteJob { .. }
             | TxBody::VerifyJob { .. } => {
                 Err("Resource job lifecycle transaction requires identity- and agent-aware executor".to_string())
+            }
+            // ClaimResearchReward requires the full identity- and state-aware executor.
+            TxBody::ClaimResearchReward { .. } => {
+                Err("ClaimResearchReward requires the full identity- and state-aware executor".to_string())
             }
         };
 

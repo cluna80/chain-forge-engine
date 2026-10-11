@@ -203,6 +203,232 @@ fn track_from_challenge_id(challenge_id: &str) -> Option<ChallengeTrack> {
     }
 }
 
+// ── QcbResearchRewardPolicy (Change Set L) ────────────────────────────────
+//
+// Reward policy for PoCD **research contributions** (avalanche experiments and
+// replications in Change Set K/L).  This is DISTINCT from `QcbRewardPolicy`
+// above, which pays in uQRC and is difficulty-multiplier-based.
+//
+// This policy:
+//   - pays in **uqcb** (micro-QCB, native token) — NOT uQRC
+//   - uses flat per-result rates: `primary_rate_uqcb` and `replication_rate_uqcb`
+//   - enforces a per-objective budget cap (`objective_budget_uqcb`)
+//   - never infers scientific significance — amounts are determined solely by
+//     `RewardKind` and the flat rate table
+//   - returns a `NewResearchRewardClaim` DTO ready for persistence and settlement
+//
+// Scientific integrity constraints (preserved verbatim from Change Set K/L spec):
+//   "No result is automatically classified as a cryptographic breakthrough."
+//   "No experimental result is automatically classified as a cryptographic anomaly
+//    or scientific discovery."
+//   "Do not introduce AI inference, new token economics, or automatic scientific
+//    discovery claims."
+
+use chain_forge_research_db::models::{NewResearchRewardClaim, RewardKind};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+/// Policy version string for `QcbResearchRewardPolicy`.
+pub const RESEARCH_POLICY_VERSION: &str = "QcbResearchRewardPolicy-v1";
+
+/// Reward policy for PoCD research contributions, denominated in uqcb.
+///
+/// ## Separation from `QcbRewardPolicy`
+///
+/// `QcbRewardPolicy` pays PoCD *proof-of-work* receipts in uQRC using a
+/// difficulty-scaled formula.  `QcbResearchRewardPolicy` pays Change Set K/L
+/// *scientific experiment* results (avalanche_experiment and
+/// avalanche_replication task kinds) in uqcb at flat per-result rates.
+///
+/// ## Budget enforcement
+///
+/// `compute_reward` will return `None` when the proposed payment would push the
+/// total disbursed for the objective past `objective_budget_uqcb`.  The caller
+/// (settlement operator) is responsible for tracking `disbursed_so_far` by
+/// querying the research DB.
+///
+/// ## Recipient binding
+///
+/// The `recipient` argument must be the authenticated wallet address of the
+/// miner that produced the canonical result.  `compute_reward` copies it
+/// verbatim into the claim — no substitution is possible at policy level.
+///
+/// ## Claim-ID determinism
+///
+/// The returned `claim_id` is deterministic:
+/// ```text
+/// hex( SHA-256( "qcb-claim-v1\x00" || chain_id || "\x00"
+///               || objective_id || "\x00" || task_id || "\x00"
+///               || reward_kind_str ) )
+/// ```
+/// This makes settlement re-submission after a crash idempotent.
+pub struct QcbResearchRewardPolicy {
+    /// Flat reward per accepted primary result (avalanche_experiment), in uqcb.
+    pub primary_rate_uqcb:     u64,
+
+    /// Flat reward per accepted replication result (avalanche_replication), in uqcb.
+    pub replication_rate_uqcb: u64,
+
+    /// Maximum total uqcb to pay out across all claims for one objective.
+    /// Prevents runaway payouts if the scheduler creates more tasks than budgeted.
+    pub objective_budget_uqcb: u64,
+
+    /// On-chain address from which uqcb rewards are sourced
+    /// (e.g. `"treasury:pocd-research"`).  Governance must keep it funded.
+    pub treasury_address:      String,
+}
+
+/// Result of `compute_reward` when budget allows.
+#[derive(Debug)]
+pub struct ResearchRewardOutput {
+    /// Ready-to-persist claim DTO.
+    pub claim: NewResearchRewardClaim,
+    /// Amount computed (mirrors `claim.amount_uqcb`).
+    pub amount_uqcb: u64,
+}
+
+/// Error returned when `compute_reward` cannot produce a valid claim.
+#[derive(Debug, thiserror::Error)]
+pub enum ResearchRewardError {
+    #[error("objective budget exhausted: budget={budget_uqcb} disbursed={disbursed_uqcb} requested={requested_uqcb}")]
+    BudgetExhausted {
+        budget_uqcb:    u64,
+        disbursed_uqcb: u64,
+        requested_uqcb: u64,
+    },
+
+    #[error("zero-amount claim rejected for task {task_id}: rate for {reward_kind:?} is 0")]
+    ZeroAmount {
+        task_id:     String,
+        reward_kind: RewardKind,
+    },
+}
+
+impl QcbResearchRewardPolicy {
+    /// Devnet defaults: 5 QCB primary, 2 QCB replication, 5000 QCB budget.
+    pub fn default_for_devnet(treasury_address: impl Into<String>) -> Self {
+        Self {
+            primary_rate_uqcb:     5_000_000,  // 5 QCB
+            replication_rate_uqcb: 2_000_000,  // 2 QCB
+            objective_budget_uqcb: 5_000_000_000, // 5000 QCB
+            treasury_address:      treasury_address.into(),
+        }
+    }
+
+    /// Compute the reward for a single verified research result.
+    ///
+    /// # Arguments
+    ///
+    /// * `chain_id`         — chain identifier (e.g. `"qcb-devnet-1"`), used
+    ///                        in deterministic claim-ID derivation and chain-ID binding.
+    /// * `objective_id`     — parent objective.
+    /// * `task_id`          — the specific task this result belongs to.
+    /// * `result_id`        — UUID of the canonical `experiment_results` row.
+    /// * `contribution_hash`— content hash of the canonical result (denormalized).
+    /// * `recipient`        — authenticated wallet address of the result's miner.
+    ///                        Must match the DIS-authenticated machine owner;
+    ///                        the caller is responsible for that check.
+    /// * `reward_kind`      — `Primary` (avalanche_experiment) or
+    ///                        `Replication` (avalanche_replication).
+    /// * `disbursed_so_far` — sum of `amount_uqcb` already finalized for this
+    ///                        objective, queried from `list_reward_claims_for_objective`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BudgetExhausted` if the payment would exceed `objective_budget_uqcb`.
+    /// Returns `ZeroAmount` if the rate for the given `RewardKind` is zero
+    /// (misconfiguration guard).
+    ///
+    /// # Scientific constraints
+    ///
+    /// This method does NOT examine result content.  It does not classify results
+    /// as discoveries, anomalies, or breakthroughs.  The amount is determined
+    /// solely by the flat rate table and `reward_kind`.
+    pub fn compute_reward(
+        &self,
+        chain_id:          &str,
+        objective_id:      &str,
+        task_id:           &str,
+        result_id:         Uuid,
+        contribution_hash: &str,
+        recipient:         &str,
+        reward_kind:       RewardKind,
+        disbursed_so_far:  u64,
+    ) -> Result<ResearchRewardOutput, ResearchRewardError> {
+        // 1. Look up the flat rate for this reward kind.
+        let amount_uqcb = match &reward_kind {
+            RewardKind::Primary     => self.primary_rate_uqcb,
+            RewardKind::Replication => self.replication_rate_uqcb,
+        };
+
+        // Guard: misconfiguration check (zero rate → reject rather than paying nothing).
+        if amount_uqcb == 0 {
+            return Err(ResearchRewardError::ZeroAmount {
+                task_id:     task_id.to_owned(),
+                reward_kind,
+            });
+        }
+
+        // 2. Budget enforcement: reject if paying would exceed the objective cap.
+        let next_total = disbursed_so_far.saturating_add(amount_uqcb);
+        if next_total > self.objective_budget_uqcb {
+            return Err(ResearchRewardError::BudgetExhausted {
+                budget_uqcb:    self.objective_budget_uqcb,
+                disbursed_uqcb: disbursed_so_far,
+                requested_uqcb: amount_uqcb,
+            });
+        }
+
+        // 3. Derive deterministic claim_id.
+        //    Format: hex( SHA-256( "qcb-claim-v1\x00" || chain_id || "\x00"
+        //                          || objective_id || "\x00" || task_id || "\x00"
+        //                          || reward_kind_str ) )
+        let reward_kind_str = reward_kind.as_str();
+        let mut hasher = Sha256::new();
+        hasher.update(b"qcb-claim-v1\x00");
+        hasher.update(chain_id.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(objective_id.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(task_id.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(reward_kind_str.as_bytes());
+        let claim_id = hex::encode(hasher.finalize());
+
+        tracing::info!(
+            claim_id       = %claim_id,
+            objective_id   = %objective_id,
+            task_id        = %task_id,
+            result_id      = %result_id,
+            recipient      = %recipient,
+            reward_kind    = %reward_kind_str,
+            amount_uqcb    = amount_uqcb,
+            budget_uqcb    = self.objective_budget_uqcb,
+            disbursed      = disbursed_so_far,
+            "QcbResearchRewardPolicy: computed research reward"
+        );
+
+        let claim = NewResearchRewardClaim {
+            claim_id:           claim_id.clone(),
+            objective_id:       objective_id.to_owned(),
+            task_id:            task_id.to_owned(),
+            result_id,
+            contribution_hash:  contribution_hash.to_owned(),
+            recipient:          recipient.to_owned(),
+            amount_uqcb,
+            policy_version:     RESEARCH_POLICY_VERSION.to_owned(),
+            reward_kind:        reward_kind_str.to_owned(),
+        };
+
+        Ok(ResearchRewardOutput { claim, amount_uqcb })
+    }
+
+    /// The policy version identifier.
+    pub fn policy_version(&self) -> &str {
+        RESEARCH_POLICY_VERSION
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -300,5 +526,128 @@ mod tests {
             Some(ChallengeTrack::Custom(_))
         ));
         assert!(track_from_challenge_id("no-separator").is_none());
+    }
+
+    // ── QcbResearchRewardPolicy tests ─────────────────────────────────────
+
+    fn dummy_result_id() -> uuid::Uuid {
+        uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+    }
+
+    #[test]
+    fn primary_rate_applied_for_primary_kind() {
+        let policy = QcbResearchRewardPolicy::default_for_devnet("treasury:pocd-research");
+        let out = policy.compute_reward(
+            "qcb-devnet-1",
+            "obj-1",
+            "task-1",
+            dummy_result_id(),
+            "deadbeef",
+            "qcb1miner",
+            RewardKind::Primary,
+            0, // no prior disbursements
+        ).unwrap();
+        assert_eq!(out.amount_uqcb, 5_000_000,
+            "primary rate should be 5 QCB = 5_000_000 uqcb");
+        assert_eq!(out.claim.policy_version, RESEARCH_POLICY_VERSION);
+        assert_eq!(out.claim.reward_kind, "primary");
+        assert_eq!(out.claim.recipient, "qcb1miner");
+    }
+
+    #[test]
+    fn replication_rate_applied_for_replication_kind() {
+        let policy = QcbResearchRewardPolicy::default_for_devnet("treasury:pocd-research");
+        let out = policy.compute_reward(
+            "qcb-devnet-1",
+            "obj-1",
+            "task-1",
+            dummy_result_id(),
+            "cafebabe",
+            "qcb1replicator",
+            RewardKind::Replication,
+            0,
+        ).unwrap();
+        assert_eq!(out.amount_uqcb, 2_000_000,
+            "replication rate should be 2 QCB = 2_000_000 uqcb");
+        assert_eq!(out.claim.reward_kind, "replication");
+    }
+
+    #[test]
+    fn deterministic_claim_id_is_stable() {
+        let policy = QcbResearchRewardPolicy::default_for_devnet("t");
+        let out1 = policy.compute_reward(
+            "qcb-devnet-1", "obj-abc", "task-xyz", dummy_result_id(),
+            "hash", "wallet", RewardKind::Primary, 0,
+        ).unwrap();
+        let out2 = policy.compute_reward(
+            "qcb-devnet-1", "obj-abc", "task-xyz", dummy_result_id(),
+            "hash", "wallet", RewardKind::Primary, 0,
+        ).unwrap();
+        assert_eq!(out1.claim.claim_id, out2.claim.claim_id,
+            "claim_id must be deterministic given the same inputs");
+    }
+
+    #[test]
+    fn claim_id_differs_for_different_reward_kinds() {
+        let policy = QcbResearchRewardPolicy::default_for_devnet("t");
+        let primary = policy.compute_reward(
+            "qcb-devnet-1", "obj-abc", "task-xyz", dummy_result_id(),
+            "hash", "wallet", RewardKind::Primary, 0,
+        ).unwrap();
+        let replication = policy.compute_reward(
+            "qcb-devnet-1", "obj-abc", "task-xyz", dummy_result_id(),
+            "hash", "wallet", RewardKind::Replication, 0,
+        ).unwrap();
+        assert_ne!(primary.claim.claim_id, replication.claim.claim_id,
+            "different reward kinds must produce different claim IDs");
+    }
+
+    #[test]
+    fn budget_exhausted_when_disbursed_plus_rate_exceeds_cap() {
+        let policy = QcbResearchRewardPolicy {
+            primary_rate_uqcb:     5_000_000,
+            replication_rate_uqcb: 2_000_000,
+            objective_budget_uqcb: 7_000_000, // room for 1 primary + 1 replication only
+            treasury_address:      "t".into(),
+        };
+        // First primary is fine.
+        let _ = policy.compute_reward(
+            "qcb-devnet-1", "obj-1", "t-1", dummy_result_id(),
+            "h", "w", RewardKind::Primary, 0,
+        ).unwrap();
+        // After disbursing 5_000_000 (primary), 2_000_000 replication is also fine.
+        let _ = policy.compute_reward(
+            "qcb-devnet-1", "obj-1", "t-2", dummy_result_id(),
+            "h", "w", RewardKind::Replication, 5_000_000,
+        ).unwrap();
+        // After 7_000_000 disbursed, any further claim hits the budget.
+        let err = policy.compute_reward(
+            "qcb-devnet-1", "obj-1", "t-3", dummy_result_id(),
+            "h", "w", RewardKind::Replication, 7_000_000,
+        ).unwrap_err();
+        assert!(matches!(err, ResearchRewardError::BudgetExhausted { .. }),
+            "expected BudgetExhausted, got: {err:?}");
+    }
+
+    #[test]
+    fn zero_rate_returns_zero_amount_error() {
+        let policy = QcbResearchRewardPolicy {
+            primary_rate_uqcb:     0, // misconfiguration
+            replication_rate_uqcb: 2_000_000,
+            objective_budget_uqcb: 1_000_000_000,
+            treasury_address:      "t".into(),
+        };
+        let err = policy.compute_reward(
+            "qcb-devnet-1", "obj-1", "task-1", dummy_result_id(),
+            "h", "w", RewardKind::Primary, 0,
+        ).unwrap_err();
+        assert!(matches!(err, ResearchRewardError::ZeroAmount { .. }),
+            "zero primary_rate_uqcb must be rejected");
+    }
+
+    #[test]
+    fn policy_version_is_v1() {
+        let policy = QcbResearchRewardPolicy::default_for_devnet("t");
+        assert_eq!(policy.policy_version(), "QcbResearchRewardPolicy-v1");
     }
 }

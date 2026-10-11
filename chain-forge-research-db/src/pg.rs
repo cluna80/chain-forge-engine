@@ -1102,6 +1102,301 @@ impl ResearchDb for PgResearchDb {
         .await?;
         Ok(row)
     }
+
+    // ── canonical-result enforcement (Change Set L) ──────────────────────────
+
+    async fn accept_task_canonical(
+        &self,
+        task_id:   &str,
+        result_id: Uuid,
+    ) -> Result<(), ResearchDbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Step 1: Atomically set canonical_result_id only if not already set.
+        let updated = sqlx::query(
+            r#"
+            UPDATE research_tasks
+            SET    canonical_result_id = $1
+            WHERE  task_id = $2
+              AND  canonical_result_id IS NULL
+            RETURNING task_id
+            "#,
+        )
+        .bind(result_id)
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if updated.is_none() {
+            // The task already has a canonical result — surface the existing ID.
+            tx.rollback().await?;
+            let existing_row = sqlx::query(
+                r#"
+                SELECT canonical_result_id
+                FROM   research_tasks
+                WHERE  task_id = $1
+                  AND  canonical_result_id IS NOT NULL
+                "#,
+            )
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            let existing: Uuid = existing_row
+                .and_then(|r| {
+                    use sqlx::Row;
+                    r.try_get::<Option<Uuid>, _>("canonical_result_id").ok().flatten()
+                })
+                .unwrap_or(Uuid::nil());
+
+            return Err(ResearchDbError::CanonicalAlreadySet {
+                task_id:            task_id.to_string(),
+                existing_result_id: existing,
+            });
+        }
+
+        // Step 2: Mark the canonical result as 'accepted'.
+        sqlx::query(
+            r#"
+            UPDATE experiment_results
+            SET    result_status = 'accepted'
+            WHERE  result_id = $1
+            "#,
+        )
+        .bind(result_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Step 3: Mark all other results for the same task as 'superseded'.
+        sqlx::query(
+            r#"
+            UPDATE experiment_results
+            SET    result_status = 'superseded'
+            WHERE  task_id = $1
+              AND  result_id != $2
+              AND  result_status NOT IN ('superseded', 'rejected')
+            "#,
+        )
+        .bind(task_id)
+        .bind(result_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Step 4: Transition task to 'accepted'.
+        sqlx::query(
+            r#"
+            UPDATE research_tasks
+            SET    task_status = 'accepted'
+            WHERE  task_id = $1
+            "#,
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ── reward claims (Change Set L) ─────────────────────────────────────────
+
+    async fn insert_reward_claim(
+        &self,
+        claim: NewResearchRewardClaim,
+    ) -> Result<ResearchRewardClaim, ResearchDbError> {
+        let row = sqlx::query_as::<_, ResearchRewardClaim>(
+            r#"
+            INSERT INTO research_reward_claims
+                (claim_id, objective_id, task_id, result_id,
+                 contribution_hash, recipient, amount_uqcb,
+                 policy_version, reward_kind)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *
+            "#,
+        )
+        .bind(&claim.claim_id)
+        .bind(&claim.objective_id)
+        .bind(&claim.task_id)
+        .bind(claim.result_id)
+        .bind(&claim.contribution_hash)
+        .bind(&claim.recipient)
+        .bind(claim.amount_uqcb as i64)
+        .bind(&claim.policy_version)
+        .bind(claim.reward_kind.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                ResearchDbError::Duplicate(format!(
+                    "reward claim already exists for task {} kind {}",
+                    claim.task_id,
+                    claim.reward_kind.as_str(),
+                ))
+            } else {
+                ResearchDbError::Sqlx(e)
+            }
+        })?;
+        Ok(row)
+    }
+
+    async fn get_reward_claim(
+        &self,
+        claim_id: &str,
+    ) -> Result<Option<ResearchRewardClaim>, ResearchDbError> {
+        let row = sqlx::query_as::<_, ResearchRewardClaim>(
+            r#"SELECT * FROM research_reward_claims WHERE claim_id = $1"#,
+        )
+        .bind(claim_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn list_reward_claims_for_objective(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<ResearchRewardClaim>, ResearchDbError> {
+        let rows = sqlx::query_as::<_, ResearchRewardClaim>(
+            r#"
+            SELECT * FROM research_reward_claims
+            WHERE  objective_id = $1
+            ORDER  BY submitted_at
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_reward_claims_by_status(
+        &self,
+        status: ClaimStatus,
+    ) -> Result<Vec<ResearchRewardClaim>, ResearchDbError> {
+        let rows = sqlx::query_as::<_, ResearchRewardClaim>(
+            r#"
+            SELECT * FROM research_reward_claims
+            WHERE  claim_status = $1
+            ORDER  BY submitted_at
+            "#,
+        )
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn mark_claim_submitted(
+        &self,
+        claim_id: &str,
+        tx_id:    &str,
+    ) -> Result<(), ResearchDbError> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE research_reward_claims
+            SET    claim_status = 'submitted',
+                   tx_id        = $2
+            WHERE  claim_id     = $1
+              AND  claim_status = 'pending'
+            RETURNING claim_id
+            "#,
+        )
+        .bind(claim_id)
+        .bind(tx_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if updated.is_none() {
+            let current = self.current_claim_status(claim_id).await?;
+            return Err(ResearchDbError::InvalidStatus {
+                claim_id:  claim_id.to_string(),
+                current:   current.unwrap_or_else(|| "not_found".to_string()),
+                attempted: "submitted".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn mark_claim_finalized(
+        &self,
+        claim_id: &str,
+    ) -> Result<(), ResearchDbError> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE research_reward_claims
+            SET    claim_status  = 'finalized',
+                   finalized_at  = now()
+            WHERE  claim_id      = $1
+              AND  claim_status  = 'submitted'
+            RETURNING claim_id
+            "#,
+        )
+        .bind(claim_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if updated.is_none() {
+            let current = self.current_claim_status(claim_id).await?;
+            return Err(ResearchDbError::InvalidStatus {
+                claim_id:  claim_id.to_string(),
+                current:   current.unwrap_or_else(|| "not_found".to_string()),
+                attempted: "finalized".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn mark_claim_rejected(
+        &self,
+        claim_id:         &str,
+        rejection_reason: &str,
+    ) -> Result<(), ResearchDbError> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE research_reward_claims
+            SET    claim_status      = 'rejected',
+                   rejection_reason  = $2
+            WHERE  claim_id          = $1
+              AND  claim_status      = 'submitted'
+            RETURNING claim_id
+            "#,
+        )
+        .bind(claim_id)
+        .bind(rejection_reason)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if updated.is_none() {
+            let current = self.current_claim_status(claim_id).await?;
+            return Err(ResearchDbError::InvalidStatus {
+                claim_id:  claim_id.to_string(),
+                current:   current.unwrap_or_else(|| "not_found".to_string()),
+                attempted: "rejected".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PgResearchDb {
+    /// Internal helper: fetch the current `claim_status` for a claim.
+    async fn current_claim_status(
+        &self,
+        claim_id: &str,
+    ) -> Result<Option<String>, ResearchDbError> {
+        let row = sqlx::query(
+            r#"SELECT claim_status FROM research_reward_claims WHERE claim_id = $1"#,
+        )
+        .bind(claim_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let status = row.map(|r| {
+            use sqlx::Row;
+            r.try_get::<String, _>("claim_status").unwrap_or_default()
+        });
+        Ok(status)
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

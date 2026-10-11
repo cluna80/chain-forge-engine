@@ -275,6 +275,23 @@ pub struct GenesisConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_challenges: Option<serde_json::Value>,
+
+    /// Addresses authorized to submit `ClaimResearchReward` transactions
+    /// on behalf of miners.  Analogous to `attestation_coordinator` for
+    /// `ConfirmSybil`.
+    ///
+    /// Settlement operators:
+    ///   - must hold ML-DSA-65 keys registered in the DIS (Digital Identity Stone)
+    ///   - sign `ClaimResearchReward` txs with their ML-DSA-65 key; chain-ID
+    ///     binding is enforced unconditionally by `verify_signature(tx, chain_id)`
+    ///   - are responsible for verifying eligibility (canonical result, quorum,
+    ///     budget) before submitting — the execution layer enforces state-key replay
+    ///     prevention and recipient binding, not the full eligibility checks
+    ///
+    /// An empty list means no address can submit `ClaimResearchReward`.
+    /// Change Set L: initial set populated at devnet genesis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settlement_operators: Vec<String>,
 }
 
 // -- Modules ----------------------------------------------------------------------
