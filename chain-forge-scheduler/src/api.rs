@@ -2,15 +2,16 @@
 //!
 //! ## Endpoints
 //!
-//! | Method | Path                                        | Description                           |
-//! |--------|---------------------------------------------|---------------------------------------|
-//! | POST   | `/scheduler/seed`                           | Insert objective + tasks (seed)       |
-//! | POST   | `/scheduler/miners/register`                | Register / heartbeat a miner          |
-//! | GET    | `/scheduler/miners/{miner_id}/task`         | Poll for a task assignment            |
-//! | POST   | `/scheduler/tasks/{task_id}/result`         | Submit task result                    |
-//! | GET    | `/scheduler/objectives/{id}/results`        | List results for an objective         |
+//! | Method | Path                                        | Description                              |
+//! |--------|---------------------------------------------|------------------------------------------|
+//! | POST   | `/scheduler/seed`                           | Insert objective + tasks (seed)          |
+//! | POST   | `/scheduler/miners/register`                | Register / heartbeat a miner             |
+//! | GET    | `/scheduler/miners/{miner_id}/task`         | Poll for a task assignment               |
+//! | POST   | `/scheduler/tasks/{task_id}/result`         | Submit task result                       |
+//! | POST   | `/scheduler/tasks/{task_id}/verify`         | Submit independent verification (CS M)   |
+//! | GET    | `/scheduler/objectives/{id}/results`        | List results for an objective            |
 //! | POST   | `/scheduler/objectives/{id}/settle`         | Settle a canonical result (Change Set L) |
-//! | GET    | `/scheduler/status`                         | Queue depth + active lease count      |
+//! | GET    | `/scheduler/status`                         | Queue depth + active lease count         |
 //!
 //! ## State sharing
 //!
@@ -35,14 +36,17 @@ use crate::{
     miner::MinerRegistry,
     scheduler::ResearchScheduler,
     settlement::{settle_objective, SettleRequest, SettlementError},
+    verification::{VerificationEngine, VerificationError, VerifyRequest},
 };
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AppState {
-    pub scheduler: ResearchScheduler,
-    pub miners:    MinerRegistry,
+    pub scheduler:    ResearchScheduler,
+    pub miners:       MinerRegistry,
+    /// Change Set M: verification engine for independent result reproduction.
+    pub verification: VerificationEngine,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -53,6 +57,8 @@ pub fn router(state: AppState) -> Router {
         .route("/scheduler/miners/register",                        post(register_miner))
         .route("/scheduler/miners/:miner_id/task",                  get(get_task_for_miner))
         .route("/scheduler/tasks/:task_id/result",                  post(submit_result))
+        // Change Set M: independent verification
+        .route("/scheduler/tasks/:task_id/verify",                  post(verify_result))
         .route("/scheduler/objectives/:objective_id/results",       get(list_objective_results))
         // Change Set L: settlement operator endpoint
         .route("/scheduler/objectives/:objective_id/settle",        post(settle_handler))
@@ -228,6 +234,87 @@ async fn submit_result(
             (StatusCode::FORBIDDEN, e.to_string()).into_response()
         }
         Err(e) => scheduler_error_response(e),
+    }
+}
+
+// ── Verify handler (Change Set M) ─────────────────────────────────────────────
+
+/// `POST /scheduler/tasks/{task_id}/verify`
+///
+/// Independent verifiers call this endpoint after reproducing (or attempting
+/// to reproduce) a submitted result.  When the number of independent
+/// `"reproduced"` verifications reaches the objective's `verification_quorum`,
+/// the result is atomically promoted to canonical and the task transitions to
+/// `'accepted'`, making it eligible for reward settlement.
+///
+/// Returns `201 Created` on success, with `quorum_reached: true` when the
+/// submission triggered canonical acceptance.
+async fn verify_result(
+    State(state):   State<Arc<AppState>>,
+    Path(task_id):  Path<String>,
+    Json(req):      Json<VerifyRequest>,
+) -> Response {
+    match state.verification.record_verification(&task_id, req).await {
+        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
+
+        Err(VerificationError::ResultNotFound(id)) => {
+            let body = serde_json::json!({
+                "error": "result_not_found",
+                "result_id": id.to_string(),
+            });
+            (StatusCode::NOT_FOUND, Json(body)).into_response()
+        }
+
+        Err(VerificationError::TaskNotFound(ref id)) => {
+            let body = serde_json::json!({
+                "error": "task_not_found",
+                "task_id": id,
+            });
+            (StatusCode::NOT_FOUND, Json(body)).into_response()
+        }
+
+        Err(VerificationError::UnknownOutcome(ref o)) => {
+            let body = serde_json::json!({
+                "error": "unknown_outcome",
+                "outcome": o,
+                "message": "Expected 'reproduced', 'rejected', or 'inconclusive'.",
+            });
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+
+        Err(VerificationError::HashMismatch { ref verifier, ref original }) => {
+            let body = serde_json::json!({
+                "error": "hash_mismatch",
+                "verifier_content_hash": verifier,
+                "original_content_hash": original,
+                "message": "Verifier hash differs from the original result. \
+                            Use outcome 'rejected' or 'inconclusive' when hashes differ.",
+            });
+            (StatusCode::CONFLICT, Json(body)).into_response()
+        }
+
+        Err(VerificationError::SelfVerification) => {
+            let body = serde_json::json!({
+                "error": "self_verification",
+                "message": "verifier_id must differ from the original miner_id.",
+            });
+            (StatusCode::FORBIDDEN, Json(body)).into_response()
+        }
+
+        Err(VerificationError::NotSubmitted(id)) => {
+            let body = serde_json::json!({
+                "error": "not_submitted",
+                "result_id": id.to_string(),
+                "message": "Result is not in 'submitted' status. \
+                            Only submitted results can receive independent verifications.",
+            });
+            (StatusCode::CONFLICT, Json(body)).into_response()
+        }
+
+        Err(e) => {
+            tracing::error!(error = %e, "verification failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 

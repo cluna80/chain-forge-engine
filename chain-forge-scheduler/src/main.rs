@@ -31,7 +31,7 @@ use clap::Parser;
 use tracing::info;
 
 use chain_forge_research_db::MemResearchDb;
-use chain_forge_scheduler::{AppState, MinerRegistry, ResearchScheduler, router};
+use chain_forge_scheduler::{AppState, MinerRegistry, ResearchScheduler, VerificationEngine, router};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── HTTP server ───────────────────────────────────────────────────────────
     let state = AppState {
+        verification: VerificationEngine::new(db.clone()),
         scheduler,
         miners: MinerRegistry::new(),
     };

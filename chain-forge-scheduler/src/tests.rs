@@ -1,4 +1,4 @@
-//! Change Set E unit tests — ResearchScheduler
+//! Change Set E / M unit tests — ResearchScheduler + VerificationEngine
 //!
 //! All tests use `MemResearchDb` (no PostgreSQL required).
 //! The SKIP LOCKED atomicity guarantee is tested against a real PostgreSQL
@@ -18,6 +18,7 @@ mod tests {
     use crate::{
         error::SchedulerError,
         scheduler::ResearchScheduler,
+        verification::{VerificationEngine, VerificationError, VerifyRequest},
     };
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -344,6 +345,227 @@ mod tests {
 
         // Clean up so we have a reference to db (avoids unused warning)
         let _ = db;
+    }
+
+    // ── Verification Engine (Change Set M) ───────────────────────────────────
+
+    /// Helper: assign + submit a result, return (db, engine, task_id, result_id).
+    async fn setup_with_submitted_result(
+        n_tasks: u64,
+    ) -> (MemResearchDb, VerificationEngine, String, uuid::Uuid) {
+        let (db, sched, obj_id) = setup(n_tasks).await;
+        let engine = VerificationEngine::new(Arc::new(db.clone()));
+
+        let row = sched.assign_task(&obj_id, "cpu", "miner_a").await.unwrap();
+        let gen = row.lease_generation;
+        let winning_hash = "aa".repeat(32);
+
+        sched
+            .submit_result(
+                &row.task_id,
+                "miner_a",
+                gen,
+                make_result_with_hash(&row.task_id, "miner_a", gen, &winning_hash),
+            )
+            .await
+            .unwrap();
+
+        // Retrieve the result_id from the DB.
+        let results = db.list_results_for_task(&row.task_id).await.unwrap();
+        assert_eq!(results.len(), 1, "expected exactly one submitted result");
+        let result_id = results[0].result_id;
+        let content_hash = results[0].content_hash.clone();
+
+        // Stash content_hash on a field we can access in tests via the UUID.
+        // We return the raw result_id; callers must use the actual content_hash
+        // from `make_result` (format: "hash_miner_a_{gen}").
+        let _ = content_hash; // avoid unused warning; callers use make_result's hash formula
+
+        (db, engine, row.task_id, result_id)
+    }
+
+    /// A single 'reproduced' verification is stored but does not trigger
+    /// canonical acceptance when quorum > 1.
+    #[tokio::test]
+    async fn single_reproduced_verification_below_quorum() {
+        let (db, engine, task_id, result_id) = setup_with_submitted_result(1).await;
+        // quorum defaults to 2; one reproduced should NOT promote to canonical.
+        let results = db.list_results_for_task(&task_id).await.unwrap();
+        let content_hash = results[0].content_hash.clone();
+
+        let resp = engine
+            .record_verification(
+                &task_id,
+                VerifyRequest {
+                    result_id,
+                    verifier_id:          "verifier_x".to_string(),
+                    outcome:              "reproduced".to_string(),
+                    verifier_content_hash: content_hash,
+                    verifier_receipt_id:  None,
+                    notes:                None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!resp.quorum_reached, "one reproduced should not meet quorum=2");
+        assert_eq!(resp.reproduced_count, 1);
+        assert_eq!(resp.quorum_required, 2);
+        assert_eq!(resp.status, "submitted");
+    }
+
+    /// Two independent 'reproduced' verifications meet quorum=2 → task accepted.
+    #[tokio::test]
+    async fn two_reproduced_verifications_meet_quorum_and_accept_task() {
+        let (db, engine, task_id, result_id) = setup_with_submitted_result(1).await;
+        let results = db.list_results_for_task(&task_id).await.unwrap();
+        let content_hash = results[0].content_hash.clone();
+
+        // First verifier — below quorum.
+        engine
+            .record_verification(
+                &task_id,
+                VerifyRequest {
+                    result_id,
+                    verifier_id:          "verifier_x".to_string(),
+                    outcome:              "reproduced".to_string(),
+                    verifier_content_hash: content_hash.clone(),
+                    verifier_receipt_id:  None,
+                    notes:                None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Second verifier — meets quorum.
+        let resp = engine
+            .record_verification(
+                &task_id,
+                VerifyRequest {
+                    result_id,
+                    verifier_id:          "verifier_y".to_string(),
+                    outcome:              "reproduced".to_string(),
+                    verifier_content_hash: content_hash.clone(),
+                    verifier_receipt_id:  Some("rcpt_verifier_y_001".to_string()),
+                    notes:                None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(resp.quorum_reached, "second reproduced should meet quorum=2");
+        assert_eq!(resp.reproduced_count, 2);
+        assert_eq!(resp.status, "accepted");
+
+        // Task must now have the canonical result set.
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "accepted");
+    }
+
+    /// Self-verification must be rejected.
+    #[tokio::test]
+    async fn self_verification_rejected() {
+        let (db, engine, task_id, result_id) = setup_with_submitted_result(1).await;
+        let results = db.list_results_for_task(&task_id).await.unwrap();
+        let content_hash = results[0].content_hash.clone();
+
+        let err = engine
+            .record_verification(
+                &task_id,
+                VerifyRequest {
+                    result_id,
+                    verifier_id:          "miner_a".to_string(), // same as original miner
+                    outcome:              "reproduced".to_string(),
+                    verifier_content_hash: content_hash,
+                    verifier_receipt_id:  None,
+                    notes:                None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::SelfVerification),
+            "self-verification must return SelfVerification; got {err:?}"
+        );
+    }
+
+    /// A 'reproduced' claim with a mismatched hash must be rejected.
+    #[tokio::test]
+    async fn reproduced_with_wrong_hash_rejected() {
+        let (_db, engine, task_id, result_id) = setup_with_submitted_result(1).await;
+
+        let err = engine
+            .record_verification(
+                &task_id,
+                VerifyRequest {
+                    result_id,
+                    verifier_id:          "verifier_z".to_string(),
+                    outcome:              "reproduced".to_string(),
+                    verifier_content_hash: "totally_different_hash".to_string(),
+                    verifier_receipt_id:  None,
+                    notes:                None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::HashMismatch { .. }),
+            "reproduced with wrong hash must return HashMismatch; got {err:?}"
+        );
+    }
+
+    /// A 'rejected' verification is stored but does not advance quorum.
+    #[tokio::test]
+    async fn rejected_verification_stored_but_does_not_advance_quorum() {
+        let (_db, engine, task_id, result_id) = setup_with_submitted_result(1).await;
+
+        let resp = engine
+            .record_verification(
+                &task_id,
+                VerifyRequest {
+                    result_id,
+                    verifier_id:          "verifier_q".to_string(),
+                    outcome:              "rejected".to_string(),
+                    verifier_content_hash: "divergent_hash".to_string(),
+                    verifier_receipt_id:  None,
+                    notes:                Some("hash differs".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // rejected → reproduced_count stays at 0, quorum_reached = false
+        assert!(!resp.quorum_reached);
+        assert_eq!(resp.reproduced_count, 0);
+        assert_eq!(resp.status, "submitted");
+    }
+
+    /// Supplying an unknown outcome string returns UnknownOutcome.
+    #[tokio::test]
+    async fn unknown_outcome_rejected() {
+        let (_db, engine, task_id, result_id) = setup_with_submitted_result(1).await;
+
+        let err = engine
+            .record_verification(
+                &task_id,
+                VerifyRequest {
+                    result_id,
+                    verifier_id:          "verifier_q".to_string(),
+                    outcome:              "maybe".to_string(),
+                    verifier_content_hash: "x".to_string(),
+                    verifier_receipt_id:  None,
+                    notes:                None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::UnknownOutcome(_)),
+            "unknown outcome must return UnknownOutcome; got {err:?}"
+        );
     }
 
     /// Spawning a phase-2 task twice (idempotency) must not error.
