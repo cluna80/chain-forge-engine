@@ -1,0 +1,35 @@
+[package]
+name        = "chain-forge-verifier-bin"
+description = "QCB Discovery Engine — Independent Verifier CLI (Change Set N)"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[[bin]]
+name = "qcb-verifier"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = "1"
+chrono     = { workspace = true }
+hex        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+uuid       = { workspace = true }
+
+# HTTP client
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# CLI args
+clap       = { version = "4", features = ["derive", "env"] }
+
+# Structured logging
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# URL encoding for path segments
+urlencoding = "2"
