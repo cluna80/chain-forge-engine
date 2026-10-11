@@ -14,10 +14,12 @@
 //!
 //! Each task carries a `range_start`, `range_end`, and `input_seed`.
 //! The miner searches the range [range_start, range_end) for a nonce N such
-//! that SHA3-256(seed || N) has a leading zero byte (difficulty 1 byte = 8 bits).
+//! that SHA-256(seed || N) has at least 16 leading zero bits (2 zero bytes).
 //! The first matching nonce is the solution.  The content_hash of the result is
-//! the hex-encoded SHA3-256 of the winning hash itself, so verifiers can
+//! the hex-encoded SHA-256 of the winning hash itself, so verifiers can
 //! re-derive it deterministically.
+//!
+//! Algorithm: `sha256-preimage-v1` — matches the challenge seeded by `qcb-seed`.
 //!
 //! ## Usage
 //!
@@ -66,7 +68,7 @@ struct Args {
     poll_interval_secs: u64,
 
     /// Algorithm version string embedded in results
-    #[arg(long, default_value = "sha3-256-v1")]
+    #[arg(long, default_value = "sha256-preimage-v1")]
     algorithm_version: String,
 
     /// Workload version string embedded in results
