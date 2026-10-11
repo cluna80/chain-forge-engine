@@ -51,6 +51,39 @@ use chain_forge_research_db::{
     models::{NewObjective, NewTask},
 };
 
+// HTTP seeding (posts directly to a running qcb-scheduler)
+mod http_seed {
+    use chain_forge_research_db::models::{NewObjective, NewTask};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct SeedResponse {
+        pub objective_id:   String,
+        pub tasks_inserted: usize,
+    }
+
+    pub async fn post_to_scheduler(
+        node_url: &str,
+        objective: NewObjective,
+        tasks: Vec<NewTask>,
+    ) -> anyhow::Result<SeedResponse> {
+        let client = reqwest::Client::new();
+        let url = format!("{node_url}/scheduler/seed");
+        let body = serde_json::json!({ "objective": objective, "tasks": tasks });
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Scheduler returned {status}: {text}");
+        }
+        Ok(resp.json::<SeedResponse>().await?)
+    }
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 /// QCB seed tool — populate the research DB with SHA-256 preimage challenges.
@@ -93,6 +126,12 @@ struct Args {
     /// Dry-run: use in-memory DB and print summary only (no Postgres needed)
     #[arg(long)]
     dry_run: bool,
+
+    /// Base URL of a running qcb-scheduler to POST the objective + tasks to.
+    /// When set, skips local DB writes and seeds the live scheduler directly.
+    /// Example: http://127.0.0.1:8080
+    #[arg(long, env = "QCB_NODE_URL")]
+    node_url: Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -108,6 +147,14 @@ async fn main() {
 
     let args = Args::parse();
 
+    // ── Route: POST to live scheduler ─────────────────────────────────────────
+    if let Some(ref node_url) = args.node_url {
+        info!(node_url = %node_url, "Seeding live scheduler via HTTP");
+        run_http(node_url, &args).await;
+        return;
+    }
+
+    // ── Route: local DB (dry-run or Postgres) ─────────────────────────────────
     let use_mem = args.dry_run || args.database_url.is_none();
     if use_mem {
         warn!("Running in DRY-RUN mode — using in-memory DB, nothing written to Postgres");
@@ -125,6 +172,88 @@ async fn main() {
                 eprintln!("Failed to connect to Postgres: {e}");
                 std::process::exit(1);
             }
+        }
+    }
+}
+
+// ── HTTP seeding (posts directly to a running qcb-scheduler) ─────────────────
+
+async fn run_http(node_url: &str, args: &Args) {
+    let objective_id  = Uuid::new_v4().to_string();
+    let total_nonces  = args.task_count * args.range_per_task;
+
+    plan::print_plan(args, &objective_id, total_nonces);
+
+    let verification_spec = serde_json::json!({
+        "type":            "sha256_preimage",
+        "difficulty_bits": args.difficulty,
+        "global_seed":     args.global_seed,
+        "algorithm":       "sha256-preimage-v1",
+        "description":     format!(
+            "Find nonce N in range such that SHA-256(seed || N) has {} leading zero bits",
+            args.difficulty
+        ),
+    });
+
+    let objective = NewObjective {
+        objective_id:        objective_id.clone(),
+        challenge_id:        args.challenge_id.clone(),
+        slug:                args.slug.clone(),
+        track:               "cryptographic-search".to_string(),
+        algorithm_version:   "sha256-preimage-v1".to_string(),
+        range_start:         0,
+        range_end:           total_nonces,
+        workload_class:      "cpu".to_string(),
+        verification_spec,
+        verification_quorum: args.verification_quorum,
+    };
+
+    let tasks: Vec<NewTask> = (0..args.task_count)
+        .map(|i| {
+            let range_start = i * args.range_per_task;
+            let range_end   = range_start + args.range_per_task;
+            let input_seed  = args.global_seed ^ (i as i64);
+            NewTask {
+                task_id:         format!("task-{objective_id}-{i:04}"),
+                objective_id:    objective_id.clone(),
+                range_start,
+                range_end,
+                workload_class:  "cpu".to_string(),
+                input_seed:      input_seed as u64,
+                phase:           1,
+                parent_hash:     None,
+                phase1_miner_id: None,
+            }
+        })
+        .collect();
+
+    match http_seed::post_to_scheduler(node_url, objective, tasks).await {
+        Ok(resp) => {
+            info!(
+                objective_id   = %resp.objective_id,
+                tasks_inserted = resp.tasks_inserted,
+                "✓ Scheduler seeded successfully"
+            );
+            println!();
+            println!("════════════════════════════════════════════════════════");
+            println!("  QCB Seed complete — scheduler at {node_url}");
+            println!("════════════════════════════════════════════════════════");
+            println!("  Objective ID : {}", resp.objective_id);
+            println!("  Challenge    : {}", args.challenge_id);
+            println!("  Tasks        : {}", resp.tasks_inserted);
+            println!("  Difficulty   : {} leading zero bits", args.difficulty);
+            println!();
+            println!("  Run a miner with:");
+            println!();
+            println!("    qcb-miner.exe \\");
+            println!("      --node-url {node_url} \\");
+            println!("      --miner-id <your-machine-name> \\");
+            println!("      --objective-id {}", resp.objective_id);
+            println!();
+        }
+        Err(e) => {
+            eprintln!("Failed to seed scheduler: {e}");
+            std::process::exit(1);
         }
     }
 }

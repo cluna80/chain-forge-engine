@@ -86,6 +86,12 @@ impl ResearchScheduler {
         self
     }
 
+    /// Expose the underlying database handle — used by the seed endpoint
+    /// to insert objectives and tasks directly into the scheduler's DB.
+    pub fn db(&self) -> &Arc<dyn ResearchDb> {
+        &self.db
+    }
+
     // ── public API ────────────────────────────────────────────────────────────
 
     /// Atomically assign the next available task for the given objective and

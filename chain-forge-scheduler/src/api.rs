@@ -4,6 +4,7 @@
 //!
 //! | Method | Path                                  | Description                       |
 //! |--------|---------------------------------------|-----------------------------------|
+//! | POST   | `/scheduler/seed`                     | Insert objective + tasks (seed)   |
 //! | POST   | `/scheduler/miners/register`          | Register / heartbeat a miner      |
 //! | GET    | `/scheduler/miners/{miner_id}/task`   | Poll for a task assignment        |
 //! | POST   | `/scheduler/tasks/{task_id}/result`   | Submit task result                |
@@ -25,7 +26,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use chain_forge_research_db::models::NewExperimentResult;
+use chain_forge_research_db::models::{NewExperimentResult, NewObjective, NewTask};
 
 use crate::{
     error::SchedulerError,
@@ -45,6 +46,7 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/scheduler/seed",                   post(seed_objective))
         .route("/scheduler/miners/register",        post(register_miner))
         .route("/scheduler/miners/:miner_id/task",  get(get_task_for_miner))
         .route("/scheduler/tasks/:task_id/result",  post(submit_result))
@@ -100,7 +102,40 @@ pub struct StatusResponse {
     pub registered_miners: usize,
 }
 
+// ── Seed request / response ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SeedRequest {
+    pub objective: NewObjective,
+    pub tasks:     Vec<NewTask>,
+}
+
+#[derive(Serialize)]
+pub struct SeedResponse {
+    pub objective_id:   String,
+    pub tasks_inserted: usize,
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
+
+async fn seed_objective(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<SeedRequest>,
+) -> Response {
+    let objective_id = req.objective.objective_id.clone();
+    let task_count   = req.tasks.len();
+
+    if let Err(e) = state.scheduler.db().insert_objective(req.objective).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    match state.scheduler.db().upsert_tasks(req.tasks).await {
+        Ok(n) => (StatusCode::CREATED, Json(SeedResponse {
+            objective_id,
+            tasks_inserted: n,
+        })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
 
 async fn register_miner(
     State(state): State<Arc<AppState>>,
