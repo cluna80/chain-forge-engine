@@ -25,6 +25,7 @@ members = [
     "chain-forge-scheduler",
     "chain-forge-verifier",
     "chain-forge-intelligence",
+    "chain-forge-miner",
     "chain-forge-wallet",
 ]
 
