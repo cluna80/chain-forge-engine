@@ -15,9 +15,9 @@ pub struct SettledResult {
     /// Task kind: "avalanche_experiment" | "avalanche_replication" | "pocd_phase1" | "pocd_phase2"
     #[serde(default = "default_task_kind")]
     pub task_kind:        String,
-    /// Seed index (0..9) — present for avalanche results
+    /// Seed index (0..9) — joined from task row, present for avalanche results
     pub avl_seed_index:   Option<u32>,
-    /// Bit index (0..255) — present for avalanche results
+    /// Bit index (0..255) — joined from task row, present for avalanche results
     pub avl_bit_index:    Option<u32>,
     /// SHA-256(canonical_seed) — hex, 64 chars
     pub avl_original_hash: Option<String>,

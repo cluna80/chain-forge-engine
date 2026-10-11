@@ -332,7 +332,13 @@ impl ResearchDb for PgResearchDb {
         offset:       usize,
     ) -> Result<Vec<ExperimentResultRow>, ResearchDbError> {
         let rows = sqlx::query_as::<_, ExperimentResultRow>(
-            "SELECT er.* FROM experiment_results er \
+            "SELECT er.result_id, er.task_id, er.receipt_id, er.miner_id, \
+                    er.content_hash, er.result_status, er.result_payload, \
+                    er.algorithm_version, er.workload_version, er.seal_nonce, \
+                    er.avl_original_hash, er.avl_flipped_hash, er.avl_xor_diff, er.avl_hamming_dist, \
+                    t.avl_seed_index, t.avl_bit_index, \
+                    er.submitted_at, er.updated_at \
+             FROM experiment_results er \
              JOIN research_tasks t ON t.task_id = er.task_id \
              WHERE t.objective_id = $1 \
              ORDER BY er.submitted_at \

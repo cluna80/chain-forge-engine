@@ -189,6 +189,13 @@ pub struct ExperimentResultRow {
     /// Avalanche only: Hamming distance between original and flipped hash
     /// (= popcount of xor_diff); 0..=256.
     pub avl_hamming_dist:   Option<i32>,
+    // ── avalanche task identity fields (joined from research_tasks) ───────────
+    /// Avalanche only: which of the 10 canonical seeds (0..9).
+    /// Populated from the parent task row by list_results_for_objective.
+    pub avl_seed_index:     Option<i32>,
+    /// Avalanche only: which input bit position is flipped (0..255).
+    /// Populated from the parent task row by list_results_for_objective.
+    pub avl_bit_index:      Option<i32>,
     // ─────────────────────────────────────────────────────────────────────────
     pub submitted_at:       DateTime<Utc>,
     pub updated_at:         DateTime<Utc>,
