@@ -54,6 +54,7 @@ pub mod api;
 pub mod error;
 pub mod miner;
 pub mod scheduler;
+pub mod settlement;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
@@ -61,6 +62,7 @@ pub use api::{router, AppState};
 pub use error::SchedulerError;
 pub use miner::{MinerInfo, MinerRegistry};
 pub use scheduler::ResearchScheduler;
+pub use settlement::{SettleRequest, SettlementError};
 
 #[cfg(test)]
 mod tests;

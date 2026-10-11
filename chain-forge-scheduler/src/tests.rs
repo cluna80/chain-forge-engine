@@ -46,6 +46,10 @@ mod tests {
                 phase:           1,
                 parent_hash:     None,
                 phase1_miner_id: None,
+                // PoCD phase-1 task — no avalanche fields
+                task_kind:       "pocd_phase1".to_string(),
+                avl_seed_index:  None,
+                avl_bit_index:   None,
             })
             .collect();
         (obj, tasks)
@@ -69,6 +73,11 @@ mod tests {
             algorithm_version: "sha256_v1".to_string(),
             workload_version:  "1.0".to_string(),
             seal_nonce:        Some(gen as u64),
+            // PoCD task — no avalanche fields
+            avl_original_hash: None,
+            avl_flipped_hash:  None,
+            avl_xor_diff:      None,
+            avl_hamming_dist:  None,
         }
     }
 

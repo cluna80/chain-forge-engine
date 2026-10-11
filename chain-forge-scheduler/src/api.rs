@@ -2,13 +2,15 @@
 //!
 //! ## Endpoints
 //!
-//! | Method | Path                                  | Description                       |
-//! |--------|---------------------------------------|-----------------------------------|
-//! | POST   | `/scheduler/seed`                     | Insert objective + tasks (seed)   |
-//! | POST   | `/scheduler/miners/register`          | Register / heartbeat a miner      |
-//! | GET    | `/scheduler/miners/{miner_id}/task`   | Poll for a task assignment        |
-//! | POST   | `/scheduler/tasks/{task_id}/result`   | Submit task result                |
-//! | GET    | `/scheduler/status`                   | Queue depth + active lease count  |
+//! | Method | Path                                        | Description                           |
+//! |--------|---------------------------------------------|---------------------------------------|
+//! | POST   | `/scheduler/seed`                           | Insert objective + tasks (seed)       |
+//! | POST   | `/scheduler/miners/register`                | Register / heartbeat a miner          |
+//! | GET    | `/scheduler/miners/{miner_id}/task`         | Poll for a task assignment            |
+//! | POST   | `/scheduler/tasks/{task_id}/result`         | Submit task result                    |
+//! | GET    | `/scheduler/objectives/{id}/results`        | List results for an objective         |
+//! | POST   | `/scheduler/objectives/{id}/settle`         | Settle a canonical result (Change Set L) |
+//! | GET    | `/scheduler/status`                         | Queue depth + active lease count      |
 //!
 //! ## State sharing
 //!
@@ -32,6 +34,7 @@ use crate::{
     error::SchedulerError,
     miner::MinerRegistry,
     scheduler::ResearchScheduler,
+    settlement::{settle_objective, SettleRequest, SettlementError},
 };
 
 // ── Shared state ──────────────────────────────────────────────────────────────
@@ -51,6 +54,8 @@ pub fn router(state: AppState) -> Router {
         .route("/scheduler/miners/:miner_id/task",                  get(get_task_for_miner))
         .route("/scheduler/tasks/:task_id/result",                  post(submit_result))
         .route("/scheduler/objectives/:objective_id/results",       get(list_objective_results))
+        // Change Set L: settlement operator endpoint
+        .route("/scheduler/objectives/:objective_id/settle",        post(settle_handler))
         .route("/scheduler/status",                                 get(status))
         .with_state(Arc::new(state))
 }
@@ -141,7 +146,7 @@ async fn seed_objective(
     Json(req):    Json<SeedRequest>,
 ) -> Response {
     let objective_id = req.objective.objective_id.clone();
-    let task_count   = req.tasks.len();
+    let _task_count  = req.tasks.len();
 
     if let Err(e) = state.scheduler.db().insert_objective(req.objective).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -242,6 +247,85 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         registered_miners: state.miners.count(),
     };
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+// ── Settlement handler (Change Set L) ─────────────────────────────────────────
+
+/// `POST /scheduler/objectives/:objective_id/settle`
+///
+/// Settlement operators call this endpoint to pay a miner whose canonical
+/// research result has been accepted.  The handler:
+///
+/// 1. Looks up the canonical accepted result for the given task.
+/// 2. Computes the reward via `QcbResearchRewardPolicy`.
+/// 3. Inserts a `pending` claim record (idempotent — duplicate claim_id returns
+///    the existing record).
+/// 4. Builds and ML-DSA-65 signs a `ClaimResearchReward` transaction.
+/// 5. POSTs the tx to the QCB node.
+/// 6. Marks the claim `submitted`.
+///
+/// Returns `201 Created` on success, `409 Conflict` when the claim already
+/// exists and has been submitted, and `422 Unprocessable` for policy or key
+/// errors.
+async fn settle_handler(
+    State(state):          State<Arc<AppState>>,
+    Path(objective_id):    Path<String>,
+    Json(req):             Json<SettleRequest>,
+) -> Response {
+    match settle_objective(state.scheduler.db(), &objective_id, req).await {
+        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
+
+        Err(SettlementError::ClaimAlreadyExists(id)) => {
+            // Idempotent: a prior run already submitted this claim.
+            let body = serde_json::json!({
+                "error": "claim_already_exists",
+                "claim_id": id,
+                "message": "This claim was already submitted in a prior request.",
+            });
+            (StatusCode::CONFLICT, Json(body)).into_response()
+        }
+
+        Err(SettlementError::NoAcceptedResult(obj, task)) => {
+            let body = serde_json::json!({
+                "error": "no_accepted_result",
+                "objective_id": obj,
+                "task_id": task,
+                "message": "No canonical accepted result found for this task. \
+                            Ensure the result has been verified and accepted before settling.",
+            });
+            (StatusCode::NOT_FOUND, Json(body)).into_response()
+        }
+
+        Err(SettlementError::PolicyRejected(e)) => {
+            let body = serde_json::json!({
+                "error": "policy_rejected",
+                "message": e.to_string(),
+            });
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+
+        Err(SettlementError::UnknownRewardKind(kind)) => {
+            let body = serde_json::json!({
+                "error": "unknown_reward_kind",
+                "reward_kind": kind,
+                "message": "Expected 'primary' or 'replication'.",
+            });
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+
+        Err(SettlementError::KeyDecode(msg)) => {
+            let body = serde_json::json!({
+                "error": "key_decode_error",
+                "message": msg,
+            });
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+
+        Err(e) => {
+            tracing::error!(error = %e, "settlement failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
 }
 
 // ── Error helper ──────────────────────────────────────────────────────────────
