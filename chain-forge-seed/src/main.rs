@@ -180,12 +180,17 @@ async fn run(db: &impl ResearchDb, args: &Args) {
             // so miners searching different ranges don't all hash the same values.
             let input_seed  = args.global_seed ^ (i as i64);
             NewTask {
-                task_id:        format!("task-{objective_id}-{i:04}"),
-                objective_id:   objective_id.clone(),
+                task_id:         format!("task-{objective_id}-{i:04}"),
+                objective_id:    objective_id.clone(),
                 range_start,
                 range_end,
-                workload_class: "cpu".to_string(),
-                input_seed:     input_seed as u64,
+                workload_class:  "cpu".to_string(),
+                input_seed:      input_seed as u64,
+                // Seed tool always creates phase-1 tasks.
+                // Phase-2 tasks are spawned dynamically by the scheduler.
+                phase:           1,
+                parent_hash:     None,
+                phase1_miner_id: None,
             }
         })
         .collect();

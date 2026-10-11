@@ -5,9 +5,20 @@
 //! * Atomically assign tasks to miners (`assign_task`).
 //! * Accept and persist miner results, guarding against stale submissions
 //!   (`submit_result`).
+//! * Spawn phase-2 tasks immediately after a phase-1 result is submitted
+//!   (`spawn_phase2_task` called internally in `submit_result`).
 //! * Sweep expired leases back to `available` (`expire_stale_leases`).
 //! * Run a background ticker that fires the expiry sweep periodically
 //!   (`run_expiry_loop`).
+//!
+//! ## Two-Phase Cascade (Change Set J)
+//!
+//! Phase-1 tasks are seeded by `qcb-seed` and placed in the DB as `phase = 1`.
+//! When a phase-1 result is successfully submitted, `submit_result` immediately
+//! calls `db.spawn_phase2_task(...)` to create the corresponding phase-2 task.
+//! The scheduler then enforces the different-miner rule via `exclude_miner` in
+//! `assign_task`: a miner that completed phase-1 is NEVER assigned the derived
+//! phase-2 task.
 //!
 //! ## Consensus separation
 //!
@@ -25,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use tracing::{debug, info};
 
 use chain_forge_research_db::{
     models::{NewExperimentResult, TaskRow},
@@ -36,21 +48,29 @@ use crate::error::SchedulerError;
 /// Default lease duration issued by `assign_task`.
 const DEFAULT_LEASE_SECS: i64 = 120;
 
+/// Default nonce search range assigned to each phase-2 task.
+///
+/// Phase-2 has only 8-bit difficulty (~256 hashes expected), so a range of
+/// 100 000 provides a comfortable headroom while keeping task sizes small.
+const DEFAULT_PHASE2_RANGE: u64 = 100_000;
+
 /// The scheduler.  Clone-cheap (holds an `Arc` internally).
 #[derive(Clone)]
 pub struct ResearchScheduler {
-    pub(crate) db:         Arc<dyn ResearchDb>,
-    lease_secs: i64,
+    pub(crate) db:   Arc<dyn ResearchDb>,
+    lease_secs:      i64,
+    phase2_range:    u64,
 }
 
 impl ResearchScheduler {
     /// Create a new scheduler with the given database handle.
     ///
-    /// Uses `DEFAULT_LEASE_SECS` unless overridden with [`with_lease_secs`].
+    /// Uses `DEFAULT_LEASE_SECS` and `DEFAULT_PHASE2_RANGE` unless overridden.
     pub fn new(db: Arc<dyn ResearchDb>) -> Self {
         Self {
             db,
-            lease_secs: DEFAULT_LEASE_SECS,
+            lease_secs:   DEFAULT_LEASE_SECS,
+            phase2_range: DEFAULT_PHASE2_RANGE,
         }
     }
 
@@ -60,10 +80,20 @@ impl ResearchScheduler {
         self
     }
 
+    /// Override the nonce range created for each phase-2 task.
+    pub fn with_phase2_range(mut self, range: u64) -> Self {
+        self.phase2_range = range;
+        self
+    }
+
     // ── public API ────────────────────────────────────────────────────────────
 
     /// Atomically assign the next available task for the given objective and
     /// workload class to `miner_id`.
+    ///
+    /// Enforces the two-phase different-miner rule: the DB query skips any
+    /// task whose `phase1_miner_id` equals `miner_id`, so a miner that
+    /// completed phase-1 cannot be assigned the derived phase-2 task.
     ///
     /// Returns the assigned `TaskRow`, including `lease_generation` — the
     /// miner **must** include this value in its result submission.
@@ -77,8 +107,15 @@ impl ResearchScheduler {
     ) -> Result<TaskRow, SchedulerError> {
         let lease_expires_at = Utc::now() + chrono::Duration::seconds(self.lease_secs);
 
+        // exclude_miner = Some(miner_id) enforces the two-phase different-miner rule.
         self.db
-            .assign_task(objective_id, workload_class, miner_id, lease_expires_at)
+            .assign_task(
+                objective_id,
+                workload_class,
+                miner_id,
+                lease_expires_at,
+                Some(miner_id),
+            )
             .await?
             .ok_or_else(|| SchedulerError::NoTaskAvailable {
                 objective_id:  objective_id.to_string(),
@@ -101,6 +138,20 @@ impl ResearchScheduler {
     ///
     /// Any failure returns `SchedulerError::LeaseSuperseded` (or a related
     /// variant) and the submission is discarded without touching the database.
+    ///
+    /// ## Phase-2 spawning (Change Set J)
+    ///
+    /// When a **phase-1** result passes all guards and is persisted, this
+    /// method immediately calls `db.spawn_phase2_task(...)` to queue the
+    /// second hop.  The phase-2 task records `phase1_miner_id = miner_id` so
+    /// the scheduler's `assign_task` can exclude that miner.
+    ///
+    /// The `winning_hash` for the phase-2 seed is extracted from
+    /// `result.result_payload["winning_hash"]`; if it is absent (e.g. from a
+    /// third-party miner that uses a different payload shape), `spawn_phase2_task`
+    /// will receive an empty string and the DB's idempotency guard will still
+    /// create the row, but miners will fail to solve it.  In practice the QCB
+    /// miner always includes `winning_hash` in the payload.
     pub async fn submit_result(
         &self,
         task_id:              &str,
@@ -145,9 +196,42 @@ impl ResearchScheduler {
             }
         }
 
+        // Capture the task phase and any winning_hash from the payload BEFORE
+        // we move `result` into insert_result.
+        let task_phase = task.phase;
+        let winning_hash = result
+            .result_payload
+            .get("winning_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         // All guards passed — persist the result, then transition task status.
         self.db.insert_result(result).await?;
         self.db.submit_task_result(task_id, miner_id).await?;
+
+        // ── Two-phase cascade: spawn phase-2 task ─────────────────────────────
+        //
+        // Immediately after a phase-1 result is persisted, create the derived
+        // phase-2 task so the next available miner can pick it up.
+        //
+        // `spawn_phase2_task` is idempotent — if the phase-2 task already
+        // exists (e.g. a duplicate submission race), it returns the existing row.
+        if task_phase == 1 {
+            let p2 = self
+                .db
+                .spawn_phase2_task(task_id, &winning_hash, miner_id, self.phase2_range)
+                .await?;
+
+            info!(
+                parent_task_id  = task_id,
+                phase2_task_id  = %p2.task_id,
+                phase1_miner_id = miner_id,
+                "Phase-2 task spawned — different miner required"
+            );
+        } else {
+            debug!(task_id, phase = task_phase, "Phase-2+ result submitted (no further cascade)");
+        }
 
         Ok(())
     }

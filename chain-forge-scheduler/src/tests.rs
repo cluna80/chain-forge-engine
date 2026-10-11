@@ -37,24 +37,35 @@ mod tests {
         };
         let tasks: Vec<NewTask> = (0..n_tasks)
             .map(|i| NewTask {
-                task_id:        format!("{}::task::{i:016x}-{:016x}", obj.objective_id, i + 1),
-                objective_id:   obj.objective_id.clone(),
-                range_start:    i * 1_000,
-                range_end:      (i + 1) * 1_000,
-                workload_class: "cpu".to_string(),
-                input_seed:     i ^ (i + 1),
+                task_id:         format!("{}::task::{i:016x}-{:016x}", obj.objective_id, i + 1),
+                objective_id:    obj.objective_id.clone(),
+                range_start:     i * 1_000,
+                range_end:       (i + 1) * 1_000,
+                workload_class:  "cpu".to_string(),
+                input_seed:      i ^ (i + 1),
+                phase:           1,
+                parent_hash:     None,
+                phase1_miner_id: None,
             })
             .collect();
         (obj, tasks)
     }
 
     fn make_result(task_id: &str, miner: &str, gen: i64) -> NewExperimentResult {
+        make_result_with_hash(task_id, miner, gen, &format!("deadbeef{gen:016x}deadbeef{gen:016x}"))
+    }
+
+    fn make_result_with_hash(task_id: &str, miner: &str, gen: i64, winning_hash: &str) -> NewExperimentResult {
         NewExperimentResult {
             task_id:           task_id.to_string(),
             receipt_id:        format!("rcpt_{miner}_{gen}"),
             miner_id:          miner.to_string(),
             content_hash:      format!("hash_{miner}_{gen}"),
-            result_payload:    json!({ "nonce": gen }),
+            result_payload:    json!({
+                "nonce":        gen,
+                "winning_hash": winning_hash,
+                "phase":        1,
+            }),
             algorithm_version: "sha256_v1".to_string(),
             workload_version:  "1.0".to_string(),
             seal_nonce:        Some(gen as u64),
@@ -257,6 +268,100 @@ mod tests {
         registry.register("m3", "gpu");
         let cpu = registry.for_workload("cpu");
         assert_eq!(cpu.len(), 2);
+    }
+
+    // ── Two-phase cascade (Change Set J) ─────────────────────────────────────
+
+    /// After a phase-1 result is submitted, a phase-2 task must be spawned.
+    #[tokio::test]
+    async fn phase2_task_spawned_after_phase1_submit() {
+        let (db, sched, obj_id) = setup(1).await;
+        let row = sched.assign_task(&obj_id, "cpu", "miner_a").await.unwrap();
+        assert_eq!(row.phase, 1);
+        let gen = row.lease_generation;
+
+        // Supply a fake winning_hash (32 bytes = 64 hex chars)
+        let winning_hash = "00".repeat(32); // 64 zeros — valid hex, 32 bytes
+        sched
+            .submit_result(
+                &row.task_id,
+                "miner_a",
+                gen,
+                make_result_with_hash(&row.task_id, "miner_a", gen, &winning_hash),
+            )
+            .await
+            .unwrap();
+
+        // The phase-2 task should now exist in the DB.
+        let p2_id = format!("phase2-{}", row.task_id);
+        let p2 = db.get_task(&p2_id).await.unwrap();
+        assert!(p2.is_some(), "phase-2 task must be spawned after phase-1 submit");
+        let p2 = p2.unwrap();
+        assert_eq!(p2.phase, 2);
+        assert_eq!(p2.parent_hash.as_deref(), Some(winning_hash.as_str()));
+        assert_eq!(p2.phase1_miner_id.as_deref(), Some("miner_a"));
+        assert_eq!(p2.status, "available");
+    }
+
+    /// The phase-1 miner must NOT be assigned the derived phase-2 task.
+    #[tokio::test]
+    async fn phase1_miner_excluded_from_phase2_assignment() {
+        let (db, sched, obj_id) = setup(1).await;
+        let row = sched.assign_task(&obj_id, "cpu", "miner_a").await.unwrap();
+        let gen = row.lease_generation;
+        let winning_hash = "00".repeat(32);
+
+        sched
+            .submit_result(
+                &row.task_id,
+                "miner_a",
+                gen,
+                make_result_with_hash(&row.task_id, "miner_a", gen, &winning_hash),
+            )
+            .await
+            .unwrap();
+
+        // miner_a tries to pick up the phase-2 task — must fail.
+        let err = sched.assign_task(&obj_id, "cpu", "miner_a").await.unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::NoTaskAvailable { .. }),
+            "phase-1 miner must be excluded from phase-2 assignment; got {err:?}"
+        );
+
+        // miner_b can pick it up.
+        let p2_row = sched.assign_task(&obj_id, "cpu", "miner_b").await.unwrap();
+        assert_eq!(p2_row.phase, 2, "miner_b should receive the phase-2 task");
+        assert_eq!(p2_row.parent_hash.as_deref(), Some(winning_hash.as_str()));
+
+        // Clean up so we have a reference to db (avoids unused warning)
+        let _ = db;
+    }
+
+    /// Spawning a phase-2 task twice (idempotency) must not error.
+    #[tokio::test]
+    async fn spawn_phase2_task_idempotent() {
+        let (db, sched, obj_id) = setup(1).await;
+        let row = sched.assign_task(&obj_id, "cpu", "miner_a").await.unwrap();
+        let gen = row.lease_generation;
+        let winning_hash = "ab".repeat(32); // 64 hex chars
+
+        sched
+            .submit_result(
+                &row.task_id,
+                "miner_a",
+                gen,
+                make_result_with_hash(&row.task_id, "miner_a", gen, &winning_hash),
+            )
+            .await
+            .unwrap();
+
+        // Call spawn directly a second time — must return the same task.
+        let p2_again = db
+            .spawn_phase2_task(&row.task_id, &winning_hash, "miner_a", 100_000)
+            .await
+            .unwrap();
+        assert_eq!(p2_again.task_id, format!("phase2-{}", row.task_id));
+        assert_eq!(p2_again.phase, 2);
     }
 }
 

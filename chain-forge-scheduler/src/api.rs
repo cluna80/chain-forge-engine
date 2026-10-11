@@ -74,14 +74,18 @@ pub struct GetTaskQuery {
 
 #[derive(Serialize)]
 pub struct TaskAssignmentResponse {
-    pub task_id:         String,
-    pub objective_id:    String,
-    pub range_start:     i64,
-    pub range_end:       i64,
-    pub workload_class:  String,
-    pub input_seed:      i64,
+    pub task_id:          String,
+    pub objective_id:     String,
+    pub range_start:      i64,
+    pub range_end:        i64,
+    pub workload_class:   String,
+    pub input_seed:       i64,
     pub lease_expires_at: chrono::DateTime<chrono::Utc>,
     pub lease_generation: i64,
+    /// Which cascade phase this task belongs to (1 or 2).
+    pub phase:            i32,
+    /// Phase-2 only: hex-encoded phase-1 winning hash that seeds this task.
+    pub parent_hash:      Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +134,8 @@ async fn get_task_for_miner(
                 input_seed:       row.input_seed,
                 lease_expires_at: row.lease_expires_at.unwrap_or_else(chrono::Utc::now),
                 lease_generation: row.lease_generation,
+                phase:            row.phase,
+                parent_hash:      row.parent_hash,
             };
             (StatusCode::OK, Json(resp)).into_response()
         }

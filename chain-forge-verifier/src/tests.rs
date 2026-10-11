@@ -39,12 +39,15 @@ mod tests {
 
     fn make_task(objective_id: &str) -> NewTask {
         NewTask {
-            task_id:        format!("{objective_id}::task::0000000000000000-0000000000000001"),
-            objective_id:   objective_id.to_string(),
-            range_start:    0,
-            range_end:      1_000,
-            workload_class: "cpu".to_string(),
-            input_seed:     42,
+            task_id:         format!("{objective_id}::task::0000000000000000-0000000000000001"),
+            objective_id:    objective_id.to_string(),
+            range_start:     0,
+            range_end:       1_000,
+            workload_class:  "cpu".to_string(),
+            input_seed:      42,
+            phase:           1,
+            parent_hash:     None,
+            phase1_miner_id: None,
         }
     }
 
@@ -78,7 +81,7 @@ mod tests {
         // Assign, then submit (mimicking the scheduler path)
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
         let assigned = db
-            .assign_task(&obj_id, "cpu", "miner_submitter", lease)
+            .assign_task(&obj_id, "cpu", "miner_submitter", lease, None)
             .await
             .unwrap()
             .unwrap();
@@ -373,11 +376,11 @@ mod tests {
 
         // Submit both tasks
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
-        let a_assigned = db.assign_task(&obj_a_id, "cpu", "miner_a", lease).await.unwrap().unwrap();
+        let a_assigned = db.assign_task(&obj_a_id, "cpu", "miner_a", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&a_assigned.task_id, "miner_a").await.unwrap();
         let result_a = db.insert_result(make_result(&task_a_id, "miner_a")).await.unwrap();
 
-        let b_assigned = db.assign_task(&obj_b_id, "cpu", "miner_b", lease).await.unwrap().unwrap();
+        let b_assigned = db.assign_task(&obj_b_id, "cpu", "miner_b", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&b_assigned.task_id, "miner_b").await.unwrap();
         let result_b = db.insert_result(make_result(&task_b_id, "miner_b")).await.unwrap();
 

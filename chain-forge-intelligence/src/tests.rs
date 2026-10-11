@@ -38,12 +38,15 @@ mod tests {
 
     fn make_task(objective_id: &str, idx: u64) -> NewTask {
         NewTask {
-            task_id:        format!("{objective_id}::task::{idx:016x}-{:016x}", idx + 1),
-            objective_id:   objective_id.to_string(),
-            range_start:    idx * 100,
-            range_end:      idx * 100 + 100,
-            workload_class: "cpu".to_string(),
-            input_seed:     idx,
+            task_id:         format!("{objective_id}::task::{idx:016x}-{:016x}", idx + 1),
+            objective_id:    objective_id.to_string(),
+            range_start:     idx * 100,
+            range_end:       idx * 100 + 100,
+            workload_class:  "cpu".to_string(),
+            input_seed:      idx,
+            phase:           1,
+            parent_hash:     None,
+            phase1_miner_id: None,
         }
     }
 
@@ -84,7 +87,7 @@ mod tests {
 
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
         let assigned = db
-            .assign_task(objective_id, "cpu", miner, lease)
+            .assign_task(objective_id, "cpu", miner, lease, None)
             .await
             .unwrap()
             .unwrap();
@@ -191,7 +194,7 @@ mod tests {
         let task_a_id = task_a.task_id.clone();
         db.upsert_tasks(vec![task_a]).await.unwrap();
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
-        let a_assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease).await.unwrap().unwrap();
+        let a_assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&a_assigned.task_id, "miner_a").await.unwrap();
         let r_a = db.insert_result(make_result(&task_a_id, "miner_a", "hash_a")).await.unwrap();
         db.insert_verification(make_verification(r_a.result_id, &task_a_id, "v1", "reproduced")).await.unwrap();
@@ -202,7 +205,7 @@ mod tests {
         let task_b = make_task(&obj_id, 1);
         let task_b_id = task_b.task_id.clone();
         db.upsert_tasks(vec![task_b]).await.unwrap();
-        let b_assigned = db.assign_task(&obj_id, "cpu", "miner_b", lease).await.unwrap().unwrap();
+        let b_assigned = db.assign_task(&obj_id, "cpu", "miner_b", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&b_assigned.task_id, "miner_b").await.unwrap();
         db.insert_result(make_result(&task_b_id, "miner_b", "hash_b")).await.unwrap();
 
@@ -277,7 +280,7 @@ mod tests {
 
         // Two different miners submit the same content_hash
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
-        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease).await.unwrap().unwrap();
+        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&assigned.task_id, "miner_a").await.unwrap();
         db.insert_result(make_result(&task_id, "miner_a", "SAME_HASH")).await.unwrap();
 
@@ -319,7 +322,7 @@ mod tests {
         db.upsert_tasks(vec![task]).await.unwrap();
 
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
-        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease).await.unwrap().unwrap();
+        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&assigned.task_id, "miner_a").await.unwrap();
         let result = db.insert_result(make_result(&task_id, "miner_a", "hash_a")).await.unwrap();
 
@@ -353,7 +356,7 @@ mod tests {
         db.upsert_tasks(vec![task]).await.unwrap();
 
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
-        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease).await.unwrap().unwrap();
+        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&assigned.task_id, "miner_a").await.unwrap();
         let result = db.insert_result(make_result(&task_id, "miner_a", "hash_a")).await.unwrap();
 
@@ -435,7 +438,7 @@ mod tests {
         db.upsert_tasks(vec![task]).await.unwrap();
 
         let lease = chrono::Utc::now() + chrono::Duration::seconds(120);
-        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease).await.unwrap().unwrap();
+        let assigned = db.assign_task(&obj_id, "cpu", "miner_a", lease, None).await.unwrap().unwrap();
         db.submit_task_result(&assigned.task_id, "miner_a").await.unwrap();
         let result = db.insert_result(make_result(&task_id, "miner_a", "hash_a")).await.unwrap();
 

@@ -21,7 +21,15 @@ pub struct TaskAssignment {
     pub input_seed:       i64,
     pub lease_expires_at: DateTime<Utc>,
     pub lease_generation: i64,
+    /// Which cascade phase this task belongs to (1 or 2).
+    #[serde(default = "default_phase")]
+    pub phase:            i32,
+    /// Phase-2 only: hex-encoded SHA-256 output from the phase-1 winner that
+    /// seeds this task's search.  `None` for phase-1 tasks.
+    pub parent_hash:      Option<String>,
 }
+
+fn default_phase() -> i32 { 1 }
 
 /// The result payload sent to the scheduler.
 #[derive(Debug, Serialize)]

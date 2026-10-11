@@ -52,12 +52,17 @@ impl From<&ResearchMicrotask> for NewTask {
         //   workload_class, input_seed,
         //   verification_spec, status, settled_receipt_id, assigned_to
         NewTask {
-            task_id:        t.task_id.clone(),
-            objective_id:   t.objective_id.clone(),
-            range_start:    t.task_start,
-            range_end:      t.task_end,
-            workload_class: workload_class_str(t.workload_class),
-            input_seed:     t.input_seed,
+            task_id:         t.task_id.clone(),
+            objective_id:    t.objective_id.clone(),
+            range_start:     t.task_start,
+            range_end:       t.task_end,
+            workload_class:  workload_class_str(t.workload_class),
+            input_seed:      t.input_seed,
+            // Phase-1 tasks are always seeded externally; phase-2 tasks are
+            // created dynamically by the scheduler (not via this bridge).
+            phase:           1,
+            parent_hash:     None,
+            phase1_miner_id: None,
         }
     }
 }

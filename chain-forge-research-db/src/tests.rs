@@ -47,12 +47,15 @@ mod tests {
 
     fn make_task(objective_id: &str, start: u64, end: u64) -> NewTask {
         NewTask {
-            task_id:        format!("{objective_id}::task::{start:016x}-{end:016x}"),
-            objective_id:   objective_id.to_string(),
-            range_start:    start,
-            range_end:      end,
-            workload_class: "cpu".to_string(),
-            input_seed:     start ^ end,
+            task_id:         format!("{objective_id}::task::{start:016x}-{end:016x}"),
+            objective_id:    objective_id.to_string(),
+            range_start:     start,
+            range_end:       end,
+            workload_class:  "cpu".to_string(),
+            input_seed:      start ^ end,
+            phase:           1,
+            parent_hash:     None,
+            phase1_miner_id: None,
         }
     }
 
@@ -651,7 +654,7 @@ mod tests {
         let exp = Utc::now() + Duration::seconds(30);
 
         let row = db
-            .assign_task(&obj_id, "cpu", "miner_alice", exp)
+            .assign_task(&obj_id, "cpu", "miner_alice", exp, None)
             .await
             .unwrap()
             .expect("should assign a task");
@@ -670,14 +673,14 @@ mod tests {
         let exp = Utc::now() + Duration::seconds(30);
 
         // Assign the only task
-        db.assign_task(&obj_id, "cpu", "miner_alice", exp)
+        db.assign_task(&obj_id, "cpu", "miner_alice", exp, None)
             .await
             .unwrap()
             .expect("first assign should succeed");
 
         // No tasks left
         let second = db
-            .assign_task(&obj_id, "cpu", "miner_bob", exp)
+            .assign_task(&obj_id, "cpu", "miner_bob", exp, None)
             .await
             .unwrap();
         assert!(second.is_none(), "should return None when all tasks are assigned");
@@ -688,9 +691,9 @@ mod tests {
         let (db, obj_id) = setup_scheduled_objective(3).await;
         let exp = Utc::now() + Duration::seconds(30);
 
-        let t1 = db.assign_task(&obj_id, "cpu", "m1", exp).await.unwrap().unwrap();
-        let t2 = db.assign_task(&obj_id, "cpu", "m2", exp).await.unwrap().unwrap();
-        let t3 = db.assign_task(&obj_id, "cpu", "m3", exp).await.unwrap().unwrap();
+        let t1 = db.assign_task(&obj_id, "cpu", "m1", exp, None).await.unwrap().unwrap();
+        let t2 = db.assign_task(&obj_id, "cpu", "m2", exp, None).await.unwrap().unwrap();
+        let t3 = db.assign_task(&obj_id, "cpu", "m3", exp, None).await.unwrap().unwrap();
 
         // Each successive assignment goes to the next range
         assert!(t1.range_start < t2.range_start);
@@ -709,7 +712,7 @@ mod tests {
         let future = Utc::now() + Duration::seconds(60);
 
         // Assign with a past deadline, then expire it, then reassign
-        let row = db.assign_task(&obj_id, "cpu", "miner_a", past).await.unwrap().unwrap();
+        let row = db.assign_task(&obj_id, "cpu", "miner_a", past, None).await.unwrap().unwrap();
         assert_eq!(row.lease_generation, 1);
 
         // Expire
@@ -717,7 +720,7 @@ mod tests {
         assert_eq!(expired, 1);
 
         // Reassign — generation must increment to 2
-        let row2 = db.assign_task(&obj_id, "cpu", "miner_b", future).await.unwrap().unwrap();
+        let row2 = db.assign_task(&obj_id, "cpu", "miner_b", future, None).await.unwrap().unwrap();
         assert_eq!(row2.lease_generation, 2, "generation increments on reassign, not reset");
         assert_eq!(row2.attempt_count, 2);
         assert_eq!(row2.assigned_to.as_deref(), Some("miner_b"));
@@ -730,7 +733,7 @@ mod tests {
         let (db, obj_id) = setup_scheduled_objective(1).await;
         let exp = Utc::now() + Duration::seconds(30);
 
-        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp, None).await.unwrap().unwrap();
         db.submit_task_result(&row.task_id, "miner_alice").await.unwrap();
 
         let updated = db.get_task(&row.task_id).await.unwrap().unwrap();
@@ -746,7 +749,7 @@ mod tests {
         let (db, obj_id) = setup_scheduled_objective(1).await;
         let exp = Utc::now() + Duration::seconds(30);
 
-        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp, None).await.unwrap().unwrap();
 
         // Wrong miner tries to submit
         let err = db.submit_task_result(&row.task_id, "miner_bob").await;
@@ -768,13 +771,13 @@ mod tests {
         let past   = Utc::now() - Duration::seconds(5);
         let future = Utc::now() + Duration::seconds(60);
 
-        let row_a = db.assign_task(&obj_id, "cpu", "miner_a", past).await.unwrap().unwrap();
+        let row_a = db.assign_task(&obj_id, "cpu", "miner_a", past, None).await.unwrap().unwrap();
 
         // Expire
         db.expire_stale_leases(Utc::now()).await.unwrap();
 
         // miner_b takes over
-        db.assign_task(&obj_id, "cpu", "miner_b", future).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "miner_b", future, None).await.unwrap().unwrap();
 
         // miner_a submits with its stale task_id → rejected
         let err = db.submit_task_result(&row_a.task_id, "miner_a").await;
@@ -790,7 +793,7 @@ mod tests {
 
         // Assign all tasks with a far-future deadline
         for miner in &["m1", "m2", "m3"] {
-            db.assign_task(&obj_id, "cpu", miner, future).await.unwrap().unwrap();
+            db.assign_task(&obj_id, "cpu", miner, future, None).await.unwrap().unwrap();
         }
 
         let count = db.expire_stale_leases(Utc::now()).await.unwrap();
@@ -804,10 +807,10 @@ mod tests {
         let future = Utc::now() + Duration::seconds(60);
 
         // Assign 2 tasks with a past deadline (stale) and 2 with a future deadline
-        db.assign_task(&obj_id, "cpu", "stale_1", past).await.unwrap().unwrap();
-        db.assign_task(&obj_id, "cpu", "stale_2", past).await.unwrap().unwrap();
-        db.assign_task(&obj_id, "cpu", "live_1", future).await.unwrap().unwrap();
-        db.assign_task(&obj_id, "cpu", "live_2", future).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "stale_1", past, None).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "stale_2", past, None).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "live_1", future, None).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "live_2", future, None).await.unwrap().unwrap();
 
         let count = db.expire_stale_leases(Utc::now()).await.unwrap();
         assert_eq!(count, 2, "exactly the two stale tasks should be returned to available");
@@ -832,9 +835,9 @@ mod tests {
         let past   = Utc::now() - Duration::seconds(1);
         let future = Utc::now() + Duration::seconds(60);
 
-        db.assign_task(&obj_id, "cpu", "miner_a", past).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "miner_a", past, None).await.unwrap().unwrap();
         db.expire_stale_leases(Utc::now()).await.unwrap();
-        let row = db.assign_task(&obj_id, "cpu", "miner_b", future).await.unwrap().unwrap();
+        let row = db.assign_task(&obj_id, "cpu", "miner_b", future, None).await.unwrap().unwrap();
 
         assert_eq!(row.lease_generation, 2, "generation is 2 after first expiry + reassign");
     }
@@ -847,7 +850,7 @@ mod tests {
         let exp = Utc::now() + Duration::seconds(30);
 
         // Phase 1: available → assigned
-        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp, None).await.unwrap().unwrap();
         assert_eq!(row.status, "assigned");
 
         // Phase 2: insert the experiment result (simulates miner work)
@@ -876,7 +879,7 @@ mod tests {
         let (db, obj_id) = setup_scheduled_objective(2).await;
         let past = Utc::now() - Duration::seconds(1);
 
-        db.assign_task(&obj_id, "cpu", "m1", past).await.unwrap().unwrap();
+        db.assign_task(&obj_id, "cpu", "m1", past, None).await.unwrap().unwrap();
         // task 2 stays available
 
         let pending = db.objectives_with_pending_work().await.unwrap();
@@ -888,7 +891,7 @@ mod tests {
         let (db, obj_id) = setup_scheduled_objective(1).await;
         let exp = Utc::now() + Duration::seconds(30);
 
-        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp).await.unwrap().unwrap();
+        let row = db.assign_task(&obj_id, "cpu", "miner_alice", exp, None).await.unwrap().unwrap();
         db.submit_task_result(&row.task_id, "miner_alice").await.unwrap();
 
         let pending = db.objectives_with_pending_work().await.unwrap();
@@ -921,12 +924,15 @@ mod tests {
         db.insert_objective(obj).await.unwrap();
 
         let task = NewTask {
-            task_id:        format!("{obj_id}::task::0000-0001"),
-            objective_id:   obj_id.clone(),
-            range_start:    0,
-            range_end:      1_000,
-            workload_class: "cpu".to_string(),
-            input_seed:     0,
+            task_id:         format!("{obj_id}::task::0000-0001"),
+            objective_id:    obj_id.clone(),
+            range_start:     0,
+            range_end:       1_000,
+            workload_class:  "cpu".to_string(),
+            input_seed:      0,
+            phase:           1,
+            parent_hash:     None,
+            phase1_miner_id: None,
         };
         let task_id = task.task_id.clone();
         db.upsert_tasks(vec![task]).await.unwrap();
@@ -934,7 +940,7 @@ mod tests {
         // Assign → submit
         let exp = Utc::now() + Duration::seconds(120);
         let assigned = db
-            .assign_task(&obj_id, "cpu", "miner_s", exp)
+            .assign_task(&obj_id, "cpu", "miner_s", exp, None)
             .await
             .unwrap()
             .unwrap();
