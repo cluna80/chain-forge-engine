@@ -205,14 +205,11 @@ pub async fn settle_objective(
     let _claim = match db.insert_reward_claim(output.claim).await {
         Ok(c) => c,
         Err(ResearchDbError::Duplicate(_)) => {
-            // Idempotent re-submission: check if a prior submission already
-            // has a tx_id we can return.
-            if let Some(existing) = db.get_reward_claim(&claim_id).await? {
-                let status = existing.claim_status.clone();
-                let tx_id  = existing.tx_id.clone().unwrap_or_default();
-                info!(claim_id, %status, "claim already exists — returning existing record");
-                return Ok(SettleResponse { claim_id, tx_id, amount_uqcb, status });
-            }
+            // Idempotent re-submission: always return 409 so callers can
+            // distinguish a new settlement from a replay.  The existing
+            // claim_id is included in the 409 body so the caller can look
+            // up the original tx_id if needed.
+            info!(claim_id, "claim already exists — returning 409 ClaimAlreadyExists");
             return Err(SettlementError::ClaimAlreadyExists(claim_id));
         }
         Err(e) => return Err(e.into()),
