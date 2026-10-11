@@ -20,12 +20,13 @@ use crate::models::*;
 
 #[derive(Default)]
 struct MemState {
-    objectives:     HashMap<String, ObjectiveRow>,
-    tasks:          HashMap<String, TaskRow>,
-    results:        HashMap<Uuid, ExperimentResultRow>,
-    verifications:  HashMap<Uuid, VerificationRecordRow>,
-    findings:       HashMap<Uuid, ResearchFindingRow>,
-    artifacts:      HashMap<Uuid, ResearchArtifactRow>,
+    objectives:             HashMap<String, ObjectiveRow>,
+    tasks:                  HashMap<String, TaskRow>,
+    results:                HashMap<Uuid, ExperimentResultRow>,
+    verifications:          HashMap<Uuid, VerificationRecordRow>,
+    findings:               HashMap<Uuid, ResearchFindingRow>,
+    artifacts:              HashMap<Uuid, ResearchArtifactRow>,
+    intelligence_reports:   HashMap<Uuid, IntelligenceReportRow>,
 }
 
 /// In-memory test double for `ResearchDb`.
@@ -675,6 +676,200 @@ impl ResearchDb for MemResearchDb {
             .collect();
         rows.sort_by_key(|t| t.updated_at);
         Ok(rows)
+    }
+
+    // ── intelligence (Change Set G) ──────────────────────────────────────────
+
+    async fn get_accepted_results_for_objective(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<ExperimentResultRow>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        // Collect task_ids that belong to this objective
+        let task_ids: std::collections::HashSet<&str> = s
+            .tasks
+            .values()
+            .filter(|t| t.objective_id == objective_id)
+            .map(|t| t.task_id.as_str())
+            .collect();
+
+        let mut rows: Vec<_> = s
+            .results
+            .values()
+            .filter(|r| {
+                task_ids.contains(r.task_id.as_str()) && r.result_status == "accepted"
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.submitted_at);
+        Ok(rows)
+    }
+
+    async fn get_objective_stats(
+        &self,
+        objective_id: &str,
+    ) -> Result<ObjectiveStats, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+
+        // Verify the objective exists
+        if !s.objectives.contains_key(objective_id) {
+            return Err(ResearchDbError::NotFound(format!(
+                "objective_id={}",
+                objective_id
+            )));
+        }
+
+        // Task counts by status
+        let tasks_for_obj: Vec<&TaskRow> = s
+            .tasks
+            .values()
+            .filter(|t| t.objective_id == objective_id)
+            .collect();
+
+        let total_tasks    = tasks_for_obj.len() as u64;
+        let available_tasks = tasks_for_obj.iter().filter(|t| t.status == "available").count() as u64;
+        let assigned_tasks  = tasks_for_obj.iter().filter(|t| t.status == "assigned").count()  as u64;
+        let submitted_tasks = tasks_for_obj.iter().filter(|t| t.status == "submitted").count() as u64;
+        let accepted_tasks  = tasks_for_obj.iter().filter(|t| t.status == "accepted").count()  as u64;
+
+        // Collect task_ids for result/verification queries
+        let task_ids: std::collections::HashSet<&str> = tasks_for_obj
+            .iter()
+            .map(|t| t.task_id.as_str())
+            .collect();
+
+        // Result stats
+        let results_for_obj: Vec<&ExperimentResultRow> = s
+            .results
+            .values()
+            .filter(|r| task_ids.contains(r.task_id.as_str()))
+            .collect();
+
+        let total_results  = results_for_obj.len() as u64;
+        let unique_miners  = results_for_obj
+            .iter()
+            .map(|r| r.miner_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64;
+
+        let result_ids: std::collections::HashSet<Uuid> = results_for_obj
+            .iter()
+            .map(|r| r.result_id)
+            .collect();
+
+        // Verification stats
+        let verifications_for_obj: Vec<&VerificationRecordRow> = s
+            .verifications
+            .values()
+            .filter(|v| result_ids.contains(&v.result_id))
+            .collect();
+
+        let reproduced_count = verifications_for_obj.iter().filter(|v| v.outcome == "reproduced").count() as u64;
+        let diverged_count   = verifications_for_obj.iter().filter(|v| v.outcome == "diverged").count()   as u64;
+
+        let completion_rate = if total_tasks == 0 {
+            None
+        } else {
+            Some(accepted_tasks as f64 / total_tasks as f64)
+        };
+
+        // verifier_agreement: per result, fraction of verifications that are
+        // 'reproduced'; average across results that have >= 1 verification.
+        let mut agreement_sum   = 0.0_f64;
+        let mut agreement_count = 0_u64;
+        for result in &results_for_obj {
+            let v_for_result: Vec<_> = verifications_for_obj
+                .iter()
+                .filter(|v| v.result_id == result.result_id)
+                .collect();
+            if !v_for_result.is_empty() {
+                let reproduced = v_for_result.iter().filter(|v| v.outcome == "reproduced").count();
+                agreement_sum   += reproduced as f64 / v_for_result.len() as f64;
+                agreement_count += 1;
+            }
+        }
+        let verifier_agreement = if agreement_count == 0 {
+            None
+        } else {
+            Some(agreement_sum / agreement_count as f64)
+        };
+
+        Ok(ObjectiveStats {
+            objective_id:    objective_id.to_string(),
+            total_tasks,
+            available_tasks,
+            assigned_tasks,
+            submitted_tasks,
+            accepted_tasks,
+            unique_miners,
+            total_results,
+            reproduced_count,
+            diverged_count,
+            completion_rate,
+            verifier_agreement,
+        })
+    }
+
+    async fn list_findings_with_confidence(
+        &self,
+        objective_id:   &str,
+        min_confidence: f64,
+    ) -> Result<Vec<ResearchFindingRow>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let mut rows: Vec<_> = s
+            .findings
+            .values()
+            .filter(|f| {
+                f.objective_id == objective_id
+                    && f.confidence.map_or(false, |c| c >= min_confidence)
+            })
+            .cloned()
+            .collect();
+        // Order by confidence DESC, then found_at DESC
+        rows.sort_by(|a, b| {
+            let ca = a.confidence.unwrap_or(0.0);
+            let cb = b.confidence.unwrap_or(0.0);
+            cb.partial_cmp(&ca)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.found_at.cmp(&a.found_at))
+        });
+        Ok(rows)
+    }
+
+    async fn upsert_intelligence_report(
+        &self,
+        report: NewIntelligenceReport,
+    ) -> Result<IntelligenceReportRow, ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+        // Find existing report for this objective if any
+        let existing_id = s
+            .intelligence_reports
+            .values()
+            .find(|r| r.objective_id == report.objective_id)
+            .map(|r| r.report_id);
+
+        let row = IntelligenceReportRow {
+            report_id:      existing_id.unwrap_or_else(Uuid::new_v4),
+            objective_id:   report.objective_id.clone(),
+            report_body:    report.report_body,
+            generated_at:   now(),
+            schema_version: report.schema_version,
+        };
+        s.intelligence_reports.insert(row.report_id, row.clone());
+        Ok(row)
+    }
+
+    async fn get_intelligence_report(
+        &self,
+        objective_id: &str,
+    ) -> Result<Option<IntelligenceReportRow>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let row = s
+            .intelligence_reports
+            .values()
+            .find(|r| r.objective_id == objective_id)
+            .cloned();
+        Ok(row)
     }
 }
 

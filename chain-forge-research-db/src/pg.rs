@@ -792,6 +792,216 @@ impl ResearchDb for PgResearchDb {
         .await?;
         Ok(rows)
     }
+
+    // ── intelligence (Change Set G) ──────────────────────────────────────────
+
+    async fn get_accepted_results_for_objective(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<ExperimentResultRow>, ResearchDbError> {
+        let rows = sqlx::query_as::<_, ExperimentResultRow>(
+            r#"
+            SELECT er.*
+            FROM   experiment_results er
+            JOIN   research_tasks rt ON rt.task_id = er.task_id
+            WHERE  rt.objective_id    = $1
+              AND  er.result_status   = 'accepted'
+            ORDER  BY er.submitted_at
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn get_objective_stats(
+        &self,
+        objective_id: &str,
+    ) -> Result<ObjectiveStats, ResearchDbError> {
+        // Verify objective exists first
+        let obj = self.get_objective(objective_id).await?;
+        if obj.is_none() {
+            return Err(ResearchDbError::NotFound(format!(
+                "objective_id={}",
+                objective_id
+            )));
+        }
+
+        // All task counts in one query (using query_as with named struct to avoid sqlx::query! offline cache)
+        #[derive(sqlx::FromRow)]
+        struct TaskCounts { total_tasks: Option<i64>, available_tasks: Option<i64>, assigned_tasks: Option<i64>, submitted_tasks: Option<i64>, accepted_tasks: Option<i64> }
+        let task_row = sqlx::query_as::<_, TaskCounts>(
+            r#"
+            SELECT
+                COUNT(*)                                           AS total_tasks,
+                COUNT(*) FILTER (WHERE status = 'available')      AS available_tasks,
+                COUNT(*) FILTER (WHERE status = 'assigned')       AS assigned_tasks,
+                COUNT(*) FILTER (WHERE status = 'submitted')      AS submitted_tasks,
+                COUNT(*) FILTER (WHERE status = 'accepted')       AS accepted_tasks
+            FROM research_tasks
+            WHERE objective_id = $1
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total_tasks     = task_row.total_tasks.unwrap_or(0)     as u64;
+        let available_tasks = task_row.available_tasks.unwrap_or(0) as u64;
+        let assigned_tasks  = task_row.assigned_tasks.unwrap_or(0)  as u64;
+        let submitted_tasks = task_row.submitted_tasks.unwrap_or(0) as u64;
+        let accepted_tasks  = task_row.accepted_tasks.unwrap_or(0)  as u64;
+
+        // Result + miner stats joined through tasks
+        #[derive(sqlx::FromRow)]
+        struct ResultCounts { total_results: Option<i64>, unique_miners: Option<i64> }
+        let result_row = sqlx::query_as::<_, ResultCounts>(
+            r#"
+            SELECT
+                COUNT(er.result_id)           AS total_results,
+                COUNT(DISTINCT er.miner_id)   AS unique_miners
+            FROM experiment_results er
+            JOIN research_tasks rt ON rt.task_id = er.task_id
+            WHERE rt.objective_id = $1
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total_results = result_row.total_results.unwrap_or(0) as u64;
+        let unique_miners = result_row.unique_miners.unwrap_or(0)  as u64;
+
+        // Verification outcome counts
+        #[derive(sqlx::FromRow)]
+        struct VerCounts { reproduced_count: Option<i64>, diverged_count: Option<i64> }
+        let ver_row = sqlx::query_as::<_, VerCounts>(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE vr.outcome = 'reproduced') AS reproduced_count,
+                COUNT(*) FILTER (WHERE vr.outcome = 'diverged')   AS diverged_count
+            FROM verification_records vr
+            JOIN experiment_results er ON er.result_id = vr.result_id
+            JOIN research_tasks rt     ON rt.task_id   = er.task_id
+            WHERE rt.objective_id = $1
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let reproduced_count = ver_row.reproduced_count.unwrap_or(0) as u64;
+        let diverged_count   = ver_row.diverged_count.unwrap_or(0)   as u64;
+
+        // Per-result verifier agreement (avg of per-result reproduced fraction)
+        #[derive(sqlx::FromRow)]
+        struct AgreeRow { verifier_agreement: Option<f64> }
+        let agree_row = sqlx::query_as::<_, AgreeRow>(
+            r#"
+            SELECT AVG(per_result.frac) AS verifier_agreement
+            FROM (
+                SELECT
+                    er.result_id,
+                    AVG(CASE WHEN vr.outcome = 'reproduced' THEN 1.0 ELSE 0.0 END) AS frac
+                FROM experiment_results er
+                JOIN research_tasks rt         ON rt.task_id   = er.task_id
+                JOIN verification_records vr   ON vr.result_id = er.result_id
+                WHERE rt.objective_id = $1
+                GROUP BY er.result_id
+                HAVING COUNT(vr.verification_id) > 0
+            ) per_result
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let verifier_agreement = agree_row.verifier_agreement;
+
+        let completion_rate = if total_tasks == 0 {
+            None
+        } else {
+            Some(accepted_tasks as f64 / total_tasks as f64)
+        };
+
+        Ok(ObjectiveStats {
+            objective_id: objective_id.to_string(),
+            total_tasks,
+            available_tasks,
+            assigned_tasks,
+            submitted_tasks,
+            accepted_tasks,
+            unique_miners,
+            total_results,
+            reproduced_count,
+            diverged_count,
+            completion_rate,
+            verifier_agreement,
+        })
+    }
+
+    async fn list_findings_with_confidence(
+        &self,
+        objective_id:   &str,
+        min_confidence: f64,
+    ) -> Result<Vec<ResearchFindingRow>, ResearchDbError> {
+        let rows = sqlx::query_as::<_, ResearchFindingRow>(
+            r#"
+            SELECT *
+            FROM   research_findings
+            WHERE  objective_id = $1
+              AND  confidence   >= $2
+            ORDER  BY confidence DESC, found_at DESC
+            "#,
+        )
+        .bind(objective_id)
+        .bind(min_confidence)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn upsert_intelligence_report(
+        &self,
+        report: NewIntelligenceReport,
+    ) -> Result<IntelligenceReportRow, ResearchDbError> {
+        let row = sqlx::query_as::<_, IntelligenceReportRow>(
+            r#"
+            INSERT INTO research_intelligence_reports
+                (objective_id, report_body, schema_version)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (objective_id) DO UPDATE
+                SET report_body    = EXCLUDED.report_body,
+                    generated_at   = now(),
+                    schema_version = EXCLUDED.schema_version
+            RETURNING *
+            "#,
+        )
+        .bind(&report.objective_id)
+        .bind(&report.report_body)
+        .bind(report.schema_version)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn get_intelligence_report(
+        &self,
+        objective_id: &str,
+    ) -> Result<Option<IntelligenceReportRow>, ResearchDbError> {
+        let row = sqlx::query_as::<_, IntelligenceReportRow>(
+            r#"
+            SELECT *
+            FROM   research_intelligence_reports
+            WHERE  objective_id = $1
+            "#,
+        )
+        .bind(objective_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

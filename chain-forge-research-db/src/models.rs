@@ -205,6 +205,62 @@ pub struct NewResearchFinding {
     pub evidence_refs:  serde_json::Value,
 }
 
+// ── intelligence (Change Set G) ───────────────────────────────────────────────
+
+/// Aggregate statistics for a single research objective.
+///
+/// Returned by `ResearchDb::get_objective_stats`.  All counts are computed
+/// in a single query so callers pay one round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectiveStats {
+    pub objective_id:       String,
+    /// Total task count for the objective.
+    pub total_tasks:        u64,
+    /// Tasks still in `'available'` status.
+    pub available_tasks:    u64,
+    /// Tasks currently `'assigned'` to a miner.
+    pub assigned_tasks:     u64,
+    /// Tasks that have been submitted and are awaiting verification.
+    pub submitted_tasks:    u64,
+    /// Tasks that have reached `'accepted'` after quorum verification.
+    pub accepted_tasks:     u64,
+    /// Unique miners that have submitted at least one result.
+    pub unique_miners:      u64,
+    /// Total submitted result rows (may exceed `accepted_tasks` due to
+    /// replication and rejected duplicates).
+    pub total_results:      u64,
+    /// Number of `'reproduced'` verification records across all results.
+    pub reproduced_count:   u64,
+    /// Number of `'diverged'` verification records across all results.
+    pub diverged_count:     u64,
+    /// Fraction of tasks that have been accepted (0.0–1.0).
+    /// `None` when `total_tasks == 0`.
+    pub completion_rate:    Option<f64>,
+    /// Mean fraction of verifications that returned `'reproduced'` per result,
+    /// across results that have at least one verification.
+    /// `None` when no verifications exist yet.
+    pub verifier_agreement: Option<f64>,
+}
+
+/// A persisted intelligence report for one objective.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct IntelligenceReportRow {
+    pub report_id:      uuid::Uuid,
+    pub objective_id:   String,
+    /// Full `ObjectiveReport` JSON (as stored in the DB).
+    pub report_body:    serde_json::Value,
+    pub generated_at:   DateTime<Utc>,
+    pub schema_version: i32,
+}
+
+/// Input for upserting an intelligence report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewIntelligenceReport {
+    pub objective_id:   String,
+    pub report_body:    serde_json::Value,
+    pub schema_version: i32,
+}
+
 /// Input for inserting a research artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewResearchArtifact {

@@ -276,6 +276,56 @@ pub trait ResearchDb: Send + Sync {
         &self,
         objective_id: &str,
     ) -> Result<Vec<TaskRow>, ResearchDbError>;
+
+    // ── intelligence (Change Set G) ──────────────────────────────────────────
+
+    /// Return all accepted results for an objective, each with its full
+    /// verification records.
+    ///
+    /// Used by `AnalysisEngine` to compute the objective report.  Only results
+    /// with `result_status = 'accepted'` are returned; results still in
+    /// `'submitted'` or `'pending'` status are excluded.
+    async fn get_accepted_results_for_objective(
+        &self,
+        objective_id: &str,
+    ) -> Result<Vec<ExperimentResultRow>, ResearchDbError>;
+
+    /// Return aggregate statistics for an objective in a single query.
+    ///
+    /// Implementations should compute all counts atomically (e.g. via
+    /// `SELECT … GROUP BY` or CTEs) so there is no time-of-check vs.
+    /// time-of-use inconsistency between the individual counters.
+    async fn get_objective_stats(
+        &self,
+        objective_id: &str,
+    ) -> Result<ObjectiveStats, ResearchDbError>;
+
+    /// List findings for an objective whose `confidence >= min_confidence`.
+    ///
+    /// Findings with `confidence = NULL` are excluded.
+    /// Results are ordered by `confidence DESC, found_at DESC`.
+    async fn list_findings_with_confidence(
+        &self,
+        objective_id:   &str,
+        min_confidence: f64,
+    ) -> Result<Vec<ResearchFindingRow>, ResearchDbError>;
+
+    /// Upsert an intelligence report for an objective.
+    ///
+    /// If a report already exists for the objective, it is replaced in place
+    /// (the `report_body`, `generated_at`, and `schema_version` are updated).
+    async fn upsert_intelligence_report(
+        &self,
+        report: NewIntelligenceReport,
+    ) -> Result<IntelligenceReportRow, ResearchDbError>;
+
+    /// Fetch the most recently generated intelligence report for an objective.
+    ///
+    /// Returns `None` if no report has been generated yet.
+    async fn get_intelligence_report(
+        &self,
+        objective_id: &str,
+    ) -> Result<Option<IntelligenceReportRow>, ResearchDbError>;
 }
 
 // ── Provenance DTO ─────────────────────────────────────────────────────────────

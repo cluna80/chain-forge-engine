@@ -24,6 +24,7 @@ members = [
     "chain-forge-research-db",
     "chain-forge-scheduler",
     "chain-forge-verifier",
+    "chain-forge-intelligence",
     "chain-forge-wallet",
 ]
 

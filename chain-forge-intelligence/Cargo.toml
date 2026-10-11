@@ -1,0 +1,24 @@
+[package]
+name        = "chain-forge-intelligence"
+description = "QCB Discovery Engine — Research Intelligence & AI Analysis (Change Set G)"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+chain-forge-research-db = { path = "../chain-forge-research-db" }
+
+axum        = { version = "0.7", features = ["json"] }
+tower       = { version = "0.4" }
+tower-http  = { version = "0.5", features = ["trace"] }
+
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+async-trait = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
