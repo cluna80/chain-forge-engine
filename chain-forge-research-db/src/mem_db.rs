@@ -135,6 +135,9 @@ impl ResearchDb for MemResearchDb {
                 phase:              t.phase as i32,
                 parent_hash:        t.parent_hash,
                 phase1_miner_id:    t.phase1_miner_id,
+                task_kind:          t.task_kind,
+                avl_seed_index:     t.avl_seed_index.map(|v| v as i32),
+                avl_bit_index:      t.avl_bit_index.map(|v| v as i32),
                 created_at:         now(),
                 updated_at:         now(),
             };
@@ -233,6 +236,10 @@ impl ResearchDb for MemResearchDb {
             algorithm_version: r.algorithm_version,
             workload_version:  r.workload_version,
             seal_nonce:        r.seal_nonce.map(|n| n as i64),
+            avl_original_hash: r.avl_original_hash,
+            avl_flipped_hash:  r.avl_flipped_hash,
+            avl_xor_diff:      r.avl_xor_diff,
+            avl_hamming_dist:  r.avl_hamming_dist.map(|v| v as i32),
             submitted_at:      now(),
             updated_at:        now(),
         };
@@ -934,6 +941,9 @@ impl ResearchDb for MemResearchDb {
             phase:              2,
             parent_hash:        Some(parent_hash.to_string()),
             phase1_miner_id:    Some(phase1_miner_id.to_string()),
+            task_kind:          "pocd_phase2".to_string(),
+            avl_seed_index:     None,
+            avl_bit_index:      None,
             created_at:         now(),
             updated_at:         now(),
         };

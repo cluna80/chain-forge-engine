@@ -1,0 +1,26 @@
+[package]
+name        = "chain-forge-analyzer"
+description = "QCB avalanche experiment analyzer — fetches results, verifies independently, reports statistics"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[[bin]]
+name = "qcb-analyzer"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+sha2        = { workspace = true }
+hex         = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest     = { version = "0.12", features = ["json"] }
+clap        = { version = "4", features = ["derive", "env"] }
+urlencoding = "2"
+anyhow      = "1"
+chrono      = { workspace = true }

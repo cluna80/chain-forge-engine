@@ -63,6 +63,10 @@ impl From<&ResearchMicrotask> for NewTask {
             phase:           1,
             parent_hash:     None,
             phase1_miner_id: None,
+            // Bridge only converts PoCD tasks; avalanche fields are not set here.
+            task_kind:       "pocd_phase1".to_string(),
+            avl_seed_index:  None,
+            avl_bit_index:   None,
         }
     }
 }

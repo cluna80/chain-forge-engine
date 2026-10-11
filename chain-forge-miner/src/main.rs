@@ -147,65 +147,145 @@ async fn run(args: Args) -> Result<(), MinerError> {
             "Task assigned — starting work"
         );
 
-        // ── Dispatch to the correct phase solver ───────────────────────────────
+        // ── Dispatch to the correct solver ────────────────────────────────────
         //
-        // Phase 1: solve SHA-256(seed || nonce), ≥ 16 leading zero bits.
-        //          content_hash = SHA-256(H1)
+        // task_kind controls which code path:
         //
-        // Phase 2: solve SHA-256(H1 || nonce), ≥ 8 leading zero bits.
-        //          content_hash = SHA-256(H1 || H2)
-        //          parent_hash must be present (scheduler guarantees this).
-        let (task_id_clone, phase, parent_hash_clone, seed, start, end) = (
-            task.task_id.clone(),
-            task.phase,
-            task.parent_hash.clone(),
-            task.input_seed,
-            task.range_start,
-            task.range_end,
-        );
+        //   "avalanche_experiment" / "avalanche_replication":
+        //     Deterministic SHA-256 avalanche measurement — no nonce search.
+        //     canonical_seed = SHA-256("qcb-avalanche-v1" || objective_id || seed_index_le64)
+        //     Measures output-bit change when one input bit is flipped.
+        //
+        //   "pocd_phase1" (phase=1):
+        //     SHA-256(seed || nonce), ≥ 16 leading zero bits.
+        //     content_hash = SHA-256(H1)
+        //
+        //   "pocd_phase2" (phase=2):
+        //     SHA-256(H1 || nonce), ≥ 8 leading zero bits.
+        //     content_hash = SHA-256(H1 || H2)
+        //     parent_hash must be present (scheduler guarantees this).
+        let task_id_clone       = task.task_id.clone();
+        let task_kind_clone     = task.task_kind.clone();
+        let objective_id_clone  = task.objective_id.clone();
+        let phase               = task.phase;
+        let parent_hash_clone   = task.parent_hash.clone();
+        let seed                = task.input_seed;
+        let start               = task.range_start;
+        let end                 = task.range_end;
+        let avl_seed_index      = task.avl_seed_index;
+        let avl_bit_index       = task.avl_bit_index;
 
-        // Run the CPU-bound work in a blocking thread.
-        let result = tokio::task::spawn_blocking(move || {
-            match phase {
-                1 => {
-                    info!(task_id = %task_id_clone, "Phase-1 challenge: SHA-256(seed||nonce), 16-bit difficulty");
-                    challenge::solve_phase1(seed, start, end).map(|sol| (
-                        sol.nonce,
-                        sol.winning_hash,
-                        sol.content_hash,
-                        1u8,
-                    ))
+        // Enum to carry either a PoCD solution or an avalanche result back
+        // from the blocking thread without heap-allocating trait objects.
+        enum WorkResult {
+            PoCD {
+                nonce:        i64,
+                winning_hash: String,
+                content_hash: String,
+                phase:        u8,
+            },
+            Avalanche(challenge::AvalancheResult),
+            NoSolution,
+        }
+
+        let work_result = tokio::task::spawn_blocking(move || {
+            match task_kind_clone.as_str() {
+                "avalanche_experiment" | "avalanche_replication" => {
+                    let seed_idx = avl_seed_index
+                        .expect("avalanche task must have avl_seed_index") as u32;
+                    let bit_idx  = avl_bit_index
+                        .expect("avalanche task must have avl_bit_index") as u32;
+                    info!(
+                        task_id    = %task_id_clone,
+                        task_kind  = %task_kind_clone,
+                        seed_index = seed_idx,
+                        bit_index  = bit_idx,
+                        "Avalanche measurement: SHA-256 single-bit-flip"
+                    );
+                    let avl = challenge::solve_avalanche(&objective_id_clone, seed_idx, bit_idx);
+                    WorkResult::Avalanche(avl)
                 }
-                2 => {
-                    let parent = parent_hash_clone
-                        .expect("phase-2 task must have parent_hash");
-                    info!(task_id = %task_id_clone, "Phase-2 challenge: SHA-256(H1||nonce), 8-bit difficulty");
-                    challenge::solve_phase2(&parent, start, end).map(|sol| (
-                        sol.nonce,
-                        sol.winning_hash,
-                        sol.content_hash,
-                        2u8,
-                    ))
-                }
-                p => {
-                    warn!(task_id = %task_id_clone, phase = p, "Unknown phase — skipping task");
-                    None
+                _ => {
+                    // Default: PoCD phase dispatch
+                    match phase {
+                        1 => {
+                            info!(task_id = %task_id_clone, "Phase-1 challenge: SHA-256(seed||nonce), 16-bit difficulty");
+                            match challenge::solve_phase1(seed, start, end) {
+                                Some(sol) => WorkResult::PoCD {
+                                    nonce:        sol.nonce,
+                                    winning_hash: sol.winning_hash,
+                                    content_hash: sol.content_hash,
+                                    phase:        1,
+                                },
+                                None => WorkResult::NoSolution,
+                            }
+                        }
+                        2 => {
+                            let parent = parent_hash_clone
+                                .expect("phase-2 task must have parent_hash");
+                            info!(task_id = %task_id_clone, "Phase-2 challenge: SHA-256(H1||nonce), 8-bit difficulty");
+                            match challenge::solve_phase2(&parent, start, end) {
+                                Some(sol) => WorkResult::PoCD {
+                                    nonce:        sol.nonce,
+                                    winning_hash: sol.winning_hash,
+                                    content_hash: sol.content_hash,
+                                    phase:        2,
+                                },
+                                None => WorkResult::NoSolution,
+                            }
+                        }
+                        p => {
+                            warn!(task_id = %task_id_clone, phase = p, "Unknown phase — skipping task");
+                            WorkResult::NoSolution
+                        }
+                    }
                 }
             }
         })
         .await
         .map_err(|e| MinerError::Worker(e.to_string()))?;
 
-        match result {
-            Some((nonce, winning_hash, content_hash, solved_phase)) => {
+        let new_result_opt: Option<NewResult> = match work_result {
+            WorkResult::Avalanche(avl) => {
+                info!(
+                    task_id      = %task.task_id,
+                    task_kind    = %task.task_kind,
+                    hamming_dist = avl.hamming_dist,
+                    content_hash = %avl.content_hash,
+                    "Avalanche measurement complete — submitting"
+                );
+                let payload = serde_json::json!({
+                    "task_kind":       task.task_kind,
+                    "seed_index":      task.avl_seed_index,
+                    "bit_index":       task.avl_bit_index,
+                    "original_hash":   avl.original_hash,
+                    "flipped_hash":    avl.flipped_hash,
+                    "xor_diff":        avl.xor_diff,
+                    "hamming_dist":    avl.hamming_dist,
+                    "algorithm":       "sha256-avalanche-v1",
+                });
+                Some(NewResult {
+                    task_id:           task.task_id.clone(),
+                    miner_id:          args.miner_id.clone(),
+                    content_hash:      avl.content_hash.clone(),
+                    result_payload:    payload,
+                    algorithm_version: "sha256-avalanche-v1".to_string(),
+                    workload_version:  "avalanche-experiment-v1".to_string(),
+                    seal_nonce:        None,
+                    avl_original_hash: Some(avl.original_hash),
+                    avl_flipped_hash:  Some(avl.flipped_hash),
+                    avl_xor_diff:      Some(avl.xor_diff),
+                    avl_hamming_dist:  Some(avl.hamming_dist),
+                })
+            }
+            WorkResult::PoCD { nonce, winning_hash, content_hash, phase: solved_phase } => {
                 info!(
                     task_id       = %task.task_id,
                     phase         = solved_phase,
                     winning_nonce = nonce,
                     content_hash  = %content_hash,
-                    "Solution found — submitting"
+                    "PoCD solution found — submitting"
                 );
-
                 let payload = serde_json::json!({
                     "phase":        solved_phase,
                     "nonce":        nonce,
@@ -214,8 +294,7 @@ async fn run(args: Args) -> Result<(), MinerError> {
                     "range_end":    task.range_end,
                     "input_seed":   task.input_seed,
                 });
-
-                let new_result = NewResult {
+                Some(NewResult {
                     task_id:           task.task_id.clone(),
                     miner_id:          args.miner_id.clone(),
                     content_hash,
@@ -223,41 +302,48 @@ async fn run(args: Args) -> Result<(), MinerError> {
                     algorithm_version: args.algorithm_version.clone(),
                     workload_version:  args.workload_version.clone(),
                     seal_nonce:        Some(nonce as u64),
-                };
-
-                match client
-                    .submit_result(
-                        &task.task_id,
-                        &args.miner_id,
-                        task.lease_generation,
-                        new_result,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        tasks_completed += 1;
-                        info!(
-                            task_id         = %task.task_id,
-                            phase           = solved_phase,
-                            tasks_completed,
-                            "Result accepted by scheduler"
-                        );
-                    }
-                    Err(MinerError::LeaseExpired(msg)) => {
-                        warn!(task_id = %task.task_id, reason = %msg, "Lease expired — dropping result");
-                    }
-                    Err(MinerError::LeaseSuperseded(msg)) => {
-                        warn!(task_id = %task.task_id, reason = %msg, "Lease superseded — dropping result");
-                    }
-                    Err(e) => return Err(e),
-                }
+                    avl_original_hash: None,
+                    avl_flipped_hash:  None,
+                    avl_xor_diff:      None,
+                    avl_hamming_dist:  None,
+                })
             }
-            None => {
+            WorkResult::NoSolution => {
                 warn!(
                     task_id = %task.task_id,
                     phase   = task.phase,
                     "No solution found in range — task will expire naturally"
                 );
+                None
+            }
+        };
+
+        if let Some(new_result) = new_result_opt {
+            match client
+                .submit_result(
+                    &task.task_id,
+                    &args.miner_id,
+                    task.lease_generation,
+                    new_result,
+                )
+                .await
+            {
+                Ok(()) => {
+                    tasks_completed += 1;
+                    info!(
+                        task_id         = %task.task_id,
+                        task_kind       = %task.task_kind,
+                        tasks_completed,
+                        "Result accepted by scheduler"
+                    );
+                }
+                Err(MinerError::LeaseExpired(msg)) => {
+                    warn!(task_id = %task.task_id, reason = %msg, "Lease expired — dropping result");
+                }
+                Err(MinerError::LeaseSuperseded(msg)) => {
+                    warn!(task_id = %task.task_id, reason = %msg, "Lease superseded — dropping result");
+                }
+                Err(e) => return Err(e),
             }
         }
     }

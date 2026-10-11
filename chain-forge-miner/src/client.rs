@@ -27,9 +27,18 @@ pub struct TaskAssignment {
     /// Phase-2 only: hex-encoded SHA-256 output from the phase-1 winner that
     /// seeds this task's search.  `None` for phase-1 tasks.
     pub parent_hash:      Option<String>,
+    /// Task kind discriminator — "pocd_phase1" | "pocd_phase2" |
+    /// "avalanche_experiment" | "avalanche_replication".
+    #[serde(default = "default_task_kind")]
+    pub task_kind:        String,
+    /// Avalanche tasks only: which canonical seed index (0..9).
+    pub avl_seed_index:   Option<i32>,
+    /// Avalanche tasks only: which input bit position to flip (0..255).
+    pub avl_bit_index:    Option<i32>,
 }
 
 fn default_phase() -> i32 { 1 }
+fn default_task_kind() -> String { "pocd_phase1".to_string() }
 
 /// The result payload sent to the scheduler.
 #[derive(Debug, Serialize)]
@@ -41,6 +50,11 @@ pub struct NewResult {
     pub algorithm_version: String,
     pub workload_version:  String,
     pub seal_nonce:        Option<u64>,
+    // Avalanche-specific result fields (None for PoCD tasks)
+    pub avl_original_hash: Option<String>,
+    pub avl_flipped_hash:  Option<String>,
+    pub avl_xor_diff:      Option<String>,
+    pub avl_hamming_dist:  Option<u32>,
 }
 
 /// Body for POST /scheduler/tasks/:id/result
@@ -61,6 +75,10 @@ struct SubmitResultInner {
     algorithm_version: String,
     workload_version:  String,
     seal_nonce:        Option<u64>,
+    avl_original_hash: Option<String>,
+    avl_flipped_hash:  Option<String>,
+    avl_xor_diff:      Option<String>,
+    avl_hamming_dist:  Option<u32>,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -186,6 +204,10 @@ impl SchedulerClient {
                 algorithm_version: result.algorithm_version,
                 workload_version:  result.workload_version,
                 seal_nonce:        result.seal_nonce,
+                avl_original_hash: result.avl_original_hash,
+                avl_flipped_hash:  result.avl_flipped_hash,
+                avl_xor_diff:      result.avl_xor_diff,
+                avl_hamming_dist:  result.avl_hamming_dist,
             },
         };
 

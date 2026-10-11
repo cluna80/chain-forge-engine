@@ -146,8 +146,9 @@ impl ResearchDb for PgResearchDb {
                 r#"
                 INSERT INTO research_tasks
                     (task_id, objective_id, range_start, range_end,
-                     workload_class, input_seed)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                     workload_class, input_seed, phase, parent_hash,
+                     phase1_miner_id, task_kind, avl_seed_index, avl_bit_index)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 ON CONFLICT (task_id) DO NOTHING
                 "#,
             )
@@ -157,6 +158,12 @@ impl ResearchDb for PgResearchDb {
             .bind(t.range_end as i64)
             .bind(&t.workload_class)
             .bind(t.input_seed as i64)
+            .bind(t.phase as i32)
+            .bind(&t.parent_hash)
+            .bind(&t.phase1_miner_id)
+            .bind(&t.task_kind)
+            .bind(t.avl_seed_index.map(|v| v as i32))
+            .bind(t.avl_bit_index.map(|v| v as i32))
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -248,8 +255,9 @@ impl ResearchDb for PgResearchDb {
             r#"
             INSERT INTO experiment_results
                 (task_id, receipt_id, miner_id, content_hash,
-                 result_payload, algorithm_version, workload_version, seal_nonce)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 result_payload, algorithm_version, workload_version, seal_nonce,
+                 avl_original_hash, avl_flipped_hash, avl_xor_diff, avl_hamming_dist)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING *
             "#,
         )
@@ -261,6 +269,10 @@ impl ResearchDb for PgResearchDb {
         .bind(&r.algorithm_version)
         .bind(&r.workload_version)
         .bind(r.seal_nonce.map(|n| n as i64))
+        .bind(&r.avl_original_hash)
+        .bind(&r.avl_flipped_hash)
+        .bind(&r.avl_xor_diff)
+        .bind(r.avl_hamming_dist.map(|v| v as i32))
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -637,9 +649,11 @@ impl ResearchDb for PgResearchDb {
             INSERT INTO research_tasks
                 (task_id, objective_id, range_start, range_end, workload_class,
                  input_seed, status, phase, parent_hash, phase1_miner_id,
+                 task_kind, avl_seed_index, avl_bit_index,
                  lease_generation, attempt_count, created_at, updated_at)
             VALUES
                 ($1, $2, 0, $3, $4, $5, 'available', 2, $6, $7,
+                 'pocd_phase2', NULL, NULL,
                  0, 0, now(), now())
             ON CONFLICT (task_id) DO UPDATE
                 SET updated_at = now()

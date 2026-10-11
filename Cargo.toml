@@ -28,6 +28,7 @@ members = [
     "chain-forge-miner",
     "chain-forge-seed",
     "chain-forge-wallet",
+    "chain-forge-analyzer",
 ]
 
 [workspace.package]
