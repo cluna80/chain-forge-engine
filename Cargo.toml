@@ -26,6 +26,7 @@ members = [
     "chain-forge-verifier",
     "chain-forge-intelligence",
     "chain-forge-miner",
+    "chain-forge-seed",
     "chain-forge-wallet",
 ]
 

@@ -1,0 +1,29 @@
+[package]
+name            = "chain-forge-seed"
+description     = "QCB devnet seed tool — creates research objectives and tasks for 3-machine miner tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "qcb-seed"
+path = "src/main.rs"
+
+[dependencies]
+chain-forge-research-db = { path = "../chain-forge-research-db" }
+
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+sha2        = { workspace = true }
+sha3        = { workspace = true }
+hex         = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+
+clap               = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
