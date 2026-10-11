@@ -4456,7 +4456,7 @@ impl Executor {
                     state.upsert_account(ta);
                 }
                 if let Ok(acct) = state.get_account_mut(treasury) {
-                    acct.debit("uqcb", *amount_uqcb as u128);
+                    let _ = acct.debit("uqcb", *amount_uqcb as u128);
                 }
                 state.refresh_leaf(treasury);
 
@@ -5090,6 +5090,7 @@ mod tests {
             hash_width:      HashWidth::Bits256,
             require_signatures: false,
             modules:         EnabledModules::all(),
+            settlement_operators: vec![],
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();

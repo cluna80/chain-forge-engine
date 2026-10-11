@@ -360,6 +360,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::AcceptJob { .. }                => "accept_job",
         TxBody::CompleteJob { .. }              => "complete_job",
         TxBody::VerifyJob { .. }                => "verify_job",
+        // PoCD Research Reward Settlement (Change Set L)
+        TxBody::ClaimResearchReward { .. }      => "claim_research_reward",
     }
 }
 
@@ -677,6 +679,18 @@ impl Node {
             info!(coordinator = %coord, "attestation coordinator configured from genesis");
         } else {
             info!("no attestation_coordinator in genesis — ConfirmSybil/ReverseSybil disabled until set");
+        }
+
+        // Change Set L: settlement operators for ClaimResearchReward.
+        // Analogous to attestation_coordinator; authorization enforced in ExecutionConfig.
+        if genesis.settlement_operators.is_empty() {
+            info!("no settlement_operators in genesis — ClaimResearchReward disabled until configured");
+        } else {
+            info!(
+                operators = ?genesis.settlement_operators,
+                "settlement operators configured from genesis ({} address(es))",
+                genesis.settlement_operators.len()
+            );
         }
 
         let qrc   = QrcEngine::new(chain_forge_qrc::D);
