@@ -88,6 +88,13 @@ pub struct TaskAssignmentResponse {
     pub phase:            i32,
     /// Phase-2 only: hex-encoded phase-1 winning hash that seeds this task.
     pub parent_hash:      Option<String>,
+    /// Task kind discriminator: "pocd_phase1" | "pocd_phase2" |
+    /// "avalanche_experiment" | "avalanche_replication".
+    pub task_kind:        String,
+    /// Avalanche tasks only: which of the 10 canonical seeds (0..9).
+    pub avl_seed_index:   Option<i32>,
+    /// Avalanche tasks only: which input bit position is flipped (0..255).
+    pub avl_bit_index:    Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +178,9 @@ async fn get_task_for_miner(
                 lease_generation: row.lease_generation,
                 phase:            row.phase,
                 parent_hash:      row.parent_hash,
+                task_kind:        row.task_kind,
+                avl_seed_index:   row.avl_seed_index,
+                avl_bit_index:    row.avl_bit_index,
             };
             (StatusCode::OK, Json(resp)).into_response()
         }
