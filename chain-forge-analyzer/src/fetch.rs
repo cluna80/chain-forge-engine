@@ -13,6 +13,7 @@ pub struct SettledResult {
     /// Which miner submitted this result
     pub miner_id:         String,
     /// Task kind: "avalanche_experiment" | "avalanche_replication" | "pocd_phase1" | "pocd_phase2"
+    #[serde(default = "default_task_kind")]
     pub task_kind:        String,
     /// Seed index (0..9) — present for avalanche results
     pub avl_seed_index:   Option<u32>,
@@ -31,6 +32,8 @@ pub struct SettledResult {
     /// Receiving timestamp
     pub submitted_at:     Option<String>,
 }
+
+fn default_task_kind() -> String { "avalanche_experiment".to_string() }
 
 // ── Client ────────────────────────────────────────────────────────────────────
 
