@@ -1,0 +1,17 @@
+[package]
+name        = "chain-forge-keygen"
+description = "QCB key generation utility — generates ML-DSA-65 and Ed25519 keypairs"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[[bin]]
+name = "qcb-keygen"
+path = "src/main.rs"
+
+[dependencies]
+chain-forge-crypto = { path = "../chain-forge-crypto", features = ["real-pqc", "real-crypto"] }
+serde_json = { workspace = true }
+hex        = { workspace = true }

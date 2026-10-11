@@ -27,6 +27,7 @@ members = [
     "chain-forge-intelligence",
     "chain-forge-miner",
     "chain-forge-verifier-bin",
+    "chain-forge-keygen",
     "chain-forge-seed",
     "chain-forge-wallet",
     "chain-forge-analyzer",
