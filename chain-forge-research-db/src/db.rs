@@ -179,19 +179,42 @@ pub trait ResearchDb: Send + Sync {
     /// workload class to a miner, returning the full `TaskRow` (including the
     /// new `lease_generation` the miner must present on submission).
     ///
-    /// Uses `SELECT … FOR UPDATE SKIP LOCKED` + `UPDATE` inside a single
-    /// implicit database transaction, so two concurrent scheduler instances
-    /// can never assign the same row.
+    /// `exclude_miner` — when `Some`, skip any task whose `phase1_miner_id`
+    /// matches this value.  Used by the scheduler to enforce the two-phase
+    /// different-miner rule: a miner that completed phase-1 of a task cannot
+    /// be assigned the resulting phase-2 task.
     ///
-    /// Returns `None` when no task with `status = 'available'` exists for
-    /// that objective / workload combination.
+    /// Returns `None` when no eligible task exists.
     async fn assign_task(
         &self,
         objective_id:     &str,
         workload_class:   &str,
         miner_id:         &str,
         lease_expires_at: DateTime<Utc>,
+        exclude_miner:    Option<&str>,
     ) -> Result<Option<TaskRow>, ResearchDbError>;
+
+    // ── two-phase cascade (Change Set J) ────────────────────────────────────
+
+    /// Spawn a phase-2 task derived from a completed phase-1 result.
+    ///
+    /// Called by the scheduler immediately after a phase-1 result is
+    /// submitted.  The new task:
+    /// - has `phase = 2`
+    /// - uses `parent_hash` (hex-encoded phase-1 winning hash) as its seed
+    ///   (the bytes of the hash XOR-folded into an i64)
+    /// - records `phase1_miner_id` so the scheduler can block that miner
+    ///   from picking up the derived task
+    ///
+    /// Returns the newly created `TaskRow`.  If a phase-2 task already exists
+    /// for this parent task (idempotent replay), returns the existing row.
+    async fn spawn_phase2_task(
+        &self,
+        parent_task_id:  &str,
+        parent_hash:     &str,
+        phase1_miner_id: &str,
+        range_per_task:  u64,
+    ) -> Result<TaskRow, ResearchDbError>;
 
     /// Transition a task from `'assigned'` to `'submitted'`.
     ///

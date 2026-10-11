@@ -545,25 +545,26 @@ impl ResearchDb for PgResearchDb {
         workload_class:   &str,
         miner_id:         &str,
         lease_expires_at: DateTime<Utc>,
+        exclude_miner:    Option<&str>,
     ) -> Result<Option<TaskRow>, ResearchDbError> {
         debug!(
             objective_id, workload_class, miner_id,
             lease_expires_at = %lease_expires_at,
+            ?exclude_miner,
             "assign_task: selecting next available row"
         );
 
-        // CTE selects the lowest range_start available task; UPDATE fires
-        // atomically in the same implicit transaction.  SKIP LOCKED ensures
-        // a concurrent scheduler instance picks a different row instead of
-        // blocking, preventing double-assignment.
+        // CTE selects the lowest range_start available task that doesn't
+        // belong to the excluded miner (two-phase rule).
         let row = sqlx::query_as::<_, TaskRow>(
             r#"
             WITH candidate AS (
                 SELECT task_id
                 FROM   research_tasks
-                WHERE  objective_id   = $1
-                  AND  workload_class = $2
-                  AND  status         = 'available'
+                WHERE  objective_id      = $1
+                  AND  workload_class    = $2
+                  AND  status            = 'available'
+                  AND  (phase1_miner_id IS NULL OR phase1_miner_id <> $5)
                 ORDER  BY range_start
                 LIMIT  1
                 FOR    UPDATE SKIP LOCKED
@@ -584,18 +585,76 @@ impl ResearchDb for PgResearchDb {
         .bind(workload_class)
         .bind(miner_id)
         .bind(lease_expires_at)
+        .bind(exclude_miner.unwrap_or("__no_exclusion__"))
         .fetch_optional(&self.pool)
         .await?;
 
         if let Some(ref t) = row {
             debug!(
                 task_id = %t.task_id,
+                phase = t.phase,
                 lease_generation = t.lease_generation,
                 "assign_task: assigned"
             );
         } else {
             debug!(objective_id, workload_class, "assign_task: no available task");
         }
+
+        Ok(row)
+    }
+
+    async fn spawn_phase2_task(
+        &self,
+        parent_task_id:  &str,
+        parent_hash:     &str,
+        phase1_miner_id: &str,
+        range_per_task:  u64,
+    ) -> Result<TaskRow, ResearchDbError> {
+        // Derive deterministic seed from first 8 bytes of parent hash.
+        let hash_bytes = hex::decode(&parent_hash[..parent_hash.len().min(16)])
+            .unwrap_or_else(|_| vec![0u8; 8]);
+        let mut seed_bytes = [0u8; 8];
+        let copy_len = hash_bytes.len().min(8);
+        seed_bytes[..copy_len].copy_from_slice(&hash_bytes[..copy_len]);
+        let input_seed = i64::from_le_bytes(seed_bytes);
+
+        let task_id = format!("phase2-{parent_task_id}");
+
+        // Fetch objective/workload from the parent task.
+        #[derive(sqlx::FromRow)]
+        struct ParentMeta { objective_id: String, workload_class: String }
+        let meta = sqlx::query_as::<_, ParentMeta>(
+            "SELECT objective_id, workload_class FROM research_tasks WHERE task_id = $1"
+        )
+        .bind(parent_task_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| ResearchDbError::NotFound(format!("parent_task_id={parent_task_id}")))?;
+
+        // Upsert — if the phase-2 task already exists return it (idempotent).
+        let row = sqlx::query_as::<_, TaskRow>(
+            r#"
+            INSERT INTO research_tasks
+                (task_id, objective_id, range_start, range_end, workload_class,
+                 input_seed, status, phase, parent_hash, phase1_miner_id,
+                 lease_generation, attempt_count, created_at, updated_at)
+            VALUES
+                ($1, $2, 0, $3, $4, $5, 'available', 2, $6, $7,
+                 0, 0, now(), now())
+            ON CONFLICT (task_id) DO UPDATE
+                SET updated_at = now()
+            RETURNING *
+            "#,
+        )
+        .bind(&task_id)
+        .bind(&meta.objective_id)
+        .bind(range_per_task as i64)
+        .bind(&meta.workload_class)
+        .bind(input_seed)
+        .bind(parent_hash)
+        .bind(phase1_miner_id)
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(row)
     }

@@ -1,83 +1,136 @@
-//! Cryptographic challenge solver (PoCD work unit).
+//! Cryptographic challenge solver — two-phase PoCD cascade.
 //!
-//! ## Challenge definition
+//! ## Phase 1
 //!
-//! Given an `input_seed` (i64) and a search range `[range_start, range_end)`,
-//! find a nonce N in that range such that:
+//!   SHA-256(seed_bytes || nonce_bytes) must have ≥ PHASE1_DIFFICULTY_BITS leading zero bits.
 //!
-//!   SHA-256(seed_bytes || nonce_bytes)  has at least DIFFICULTY_BITS leading zero bits
+//!   seed_bytes  = input_seed as little-endian i64 (8 bytes)
+//!   nonce_bytes = nonce as little-endian i64 (8 bytes)
 //!
-//! where `seed_bytes` = seed as little-endian i64 (8 bytes)
-//! and   `nonce_bytes` = N as little-endian i64 (8 bytes).
+//! ## Phase 2
 //!
-//! This matches the challenge spec seeded by `qcb-seed` (`algorithm: sha256-preimage-v1`).
+//!   SHA-256(parent_hash_bytes || nonce_bytes) must have ≥ PHASE2_DIFFICULTY_BITS leading zero bits.
 //!
-//! ## Result
+//!   parent_hash_bytes = 32 raw bytes decoded from the hex parent_hash string
+//!   nonce_bytes       = nonce as little-endian i64 (8 bytes)
 //!
-//! `content_hash` — hex-encoded SHA-256 of the winning hash bytes.
-//! This lets any verifier re-derive it: hash the same seed+nonce,
-//! compare the result, then hash *that* to reproduce content_hash.
+//! ## Content hash
+//!
+//!   Phase 1: content_hash = SHA-256(H1_bytes)
+//!   Phase 2: content_hash = SHA-256(H1_bytes || H2_bytes)
+//!              where H1_bytes = hex::decode(parent_hash) passed in from the task
+//!
+//! The content_hash is what multiple miners must independently reproduce for
+//! the quorum check to pass.  Any verifier can re-derive it from the nonce alone.
 //!
 //! ## Difficulty
 //!
-//! Currently set to DIFFICULTY_BITS = 16 (two leading zero bytes), matching
-//! the `qcb-seed` default. Increase to raise difficulty; decrease for faster tests.
+//! Phase 1: 16 leading zero bits (2 zero bytes) — real work, ~65k hashes avg
+//! Phase 2:  8 leading zero bits (1 zero byte)  — lighter, chained on H1
 
 use sha2::{Digest, Sha256};
 
-/// Difficulty: how many leading zero BITS the hash must have.
-/// 16 = 2 leading zero bytes, matching the seeded challenge default.
-const DIFFICULTY_BITS: u32 = 16;
+/// Phase-1 difficulty: leading zero bits the first hash must have.
+const PHASE1_DIFFICULTY_BITS: u32 = 16;
 
-/// A found solution.
-pub struct Solution {
-    /// The winning nonce value.
-    pub nonce: i64,
-    /// Hex-encoded winning hash (the raw SHA-256 output).
+/// Phase-2 difficulty: leading zero bits the second hash must have.
+/// Lighter than phase-1 because it already depends on phase-1 work.
+const PHASE2_DIFFICULTY_BITS: u32 = 8;
+
+// ── Solution types ────────────────────────────────────────────────────────────
+
+/// A found phase-1 solution.
+#[derive(Debug, Clone)]
+pub struct Phase1Solution {
+    pub nonce:        i64,
+    /// Hex-encoded raw SHA-256 output (H1).
     pub winning_hash: String,
-    /// Hex-encoded SHA-256 of the winning hash — this is the content_hash
-    /// submitted to the scheduler so verifiers can deterministically reproduce it.
+    /// Hex-encoded SHA-256(H1) — submitted as content_hash.
     pub content_hash: String,
 }
 
-/// Search [range_start, range_end) for a nonce that satisfies the challenge.
+/// A found phase-2 solution.
+#[derive(Debug, Clone)]
+pub struct Phase2Solution {
+    pub nonce:        i64,
+    /// Hex-encoded raw SHA-256(parent_hash_bytes || nonce) output (H2).
+    pub winning_hash: String,
+    /// Hex-encoded SHA-256(H1_bytes || H2_bytes) — the combined proof.
+    pub content_hash: String,
+}
+
+// ── Solvers ───────────────────────────────────────────────────────────────────
+
+/// Search `[range_start, range_end)` for a phase-1 nonce.
 ///
-/// Returns `Some(Solution)` on success, `None` if no nonce in the range works.
-/// This is CPU-bound and should be called from `spawn_blocking`.
-pub fn solve(seed: i64, range_start: i64, range_end: i64) -> Option<Solution> {
+/// CPU-bound; call from `spawn_blocking`.
+pub fn solve_phase1(seed: i64, range_start: i64, range_end: i64) -> Option<Phase1Solution> {
     let seed_bytes = seed.to_le_bytes();
 
     for nonce in range_start..range_end {
         let nonce_bytes = nonce.to_le_bytes();
 
-        // SHA-256(seed || nonce)
-        let mut hasher = Sha256::new();
-        hasher.update(seed_bytes);
-        hasher.update(nonce_bytes);
-        let hash_bytes = hasher.finalize();
+        let mut h = Sha256::new();
+        h.update(seed_bytes);
+        h.update(nonce_bytes);
+        let hash_bytes = h.finalize();
 
-        // Check difficulty (leading zero bits)
-        if leading_zero_bits(&hash_bytes) >= DIFFICULTY_BITS {
+        if leading_zero_bits(&hash_bytes) >= PHASE1_DIFFICULTY_BITS {
             let winning_hash = hex::encode(&hash_bytes);
 
-            // content_hash = SHA-256(winning_hash_bytes)
+            // content_hash = SHA-256(H1)
             let mut h2 = Sha256::new();
             h2.update(&hash_bytes);
             let content_hash = hex::encode(h2.finalize());
 
-            return Some(Solution {
-                nonce,
-                winning_hash,
-                content_hash,
-            });
+            return Some(Phase1Solution { nonce, winning_hash, content_hash });
         }
     }
-
     None
 }
 
+/// Search `[range_start, range_end)` for a phase-2 nonce.
+///
+/// `parent_hash_hex` is the hex-encoded H1 from the phase-1 winner.
+/// CPU-bound; call from `spawn_blocking`.
+pub fn solve_phase2(
+    parent_hash_hex: &str,
+    range_start:     i64,
+    range_end:       i64,
+) -> Option<Phase2Solution> {
+    // Decode the phase-1 hash bytes — these are the prefix for every hash attempt.
+    let h1_bytes = match hex::decode(parent_hash_hex) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+
+    for nonce in range_start..range_end {
+        let nonce_bytes = nonce.to_le_bytes();
+
+        let mut h = Sha256::new();
+        h.update(&h1_bytes);
+        h.update(nonce_bytes);
+        let h2_bytes = h.finalize();
+
+        if leading_zero_bits(&h2_bytes) >= PHASE2_DIFFICULTY_BITS {
+            let winning_hash = hex::encode(&h2_bytes);
+
+            // content_hash = SHA-256(H1 || H2) — the combined two-machine proof
+            let mut hc = Sha256::new();
+            hc.update(&h1_bytes);
+            hc.update(&h2_bytes);
+            let content_hash = hex::encode(hc.finalize());
+
+            return Some(Phase2Solution { nonce, winning_hash, content_hash });
+        }
+    }
+    None
+}
+
+// ── Helper ────────────────────────────────────────────────────────────────────
+
 /// Count the number of leading zero bits in a byte slice.
-fn leading_zero_bits(bytes: &[u8]) -> u32 {
+pub fn leading_zero_bits(bytes: &[u8]) -> u32 {
     let mut count = 0u32;
     for &b in bytes {
         if b == 0 {
@@ -96,49 +149,83 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn solve_finds_a_solution_in_wide_range() {
-        // With difficulty=16 bits, expect a hit within ~65536 nonces on average.
-        let sol = solve(42, 0, 5_000_000);
-        assert!(sol.is_some(), "expected a solution within 5M nonces at difficulty 16 bits");
-        let sol = sol.unwrap();
+    // ── Phase 1 ──────────────────────────────────────────────────────────────
 
-        // Verify the winning hash ourselves
-        let seed_bytes = 42i64.to_le_bytes();
+    #[test]
+    fn phase1_finds_solution() {
+        let sol = solve_phase1(31415926535897932i64, 0, 5_000_000)
+            .expect("solution in 5M nonces at 16 bits");
+
+        // Re-verify the winning hash
+        let seed_bytes = 31415926535897932i64.to_le_bytes();
         let nonce_bytes = sol.nonce.to_le_bytes();
         let mut h = Sha256::new();
         h.update(seed_bytes);
         h.update(nonce_bytes);
         let expected = h.finalize();
         assert_eq!(hex::encode(&expected), sol.winning_hash);
-        assert!(leading_zero_bits(&expected) >= DIFFICULTY_BITS, "must have 16 leading zero bits");
+        assert!(leading_zero_bits(&expected) >= PHASE1_DIFFICULTY_BITS);
 
-        // Verify content_hash is SHA-256(winning_hash_bytes)
+        // Re-verify content_hash = SHA-256(H1)
         let mut h2 = Sha256::new();
         h2.update(&expected);
         assert_eq!(hex::encode(h2.finalize()), sol.content_hash);
     }
 
     #[test]
-    fn solve_returns_none_on_empty_range() {
-        assert!(solve(42, 5, 5).is_none());
+    fn phase1_none_on_empty_range() {
+        assert!(solve_phase1(42, 5, 5).is_none());
     }
 
     #[test]
-    fn solve_returns_none_on_tiny_range_with_no_solution() {
-        // A single nonce is astronomically unlikely to satisfy 16-bit difficulty.
-        let result = solve(999_999_999, 0, 1);
-        // Just confirm it doesn't panic; likely None.
-        let _ = result;
+    fn phase1_deterministic() {
+        let s1 = solve_phase1(7, 0, 5_000_000).unwrap();
+        let s2 = solve_phase1(7, 0, 5_000_000).unwrap();
+        assert_eq!(s1.nonce, s2.nonce);
+        assert_eq!(s1.content_hash, s2.content_hash);
+    }
+
+    // ── Phase 2 ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn phase2_finds_solution_from_phase1_hash() {
+        // First get a real phase-1 hash to use as parent
+        let p1 = solve_phase1(31415926535897932i64, 0, 5_000_000).unwrap();
+
+        // Phase-2 should find a solution quickly (8-bit difficulty)
+        let sol = solve_phase2(&p1.winning_hash, 0, 500_000)
+            .expect("phase-2 solution in 500k nonces at 8 bits");
+
+        // Re-verify H2
+        let h1_bytes = hex::decode(&p1.winning_hash).unwrap();
+        let nonce_bytes = sol.nonce.to_le_bytes();
+        let mut h = Sha256::new();
+        h.update(&h1_bytes);
+        h.update(nonce_bytes);
+        let h2_bytes = h.finalize();
+        assert_eq!(hex::encode(&h2_bytes), sol.winning_hash);
+        assert!(leading_zero_bits(&h2_bytes) >= PHASE2_DIFFICULTY_BITS);
+
+        // Re-verify combined content_hash = SHA-256(H1 || H2)
+        let mut hc = Sha256::new();
+        hc.update(&h1_bytes);
+        hc.update(&h2_bytes);
+        assert_eq!(hex::encode(hc.finalize()), sol.content_hash);
     }
 
     #[test]
-    fn two_miners_same_task_produce_same_content_hash() {
-        // Determinism check: both miners searching the same range with same seed
-        // must agree on the solution (and therefore the content_hash).
-        let sol1 = solve(31415926535897932i64, 0, 5_000_000).expect("solution expected");
-        let sol2 = solve(31415926535897932i64, 0, 5_000_000).expect("solution expected");
-        assert_eq!(sol1.nonce, sol2.nonce);
-        assert_eq!(sol1.content_hash, sol2.content_hash);
+    fn phase2_different_miners_same_content_hash() {
+        // Two miners solving the same phase-2 task must agree on content_hash
+        let p1 = solve_phase1(42, 0, 5_000_000).unwrap();
+        let sol_a = solve_phase2(&p1.winning_hash, 0, 500_000).unwrap();
+        let sol_b = solve_phase2(&p1.winning_hash, 0, 500_000).unwrap();
+        assert_eq!(sol_a.nonce, sol_b.nonce);
+        assert_eq!(sol_a.content_hash, sol_b.content_hash);
+    }
+
+    #[test]
+    fn phase2_invalid_parent_hash_returns_none() {
+        // Bad hex → returns None gracefully
+        assert!(solve_phase2("not_hex!!", 0, 100).is_none());
     }
 }

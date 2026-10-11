@@ -132,6 +132,9 @@ impl ResearchDb for MemResearchDb {
                 lease_expires_at:   None,
                 lease_generation:   0,
                 attempt_count:      0,
+                phase:              t.phase as i32,
+                parent_hash:        t.parent_hash,
+                phase1_miner_id:    t.phase1_miner_id,
                 created_at:         now(),
                 updated_at:         now(),
             };
@@ -483,13 +486,12 @@ impl ResearchDb for MemResearchDb {
         workload_class:   &str,
         miner_id:         &str,
         lease_expires_at: DateTime<Utc>,
+        exclude_miner:    Option<&str>,
     ) -> Result<Option<TaskRow>, ResearchDbError> {
         let mut s = self.state.lock().unwrap();
 
         // Find the available task with the smallest range_start.
-        // Mimics the PostgreSQL `ORDER BY range_start LIMIT 1` selection.
-        // The in-memory version cannot use `SKIP LOCKED`, but a real
-        // concurrent-scheduler test should use `PgResearchDb`.
+        // Skip tasks whose phase1_miner_id matches exclude_miner (two-phase rule).
         let task_id = s
             .tasks
             .values()
@@ -497,6 +499,9 @@ impl ResearchDb for MemResearchDb {
                 t.objective_id   == objective_id
                     && t.workload_class == workload_class
                     && t.status         == "available"
+                    && exclude_miner.map_or(true, |em| {
+                        t.phase1_miner_id.as_deref() != Some(em)
+                    })
             })
             .min_by_key(|t| t.range_start)
             .map(|t| t.task_id.clone());
@@ -869,6 +874,72 @@ impl ResearchDb for MemResearchDb {
             .values()
             .find(|r| r.objective_id == objective_id)
             .cloned();
+        Ok(row)
+    }
+
+    // ── two-phase cascade (Change Set J) ────────────────────────────────────
+
+    async fn spawn_phase2_task(
+        &self,
+        parent_task_id:  &str,
+        parent_hash:     &str,
+        phase1_miner_id: &str,
+        range_per_task:  u64,
+    ) -> Result<TaskRow, ResearchDbError> {
+        let (objective_id, workload_class) = {
+            let s = self.state.lock().unwrap();
+            let parent = s
+                .tasks
+                .get(parent_task_id)
+                .ok_or_else(|| ResearchDbError::NotFound(format!("parent_task_id={parent_task_id}")))?;
+            (parent.objective_id.clone(), parent.workload_class.clone())
+        };
+
+        // Idempotency: if a phase-2 task already exists for this parent, return it.
+        {
+            let s = self.state.lock().unwrap();
+            if let Some(existing) = s.tasks.values().find(|t| {
+                t.objective_id == objective_id
+                    && t.phase == 2
+                    && t.parent_hash.as_deref() == Some(parent_hash)
+            }) {
+                return Ok(existing.clone());
+            }
+        }
+
+        // Derive a deterministic i64 seed from the parent hash bytes.
+        // Take the first 8 bytes of the hash (decoded from hex) and read as LE i64.
+        let hash_bytes = hex::decode(&parent_hash[..parent_hash.len().min(16)])
+            .unwrap_or_else(|_| vec![0u8; 8]);
+        let mut seed_bytes = [0u8; 8];
+        let copy_len = hash_bytes.len().min(8);
+        seed_bytes[..copy_len].copy_from_slice(&hash_bytes[..copy_len]);
+        let input_seed = i64::from_le_bytes(seed_bytes);
+
+        let task_id = format!("phase2-{parent_task_id}");
+
+        let row = TaskRow {
+            task_id:            task_id.clone(),
+            objective_id,
+            range_start:        0,
+            range_end:          range_per_task as i64,
+            workload_class,
+            input_seed,
+            status:             "available".to_string(),
+            assigned_to:        None,
+            settled_receipt_id: None,
+            lease_expires_at:   None,
+            lease_generation:   0,
+            attempt_count:      0,
+            phase:              2,
+            parent_hash:        Some(parent_hash.to_string()),
+            phase1_miner_id:    Some(phase1_miner_id.to_string()),
+            created_at:         now(),
+            updated_at:         now(),
+        };
+
+        let mut s = self.state.lock().unwrap();
+        s.tasks.insert(task_id, row.clone());
         Ok(row)
     }
 }
