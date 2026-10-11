@@ -240,8 +240,9 @@ impl ResearchDb for MemResearchDb {
             avl_flipped_hash:  r.avl_flipped_hash,
             avl_xor_diff:      r.avl_xor_diff,
             avl_hamming_dist:  r.avl_hamming_dist.map(|v| v as i32),
-            // avl_seed_index and avl_bit_index are populated at read time
-            // from the parent task row; stored as None here.
+            // task_kind, avl_seed_index, avl_bit_index are populated at read
+            // time from the parent task row; stored as defaults here.
+            task_kind:         String::new(),
             avl_seed_index:    None,
             avl_bit_index:     None,
             submitted_at:      now(),
@@ -703,12 +704,12 @@ impl ResearchDb for MemResearchDb {
         offset:       usize,
     ) -> Result<Vec<ExperimentResultRow>, ResearchDbError> {
         let s = self.state.lock().unwrap();
-        // Build a map of task_id → (avl_seed_index, avl_bit_index) for this objective.
-        let task_index: std::collections::HashMap<&str, (Option<i32>, Option<i32>)> = s
+        // Build a map of task_id → (task_kind, avl_seed_index, avl_bit_index) for this objective.
+        let task_index: std::collections::HashMap<&str, (String, Option<i32>, Option<i32>)> = s
             .tasks
             .values()
             .filter(|t| t.objective_id == objective_id)
-            .map(|t| (t.task_id.as_str(), (t.avl_seed_index, t.avl_bit_index)))
+            .map(|t| (t.task_id.as_str(), (t.task_kind.clone(), t.avl_seed_index, t.avl_bit_index)))
             .collect();
         let mut rows: Vec<_> = s
             .results
@@ -716,9 +717,10 @@ impl ResearchDb for MemResearchDb {
             .filter(|r| task_index.contains_key(r.task_id.as_str()))
             .map(|r| {
                 let mut row = r.clone();
-                if let Some(&(seed_idx, bit_idx)) = task_index.get(r.task_id.as_str()) {
-                    row.avl_seed_index = seed_idx;
-                    row.avl_bit_index  = bit_idx;
+                if let Some((kind, seed_idx, bit_idx)) = task_index.get(r.task_id.as_str()) {
+                    row.task_kind      = kind.clone();
+                    row.avl_seed_index = *seed_idx;
+                    row.avl_bit_index  = *bit_idx;
                 }
                 row
             })

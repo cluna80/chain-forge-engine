@@ -336,7 +336,7 @@ impl ResearchDb for PgResearchDb {
                     er.content_hash, er.result_status, er.result_payload, \
                     er.algorithm_version, er.workload_version, er.seal_nonce, \
                     er.avl_original_hash, er.avl_flipped_hash, er.avl_xor_diff, er.avl_hamming_dist, \
-                    t.avl_seed_index, t.avl_bit_index, \
+                    t.task_kind, t.avl_seed_index, t.avl_bit_index, \
                     er.submitted_at, er.updated_at \
              FROM experiment_results er \
              JOIN research_tasks t ON t.task_id = er.task_id \

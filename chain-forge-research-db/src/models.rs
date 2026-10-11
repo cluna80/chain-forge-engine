@@ -189,7 +189,12 @@ pub struct ExperimentResultRow {
     /// Avalanche only: Hamming distance between original and flipped hash
     /// (= popcount of xor_diff); 0..=256.
     pub avl_hamming_dist:   Option<i32>,
-    // ── avalanche task identity fields (joined from research_tasks) ───────────
+    // ── task identity fields (joined from research_tasks) ────────────────────
+    /// Task kind discriminator: "avalanche_experiment" | "avalanche_replication"
+    /// | "pocd_phase1" | "pocd_phase2".
+    /// Populated from the parent task row by list_results_for_objective.
+    #[serde(default = "default_task_kind")]
+    pub task_kind:          String,
     /// Avalanche only: which of the 10 canonical seeds (0..9).
     /// Populated from the parent task row by list_results_for_objective.
     pub avl_seed_index:     Option<i32>,
