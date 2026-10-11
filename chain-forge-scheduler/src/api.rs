@@ -46,11 +46,12 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/scheduler/seed",                   post(seed_objective))
-        .route("/scheduler/miners/register",        post(register_miner))
-        .route("/scheduler/miners/:miner_id/task",  get(get_task_for_miner))
-        .route("/scheduler/tasks/:task_id/result",  post(submit_result))
-        .route("/scheduler/status",                 get(status))
+        .route("/scheduler/seed",                                   post(seed_objective))
+        .route("/scheduler/miners/register",                        post(register_miner))
+        .route("/scheduler/miners/:miner_id/task",                  get(get_task_for_miner))
+        .route("/scheduler/tasks/:task_id/result",                  post(submit_result))
+        .route("/scheduler/objectives/:objective_id/results",       get(list_objective_results))
+        .route("/scheduler/status",                                 get(status))
         .with_state(Arc::new(state))
 }
 
@@ -73,6 +74,16 @@ pub struct GetTaskQuery {
     pub objective_id:  String,
     pub workload_class: Option<String>,
 }
+
+#[derive(Deserialize)]
+pub struct ResultsQuery {
+    #[serde(default = "default_limit")]
+    pub limit:  usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_limit() -> usize { 1000 }
 
 #[derive(Serialize)]
 pub struct TaskAssignmentResponse {
@@ -212,6 +223,17 @@ async fn submit_result(
             (StatusCode::FORBIDDEN, e.to_string()).into_response()
         }
         Err(e) => scheduler_error_response(e),
+    }
+}
+
+async fn list_objective_results(
+    State(state):          State<Arc<AppState>>,
+    Path(objective_id):    Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ResultsQuery>,
+) -> Response {
+    match state.scheduler.db().list_results_for_objective(&objective_id, q.limit, q.offset).await {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e)   => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

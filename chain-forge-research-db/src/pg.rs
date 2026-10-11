@@ -325,6 +325,27 @@ impl ResearchDb for PgResearchDb {
         Ok(rows)
     }
 
+    async fn list_results_for_objective(
+        &self,
+        objective_id: &str,
+        limit:        usize,
+        offset:       usize,
+    ) -> Result<Vec<ExperimentResultRow>, ResearchDbError> {
+        let rows = sqlx::query_as::<_, ExperimentResultRow>(
+            "SELECT er.* FROM experiment_results er \
+             JOIN research_tasks t ON t.task_id = er.task_id \
+             WHERE t.objective_id = $1 \
+             ORDER BY er.submitted_at \
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(objective_id)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn update_result_status(
         &self,
         result_id: Uuid,

@@ -692,6 +692,29 @@ impl ResearchDb for MemResearchDb {
 
     // ── intelligence (Change Set G) ──────────────────────────────────────────
 
+    async fn list_results_for_objective(
+        &self,
+        objective_id: &str,
+        limit:        usize,
+        offset:       usize,
+    ) -> Result<Vec<ExperimentResultRow>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let task_ids: std::collections::HashSet<&str> = s
+            .tasks
+            .values()
+            .filter(|t| t.objective_id == objective_id)
+            .map(|t| t.task_id.as_str())
+            .collect();
+        let mut rows: Vec<_> = s
+            .results
+            .values()
+            .filter(|r| task_ids.contains(r.task_id.as_str()))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.submitted_at);
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
+    }
+
     async fn get_accepted_results_for_objective(
         &self,
         objective_id: &str,

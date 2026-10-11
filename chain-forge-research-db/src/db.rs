@@ -109,6 +109,16 @@ pub trait ResearchDb: Send + Sync {
         miner_id: &str,
     ) -> Result<Vec<ExperimentResultRow>, ResearchDbError>;
 
+    /// List all results for an objective regardless of status (submitted,
+    /// accepted, etc.).  Used by the analyzer to read results from an
+    /// in-memory scheduler that has no independent-verification step.
+    async fn list_results_for_objective(
+        &self,
+        objective_id: &str,
+        limit:        usize,
+        offset:       usize,
+    ) -> Result<Vec<ExperimentResultRow>, ResearchDbError>;
+
     /// Update result status (e.g. 'submitted' → 'independently_verified').
     async fn update_result_status(
         &self,
