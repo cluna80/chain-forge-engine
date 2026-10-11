@@ -23,7 +23,7 @@ uuid        = { workspace = true }
 chrono      = { workspace = true }
 
 # HTTP client
-reqwest     = { version = "0.12", features = ["json"] }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # CLI args
 clap        = { version = "4", features = ["derive", "env"] }

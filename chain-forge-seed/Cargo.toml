@@ -27,5 +27,5 @@ tracing     = { workspace = true }
 
 clap               = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-reqwest            = { version = "0.12", features = ["json"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 anyhow             = "1"
