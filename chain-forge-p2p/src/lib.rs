@@ -793,6 +793,14 @@ pub mod real {
 
                                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                     tracing::info!(peer = %peer_id, "connection established");
+                                    // Register as an explicit gossipsub peer immediately so
+                                    // flood_publish delivers votes before the mesh heartbeat
+                                    // (1 s after startup). Without this, bootstrap-dialed peers
+                                    // are not in the gossipsub explicit-peer set and
+                                    // flood_publish silently drops messages to them until the
+                                    // first heartbeat adds them to the mesh.
+                                    swarm.behaviour_mut()
+                                        .gossipsub.add_explicit_peer(&peer_id);
                                     let addr = endpoint.get_remote_address().to_string();
                                     // A peer can briefly hold more than one simultaneous
                                     // connection -- e.g. when both sides list each other in
