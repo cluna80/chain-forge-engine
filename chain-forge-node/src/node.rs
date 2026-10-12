@@ -299,6 +299,19 @@ pub struct Node {
     /// Behind a Mutex so the API handler thread can read it without holding
     /// a &mut Node reference.
     pocd_registry: Option<std::sync::Arc<Mutex<chain_forge_pocd::DiscoveryRegistry>>>,
+
+    // ── Change Set R — P2P Proof Gossip ───────────────────────────────────────
+
+    /// Anti-replay set for `GossipTopic::DiscoveryProof` messages.
+    ///
+    /// Keyed on `receipt_id` (string).  Bounded at
+    /// `gossip_proof::MAX_SEEN_GOSSIP_RECEIPTS`; oldest entries are evicted
+    /// via a companion VecDeque when the cap is reached.
+    seen_gossip_receipts: std::collections::HashSet<String>,
+
+    /// FIFO queue of `receipt_id`s inserted into `seen_gossip_receipts`, used
+    /// to evict the oldest entry when the set reaches its cap.
+    seen_gossip_receipts_order: std::collections::VecDeque<String>,
 }
 
 /// Map a transaction body to a short string label for the explorer.
@@ -857,6 +870,8 @@ impl Node {
             has_bootstrap_peers,
             pocd_config,
             pocd_registry,
+            seen_gossip_receipts:       std::collections::HashSet::new(),
+            seen_gossip_receipts_order: std::collections::VecDeque::new(),
         })
     }
 
@@ -912,6 +927,48 @@ impl Node {
     /// PoCD config (None if PoCD not enabled in genesis).
     pub fn pocd_config(&self) -> Option<&chain_forge_pocd::PoCDConfig> {
         self.pocd_config.as_ref()
+    }
+
+    // ── Change Set R: proof gossip publish helper ─────────────────────────────
+
+    /// Publish a `DiscoveryReceipt` to all peers via `GossipTopic::DiscoveryProof`.
+    ///
+    /// Called by the verification layer (and the API's `POST /api/gc-receipt`
+    /// path) immediately after a receipt is accepted into the local registry.
+    /// The receipt fans out to all connected nodes so every node converges on
+    /// the same proof pool before the epoch boundary.
+    ///
+    /// This is a fire-and-forget publish — network errors are logged at `warn`
+    /// level and do not propagate to the caller.  The receipt is already in the
+    /// local registry at this point, so a publish failure only affects
+    /// propagation, not local correctness.
+    pub async fn publish_discovery_receipt(&self, receipt: chain_forge_pocd::DiscoveryReceipt) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let gossip = crate::gossip_proof::DiscoveryProofGossip {
+            chain_id:       self.genesis.chain_id.clone(),
+            receipt,
+            published_at_ms: now_ms,
+        };
+
+        let receipt_id  = gossip.receipt.receipt_id.clone();
+        let challenge   = gossip.receipt.challenge_id.clone();
+        let payload = gossip.to_payload();
+        if let Err(e) = self.network.publish(chain_forge_p2p::OutboundMessage {
+            topic:   chain_forge_p2p::GossipTopic::DiscoveryProof,
+            payload,
+        }).await {
+            warn!(error = %e, "failed to gossip DiscoveryReceipt");
+        } else {
+            info!(
+                receipt_id  = %receipt_id,
+                challenge   = %challenge,
+                "DiscoveryReceipt published to gossip mesh"
+            );
+        }
     }
 
     /// Sign a Vote with this node's key, domain-separated by chain_id.
@@ -1770,6 +1827,111 @@ impl Node {
                         // round-trip at a time rather than waiting for the next
                         // organic proposal/vote to reveal the next gap.
                         self.request_sync().await;
+                    }
+
+                    // ── Change Set R: ingest gossiped DiscoveryReceipts ───────
+                    GossipTopic::DiscoveryProof => {
+                        // 1. Deserialise the envelope.
+                        let gossip: crate::gossip_proof::DiscoveryProofGossip =
+                            match serde_json::from_slice(&msg.payload) {
+                                Ok(g)  => g,
+                                Err(e) => {
+                                    warn!(from = %msg.from, error = %e, "malformed DiscoveryProofGossip, ignoring");
+                                    return Ok(());
+                                }
+                            };
+
+                        // 2. Chain-ID guard — reject cross-chain gossip.
+                        if gossip.chain_id != self.genesis.chain_id {
+                            debug!(
+                                from = %msg.from,
+                                their_chain = %gossip.chain_id,
+                                our_chain   = %self.genesis.chain_id,
+                                "DiscoveryProofGossip: wrong chain_id, dropping"
+                            );
+                            return Ok(());
+                        }
+
+                        // 3. Staleness guard.
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if gossip.is_stale(now_ms) {
+                            debug!(
+                                receipt_id = %gossip.receipt.receipt_id,
+                                age_ms = now_ms.saturating_sub(gossip.published_at_ms),
+                                "DiscoveryProofGossip: stale, dropping"
+                            );
+                            return Ok(());
+                        }
+
+                        let receipt_id = gossip.receipt.receipt_id.clone();
+
+                        // 4. Anti-replay: skip if we've seen this receipt_id before.
+                        if self.seen_gossip_receipts.contains(&receipt_id) {
+                            debug!(receipt_id = %receipt_id, "DiscoveryProofGossip: duplicate, skipping");
+                            return Ok(());
+                        }
+
+                        // 5. Insert into the local PoCD registry (if PoCD is enabled).
+                        let inserted = if let Some(ref reg_arc) = self.pocd_registry {
+                            let mut reg = reg_arc.lock().unwrap();
+                            // add_receipt is idempotent on receipt_id; it also marks
+                            // the proof_id as seen so the verifier won't double-accept.
+                            match reg.add_receipt(gossip.receipt.clone()) {
+                                Ok(()) => {
+                                    info!(
+                                        receipt_id  = %receipt_id,
+                                        challenge   = %gossip.receipt.challenge_id,
+                                        machine_id  = %gossip.receipt.machine_id,
+                                        from        = %msg.from,
+                                        "DiscoveryProofGossip: receipt ingested from peer"
+                                    );
+                                    true
+                                }
+                                Err(e) => {
+                                    // DuplicateReceipt is expected on a reconnecting peer
+                                    // that re-gossips its known receipts — not an error.
+                                    debug!(
+                                        receipt_id = %receipt_id,
+                                        error = %e,
+                                        "DiscoveryProofGossip: add_receipt returned (likely dup)"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            debug!("DiscoveryProofGossip: PoCD not enabled on this node, ignoring");
+                            false
+                        };
+
+                        // 6. Record in anti-replay set (even if PoCD disabled, so we
+                        //    don't deserialise + check a second time on re-delivery).
+                        self.seen_gossip_receipts.insert(receipt_id.clone());
+                        self.seen_gossip_receipts_order.push_back(receipt_id);
+
+                        // Evict oldest when capped.
+                        while self.seen_gossip_receipts.len()
+                            > crate::gossip_proof::MAX_SEEN_GOSSIP_RECEIPTS
+                        {
+                            if let Some(old) = self.seen_gossip_receipts_order.pop_front() {
+                                self.seen_gossip_receipts.remove(&old);
+                            }
+                        }
+
+                        // 7. Re-broadcast if freshly inserted (flood-fill semantics).
+                        //    Without this, only the originating node pushes the message;
+                        //    nodes that weren't in the gossipsub mesh at that instant
+                        //    never converge. Re-broadcasting from every first-inserter
+                        //    means the proof fans out across the full mesh within one
+                        //    gossip round-trip.
+                        if inserted {
+                            let _ = self.network.publish(chain_forge_p2p::OutboundMessage {
+                                topic:   chain_forge_p2p::GossipTopic::DiscoveryProof,
+                                payload: msg.payload,
+                            }).await;
+                        }
                     }
                 }
             }
@@ -3555,5 +3717,132 @@ mod tests {
         let total_burned = node.qrc_metrics.lock().unwrap().total_qcb_burned_uqcb;
         assert_eq!(total_burned, first_burn,
             "QRC metrics must only count the first (accepted) slash");
+    }
+
+    // ── Change Set R: DiscoveryProof gossip tests ─────────────────────────────
+
+    /// Build a minimal but valid `DiscoveryReceipt` for use in gossip tests.
+    fn test_receipt(receipt_id: &str, challenge_id: &str, chain_id: &str) -> chain_forge_pocd::DiscoveryReceipt {
+        chain_forge_pocd::DiscoveryReceipt {
+            receipt_id:          receipt_id.into(),
+            chain_id:            chain_id.into(),
+            challenge_id:        challenge_id.into(),
+            machine_id:          "miner-42".into(),
+            output_hash:         "abc123".into(),
+            input_hash:          "def456".into(),
+            methodology_ref:     "ipfs://Qm...".into(),
+            discovery_nonce:     99,
+            checks_performed:    1_000_000,
+            elapsed_seconds:     1.5,
+            submitted_at:        "2026-10-12T00:00:00Z".into(),
+            machine_signature:   "".into(),
+            seal_nonce:          42,
+            seal_hash:           "00001234".into(),
+            seal_difficulty_bits: 8,
+            verifier_id:         "verifier-01".into(),
+            verifier_signature:  "".into(),
+            committed_at_block:  0,
+            reward_distributed:  false,
+            _proof_id:           format!("proof-for-{receipt_id}"),
+        }
+    }
+
+    fn proof_gossip_event(receipt: chain_forge_pocd::DiscoveryReceipt, chain_id: &str) -> NetworkEvent {
+        let g = crate::gossip_proof::DiscoveryProofGossip {
+            chain_id: chain_id.into(),
+            receipt,
+            published_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        gossip(GossipTopic::DiscoveryProof, g.to_payload())
+    }
+
+    /// A genesis string with a minimal `pocd` section so DiscoveryRegistry is active.
+    fn genesis_with_pocd() -> String {
+        // Insert the pocd section before the final closing brace of GENESIS.
+        // We use rfind to locate the last '}' which closes the top-level object.
+        // All fields required by PoCDConfig (no serde defaults) must be present.
+        let mut s = GENESIS.to_string();
+        let pos = s.rfind('}').expect("GENESIS must end with '}'");
+        let pocd = r#","pocd":{"enabled":true,"chain_id":"qcb-testnet-1","challenge_tracks":[],"reward_epoch_blocks":100,"require_verified_identity":false,"min_seal_difficulty_bits":8}"#;
+        s.insert_str(pos, pocd);
+        s
+    }
+
+    #[tokio::test]
+    async fn discovery_proof_gossip_ingests_receipt() {
+        let mut node = Node::new(&genesis_with_pocd(), None).await.unwrap();
+        // Registry starts empty.
+        assert_eq!(node.pocd_registry().unwrap().lock().unwrap().receipt_count(), 0);
+
+        let receipt = test_receipt("rcpt-001", "ch-1", "qcb-testnet-1");
+        let event   = proof_gossip_event(receipt.clone(), "qcb-testnet-1");
+
+        node.handle_event(event).await.unwrap();
+
+        let reg = node.pocd_registry().unwrap();
+        let reg = reg.lock().unwrap();
+        assert_eq!(reg.receipt_count(), 1, "receipt should be in registry after gossip");
+        assert!(reg.get_receipt("rcpt-001").is_some());
+    }
+
+    #[tokio::test]
+    async fn discovery_proof_gossip_deduplicates() {
+        let mut node  = Node::new(&genesis_with_pocd(), None).await.unwrap();
+        let receipt   = test_receipt("rcpt-dup", "ch-1", "qcb-testnet-1");
+
+        // Send the same receipt twice.
+        node.handle_event(proof_gossip_event(receipt.clone(), "qcb-testnet-1")).await.unwrap();
+        node.handle_event(proof_gossip_event(receipt.clone(), "qcb-testnet-1")).await.unwrap();
+
+        // Registry still has exactly one entry.
+        let count = node.pocd_registry().unwrap().lock().unwrap().receipt_count();
+        assert_eq!(count, 1, "duplicate gossip must not insert twice");
+
+        // Anti-replay set also has exactly one entry.
+        assert_eq!(node.seen_gossip_receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_proof_gossip_rejects_wrong_chain() {
+        let mut node  = Node::new(&genesis_with_pocd(), None).await.unwrap();
+        let receipt   = test_receipt("rcpt-wrongchain", "ch-1", "qcb-mainnet-1");
+
+        // Gossip is tagged with a different chain_id.
+        node.handle_event(proof_gossip_event(receipt, "qcb-mainnet-1")).await.unwrap();
+
+        // Registry must remain empty.
+        let count = node.pocd_registry().unwrap().lock().unwrap().receipt_count();
+        assert_eq!(count, 0, "cross-chain receipt must be dropped");
+    }
+
+    #[tokio::test]
+    async fn discovery_proof_gossip_rejects_stale() {
+        let mut node  = Node::new(&genesis_with_pocd(), None).await.unwrap();
+        let receipt   = test_receipt("rcpt-stale", "ch-1", "qcb-testnet-1");
+
+        // Build a gossip message with an ancient published_at_ms.
+        let stale = crate::gossip_proof::DiscoveryProofGossip {
+            chain_id:        "qcb-testnet-1".into(),
+            receipt,
+            published_at_ms: 0, // epoch 0 = very stale
+        };
+        node.handle_event(gossip(GossipTopic::DiscoveryProof, stale.to_payload()))
+            .await.unwrap();
+
+        let count = node.pocd_registry().unwrap().lock().unwrap().receipt_count();
+        assert_eq!(count, 0, "stale gossip must be dropped");
+    }
+
+    #[tokio::test]
+    async fn discovery_proof_gossip_noop_without_pocd() {
+        // Node without a `pocd` genesis section: proof gossip is silently ignored.
+        let mut node  = Node::new(GENESIS, None).await.unwrap();
+        let receipt   = test_receipt("rcpt-no-pocd", "ch-1", "qcb-testnet-1");
+        // Must not panic or error.
+        node.handle_event(proof_gossip_event(receipt, "qcb-testnet-1")).await.unwrap();
+        assert!(node.pocd_registry().is_none());
     }
 }

@@ -79,6 +79,13 @@ pub enum GossipTopic {
     /// certificate and the original proposal (transactions included), so
     /// the requester can verify and replay it locally.
     SyncResponse,
+    /// A PoCD DiscoveryProof (or accepted DiscoveryReceipt) gossiped
+    /// network-wide so all nodes converge on the same proof pool before
+    /// the epoch boundary (Change Set R).
+    ///
+    /// Payload: JSON-encoded `DiscoveryProofGossip`.
+    /// Anti-replay: receiving nodes dedup by `receipt_id` / `proof_id`.
+    DiscoveryProof,
 }
 
 impl GossipTopic {
@@ -90,6 +97,7 @@ impl GossipTopic {
             Self::PeerAnnounce   => "chain-forge/peer-announce/1.0.0",
             Self::SyncRequest    => "chain-forge/sync-request/1.0.0",
             Self::SyncResponse   => "chain-forge/sync-response/1.0.0",
+            Self::DiscoveryProof => "qcb/pocd-proofs/v1",
         }
     }
 }
@@ -952,6 +960,7 @@ pub mod real {
             GossipTopic::PeerAnnounce   => "chain-forge/peer-announce/1.0.0",
             GossipTopic::SyncRequest    => "chain-forge/sync-request/1.0.0",
             GossipTopic::SyncResponse   => "chain-forge/sync-response/1.0.0",
+            GossipTopic::DiscoveryProof => "qcb/pocd-proofs/v1",
         }
     }
 
@@ -963,6 +972,7 @@ pub mod real {
             "chain-forge/peer-announce/1.0.0"  => Some(GossipTopic::PeerAnnounce),
             "chain-forge/sync-request/1.0.0"   => Some(GossipTopic::SyncRequest),
             "chain-forge/sync-response/1.0.0"  => Some(GossipTopic::SyncResponse),
+            "qcb/pocd-proofs/v1"               => Some(GossipTopic::DiscoveryProof),
             _                                  => None,
         }
     }
