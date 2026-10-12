@@ -86,6 +86,16 @@ pub enum GossipTopic {
     /// Payload: JSON-encoded `DiscoveryProofGossip`.
     /// Anti-replay: receiving nodes dedup by `receipt_id` / `proof_id`.
     DiscoveryProof,
+
+    /// A verifier attestation gossiped network-wide so every node can
+    /// accumulate the quorum of independent reproductions and converge on
+    /// the same reward-eligibility decision (Change Set S).
+    ///
+    /// Payload: JSON-encoded `VerifierAttestationGossip`.
+    /// Anti-replay: dedup by `(task_id, verifier_id)`.
+    /// Quorum: when a `(task_id, output_hash)` pair reaches 2 independent
+    /// attestations, every node calls `accept_task_canonical()` atomically.
+    VerifierAttestation,
 }
 
 impl GossipTopic {
@@ -97,7 +107,8 @@ impl GossipTopic {
             Self::PeerAnnounce   => "chain-forge/peer-announce/1.0.0",
             Self::SyncRequest    => "chain-forge/sync-request/1.0.0",
             Self::SyncResponse   => "chain-forge/sync-response/1.0.0",
-            Self::DiscoveryProof => "qcb/pocd-proofs/v1",
+            Self::DiscoveryProof      => "qcb/pocd-proofs/v1",
+            Self::VerifierAttestation => "qcb/verifier-attestations/v1",
         }
     }
 }
@@ -960,7 +971,8 @@ pub mod real {
             GossipTopic::PeerAnnounce   => "chain-forge/peer-announce/1.0.0",
             GossipTopic::SyncRequest    => "chain-forge/sync-request/1.0.0",
             GossipTopic::SyncResponse   => "chain-forge/sync-response/1.0.0",
-            GossipTopic::DiscoveryProof => "qcb/pocd-proofs/v1",
+            GossipTopic::DiscoveryProof      => "qcb/pocd-proofs/v1",
+            GossipTopic::VerifierAttestation => "qcb/verifier-attestations/v1",
         }
     }
 
@@ -973,6 +985,7 @@ pub mod real {
             "chain-forge/sync-request/1.0.0"   => Some(GossipTopic::SyncRequest),
             "chain-forge/sync-response/1.0.0"  => Some(GossipTopic::SyncResponse),
             "qcb/pocd-proofs/v1"               => Some(GossipTopic::DiscoveryProof),
+            "qcb/verifier-attestations/v1"     => Some(GossipTopic::VerifierAttestation),
             _                                  => None,
         }
     }

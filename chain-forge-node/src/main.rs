@@ -25,6 +25,7 @@ mod node;
 mod api;
 mod auth;
 pub mod gossip_proof;
+pub mod gossip_attestation;
 pub mod telemetry;
 
 use std::path::PathBuf;

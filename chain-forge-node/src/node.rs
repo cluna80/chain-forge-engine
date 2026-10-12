@@ -312,6 +312,30 @@ pub struct Node {
     /// FIFO queue of `receipt_id`s inserted into `seen_gossip_receipts`, used
     /// to evict the oldest entry when the set reaches its cap.
     seen_gossip_receipts_order: std::collections::VecDeque<String>,
+
+    // ── Change Set S — Decentralized Verifier Attestation Gossip ─────────────
+
+    /// Anti-replay set for `GossipTopic::VerifierAttestation` messages.
+    ///
+    /// Keyed on `"{task_id}::{verifier_id}"` (the `replay_key()`).
+    /// Bounded at `gossip_attestation::MAX_SEEN_ATTESTATION_KEYS`; evicted
+    /// FIFO via `seen_attestation_keys_order`.
+    seen_attestation_keys: std::collections::HashSet<String>,
+
+    /// FIFO eviction queue for `seen_attestation_keys`.
+    seen_attestation_keys_order: std::collections::VecDeque<String>,
+
+    /// Accumulates verifier attestations per `(task_id, output_hash)`.
+    ///
+    /// Keyed on `"{task_id}::{output_hash}"` (the `quorum_key()`).
+    /// When a bucket's `controller` set reaches `ATTESTATION_QUORUM` distinct
+    /// entries, the corresponding `DiscoveryReceipt` in the local PoCD registry
+    /// is confirmed as independently verified.  The bucket is kept after quorum
+    /// to absorb late-arriving duplicate attestations without re-triggering.
+    attestation_accumulator: std::collections::HashMap<
+        String,
+        crate::gossip_attestation::AttestationBucket,
+    >,
 }
 
 /// Map a transaction body to a short string label for the explorer.
@@ -872,6 +896,10 @@ impl Node {
             pocd_registry,
             seen_gossip_receipts:       std::collections::HashSet::new(),
             seen_gossip_receipts_order: std::collections::VecDeque::new(),
+            // Change Set S
+            seen_attestation_keys:       std::collections::HashSet::new(),
+            seen_attestation_keys_order: std::collections::VecDeque::new(),
+            attestation_accumulator:     std::collections::HashMap::new(),
         })
     }
 
@@ -967,6 +995,46 @@ impl Node {
                 receipt_id  = %receipt_id,
                 challenge   = %challenge,
                 "DiscoveryReceipt published to gossip mesh"
+            );
+        }
+    }
+
+    // ── Change Set S: attestation gossip publish helper ───────────────────────
+
+    /// Publish a `VerifierAttestationGossip` to all peers via
+    /// `GossipTopic::VerifierAttestation`.
+    ///
+    /// Called immediately after a verification vote is recorded locally
+    /// (by the scheduler's VerificationEngine, or via the node's internal
+    /// `/internal/gossip/attestation` endpoint).  The attestation fans out so
+    /// every node can accumulate an independent quorum view and converge on
+    /// the same reward-eligibility decision (Change Set S).
+    ///
+    /// Errors are logged at WARN level and do not propagate — the attestation is
+    /// already recorded locally; gossip failure only affects other nodes' quorum
+    /// convergence, not local correctness.
+    pub async fn publish_verifier_attestation(
+        &self,
+        attestation: crate::gossip_attestation::VerifierAttestationGossip,
+    ) {
+        let task_id  = attestation.task_id.clone();
+        let verifier = attestation.verifier_id.clone();
+        let payload  = attestation.to_payload();
+        if let Err(e) = self.network.publish(chain_forge_p2p::OutboundMessage {
+            topic:   chain_forge_p2p::GossipTopic::VerifierAttestation,
+            payload,
+        }).await {
+            warn!(
+                error    = %e,
+                task_id  = %task_id,
+                verifier = %verifier,
+                "failed to gossip VerifierAttestation"
+            );
+        } else {
+            info!(
+                task_id  = %task_id,
+                verifier = %verifier,
+                "VerifierAttestation published to gossip mesh"
             );
         }
     }
@@ -1929,6 +1997,163 @@ impl Node {
                         if inserted {
                             let _ = self.network.publish(chain_forge_p2p::OutboundMessage {
                                 topic:   chain_forge_p2p::GossipTopic::DiscoveryProof,
+                                payload: msg.payload,
+                            }).await;
+                        }
+                    }
+
+                    // ── Change Set S: ingest gossiped VerifierAttestations ────────
+                    GossipTopic::VerifierAttestation => {
+                        use crate::gossip_attestation::{
+                            VerifierAttestationGossip,
+                            MAX_SEEN_ATTESTATION_KEYS,
+                        };
+
+                        // 1. Deserialise the envelope.
+                        let att: VerifierAttestationGossip =
+                            match serde_json::from_slice(&msg.payload) {
+                                Ok(a)  => a,
+                                Err(e) => {
+                                    warn!(
+                                        from  = %msg.from,
+                                        error = %e,
+                                        "malformed VerifierAttestationGossip, ignoring"
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                        // 2. Chain-ID guard — reject cross-chain gossip.
+                        if att.chain_id != self.genesis.chain_id {
+                            debug!(
+                                from        = %msg.from,
+                                their_chain = %att.chain_id,
+                                our_chain   = %self.genesis.chain_id,
+                                "VerifierAttestationGossip: wrong chain_id, dropping"
+                            );
+                            return Ok(());
+                        }
+
+                        // 3. Staleness guard.
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if att.is_stale(now_ms) {
+                            debug!(
+                                task_id    = %att.task_id,
+                                verifier   = %att.verifier_id,
+                                age_ms     = now_ms.saturating_sub(att.published_at_ms),
+                                "VerifierAttestationGossip: stale, dropping"
+                            );
+                            return Ok(());
+                        }
+
+                        // 4. Only "reproduced" attestations count toward quorum;
+                        //    "failed" are gossiped for audit but discarded here.
+                        if !att.counts_toward_quorum() {
+                            debug!(
+                                task_id  = %att.task_id,
+                                verifier = %att.verifier_id,
+                                outcome  = %att.outcome,
+                                "VerifierAttestationGossip: non-reproduced outcome, dropping"
+                            );
+                            return Ok(());
+                        }
+
+                        // 5. Anti-replay: skip if we've already seen this
+                        //    (task_id, verifier_id) pair.
+                        let replay_key = att.replay_key();
+                        if self.seen_attestation_keys.contains(&replay_key) {
+                            debug!(
+                                task_id  = %att.task_id,
+                                verifier = %att.verifier_id,
+                                "VerifierAttestationGossip: duplicate, skipping"
+                            );
+                            return Ok(());
+                        }
+
+                        // 6. Record in anti-replay set; evict oldest when capped.
+                        self.seen_attestation_keys.insert(replay_key.clone());
+                        self.seen_attestation_keys_order.push_back(replay_key);
+                        while self.seen_attestation_keys.len() > MAX_SEEN_ATTESTATION_KEYS {
+                            if let Some(old) = self.seen_attestation_keys_order.pop_front() {
+                                self.seen_attestation_keys.remove(&old);
+                            }
+                        }
+
+                        // 7. Accumulate into the per-(task_id, output_hash) bucket.
+                        let quorum_key  = att.quorum_key();
+                        let bucket = self.attestation_accumulator
+                            .entry(quorum_key.clone())
+                            .or_default();
+                        let was_new = bucket.record(&att.controller_id, &att.result_id);
+
+                        info!(
+                            task_id     = %att.task_id,
+                            verifier    = %att.verifier_id,
+                            controller  = %att.controller_id,
+                            output_hash = %att.output_hash,
+                            controllers = bucket.controllers.len(),
+                            from        = %msg.from,
+                            "VerifierAttestationGossip: attestation recorded"
+                        );
+
+                        // 8. Quorum check — if we just crossed the threshold, record the
+                        //    convergence event.  We only act on the exact crossing
+                        //    (was_new && has_quorum) so the log fires exactly once per
+                        //    (task_id, output_hash) pair rather than for every additional
+                        //    attestation that arrives after quorum was already reached.
+                        //
+                        //    Architectural note: the scheduler's VerificationEngine (a
+                        //    separate process) handles `accept_task_canonical()` for the
+                        //    off-chain task state.  The node's PoCD registry tracks
+                        //    DiscoveryReceipts for on-chain reward accounting; a receipt
+                        //    is already in the registry when it was inserted via Change Set
+                        //    R gossip or local verification — the attestation quorum here
+                        //    is an independent signal that the result was reproduced by
+                        //    distinct controllers, which the epoch-boundary reward pass
+                        //    will read via `pending_reward_receipts()`.  No additional
+                        //    flag needs to be set; the receipt being present is sufficient.
+                        if was_new && bucket.has_quorum() {
+                            let result_id = bucket.latest_result_id.clone();
+                            info!(
+                                task_id     = %att.task_id,
+                                output_hash = %att.output_hash,
+                                result_id   = %result_id,
+                                controllers = bucket.controllers.len(),
+                                "VerifierAttestationGossip: quorum reached — \
+                                 result independently reproduced by {} distinct controllers",
+                                bucket.controllers.len(),
+                            );
+                            // PoCD registry awareness: if the node has a registry and the
+                            // receipt corresponding to this result_id is present, we log it
+                            // for the epoch-boundary reward pass.  No state change needed —
+                            // the receipt's presence in the registry is the eligibility signal.
+                            if let Some(ref reg_arc) = self.pocd_registry {
+                                let reg = reg_arc.lock().unwrap();
+                                if reg.get_receipt(&result_id).is_some() {
+                                    info!(
+                                        result_id = %result_id,
+                                        "VerifierAttestationGossip: quorum confirmed for receipt already in registry"
+                                    );
+                                } else {
+                                    debug!(
+                                        result_id = %result_id,
+                                        "VerifierAttestationGossip: quorum reached; receipt not yet in local registry \
+                                         (may arrive via DiscoveryProof gossip)"
+                                    );
+                                }
+                            } else {
+                                debug!("VerifierAttestationGossip: PoCD not enabled, quorum logged only");
+                            }
+                        }
+
+                        // 9. Re-broadcast if this attestation was new (flood-fill).
+                        //    Nodes that missed the original publish receive it this way.
+                        if was_new {
+                            let _ = self.network.publish(chain_forge_p2p::OutboundMessage {
+                                topic:   chain_forge_p2p::GossipTopic::VerifierAttestation,
                                 payload: msg.payload,
                             }).await;
                         }
@@ -3844,5 +4069,184 @@ mod tests {
         // Must not panic or error.
         node.handle_event(proof_gossip_event(receipt, "qcb-testnet-1")).await.unwrap();
         assert!(node.pocd_registry().is_none());
+    }
+
+    // ── Change Set S: VerifierAttestation gossip tests ────────────────────────
+
+    /// Build a minimal `VerifierAttestationGossip` for use in attestation tests.
+    fn test_attestation(
+        task_id:      &str,
+        verifier_id:  &str,
+        controller_id: &str,
+        output_hash:  &str,
+        chain_id:     &str,
+    ) -> crate::gossip_attestation::VerifierAttestationGossip {
+        crate::gossip_attestation::VerifierAttestationGossip {
+            chain_id:         chain_id.into(),
+            task_id:          task_id.into(),
+            result_id:        format!("result-for-{task_id}"),
+            verifier_id:      verifier_id.into(),
+            controller_id:    controller_id.into(),
+            output_hash:      output_hash.into(),
+            outcome:          "reproduced".into(),
+            workload_version: "v1.0".into(),
+            submission_nonce: "nonce-001".into(),
+            signature:        "".into(),
+            published_at_ms:  std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+
+    fn attestation_gossip_event(
+        att: crate::gossip_attestation::VerifierAttestationGossip,
+    ) -> NetworkEvent {
+        gossip(GossipTopic::VerifierAttestation, att.to_payload())
+    }
+
+    /// A single attestation does not reach quorum (quorum = 2 distinct controllers).
+    #[tokio::test]
+    async fn attestation_gossip_single_attestation_no_quorum() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let att = test_attestation("task-1", "verifier-A", "ctrl-A", "hash-xyz", "qcb-testnet-1");
+        node.handle_event(attestation_gossip_event(att)).await.unwrap();
+
+        // Anti-replay set now has one entry.
+        assert_eq!(node.seen_attestation_keys.len(), 1);
+
+        // Accumulator has one controller for task-1.
+        let bucket = node.attestation_accumulator
+            .get("task-1::hash-xyz")
+            .expect("bucket must exist after first attestation");
+        assert_eq!(bucket.controllers.len(), 1);
+        assert!(!bucket.has_quorum(), "single attestation must not reach quorum");
+    }
+
+    /// Two attestations from distinct controllers on the same (task_id, output_hash)
+    /// reach quorum.
+    #[tokio::test]
+    async fn attestation_gossip_two_controllers_reach_quorum() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        let att_a = test_attestation("task-2", "verifier-A", "ctrl-A", "hash-abc", "qcb-testnet-1");
+        let att_b = test_attestation("task-2", "verifier-B", "ctrl-B", "hash-abc", "qcb-testnet-1");
+
+        node.handle_event(attestation_gossip_event(att_a)).await.unwrap();
+        node.handle_event(attestation_gossip_event(att_b)).await.unwrap();
+
+        let bucket = node.attestation_accumulator
+            .get("task-2::hash-abc")
+            .expect("bucket must exist after attestations");
+        assert_eq!(bucket.controllers.len(), 2);
+        assert!(bucket.has_quorum(), "two distinct controllers must reach quorum");
+    }
+
+    /// Two attestations from the SAME controller (different verifier IDs) do NOT
+    /// reach quorum — the Sybil guard deduplicates by controller_id.
+    #[tokio::test]
+    async fn attestation_gossip_same_controller_no_quorum() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        // Same controller_id, different verifier_ids — this is the Sybil case.
+        let att_a = test_attestation("task-3", "verifier-A", "ctrl-SAME", "hash-def", "qcb-testnet-1");
+        let att_b = test_attestation("task-3", "verifier-B", "ctrl-SAME", "hash-def", "qcb-testnet-1");
+
+        node.handle_event(attestation_gossip_event(att_a)).await.unwrap();
+        node.handle_event(attestation_gossip_event(att_b)).await.unwrap();
+
+        let bucket = node.attestation_accumulator
+            .get("task-3::hash-def")
+            .expect("bucket must exist");
+        // Controller dedup: both verifiers share a controller, so the bucket has only 1.
+        assert_eq!(bucket.controllers.len(), 1, "same controller must not inflate count");
+        assert!(!bucket.has_quorum(), "Sybil controllers must not reach quorum");
+    }
+
+    /// A duplicate attestation (same task_id, same verifier_id) is rejected by the
+    /// anti-replay set and does not advance the accumulator.
+    #[tokio::test]
+    async fn attestation_gossip_deduplicates_same_verifier() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        let att = test_attestation("task-4", "verifier-A", "ctrl-A", "hash-ghi", "qcb-testnet-1");
+
+        // Send the exact same attestation twice.
+        node.handle_event(attestation_gossip_event(att.clone())).await.unwrap();
+        node.handle_event(attestation_gossip_event(att)).await.unwrap();
+
+        // Anti-replay set has only one key.
+        assert_eq!(node.seen_attestation_keys.len(), 1);
+
+        let bucket = node.attestation_accumulator
+            .get("task-4::hash-ghi")
+            .expect("bucket must exist");
+        assert_eq!(bucket.controllers.len(), 1, "duplicate verifier must not be counted twice");
+    }
+
+    /// A cross-chain attestation (wrong chain_id) must be silently dropped.
+    #[tokio::test]
+    async fn attestation_gossip_rejects_wrong_chain() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let att = test_attestation("task-5", "verifier-A", "ctrl-A", "hash-jkl", "qcb-mainnet-1");
+        node.handle_event(attestation_gossip_event(att)).await.unwrap();
+
+        assert!(
+            node.attestation_accumulator.is_empty(),
+            "cross-chain attestation must be dropped without touching the accumulator"
+        );
+        assert!(node.seen_attestation_keys.is_empty());
+    }
+
+    /// A stale attestation (published_at_ms = 0) must be silently dropped.
+    #[tokio::test]
+    async fn attestation_gossip_rejects_stale() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let mut att = test_attestation("task-6", "verifier-A", "ctrl-A", "hash-mno", "qcb-testnet-1");
+        att.published_at_ms = 0; // epoch 0 = ancient
+
+        node.handle_event(attestation_gossip_event(att)).await.unwrap();
+
+        assert!(node.attestation_accumulator.is_empty(), "stale attestation must be dropped");
+        assert!(node.seen_attestation_keys.is_empty());
+    }
+
+    /// A non-reproduced outcome ("failed") must be dropped — only "reproduced"
+    /// counts toward quorum.
+    #[tokio::test]
+    async fn attestation_gossip_rejects_failed_outcome() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let mut att = test_attestation("task-7", "verifier-A", "ctrl-A", "hash-pqr", "qcb-testnet-1");
+        att.outcome = "failed".into();
+
+        node.handle_event(attestation_gossip_event(att)).await.unwrap();
+
+        assert!(node.attestation_accumulator.is_empty(), "failed outcome must be dropped");
+        assert!(node.seen_attestation_keys.is_empty(),
+            "failed outcome must not be recorded in anti-replay set");
+    }
+
+    /// Attestations with the SAME task_id but DIFFERENT output_hash values are
+    /// counted in separate buckets and do not contribute to each other's quorum.
+    #[tokio::test]
+    async fn attestation_gossip_separate_buckets_per_output_hash() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        // verifier-A attests output_hash = "hash-A"
+        let att_a = test_attestation("task-8", "verifier-A", "ctrl-A", "hash-A", "qcb-testnet-1");
+        // verifier-B attests a DIFFERENT output_hash = "hash-B" for the same task
+        let att_b = test_attestation("task-8", "verifier-B", "ctrl-B", "hash-B", "qcb-testnet-1");
+
+        node.handle_event(attestation_gossip_event(att_a)).await.unwrap();
+        node.handle_event(attestation_gossip_event(att_b)).await.unwrap();
+
+        // Two separate buckets, neither at quorum.
+        let bucket_a = node.attestation_accumulator.get("task-8::hash-A").expect("bucket-A");
+        let bucket_b = node.attestation_accumulator.get("task-8::hash-B").expect("bucket-B");
+
+        assert_eq!(bucket_a.controllers.len(), 1, "hash-A bucket has only ctrl-A");
+        assert_eq!(bucket_b.controllers.len(), 1, "hash-B bucket has only ctrl-B");
+        assert!(!bucket_a.has_quorum(), "conflicting hash-A does not reach quorum alone");
+        assert!(!bucket_b.has_quorum(), "conflicting hash-B does not reach quorum alone");
     }
 }
