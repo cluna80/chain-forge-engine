@@ -45,6 +45,8 @@ pub async fn serve(
     pocd_registry:   Option<Arc<Mutex<DiscoveryRegistry>>>,
     challenge_store: Arc<Mutex<ChallengeStore>>,
     node_id:         String,
+    // Change Set T — peer capacity table (advisory, non-correctness).
+    peer_capacity_table: Arc<Mutex<crate::gossip_capacity::PeerCapacityTable>>,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,9 +72,10 @@ pub async fn serve(
                 let peers            = peers.clone();
                 let tx_queue         = tx_queue.clone();
                 let precheck         = precheck.clone();
-                let pocd_registry    = pocd_registry.clone();
-                let challenge_store  = challenge_store.clone();
-                let node_id          = node_id.clone();
+                let pocd_registry       = pocd_registry.clone();
+                let challenge_store     = challenge_store.clone();
+                let node_id             = node_id.clone();
+                let peer_capacity_table = peer_capacity_table.clone();
 
                 tokio::spawn(async move {
                     // Read the WHOLE request: headers, then Content-Length
@@ -326,6 +329,21 @@ pub async fn serve(
                         // Used by integration tests to verify per-human power cap (Section 3.3).
                         let ex = explorer.lock().unwrap();
                         http_200_json(&serde_json::to_string(&ex.validator_powers).unwrap_or_default())
+                    } else if first_line.starts_with("GET /api/peers/capacity") {
+                        // GET /api/peers/capacity — Change Set T.
+                        // Advisory peer capacity table for external schedulers.
+                        // Returns only non-stale entries (TTL = CAPACITY_AD_MAX_AGE_MS).
+                        // Schedulers MUST treat these as hints only — never as
+                        // correctness-critical signals.
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let mut tbl = peer_capacity_table.lock().unwrap();
+                        let entries: Vec<_> = tbl.live_entries(now_ms)
+                            .into_iter()
+                            .collect();
+                        http_200_json(&serde_json::to_string(&entries).unwrap_or_default())
                     } else if first_line.starts_with("GET /api/peers") {
                         // GET /api/peers — connected peers (real network layer)
                         let p = peers.lock().unwrap();

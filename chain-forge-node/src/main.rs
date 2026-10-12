@@ -26,6 +26,7 @@ mod api;
 mod auth;
 pub mod gossip_proof;
 pub mod gossip_attestation;
+pub mod gossip_capacity;
 pub mod telemetry;
 
 use std::path::PathBuf;
@@ -203,6 +204,7 @@ async fn main() {
     }
 
     let pocd_registry = node.pocd_registry();
+    let peer_capacity_table = node.peer_capacity_table();
     // DIS-001 Phase A: in-memory challenge store for QR auth; one per node process.
     let challenge_store = std::sync::Arc::new(std::sync::Mutex::new(
         auth::ChallengeStore::new()
@@ -215,6 +217,7 @@ async fn main() {
         api::serve(
             api_port, status, explorer, qrc_metrics, peers, tx_queue,
             precheck, pocd_registry, challenge_store, node_id,
+            peer_capacity_table,
         ).await;
     });
 

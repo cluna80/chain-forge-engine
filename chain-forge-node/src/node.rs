@@ -336,6 +336,19 @@ pub struct Node {
         String,
         crate::gossip_attestation::AttestationBucket,
     >,
+
+    // ── Change Set T — Light P2P Resource/Capacity Discovery ─────────────────
+
+    /// Per-peer capacity table, updated from incoming `GossipTopic::CapacityAd`
+    /// messages.  TTL-evicted lazily on `live_entries()`.  Exposed read-only via
+    /// `GET /api/peers/capacity`.  Behind an Arc<Mutex<>> so the API task can
+    /// snapshot it without holding a &mut Node reference.
+    peer_capacity_table: Arc<Mutex<crate::gossip_capacity::PeerCapacityTable>>,
+
+    /// UTC millisecond timestamp of the last time this node broadcast its own
+    /// capacity ad.  0 means "never".  The event loop heartbeat re-broadcasts
+    /// every `CAPACITY_AD_INTERVAL_SECS` seconds.
+    last_capacity_ad_ms: u64,
 }
 
 /// Map a transaction body to a short string label for the explorer.
@@ -900,6 +913,9 @@ impl Node {
             seen_attestation_keys:       std::collections::HashSet::new(),
             seen_attestation_keys_order: std::collections::VecDeque::new(),
             attestation_accumulator:     std::collections::HashMap::new(),
+            // Change Set T
+            peer_capacity_table: Arc::new(Mutex::new(crate::gossip_capacity::PeerCapacityTable::new())),
+            last_capacity_ad_ms: 0,
         })
     }
 
@@ -1037,6 +1053,76 @@ impl Node {
                 "VerifierAttestation published to gossip mesh"
             );
         }
+    }
+
+    // ── Change Set T: capacity ad publish helper ──────────────────────────────
+
+    /// Build and publish this node's own `CapacityAdGossip` to the mesh.
+    ///
+    /// Computes `cpu_available_pct` from the current mempool depth against
+    /// a fixed concurrent-task ceiling (advisory heuristic only).  The peer_id
+    /// is derived from the node's chain_id + validator_id so it is stable across
+    /// restarts on the same genesis.
+    ///
+    /// Fire-and-forget: network errors are logged at WARN, never propagated.
+    /// Updates `last_capacity_ad_ms` so the caller's heartbeat loop can throttle.
+    pub async fn publish_own_capacity_ad(&mut self, now_ms: u64) {
+        use crate::gossip_capacity::{CapacityAdGossip, CAPACITY_AD_INTERVAL_SECS};
+
+        let queue_depth = self.mempool.len() as u32;
+        let max_concurrent: u32 = 8; // advisory ceiling; tunable in a later change set
+        let cpu_pct = {
+            let used = queue_depth.min(max_concurrent);
+            let pct = (1.0 - used as f64 / max_concurrent as f64) * 100.0;
+            pct.clamp(0.0, 100.0) as u8
+        };
+
+        let peer_id = match &self.validator_id {
+            Some(vid) => format!("{}::{}", self.genesis.chain_id, vid.0),
+            None      => format!("{}::observer", self.genesis.chain_id),
+        };
+
+        let ad = CapacityAdGossip {
+            chain_id:                   self.genesis.chain_id.clone(),
+            peer_id:                    peer_id.clone(),
+            node_version:               env!("CARGO_PKG_VERSION").to_string(),
+            supported_workload_versions: if self.pocd_config.is_some() {
+                vec!["pocd_phase1".to_string()]
+            } else {
+                vec![]
+            },
+            queue_depth,
+            cpu_available_pct:          cpu_pct,
+            max_concurrent_tasks:       max_concurrent,
+            published_at_ms:            now_ms,
+        };
+
+        let payload = ad.to_payload();
+        if let Err(e) = self.network.publish(chain_forge_p2p::OutboundMessage {
+            topic:   chain_forge_p2p::GossipTopic::CapacityAd,
+            payload,
+        }).await {
+            warn!(
+                error   = %e,
+                peer_id = %peer_id,
+                "failed to publish own CapacityAd"
+            );
+        } else {
+            info!(
+                peer_id         = %peer_id,
+                queue_depth     = queue_depth,
+                cpu_available   = cpu_pct,
+                interval_secs   = CAPACITY_AD_INTERVAL_SECS,
+                "CapacityAd published"
+            );
+            self.last_capacity_ad_ms = now_ms;
+        }
+    }
+
+    /// Accessor used by the API endpoint `GET /api/peers/capacity`.
+    /// Returns a clone of the Arc so the API task can lock it independently.
+    pub fn peer_capacity_table(&self) -> Arc<Mutex<crate::gossip_capacity::PeerCapacityTable>> {
+        self.peer_capacity_table.clone()
     }
 
     /// Sign a Vote with this node's key, domain-separated by chain_id.
@@ -1609,6 +1695,21 @@ impl Node {
                     // observer node. It relays gossip and executes committed
                     // blocks via handle_event, but never proposes or votes.
 
+                    // ── Change Set T: periodic capacity ad ────────────────────────
+                    // Broadcast own capacity ad at startup (last_capacity_ad_ms == 0)
+                    // and every CAPACITY_AD_INTERVAL_SECS thereafter.
+                    {
+                        use crate::gossip_capacity::CAPACITY_AD_INTERVAL_SECS;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let elapsed_secs = now_ms.saturating_sub(self.last_capacity_ad_ms) / 1_000;
+                        if self.last_capacity_ad_ms == 0 || elapsed_secs >= CAPACITY_AD_INTERVAL_SECS {
+                            self.publish_own_capacity_ad(now_ms).await;
+                        }
+                    }
+
                 }
             }
         }
@@ -2156,6 +2257,53 @@ impl Node {
                                 topic:   chain_forge_p2p::GossipTopic::VerifierAttestation,
                                 payload: msg.payload,
                             }).await;
+                        }
+                    }
+
+                    // ── Change Set T: ingest peer capacity ads ────────────────────
+                    GossipTopic::CapacityAd => {
+                        use crate::gossip_capacity::CapacityAdGossip;
+
+                        // 1. Deserialise.
+                        let ad: CapacityAdGossip =
+                            match serde_json::from_slice(&msg.payload) {
+                                Ok(a)  => a,
+                                Err(e) => {
+                                    warn!(
+                                        from  = %msg.from,
+                                        error = %e,
+                                        "malformed CapacityAdGossip, ignoring"
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                        // 2. Chain-ID guard — drop ads from a different chain.
+                        if ad.chain_id != self.genesis.chain_id {
+                            debug!(
+                                from        = %msg.from,
+                                their_chain = %ad.chain_id,
+                                our_chain   = %self.genesis.chain_id,
+                                "CapacityAd: wrong chain_id, dropping"
+                            );
+                            return Ok(());
+                        }
+
+                        // 3. Clock for staleness + rate-limit checks.
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+
+                        // 4. Upsert into the peer capacity table.
+                        //    Returns false when the ad is stale or rate-limited
+                        //    (CAPACITY_AD_MIN_INTERVAL_MS per peer) — no log spam.
+                        let accepted = self.peer_capacity_table.lock().unwrap().upsert(ad, now_ms);
+
+                        // Advisory-only: no re-broadcast.  Each node emits its own
+                        // ad.  This keeps traffic O(N) rather than O(N²).
+                        if accepted {
+                            debug!(from = %msg.from, "CapacityAd accepted");
                         }
                     }
                 }
@@ -4248,5 +4396,132 @@ mod tests {
         assert_eq!(bucket_b.controllers.len(), 1, "hash-B bucket has only ctrl-B");
         assert!(!bucket_a.has_quorum(), "conflicting hash-A does not reach quorum alone");
         assert!(!bucket_b.has_quorum(), "conflicting hash-B does not reach quorum alone");
+    }
+
+    // ── Change Set T: PeerCapacityTable unit tests ────────────────────────────
+
+    fn capacity_ad(peer_id: &str, chain_id: &str, published_at_ms: u64) -> crate::gossip_capacity::CapacityAdGossip {
+        crate::gossip_capacity::CapacityAdGossip {
+            chain_id:                    chain_id.to_string(),
+            peer_id:                     peer_id.to_string(),
+            node_version:                "0.1.0".to_string(),
+            supported_workload_versions: vec!["pocd_phase1".to_string()],
+            queue_depth:                 0,
+            cpu_available_pct:           100,
+            max_concurrent_tasks:        8,
+            published_at_ms,
+        }
+    }
+
+    fn capacity_ad_event(ad: crate::gossip_capacity::CapacityAdGossip) -> NetworkEvent {
+        gossip(GossipTopic::CapacityAd, ad.to_payload())
+    }
+
+    /// Helper: current wall-clock time in milliseconds (same as the gossip handler uses).
+    fn wall_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    #[tokio::test]
+    async fn capacity_ad_accepted_and_stored() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        // Use wall-clock time — the gossip handler uses SystemTime::now() for the
+        // staleness check, so the ad's published_at_ms must be "recent" in real time.
+        let now_ms = wall_ms();
+        let ad = capacity_ad("peer-1", "qcb-testnet-1", now_ms);
+        node.handle_event(capacity_ad_event(ad)).await.unwrap();
+        let tbl = node.peer_capacity_table.lock().unwrap();
+        assert!(tbl.get("peer-1", now_ms + 1).is_some(), "ad should be stored");
+    }
+
+    #[tokio::test]
+    async fn capacity_ad_wrong_chain_rejected() {
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let now_ms = wall_ms();
+        let ad = capacity_ad("peer-2", "other-chain-99", now_ms);
+        node.handle_event(capacity_ad_event(ad)).await.unwrap();
+        let tbl = node.peer_capacity_table.lock().unwrap();
+        assert!(tbl.get("peer-2", now_ms + 1).is_none(), "wrong-chain ad should be dropped");
+    }
+
+    #[tokio::test]
+    async fn capacity_ad_stale_rejected() {
+        use crate::gossip_capacity::CAPACITY_AD_MAX_AGE_MS;
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        // Published far enough in the past to be stale vs. the gossip handler's
+        // real SystemTime::now() check.
+        let now_ms = wall_ms();
+        let stale_ms = now_ms - CAPACITY_AD_MAX_AGE_MS - 1;
+        let ad = capacity_ad("peer-3", "qcb-testnet-1", stale_ms);
+        node.handle_event(capacity_ad_event(ad)).await.unwrap();
+        let tbl = node.peer_capacity_table.lock().unwrap();
+        assert!(tbl.get("peer-3", now_ms).is_none(), "stale ad should be dropped");
+    }
+
+    #[tokio::test]
+    async fn capacity_table_rate_limits_rapid_updates() {
+        use crate::gossip_capacity::{PeerCapacityTable, CAPACITY_AD_MIN_INTERVAL_MS};
+        let mut tbl = PeerCapacityTable::new();
+        let now_ms = 1_000_000u64;
+        let ad1 = capacity_ad("peer-4", "qcb-testnet-1", now_ms);
+        let ad2 = capacity_ad("peer-4", "qcb-testnet-1", now_ms + 100); // only 100 ms later
+
+        assert!(tbl.upsert(ad1, now_ms), "first ad should be accepted");
+        assert!(!tbl.upsert(ad2, now_ms + 100), "rapid second ad should be rate-limited");
+        let _ = CAPACITY_AD_MIN_INTERVAL_MS; // reference to avoid unused-constant warning
+    }
+
+    #[tokio::test]
+    async fn capacity_table_accepts_after_interval() {
+        use crate::gossip_capacity::{PeerCapacityTable, CAPACITY_AD_MIN_INTERVAL_MS};
+        let mut tbl = PeerCapacityTable::new();
+        let now_ms = 1_000_000u64;
+        let ad1 = capacity_ad("peer-5", "qcb-testnet-1", now_ms);
+        let later = now_ms + CAPACITY_AD_MIN_INTERVAL_MS + 1;
+        let ad2 = capacity_ad("peer-5", "qcb-testnet-1", later);
+
+        assert!(tbl.upsert(ad1, now_ms), "first ad accepted");
+        assert!(tbl.upsert(ad2, later), "ad after full interval should be accepted");
+    }
+
+    #[tokio::test]
+    async fn capacity_table_preference_score() {
+        use crate::gossip_capacity::CapacityAdGossip;
+        let ad = CapacityAdGossip {
+            chain_id:                    "x".to_string(),
+            peer_id:                     "p".to_string(),
+            node_version:                "0.1.0".to_string(),
+            supported_workload_versions: vec![],
+            queue_depth:                 0,
+            cpu_available_pct:           80,
+            max_concurrent_tasks:        8,
+            published_at_ms:             0,
+        };
+        // With queue_depth=0 the penalty is 0, so score = cpu_available_pct
+        assert_eq!(ad.preference_score(), 80, "idle node score equals cpu_available_pct");
+        let busy = CapacityAdGossip { queue_depth: 10, cpu_available_pct: 50, ..ad };
+        // penalty = queue_depth(10) * 5 = 50, clamped to cpu(50), score = 0
+        assert_eq!(busy.preference_score(), 0, "saturated node score is 0");
+    }
+
+    #[tokio::test]
+    async fn capacity_table_supports_workload() {
+        use crate::gossip_capacity::CapacityAdGossip;
+        let ad = CapacityAdGossip {
+            chain_id:                    "x".to_string(),
+            peer_id:                     "p".to_string(),
+            node_version:                "0.1.0".to_string(),
+            supported_workload_versions: vec!["pocd_phase1".to_string(), "avl_experiment".to_string()],
+            queue_depth:                 0,
+            cpu_available_pct:           100,
+            max_concurrent_tasks:        8,
+            published_at_ms:             0,
+        };
+        assert!(ad.supports_workload("pocd_phase1"));
+        assert!(ad.supports_workload("avl_experiment"));
+        assert!(!ad.supports_workload("unknown_workload"));
     }
 }

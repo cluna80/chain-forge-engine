@@ -96,6 +96,20 @@ pub enum GossipTopic {
     /// Quorum: when a `(task_id, output_hash)` pair reaches 2 independent
     /// attestations, every node calls `accept_task_canonical()` atomically.
     VerifierAttestation,
+
+    /// A node's self-reported resource and workload capacity advertisement
+    /// (Change Set T — Light P2P Resource/Capacity Discovery).
+    ///
+    /// Payload: JSON-encoded `CapacityAdGossip`.
+    /// Broadcast: each node publishes its own ad at startup and every
+    /// `CAPACITY_AD_INTERVAL_SECS` seconds thereafter.
+    /// Receive: nodes store the most-recent ad per `peer_id` in a bounded
+    /// table (`peer_capacity_table`). Entries older than
+    /// `CAPACITY_AD_MAX_AGE_MS` are dropped lazily on read.
+    /// Purpose: advisory only — schedulers query `GET /api/peers/capacity`
+    /// to prefer idle peers with matching workload support. No consensus
+    /// impact; ignoring capacity ads is always safe.
+    CapacityAd,
 }
 
 impl GossipTopic {
@@ -109,6 +123,7 @@ impl GossipTopic {
             Self::SyncResponse   => "chain-forge/sync-response/1.0.0",
             Self::DiscoveryProof      => "qcb/pocd-proofs/v1",
             Self::VerifierAttestation => "qcb/verifier-attestations/v1",
+            Self::CapacityAd          => "qcb/capacity-ads/v1",
         }
     }
 }
@@ -973,6 +988,7 @@ pub mod real {
             GossipTopic::SyncResponse   => "chain-forge/sync-response/1.0.0",
             GossipTopic::DiscoveryProof      => "qcb/pocd-proofs/v1",
             GossipTopic::VerifierAttestation => "qcb/verifier-attestations/v1",
+            GossipTopic::CapacityAd          => "qcb/capacity-ads/v1",
         }
     }
 
@@ -986,6 +1002,7 @@ pub mod real {
             "chain-forge/sync-response/1.0.0"  => Some(GossipTopic::SyncResponse),
             "qcb/pocd-proofs/v1"               => Some(GossipTopic::DiscoveryProof),
             "qcb/verifier-attestations/v1"     => Some(GossipTopic::VerifierAttestation),
+            "qcb/capacity-ads/v1"              => Some(GossipTopic::CapacityAd),
             _                                  => None,
         }
     }
