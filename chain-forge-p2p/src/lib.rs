@@ -563,6 +563,15 @@ pub mod real {
                 .mesh_n(3)
                 .mesh_n_high(8)
                 .mesh_outbound_min(1)
+                // Flood-publish sends each message directly to ALL connected
+                // peers that are subscribed to the topic, bypassing the mesh
+                // fanout entirely. For a small validator set (4 nodes, all
+                // directly connected) this guarantees vote delivery without
+                // waiting for gossipsub mesh formation after the first
+                // heartbeat. Without this, Carol's first votes went out before
+                // Alice/Bob had added her to their mesh, so the votes were
+                // silently dropped and Carol accumulated liveness misses.
+                .flood_publish(true)
                 .message_id_fn(|msg: &gossipsub::Message| {
                     // Include source peer + sequence number so that the same
                     // content (e.g. an empty block proposal retransmitted across
