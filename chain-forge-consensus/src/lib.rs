@@ -1677,12 +1677,30 @@ impl ConsensusEngine for TendermintEngine {
         }
 
         // Verify the vote's signature if we have the crypto feature.
+        //
+        // Fail-closed rule: when a validator has a public key registered in
+        // the ValidatorSet, an empty signature is treated as a forgery and the
+        // vote is rejected.  Phase-0 nodes (no key on file) are still allowed
+        // through so a mixed key/no-key devnet doesn't hard-break.
+        // This mirrors the identical check in chain-forge-node/src/node.rs and
+        // closes the adversarial empty-signature injection path (Test #5).
         #[cfg(feature = "real-crypto")]
-        if !vote.signature.is_empty() {
+        {
             let vs = self.validator_set.as_ref()
                 .ok_or_else(|| ConsensusError::Internal("no validator set".into()))?;
             let pub_key = vs.public_key_of(&vote.validator);
             if !pub_key.is_empty() {
+                // Key is on file — signature MUST be present and valid.
+                if vote.signature.is_empty() {
+                    return Err(ConsensusError::InvalidVote {
+                        validator:  vote.validator.clone(),
+                        block_hash: vote.block_hash.clone()
+                            .unwrap_or_else(|| BlockHash("nil".into())),
+                        reason:     "validator has a registered key but vote carries \
+                                     an empty signature (possible forgery)"
+                                    .into(),
+                    });
+                }
                 let msg = vote_signing_bytes(
                     &self.chain_id, &vote.vote_type, vote.height, vote.round,
                     vote.block_hash.as_ref(),
@@ -1988,19 +2006,30 @@ impl ConsensusEngine for TendermintEngine {
             .collect();
 
         // -- Phase 1: individual signature verification ----------------------
-        // Verify every precommit that carries a non-empty signature.
-        // Precommits with empty signatures (Phase 0 / observer nodes) are
-        // counted toward power but not cryptographically verified; once all
-        // validators sign, every precommit will have a signature.
+        // Fail-closed: if a validator has a public key registered, their
+        // precommit MUST carry a valid signature.  Empty-sig precommits from
+        // validators with a registered key are rejected as potential forgeries.
+        // Validators with no key on file (Phase-0 / observer nodes) are still
+        // counted toward power without a signature check.
         #[cfg(feature = "real-crypto")]
         for vote in &valid_precommits {
-            if vote.signature.is_empty() { continue; }
-
             let pub_key = validator_set.public_key_of(&vote.validator);
             if pub_key.is_empty() {
-                // No registered key → skip verification for this signer.
-                // (New validator that hasn't had its key backfilled yet.)
+                // No registered key → Phase-0 tolerance, skip verification.
                 continue;
+            }
+
+            // Key is on file — signature MUST be present and valid.
+            if vote.signature.is_empty() {
+                return Err(ConsensusError::InvalidVote {
+                    validator:  vote.validator.clone(),
+                    block_hash: certificate.block_hash.clone(),
+                    reason:     format!(
+                        "validator {} has a registered key but precommit in commit \
+                         certificate carries an empty signature (possible forgery)",
+                        vote.validator
+                    ),
+                });
             }
 
             let msg = vote_signing_bytes(
@@ -3020,6 +3049,166 @@ mod tests {
         assert!(
             engine.verify_commit(&cert, &vs).is_ok(),
             "empty signatures should pass: they are counted toward power but not crypto-verified"
+        );
+    }
+
+    /// Security regression: when a validator has a registered public key, an
+    /// empty signature on a vote arriving via `receive_vote` must be rejected
+    /// (possible forgery / spoofed vote).  The Phase-0 tolerance path (empty key
+    /// → skip verification) must NOT apply when a key is on file.
+    #[cfg(feature = "real-crypto")]
+    #[tokio::test]
+    async fn receive_vote_rejects_empty_sig_when_key_registered() {
+        use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
+
+        let kp = ClassicalScheme.generate_keypair("seed-carol").unwrap();
+
+        // One validator with a real public key, others keyless.
+        let vs = ValidatorSet {
+            height: 0,
+            validators: vec![
+                ValidatorInfo {
+                    id: ValidatorId("carol".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: kp.public_key.clone(),
+                },
+                ValidatorInfo {
+                    id: ValidatorId("alice".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: vec![],
+                },
+                ValidatorInfo {
+                    id: ValidatorId("bob".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: vec![],
+                },
+                ValidatorInfo {
+                    id: ValidatorId("dave".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: vec![],
+                },
+            ],
+        };
+
+        let mut engine = TendermintEngine::new();
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        // Carol has a registered key but sends an empty signature — must be rejected.
+        let spoofed_vote = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     0,
+            round:      0,
+            validator:  ValidatorId("carol".into()),
+            block_hash: Some(BlockHash("block_test".into())),
+            signature:  vec![],  // empty — would have bypassed old opt-in check
+        };
+
+        let result = engine.receive_vote(spoofed_vote).await;
+        assert!(
+            result.is_err(),
+            "empty-sig vote from a validator with a registered key must be rejected"
+        );
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains("empty signature") || err_str.contains("registered key"),
+            "error must name the cause: {err_str}"
+        );
+    }
+
+    /// Security regression: an empty-signature precommit in a CommitCertificate
+    /// for a validator that has a registered key must cause `verify_commit` to
+    /// return an error.  Without this fix an adversary who controls a keyed
+    /// validator's peer identity could inject forgeries via the direct consensus
+    /// path (bypassing the node.rs gossip-layer check).
+    #[cfg(feature = "real-crypto")]
+    #[tokio::test]
+    async fn verify_commit_rejects_empty_sig_when_key_registered() {
+        use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
+
+        let kp = ClassicalScheme.generate_keypair("seed-carol-commit").unwrap();
+
+        // Three keyless validators + one keyed (carol).
+        let vs = ValidatorSet {
+            height: 0,
+            validators: vec![
+                ValidatorInfo {
+                    id: ValidatorId("alice".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: vec![],
+                },
+                ValidatorInfo {
+                    id: ValidatorId("bob".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: vec![],
+                },
+                ValidatorInfo {
+                    id: ValidatorId("carol".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: kp.public_key.clone(),
+                },
+                ValidatorInfo {
+                    id: ValidatorId("dave".into()),
+                    voting_power: 1,
+                    pop_verified: true,
+                    public_key: vec![],
+                },
+            ],
+        };
+
+        let block_hash = BlockHash("forgery_test_block".into());
+
+        let mut engine = TendermintEngine::new();
+        engine.init(default_config(), vs.clone()).await.unwrap();
+
+        // Certificate: alice, bob (keyless, fine) + carol (keyed, empty sig → forgery).
+        let cert = CommitCertificate {
+            height: 0,
+            round: 0,
+            block_hash: block_hash.clone(),
+            precommits: vec![
+                Vote {
+                    vote_type:  VoteType::Precommit,
+                    height:     0,
+                    round:      0,
+                    validator:  ValidatorId("alice".into()),
+                    block_hash: Some(block_hash.clone()),
+                    signature:  vec![],
+                },
+                Vote {
+                    vote_type:  VoteType::Precommit,
+                    height:     0,
+                    round:      0,
+                    validator:  ValidatorId("bob".into()),
+                    block_hash: Some(block_hash.clone()),
+                    signature:  vec![],
+                },
+                Vote {
+                    vote_type:  VoteType::Precommit,
+                    height:     0,
+                    round:      0,
+                    validator:  ValidatorId("carol".into()),
+                    block_hash: Some(block_hash.clone()),
+                    signature:  vec![],  // Carol has a key — this is a forgery attempt
+                },
+            ],
+        };
+
+        let result = engine.verify_commit(&cert, &vs);
+        assert!(
+            result.is_err(),
+            "CommitCertificate with empty-sig from a keyed validator must be rejected"
+        );
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains("empty signature") || err_str.contains("registered key"),
+            "error must name the cause: {err_str}"
         );
     }
 
