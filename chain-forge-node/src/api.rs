@@ -147,30 +147,43 @@ pub async fn serve(
                                 http_400_json(&resp.to_string())
                             }
                             Ok(tx)
-                                if !precheck.settlement_operators.is_empty()
-                                    && matches!(
-                                        &tx.body,
-                                        chain_forge_execution::TxBody::ClaimResearchReward { .. }
-                                    )
-                                    && !precheck.settlement_operators.contains(&tx.sender) =>
+                                if matches!(
+                                    &tx.body,
+                                    chain_forge_execution::TxBody::ClaimResearchReward { .. }
+                                )
+                                && !precheck.settlement_operators.contains(&tx.sender) =>
                             {
-                                // Guard: reject unauthorized settlement operators at
-                                // mempool ingress rather than waiting until execution.
-                                // The executor has the same check but fires only after
-                                // the TX is included in a block — too late for the
-                                // scheduler to report the right HTTP status.
-                                let resp = serde_json::json!({
-                                    "status": "rejected",
-                                    "tx_id": tx.id,
-                                    "message": format!(
+                                // Fail-closed: ClaimResearchReward is denied when the
+                                // sender is absent from settlement_operators, including
+                                // when the list is empty (misconfigured genesis → deny
+                                // all rather than allow all).
+                                //
+                                // The executor has a matching guard at execution time;
+                                // this ingress check ensures the scheduler receives a
+                                // non-2xx immediately so it can surface the rejection
+                                // without waiting for block inclusion.
+                                let reason = if precheck.settlement_operators.is_empty() {
+                                    format!(
+                                        "ClaimResearchReward: no settlement_operators configured \
+                                         in genesis — all claims denied (sender: {})",
+                                        tx.sender
+                                    )
+                                } else {
+                                    format!(
                                         "ClaimResearchReward: sender {} is not a recognized \
                                          settlement operator",
                                         tx.sender
                                     )
+                                };
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
                                 });
                                 tracing::warn!(
                                     tx_id  = %tx.id,
                                     sender = %tx.sender,
+                                    operators_configured = precheck.settlement_operators.len(),
                                     "ClaimResearchReward rejected at mempool ingress: unauthorized operator"
                                 );
                                 http_400_json(&resp.to_string())

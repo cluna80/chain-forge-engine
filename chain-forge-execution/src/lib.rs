@@ -4389,14 +4389,26 @@ impl Executor {
                 // analogous to the pilot-phase coordinator that gates ConfirmSybil.
                 // Their ML-DSA-65 signatures are already verified unconditionally
                 // by `verify_signature(tx, chain_id)` before this arm is reached.
+                //
+                // Fail-closed: an empty settlement_operators list denies all
+                // ClaimResearchReward transactions. A misconfigured genesis cannot
+                // accidentally open treasury-funded claims to any sender.
                 if !self.config.settlement_operators.contains(&tx.sender) {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
+                    let reason = if self.config.settlement_operators.is_empty() {
+                        format!(
+                            "ClaimResearchReward: no settlement_operators configured in genesis \
+                             — all claims denied (sender: {}, claim_id={}, objective_id={})",
+                            tx.sender, claim_id, objective_id
+                        )
+                    } else {
                         format!(
                             "ClaimResearchReward: sender {} is not a recognized \
                              settlement operator (claim_id={}, objective_id={})",
                             tx.sender, claim_id, objective_id
-                        ),
+                        )
+                    };
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit, reason,
                     );
                 }
 
