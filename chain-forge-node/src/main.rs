@@ -174,9 +174,10 @@ async fn main() {
     let tx_queue      = node.tx_queue();
     let api_port      = args.api_port;
     let precheck      = api::TxPrecheck {
-        chain_id:           node.chain_id().to_string(),
-        require_signatures: node.require_signatures(),
-        modules:            node.enabled_modules(),
+        chain_id:             node.chain_id().to_string(),
+        require_signatures:   node.require_signatures(),
+        modules:              node.enabled_modules(),
+        settlement_operators: node.settlement_operators(),
     };
     // Set the data directory for state persistence.
     if let Some(ref dir) = args.data_dir {

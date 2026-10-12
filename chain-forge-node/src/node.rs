@@ -870,6 +870,12 @@ impl Node {
         self.genesis.execution.require_signatures
     }
 
+    /// Addresses authorised to settle research rewards (API pre-check uses this).
+    /// Returns an empty Vec for chains that do not configure settlement_operators.
+    pub fn settlement_operators(&self) -> Vec<String> {
+        self.genesis.settlement_operators.clone()
+    }
+
     pub fn chain_id(&self) -> &str {
         &self.genesis.chain_id
     }

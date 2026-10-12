@@ -25,9 +25,13 @@ use chain_forge_pocd::{DiscoveryProof, DiscoveryRegistry};
 /// account state and is enforced at execution on every node.
 #[derive(Clone)]
 pub struct TxPrecheck {
-    pub chain_id:           String,
-    pub require_signatures: bool,
-    pub modules:            chain_forge_core::EnabledModules,
+    pub chain_id:             String,
+    pub require_signatures:   bool,
+    pub modules:              chain_forge_core::EnabledModules,
+    /// Addresses authorised to submit ClaimResearchReward transactions.
+    /// Populated from genesis `settlement_operators`. An empty list disables
+    /// the ingress check (useful for chains that don't use the PoCD module).
+    pub settlement_operators: Vec<String>,
 }
 
 pub async fn serve(
@@ -140,6 +144,35 @@ pub async fn serve(
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
+                                http_400_json(&resp.to_string())
+                            }
+                            Ok(tx)
+                                if !precheck.settlement_operators.is_empty()
+                                    && matches!(
+                                        &tx.body,
+                                        chain_forge_execution::TxBody::ClaimResearchReward { .. }
+                                    )
+                                    && !precheck.settlement_operators.contains(&tx.sender) =>
+                            {
+                                // Guard: reject unauthorized settlement operators at
+                                // mempool ingress rather than waiting until execution.
+                                // The executor has the same check but fires only after
+                                // the TX is included in a block — too late for the
+                                // scheduler to report the right HTTP status.
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": format!(
+                                        "ClaimResearchReward: sender {} is not a recognized \
+                                         settlement operator",
+                                        tx.sender
+                                    )
+                                });
+                                tracing::warn!(
+                                    tx_id  = %tx.id,
+                                    sender = %tx.sender,
+                                    "ClaimResearchReward rejected at mempool ingress: unauthorized operator"
+                                );
                                 http_400_json(&resp.to_string())
                             }
                             Ok(tx) => {
