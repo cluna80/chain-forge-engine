@@ -204,6 +204,41 @@ pub trait ResearchDb: Send + Sync {
         exclude_miner:    Option<&str>,
     ) -> Result<Option<TaskRow>, ResearchDbError>;
 
+    // ── beacon-based deterministic assignment (Change Set Q) ─────────────────
+
+    /// Return the `task_id` strings of all tasks with `status = 'available'`
+    /// for the given objective and workload class, ordered by `created_at ASC`.
+    ///
+    /// Used by the beacon-assignment path: the miner derives a deterministic
+    /// index into this list from a BTC block hash seed, then calls
+    /// `claim_specific_task` to atomically acquire that slot.
+    ///
+    /// `exclude_miner` — when `Some(id)`, tasks whose `phase1_miner_id` equals
+    /// `id` are omitted (same two-phase different-miner rule as `assign_task`).
+    async fn list_available_task_ids(
+        &self,
+        objective_id:   &str,
+        workload_class: &str,
+        exclude_miner:  Option<&str>,
+    ) -> Result<Vec<String>, ResearchDbError>;
+
+    /// Atomically claim a specific task by its `task_id`.
+    ///
+    /// Transitions `status = 'available'` → `'assigned'` for exactly the
+    /// requested task, setting `assigned_to`, `lease_expires_at`, and
+    /// incrementing `lease_generation`.
+    ///
+    /// Returns the updated `TaskRow` when the claim succeeds.
+    /// Returns `None` when the task was already taken (another miner raced to
+    /// the same beacon-derived slot) — the caller should retry with
+    /// `derive_retry_seed` and call again with the next candidate.
+    async fn claim_specific_task(
+        &self,
+        task_id:         &str,
+        miner_id:        &str,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<TaskRow>, ResearchDbError>;
+
     // ── two-phase cascade (Change Set J) ────────────────────────────────────
 
     /// Spawn a phase-2 task derived from a completed phase-1 result.

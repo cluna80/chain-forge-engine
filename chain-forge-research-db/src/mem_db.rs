@@ -537,6 +537,54 @@ impl ResearchDb for MemResearchDb {
         Ok(Some(row.clone()))
     }
 
+    async fn list_available_task_ids(
+        &self,
+        objective_id:   &str,
+        workload_class: &str,
+        exclude_miner:  Option<&str>,
+    ) -> Result<Vec<String>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let mut ids: Vec<(chrono::DateTime<Utc>, String)> = s
+            .tasks
+            .values()
+            .filter(|t| {
+                t.objective_id   == objective_id
+                    && t.workload_class == workload_class
+                    && t.status         == "available"
+                    && exclude_miner.map_or(true, |em| {
+                        t.phase1_miner_id.as_deref() != Some(em)
+                    })
+            })
+            .map(|t| (t.created_at, t.task_id.clone()))
+            .collect();
+        ids.sort_by_key(|(created_at, _)| *created_at);
+        Ok(ids.into_iter().map(|(_, id)| id).collect())
+    }
+
+    async fn claim_specific_task(
+        &self,
+        task_id:          &str,
+        miner_id:         &str,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<TaskRow>, ResearchDbError> {
+        let mut s = self.state.lock().unwrap();
+        let row = match s.tasks.get_mut(task_id) {
+            Some(r) => r,
+            None    => return Ok(None),
+        };
+        // Only claim if currently available — another miner may have raced us.
+        if row.status != "available" {
+            return Ok(None);
+        }
+        row.status           = "assigned".to_string();
+        row.assigned_to      = Some(miner_id.to_string());
+        row.lease_expires_at = Some(lease_expires_at);
+        row.lease_generation += 1;
+        row.attempt_count    += 1;
+        row.updated_at        = now();
+        Ok(Some(row.clone()))
+    }
+
     async fn submit_task_result(
         &self,
         task_id:  &str,

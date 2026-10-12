@@ -642,6 +642,62 @@ impl ResearchDb for PgResearchDb {
         Ok(row)
     }
 
+    async fn list_available_task_ids(
+        &self,
+        objective_id:   &str,
+        workload_class: &str,
+        exclude_miner:  Option<&str>,
+    ) -> Result<Vec<String>, ResearchDbError> {
+        // When exclude_miner is None we use a sentinel that never matches a
+        // real miner id so the WHERE clause stays the same shape in both branches.
+        let exclude = exclude_miner.unwrap_or("");
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT task_id FROM research_tasks
+             WHERE objective_id   = $1
+               AND workload_class = $2
+               AND status         = 'available'
+               AND ($3 = '' OR phase1_miner_id IS DISTINCT FROM $3)
+             ORDER BY created_at ASC"
+        )
+        .bind(objective_id)
+        .bind(workload_class)
+        .bind(exclude)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ResearchDbError::Internal(e.to_string()))?;
+        Ok(rows)
+    }
+
+    async fn claim_specific_task(
+        &self,
+        task_id:          &str,
+        miner_id:         &str,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<TaskRow>, ResearchDbError> {
+        // Atomically transition 'available' → 'assigned' for exactly this task.
+        // If the task is already taken (concurrent claim), the UPDATE matches
+        // zero rows and we return None — the caller retries with a new seed.
+        let row = sqlx::query_as::<_, TaskRow>(
+            "UPDATE research_tasks
+             SET status           = 'assigned',
+                 assigned_to      = $2,
+                 lease_expires_at = $3,
+                 lease_generation = lease_generation + 1,
+                 attempt_count    = attempt_count + 1,
+                 updated_at       = NOW()
+             WHERE task_id = $1
+               AND status  = 'available'
+             RETURNING *"
+        )
+        .bind(task_id)
+        .bind(miner_id)
+        .bind(lease_expires_at)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ResearchDbError::Internal(e.to_string()))?;
+        Ok(row)
+    }
+
     async fn spawn_phase2_task(
         &self,
         parent_task_id:  &str,

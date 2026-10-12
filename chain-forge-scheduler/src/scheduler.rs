@@ -43,6 +43,7 @@ use chain_forge_research_db::{
     ResearchDb,
 };
 
+use crate::beacon::{derive_job_seed, derive_retry_seed, select_task_index};
 use crate::error::SchedulerError;
 
 /// Default lease duration issued by `assign_task`.
@@ -127,6 +128,88 @@ impl ResearchScheduler {
                 objective_id:  objective_id.to_string(),
                 workload_class: workload_class.to_string(),
             })
+    }
+
+    /// Assign a task using BTC-beacon deterministic selection (Change Set Q).
+    ///
+    /// ## Protocol
+    ///
+    /// 1. Derive `job_seed = SHA-256("QCB-BEACON-v1\x00" || btc_hash || challenge_id || "\x00" || miner_id)`
+    /// 2. List all `'available'` tasks for the objective ordered by `created_at`.
+    /// 3. Pick `task_index = u64::from_le_bytes(seed[0..8]) % task_count`.
+    /// 4. Call `db.claim_specific_task(task_ids[task_index], ...)` — atomically
+    ///    transitions 'available' → 'assigned' only if no other miner raced us.
+    /// 5. On collision (task already taken), derive a retry seed and repeat from 3,
+    ///    up to `MAX_BEACON_RETRIES` times.
+    /// 6. On exhaustion, fall back to `assign_task` (legacy FIFO path) so miners
+    ///    never stall just because beacon collisions are frequent at low task counts.
+    ///
+    /// Returns the assigned `TaskRow` (beacon path) or `NoTaskAvailable` when
+    /// the queue is empty.
+    pub async fn assign_task_by_beacon(
+        &self,
+        objective_id:   &str,
+        workload_class: &str,
+        miner_id:       &str,
+        btc_hash:       &[u8; 32],
+    ) -> Result<TaskRow, SchedulerError> {
+        const MAX_BEACON_RETRIES: u64 = 8;
+
+        let lease_expires_at = chrono::Utc::now()
+            + chrono::Duration::seconds(self.lease_secs);
+
+        // Step 1 — list available tasks (exclude two-phase self-assignment).
+        let task_ids = self
+            .db
+            .list_available_task_ids(objective_id, workload_class, Some(miner_id))
+            .await?;
+
+        if task_ids.is_empty() {
+            return Err(SchedulerError::NoTaskAvailable {
+                objective_id:  objective_id.to_string(),
+                workload_class: workload_class.to_string(),
+            });
+        }
+
+        // Step 2 — deterministic selection loop.
+        let mut seed = derive_job_seed(btc_hash, objective_id, miner_id);
+
+        for round in 0..MAX_BEACON_RETRIES {
+            let idx = select_task_index(&seed, task_ids.len())
+                .expect("task_ids is non-empty here");
+            let task_id = &task_ids[idx];
+
+            match self.db.claim_specific_task(task_id, miner_id, lease_expires_at).await? {
+                Some(row) => {
+                    info!(
+                        task_id   = %row.task_id,
+                        miner_id,
+                        beacon    = hex::encode(btc_hash),
+                        round,
+                        "Beacon-assigned task claimed"
+                    );
+                    return Ok(row);
+                }
+                None => {
+                    // Collision — another miner claimed this slot first.
+                    debug!(
+                        task_id = %task_id,
+                        round,
+                        "Beacon collision — retrying with next seed"
+                    );
+                    seed = derive_retry_seed(&seed, round);
+                }
+            }
+        }
+
+        // Step 3 — beacon retries exhausted; fall back to FIFO assignment so
+        // miners never stall at low task counts.
+        tracing::warn!(
+            objective_id,
+            miner_id,
+            "Beacon retries exhausted — falling back to legacy FIFO assignment"
+        );
+        self.assign_task(objective_id, workload_class, miner_id).await
     }
 
     /// Submit a result for a task the miner was assigned.

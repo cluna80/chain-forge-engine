@@ -31,7 +31,7 @@ use clap::Parser;
 use tracing::info;
 
 use chain_forge_research_db::MemResearchDb;
-use chain_forge_scheduler::{AppState, MinerRegistry, ResearchScheduler, VerificationEngine, VerifierRegistry, router};
+use chain_forge_scheduler::{AppState, BeaconService, MinerRegistry, ResearchScheduler, VerificationEngine, VerifierRegistry, router};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -73,6 +73,20 @@ struct Args {
     /// Defaults to "qcb-devnet" when not specified.
     #[arg(long, env = "QCB_CHAIN_ID", default_value = "qcb-devnet")]
     chain_id: String,
+
+    /// Bitcoin JSON-RPC URL for BTC-beacon deterministic job assignment (Change Set Q).
+    ///
+    /// When provided, miners can call GET /scheduler/beacon to get the latest
+    /// BTC block hash and use it as entropy for deterministic task selection —
+    /// removing the central scheduler from the assignment decision.
+    ///
+    /// Example: http://user:pass@127.0.0.1:8332
+    ///
+    /// When omitted, a stub beacon is used (deterministic counter-based hash,
+    /// safe for devnet / tests).  The legacy FIFO assignment path remains
+    /// available for miners that don't supply a ?btc_hash= query param.
+    #[arg(long, env = "QCB_BTC_RPC_URL")]
+    btc_rpc_url: Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -143,12 +157,26 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // ── Beacon service (Change Set Q) ─────────────────────────────────────────
+    let beacon = match args.btc_rpc_url {
+        Some(ref url) => {
+            info!(url = %url, "BTC-beacon mode: using real Bitcoin node for job assignment entropy");
+            BeaconService::with_btc_node(url.clone())
+        }
+        None => {
+            info!("No --btc-rpc-url provided — using stub beacon (devnet mode)");
+            info!("Miners can still use deterministic assignment via GET /scheduler/beacon");
+            BeaconService::stub()
+        }
+    };
+
     // ── HTTP server ───────────────────────────────────────────────────────────
     let state = AppState {
         verification,
         scheduler,
         miners: MinerRegistry::new(),
         verifier_registry,
+        beacon,
     };
 
     let app = router(state);
@@ -157,11 +185,12 @@ async fn main() -> anyhow::Result<()> {
     info!(addr = %args.bind, "QCB scheduler listening");
     info!("Endpoints:");
     info!("  POST /scheduler/miners/register");
-    info!("  GET  /scheduler/miners/{{miner_id}}/task?objective_id=<UUID>");
+    info!("  GET  /scheduler/miners/{{miner_id}}/task?objective_id=<UUID>[&btc_hash=<hex>]");
     info!("  POST /scheduler/tasks/{{task_id}}/result");
     info!("  GET  /scheduler/status");
     info!("  POST /scheduler/verifiers/register");
     info!("  GET  /scheduler/verifiers");
+    info!("  GET  /scheduler/beacon");
 
     axum::serve(listener, app).await?;
     Ok(())

@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use chain_forge_research_db::models::{NewExperimentResult, NewObjective, NewTask};
 
 use crate::{
+    beacon::BeaconService,
     error::SchedulerError,
     miner::MinerRegistry,
     scheduler::ResearchScheduler,
@@ -54,6 +55,10 @@ pub struct AppState {
     /// `None` — legacy mode (no signature or independence checks).
     /// `Some` — registry mode: all verifications must be authenticated.
     pub verifier_registry: Option<VerifierRegistry>,
+    /// Change Set Q: BTC-beacon deterministic job assignment service.
+    /// Miners can call GET /scheduler/beacon to get the current slot without
+    /// running their own BTC node.
+    pub beacon: BeaconService,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -72,6 +77,8 @@ pub fn router(state: AppState) -> Router {
         // Change Set P (P1): verifier identity registration
         .route("/scheduler/verifiers/register",                     post(register_verifier))
         .route("/scheduler/verifiers",                              get(list_verifiers))
+        // Change Set Q: BTC-beacon deterministic assignment
+        .route("/scheduler/beacon",                                 get(get_beacon))
         .route("/scheduler/status",                                 get(status))
         .with_state(Arc::new(state))
 }
@@ -94,6 +101,10 @@ pub struct RegisterMinerResponse {
 pub struct GetTaskQuery {
     pub objective_id:  String,
     pub workload_class: Option<String>,
+    /// Change Set Q: BTC block hash (64 hex chars) for deterministic beacon
+    /// assignment.  When present, the scheduler uses `assign_task_by_beacon`.
+    /// When absent, falls back to legacy FIFO-random assignment.
+    pub btc_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -197,7 +208,25 @@ async fn get_task_for_miner(
     axum::extract::Query(q): axum::extract::Query<GetTaskQuery>,
 ) -> Response {
     let workload = q.workload_class.as_deref().unwrap_or("cpu");
-    match state.scheduler.assign_task(&q.objective_id, workload, &miner_id).await {
+
+    // Change Set Q — beacon path when btc_hash is provided.
+    let assign_result = if let Some(ref btc_hex) = q.btc_hash {
+        match decode_btc_hash(btc_hex) {
+            Ok(hash) => {
+                state.scheduler
+                    .assign_task_by_beacon(&q.objective_id, workload, &miner_id, &hash)
+                    .await
+            }
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, msg).into_response();
+            }
+        }
+    } else {
+        // Legacy FIFO path — no btc_hash provided.
+        state.scheduler.assign_task(&q.objective_id, workload, &miner_id).await
+    };
+
+    match assign_result {
         Ok(row) => {
             let resp = TaskAssignmentResponse {
                 task_id:          row.task_id,
@@ -221,6 +250,27 @@ async fn get_task_for_miner(
         }
         Err(e) => scheduler_error_response(e),
     }
+}
+
+/// GET /scheduler/beacon — return the current BTC beacon slot.
+///
+/// Miners without a BTC RPC node call this to get the beacon hash for
+/// deterministic job selection.
+async fn get_beacon(State(state): State<Arc<AppState>>) -> Response {
+    match state.beacon.fetch().await {
+        Ok(slot) => (StatusCode::OK, Json(slot)).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Beacon unavailable: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Decode a 64-char hex BTC block hash to raw bytes.
+fn decode_btc_hash(hex: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex).map_err(|_| format!("btc_hash: invalid hex: {hex}"))?;
+    bytes.try_into().map_err(|_| format!("btc_hash: expected 32 bytes (64 hex chars), got {}", hex.len() / 2))
 }
 
 async fn submit_result(

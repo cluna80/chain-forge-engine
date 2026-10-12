@@ -51,6 +51,7 @@
 //! be issued.
 
 pub mod api;
+pub mod beacon;
 pub mod error;
 pub mod miner;
 pub mod scheduler;
@@ -61,6 +62,7 @@ pub mod verifier_registry;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use api::{router, AppState};
+pub use beacon::{BeaconService, BeaconSlot};
 pub use error::SchedulerError;
 pub use miner::{MinerInfo, MinerRegistry};
 pub use scheduler::ResearchScheduler;
