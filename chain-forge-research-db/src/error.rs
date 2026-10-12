@@ -63,4 +63,10 @@ pub enum ResearchDbError {
     /// Any other error.
     #[error("{0}")]
     Other(String),
+
+    /// Internal error from a non-DB source (e.g. registry or crypto layer).
+    /// Used to bridge external error types through `ResearchDbError` without
+    /// adding new dependencies to this crate.
+    #[error("internal error: {0}")]
+    Internal(String),
 }

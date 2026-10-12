@@ -289,6 +289,19 @@ pub trait ResearchDb: Send + Sync {
         result_id: Uuid,
     ) -> Result<u64, ResearchDbError>;
 
+    /// Return the `verifier_id` values of all `'reproduced'` verifications for
+    /// a result.
+    ///
+    /// Change Set P (P3) uses this list to perform controller-independence and
+    /// independence-group checks before promoting a result to canonical.
+    ///
+    /// The list is ordered by submission time (oldest first) so deterministic
+    /// tests can predict which verifiers are returned.
+    async fn list_reproduced_verifier_ids(
+        &self,
+        result_id: Uuid,
+    ) -> Result<Vec<String>, ResearchDbError>;
+
     /// Transition a task from `'submitted'` to `'accepted'`, and mark the
     /// associated result as `'accepted'`.
     ///

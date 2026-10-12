@@ -56,6 +56,7 @@ pub mod miner;
 pub mod scheduler;
 pub mod settlement;
 pub mod verification;
+pub mod verifier_registry;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
@@ -65,6 +66,10 @@ pub use miner::{MinerInfo, MinerRegistry};
 pub use scheduler::ResearchScheduler;
 pub use settlement::{SettleRequest, SettlementError};
 pub use verification::{VerificationEngine, VerificationError, VerifyRequest, VerifyResponse};
+pub use verifier_registry::{
+    VerifierRegistry, VerifierRecord, RegistryError,
+    RegisterVerifierRequest, RegisterVerifierResponse,
+};
 
 #[cfg(test)]
 mod tests;

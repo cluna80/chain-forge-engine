@@ -37,6 +37,9 @@ use crate::{
     scheduler::ResearchScheduler,
     settlement::{settle_objective, SettleRequest, SettlementError},
     verification::{VerificationEngine, VerificationError, VerifyRequest},
+    verifier_registry::{
+        RegisterVerifierRequest, RegistryError, VerifierRegistry,
+    },
 };
 
 // ── Shared state ──────────────────────────────────────────────────────────────
@@ -47,6 +50,10 @@ pub struct AppState {
     pub miners:       MinerRegistry,
     /// Change Set M: verification engine for independent result reproduction.
     pub verification: VerificationEngine,
+    /// Change Set P (P1): verifier identity registry.
+    /// `None` — legacy mode (no signature or independence checks).
+    /// `Some` — registry mode: all verifications must be authenticated.
+    pub verifier_registry: Option<VerifierRegistry>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -62,6 +69,9 @@ pub fn router(state: AppState) -> Router {
         .route("/scheduler/objectives/:objective_id/results",       get(list_objective_results))
         // Change Set L: settlement operator endpoint
         .route("/scheduler/objectives/:objective_id/settle",        post(settle_handler))
+        // Change Set P (P1): verifier identity registration
+        .route("/scheduler/verifiers/register",                     post(register_verifier))
+        .route("/scheduler/verifiers",                              get(list_verifiers))
         .route("/scheduler/status",                                 get(status))
         .with_state(Arc::new(state))
 }
@@ -311,6 +321,80 @@ async fn verify_result(
             (StatusCode::CONFLICT, Json(body)).into_response()
         }
 
+        // ── Change Set P (P2) errors ──────────────────────────────────────────
+
+        Err(VerificationError::UnregisteredVerifier(ref id)) => {
+            let body = serde_json::json!({
+                "error": "unregistered_verifier",
+                "verifier_id": id,
+                "message": "Verifier identity is not registered. \
+                            POST /scheduler/verifiers/register first.",
+            });
+            (StatusCode::FORBIDDEN, Json(body)).into_response()
+        }
+
+        Err(VerificationError::UnauthorizedVerifier(ref id)) => {
+            let body = serde_json::json!({
+                "error": "unauthorized_verifier",
+                "verifier_id": id,
+                "message": "Verifier is registered but not currently authorized \
+                            (may be revoked or suspended).",
+            });
+            (StatusCode::FORBIDDEN, Json(body)).into_response()
+        }
+
+        Err(VerificationError::SignatureRequired) => {
+            let body = serde_json::json!({
+                "error": "signature_required",
+                "message": "This scheduler requires signed verification submissions. \
+                            Include 'signature', 'workload_version', and 'submission_nonce' \
+                            fields (Change Set P).",
+            });
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+
+        Err(VerificationError::InvalidSignature) => {
+            let body = serde_json::json!({
+                "error": "invalid_signature",
+                "message": "Submission signature did not verify against the registered \
+                            public key for this verifier_id.",
+            });
+            (StatusCode::FORBIDDEN, Json(body)).into_response()
+        }
+
+        // ── Change Set P (P3) errors ──────────────────────────────────────────
+
+        Err(VerificationError::ControllerOverlap(ref ids)) => {
+            let body = serde_json::json!({
+                "error": "controller_overlap",
+                "verifiers": ids,
+                "message": "Quorum cannot be reached: two or more of the submitting \
+                            verifiers are controlled by the same entity.",
+            });
+            (StatusCode::CONFLICT, Json(body)).into_response()
+        }
+
+        Err(VerificationError::IndependenceGroupOverlap(ref group)) => {
+            let body = serde_json::json!({
+                "error": "independence_group_overlap",
+                "group": group,
+                "message": "Quorum cannot be reached: two or more of the submitting \
+                            verifiers are in the same independence group.",
+            });
+            (StatusCode::CONFLICT, Json(body)).into_response()
+        }
+
+        Err(VerificationError::MinerVerifierOverlap { ref verifier, ref controller }) => {
+            let body = serde_json::json!({
+                "error": "miner_verifier_overlap",
+                "verifier_id": verifier,
+                "controller_id": controller,
+                "message": "A verifier controlled by the same entity as the original \
+                            miner cannot contribute to this result's quorum.",
+            });
+            (StatusCode::FORBIDDEN, Json(body)).into_response()
+        }
+
         Err(e) => {
             tracing::error!(error = %e, "verification failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -413,6 +497,112 @@ async fn settle_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
+}
+
+// ── Verifier registration handlers (Change Set P — P1) ───────────────────────
+
+/// `POST /scheduler/verifiers/register`
+///
+/// Register a new verifier identity with proof-of-possession of the ML-DSA-65
+/// private key.  Returns `201 Created` on success.
+///
+/// Requires the scheduler to have been started with a verifier registry
+/// (`--verifier-registry` flag).  Returns `501 Not Implemented` when no
+/// registry is configured (legacy mode).
+async fn register_verifier(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<RegisterVerifierRequest>,
+) -> Response {
+    let Some(ref registry) = state.verifier_registry else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "registry_not_configured",
+                "message": "This scheduler instance is running in legacy mode without a \
+                            verifier registry.  Restart with --verifier-registry to enable \
+                            authenticated verifier identities (Change Set P).",
+            })),
+        )
+            .into_response();
+    };
+
+    match registry.register(req) {
+        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
+
+        Err(RegistryError::AlreadyRegistered(id)) => {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "already_registered",
+                    "verifier_id": id,
+                    "message": "A verifier with this ID is already registered.",
+                })),
+            )
+                .into_response()
+        }
+
+        Err(RegistryError::InvalidPoP) => {
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "invalid_pop",
+                    "message": "Proof-of-possession signature did not verify. \
+                                Sign b\"QCB-VERIFIER-POP-v1\\x00\" || verifier_id \
+                                with your ML-DSA-65 private key.",
+                })),
+            )
+                .into_response()
+        }
+
+        Err(RegistryError::KeyDecode(msg)) => {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "key_decode_error",
+                    "message": msg,
+                })),
+            )
+                .into_response()
+        }
+
+        Err(RegistryError::SigDecode(msg)) => {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "signature_decode_error",
+                    "message": msg,
+                })),
+            )
+                .into_response()
+        }
+
+        Err(e) => {
+            tracing::error!(error = %e, "verifier registration failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// `GET /scheduler/verifiers`
+///
+/// List all registered verifiers.  Includes revoked and suspended entries for
+/// administrative inspection.
+async fn list_verifiers(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let Some(ref registry) = state.verifier_registry else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "registry_not_configured",
+                "message": "No verifier registry is configured.",
+            })),
+        )
+            .into_response();
+    };
+
+    let all = registry.list_all();
+    (StatusCode::OK, Json(all)).into_response()
 }
 
 // ── Error helper ──────────────────────────────────────────────────────────────

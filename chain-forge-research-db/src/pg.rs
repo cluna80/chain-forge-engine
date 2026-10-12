@@ -837,6 +837,25 @@ impl ResearchDb for PgResearchDb {
         Ok(count as u64)
     }
 
+    async fn list_reproduced_verifier_ids(
+        &self,
+        result_id: Uuid,
+    ) -> Result<Vec<String>, ResearchDbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT verifier_id
+            FROM   verification_records
+            WHERE  result_id = $1
+              AND  outcome   = 'reproduced'
+            ORDER BY verified_at ASC
+            "#,
+        )
+        .bind(result_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     async fn accept_task(
         &self,
         task_id:   &str,

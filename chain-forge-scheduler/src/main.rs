@@ -31,7 +31,7 @@ use clap::Parser;
 use tracing::info;
 
 use chain_forge_research_db::MemResearchDb;
-use chain_forge_scheduler::{AppState, MinerRegistry, ResearchScheduler, VerificationEngine, router};
+use chain_forge_scheduler::{AppState, MinerRegistry, ResearchScheduler, VerificationEngine, VerifierRegistry, router};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,23 @@ struct Args {
     /// How often (in seconds) the scheduler scans for expired leases.
     #[arg(long, env = "QCB_EXPIRE_INTERVAL_SECS", default_value_t = 15)]
     expire_interval_secs: u64,
+
+    /// Path to the verifier registry JSON file (Change Set P — P1).
+    ///
+    /// If provided, the scheduler starts in authenticated-verifier mode:
+    /// all verification submissions must include a registered verifier_id
+    /// and a valid ML-DSA-65 signature.  The registry is loaded from the
+    /// file on startup and written back on every registration or revocation.
+    ///
+    /// If omitted, the scheduler operates in legacy mode (Change Set M
+    /// behaviour, no signature or independence checks).
+    #[arg(long, env = "QCB_VERIFIER_REGISTRY")]
+    verifier_registry: Option<std::path::PathBuf>,
+
+    /// QCB chain ID to embed in signed verification payloads (Change Set P — P2).
+    /// Defaults to "qcb-devnet" when not specified.
+    #[arg(long, env = "QCB_CHAIN_ID", default_value = "qcb-devnet")]
+    chain_id: String,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -108,11 +125,30 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ── Verifier registry (Change Set P — P1) ────────────────────────────────
+    let (verification, verifier_registry) = match args.verifier_registry {
+        Some(ref path) => {
+            info!(path = %path.display(), "Loading verifier registry (authenticated-verifier mode)");
+            let reg = VerifierRegistry::with_persistence(path);
+            let eng = VerificationEngine::with_registry(
+                db.clone(),
+                reg.clone(),
+                args.chain_id.clone(),
+            );
+            (eng, Some(reg))
+        }
+        None => {
+            info!("No --verifier-registry provided — operating in legacy mode (no signature checks)");
+            (VerificationEngine::new(db.clone()), None)
+        }
+    };
+
     // ── HTTP server ───────────────────────────────────────────────────────────
     let state = AppState {
-        verification: VerificationEngine::new(db.clone()),
+        verification,
         scheduler,
         miners: MinerRegistry::new(),
+        verifier_registry,
     };
 
     let app = router(state);
@@ -124,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET  /scheduler/miners/{{miner_id}}/task?objective_id=<UUID>");
     info!("  POST /scheduler/tasks/{{task_id}}/result");
     info!("  GET  /scheduler/status");
+    info!("  POST /scheduler/verifiers/register");
+    info!("  GET  /scheduler/verifiers");
 
     axum::serve(listener, app).await?;
     Ok(())

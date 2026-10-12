@@ -401,6 +401,9 @@ mod tests {
                     verifier_id:          "verifier_x".to_string(),
                     outcome:              "reproduced".to_string(),
                     verifier_content_hash: content_hash,
+                    signature:             None,
+                    workload_version:      None,
+                    submission_nonce:      None,
                     verifier_receipt_id:  None,
                     notes:                None,
                 },
@@ -430,6 +433,9 @@ mod tests {
                     verifier_id:          "verifier_x".to_string(),
                     outcome:              "reproduced".to_string(),
                     verifier_content_hash: content_hash.clone(),
+                    signature:             None,
+                    workload_version:      None,
+                    submission_nonce:      None,
                     verifier_receipt_id:  None,
                     notes:                None,
                 },
@@ -446,6 +452,9 @@ mod tests {
                     verifier_id:          "verifier_y".to_string(),
                     outcome:              "reproduced".to_string(),
                     verifier_content_hash: content_hash.clone(),
+                    signature:             None,
+                    workload_version:      None,
+                    submission_nonce:      None,
                     verifier_receipt_id:  Some("rcpt_verifier_y_001".to_string()),
                     notes:                None,
                 },
@@ -477,6 +486,9 @@ mod tests {
                     verifier_id:          "miner_a".to_string(), // same as original miner
                     outcome:              "reproduced".to_string(),
                     verifier_content_hash: content_hash,
+                    signature:             None,
+                    workload_version:      None,
+                    submission_nonce:      None,
                     verifier_receipt_id:  None,
                     notes:                None,
                 },
@@ -503,6 +515,9 @@ mod tests {
                     verifier_id:          "verifier_z".to_string(),
                     outcome:              "reproduced".to_string(),
                     verifier_content_hash: "totally_different_hash".to_string(),
+                    signature:             None,
+                    workload_version:      None,
+                    submission_nonce:      None,
                     verifier_receipt_id:  None,
                     notes:                None,
                 },
@@ -529,6 +544,9 @@ mod tests {
                     verifier_id:          "verifier_q".to_string(),
                     outcome:              "rejected".to_string(),
                     verifier_content_hash: "divergent_hash".to_string(),
+                    signature:             None,
+                    workload_version:      None,
+                    submission_nonce:      None,
                     verifier_receipt_id:  None,
                     notes:                Some("hash differs".to_string()),
                 },
@@ -555,6 +573,9 @@ mod tests {
                     verifier_id:          "verifier_q".to_string(),
                     outcome:              "maybe".to_string(),
                     verifier_content_hash: "x".to_string(),
+                    signature:             None,
+                    workload_version:      None,
+                    submission_nonce:      None,
                     verifier_receipt_id:  None,
                     notes:                None,
                 },
@@ -594,7 +615,454 @@ mod tests {
         assert_eq!(p2_again.task_id, format!("phase2-{}", row.task_id));
         assert_eq!(p2_again.phase, 2);
     }
-}
+
+    // ── Change Set P — Adversarial Tests (P5) ────────────────────────────────
+    //
+    // 14 adversarial cases covering P1 (registry), P2 (signed submissions),
+    // and P3 (controller-independence quorum enforcement).
+    //
+    // All tests run in legacy or authenticated mode depending on whether a
+    // VerifierRegistry is attached to the VerificationEngine.
+
+    use crate::verifier_registry::{
+        RegisterVerifierRequest, VerifierRegistry,
+    };
+
+    // ── P5 helper: build a VerifyRequest with signature fields populated ──────
+
+    fn make_verify_req(
+        result_id:  uuid::Uuid,
+        verifier_id: &str,
+        content_hash: &str,
+    ) -> VerifyRequest {
+        // Sentinel values: non-empty strings accepted by the test stub.
+        VerifyRequest {
+            result_id,
+            verifier_id:           verifier_id.to_owned(),
+            outcome:               "reproduced".to_owned(),
+            verifier_content_hash: content_hash.to_owned(),
+            signature:             Some(hex::encode(vec![0x01u8, 0x02, 0x03])),
+            workload_version:      Some("test-1.0".to_owned()),
+            submission_nonce:      Some("nonce-0001".to_owned()),
+            verifier_receipt_id:   None,
+            notes:                 None,
+        }
+    }
+
+    fn make_verifier_req(id: &str, controller: &str) -> RegisterVerifierRequest {
+        RegisterVerifierRequest {
+            verifier_id:       id.to_owned(),
+            public_key_hex:    hex::encode(vec![0xAAu8; 32]),
+            controller_id:     controller.to_owned(),
+            independence_group: None,
+            pop_signature_hex: hex::encode(vec![0x01u8, 0x02, 0x03]),
+        }
+    }
+
+    /// Build an authenticated engine + seeded registry, returning the engine
+    /// and the registry for direct manipulation.
+    async fn setup_authenticated(
+        n_tasks: u64,
+    ) -> (MemResearchDb, VerificationEngine, VerifierRegistry, String, uuid::Uuid, String) {
+        let (db, sched, obj_id) = setup(n_tasks).await;
+
+        let registry = VerifierRegistry::new();
+        let engine = VerificationEngine::with_registry(
+            Arc::new(db.clone()),
+            registry.clone(),
+            "qcb-devnet",
+        );
+
+        let row = sched.assign_task(&obj_id, "cpu", "miner_a").await.unwrap();
+        let gen = row.lease_generation;
+        let winning_hash = "cc".repeat(32);
+
+        sched
+            .submit_result(
+                &row.task_id,
+                "miner_a",
+                gen,
+                make_result_with_hash(&row.task_id, "miner_a", gen, &winning_hash),
+            )
+            .await
+            .unwrap();
+
+        let results = db.list_results_for_task(&row.task_id).await.unwrap();
+        let result_id = results[0].result_id;
+        let content_hash = results[0].content_hash.clone();
+
+        (db, engine, registry, row.task_id, result_id, content_hash)
+    }
+
+    // ── P5 Test 1: Unregistered verifier is rejected ──────────────────────────
+
+    #[tokio::test]
+    async fn p5_01_unregistered_verifier_rejected() {
+        let (_db, engine, _registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        let req = make_verify_req(result_id, "ghost_verifier", &content_hash);
+        let err = engine.record_verification(&task_id, req).await.unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::UnregisteredVerifier(_)),
+            "unregistered verifier must be rejected; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 2: Revoked verifier is rejected ───────────────────────────────
+
+    #[tokio::test]
+    async fn p5_02_revoked_verifier_rejected() {
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        // Register then immediately revoke
+        registry.register(make_verifier_req("revoked_v", "org-r")).unwrap();
+        registry.revoke("revoked_v").unwrap();
+
+        let req = make_verify_req(result_id, "revoked_v", &content_hash);
+        let err = engine.record_verification(&task_id, req).await.unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::UnauthorizedVerifier(_)),
+            "revoked verifier must be rejected; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 3: Missing signature fields are rejected ──────────────────────
+
+    #[tokio::test]
+    async fn p5_03_missing_signature_fields_rejected() {
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        registry.register(make_verifier_req("v_nosig", "org-nosig")).unwrap();
+
+        // Omit all three P2 fields
+        let req = VerifyRequest {
+            result_id,
+            verifier_id:           "v_nosig".to_owned(),
+            outcome:               "reproduced".to_owned(),
+            verifier_content_hash: content_hash.clone(),
+            signature:             None, // missing
+            workload_version:      None, // missing
+            submission_nonce:      None, // missing
+            verifier_receipt_id:   None,
+            notes:                 None,
+        };
+
+        let err = engine.record_verification(&task_id, req).await.unwrap_err();
+        assert!(
+            matches!(err, VerificationError::SignatureRequired),
+            "missing signature fields must return SignatureRequired; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 4: Partial signature fields (only sig, no nonce) rejected ─────
+
+    #[tokio::test]
+    async fn p5_04_partial_signature_fields_rejected() {
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        registry.register(make_verifier_req("v_partial", "org-partial")).unwrap();
+
+        // Supply signature but omit workload_version
+        let req = VerifyRequest {
+            result_id,
+            verifier_id:           "v_partial".to_owned(),
+            outcome:               "reproduced".to_owned(),
+            verifier_content_hash: content_hash.clone(),
+            signature:             Some(hex::encode(vec![0x01u8, 0x02, 0x03])),
+            workload_version:      None, // missing
+            submission_nonce:      Some("nonce-x".to_owned()),
+            verifier_receipt_id:   None,
+            notes:                 None,
+        };
+
+        let err = engine.record_verification(&task_id, req).await.unwrap_err();
+        assert!(
+            matches!(err, VerificationError::SignatureRequired),
+            "partial P2 fields must return SignatureRequired; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 5: Invalid hex in signature rejected ──────────────────────────
+
+    #[tokio::test]
+    async fn p5_05_invalid_hex_signature_rejected() {
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        registry.register(make_verifier_req("v_badsig", "org-badsig")).unwrap();
+
+        let req = VerifyRequest {
+            result_id,
+            verifier_id:           "v_badsig".to_owned(),
+            outcome:               "reproduced".to_owned(),
+            verifier_content_hash: content_hash.clone(),
+            signature:             Some("NOT_VALID_HEX!@#$".to_owned()),
+            workload_version:      Some("1.0".to_owned()),
+            submission_nonce:      Some("nonce-y".to_owned()),
+            verifier_receipt_id:   None,
+            notes:                 None,
+        };
+
+        let err = engine.record_verification(&task_id, req).await.unwrap_err();
+        assert!(
+            matches!(err, VerificationError::InvalidSignature),
+            "malformed hex in signature must return InvalidSignature; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 6: Sybil quorum blocked by same controller ───────────────────
+    //
+    // Two distinct verifier_ids but same controller_id — the second's
+    // "reproduced" vote must not trigger canonical acceptance.
+
+    #[tokio::test]
+    async fn p5_06_sybil_quorum_same_controller_blocked() {
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        // Both verifiers controlled by the same entity
+        registry.register(make_verifier_req("sybil_v1", "attacker-org")).unwrap();
+        registry.register(make_verifier_req("sybil_v2", "attacker-org")).unwrap();
+
+        // First verifier submits — no quorum yet (need 2)
+        let req1 = make_verify_req(result_id, "sybil_v1", &content_hash);
+        let resp1 = engine.record_verification(&task_id, req1).await.unwrap();
+        assert!(!resp1.quorum_reached, "below quorum after first verifier");
+
+        // Second verifier (same controller) submits — P3 must block
+        let req2 = make_verify_req(result_id, "sybil_v2", &content_hash);
+        let err = engine.record_verification(&task_id, req2).await.unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::ControllerOverlap(_)),
+            "Sybil quorum (same controller) must be blocked; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 7: Independence-group overlap rejected ────────────────────────
+
+    #[tokio::test]
+    async fn p5_07_independence_group_overlap_rejected() {
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        // Two verifiers with different controllers but same independence_group
+        let mut req_a = make_verifier_req("ig_v1", "org-c");
+        req_a.independence_group = Some("lab-x".to_owned());
+        let mut req_b = make_verifier_req("ig_v2", "org-d");
+        req_b.independence_group = Some("lab-x".to_owned());
+
+        registry.register(req_a).unwrap();
+        registry.register(req_b).unwrap();
+
+        // First verifier — below quorum
+        let resp1 = engine
+            .record_verification(&task_id, make_verify_req(result_id, "ig_v1", &content_hash))
+            .await
+            .unwrap();
+        assert!(!resp1.quorum_reached);
+
+        // Second verifier — same group, must be blocked by P3
+        let err = engine
+            .record_verification(&task_id, make_verify_req(result_id, "ig_v2", &content_hash))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::IndependenceGroupOverlap(_)),
+            "independence-group overlap must be blocked; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 8: Miner-controller overlap rejected (verifier owns miner) ────
+
+    #[tokio::test]
+    async fn p5_08_miner_controller_overlap_rejected() {
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        // Verifier whose controller_id matches the miner's miner_id ("miner_a")
+        // — simulates miner registering a verifier identity under its own controller
+        let req = make_verifier_req("miner_verifier", "miner_a");
+        // controller_id = "miner_a" matches result.miner_id
+        registry.register(req).unwrap();
+
+        let verify_req = make_verify_req(result_id, "miner_verifier", &content_hash);
+        let err = engine.record_verification(&task_id, verify_req).await.unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::MinerVerifierOverlap { .. }),
+            "verifier sharing controller with miner must be rejected; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 9: Legacy mode accepts submission without P2 fields ───────────
+    //
+    // When no registry is attached (legacy / Change Set M behaviour), the engine
+    // must NOT require signature fields.
+
+    #[tokio::test]
+    async fn p5_09_legacy_mode_accepts_unsigned_submission() {
+        let (db, sched, obj_id) = setup(1).await;
+        // Legacy engine — no registry
+        let engine = VerificationEngine::new(Arc::new(db.clone()));
+
+        let row = sched.assign_task(&obj_id, "cpu", "miner_a").await.unwrap();
+        let gen = row.lease_generation;
+        let winning_hash = "dd".repeat(32);
+
+        sched
+            .submit_result(
+                &row.task_id,
+                "miner_a",
+                gen,
+                make_result_with_hash(&row.task_id, "miner_a", gen, &winning_hash),
+            )
+            .await
+            .unwrap();
+
+        let results = db.list_results_for_task(&row.task_id).await.unwrap();
+        let result_id = results[0].result_id;
+        let content_hash = results[0].content_hash.clone();
+
+        // No signature fields — legacy engine must accept
+        let req = VerifyRequest {
+            result_id,
+            verifier_id:           "legacy_verifier".to_owned(),
+            outcome:               "reproduced".to_owned(),
+            verifier_content_hash: content_hash,
+            signature:             None,
+            workload_version:      None,
+            submission_nonce:      None,
+            verifier_receipt_id:   None,
+            notes:                 None,
+        };
+
+        let resp = engine.record_verification(&row.task_id, req).await.unwrap();
+        assert!(!resp.quorum_reached, "below quorum after first verifier in legacy mode");
+    }
+
+    // ── P5 Test 10: Double-registration of same verifier_id rejected ──────────
+
+    #[tokio::test]
+    async fn p5_10_double_registration_rejected() {
+        let registry = VerifierRegistry::new();
+        registry.register(make_verifier_req("dup_v", "org-dup")).unwrap();
+        let err = registry.register(make_verifier_req("dup_v", "org-other")).unwrap_err();
+        assert!(
+            matches!(err, crate::verifier_registry::RegistryError::AlreadyRegistered(_)),
+            "double registration must be rejected; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 11: Empty public key in registration rejected ─────────────────
+
+    #[tokio::test]
+    async fn p5_11_empty_public_key_rejected() {
+        let registry = VerifierRegistry::new();
+        let req = RegisterVerifierRequest {
+            verifier_id:       "v_empty_key".to_owned(),
+            public_key_hex:    "".to_owned(), // invalid — empty after decode
+            controller_id:     "org-x".to_owned(),
+            independence_group: None,
+            pop_signature_hex: hex::encode(vec![0x01u8, 0x02, 0x03]),
+        };
+        let err = registry.register(req).unwrap_err();
+        // Empty hex decodes to empty bytes; the stub rejects empty public key
+        assert!(
+            matches!(
+                err,
+                crate::verifier_registry::RegistryError::InvalidPoP
+                    | crate::verifier_registry::RegistryError::KeyDecode(_)
+            ),
+            "empty public key must be rejected; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 12: Empty signature in registration rejected ──────────────────
+
+    #[tokio::test]
+    async fn p5_12_empty_pop_signature_rejected() {
+        let registry = VerifierRegistry::new();
+        let req = RegisterVerifierRequest {
+            verifier_id:       "v_empty_sig".to_owned(),
+            public_key_hex:    hex::encode(vec![0xBBu8; 32]),
+            controller_id:     "org-y".to_owned(),
+            independence_group: None,
+            pop_signature_hex: "".to_owned(), // empty signature
+        };
+        let err = registry.register(req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::verifier_registry::RegistryError::InvalidPoP
+                    | crate::verifier_registry::RegistryError::SigDecode(_)
+            ),
+            "empty PoP signature must be rejected; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 13: Revoked verifier re-registration is blocked ──────────────
+    //
+    // After revocation, the same verifier_id must not be re-registerable.
+    // The controller must issue a new identity.
+
+    #[tokio::test]
+    async fn p5_13_revoked_verifier_cannot_reregister() {
+        let registry = VerifierRegistry::new();
+        registry.register(make_verifier_req("old_v", "org-old")).unwrap();
+        registry.revoke("old_v").unwrap();
+
+        // Attempt to re-register the same verifier_id
+        let err = registry.register(make_verifier_req("old_v", "org-old")).unwrap_err();
+        assert!(
+            matches!(err, crate::verifier_registry::RegistryError::AlreadyRegistered(_)),
+            "revoked verifier must not be re-registerable; got {err:?}"
+        );
+    }
+
+    // ── P5 Test 14: Three-verifier quorum, two same controller — still blocked ──
+    //
+    // Even when there are more than `quorum` reproduced votes, if the set
+    // that puts the count over threshold contains a controller overlap, the
+    // engine must refuse canonical acceptance.
+
+    #[tokio::test]
+    async fn p5_14_three_verifiers_two_same_controller_blocked() {
+        // Use a fresh objective with quorum=2 (the default from make_objective).
+        let (_db, engine, registry, task_id, result_id, content_hash) =
+            setup_authenticated(1).await;
+
+        // v_good is independent; v_bad1 and v_bad2 share a controller.
+        registry.register(make_verifier_req("v_good", "org-independent")).unwrap();
+        registry.register(make_verifier_req("v_bad1", "attacker2")).unwrap();
+        registry.register(make_verifier_req("v_bad2", "attacker2")).unwrap();
+
+        // v_bad1 submits first — below quorum
+        let r1 = engine
+            .record_verification(&task_id, make_verify_req(result_id, "v_bad1", &content_hash))
+            .await
+            .unwrap();
+        assert!(!r1.quorum_reached);
+
+        // v_bad2 submits second (same controller as v_bad1) — P3 must block
+        let err = engine
+            .record_verification(&task_id, make_verify_req(result_id, "v_bad2", &content_hash))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VerificationError::ControllerOverlap(_)),
+            "two same-controller verifiers must not satisfy quorum; got {err:?}"
+        );
+    }
+} // end mod tests
 
 // ── ResearchScheduler private helper (test only) ──────────────────────────────
 

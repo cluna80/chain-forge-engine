@@ -651,6 +651,21 @@ impl ResearchDb for MemResearchDb {
         Ok(count as u64)
     }
 
+    async fn list_reproduced_verifier_ids(
+        &self,
+        result_id: Uuid,
+    ) -> Result<Vec<String>, ResearchDbError> {
+        let s = self.state.lock().unwrap();
+        let mut rows: Vec<_> = s
+            .verifications
+            .values()
+            .filter(|v| v.result_id == result_id && v.outcome == "reproduced")
+            .collect();
+        // Sort by verification_id (UUID v4 with timestamp prefix) for determinism.
+        rows.sort_by_key(|v| v.verification_id);
+        Ok(rows.iter().map(|v| v.verifier_id.clone()).collect())
+    }
+
     async fn accept_task(
         &self,
         task_id:   &str,
