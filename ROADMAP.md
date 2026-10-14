@@ -18,9 +18,15 @@
 
 ## Phase 0 — Chain Forge Engine Foundation
 
-**Goal**: A working, partition-tolerant BFT consensus engine plus one complete, adversarially-verified, cross-machine resource purchase using QRC — Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios.
+**Goal**: A working, partition-tolerant BFT consensus engine plus one complete, adversarially-verified, cross-machine resource purchase and a live PoCD research pipeline — Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios. Separately, external miners submit SHA-256 cryptographic discovery proofs that are independently verified and rewarded in uQCB from `treasury:pocd-research`.
 
-**Architecture shift (October 2026)**: The original QRC model assumed resources are minted by providing capacity. The revised model is simpler and cleaner: **resources are purchased with existing QRC; providing resources does not automatically mint QRC.** Provider payment = releasing pre-escrowed QRC. This reorients `chain-forge-qrc` (handles money) and introduces `chain-forge-resource` (handles what was bought with the money). Existing engine work is not wasted — it is reclassified below.
+**Token model (current)**:
+- **QCB** — the native chain token; staked by validators, earned by miners at 1,000,000 uQCB → 1 QCB.
+- **uQCB** — micro-QCB; PoCD research rewards paid from `treasury:pocd-research` in uQCB; accumulates toward QCB conversion at the fixed ratio above.
+- **QRC** — resource marketplace token; used for job escrow (`LockQrcForJob` / `ReleaseQrcForJob`); purchased from QCB via `PurchaseQrc`; **not used for PoCD rewards**.
+- **QRC is not minted by providing capacity.** Provider payment = releasing pre-escrowed QRC from the job escrow. `chain-forge-qrc` handles money; `chain-forge-resource` handles what was bought with it.
+
+> **Note**: The `CreditProvider` and `QrcContributionSettle` tx types remain in the codebase as legacy primitives from the original contribution-minting model. Do not build new dependencies on them — see QRC Money Layer below.
 
 ### Consensus & Networking
 
