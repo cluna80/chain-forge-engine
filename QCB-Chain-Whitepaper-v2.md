@@ -324,6 +324,120 @@ The whitepaper describes a mechanism: identity and economy are coupled, neither 
 
 The identity is the door, and QCB's economy is what is behind it. A person who holds BTC, ETH, XRP, or SOL and wants the four unique capabilities described above — personhood governance, $QCB resource access and value capture, Charmed Agents, RWA compliance — verifies on QCB and participates. Their existing holdings are irrelevant to their verification; the identity is not a service their coins can access. It is a door that a person walks through, and what is behind it is QCB's own economy: the activity rewards they can earn, the agents they can run, the governance they can participate in, the assets they can issue with compliance built in. QCB does not want people's coins. It wants people, and the economy their participation creates is the thing that makes $QCB valuable. This is the inversion at the core of the design: most chains attract capital and hope people follow. QCB attracts people and the capital follows from what people do once they are here. Whether that inversion produces adoption is the empirical question that the rest of this document routes, correctly, to the pilot phases.
 
+
+4.5.1 Digital Identity Stone (DIS) — Authentication Without Key Exposure
+The identity layer described in Section 4 answers a protocol-level question: is this participant a unique verified human? That is the uniqueness guarantee — the thing consensus, governance, and the resource economy all depend on. It is not, by itself, an answer to a second, separate question: how does a verified human authenticate to a service without exposing the key material that proves their identity?
+
+Those are different problems, and conflating them is a common failure in identity systems. The uniqueness guarantee is about what the protocol knows. Authentication is about how the human proves what the protocol already knows — to a service, to an application, to an agent acting on their behalf — without leaking the underlying secret every time they do.
+
+QCB addresses the second problem through a native component: the Digital Identity Stone (DIS). DIS is not the identity layer. It is the authentication layer that sits on top of it. The identity layer is the door. DIS is the key that opens it — and, critically, a key that never leaves the holder's device.
+
+4.5.2 Why authentication is a separate concern
+A naive design would let a service verify identity by receiving the user's public key directly. This fails for three reasons:
+
+Public-key exposure is permanent. Once a public key is transmitted to a service — logged, cached, or stored — it becomes a correlatable identifier. The user can be tracked across every service that learns the same key, even if each service only sees the key once.
+
+Post-quantum signatures do not hide the signer. Ordinary ML-DSA (CRYSTALS-Dilithium) signatures verify against a public key that is not, by construction, hidden. A system that requires unlinkable authorization cannot get it from a plain ML-DSA signature alone.
+
+Key exposure compounds risk. Every transmission of a signing secret — even a public one — increases the surface for interception, replay, and correlation. A design that never transmits the signing secret at all is strictly better than one that transmits it occasionally.
+
+DIS is designed around a single principle: the private key never leaves the wallet, and the public key is not transmitted unless the protocol explicitly requires it. Authentication happens through a temporary challenge-response exchange, not through key presentation.
+
+4.5.3 The authentication flow
+The DIS authentication flow is deliberately simple, and deliberately scoped to a single use:
+
+User opens QCB application → challenge presented (QR code, deep link, or API)
+→ User scans or accepts the challenge with the QCB wallet
+→ Wallet signs the challenge locally using ML-DSA-65
+→ Service verifies the signature against the challenge
+→ Service grants access or records authorization
+(Private key never leaves the device; challenge expires after use)
+
+The challenge is short-lived (60 seconds in the current implementation) and single-use. A consumed challenge cannot be replayed — the node maintains a challenge store with atomic consume semantics and bounded capacity, evicting stale challenges automatically. A captured challenge is useless after its TTL expires or after it has been consumed once.
+
+The QR code is the doorway, not the key. Scanning it initiates an authentication exchange; it does not transmit anything that can be used to forge a future authentication.
+
+4.5.4 What DIS does and does not guarantee
+What DIS guarantees:
+
+Key non-exposure. The private key never leaves the wallet. Signatures are produced locally, on the device that holds the key.
+
+Replay resistance. Challenges are single-use and time-bounded. A captured challenge-response pair cannot be replayed.
+
+Chain binding. Signatures are bound to a specific chain ID via a domain-separated preimage (SHA-256("chain-forge/pq-tx/v1\n" + chain_id + "\n" + body_json)). A signature valid for one chain is cryptographically invalid on another. Cross-chain replay is not possible.
+
+Post-quantum authentication. Authentication uses ML-DSA-65 (NIST FIPS 204 / Dilithium3), not classical ECDSA or Ed25519. The authentication path does not inherit the quantum vulnerability described in Section 10.
+
+Nonce and balance enforcement. Signed transactions carry nonces and are subject to the same execution-layer enforcement as any other transaction. Replay and overdraft are rejected at execution, not only at submission.
+
+What DIS does not guarantee on its own:
+
+Unlinkability across services. A plain ML-DSA signature does not hide the signing public key from the verifier. If a service must learn only that a valid identity authorized a request — without learning which identity — a zero-knowledge credential layer is required. That layer is a distinct component (the privacy-preserving authorization layer, described below), not part of DIS Phase A/B.
+
+Privacy of metadata. Timing, network origin, and challenge frequency are observable at the transport layer. DIS does not claim transport-layer privacy; that is a separate concern addressed by the privacy-preserving authorization layer.
+
+Device compromise protection. If the device holding the private key is compromised, DIS cannot protect the key. Encrypted-at-rest storage (Argon2id + AES-256-GCM in the current implementation) raises the cost of extraction but does not eliminate it. Hardware-backed key storage is a future direction.
+
+4.5.5 Relationship to the identity layer and the sovereignty constraint
+DIS is a component of the identity layer, not a separate system. It uses the same ML-DSA key material that the wallet uses for transaction signing, and it produces addresses in the same namespace (qcb1pq… — derived from double-SHA-256 of the public key, distinguished from classical qcb1… addresses by prefix).
+
+This means DIS is subject to the same constitutional guarantees as the identity layer itself (Section 7.3):
+
+Interface vs. implementation. What is constitutional is the interface — a uniqueness guarantee per human, no single party able to unilaterally control verification, and a bounded disclosed verification cost. DIS is an implementation of the authentication portion of that interface. It can be replaced under ordinary governance if a better authentication mechanism becomes available, so long as it continues to satisfy the interface.
+
+Cryptographic agility. Because DIS uses ML-DSA, it inherits the cryptographic-primitive replacement mechanism described in Section 7.3. If ML-DSA is broken or superseded, DIS can migrate to a new signature scheme without forking the chain or invalidating existing authentications.
+
+Sovereignty. DIS does not introduce any external dependency. It does not call out to a government identity provider, a corporate biometric service, or a third-party authentication API. The challenge-response exchange is entirely between the user's wallet and the QCB node.
+
+4.5.6 The privacy-preserving authorization layer
+DIS Phase A/B covers authentication: proving control of a key. It does not, by itself, provide unlinkable authorization — the property that a service can verify "a valid identity authorized this" without learning which identity.
+
+That property requires a separate layer, built on top of DIS. Two mechanisms are under consideration:
+
+Service-specific pseudonyms. The wallet can derive a distinct identifier per service, so that the same verified human appears as different identifiers to different services. This is unlinkability at the identifier level, not the signature level.
+
+Zero-knowledge authorization. A ZK credential layer proves possession of a valid identity credential without revealing the credential itself. This is the stronger property, and the harder one. It is a research milestone, not a Phase A/B deliverable.
+
+Both mechanisms are recorded as future work. Neither is claimed as complete. The distinction between authentication (DIS Phase A/B, shipped) and authorization (privacy layer, pending) is deliberate and is maintained in the roadmap as separate milestones.
+
+4.5.7 Implementation status
+The Digital Identity Stone is implemented through Phase B as of October 2026.
+
+Phase	Scope	Status
+A — Identity and authentication	ML-DSA-65 wallet identity, QR challenge issuance, signature verification, anti-replay	✅ Complete
+B — Security hardening	Chain-ID binding in signatures, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality	✅ Complete
+B-Privacy — Unlinkable authorization	Selective disclosure, service-specific pseudonyms, zero-knowledge authorization	🔲 Pending
+C — Post-quantum credential storage	Encrypted credential storage using PQ key-establishment and authenticated encryption	🔲 Pending
+D — Integration	QCB wallets, personhood, Charmed Agents, enterprise authorization, private multisig	🔲 Pending
+E — Security testing	QR replay, phishing, session hijacking, key compromise, identity correlation, account recovery	🔲 Pending
+The Phase A/B implementation lives in chain-forge-node/src/auth.rs (challenge issuance and signature verification), chain-forge-wallet (native Rust ML-DSA wallet with encrypted key storage and sign-challenge CLI), and the execution layer (verify_mldsa_authorization() in chain-forge-execution). The adversarial test suite covers five scenarios against a live devnet: happy path, anti-replay, forged signature, wrong key, and unknown challenge ID. All five pass.
+
+The remaining phases (B-Privacy, C, D, E) are tracked in the engineering roadmap under milestone QCB-DIS-001. Phase B-Privacy depends on the privacy-preserving authorization research milestone (QCB-PM-001), which is recorded as research, not implementation.
+
+4.5.8 What this means for the identity layer's strategic claim
+Section 4.5 argues that the identity layer is the strategic asset — the thing that makes everything else on QCB defensible. DIS is what makes that asset usable by real applications.
+
+Without DIS, every service that wanted to verify a QCB identity would have to design its own authentication path, and each design would carry its own risks: key exposure, replay, cross-chain confusion, and classical-cryptography exposure. DIS standardizes the authentication path at the protocol layer, in the same way the identity layer standardizes the uniqueness guarantee at the protocol layer.
+
+This matters for the three strategic phases described in Section 4.6 (Strategic Directions — previously the sole occupant of this section number; the DIS material is inserted before it, and the strategic directions section is renumbered accordingly):
+
+Phase A (RWA compliance) requires verified holders. DIS is how a holder proves verification to an issuer without exposing their key.
+
+Phase B (Agent authorization) requires an accountable human sponsor. DIS is how a sponsor authenticates the authorization of an agent without exposing the sponsor's key.
+
+Phase C (general proof-of-personhood standard) requires that external systems can query QCB attestations. DIS is the authentication protocol those external systems would use.
+
+In each case, the pattern is the same: the identity layer establishes the fact, and DIS establishes the authentication mechanism by which the fact can be proven to a relying party without leaking the underlying secret.
+
+4.5.9 Open questions
+Three open questions attach to DIS and are tracked in the roadmap:
+
+Unlinkability across services (Phase B-Privacy / QCB-PM-001). Can unlinkable authorization be provided without zero-knowledge proofs, or is ZK required? The current design assumes ZK is required for the strongest property, but a pseudonym-based approach may be sufficient for some use cases at lower cost.
+
+Credential lifecycle (Phase C). How are credentials rotated, revoked, and recovered? This intersects with the identity liveness question (Open Question 24) and the cryptographic migration question (Open Question 16).
+
+Enterprise integration (Phase D). How does DIS authenticate on behalf of an enterprise-controlled resource or agent, where the authorizing human is not the direct key holder? This intersects with the Enterprise Authorization Tree design recorded in the roadmap.
+
 ---
 
 4.6 Strategic Directions: Three Phases, One Mechanism
