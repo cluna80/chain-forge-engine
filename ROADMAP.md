@@ -186,6 +186,23 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 **Prerequisite**: Phase 0 complete — includes cross-machine resource purchase acceptance test passing.
 
+### Validator Onboarding — Permissionless Entry via Stake Bond
+
+> **Design decision (October 2026)**: QCB mainnet should attract validators, not gatekeep them. The onboarding model is stake-based and permissionless — anyone who bonds the minimum uQCB can join the active validator set. No whitelist, no committee approval. Existing slashing (liveness + equivocation) is the Sybil defense.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `BondValidator` tx type | ⬜ | Lock uQCB as validator stake; candidate enters pending set |
+| `UnbondValidator` tx type | ⬜ | Start unbonding timer; stake released after cooldown period (prevents slash-and-run) |
+| Minimum bond threshold | ❓ | Design decision: low enough for individual participation, high enough to make Sybil attacks expensive |
+| Maximum active validator set size | ❓ | BFT doesn't scale to thousands of validators; cap at ~100–200, ranked by stake |
+| Stake-ranked validator set at epoch boundary | ⬜ | Top-N stakers automatically enter/exit active set; replaces manual `ValidatorSetChange` governance votes for routine churn |
+| Unbonding cooldown enforcement | ⬜ | Stake locked for N epochs after `UnbondValidator`; slashable during cooldown |
+| Validator commission rate | ⬜ | Validators take a configurable % of PoCD research rewards routed through their node |
+| Validator self-service docs | ⬜ | Operator guide: keygen → bond → run node → monitor → unbond |
+
+> **Relationship to personhood weighting**: Stake determines who is in the active set; personhood cap determines how much influence any one human can accumulate within that set. Both constraints apply simultaneously.
+
 ### Consensus — Personhood Weighting
 
 | Item | Status | Notes |
@@ -194,7 +211,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | `ValidatorInfo.pop_verified` gating in consensus | ⬜ | Only PoP-confirmed validators counted for quorum |
 | Stake → influence cap enforcement | ⬜ | See whitepaper §3.3 |
 | Validator liveness under partial-participation (Open Q14) | ❓ | How does finality behave if large fraction of verified humans go offline? |
-| Governance quorum floor enforcement | ⬜ | >3% turnout for ordinary QRC votes; >6% for constitutional (derived from §6.6) |
+| Governance quorum floor enforcement | ⬜ | >3% turnout for ordinary votes; >6% for constitutional (derived from §6.6) |
 
 ### Identity — Charm Confinement
 
