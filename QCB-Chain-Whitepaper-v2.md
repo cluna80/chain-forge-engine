@@ -325,14 +325,14 @@ The whitepaper describes a mechanism: identity and economy are coupled, neither 
 The identity is the door, and QCB's economy is what is behind it. A person who holds BTC, ETH, XRP, or SOL and wants the four unique capabilities described above — personhood governance, $QCB resource access and value capture, Charmed Agents, RWA compliance — verifies on QCB and participates. Their existing holdings are irrelevant to their verification; the identity is not a service their coins can access. It is a door that a person walks through, and what is behind it is QCB's own economy: the activity rewards they can earn, the agents they can run, the governance they can participate in, the assets they can issue with compliance built in. QCB does not want people's coins. It wants people, and the economy their participation creates is the thing that makes $QCB valuable. This is the inversion at the core of the design: most chains attract capital and hope people follow. QCB attracts people and the capital follows from what people do once they are here. Whether that inversion produces adoption is the empirical question that the rest of this document routes, correctly, to the pilot phases.
 
 
-4.5.1 Digital Identity Stone (DIS) — Authentication Without Key Exposure
+### 4.5.1.1 Digital Identity Stone (DIS) — Authentication Without Key Exposure
 The identity layer described in Section 4 answers a protocol-level question: is this participant a unique verified human? That is the uniqueness guarantee — the thing consensus, governance, and the resource economy all depend on. It is not, by itself, an answer to a second, separate question: how does a verified human authenticate to a service without exposing the key material that proves their identity?
 
 Those are different problems, and conflating them is a common failure in identity systems. The uniqueness guarantee is about what the protocol knows. Authentication is about how the human proves what the protocol already knows — to a service, to an application, to an agent acting on their behalf — without leaking the underlying secret every time they do.
 
 QCB addresses the second problem through a native component: the Digital Identity Stone (DIS). DIS is not the identity layer. It is the authentication layer that sits on top of it. The identity layer is the door. DIS is the key that opens it — and, critically, a key that never leaves the holder's device.
 
-4.5.2 Why authentication is a separate concern
+#### 4.5.1.2 Why authentication is a separate concern
 A naive design would let a service verify identity by receiving the user's public key directly. This fails for three reasons:
 
 Public-key exposure is permanent. Once a public key is transmitted to a service — logged, cached, or stored — it becomes a correlatable identifier. The user can be tracked across every service that learns the same key, even if each service only sees the key once.
@@ -343,7 +343,7 @@ Key exposure compounds risk. Every transmission of a signing secret — even a p
 
 DIS is designed around a single principle: the private key never leaves the wallet, and the public key is not transmitted unless the protocol explicitly requires it. Authentication happens through a temporary challenge-response exchange, not through key presentation.
 
-4.5.3 The authentication flow
+#### 4.5.1.3 The authentication flow
 The DIS authentication flow is deliberately simple, and deliberately scoped to a single use:
 
 User opens QCB application → challenge presented (QR code, deep link, or API)
@@ -357,7 +357,7 @@ The challenge is short-lived (60 seconds in the current implementation) and sing
 
 The QR code is the doorway, not the key. Scanning it initiates an authentication exchange; it does not transmit anything that can be used to forge a future authentication.
 
-4.5.4 What DIS does and does not guarantee
+#### 4.5.1.4 What DIS does and does not guarantee
 What DIS guarantees:
 
 Key non-exposure. The private key never leaves the wallet. Signatures are produced locally, on the device that holds the key.
@@ -378,7 +378,7 @@ Privacy of metadata. Timing, network origin, and challenge frequency are observa
 
 Device compromise protection. If the device holding the private key is compromised, DIS cannot protect the key. Encrypted-at-rest storage (Argon2id + AES-256-GCM in the current implementation) raises the cost of extraction but does not eliminate it. Hardware-backed key storage is a future direction.
 
-4.5.5 Relationship to the identity layer and the sovereignty constraint
+#### 4.5.1.5 Relationship to the identity layer and the sovereignty constraint
 DIS is a component of the identity layer, not a separate system. It uses the same ML-DSA key material that the wallet uses for transaction signing, and it produces addresses in the same namespace (qcb1pq… — derived from double-SHA-256 of the public key, distinguished from classical qcb1… addresses by prefix).
 
 This means DIS is subject to the same constitutional guarantees as the identity layer itself (Section 7.3):
@@ -389,7 +389,7 @@ Cryptographic agility. Because DIS uses ML-DSA, it inherits the cryptographic-pr
 
 Sovereignty. DIS does not introduce any external dependency. It does not call out to a government identity provider, a corporate biometric service, or a third-party authentication API. The challenge-response exchange is entirely between the user's wallet and the QCB node.
 
-4.5.6 The privacy-preserving authorization layer
+#### 4.5.1.6 The privacy-preserving authorization layer
 DIS Phase A/B covers authentication: proving control of a key. It does not, by itself, provide unlinkable authorization — the property that a service can verify "a valid identity authorized this" without learning which identity.
 
 That property requires a separate layer, built on top of DIS. Two mechanisms are under consideration:
@@ -400,7 +400,7 @@ Zero-knowledge authorization. A ZK credential layer proves possession of a valid
 
 Both mechanisms are recorded as future work. Neither is claimed as complete. The distinction between authentication (DIS Phase A/B, shipped) and authorization (privacy layer, pending) is deliberate and is maintained in the roadmap as separate milestones.
 
-4.5.7 Implementation status
+#### 4.5.1.7 Implementation status
 The Digital Identity Stone is implemented through Phase B as of October 2026.
 
 Phase	Scope	Status
@@ -414,7 +414,7 @@ The Phase A/B implementation lives in chain-forge-node/src/auth.rs (challenge is
 
 The remaining phases (B-Privacy, C, D, E) are tracked in the engineering roadmap under milestone QCB-DIS-001. Phase B-Privacy depends on the privacy-preserving authorization research milestone (QCB-PM-001), which is recorded as research, not implementation.
 
-4.5.8 What this means for the identity layer's strategic claim
+#### 4.5.1.8 What this means for the identity layer's strategic claim
 Section 4.5 argues that the identity layer is the strategic asset — the thing that makes everything else on QCB defensible. DIS is what makes that asset usable by real applications.
 
 Without DIS, every service that wanted to verify a QCB identity would have to design its own authentication path, and each design would carry its own risks: key exposure, replay, cross-chain confusion, and classical-cryptography exposure. DIS standardizes the authentication path at the protocol layer, in the same way the identity layer standardizes the uniqueness guarantee at the protocol layer.
@@ -429,7 +429,7 @@ Phase C (general proof-of-personhood standard) requires that external systems ca
 
 In each case, the pattern is the same: the identity layer establishes the fact, and DIS establishes the authentication mechanism by which the fact can be proven to a relying party without leaking the underlying secret.
 
-4.5.9 Open questions
+#### 4.5.1.9 Open questions
 Three open questions attach to DIS and are tracked in the roadmap:
 
 Unlinkability across services (Phase B-Privacy / QCB-PM-001). Can unlinkable authorization be provided without zero-knowledge proofs, or is ZK required? The current design assumes ZK is required for the strongest property, but a pseudonym-based approach may be sufficient for some use cases at lower cost.
