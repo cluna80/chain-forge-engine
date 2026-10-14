@@ -722,7 +722,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 29. **3-way PoCD epoch reward split — confirmed on 3-node devnet (2026-10-09)** ✅ **DONE** — All three miners (machine IDs: `qcb1devminer-alice`, `bob`, `dave`) running against Alice's node via `--machine` flag receive separate per-wallet uQCB credits at the block 720 epoch boundary. 100+ `pocd_reward distributed` log lines confirmed across all three wallets in a single epoch. Per-proof amounts: 29,259 / 36,574 / 48,765 / 60,957 / 73,148 uQCB (track-weighted). Confirmed devnet startup sequence: Alice node (no bootstrap) → Bob + Dave nodes (`--bootstrap /ip4/127.0.0.1/tcp/27000`) → all three miners pointing at Alice with distinct `--machine` flags. **Known gap**: PoCD proof pools are node-local — proofs submitted to Alice are not gossiped to Bob/Dave over P2P. See item 30 below.
 
-30. **PoCD proof pool P2P gossip** ⬜ **PENDING** — Each node's `DiscoveryRegistry` (proof store) is currently local-only. Proofs submitted to one node do not propagate to peers. Consequence: miners pointing at different nodes accumulate proofs in separate pools; only the node that received a proof awards it at epoch boundary. Phase 1 item: add `DiscoveryProof` gossip topic to the libp2p gossip layer so all nodes converge to the same proof pool before the epoch boundary fires.
+30. ~~**PoCD proof pool P2P gossip**~~ ✅ **DONE (commit `93a2018`)** — `GossipTopic::DiscoveryProof` added; proofs published to libp2p gossip layer and inserted into every node's `DiscoveryRegistry` on receipt; all nodes converge to the same proof pool before the epoch boundary fires. See Change Set R above.
 
 ---
 
@@ -764,6 +764,132 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 | **`scripts/pocd_miner.py` — rewritten with real per-track computation + multi-threading (2026-10-09)** | ✅ | Old miner used `random_output_hash()` (unverifiable); replaced with 5 deterministic per-track workers: **Mathematics** (Fibonacci(n), n seeded from challenge_id, 100–200 range; SHA256 of decimal string), **Cryptography** (real hash pre-image search — find `qcb-preimage-{N}` where SHA256 starts with `0`; seeded start nonce), **ComputationalEfficiency** (16×16 integer matrix multiply A×B mod 2^31; SHA256 of diagonal checksum), **PhysicsAndOpenScience** (4-dim lattice SVP — exhaustive [-6,6]^4 coefficient search over LCG-seeded basis; verifiable by any node from challenge_id alone), **AiAssistedDiscovery** (Sieve of Eratosthenes for π(n) where n seeded to 10k–50k range). Multi-threaded seal mining: `--threads N` (default: min(cpu_count, 8)); each thread searches independent random nonce range; `queue.Queue` + `threading.Event` for coordination. CLI additions: `--threads`, `--track all` (round-robin, new default), `--node carol` (127.0.0.1:8083). Python 3.8+ stdlib-only. |
 | **Genesis files upgraded — 5 challenge tracks, 8-bit difficulty (2026-10-09)** | ✅ | `tests/devnet/genesis-3node.json`: `min_seal_difficulty_bits` raised 4→8; `AiAssistedDiscovery` added to `challenge_tracks`; new `PhysicsAndOpenScience::devnet-lattice-1` challenge added; all 5 genesis challenges now have `seal_difficulty_bits: 8`; full `verification_criteria` strings (deterministic, reproducible by any verifier from challenge_id alone). `tests/devnet/genesis-4node.json`: full `pocd` block added (was absent); `treasury:pocd` genesis account added (50,000,000,000 uqcb); 5 genesis challenges added at 8-bit difficulty (Mathematics, Cryptography, ComputationalEfficiency, PhysicsAndOpenScience, AiAssistedDiscovery); `challenge_tracks` includes all 5. 4-node genesis is now PoCD-ready for testnet. |
 | Migrate `chain-forge-resource` seal functions to delegate to `chain-forge-pocd` | ⬜ | Remove duplication; `UsefulWorkReceipt` becomes a wrapper |
+
+---
+
+## Phase 0e — PoCD Scheduler, Verifier, and External Miner
+
+**Goal**: A production-grade PoCD pipeline that external machines can join. Dedicated scheduler distributes cryptographic challenge tasks across independent miners; independent verifiers reproduce and confirm results; `qcb-miner` binary ships as a standalone binary any operator can run.
+
+**Design principles**:
+- Scheduler, miner, and verifier are **separate binaries** — no compile-time dependency between them; all communication over HTTP.
+- Two-phase cascade enforces independent machine cooperation: a single machine cannot earn both phase-1 and phase-2 rewards for the same task.
+- No result is automatically classified as a cryptographic breakthrough or scientific discovery. Human review is always required.
+- Consensus (BFT) is entirely unaffected by PoCD mining activity.
+
+### Change Set L — PoCD Scheduler (`chain-forge-scheduler`) ✅ COMPLETE
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `chain-forge-scheduler` crate | ✅ | Standalone binary `qcb-scheduler`; workspace member |
+| Task lease model | ✅ | Tasks assigned with `lease_expires_at`; expired leases reassigned; HTTP 410 on late submit |
+| Two-phase cascade enforcement | ✅ | Phase-2 tasks always assigned to a different miner than phase-1 solver; scheduler enforces constraint |
+| Miner registration API | ✅ | `POST /scheduler/miners/register` — `{miner_id, workload_class}` |
+| Task poll API | ✅ | `GET /scheduler/miners/{id}/task?objective_id=…&workload_class=…`; HTTP 204 = no task available |
+| Result submission API | ✅ | `POST /scheduler/tasks/{id}/result`; 409 = lease superseded; 410 = lease expired |
+| Objective management API | ✅ | `GET /scheduler/objectives`; administrators create and manage research objectives |
+| Task range assignment | ✅ | Scheduler assigns `[range_start, range_end)` nonce ranges; miners search the assigned slice |
+| Result deduplication | ✅ | Duplicate result submissions rejected; idempotency preserved |
+| Independent verification queue | ✅ | Accepted results queued for verifier confirmation; quorum-based acceptance |
+
+### Change Set M — Two-Phase PoCD Protocol ✅ COMPLETE
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Phase-1 algorithm | ✅ | `SHA-256(seed_le64 ∥ nonce_le64)` ≥ 16 leading zero bits; content hash = `SHA-256(H1)` |
+| Phase-2 algorithm | ✅ | `SHA-256(H1_bytes ∥ nonce_le64)` ≥ 8 leading zero bits; content hash = `SHA-256(H1 ∥ H2)` |
+| Parent-hash chaining | ✅ | Phase-2 task carries `parent_hash` (hex-encoded H1) from phase-1 winner; scheduler supplies it |
+| Cross-machine constraint | ✅ | Scheduler never assigns phase-2 to the phase-1 solver; miner binary is unaware of constraint |
+| Content hash derivation | ✅ | Phase-1: `SHA-256(H1_bytes)`; Phase-2: `SHA-256(H1_bytes ∥ H2_bytes)` — combined two-machine proof |
+
+### Change Set N — `chain-forge-miner` (`qcb-miner` binary) ✅ COMPLETE
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `chain-forge-miner` crate | ✅ | Workspace member; `qcb-miner` standalone binary; zero compile-time deps on other chain-forge crates |
+| CLI (`clap`) | ✅ | `--node-url`, `--miner-id`, `--objective-id`, `--workload-class`, `--poll-interval-secs`, `--algorithm-version`, `--workload-version`; all flags have env var equivalents (`QCB_NODE_URL`, etc.) |
+| `solve_phase1()` | ✅ | Searches `[range_start, range_end)` nonces; returns winning nonce + H1 when ≥ 16 leading zero bits found |
+| `solve_phase2()` | ✅ | Decodes parent_hash hex; searches nonces; returns winning nonce + H2 when ≥ 8 leading zero bits found |
+| `spawn_blocking` for CPU work | ✅ | All SHA-256 nonce search runs in `tokio::task::spawn_blocking`; async runtime never blocked |
+| Event loop | ✅ | Register → poll → solve → submit → loop; `poll_interval_secs` configurable (default 5s) |
+| HTTP 409 / 410 handling | ✅ | Lease superseded (409) and lease expired (410) logged as WARN and miner continues |
+| `SchedulerClient` | ✅ | Thin async wrapper; 30s timeout; rustls-tls (no OpenSSL dep) |
+| `MinerError` enum | ✅ | `Http`, `Scheduler`, `Deserialize`, `LeaseExpired`, `LeaseSuperseded`, `Forbidden`, `Worker` |
+| 13 unit tests | ✅ | Phase-1 and phase-2 solvers; determinism; cross-miner content-hash agreement; avalanche seed derivation; hamming-distance consistency; invalid-hex parent-hash graceful None |
+
+### Change Set N+1 — Avalanche Experiments ✅ COMPLETE
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `solve_avalanche()` | ✅ | Deterministic; two SHA-256 calls; no nonce search |
+| Canonical seed derivation | ✅ | `SHA-256("qcb-avalanche-v1" ∥ objective_id_utf8 ∥ seed_index_le64)` |
+| Bit-flip experiment | ✅ | `original_hash = SHA-256(canonical_seed)`; bit `bit_index` flipped; `flipped_hash = SHA-256(flipped_seed)` |
+| XOR diff + Hamming distance | ✅ | `xor_diff = original_hash XOR flipped_hash`; `hamming_dist = popcount(xor_diff)` |
+| Content hash | ✅ | `SHA-256(original_hash_bytes ∥ flipped_hash_bytes)` |
+| Task dispatch | ✅ | `task_kind == "avalanche_experiment" | "avalanche_replication"` → `solve_avalanche()`; otherwise → phase-based PoCD solver |
+| Avalanche test coverage | ✅ | Seed derivation determinism; hamming-distance consistency; cross-miner agreement |
+
+### Change Set O — Consensus Vote Security Fix ✅ COMPLETE
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Fail-closed empty-signature guard | ✅ | Consensus votes with an empty or zero-length signature are rejected before verification attempt; previously could panic or accept; now hard-fail |
+| Regression tests | ✅ | Empty-sig vote rejected at the consensus layer; existing adversarial gossip tests unaffected |
+
+### Change Set P — Authenticated PoCD Verification (`chain-forge-verifier`, `qcb-verifier`) ✅ P1–P5 COMPLETE
+
+| Phase | Item | Status | Notes |
+|-------|------|--------|-------|
+| P1 | `chain-forge-verifier` crate | ✅ | Workspace member; `qcb-verifier` binary; verifier reproduces miner hash and confirms or rejects |
+| P1 | `qcb-keygen` binary | ✅ | Standalone key-generation tool; creates ML-DSA-65 verifier keypairs; keys stored encrypted at rest |
+| P2 | Verifier result signing | ✅ | Accepted results signed with ML-DSA-65; signature included in verification response |
+| P3 | Scheduler verifier API | ✅ | `POST /scheduler/tasks/{id}/verification`; verifier submits signed acceptance/rejection |
+| P4 | Quorum logic | ✅ | Scheduler accepts result as canonical after N independent verifier confirmations (configurable) |
+| P5 | Sybil resistance (rate-limiting) | ✅ | Per-verifier submission rate limit; Sybil-flooding of verification queue blocked |
+| P6 | Devnet demo — verifier Sybil protection | ⬜ | 7 adversarial scenarios: duplicate verifier, fake quorum, replayed verification, spoofed verifier ID, quorum stuffing, late verification, verifier collusion; devnet proof required |
+
+### Change Set R — P2P Proof Gossip ✅ COMPLETE (commit `93a2018`)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `GossipTopic::DiscoveryProof` | ✅ | New gossip topic; miners publish accepted PoCD proofs to the libp2p gossip layer |
+| Proof gossip handler in `chain-forge-node` | ✅ | Nodes receive gossiped proofs and insert into their local `DiscoveryRegistry` |
+| Cross-node proof pool convergence | ✅ | All nodes converge to same proof set before epoch boundary; resolves item 30 (node-local proof pool isolation) |
+| Anti-spam guards | ✅ | Duplicate proofs rejected at gossip layer; proof already in registry silently dropped |
+| Proof gossip integration tests | ✅ | Proof submitted to Alice propagates to Bob and Dave before epoch close |
+
+### Change Set T — Light P2P Resource/Capacity Discovery ✅ COMPLETE (commit `bd9d4ff`)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `GossipTopic::CapacityAd` | ✅ | New gossip topic; nodes broadcast `CapacityAdGossip { node_id, cpu_free_pct, mem_free_pct, disk_free_gb, timestamp_secs }` |
+| `PeerCapacityTable` | ✅ | In-memory table; 500-entry bounded; 5-minute TTL eviction; O(N) scan, no flood-fill |
+| `GET /api/peers/capacity` | ✅ | REST endpoint returns current table; scheduler can query to prefer idle nodes for task assignment |
+| Advisory-only semantics | ✅ | Capacity ads are hints, not commitments; no consensus dependency; stale/missing entries handled gracefully |
+| Anti-spam rate limiting | ✅ | 30-second per-peer rate limit on capacity ad acceptance; flood of ads from one peer ignored |
+| Capacity ad integration tests | ✅ | Ad broadcast, table insertion, TTL eviction, anti-spam guard all tested |
+| `qcb-miner` does not send capacity ads | ✅ | Capacity ads are emitted by `chain-forge-node`; miner's queue depth reflected indirectly if co-hosted with a node |
+
+### Item 5 — External Miner Documentation ✅ COMPLETE (commit `0e589ec`)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `chain-forge-miner/README.md` | ✅ | Developer-facing crate README: build commands, test summary (13/13), architecture, two-phase cascade table, task dispatch logic, scheduler API surface, dependency table, invariants |
+| `docs/QCB-Miner-External-Guide.md` | ✅ | Complete operator guide: prerequisites, quick-start, full CLI reference, algorithm specs, task lease semantics, running multiple miners, structured log event guide, env var table, systemd unit example, troubleshooting, security notes, capacity ad context, protocol invariants, API endpoint reference |
+
+### PoCD Devnet Acceptance Test Results ✅ 9/9 PASSING
+
+| Test | Result | Notes |
+|------|--------|-------|
+| Phase-1 SHA-256 preimage search (16-bit difficulty) | ✅ | Solver finds winning nonce in assigned range |
+| Phase-2 chained search (8-bit difficulty, parent-hash dep) | ✅ | H1 bytes chained correctly; different miner enforced |
+| Determinism across multiple solver runs | ✅ | Same seed + nonce always produces same hash |
+| Phase-2 cross-miner content-hash agreement | ✅ | `SHA-256(H1 ∥ H2)` agrees across independent solvers |
+| Avalanche seed derivation (deterministic by `(objective_id, seed_index)`) | ✅ | Canonical seed reproducible by any machine |
+| Avalanche hamming-distance consistency | ✅ | XOR diff + popcount verified against reference |
+| Invalid-hex parent-hash returns `None` gracefully | ✅ | No panic; solver returns None cleanly |
+| Result deduplication (duplicate submit rejected) | ✅ | HTTP 409 on duplicate; miner continues |
+| Lease expiry handling | ✅ | HTTP 410 logged as WARN; miner moves on |
 
 ---
 
