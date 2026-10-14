@@ -20,13 +20,12 @@
 
 **Goal**: A working, partition-tolerant BFT consensus engine plus one complete, adversarially-verified, cross-machine resource purchase and a live PoCD research pipeline — Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios. Separately, external miners submit SHA-256 cryptographic discovery proofs that are independently verified and rewarded in uQCB from `treasury:pocd-research`.
 
-**Token model (current)**:
-- **QCB** — the native chain token; staked by validators, earned by miners at 1,000,000 uQCB → 1 QCB.
-- **uQCB** — micro-QCB; PoCD research rewards paid from `treasury:pocd-research` in uQCB; accumulates toward QCB conversion at the fixed ratio above.
-- **QRC** — resource marketplace token; used for job escrow (`LockQrcForJob` / `ReleaseQrcForJob`); purchased from QCB via `PurchaseQrc`; **not used for PoCD rewards**.
-- **QRC is not minted by providing capacity.** Provider payment = releasing pre-escrowed QRC from the job escrow. `chain-forge-qrc` handles money; `chain-forge-resource` handles what was bought with it.
+**Token model (current — single token)**:
+- **QCB / uQCB** — the one and only token on QCB Chain. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, escrow, job payments, PoCD rewards, staking, and governance use uQCB. There is no second token.
+- **PoCD research rewards** — paid from `treasury:pocd-research` in uQCB.
+- **Job escrow** — `LockQrcForJob` / `ReleaseQrcForJob` tx types operate in uQCB despite the legacy "Qrc" name; no `PurchaseQrc` step is needed or used.
 
-> **Note**: The `CreditProvider` and `QrcContributionSettle` tx types remain in the codebase as legacy primitives from the original contribution-minting model. Do not build new dependencies on them — see QRC Money Layer below.
+> **QRC is retired.** `chain-forge-qrc` (`QrcEngine`, `uqrc` balances, `PurchaseQrc`, `QrcContributionSettle`, `CreditProvider`) remains compiled into the workspace as a vestigial crate but is not active in any current devnet flow. The "Qrc" in escrow tx type names is a naming artifact — those tx types already operate entirely in uQCB. A future cleanup change set will rename the escrow tx types and formally remove or tombstone the `chain-forge-qrc` crate.
 
 ### Consensus & Networking
 
@@ -66,24 +65,26 @@
 
 > **Security hardening milestones QCB-CS-001 and QCB-KR-001** are Phase 1 items that build directly on the work above. See Phase 1 → Cryptographic Security Hardening.
 
-### QRC Money Layer (`chain-forge-qrc`) — Reclassified
+### QRC Layer (`chain-forge-qrc`) — Retired
 
-> **What changed**: `chain-forge-qrc` is now solely responsible for QRC as currency. It does not define jobs, match providers, or settle resource-specific receipts — that moves to `chain-forge-resource`. Each existing component is classified below.
+> **QRC is a retired concept.** QCB Chain is a single-token chain. All balances, escrow, job payments, PoCD rewards, staking, and governance use **uQCB** only. The `chain-forge-qrc` crate remains compiled into the workspace as a vestigial artifact but none of its logic runs in any active devnet flow.
 
 | Component | Status | Direction |
 |-----------|--------|-----------|
-| `QrcEngine`, `ResourceKind` (7 types), serde + persistence | ✅ | **Keep** — QRC account balances, conversion rate, pricing foundation |
-| Dynamic conversion rate (Control 1) | ✅ | **Keep** — congestion-based QCB→QRC rate; still valid pricing signal |
-| Epoch conversion cap (Control 2) | ✅ | **Keep** — prevents adversarial conversion flooding |
-| CoverageRatio circuit breaker (Control 5) | ✅ | **Re-evaluate** — designed for contribution-minting model; review after escrow settlement is wired |
-| Per-resource congestion pricing | ✅ | **Keep** — excellent marketplace signal; wires into resource discovery |
-| `PurchaseQrc` tx type | ✅ | **Keep** — QCB→QRC on-ramp; job-scoped buy-in path still needed |
-| `CapacityReport` / `CapacityEvidence_v0` | ✅ | **Evolve** → `ResourceExecutionReceipt` in `chain-forge-resource`; same Byzantine-resistant median, new meaning: "job fulfilled" not "capacity contributed" |
-| `CreditProvider` tx type | ✅ | **Legacy / under review** — minting-era primitive; not the right primitive for escrow release; do not build new dependencies on it |
-| `QrcContributionSettle` | ✅ | **Legacy / under review** — contribution-minting model artefact; defer pending revised issuance model |
-| Consumption burn (Control 4) — `p_burn = 0.25` | ✅ | **Re-evaluate** — burning the money providers expect to receive is wrong; suspend automatic burn until escrow/revenue-policy design settles |
-| On-chain capacity tracking (Control 3) | ✅ | **Keep for market health** — use for discovery pricing + CR; not for minting |
-| Node-layer CR exposure (block header / chain event) | ⬜ | **Keep** — light clients / agents need current CR; header schema must stabilize first |
+| `QrcEngine`, `uqrc` balances, serde + persistence | ⬜ | **Retired** — no active code path; not called in any current devnet flow |
+| Dynamic QCB→QRC conversion rate (Control 1) | ⬜ | **Retired** — second token does not exist; rate has no meaning |
+| Epoch conversion cap (Control 2) | ⬜ | **Retired** — no conversion path exists |
+| CoverageRatio circuit breaker (Control 5) | ⬜ | **Retired** — designed for a contribution-minting model that was abandoned |
+| Per-resource congestion pricing in QRC | ⬜ | **Retired** — resource pricing now expressed in uQCB |
+| `PurchaseQrc` tx type | ⬜ | **Retired** — no QCB→QRC on-ramp needed; single token only |
+| `CapacityReport` / `CapacityEvidence_v0` | ⬜ | **Superseded** → `ResourceExecutionReceipt` in `chain-forge-resource` |
+| `CreditProvider` tx type | ⬜ | **Retired** — minting-era primitive; never used in uQCB flows |
+| `QrcContributionSettle` | ⬜ | **Retired** — contribution-minting model artifact |
+| Consumption burn (Control 4) — `p_burn = 0.25` | ⬜ | **Retired** — burning uQCB held by providers was never activated |
+| On-chain capacity tracking (Control 3) | ⬜ | **Retired** — capacity ads handled by Change Set T (`GossipTopic::CapacityAd`) |
+| `LockQrcForJob` / `ReleaseQrcForJob` tx type names | ✅ | **Legacy naming artifact** — these tx types operate entirely in uQCB; a future cleanup change set will rename them to remove the "Qrc" reference |
+
+> A future cleanup change set will formally tombstone or remove `chain-forge-qrc` and rename the escrow tx types to `LockUqcbForJob` / `ReleaseUqcbForJob`.
 
 ### Resource Market Layer (`chain-forge-resource`) — NEW CRATE
 
@@ -96,21 +97,21 @@
 | `ResourceJob` state machine | ✅ | Full `CREATED→FUNDED→MATCHED→RUNNING→(COMPLETED/FAILED)→(VERIFIED/REFUND)→SETTLED` + `DISPUTED→RESOLUTION` branch; `is_terminal()` guard; 9 unit tests covering all paths + invalid-transition rejection |
 | `ResourceExecutionReceipt` | ✅ | `ResourceExecutionReceipt` + `UsefulWorkReceipt`; `compute_seal_hash`, `find_seal_nonce`, `meets_difficulty`, `verify_seal`; 6 unit tests |
 | P2P resource discovery | ⬜ | Agents broadcast `ResourceRequest` over libp2p gossip; providers respond with `ResourceOffer`; live availability stays off-chain; only economically important commitments/results go on-chain |
-| QRC escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ✅ | Agent locks QRC before job starts; provider receives only on verified completion; refund path for failure/timeout; N3/N4/N5 guards tested; `DisputeResourceJob` stub for Phase 1; `RefundReason` enum covers all failure cases |
+| uQCB job escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ✅ | Agent locks uQCB before job starts; provider receives only on verified completion; refund path for failure/timeout; N3/N4/N5 guards tested; `DisputeResourceJob` stub for Phase 1; `RefundReason` enum covers all failure cases. Note: tx type names carry legacy "Qrc" label — amounts are entirely in uQCB |
 | `ResourceNode` prototype (Machine 2) | ⬜ | Machine 2 (Carol) advertises: `ProviderID`, `SponsorID`, **`MachineID`**, resource capabilities, `container_execution` + `python_execution` runtime types, availability, price, location/latency region, resource limits |
 | Secure workload sandbox (container) | ⬜ | Resource providers cannot execute arbitrary agent code on bare host; Docker/container prototype for Phase 0; note: production hostile multi-tenant workloads need stronger isolation — containers are a Phase 0 approximation only |
 | Job cancellation / failure / timeout handling | ⬜ | Explicit handling for: provider disappear mid-job, agent sends invalid workload, connection fails, provider produces wrong output, agent falsely claims failure, provider claims completion but result is unusable |
 
 ### Agent Economic Identity (AEI) — Moved forward from Phase 4
 
-> Required to properly test the new QRC resource model. Without it you cannot prove Alice's agent cannot exceed Alice's authorization.
+> Required to properly test the resource escrow model. Without it you cannot prove Alice's agent cannot exceed Alice's authorization.
 
 | Item | Status | Notes |
 |------|--------|-------|
 | `AgentID` + `SponsorID` linkage primitive | ✅ | `AgentId` in `chain-forge-resource`; `SponsorId` in `MachineRecord.owner`; `MachineID → ProviderID → SponsorID` hierarchy is expressed via `ProviderOwner` |
 | **`MachineID` formalization** | ✅ | `MachineRecord { machine_id, owner: ProviderOwner, attestation_key, capability_descriptor, mode, status }`; `MachineAttestationKey` (Ed25519 pubkey, base64); `MachineStatus` (Pending/Active/Inactive/Banned) |
 | **`ProviderOwner` enum** | ✅ | `enum ProviderOwner { Individual(SponsorId), Enterprise(EnterpriseId) }` — defined; Phase 0 uses `Individual(Carol)`; Phase 1 adds `Enterprise(Acme)` without ripping apart ResourceJob, escrow, or discovery |
-| `AgentTreasury` primitive | ✅ | `treasury:{agent_id}` virtual account; credited by `DepositToTreasury` tx; debited by `LockQrcForJob` (treasury-first, fallback to agent wallet); `per_job_limit_uqrc` cap enforced at execution; sponsor gate on deposit |
+| `AgentTreasury` primitive | ✅ | `treasury:{agent_id}` virtual account; credited by `DepositToTreasury` tx; debited by `LockQrcForJob` (treasury-first, fallback to agent wallet) in uQCB; `per_job_limit_uqrc` cap enforced at execution; sponsor gate on deposit |
 | `CapabilitySet` + `SpendingLimits` | ✅ | `SpendingLimits` struct (`epoch_limit`, `lifetime_limit`, `max_balance`, `per_job_limit`); `check_per_job()` enforcer; `resource_agent()` preset; agent cannot exceed sponsor's authorization |
 | `RevenuePolicy` primitive | ⬜ | Configurable destination for agent revenue; e.g. `Sponsor: 30% / AgentTreasury: 60% / Reserve: 10%`; successful service settles automatically |
 
