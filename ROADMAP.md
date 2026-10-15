@@ -1,4 +1,4 @@
-# Chain Forge / QCB Chain — Engineering Roadmap
+# Chain Forge / Qattice — Engineering Roadmap
 
 > **How to use this doc**: This is the running reference for what's done, what's next, and what's on the horizon. Update it when a milestone ships. Cross-reference the whitepaper (`QCB-Chain-Whitepaper-v2.md`) for economic design rationale; this doc is the engineering view.
 
@@ -15,6 +15,8 @@
 | ❓ | Open question / design decision needed |
 
 ---
+### The name is Qattice, changed from QCB but still uses $QCB as the token to the ecosystem.
+
 
 ## Phase 0 — Chain Forge Engine Foundation
 
