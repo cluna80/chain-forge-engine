@@ -10,9 +10,9 @@ Abstract
 
 Qattice is a sovereign Layer-1 blockchain, built on Chain Forge — a from-scratch Rust blockchain engine — rather than on an existing framework like Cosmos SDK or Solana. QCB combines a novel consensus mechanism — Byzantine Fault Tolerant agreement with validator power weighted by verified personhood rather than raw stake — with four native protocol components: a single-token resource and value economy (burn $QCB to access network resources — compute, storage, ZK proving, oracle queries, AI inference, and bandwidth; earn uQCB for verified Grand Challenge work and convert to $QCB; $QCB supply contracts over time as usage burns it), alongside three charm-based agent and identity modules — Charm Confinement, Intrinsic Charm, and Charmed Agents.
 
-QCB does not derive its consensus, its state machine, or its core modules from any other chain's codebase. In this, it follows the lineage of Bitcoin and XRP Ledger — chains with their own original designs — while making a deliberate departure from both: consensus power tied to verified human identity rather than computational work or capital, and a monetary engine designed to circulate rather than accumulate. The chain is self-contained by design: no bridges, no wrapped assets, no interoperability that could allow unverified actors into the system.
+Qattice does not derive its consensus, its state machine, or its core modules from any other chain's codebase. In this, it follows the lineage of Bitcoin and XRP Ledger — chains with their own original designs — while making a deliberate departure from both: consensus power tied to verified human identity rather than computational work or capital, and a monetary engine designed to circulate rather than accumulate. The chain is self-contained by design: no bridges, no wrapped assets, no interoperability that could allow unverified actors into the system.
 
-The monetary engine described in Section 6 is contingent on one unvalidated component: the identity layer (Section 4). Until the identity layer is validated through the staged pilot process, $QCB's resource economy and Grand Challenge earnings should be understood as a research deployment, not a production system. QCB operates a single-token model: $QCB is both the resource access token (burn to use network capacity) and the value-capture asset (held, staked, appreciated). uQCB is a non-tradeable micro-denomination earned from verified Grand Challenge work and converted to $QCB at 1,000,000:1. A separate resource token (QRC) has been prototyped in `chain-forge-qrc` and may be introduced in a future phase if resource pricing genuinely requires separation from network ownership; until that need is demonstrated at scale, QCB is the sole protocol token. This document describes the intended steady-state system in full; the early-adoption phase — when the network is small and belief precedes evidence — is described in Section 8.
+The monetary engine described in Section 6 is contingent on one unvalidated component: the identity layer (Section 4). Until the identity layer is validated through the staged pilot process, $QCB's resource economy and Grand Challenge earnings should be understood as a research deployment, not a production system. QCB operates a single-token model: $QCB is both the resource access token (burn to use network capacity) and the value-capture asset (held, staked, appreciated). uQCB is a non-tradeable micro-denomination earned from verified Grand Challenge work and converted to $QCB at 1,000,000:1. A separate resource token (QRC) has been prototyped in `chain-forge-qrc` and may be introduced in a future phase if resource pricing genuinely requires separation from network ownership; until that need is demonstrated at scale, $QCB is the sole protocol token. This document describes the intended steady-state system in full; the early-adoption phase — when the network is small and belief precedes evidence — is described in Section 8.
 
 A note on dependency chains: the sections that follow trace a sequence of dependencies, each of which has its own precondition. Identity depends on sybil resistance. Sybil resistance depends on live-challenge ceremonies not being defeated by well-resourced bots. Resource economy depends on the Grand Challenge network reaching meaningful throughput. Each dependency is real and is named where it arises. The staged pilots described in Section 4 are designed to determine whether these dependencies resolve into solvable engineering and legal decisions, or whether some of them represent constraints the system cannot satisfy under its own stated principles. The document does not claim to know which outcome will prevail — only that the honest path is to name the chain and test it.
 
@@ -22,9 +22,9 @@ Vision: A Trustworthy Distributed Supercomputer for Humanity
 
 Distributed compute networks are not new. SETI@home pointed millions of machines at a single problem. Folding@home applied crowd-sourced cycles to protein simulation. Both produced real results. Both shared a fundamental limitation: a central organization decided the problem, collected the output, and published what it chose. Participants had no verifiable record of what their machine did, no accountability for results, and no say in what happened next.
 
-QCB's Grand Challenge architecture is a different thing entirely.
+Qattice's Grand Challenge architecture is a different thing entirely.
 
-Every machine on QCB is a first-class citizen on-chain — attested by a MachineID, with every ResourceExecutionReceipt cryptographically signed and hash-committed before any result is accepted. You cannot fake a discovery. You cannot claim credit for work you did not do. The network does not just solve a problem — it proves it solved it, in a form any independent machine can verify, on a ledger no single party controls.
+Every machine on Qattice is a first-class citizen on-chain — attested by a MachineID, with every ResourceExecutionReceipt cryptographically signed and hash-committed before any result is accepted. You cannot fake a discovery. You cannot claim credit for work you did not do. The network does not just solve a problem — it proves it solved it, in a form any independent machine can verify, on a ledger no single party controls.
 
 Discoveries pass through human review gates before any reward is issued or any acceptance is recorded. The Proof of Useful Discovery requirement — independent verifier reproduction, domain-expert quorum ratification — means the network cannot be gamed by volume. Every accepted result is something humans examined and confirmed.
 
@@ -40,7 +40,7 @@ This design points at the hardest open problems in science — not because they 
 
 None of these are unsolved because physicists are not smart enough. They are unsolved because the verified, coordinated compute does not exist yet.
 
-QCB is building it — not as a product, but as a protocol-layer public good that belongs to no one organization and can be governed away from no one's control.
+Qattice is building it — not as a product, but as a protocol-layer public good that belongs to no one organization and can be governed away from no one's control.
 
 The Name Is the Mission
 
@@ -48,7 +48,7 @@ The Large Hadron Collider is the largest, most complex scientific instrument hum
 
 But the LHC is centralized. CERN owns it. A handful of institutions control what gets studied. The data is vast but the governance is narrow. No individual scientist, no matter how brilliant, votes on what problem the collider works on next.
 
-QCB is the decentralized version of that ambition — not a physical collider, but a computational one. Instead of accelerating particles, it accelerates verified human and machine intelligence toward the hardest open problems. Instead of CERN governance, it has on-chain governance where every verified human has a voice in which challenges get activated next. Instead of a single facility in Geneva, it is distributed across machines worldwide — every one of them attested, every result verified, every discovery hash-committed on a ledger no single institution controls.
+Qattice is the decentralized version of that ambition — not a physical collider, but a computational one. Instead of accelerating particles, it accelerates verified human and machine intelligence toward the hardest open problems. Instead of CERN governance, it has on-chain governance where every verified human has a voice in which challenges get activated next. Instead of a single facility in Geneva, it is distributed across machines worldwide — every one of them attested, every result verified, every discovery hash-committed on a ledger no single institution controls.
 
 The name carries that weight deliberately:
 
@@ -180,7 +180,7 @@ What private commissions provide that no cloud provider can match: the result co
 
 The two tiers reinforce each other. Private commissions bring $QCB into the network from institutions and companies that need specific results. That $QCB funds verifiers, builds discovery bonus pools, and weights priority routing — the same mechanisms that serve the public tracks. A well-funded private commission pulls more machines onto the network, which deepens verifier coverage for the public tracks running alongside it.
 
-The QCB distributed supercomputer does not choose between serving humanity and serving a paying client. It does both at once.
+The Qattice distributed supercomputer does not choose between serving humanity and serving a paying client. It does both at once.
 
 ---
 
@@ -188,7 +188,7 @@ Equilibrium State: When the Network Becomes Alive
 
 Reaching equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. No single moment marks it. But there is a point at which the network stops being something that requires active maintenance to stay alive and becomes something that sustains itself.
 
-QCB defines Equilibrium State as the condition where:
+Qattice defines Equilibrium State as the condition where:
 
 · The validator set is large and geographically distributed enough that no regional outage, no coordinated departure, and no single bad actor can halt block production or reverse finality
 · The machine population is deep enough that every active Grand Challenge track has sufficient independent verifier machines to confirm results without any track going dark for lack of participants
@@ -215,16 +215,16 @@ The scale required is large. The timeline is long. Both facts are stated here pl
 
 ---
 
-1. What QCB Is
+1. What Qattice Is
 
-QCB Chain is a from-scratch Layer-1 blockchain, built on Chain Forge — a purpose-built Rust blockchain engine — rather than an existing chain framework. It provides four things no general-purpose chain offers natively, together, at the protocol layer:
+Qattice is a from-scratch Layer-1 blockchain, built on Chain Forge — a purpose-built Rust blockchain engine — rather than an existing chain framework. It provides four things no general-purpose chain offers natively, together, at the protocol layer:
 
 1. Personhood-weighted BFT consensus — validator power tied to verified human identity, not stake or hashpower
 2. Charm-based state confinement and agent representation — identity-scoped state and native support for autonomous agents as first-class chain citizens
 3. A working monetary engine — $QCB is the sole protocol token, serving as both the resource access token (burn $QCB to submit compute jobs; network usage drives deflationary pressure) and the value-capture asset (held, staked, appreciated); uQCB accumulates from verified Grand Challenge work and converts permissionlessly to $QCB at 1,000,000:1; a five-control resource solvency architecture enforces capacity invariants; a separate resource token (QRC) exists as a prototype in `chain-forge-qrc` and may be introduced if resource pricing separation earns its complexity cost at scale
 4. Full sovereignty — no dependency on another chain's consensus engine, module framework, or governance assumptions
 
-QCB's purpose is to be the substrate for a charm-based agent economy where identity, state confinement, agent behavior, consensus power, and money circulation are all protocol-level concerns — not application-layer add-ons.
+Qattice's purpose is to be the substrate for a charm-based agent economy where identity, state confinement, agent behavior, consensus power, and money circulation are all protocol-level concerns — not application-layer add-ons.
 
 ---
 
@@ -233,11 +233,11 @@ QCB's purpose is to be the substrate for a charm-based agent economy where ident
 Frameworks like Cosmos SDK (via CometBFT) and Solana offer fast paths to a working chain, but both come with inherited assumptions QCB is not willing to accept:
 
 · Stake-weighted consensus power — validator influence tracks capital, not verified humans. This directly conflicts with QCB's one-human-one-vote governance philosophy.
-· Framework dependency — QCB's consensus safety would depend on another project's codebase, upgrade cycle, and maintainers, not its own.
+· Framework dependency — Qattice's consensus safety would depend on another project's codebase, upgrade cycle, and maintainers, not its own.
 · No native identity layer — proof-of-personhood would have to be bolted on as an application-layer concern, disconnected from consensus and governance.
-· Shared infrastructure risk — bugs or exploits in a shared framework become QCB's risk, not just the framework's.
+· Shared infrastructure risk — bugs or exploits in a shared framework become Qattice's risk, not just the framework's.
 
-Building QCB from the ground up, in Rust, on its own engine (Chain Forge) removes all four constraints. The cost is real: this is a multi-year infrastructure project, not a fork-and-configure exercise. Bitcoin and XRP Ledger both took years to harden their original consensus designs under real adversarial conditions before being trusted with real value — QCB accepts the same timeline as the price of genuine sovereignty. The cost is not only development time — it is the competitive gap that opens while QCB builds from zero and existing L1s continue to harden and grow. Sovereignty has a price beyond the calendar.
+Building Qattice from the ground up, in Rust, on its own engine (Chain Forge) removes all four constraints. The cost is real: this is a multi-year infrastructure project, not a fork-and-configure exercise. Bitcoin and XRP Ledger both took years to harden their original consensus designs under real adversarial conditions before being trusted with real value — QCB accepts the same timeline as the price of genuine sovereignty. The cost is not only development time — it is the competitive gap that opens while QCB builds from zero and existing L1s continue to harden and grow. Sovereignty has a price beyond the calendar.
 
 ---
 
@@ -245,7 +245,7 @@ Building QCB from the ground up, in Rust, on its own engine (Chain Forge) remove
 
 3.1 The Mechanism
 
-QCB uses a Byzantine Fault Tolerant consensus algorithm (BFT family — the specific implementation is being developed via Chain Forge, which is designed to support multiple pluggable BFT variants). What makes QCB's consensus novel is not the BFT algorithm itself, but how validator power is assigned:
+Qattice uses a Byzantine Fault Tolerant consensus algorithm (BFT family — the specific implementation is being developed via Chain Forge, which is designed to support multiple pluggable BFT variants). What makes Qattice's consensus novel is not the BFT algorithm itself, but how validator power is assigned:
 
 Validator voting power is weighted by verified personhood, not stake.
 
@@ -253,8 +253,8 @@ Each verified human (per the identity layer in Section 4) can control a bounded 
 
 3.2 Why Not Proof of Work or Plain Proof of Stake
 
-· Proof of Work is energy-intensive and settlement-slow — directly at odds with QCB's goal of fast, low-cost resource transactions.
-· Plain Proof of Stake concentrates consensus power with capital, which conflicts with QCB's governance philosophy at the deepest layer of the system.
+· Proof of Work is energy-intensive and settlement-slow — directly at odds with Qattice's goal of fast, low-cost resource transactions.
+· Plain Proof of Stake concentrates consensus power with capital, which conflicts with Qattice's governance philosophy at the deepest layer of the system.
 
 Personhood-weighted BFT is the design that makes "one human, one vote" true from consensus up through governance, not just at the surface.
 
@@ -276,7 +276,7 @@ Proof-of-personhood is not an application built on QCB — it is wired into the 
 · Web-of-trust / social graph (e.g., BrightID, Circles) — no central authority, but gameable at scale without a strong backstop.
 · Live human-intelligence ceremonies (e.g., Idena's synchronized validation) — no government or corporate dependency, real sybil-resistance properties, but with real friction and an open engineering challenge against well-resourced bot farms.
 
-QCB's identity layer design has advanced past the research phase: the attestation guard mechanism (the on-chain sybil-resistance layer for the web-of-trust base) has been implemented through Phase D in `chain-forge-identity` and wired into the execution layer and node startup. The current direction — a decentralized web-of-trust base layer, strengthened by live-challenge ceremonies as a sybil-resistance backstop — is now code, not just design. It avoids both government and corporate control, consistent with QCB's sovereignty principle. This remains the single highest-risk open question in the entire system: every downstream mechanism (activity rewards, consensus weighting, governance, BME funding) depends on this layer holding up under real adversarial pressure. The attestation guard implementation is the first falsifiable step — a pilot that can now run against the concrete cost and sybil-rate targets below — before being treated as production-ready. See `docs/QCB-Attestation-Guard-Design.md` for the full guard design and `Section 11` for the Phase 0 checkpoint note.
+Qattice's identity layer design has advanced past the research phase: the attestation guard mechanism (the on-chain sybil-resistance layer for the web-of-trust base) has been implemented through Phase D in `chain-forge-identity` and wired into the execution layer and node startup. The current direction — a decentralized web-of-trust base layer, strengthened by live-challenge ceremonies as a sybil-resistance backstop — is now code, not just design. It avoids both government and corporate control, consistent with Qattice's sovereignty principle. This remains the single highest-risk open question in the entire system: every downstream mechanism (activity rewards, consensus weighting, governance, BME funding) depends on this layer holding up under real adversarial pressure. The attestation guard implementation is the first falsifiable step — a pilot that can now run against the concrete cost and sybil-rate targets below — before being treated as production-ready. See `docs/QCB-Attestation-Guard-Design.md` for the full guard design and `Section 11` for the Phase 0 checkpoint note.
 
 As a starting point for those targets (illustrative, not final — subject to revision as the pilot is designed): a sybil rate below 3% under adversarial red-team testing, and a per-verification cost below $5 per verified human. Naming even provisional numbers here converts the pilot from a procedural commitment into a falsifiable one; see Open Question 1 for where these get finalized against real pilot data.
 
@@ -292,11 +292,11 @@ This section names that explicitly, because the document otherwise distributes t
 
 Four unique capabilities, all requiring identity
 
-QCB offers four things no other chain offers, and every one of them requires identity verification:
+Qattice offers four things no other chain offers, and every one of them requires identity verification:
 
 Personhood-weighted consensus (Section 3) — validator power is bounded by verified human identity, not capital or compute. No other chain ties governance authority to verified personhood at the consensus layer. If you want to participate in a chain where one human's influence is structurally capped regardless of wealth, QCB is the only option, and it requires verifying as a human.
 
-Resource economy (Section 6.2) — verified resource providers earn $QCB through VCA-attested contribution (via escrow-release on job completion), and resource consumers burn $QCB to submit jobs. $QCB is the single resource claim on network compute, storage, ZK proving, oracle queries, AI inference, and bandwidth. No other chain implements a native resource economy whose solvency is enforced by an on-chain CoverageRatio circuit breaker. If you want to participate in a network where resource access is priced, rationed, and governed at the protocol layer — with provider economics tied directly to attested capacity — QCB is the only option, and the contribution path requires verified provider status.
+Resource economy (Section 6.2) — verified resource providers earn $QCB through VCA-attested contribution (via escrow-release on job completion), and resource consumers burn $QCB to submit jobs. $QCB is the single resource claim on network compute, storage, ZK proving, oracle queries, AI inference, and bandwidth. No other chain implements a native resource economy whose solvency is enforced by an on-chain CoverageRatio circuit breaker. If you want to participate in a network where resource access is priced, rationed, and governed at the protocol layer — with provider economics tied directly to attested capacity — Qattice is the only option, and the contribution path requires verified provider status.
 
 Charmed Agents with bounded authorization (Section 5.3) — autonomous agents are sponsored by verified humans, with cryptographic scoping of their economic footprint. No other chain has native agent identity with a human accountability chain. If you want to run an economic agent that a verified human is responsible for, QCB is the only option, and it requires a verified sponsor.
 
@@ -308,7 +308,7 @@ The coupling principle
 
 The identity layer has value only if it is coupled to the economy, and the economy has value only if it is coupled to the identity layer. Each direction of the coupling is a design decision:
 
-Identity gates participation (already specified): activity rewards, consensus power, governance votes, Charmed Agent sponsorship, and Sponsored Contract deployment all require verified identity. A non-verified actor cannot access QCB's economic plumbing.
+Identity gates participation (already specified): activity rewards, consensus power, governance votes, Charmed Agent sponsorship, and Sponsored Contract deployment all require verified identity. A non-verified actor cannot access Qattice's economic plumbing.
 
 Participation maintains identity (not yet specified): verified humans who never claim activity rewards, never vote, and never transact may be able to hold verification indefinitely. If so, identity becomes a free-standing credential that other systems can query without the holder participating in QCB's economy. This decouples identity from the chain and turns QCB into infrastructure for other chains' benefit — a public good that QCB cannot capture value from. A liveness requirement — some minimum periodic participation (activity reward claims, governance votes, or $QCB resource transactions) to maintain active verification status — closes this gap. The specific requirement is an open question (Open Question 24), but the principle is a founding commitment: identity and economic participation are coupled in both directions, not just one.
 
@@ -320,19 +320,19 @@ The design has to prevent this through the liveness requirement above, not hope 
 
 What this document does and does not claim
 
-The whitepaper describes a mechanism: identity and economy are coupled, neither works without the other, and the coupling creates something no other chain has built. Whether that mechanism becomes valuable is an empirical question the pilot phases must answer — through the identity layer validation in Section 4, the merchant adoption in Section 8, and the RWA demand described in Section 8.2. The document does not claim QCB will become the identity layer of the broader ecosystem, or that every chain will need it. Those outcomes depend on whether the mechanism works as designed, and no whitepaper can determine that in advance. The claim is narrower and stronger: the mechanism is real, the coupling is intentional, and the pilot will determine whether it holds.
+The whitepaper describes a mechanism: identity and economy are coupled, neither works without the other, and the coupling creates something no other chain has built. Whether that mechanism becomes valuable is an empirical question the pilot phases must answer — through the identity layer validation in Section 4, the merchant adoption in Section 8, and the RWA demand described in Section 8.2. The document does not claim Qattice will become the identity layer of the broader ecosystem, or that every chain will need it. Those outcomes depend on whether the mechanism works as designed, and no whitepaper can determine that in advance. The claim is narrower and stronger: the mechanism is real, the coupling is intentional, and the pilot will determine whether it holds.
 
-The identity is the door, and QCB's economy is what is behind it. A person who holds BTC, ETH, XRP, or SOL and wants the four unique capabilities described above — personhood governance, $QCB resource access and value capture, Charmed Agents, RWA compliance — verifies on QCB and participates. Their existing holdings are irrelevant to their verification; the identity is not a service their coins can access. It is a door that a person walks through, and what is behind it is QCB's own economy: the activity rewards they can earn, the agents they can run, the governance they can participate in, the assets they can issue with compliance built in. QCB does not want people's coins. It wants people, and the economy their participation creates is the thing that makes $QCB valuable. This is the inversion at the core of the design: most chains attract capital and hope people follow. QCB attracts people and the capital follows from what people do once they are here. Whether that inversion produces adoption is the empirical question that the rest of this document routes, correctly, to the pilot phases.
+The identity is the door, and Qattice's economy is what is behind it. A person who holds BTC, ETH, XRP, or SOL and wants the four unique capabilities described above — personhood governance, $QCB resource access and value capture, Charmed Agents, RWA compliance — verifies on Qattice and participates. Their existing holdings are irrelevant to their verification; the identity is not a service their coins can access. It is a door that a person walks through, and what is behind it is Qattice's own economy: the activity rewards they can earn, the agents they can run, the governance they can participate in, the assets they can issue with compliance built in. QCB does not want people's coins. It wants people, and the economy their participation creates is the thing that makes $QCB valuable. This is the inversion at the core of the design: most chains attract capital and hope people follow. QCB attracts people and the capital follows from what people do once they are here. Whether that inversion produces adoption is the empirical question that the rest of this document routes, correctly, to the pilot phases.
 
 
-### 4.5.1 Digital Identity Stone (DIS) — Authentication Without Key Exposure
+#Digital Identity Stone (DIS) — Authentication Without Key Exposure
 The identity layer described in Section 4 answers a protocol-level question: is this participant a unique verified human? That is the uniqueness guarantee — the thing consensus, governance, and the resource economy all depend on. It is not, by itself, an answer to a second, separate question: how does a verified human authenticate to a service without exposing the key material that proves their identity?
 
 Those are different problems, and conflating them is a common failure in identity systems. The uniqueness guarantee is about what the protocol knows. Authentication is about how the human proves what the protocol already knows — to a service, to an application, to an agent acting on their behalf — without leaking the underlying secret every time they do.
 
 QCB addresses the second problem through a native component: the Digital Identity Stone (DIS). DIS is not the identity layer. It is the authentication layer that sits on top of it. The identity layer is the door. DIS is the key that opens it — and, critically, a key that never leaves the holder's device.
 
-#### 4.5.2 Why authentication is a separate concern
+Why authentication is a separate concern
 A naive design would let a service verify identity by receiving the user's public key directly. This fails for three reasons:
 
 Public-key exposure is permanent. Once a public key is transmitted to a service — logged, cached, or stored — it becomes a correlatable identifier. The user can be tracked across every service that learns the same key, even if each service only sees the key once.
@@ -343,7 +343,7 @@ Key exposure compounds risk. Every transmission of a signing secret — even a p
 
 DIS is designed around a single principle: the private key never leaves the wallet, and the public key is not transmitted unless the protocol explicitly requires it. Authentication happens through a temporary challenge-response exchange, not through key presentation.
 
-#### 4.5.3 The authentication flow
+The authentication flow
 The DIS authentication flow is deliberately simple, and deliberately scoped to a single use:
 
 User opens QCB application → challenge presented (QR code, deep link, or API)
@@ -357,7 +357,7 @@ The challenge is short-lived (60 seconds in the current implementation) and sing
 
 The QR code is the doorway, not the key. Scanning it initiates an authentication exchange; it does not transmit anything that can be used to forge a future authentication.
 
-#### 4.5.4 What DIS does and does not guarantee
+What DIS does and does not guarantee
 What DIS guarantees:
 
 Key non-exposure. The private key never leaves the wallet. Signatures are produced locally, on the device that holds the key.
@@ -378,7 +378,7 @@ Privacy of metadata. Timing, network origin, and challenge frequency are observa
 
 Device compromise protection. If the device holding the private key is compromised, DIS cannot protect the key. Encrypted-at-rest storage (Argon2id + AES-256-GCM in the current implementation) raises the cost of extraction but does not eliminate it. Hardware-backed key storage is a future direction.
 
-#### 4.5.5 Relationship to the identity layer and the sovereignty constraint
+Relationship to the identity layer and the sovereignty constraint
 DIS is a component of the identity layer, not a separate system. It uses the same ML-DSA key material that the wallet uses for transaction signing, and it produces addresses in the same namespace (qcb1pq… — derived from double-SHA-256 of the public key, distinguished from classical qcb1… addresses by prefix).
 
 This means DIS is subject to the same constitutional guarantees as the identity layer itself (Section 7.3):
@@ -389,7 +389,7 @@ Cryptographic agility. Because DIS uses ML-DSA, it inherits the cryptographic-pr
 
 Sovereignty. DIS does not introduce any external dependency. It does not call out to a government identity provider, a corporate biometric service, or a third-party authentication API. The challenge-response exchange is entirely between the user's wallet and the QCB node.
 
-#### 4.5.6 The privacy-preserving authorization layer
+The privacy-preserving authorization layer
 DIS Phase A/B covers authentication: proving control of a key. It does not, by itself, provide unlinkable authorization — the property that a service can verify "a valid identity authorized this" without learning which identity.
 
 That property requires a separate layer, built on top of DIS. Two mechanisms are under consideration:
@@ -400,7 +400,7 @@ Zero-knowledge authorization. A ZK credential layer proves possession of a valid
 
 Both mechanisms are recorded as future work. Neither is claimed as complete. The distinction between authentication (DIS Phase A/B, shipped) and authorization (privacy layer, pending) is deliberate and is maintained in the roadmap as separate milestones.
 
-#### 4.5.7 Implementation status
+Implementation status
 The Digital Identity Stone is implemented through Phase B as of October 2026.
 
 Phase	Scope	Status
@@ -414,12 +414,12 @@ The Phase A/B implementation lives in chain-forge-node/src/auth.rs (challenge is
 
 The remaining phases (B-Privacy, C, D, E) are tracked in the engineering roadmap under milestone QCB-DIS-001. Phase B-Privacy depends on the privacy-preserving authorization research milestone (QCB-PM-001), which is recorded as research, not implementation.
 
-#### 4.5.8 What this means for the identity layer's strategic claim
+What this means for the identity layer's strategic claim
 Section 4.5 argues that the identity layer is the strategic asset — the thing that makes everything else on QCB defensible. DIS is what makes that asset usable by real applications.
 
 Without DIS, every service that wanted to verify a QCB identity would have to design its own authentication path, and each design would carry its own risks: key exposure, replay, cross-chain confusion, and classical-cryptography exposure. DIS standardizes the authentication path at the protocol layer, in the same way the identity layer standardizes the uniqueness guarantee at the protocol layer.
 
-This matters for the three strategic phases described in Section 4.6 (Strategic Directions — previously the sole occupant of this section number; the DIS material is inserted before it, and the strategic directions section is renumbered accordingly):
+This matters for the three strategic phases described in Section 4.6 (Strategic Directions):
 
 Phase A (RWA compliance) requires verified holders. DIS is how a holder proves verification to an issuer without exposing their key.
 
@@ -429,7 +429,7 @@ Phase C (general proof-of-personhood standard) requires that external systems ca
 
 In each case, the pattern is the same: the identity layer establishes the fact, and DIS establishes the authentication mechanism by which the fact can be proven to a relying party without leaking the underlying secret.
 
-#### 4.5.9 Open questions
+Open questions
 Three open questions attach to DIS and are tracked in the roadmap:
 
 Unlinkability across services (Phase B-Privacy / QCB-PM-001). Can unlinkable authorization be provided without zero-knowledge proofs, or is ZK required? The current design assumes ZK is required for the strongest property, but a pseudonym-based approach may be sufficient for some use cases at lower cost.
@@ -438,35 +438,37 @@ Credential lifecycle (Phase C). How are credentials rotated, revoked, and recove
 
 Enterprise integration (Phase D). How does DIS authenticate on behalf of an enterprise-controlled resource or agent, where the authorizing human is not the direct key holder? This intersects with the Enterprise Authorization Tree design recorded in the roadmap.
 
+None of these are blocking for Phase A/B, which is complete and tested. They are named here because the layer they belong to is the identity layer, and the identity layer's constitutional guarantees require that these questions have answers before the layer is treated as production-ready.
+
 ---
 
 4.6 Strategic Directions: Three Phases, One Mechanism
 
-Everything in this section is contingent on the identity layer pilot (Section 4) hitting its targets. If the pilot fails, this section describes directions that were considered and not pursued, not capabilities QCB has. That framing is deliberate — the document's discipline has been to name dependencies before claiming outcomes, and this section follows the same rule.
+Everything in this section is contingent on the identity layer pilot (Section 4) hitting its targets. If the pilot fails, this section describes directions that were considered and not pursued, not capabilities Qattice has. That framing is deliberate — the document's discipline has been to name dependencies before claiming outcomes, and this section follows the same rule.
 
 Subject to that caveat: if the identity layer holds up under adversarial testing, QCB has a three-phase strategy for becoming something larger than an activity rewards chain with good architecture. The three phases are the same mechanism pointed at three different markets in sequence.
 
 The shared mechanism
 
-QCB's identity layer answers verification questions: is this address a verified human, is this agent authorized, does this holder meet compliance requirements? Every external system that needs to answer a verification question is a potential consumer of QCB's identity layer. The three phases below are three markets where that question is being asked and where QCB's answer is structurally better than alternatives — not because it is more accurate, but because it provides the answer at the protocol layer rather than as a wrapper that has to be trusted separately from the chain.
+Qattice's identity layer answers verification questions: is this address a verified human, is this agent authorized, does this holder meet compliance requirements? Every external system that needs to answer a verification question is a potential consumer of QCB's identity layer. The three phases below are three markets where that question is being asked and where QCB's answer is structurally better than alternatives — not because it is more accurate, but because it provides the answer at the protocol layer rather than as a wrapper that has to be trusted separately from the chain.
 
 Phase A: RWA compliance (near-term, post-EVM)
 
-Market: RWA issuers who need verified holders for regulatory compliance. The traditional approach requires a separate KYC/AML stack, periodic re-verification, and a trust relationship between the issuer and the compliance provider. QCB's answer: every SponsorID-linked account is a verified human, and the verification is the protocol, not a wrapper. The issuer does not build a KYC stack; the chain provides one.
+Market: RWA issuers who need verified holders for regulatory compliance. The traditional approach requires a separate KYC/AML stack, periodic re-verification, and a trust relationship between the issuer and the compliance provider. Qattice's answer: every SponsorID-linked account is a verified human, and the verification is the protocol, not a wrapper. The issuer does not build a KYC stack; the chain provides one.
 
-What this requires: the permissioned EVM (Phase 5+ in the roadmap), RWA-ready compliance primitives (issuer registry, jurisdictional flags, transfer restrictions on non-verified receivers), and one real issuer willing to build on QCB rather than a purpose-built RWA chain.
+What this requires: the permissioned EVM (Phase 5+ in the roadmap), RWA-ready compliance primitives (issuer registry, jurisdictional flags, transfer restrictions on non-verified receivers), and one real issuer willing to build on Qattice rather than a purpose-built RWA chain.
 
-Success test: an RWA issuer uses QCB's identity layer as their compliance layer instead of building or licensing a separate one.
+Success test: an RWA issuer uses Qattice's identity layer as their compliance layer instead of building or licensing a separate one.
 
-Failure mode: no issuer finds QCB's compliance primitives sufficient, or the regulatory posture (Open Question 5) is unresolved in a way that makes QCB-native compliance legally uncertain. The strategy stops at Phase A.
+Failure mode: no issuer finds Qattice's compliance primitives sufficient, or the regulatory posture (Open Question 5) is unresolved in a way that makes Qattice-native compliance legally uncertain. The strategy stops at Phase A.
 
 Phase B: Agent authorization (mid-term, post-AEI)
 
-Market: external agent frameworks that need to verify which agents are authorized to act on behalf of which humans. The AEI (Agent Economic Identity) specification — SponsorID, CapabilitySet, SpendingLimits, ParentAgentID — provides a standard way to answer this question. An external system that accepts QCB's SponsorID attestations as authorization gets the same property QCB's own Charmed Agents have: a cryptographic guarantee that a verified human is accountable for the agent's actions.
+Market: external agent frameworks that need to verify which agents are authorized to act on behalf of which humans. The AEI (Agent Economic Identity) specification — SponsorID, CapabilitySet, SpendingLimits, ParentAgentID — provides a standard way to answer this question. An external system that accepts Qattice's SponsorID attestations as authorization gets the same property Qattice's own Charmed Agents have: a cryptographic guarantee that a verified human is accountable for the agent's actions.
 
-What this requires: the AEI specification formalized (currently a design sketch in this document, not a protocol specification), agent-to-agent settlement in $QCB functional, and one external agent framework willing to reference QCB's SponsorID scheme rather than its own.
+What this requires: the AEI specification formalized (currently a design sketch in this document, not a protocol specification), agent-to-agent settlement in $QCB functional, and one external agent framework willing to reference Qattice's SponsorID scheme rather than its own.
 
-Success test: an external agent framework accepts QCB SponsorID attestations as its authorization mechanism, without requiring those agents to run entirely on QCB.
+Success test: an external agent framework accepts Qattice SponsorID attestations as its authorization mechanism, without requiring those agents to run entirely on Qattice.
 
 Failure mode: the AEI specification proves incompatible with how external frameworks model agent identity, or no external framework finds the QCB-native guarantee compelling enough to integrate. The strategy stops at Phase B.
 
@@ -476,7 +478,7 @@ Market: any system that needs to verify a user is human — spam prevention, gov
 
 What this requires: a public attestation interface (any system can query "is this address a verified human" without learning which human), zero-knowledge proofs of identity properties (prove humanity without revealing identity), and at least one non-QCB system outside the agent or RWA verticals accepting QCB attestations as proof of humanity.
 
-Success test: a system with no other connection to QCB — not an RWA platform, not an agent framework — accepts QCB attestations as its proof-of-humanity mechanism.
+Success test: a system with no other connection to Qattice — not an RWA platform, not an agent framework — accepts Qattice attestations as its proof-of-humanity mechanism.
 
 Failure mode: Phase B succeeds but Phase C's market turns out to use identity differently (wanting government-backed attestations, biometric proofs, or social-graph trust that QCB's web-of-trust model doesn't provide). The strategy stops at Phase C.
 
@@ -484,7 +486,7 @@ What the three phases are and are not
 
 They are: a testable sequence where each phase uses the same identity layer infrastructure to serve a progressively larger market, and where each phase's success is a precondition for attempting the next.
 
-They are not: a prediction that QCB will become the ecosystem's identity layer. Section 4.5's caveat applies here too — the mechanism is real, the sequence is coherent, and whether it produces adoption is what the phases are designed to determine. Writing the phases into the whitepaper is not a commitment to completing them. It is a commitment to attempting Phase A if the pilot succeeds, attempting Phase B if Phase A succeeds, and attempting Phase C if Phase B succeeds. At each step, the strategy is tested against reality before the next step is claimed.
+They are not: a prediction that Qattice will become the ecosystem's identity layer. Section 4.5's caveat applies here too — the mechanism is real, the sequence is coherent, and whether it produces adoption is what the phases are designed to determine. Writing the phases into the whitepaper is not a commitment to completing them. It is a commitment to attempting Phase A if the pilot succeeds, attempting Phase B if Phase A succeeds, and attempting Phase C if Phase B succeeds. At each step, the strategy is tested against reality before the next step is claimed.
 
 The strategy is only as strong as the pilot. Everything above is downstream of the identity layer proving that it can detect sybils at scale, at a cost below $5 per verification, with a fraud rate below 3%. If the pilot misses those targets, Phase A never starts, and the strategic directions described here are archived as considered and not pursued rather than executed.
 
@@ -492,11 +494,11 @@ The strategy is only as strong as the pilot. Everything above is downstream of t
 
 5. Core Protocol Modules
 
-QCB has four native protocol-level components, implemented directly in the chain's own state machine rather than as smart contracts or SDK modules. Being protocol-level is not the same as being constitutional (Section 7.3): existing as native state-machine logic determines where these components run; the constitutional layer determines how hard they are to change. Charm Confinement and Intrinsic Charm's specific mechanics, and Charmed Agents' operating rules, are protocol-level but ordinary-governance-adjustable — they can be tuned as the system matures. Only the pieces named explicitly in Section 7.3 (the identity interface, the single-resource-token rule, and the sovereignty constraint) sit behind the higher constitutional bar. $QCB's resource economy parameters — conversion rate bounds, epoch cap coefficients, CoverageRatio thresholds, consumption burn fraction — are protocol-level and governance-adjustable (Section 6.6), but the single-resource-token rule they operate under is itself constitutional.
+Qattice has four native protocol-level components, implemented directly in the chain's own state machine rather than as smart contracts or SDK modules. Being protocol-level is not the same as being constitutional (Section 7.3): existing as native state-machine logic determines where these components run; the constitutional layer determines how hard they are to change. Charm Confinement and Intrinsic Charm's specific mechanics, and Charmed Agents' operating rules, are protocol-level but ordinary-governance-adjustable — they can be tuned as the system matures. Only the pieces named explicitly in Section 7.3 (the identity interface, the single-resource-token rule, and the sovereignty constraint) sit behind the higher constitutional bar. $QCB's resource economy parameters — conversion rate bounds, epoch cap coefficients, CoverageRatio thresholds, consumption burn fraction — are protocol-level and governance-adjustable (Section 6.6), but the single-resource-token rule they operate under is itself constitutional.
 
 5.0 What "Charm" Means
 
-"Charm" is QCB's term for a bundle of protocol-enforced properties — identity verification tier, decay-exemption credits, scope boundaries — that travel with a piece of state or an identity rather than being assigned or checked by an external application. A charm is intrinsic to what it's attached to, not a permission granted from outside it. The three modules below apply this concept in three different ways: confining state to its rightful context (5.1), attaching properties directly to identity (5.2), and extending first-class chain citizenship to autonomous agents (5.3).
+"Charm" is Qattice's term for a bundle of protocol-enforced properties — identity verification tier, decay-exemption credits, scope boundaries — that travel with a piece of state or an identity rather than being assigned or checked by an external application. A charm is intrinsic to what it's attached to, not a permission granted from outside it. The three modules below apply this concept in three different ways: confining state to its rightful context (5.1), attaching properties directly to identity (5.2), and extending first-class chain citizenship to autonomous agents (5.3).
 
 5.1 Charm Confinement
 Scoped state isolation at the protocol layer. Ensures identity-linked claims (such as activity reward claim rights) and agent-controlled resources remain bound to their defined context — one verified identity, one claim per epoch, with no cross-context leakage.
@@ -538,7 +540,7 @@ $QCB serves as the chain's sole resource token — a redeemable claim on network
 
 Note: everything in this section describes the tokenomics as designed. Their real-world behavior — particularly resource solvency (Section 6.10's five-control architecture) and the network's ability to fund meaningful burns — depends on the identity layer (Section 4) for VCA-verified provider attestation and on the network reaching meaningful resource utilization. See the Abstract for the dependency chain stated plainly.
 
-QCB Chain operates with a single protocol token — $QCB — that serves dual functions: resource access (burn to use network capacity) and value capture (hold, stake, appreciate). uQCB is the non-tradeable micro-denomination earned from Grand Challenge work, bound to the earning machine, and convertible permissionlessly to $QCB. This is not a simplification that sacrifices economic coherence — it is a deliberate architectural choice to avoid the complexity and bootstrapping cost of a two-token model until that complexity is justified by scale.
+Qattice operates with a single protocol token — $QCB — that serves dual functions: resource access (burn to use network capacity) and value capture (hold, stake, appreciate). uQCB is the non-tradeable micro-denomination earned from Grand Challenge work, bound to the earning machine, and convertible permissionlessly to $QCB. This is not a simplification that sacrifices economic coherence — it is a deliberate architectural choice to avoid the complexity and bootstrapping cost of a two-token model until that complexity is justified by scale.
 
 6.1 Design Principle: Single Token, Dual Role
 
@@ -854,18 +856,18 @@ Interface vs. implementation: what is constitutional is the identity interface �
 
 ---
 
-7.4 Chain Forge — The Foundation Beneath QCB
+7.4 Chain Forge — The Foundation Beneath Qattice
 
-QCB Chain is the first chain built on Chain Forge, a from-scratch Rust blockchain engine with a pluggable consensus architecture supporting multiple BFT algorithm variants. The two projects are related but distinct, and worth being explicit about:
+Qattice is the first chain built on Chain Forge, a from-scratch Rust blockchain engine with a pluggable consensus architecture supporting multiple BFT algorithm variants. The two projects are related but distinct, and worth being explicit about:
 
-Dimension | Chain Forge | QCB Chain
+Dimension | Chain Forge | Qattice Chain
 What it is | The engine — a Rust blockchain-building toolkit | The first chain built with that engine
 Audience | Developers building their own sovereign chains | Verified humans, merchants, agent operators
 Purpose | Infrastructure — makes sovereign, from-scratch chains possible without each builder re-solving consensus from zero | Flagship — proves the infrastructure works under real conditions
 Lifespan | An ongoing engine, evolving with each chain built on it | Intended to outlast any single team or founder
 Relationship | Foundation | First building on that foundation
 
-Chain Forge's current priority is its consensus module — building out multiple pluggable BFT variants (Tendermint-style, HotStuff-style, and an XRPL-inspired agreement model) so that QCB, and any future chain built on the engine, can select the algorithm that fits its needs rather than inheriting one hardcoded choice. QCB's personhood-weighted BFT (Section 3) is one configuration of that engine, not a separate codebase — validating Chain Forge's pluggable design is itself part of what QCB's launch needs to prove.
+Chain Forge's current priority is its consensus module — building out multiple pluggable BFT variants (Tendermint-style, HotStuff-style, and an XRPL-inspired agreement model) so that QCB, and any future chain built on the engine, can select the algorithm that fits its needs rather than inheriting one hardcoded choice. Qattice's personhood-weighted BFT (Section 3) is one configuration of that engine, not a separate codebase — validating Chain Forge's pluggable design is itself part of what Qattice's launch needs to prove.
 
 **Phase 0 progress as of September 2026.** The Chain Forge consensus engine has crossed its first major milestone: a 4-node Tendermint-style BFT testnet is producing and committing blocks under real network conditions. Specific achievements confirmed on the development network:
 
@@ -957,7 +959,7 @@ Concretely, that means:
 · Chain Forge (Section 7.4), being built from scratch rather than inheriting Cosmos SDK or Solana's cryptographic assumptions, should treat the signature scheme as pluggable from the start — the same architectural principle already applied to consensus (multiple BFT variants) and intended for identity (multiple PoP methods behind one interface). NIST has already standardized post-quantum signature schemes (ML-DSA/CRYSTALS-Dilithium, SLH-DSA/SPHINCS+, and FN-DSA/Falcon); Chain Forge does not need to invent new cryptography, only avoid hardcoding classical-only assumptions into its consensus and account-model code.
 · Given QCB's own roadmap timeline (Section 11 puts testnet 3–6+ years out), launching with a hybrid classical+post-quantum signature scheme, or a PQC-native scheme outright, is a materially lower-risk starting position than launching with pure ECDSA and treating PQC migration as a later retrofit. A chain designed for multi-decade survival should not launch already carrying its single most consequential cryptographic weakness by default.
 
-This tradeoff is real and worth stating plainly rather than deferring entirely: NIST's standardized ML-DSA (Dilithium) signatures run roughly 2.4KB against ECDSA's ~64 bytes — a two-order-of-magnitude size increase that lands directly on Section 8's fast, low-cost merchant-payment goal, since larger signatures mean larger transactions, more state growth, and more bandwidth per block. Falcon offers a smaller signature at the cost of a more complex, harder-to-implement-safely signing algorithm; SPHINCS+ is smaller still on the public key but produces the largest signatures of the three. There is no PQC option that matches ECDSA's compactness — adopting post-quantum signatures means accepting this cost somewhere in the stack, not engineering it away. This section does not resolve which specific algorithm QCB adopts, what triggers migration, or how the size cost is absorbed (larger blocks, fee adjustments, or a hybrid scheme that only pays the PQC cost for high-value or validator transactions) — those are addressed in Open Question 16.
+This tradeoff is real and worth stating plainly rather than deferring entirely: NIST's standardized ML-DSA (Dilithium) signatures run roughly 2.4KB against ECDSA's ~64 bytes — a two-order-of-magnitude size increase that lands directly on Section 8's fast, low-cost merchant-payment goal, since larger signatures mean larger transactions, more state growth, and more bandwidth per block. Falcon offers a smaller signature at the cost of a more complex, harder-to-implement-safely signing algorithm; SPHINCS+ is smaller still on the public key but produces the largest signatures of the three. There is no PQC option that matches ECDSA's compactness — adopting post-quantum signatures means accepting this cost somewhere in the stack, not engineering it away. This section does not resolve which specific algorithm Qattice adopts, what triggers migration, or how the size cost is absorbed (larger blocks, fee adjustments, or a hybrid scheme that only pays the PQC cost for high-value or validator transactions) — those are addressed in Open Question 16.
 
 ---
 
