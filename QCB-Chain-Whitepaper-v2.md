@@ -1,6 +1,6 @@
-QCB Chain Whitepaper
+Qattice - $QCB  Whitepaper
 
-QuarkCharmBit — A Sovereign, Ground-Up Layer-1 for Charm-Based Agent Economies
+Qattice — A Sovereign, Ground-Up Layer-1 for Charm-Based Agent Economies
 
 Money engineered to move. Agents engineered to work. Built from the ground up, owned by no one else's framework.
 
@@ -8,7 +8,7 @@ Money engineered to move. Agents engineered to work. Built from the ground up, o
 
 Abstract
 
-QCB Chain (QuarkCharmBit) is a sovereign Layer-1 blockchain, built on Chain Forge — a from-scratch Rust blockchain engine — rather than on an existing framework like Cosmos SDK or Solana. QCB combines a novel consensus mechanism — Byzantine Fault Tolerant agreement with validator power weighted by verified personhood rather than raw stake — with four native protocol components: a single-token resource and value economy (burn $QCB to access network resources — compute, storage, ZK proving, oracle queries, AI inference, and bandwidth; earn uQCB for verified Grand Challenge work and convert to $QCB; $QCB supply contracts over time as usage burns it), alongside three charm-based agent and identity modules — Charm Confinement, Intrinsic Charm, and Charmed Agents.
+Qattice is a sovereign Layer-1 blockchain, built on Chain Forge — a from-scratch Rust blockchain engine — rather than on an existing framework like Cosmos SDK or Solana. QCB combines a novel consensus mechanism — Byzantine Fault Tolerant agreement with validator power weighted by verified personhood rather than raw stake — with four native protocol components: a single-token resource and value economy (burn $QCB to access network resources — compute, storage, ZK proving, oracle queries, AI inference, and bandwidth; earn uQCB for verified Grand Challenge work and convert to $QCB; $QCB supply contracts over time as usage burns it), alongside three charm-based agent and identity modules — Charm Confinement, Intrinsic Charm, and Charmed Agents.
 
 QCB does not derive its consensus, its state machine, or its core modules from any other chain's codebase. In this, it follows the lineage of Bitcoin and XRP Ledger — chains with their own original designs — while making a deliberate departure from both: consensus power tied to verified human identity rather than computational work or capital, and a monetary engine designed to circulate rather than accumulate. The chain is self-contained by design: no bridges, no wrapped assets, no interoperability that could allow unverified actors into the system.
 
