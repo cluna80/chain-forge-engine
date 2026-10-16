@@ -11,6 +11,11 @@
 //! for FS-01.
 //!
 //! See `docs/FeeSponsor.md` for the full design.
+//!
+//! `store` (FS-02) adds persistent SponsorAccount storage, single-use
+//! auth_id replay tracking, and revocation on top of these primitives.
+
+pub mod store;
 
 use chain_forge_crypto::{MlDsaScheme, SchemeId, Signature, SignatureScheme};
 use serde::{Deserialize, Serialize};
@@ -27,8 +32,30 @@ pub struct SponsorAccount {
     pub sponsor_id: SponsorId,
     /// Public key bytes (ML-DSA public key expected by convention).
     pub public_key: Vec<u8>,
+    /// Pre-funded balance available to pay fees on users' behalf.
+    pub balance_uqcb: u128,
     /// Policy describing limits and allowed scopes.
     pub policy: SponsorPolicy,
+    /// Set by an immediate `revoke()`, or by `revoke_before_block()` to the
+    /// batch-revocation cutoff. Any SponsorAuthorization with
+    /// `issued_at_block <= revoked_until_block` is rejected (docs/FeeSponsor.md
+    /// "Revocation semantics").
+    pub revoked_until_block: Option<u64>,
+    /// uqcb spent so far in the current epoch; reset by `advance_epoch()`.
+    pub epoch_spent_uqcb: u128,
+}
+
+impl SponsorAccount {
+    pub fn new(sponsor_id: SponsorId, public_key: Vec<u8>, policy: SponsorPolicy) -> Self {
+        Self {
+            sponsor_id,
+            public_key,
+            balance_uqcb: 0,
+            policy,
+            revoked_until_block: None,
+            epoch_spent_uqcb: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,7 +65,7 @@ pub struct SponsorPolicy {
 }
 
 /// 128-bit single-use authorization id.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AuthId(pub [u8; 16]);
 
 /// SponsorAuthorization structure signed by sponsor's ML-DSA key.
