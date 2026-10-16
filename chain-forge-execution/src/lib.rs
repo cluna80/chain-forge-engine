@@ -28,6 +28,10 @@ use chain_forge_qrc::QrcEngine;
 use chain_forge_agents::{AgentStore, AgentType, SpendingLimits};
 use chain_forge_pocd::DiscoveryRegistry;
 
+/// Validator Onboarding — Permissionless Entry via Stake Bond. See
+/// ROADMAP.md, "Validator Onboarding" section.
+pub mod validator_bond;
+
 // -- Error --------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +98,8 @@ impl GasModel {
                     TxBody::Transfer { .. }          => op_multiplier * 2,
                     TxBody::Burn    { .. }           => op_multiplier * 3,
                     TxBody::Stake   { .. }           => op_multiplier * 5,
+                    TxBody::BondValidator { .. }     => op_multiplier * 5,
+                    TxBody::UnbondValidator          => op_multiplier * 5,
                     TxBody::Custom  { .. }           => op_multiplier * 10,
                     TxBody::ClaimUbi { .. }          => op_multiplier * 3,
                     TxBody::RedirectToUbiPool { .. } => op_multiplier * 3,
@@ -194,6 +200,22 @@ pub enum TxBody {
         validator: String,
         amount:    u128,
     },
+    /// Validator Onboarding (ROADMAP.md): bond uqcb as validator stake.
+    /// Sender is the validator candidate; incremental bonding is allowed --
+    /// whether the resulting total clears the minimum bond threshold only
+    /// matters for active-set eligibility, not for this tx succeeding.
+    /// See `validator_bond::ValidatorBondStore::bond()`.
+    BondValidator {
+        amount: u128,
+    },
+    /// Validator Onboarding (ROADMAP.md): begin unbonding the sender's
+    /// entire current validator stake. Stops counting toward the active
+    /// set immediately; funds remain locked (and slashable) for the
+    /// unbonding cooldown before a later `UnbondValidator` call sweeps
+    /// the matured amount back to the sender's balance. See
+    /// `validator_bond::ValidatorBondStore::start_unbond()` /
+    /// `sweep_matured()`.
+    UnbondValidator,
     /// Custom operation -- opaque payload for module-specific logic.
     /// Used by Charm Confinement, Intrinsic Charm, Charmed Agents.
     /// QRC operations now use typed variants below.
@@ -933,6 +955,8 @@ impl TxBody {
             TxBody::Transfer { .. }               => "Transfer",
             TxBody::Burn { .. }                   => "Burn",
             TxBody::Stake { .. }                  => "Stake",
+            TxBody::BondValidator { .. }          => "BondValidator",
+            TxBody::UnbondValidator               => "UnbondValidator",
             TxBody::Custom { .. }                 => "Custom",
             TxBody::ClaimUbi { .. }               => "ClaimUbi",
             TxBody::RedirectToUbiPool { .. }      => "RedirectToUbiPool",
@@ -1016,6 +1040,7 @@ fn advance_nonce_if_not_already(tx: &Transaction, state: &mut StateStore) {
         TxBody::Transfer { .. }
             | TxBody::Burn { .. }
             | TxBody::Stake { .. }
+            | TxBody::BondValidator { .. }
             | TxBody::ClaimUbi { .. }
             | TxBody::RedirectToUbiPool { .. }
             // QRC variants mutate account state via the QrcEngine but do NOT
@@ -1106,6 +1131,8 @@ impl Transaction {
             TxBody::Transfer { to, denom, .. }       => to.len() + denom.len() + 16,
             TxBody::Burn     { denom, .. }            => denom.len() + 16,
             TxBody::Stake    { validator, .. }        => validator.len() + 16,
+            TxBody::BondValidator { .. }               => 16,
+            TxBody::UnbondValidator                    => 8,
             TxBody::Custom   { module, payload }      => module.len() + payload.len(),
             TxBody::RegisterIdentity                  => 8,
             TxBody::Attest   { claimant_id }          => claimant_id.len() + 8,
@@ -1231,6 +1258,36 @@ impl Transaction {
             sender: sender.to_string(),
             nonce,
             body: TxBody::ClaimUbi { identity_id: identity_id.to_string() },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        }
+    }
+
+    /// Validator Onboarding (ROADMAP.md): bond uqcb as validator stake.
+    pub fn bond_validator(id: &str, sender: &str, amount: u128, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::BondValidator { amount },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        }
+    }
+
+    /// Validator Onboarding (ROADMAP.md): begin/complete unbonding.
+    pub fn unbond_validator(id: &str, sender: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::UnbondValidator,
             gas_limit: 50_000,
             signature: vec![],
             public_key: vec![],
@@ -1965,6 +2022,9 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
     match body {
         TxBody::Transfer { .. } | TxBody::Burn { .. } | TxBody::Custom { .. } => None,
         TxBody::Stake { .. } => Some("staking"),
+        // Validator Onboarding (ROADMAP.md) reuses the "staking" module --
+        // bonding/unbonding is the same economic gate as TxBody::Stake.
+        TxBody::BondValidator { .. } | TxBody::UnbondValidator => Some("staking"),
         TxBody::RegisterIdentity
         | TxBody::Attest { .. }
         | TxBody::RevokeAttestation { .. }
@@ -2172,6 +2232,107 @@ impl Executor {
                     identity.record_activity_by_address(&tx.sender);
                 }
                 result
+            }
+
+            // Validator Onboarding (ROADMAP.md). Bonded stake and the
+            // unbonding cooldown are tracked as on-chain balances of two
+            // deterministic virtual accounts per validator -- no private
+            // key ever controls them, same convention as `treasury:*`:
+            //   `validator-bond:{address}`      balance["uqcb"] = currently bonded
+            //   `validator-unbonding:{address}` balance["uqcb"] = amount cooling down
+            //                                    balance["unlock_epoch"] = epoch it unlocks at
+            // This keeps the rule set identical to what
+            // `validator_bond::ValidatorBondStore` specifies and tests in
+            // isolation, without threading a new store parameter through
+            // every call site of this function. Computing the stake-ranked
+            // active set (`validator_bond::ValidatorBondStore::active_set()`)
+            // from these accounts, and swapping it into the live
+            // ConsensusEngine's ValidatorSet at epoch boundaries, is the
+            // remaining integration work -- see the module doc comment in
+            // `validator_bond.rs` and ROADMAP.md.
+            TxBody::BondValidator { amount } => {
+                let bond_account = format!("validator-bond:{}", tx.sender);
+                state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
+                    .map(|_| {
+                        events.push(format!(
+                            "bond_validator: {} {} bonded by {}",
+                            amount, self.config.native_denom, tx.sender
+                        ));
+                        identity.record_activity_by_address(&tx.sender);
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::UnbondValidator => {
+                let bond_account = format!("validator-bond:{}", tx.sender);
+                let unbonding_account = format!("validator-unbonding:{}", tx.sender);
+                let current_epoch = identity.clock.current_epoch;
+
+                let currently_bonded = state.get_account(&bond_account)
+                    .map(|a| a.balance_of(&self.config.native_denom))
+                    .unwrap_or(0);
+
+                if currently_bonded > 0 {
+                    // New unbonding request: move the entire bonded amount
+                    // into the cooldown-locked account and stamp its
+                    // unlock_epoch. Only reachable when currently_bonded > 0,
+                    // which is already false while a prior unbonding entry
+                    // is outstanding (start_unbond zeroes the bond account),
+                    // so this inherently forbids queuing a second cooldown
+                    // on top of one already in flight.
+                    let cooldown_epochs = validator_bond::DEFAULT_UNBONDING_COOLDOWN_EPOCHS;
+                    let unlock_epoch = current_epoch.saturating_add(cooldown_epochs);
+                    state.transfer(&bond_account, &unbonding_account, &self.config.native_denom, currently_bonded)
+                        .map_err(|e| e.to_string())
+                        .map(|_| {
+                            if let Ok(acct) = state.get_account_mut(&unbonding_account) {
+                                acct.balances.insert("unlock_epoch".to_string(), unlock_epoch as u128);
+                            }
+                            events.push(format!(
+                                "unbond_validator: {} started unbonding {} {}, unlocks at epoch {}",
+                                tx.sender, currently_bonded, self.config.native_denom, unlock_epoch
+                            ));
+                            identity.record_activity_by_address(&tx.sender);
+                        })
+                } else {
+                    // No active bond -- either there's a matured cooldown to
+                    // sweep back to the owner, or there's genuinely nothing
+                    // bonded or unbonding at all.
+                    let unlock_epoch = state.get_account(&unbonding_account)
+                        .map(|a| a.balances.get("unlock_epoch").copied().unwrap_or(0))
+                        .unwrap_or(0);
+                    let unbonding_amount = state.get_account(&unbonding_account)
+                        .map(|a| a.balance_of(&self.config.native_denom))
+                        .unwrap_or(0);
+
+                    if unbonding_amount == 0 {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!("{} has no bonded stake and no unbonding entry to sweep", tx.sender),
+                        );
+                    }
+                    if (current_epoch as u128) < unlock_epoch {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "{} unbonding cooldown not complete: unlocks at epoch {}, current epoch {}",
+                                tx.sender, unlock_epoch, current_epoch
+                            ),
+                        );
+                    }
+                    // Matured: sweep back to the owner's own balance.
+                    state.transfer(&unbonding_account, &tx.sender, &self.config.native_denom, unbonding_amount)
+                        .map_err(|e| e.to_string())
+                        .map(|_| {
+                            if let Ok(acct) = state.get_account_mut(&unbonding_account) {
+                                acct.balances.insert("unlock_epoch".to_string(), 0);
+                            }
+                            events.push(format!(
+                                "unbond_validator: {} swept {} {} back to balance after cooldown",
+                                tx.sender, unbonding_amount, self.config.native_denom
+                            ));
+                        })
+                }
             }
 
             TxBody::Custom { module, payload } => {
@@ -4643,6 +4804,12 @@ impl Executor {
             | TxBody::ReportSuspectedSybil { .. } => {
                 Err("identity-gated transaction requires identity-aware executor".to_string())
             }
+            // Validator Onboarding (ROADMAP.md): the unbonding cooldown is
+            // tracked in epochs, so this needs identity.clock.current_epoch
+            // -- execute_tx_with_identity() only.
+            TxBody::BondValidator { .. } | TxBody::UnbondValidator => {
+                Err("validator bonding transaction requires identity-aware executor".to_string())
+            }
             // QRC typed tx types require the QRC engine (execute_tx_with_identity).
             TxBody::QrcPurchase { .. }
             | TxBody::QrcSpend { .. }
@@ -5197,6 +5364,161 @@ mod tests {
         let qrc = QrcEngine::new(chain_forge_qrc::D);
         let agents = AgentStore::new();
         (Executor::new(config), state, identity, qrc, agents)
+    }
+
+    // -- Validator Onboarding (ROADMAP.md): BondValidator / UnbondValidator --
+
+    #[test]
+    fn bond_validator_moves_funds_into_bond_account() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+    }
+
+    #[test]
+    fn bonding_is_incremental_and_accumulates() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx1 = Transaction::bond_validator("bond1", "qcb1alice", 500_000, 0);
+        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r1.success, "{:?}", r1.error);
+        let tx2 = Transaction::bond_validator("bond2", "qcb1alice", 300_000, 1);
+        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r2.success, "{:?}", r2.error);
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 800_000);
+    }
+
+    #[test]
+    fn bond_fails_cleanly_on_insufficient_balance() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Alice only has 5_000_000 at genesis.
+        let tx = Transaction::bond_validator("bond1", "qcb1alice", 50_000_000, 0);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        // No partial debit: balance and bond account both untouched.
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        assert!(state.get_account("validator-bond:qcb1alice").is_err());
+    }
+
+    #[test]
+    fn unbond_without_any_bond_is_rejected() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx = Transaction::unbond_validator("unbond1", "qcb1alice", 0);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("no bonded stake"));
+    }
+
+    #[test]
+    fn unbond_starts_cooldown_and_removes_from_bond_account() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        let r = exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        // No longer counted as bonded -- stops counting toward the active set immediately.
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 0);
+        // Funds are locked in the unbonding account, not back in Alice's spendable balance yet.
+        assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+    }
+
+    #[test]
+    fn claiming_unbonded_stake_before_cooldown_elapses_is_rejected() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Still epoch 0 -- cooldown (21 epochs) has not elapsed. A second
+        // UnbondValidator call (the only way to attempt a sweep) must be
+        // rejected, and must NOT move any funds.
+        let sweep_attempt = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let r = exec.execute_tx_with_identity(&sweep_attempt, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("cooldown not complete"));
+        assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+    }
+
+    #[test]
+    fn claiming_unbonded_stake_after_cooldown_elapses_releases_funds_exactly_once() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Advance past the 21-epoch cooldown.
+        identity.clock.current_epoch = 21;
+
+        let sweep = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let r = exec.execute_tx_with_identity(&sweep, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 0);
+
+        // Calling UnbondValidator again finds nothing bonded and nothing
+        // matured left to sweep -- it must not double-release funds.
+        let double_sweep = Transaction::unbond_validator("unbond3", "qcb1alice", 3);
+        let r2 = exec.execute_tx_with_identity(&double_sweep, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r2.success);
+        assert!(r2.error.unwrap().contains("no bonded stake"));
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+    }
+
+    #[test]
+    fn second_unbond_while_one_already_cooling_down_is_rejected() {
+        // Exercises the "slash-and-run" guard: a validator cannot queue a
+        // second, overlapping unbonding request while the first is still
+        // locked -- there is nothing bonded left to start a new one from.
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let unbond1 = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        exec.execute_tx_with_identity(&unbond1, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Still cooling down (epoch 0 < unlock epoch 21); a second attempt
+        // at the same nonce-advancing call correctly reports "not complete",
+        // not a fresh, separately-tracked unbonding request.
+        let unbond2 = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let r = exec.execute_tx_with_identity(&unbond2, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("cooldown not complete"));
+    }
+
+    #[test]
+    fn bonding_by_different_validators_is_independent() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
+        let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
+        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+        assert_eq!(state.get_account("validator-bond:qcb1bob").unwrap().balance_of("uqcb"), 4_000_000);
+
+        // Unbonding Alice must not touch Bob's independent bond.
+        let unbond_a = Transaction::unbond_validator("unbondA", "qcb1alice", 1);
+        assert!(exec.execute_tx_with_identity(&unbond_a, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert_eq!(state.get_account("validator-bond:qcb1bob").unwrap().balance_of("uqcb"), 4_000_000);
+    }
+
+    #[test]
+    fn simple_executor_rejects_bonding_tx_types() {
+        // BondValidator/UnbondValidator need identity.clock.current_epoch
+        // for the cooldown and are only supported via
+        // execute_tx_with_identity(); the plain execute_tx() path must
+        // reject them explicitly rather than silently no-op or panic.
+        let (exec, mut state) = setup();
+        let tx = Transaction::bond_validator("bond1", "qcb1alice", 1_000_000, 0);
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("identity-aware executor"));
     }
 
     #[test]
