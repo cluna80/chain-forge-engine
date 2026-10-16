@@ -291,6 +291,16 @@ Sponsored Contracts (Section 7.2) are a distinct subclass of Charmed Agent cover
 
 Two pieces of protocol infrastructure are not yet specified: an **Agent Service Registry** (on-chain directory of agent services and prices) and **payment primitives beyond a single transfer** (streaming or usage-metered payments for recurring and metered agent services).
 
+### 5.4 Discovery Records
+
+Every verified Grand Challenge contribution that qualifies as a discovery produces a permanent on-chain record alongside its reward. The record — defined in `chain-forge-pocd` and minted through the same verification path that produces the PoCD pipeline's `DiscoveryReceipt` — captures the challenge identifier, output hash, seal difficulty, verifier identities (MachineIDs and SponsorIDs), and timestamp. It is non-transferable, queryable by anyone (by MachineID or by SponsorID), and permanently bound to the discovering MachineID.
+
+A Discovery Record is a badge, not a token: it cannot be sold, transferred, spent, or used as governance weight, and it confers no voting rights, priority access, future payment claim, or special status. It does not affect the Pending uQCB reward path, which remains the sole mechanism through which verified work earns treasury-funded QCB redemption. Discovery Records supplement attribution; they do not replace or extend the reward system.
+
+A `DiscoveryReceipt` is ephemeral — it lives in the PoCD registry, gets converted into a reward at epoch close, and then fades. A Discovery Record is the permanent version of the same verification event: committed to chain state and queryable forever. Because the record attaches to the discovery event itself, it cannot be minted until the track-specific criteria that define a "discovery" are formalized through governance — the same dependency the discovery bonus reward already has. Until those criteria exist for at least one challenge track, there is no event for a Discovery Record to attach to.
+
+Discovery Records are a chain-agnostic PoCD feature, not a QCB-specific addition: any chain built on Chain Forge that integrates PoCD can mint them with the same shape.
+
 ---
 
 ## Section 6: Token Economics
