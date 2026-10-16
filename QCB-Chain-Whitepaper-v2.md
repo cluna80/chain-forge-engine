@@ -172,18 +172,46 @@ Reaching Equilibrium State will take years. The architectural commitment is diff
 
 ---
 
+## Verification as a Primitive
+
+Qattice's protocol-level verification is a general primitive, not a mining-specific feature. Mining — the Grand Challenge / PoCD pipeline described above — is the first application. Identity, agent work, scientific attribution, and any future application that needs verified claims are the same primitive applied to different domains.
+
+The chain provides four things at the protocol layer: **cryptographic proof that work was performed** (seal hashes, signed receipts); **independent verification that it was correct** (verifier identities, challenge-specific acceptance criteria); **permanent attribution of who did it** (MachineID- and SponsorID-bound records, including Discovery Records, Section 5.4); and **a settlement layer that moves value based on verified outcomes** (Pending uQCB accumulation, treasury redemption, FeeSponsor's deterministic fee accounting). Any application that needs any of these gets them from the same protocol layer rather than building its own verification stack.
+
+This reframes what follows: mining, identity, Charmed Agents, and scientific attribution are not four separate features bolted onto a chain. They are four applications of one verification primitive. Section 10.4 extends this further — the same primitive, offered as a service to protocols other than Qattice.
+
+**The honest caveat:** this depends on the mining layer being real, which it is — the verification pipeline works, receipts are verified, rewards are distributed, attribution is on-chain (Section 1, "What's Been Built"). The rest of this claim is what that foundation enables, and most of it is not shipped yet: Charmed Agents are not at scale, DIS privacy is not built, RWA issuance is Phase 5+. The primitive is real; the applications beyond mining are what it makes possible, not what it has already delivered.
+
 ## What Qattice Is
 
-Qattice is a from-scratch Layer-1 blockchain, built on Chain Forge — a purpose-built Rust blockchain engine. It provides four things no general-purpose chain offers natively, together, at the protocol layer:
+Qattice is a chain where verification is a protocol primitive. Everything else — mining, identity, agents, scientific attribution — is an application of that primitive, not a separate feature list. Built from scratch on Chain Forge, a purpose-built Rust blockchain engine, Qattice provides four things no general-purpose chain offers natively, together, at the protocol layer:
 
 - **Personhood-weighted BFT consensus** — validator power tied to verified human identity, not stake or hashpower
 - **Charm-based state confinement and agent representation** — identity-scoped state and native support for autonomous agents as first-class chain citizens
 - **A working monetary engine** — $QCB is the sole protocol token; uQCB accumulates from verified Grand Challenge work and converts permissionlessly to $QCB at 1,000,000:1
 - **Full sovereignty** — no dependency on another chain's consensus engine, module framework, or governance assumptions
 
+These are examples of the primitive in action, not an exhaustive feature list — proof, verification, attribution, and settlement applied to consensus, state, money, and governance respectively.
+
 ### Why Build From Scratch
 
 Frameworks like Cosmos SDK and Solana offer fast paths to a working chain, but both come with inherited assumptions QCB is not willing to accept: stake-weighted consensus power, framework dependency, no native identity layer, and shared infrastructure risk. Building on Chain Forge removes all four constraints. The cost is real — a multi-year infrastructure project — and sovereignty has a price beyond the calendar.
+
+## What Qattice Can Become
+
+This is not a roadmap — Section 11 is the roadmap, with dates and acceptance criteria. This is a statement of what the verification primitive enables, if the identity layer and the mining layer continue to hold up under real adversarial pressure.
+
+**Agent economies.** Charmed Agents with bounded, cryptographically scoped authorization, operating at a scale where autonomous agents routinely transact, settle, and are held accountable through their human sponsor — without any single agent or sponsor accumulating unbounded influence.
+
+**RWA compliance as a protocol property.** Tokenized real-world assets where "the holder is a verified human" is guaranteed by the chain itself, not bolted on by an issuer's separate KYC vendor.
+
+**Verified user applications.** Any application — inside or outside Qattice — that needs to know "this is a real, unique human" without building its own identity infrastructure.
+
+**Distributed research at scale.** Grand Challenge tracks running simultaneously with full verifier coverage, producing scientific results that are citable, auditable, and attributable down to the machine that produced them — the Equilibrium State described above, realized.
+
+**Post-quantum verification infrastructure for other protocols.** Section 10.4 describes this in full: Qattice's post-quantum stack, offered as a service other chains don't have to build themselves.
+
+None of these are predictions. They are possibilities the verification primitive makes available, contingent on the same preconditions named throughout this document — above all, the identity layer surviving its pilot.
 
 ---
 
@@ -398,6 +426,8 @@ FeeSponsor lets a verified developer, research institution, enterprise, or Charm
 
 Qattice is designed as a self-contained Layer-1. There are no bridges, no interoperability connections, and no wrapped assets in the initial architecture. Any bridge that would allow unverified actors to hold or use $QCB is architecturally forbidden. This constraint will be revisited only after the chain is live and stable, the identity layer has survived adversarial pressure at scale, and there is a concrete reason to interoperate.
 
+**Direction matters.** This constraint governs *inbound* interoperability — anything that would let unverified actors or assets into Qattice. It does not forbid *outbound* verification services: Qattice attesting to other protocols about a credential, a signature, or an identity claim, as described in Section 10.4. Qattice choosing to verify something for another protocol is not the same as Qattice accepting an unverified actor from that protocol — the former is a service Qattice controls end to end; the latter is the exact security hole this constraint exists to forbid. Outbound verification services are permitted and are a Phase 5+ strategic direction, contingent on the identity layer pilot; they do not require revisiting this constraint, because they do not import anything into Qattice.
+
 ### 7.2 Permissioned EVM Layer
 
 Qattice absorbs EVM capability natively rather than bridging to an EVM-compatible chain. EVM contracts on QCB are Sponsored Contracts — a subclass of Charmed Agent. Every contract must have a SponsorID linking it to a verified human; every $QCB transfer in or out of an EVM contract passes through the protocol's identity checks; no EVM contract can issue tokens that bypass $QCB's sole-asset status.
@@ -418,6 +448,7 @@ What lives in the constitutional layer:
 - **The cryptographic-primitive replacement mechanism** — the guarantee that the signature scheme can be replaced without forking the chain.
 - **The single-tradeable-asset rule** — $QCB is the sole protocol tradeable asset; no application-layer token may substitute for $QCB in QCB's economic plumbing.
 - **The sovereignty constraint** — no bridge allowing unverified actors into $QCB; no anonymous EVM accounts; no parallel resource token substituting for $QCB.
+- **The external verification interface** (if Section 10.4's post-quantum verification services are offered) — the Qattice Attestation format, the API semantics other protocols depend on, and the verification guarantees those attestations carry. Once external protocols integrate against this interface, changing its format or semantics is a constitutional change, not an ordinary governance parameter — the same interface/implementation split as the identity primitive above, extended to cover a contract Qattice makes with parties outside itself.
 - **The amendment process itself.**
 
 **Amendment process:** a constitutional change requires (a) a supermajority of verified-human votes (proposed at two-thirds or greater), (b) the >6% blocking-safety quorum from Section 6.6 plus the absolute-minimum-voter-count protection, and (c) a mandatory public waiting period. Exact thresholds remain an open question.
@@ -474,6 +505,26 @@ The fix is not simply "use a post-quantum signature algorithm" — algorithm cho
 > **Implementation status:** ML-DSA-65 (CRYSTALS-Dilithium3 / NIST FIPS 204) is already live as the validator signing scheme and the wallet signing scheme. The crypto-agility constitutional guarantee — ensuring the scheme can be replaced under governance — is captured in the whitepaper and roadmap but is not yet protocol-enforced. Pluggable signature scheme support in chain-forge-consensus is a Phase 1 item.
 
 The size tradeoff is real and stated plainly: ML-DSA signatures are ~2.4KB against ECDSA's ~64 bytes. There is no PQC option that matches ECDSA's compactness — adopting post-quantum signatures means accepting this cost. Which specific algorithm Qattice adopts at launch versus in reserve, and how the size cost is absorbed, are addressed in Open Question 16.
+
+### 10.4 Post-Quantum Verification Services
+
+Qattice's post-quantum stack — ML-DSA-65 validator signing, DIS authentication (Section 4, "Digital Identity Stone"), and the crypto-agility constitutional guarantee above — is not only a feature Qattice has internally. It is a capability other protocols can use.
+
+**The problem.** The industry faces a multi-year post-quantum migration. Every chain has to migrate its signatures, its accounts, and its authentication, and the migration is expensive: lattice signatures are orders of magnitude larger than ECDSA, and the throughput and propagation penalties under fixed block limits are severe. Most protocols will not build their own post-quantum identity infrastructure; they will integrate with someone else's.
+
+**The service.** Qattice can offer three verification services to other protocols:
+
+- **Cross-chain identity verification.** A protocol queries Qattice's identity layer for a proof that a user holds a verified Qattice credential, and gates access on that proof. The user authenticates once on Qattice; the credential is usable elsewhere.
+- **Signature verification as a service.** A protocol that wants to accept ML-DSA-65 signatures without implementing the verification itself submits the signature to Qattice and receives a signed attestation of its validity, rather than re-implementing the cryptography.
+- **Post-quantum credential issuance.** A protocol uses Qattice's identity layer as its issuer: the user verifies on Qattice, receives a credential, and presents proofs of that credential to any protocol that accepts Qattice attestations.
+
+**The interface.** External verification uses a signed attestation format — a *Qattice Attestation* — containing the subject, the verification result, a timestamp, and Qattice's chain ID, signed with ML-DSA-65 and verifiable by anyone holding Qattice's public key. Revocation is propagated on a pull model with a documented maximum staleness window: an external protocol holding an attestation older than that window must re-query before relying on it.
+
+**The commitment, named plainly.** Each model carries a different weight. Cross-chain identity verification and signature-verification-as-a-service are point-in-time: Qattice must be available and must produce correct proofs or attestations at the moment of the query. Credential issuance is the heaviest commitment — Qattice becomes responsible for a credential's integrity (validity, rotation, revocation) for as long as it remains valid, not just at issuance. Taking on any of these means the external identity interface — the attestation format, the API semantics, the verification guarantees — stops being internal to Qattice and becomes a public, versioned contract. A change to that external interface is a constitutional change, not an ordinary governance parameter (Section 7.3).
+
+**The constraint.** The sovereignty constraint (Section 7.1) forbids inbound interoperability — unverified actors entering Qattice through a bridge. Outbound verification services are the opposite direction: Qattice attesting to other protocols, never the reverse. The former is a security hole; the latter is a service. Being a trusted verifier for other protocols is a different relationship than being a sovereign, self-contained chain — it creates a reliability dependency other systems place on Qattice's uptime and a governance-coordination cost when the interface changes — and it is taken on deliberately, not as a side effect of being post-quantum internally.
+
+**Preconditions.** This entire service depends on the identity layer's pilot succeeding. If the attestation guard cannot resist sybils at scale (Section 4), the credentials and attestations Qattice would issue are worthless to an external integrator — the pilot is the precondition, not an implementation detail to solve later. This is Phase 5+ work; nothing here is buildable before the identity layer is proven. See `ROADMAP.md` for the external verification API, attestation format, revocation propagation, and integrator SDK line items.
 
 ---
 

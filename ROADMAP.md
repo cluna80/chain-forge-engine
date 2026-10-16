@@ -695,6 +695,10 @@ The architectural commitment is different from the timeline: QCB is designed for
 | RWA issuance layer | 🔲 | Tokenized assets via permissioned EVM; QCB compliance-at-protocol-layer |
 | Governance succession (post-founder) | ❓ | Open Q10 |
 | Interoperability (PoP-preserving bridge only) | 🔲 | Forbidden until chain stable and identity proven; Open Q per §7.1 |
+| Post-quantum verification services — external verification API | 🔲 | `POST /api/verify/credential`, `GET /api/attestation/{subject}`, `POST /api/verify/signature`; public key for verifying Qattice's own attestation signatures. Whitepaper §10.4. Contingent on the identity pilot succeeding — see §4 |
+| Post-quantum verification services — attestation format & signing | 🔲 | The "Qattice Attestation" structure (subject, verification result, timestamp, chain ID), signed ML-DSA-65; once external protocols integrate, this format becomes constitutional (§7.3), not ordinary-governance-changeable |
+| Post-quantum verification services — revocation propagation | 🔲 | Pull model with a documented maximum staleness window (re-query after N seconds), not push/subscription — avoids Qattice maintaining broadcast infrastructure for external integrators |
+| Post-quantum verification services — integrator documentation and SDK | 🔲 | Onboarding material for other protocols integrating Models A (cross-chain identity verification), B (signature verification as a service), and C (credential issuance) |
 | HotStuff BFT variant | ✅ | Shipped — pluggability proven |
 | XRPL-inspired FBA variant | ✅ | Shipped — global UNL, 80% threshold, 18 tests passing; all three pluggable BFT variants now confirmed |
 | Production-grade JMT state tree | ⬜ | Replaces current state layer |
