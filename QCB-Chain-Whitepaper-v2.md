@@ -366,6 +366,20 @@ Illustrative percentages are non-final; the genesis distribution must explicitly
 
 A locked release schedule is carved from the existing genesis allocation — 4% of total $QCB supply (8.4 million $QCB), released linearly over 8 years — to verified humans who stake or lock $QCB or accumulate qualifying Grand Challenge Pending uQCB redemptions. Nothing is created; existing, capped supply moves. The mechanism, duration, and proportional-share formula are governed through the protocol governance process (Section 6.6), not constitutionally.
 
+### 6.10 FeeSponsor — Native Transaction Fee Sponsorship
+
+FeeSponsor lets a verified developer, research institution, enterprise, or Charmed Agent pre-fund a sponsor account and pay the gas fee on a user's behalf, without taking custody of the user's funds or operation. It is a native fee-payer primitive, **not** a second token and not a protocol-level resource marketplace: a sponsored transaction still moves only existing QCB/uQCB, with no new minting and no change to PoCD rewards or BFT voting power.
+
+**Dual authorization.** Every sponsored transaction carries two independent signatures: the user's own signature over their operation, unchanged from an ordinary transaction, and a separate `SponsorAuthorization` signed by the sponsor's ML-DSA key. The sponsor's signature is bound — via a domain-separated signing message — to the chain ID, the canonical hash of the user's unsigned transaction body, the authorization's own single-use ID, the sponsor's ID, the maximum fee the sponsor agreed to cover, and the block window in which the authorization is valid. Tampering with any one of those fields invalidates the signature; nothing is left implicitly trusted.
+
+**No automatic fallback.** If a sponsor authorization is present but the sponsor cannot or will not pay — policy limit, expired or already-used authorization, insufficient sponsor balance, revocation — the transaction is rejected outright. It is never silently charged to the user's own wallet. A user who wants that fallback behavior must attach their own explicit, separately signed fallback authorization; nothing about sponsorship happens by default.
+
+**Sponsor policy and single-use authorizations.** Each sponsor account carries a policy capping the maximum fee per transaction and a budget per epoch, and nodes track the sponsor's balance deterministically against both. Each authorization is single-use, identified by a random ID, and expires within a bounded window; once consumed or expired it cannot be replayed, and used IDs are pruned from state once they age past their expiry plus a fixed retention window, keeping the storage bound predictable. A sponsor can revoke service immediately, or retroactively invalidate every authorization issued up to a given point, without having to enumerate individual authorizations.
+
+**Deterministic accounting.** Every node must reach the same decision about who pays and whether the transaction is accepted. Fee calculation, sponsor-authorization validation, and the fee debit itself happen deterministically before the transaction's own application logic runs, so that a transaction that fails after a valid sponsor debit still leaves every node in the same state. Full execution semantics, data types, and the acceptance-test suite are specified in `docs/FeeSponsor.md`.
+
+> **Implementation status:** the cryptographic primitives (sponsor account/policy/authorization types, canonical hashing, and ML-DSA verification binding every authorized field) and a persistent sponsor store (balances, single-use replay tracking, revocation, per-tx and epoch policy enforcement) exist and are tested, but are not yet wired into live transaction execution or merged to the main branch. Native per-transaction fee debiting does not yet exist in the engine for ordinary (unsponsored) transactions either — that is the actual prerequisite this feature is waiting on, tracked in `ROADMAP.md`.
+
 ---
 
 ## Section 7: Sovereignty, Execution Environment, and the Constitutional Layer

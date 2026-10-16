@@ -20,22 +20,24 @@
 
 ## Planned Feature — FeeSponsor (Native Transaction Fee Sponsorship)
 
-**Status:** 🔲 Planned — not implemented. **Placement:** After core deterministic transaction-fee accounting and before broad application onboarding.
+**Status:** 🔄 In progress on branch `fs-01-feesponsor` (FS-01 + FS-02 landed; not yet merged to `main`, not yet wired into live execution). **Placement:** After core deterministic transaction-fee accounting and before broad application onboarding.
 
-**Goal:** Let verified developers, research institutions, enterprises, and Charmed Agents sponsor Qattice transaction fees in QCB on behalf of users. The user authorizes the operation; the sponsor separately authorizes the fee payment. This is a native fee-payer primitive, **not** a second token or a protocol-level resource marketplace.
+**Goal:** Let verified developers, research institutions, enterprises, and Charmed Agents sponsor Qattice transaction fees in QCB on behalf of users. The user authorizes the operation; the sponsor separately authorizes the fee payment. This is a native fee-payer primitive, **not** a second token or a protocol-level resource marketplace. Full design: `docs/FeeSponsor.md`.
 
 | Milestone | Status | Acceptance criteria |
 |---|---|---|
-| Fee accounting prerequisite | 🔲 | Deterministic uQCB fees, charge/refund/failure rules, fee recipient policy, and insufficient-funds handling |
-| FeeSponsor account | 🔲 | Pre-funded uQCB balance, distinct from user accounts and PoCD research treasury |
-| Dual authorization | 🔲 | User operation signature and scoped sponsor authorization bound to chain ID, transaction hash, max fee, nonce, and expiration |
-| Sponsor policies | 🔲 | SponsorID linkage without conflating identity sponsorship and fee payment; allowlists, per-tx/epoch budgets, revocation |
-| Deterministic execution | 🔲 | All nodes agree on fee payer, fee debit, nonce use, failed-tx behavior, and atomic state updates |
-| Adversarial tests | 🔲 | Forged signatures, replay/cross-chain replay, budget exhaustion, policy bypass, and double charging rejected |
+| Fee accounting prerequisite | 🔲 **Blocking — not yet started.** `chain-forge-execution::execute_tx()`/`execute_block()` only *count* gas as `fees_collected` for block-result reporting today; no code path actually debits any account's uQCB balance for a fee, sponsored or not. FeeSponsor cannot reach "sponsor pays instead of user" until a real per-tx fee debit exists for the unsponsored path first — this is FS-03, and it's a bigger, more invasive change than FeeSponsor itself since it touches core chain economics. | Deterministic uQCB fees, charge/refund/failure rules, fee recipient policy, and insufficient-funds handling |
+| FeeSponsor crypto primitives (FS-01) | ✅ `chain-forge-execution::feesponsor` — `SponsorAccount`/`SponsorPolicy`/`SponsorAuthorization` types, canonical body hashing matched to the executor's existing `body_json` tx-signing convention, and ML-DSA signature verification with every authorized field (not just `tx_body_hash`) bound into the signed message. 20 unit tests. | Pre-funded uQCB balance type, distinct from user accounts and PoCD research treasury |
+| Dual authorization | ✅ (crypto-level) `sponsor_signing_message()` binds chain_id, tx_body_hash, auth_id, sponsor_id, max_fee_uqcb, issued_at_block, expires_at_block | User operation signature and scoped sponsor authorization bound to chain ID, transaction hash, max fee, nonce, and expiration |
+| Sponsor policies & persistent storage (FS-02) | ✅ `feesponsor::store::SponsorStore` — `register`/`deposit`, `revoke_now`/`revoke_before_block` (RevokeAuthPrefix), per-tx-max-fee + epoch-budget enforcement, single-use `auth_id` replay tracking with GC pruning, `advance_epoch()`. Self-contained; not yet threaded through `StateStore`/block execution the way `AgentStore`/`IdentityStore` are. | SponsorID linkage without conflating identity sponsorship and fee payment; allowlists, per-tx/epoch budgets, revocation |
+| Deterministic execution (FS-03) | 🔲 Blocked on the fee-accounting prerequisite above. Needs `execute_tx_with_identity()` to branch on a `SponsorAuthorization` in the tx envelope, call `SponsorStore::validate_and_consume()`, and mirror its result onto `StateStore` atomically with the real fee debit and application-logic rollback-on-failure (`pay_on_failure` policy). | All nodes agree on fee payer, fee debit, nonce use, failed-tx behavior, and atomic state updates |
+| Adversarial tests | ✅ (crypto + store level) Forged signature, tampered max_fee/expiry, cross-chain replay, duplicate auth_id, revocation-before-vs-after-issuance, policy bypass, insufficient balance — all rejected with no partial debit. ⬜ Still needed once FS-03 lands: adversarial tests against the real `Transaction`/`TxBody` envelope and multi-node execution. | Forged signatures, replay/cross-chain replay, budget exhaustion, policy bypass, and double charging rejected |
 | Multi-node devnet | 🔲 | Sponsored and ordinary transactions yield consistent state on multiple nodes, including failures |
 | Developer SDK | 🔲 | Examples for Grand Challenge, Charmed Agents, and third-party applications; verified sponsors first |
 
 **Invariants:** Only existing QCB/uQCB moves; no new minting, no default burn, no changes to PoCD rewards or BFT voting power. Sponsorship grants no control over user funds. Fee rate and recipient policy remain open design decisions.
+
+**Next step for whoever picks this up:** implement real per-tx fee debiting in `chain-forge-execution` for the plain (unsponsored) path first — that's the actual blocker, not FeeSponsor-specific work — then wire `SponsorAuthorization` into the `Transaction` envelope and branch `execute_tx_with_identity()` through `SponsorStore::validate_and_consume()` for the sponsored path.
 
 ---
 
