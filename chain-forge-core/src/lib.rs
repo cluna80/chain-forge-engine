@@ -531,6 +531,81 @@ impl GenesisConfig {
 
         errors
     }
+
+    /// Hard validation (unlike `validate()` above, which only produces
+    /// warnings today): every genesis account with `role == "validator"`
+    /// must carry a well-formed `public_key`.
+    ///
+    /// This is the security-change-set fix for mandatory validator keys
+    /// (Decision: Option B, "mandatory registered consensus keys... for
+    /// all validators, including genesis validators" -- no devnet bypass).
+    /// `chain-forge-node::Node::new` calls this as a hard error, before
+    /// consensus begins, rather than folding it into `validate()`'s
+    /// warning-only list: a chain that cannot seat any validator with real
+    /// voting power is not a "proceed with a warning" situation.
+    ///
+    /// "Well-formed" here means structurally valid -- present, valid hex,
+    /// and at least 32 bytes (the Ed25519/ML-DSA-class floor; this is a
+    /// sanity floor, not a scheme-specific length check, since
+    /// `cryptography.validator_scheme` can vary). It does NOT verify the
+    /// key is a valid point on any particular curve, or that a matching
+    /// private key exists anywhere -- that half of the check
+    /// (`local private key corresponds to the registered public key`) is
+    /// `Node::load_signing_key`'s job, once an operator's node starts up
+    /// and loads its own key file.
+    pub fn validate_validator_keys(&self) -> Result<(), String> {
+        for acct in &self.genesis_accounts {
+            if acct.role != "validator" {
+                continue;
+            }
+            let hex = match &acct.public_key {
+                None => {
+                    return Err(format!(
+                        "genesis validator {:?} ({}) has no public_key -- \
+                         every validator must carry a registered consensus \
+                         key before consensus begins (no keyless validators, \
+                         genesis included)",
+                        acct.label, acct.address
+                    ));
+                }
+                Some(h) if h.is_empty() => {
+                    return Err(format!(
+                        "genesis validator {:?} ({}) has an empty public_key",
+                        acct.label, acct.address
+                    ));
+                }
+                Some(h) => h,
+            };
+            if hex.len() % 2 != 0 {
+                return Err(format!(
+                    "genesis validator {:?} ({}) public_key is not valid hex \
+                     (odd length: {} characters)",
+                    acct.label, acct.address, hex.len()
+                ));
+            }
+            let bytes: Option<Vec<u8>> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                .collect();
+            let bytes = match bytes {
+                Some(b) => b,
+                None => {
+                    return Err(format!(
+                        "genesis validator {:?} ({}) public_key is not valid hex",
+                        acct.label, acct.address
+                    ));
+                }
+            };
+            if bytes.len() < 32 {
+                return Err(format!(
+                    "genesis validator {:?} ({}) public_key is only {} bytes \
+                     -- too short to be a real consensus key (expected >= 32)",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 // -- Tests --------------------------------------------------------------------
@@ -775,6 +850,82 @@ mod tests {
         let errors = cfg.validate();
         assert!(errors.iter().any(|e| e.contains("ml-dsa")),
             "should warn about ml-dsa tx size: {errors:?}");
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_missing_public_key() {
+        // minimal_genesis_json()'s validator deliberately has no public_key
+        // (the pre-migration Phase-0 fixture) -- validate_validator_keys()
+        // must hard-reject it, unlike validate() which only warns.
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let err = cfg.validate_validator_keys().expect_err(
+            "a validator with no public_key must be a hard error"
+        );
+        assert!(err.contains("qcb1abc123"), "error should name the offending validator: {err}");
+        assert!(err.contains("no public_key"), "error should say why: {err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_accepts_well_formed_key() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            &format!(
+                "\"role\": \"validator\",\n                    \"public_key\": \"{}\"\n                }},",
+                "aa".repeat(32)
+            ),
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        assert!(cfg.validate_validator_keys().is_ok());
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_empty_string_key() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            "\"role\": \"validator\",\n                    \"public_key\": \"\"\n                },",
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_keys().expect_err("empty public_key must be rejected");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_invalid_hex() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            "\"role\": \"validator\",\n                    \"public_key\": \"not-hex!!\"\n                },",
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_keys().expect_err("non-hex public_key must be rejected");
+        assert!(err.contains("not valid hex"), "{err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_too_short_key() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            "\"role\": \"validator\",\n                    \"public_key\": \"aabbcc\"\n                },",
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_keys().expect_err("a 3-byte key must be rejected as too short");
+        assert!(err.contains("too short"), "{err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_ignores_non_validator_roles() {
+        // The treasury account in minimal_genesis_json() has no public_key
+        // either -- that's fine, the check is scoped to role == "validator".
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let treasury_only = cfg.genesis_accounts.iter().all(|a| a.role == "validator" || a.public_key.is_none());
+        assert!(treasury_only, "sanity: fixture's treasury account has no key either");
+        // The only reason validate_validator_keys() fails on this fixture is
+        // the validator's missing key, not the treasury's.
+        let err = cfg.validate_validator_keys().unwrap_err();
+        assert!(!err.contains("qcb1def456"), "must not flag the treasury account: {err}");
     }
 
     #[test]

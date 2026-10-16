@@ -465,6 +465,16 @@ impl Node {
             }
         }
 
+        // Hard error, in every environment: mandatory validator keys
+        // (security change set, Decision Option B -- "no devnet bypass
+        // that allows unverified or keyless validators to participate in
+        // consensus"). A chain that cannot seat any validator with a real
+        // registered key is not a "proceed with a warning" situation --
+        // nothing could ever reach quorum (see gate_voting_power in
+        // chain-forge-consensus), so refuse to start at all rather than
+        // boot into a validator set that can never vote.
+        genesis.validate_validator_keys().map_err(NodeError::Genesis)?;
+
         // Hard error, in every environment: running with a module list the
         // engine can't honour would mean the chain behaves differently
         // from what its genesis says.
@@ -721,6 +731,59 @@ impl Node {
                 }
             }
             let _ = engine.update_validator_set(vs);
+        }
+
+        // Hard error: confirm the genesis validator set can actually reach
+        // quorum before this node enters consensus at all.
+        //
+        // `update_validator_set` just above runs every validator through
+        // `gate_voting_power` (chain-forge-consensus): a validator with no
+        // registered key or no verified personhood now has voting_power
+        // forced to 0, unconditionally, in every engine. Genesis key
+        // validation (`validate_validator_keys`, checked earlier in this
+        // function) guarantees every validator HAS a key; this check
+        // confirms the other half actually held -- enough of them are also
+        // verified -- rather than assuming it did. Catches a genesis that
+        // is structurally valid (real keys) but operationally dead (e.g.
+        // identity seeding silently failed, or every genesis account's role
+        // doesn't match an actual Verified IdentityRecord): better to
+        // refuse to start than to boot into a validator set that can never
+        // vote.
+        {
+            let vs = engine.validator_set();
+            let eligible = vs.validators.iter().filter(|v| v.voting_power > 0).count();
+            if eligible == 0 {
+                return Err(NodeError::Consensus(format!(
+                    "genesis validator set has zero eligible voting power after \
+                     the personhood/key gate -- every one of its {} validator(s) \
+                     is missing a registered key, lacks verified personhood, or \
+                     both. The chain cannot reach quorum and will never produce \
+                     a block. Fix genesis identity seeding or validator_scheme \
+                     before starting this node.",
+                    vs.validators.len()
+                )));
+            }
+            if eligible < vs.validators.len() {
+                warn!(
+                    eligible,
+                    total = vs.validators.len(),
+                    "{} of {} genesis validators have zero effective voting \
+                     power (missing key or unverified personhood) -- starting \
+                     anyway since at least one is eligible, but BFT safety \
+                     margin is computed over the eligible set, not the nominal \
+                     one",
+                    vs.validators.len() - eligible, vs.validators.len()
+                );
+            }
+            if eligible < 4 {
+                warn!(
+                    eligible,
+                    "fewer than 4 validators have effective voting power -- \
+                     byzantine_fault_tolerance() is 0 for sets this small \
+                     regardless of nominal size; this chain has no real BFT \
+                     safety margin yet"
+                );
+            }
         }
 
         // Pilot-phase attestation coordinator. If genesis names one, wire it
@@ -1164,11 +1227,14 @@ impl Node {
     ///                     or the validator is not in the active set at all.
     ///                     Caller must drop the vote.
     ///
-    /// Design: we look up the sender's public key from the consensus ValidatorSet
-    /// (populated from genesis or backfilled by `load_signing_key`). If the key
-    /// is non-empty we MUST verify — an empty signature against a known key is
-    /// treated as a forgery. If the key is empty we allow through so a mixed
-    /// key/no-key devnet still works.
+    /// Design: we look up the sender's public key from the consensus ValidatorSet,
+    /// which genesis is now required to populate for every validator
+    /// (`load_signing_key` only verifies a local private key against that
+    /// registered key -- it no longer backfills it; see that function's
+    /// doc comment). If the key is non-empty we MUST verify — an empty
+    /// signature against a known key is treated as a forgery. If the key
+    /// is empty (should not happen post-migration for a real validator) we
+    /// allow through so a mixed key/no-key devnet still works.
     ///
     /// Whitepaper refs: Section 7.5 (validator identity), Section 8.1 (vote rules).
     fn verify_vote_signature(&self, vote: &Vote) -> Result<(), String> {
@@ -1231,6 +1297,9 @@ impl Node {
                 .map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
                 .collect()
         }
+        fn hex_encode(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read key file {:?}: {e}", path))?;
         let k: serde_json::Value = serde_json::from_str(&text)
@@ -1244,24 +1313,59 @@ impl Node {
             public_key:  field("public_key")?,
             private_key: field("private_key")?,
         };
-        // Bind the keypair to the consensus layer so it can verify peer keys
-        // Look up this validator's address from the key file to match genesis
+        // Look up this validator's address from the key file to match genesis.
         let address = k["address"].as_str()
             .unwrap_or_default().to_string();
-        // Backfill the public key into the consensus ValidatorSet so that
-        // peer validators can verify our proposals and votes immediately.
         let my_id = chain_forge_consensus::ValidatorId(address.clone());
-        let mut vs = self.consensus.validator_set().clone();
-        if let Some(vi) = vs.validators.iter_mut().find(|v| v.id == my_id) {
-            vi.public_key = kp.public_key.clone();
-            self.consensus.update_validator_set(vs).ok();
+
+        // Security change set (mandatory validator keys, Decision Option B):
+        // genesis is now the SOLE authority for a validator's registered
+        // public key -- validate_validator_keys() guarantees every genesis
+        // validator already has one before this node ever reaches consensus.
+        // This function's job changed from "backfill the missing key" to
+        // "verify the local private key actually corresponds to the key
+        // genesis already published for this address" (requirement #3: the
+        // local private signing key must correspond to the registered
+        // public key; this is where that's enforced). It no longer writes
+        // into the live ValidatorSet at all -- a key file cannot rebind
+        // another validator's public identity, intentionally or by mistake.
+        let vs = self.consensus.validator_set();
+        let registered = vs.validators.iter().find(|v| v.id == my_id)
+            .ok_or_else(|| format!(
+                "key file {:?} claims address {address:?}, which is not in \
+                 this chain's validator set at all -- cannot load a signing \
+                 key for a validator genesis never registered",
+                path
+            ))?;
+        if registered.public_key.is_empty() {
+            // Should be unreachable post-migration (genesis validation
+            // requires every validator to have a key), but fail loudly
+            // rather than silently trusting an unverifiable key file if it
+            // somehow is reached.
+            return Err(format!(
+                "validator {address} has no public_key registered in genesis \
+                 at all -- refusing to load a local signing key for it \
+                 (genesis must register every validator's key; this node \
+                 will not backfill one from a private key file)"
+            ));
         }
+        if registered.public_key != kp.public_key {
+            return Err(format!(
+                "key mismatch for validator {address}: the local private key \
+                 in {path:?} corresponds to public key {}, but genesis has \
+                 {} registered for this address. Refusing to load -- either \
+                 the wrong key file was supplied, or this address's genesis \
+                 registration doesn't belong to this operator.",
+                hex_encode(&kp.public_key), hex_encode(&registered.public_key),
+            ));
+        }
+
         // Set this node's validator identity so the event loop participates
         // in consensus (casts prevotes / precommits) rather than running as
         // an observer. Without this, the node logs "validator=None" and never
         // votes, so the network cannot reach quorum.
-        self.validator_id = Some(chain_forge_consensus::ValidatorId(address.clone()));
-        tracing::info!(address = %address, "validator signing key loaded");
+        self.validator_id = Some(my_id);
+        tracing::info!(address = %address, "validator signing key loaded and verified against genesis");
         self.signing_key = Some(kp);
         Ok(())
     }
@@ -1845,8 +1949,10 @@ impl Node {
                         // consensus. This stops forged votes from being counted
                         // toward quorum — the first line of vote security.
                         // Only verified when the sending validator has a public
-                        // key in the ValidatorSet (loaded from genesis or via
-                        // load_signing_key). Validators without a key on file
+                        // key in the ValidatorSet -- genesis is now required to
+                        // register one for every validator (load_signing_key
+                        // only checks a local private key against it, it
+                        // doesn't backfill). Validators without a key on file
                         // are allowed through with a warn so a mixed key/no-key
                         // network (Phase 0 devnet) doesn't hard-break.
                         if let Err(reject) = self.verify_vote_signature(&vote) {
@@ -3187,26 +3293,60 @@ impl Node {
             let power = validator.voting_power;
             if power == 0 { continue; }
 
-            // Cast prevote
-            let prevote = Vote {
-                vote_type:  VoteType::Prevote,
-                height,
-                round,
-                validator:  validator.id.clone(),
-                block_hash: Some(proposal.block_hash.clone()),
-                signature:  vec![],
+            // Every genesis validator now carries a registered consensus
+            // key (mandatory-keys migration), so receive_vote's fail-closed
+            // rule treats an empty signature on a keyed validator as a
+            // forgery and rejects it (chain-forge-consensus::TendermintEngine
+            // ::receive_vote and friends). Before this migration no genesis
+            // validator had a key, so an empty signature here was silently
+            // accepted; it no longer is.
+            //
+            // This loop simulates ALL validators voting from a single
+            // process (devnet/single-node mode has no real peers), so we
+            // cannot sign with "the" operator key -- there isn't one key
+            // for four identities. We also must never place other
+            // validators' private keys in genesis. Instead we re-derive
+            // the same deterministic keypair devnet genesis tooling already
+            // uses (chain-forge-crypto/src/bin/gen_devnet_keys.rs derives
+            // every devnet validator's keypair from `generate_keypair
+            // (address)`), strictly in memory, for this simulation only.
+            // We only use it if it reproduces the exact public key genesis
+            // registered for that validator -- if some other, externally
+            // supplied key was registered instead, the derived key won't
+            // match and the vote is correctly left unsigned (and will then
+            // be rejected, same as a real forged vote would be), rather
+            // than silently trusted.
+            let devnet_sim_key = ClassicalScheme.generate_keypair(&validator.id.0)
+                .ok()
+                .filter(|kp| kp.public_key == validator.public_key);
+
+            let sign_devnet_vote = |vote_type: VoteType| -> Vote {
+                let mut vote = Vote {
+                    vote_type,
+                    height,
+                    round,
+                    validator:  validator.id.clone(),
+                    block_hash: Some(proposal.block_hash.clone()),
+                    signature:  vec![],
+                };
+                if let Some(ref kp) = devnet_sim_key {
+                    let bytes = vote_signing_bytes(
+                        &self.genesis.chain_id, &vote.vote_type, vote.height,
+                        vote.round, vote.block_hash.as_ref(),
+                    );
+                    if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
+                        vote.signature = sig.bytes;
+                    }
+                }
+                vote
             };
+
+            // Cast prevote
+            let prevote = sign_devnet_vote(VoteType::Prevote);
             let _ = self.consensus.receive_vote(prevote).await;
 
             // Cast precommit
-            let precommit = Vote {
-                vote_type:  VoteType::Precommit,
-                height,
-                round,
-                validator:  validator.id.clone(),
-                block_hash: Some(proposal.block_hash.clone()),
-                signature:  vec![],
-            };
+            let precommit = sign_devnet_vote(VoteType::Precommit);
 
             match self.consensus.receive_vote(precommit).await {
                 Ok(Some(c)) => { cert = Some(c); break; }
@@ -3436,12 +3576,23 @@ mod tests {
         "modules": ["bank", "staking", "identity", "qrc", "agents"],
         "custom_modules": [],
         "genesis_accounts": [
-            { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator" },
-            { "label": "Bob",   "address": "qcb1bob",   "balance": "5000000", "role": "validator" },
-            { "label": "Carol", "address": "qcb1carol", "balance": "5000000", "role": "validator" },
-            { "label": "Dave",  "address": "qcb1dave",  "balance": "5000000", "role": "validator" }
+            { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator", "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8" },
+            { "label": "Bob",   "address": "qcb1bob",   "balance": "5000000", "role": "validator", "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0" },
+            { "label": "Carol", "address": "qcb1carol", "balance": "5000000", "role": "validator", "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692" },
+            { "label": "Dave",  "address": "qcb1dave",  "balance": "5000000", "role": "validator", "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0" }
         ]
     }"#;
+    // The four public keys above are not arbitrary: they are
+    // ClassicalScheme.generate_keypair("qcb1<name>") under the real-crypto
+    // feature (SHA-256(address) -> deterministic Ed25519 seed) -- the exact
+    // same values already committed in tests/devnet/genesis-4node.json for
+    // the real 4-node devnet harness. Reusing them keeps every genesis
+    // fixture in this codebase internally consistent with one
+    // deterministic, reproducible keygen path, rather than introducing a
+    // third, disconnected set of test-only keys. Verified independently
+    // against the current chain-forge-crypto::ClassicalScheme::generate_keypair
+    // implementation while building this migration -- see the "Mandatory
+    // validator keys" migration notes.
 
     #[tokio::test]
     async fn node_initialises_from_genesis() {
@@ -3557,7 +3708,18 @@ mod tests {
         let vs = node.consensus.validator_set();
         let erin = vs.validators.iter().find(|v| v.id.0 == "qcb1erin")
             .expect("qcb1erin must be admitted to the active set after bonding above the minimum");
-        assert_eq!(erin.voting_power, 2_000_000);
+        // Mandatory-personhood migration: stake determines admission
+        // eligibility and ranking, but voting power is bounded by verified
+        // personhood (chain-forge-consensus::gate_voting_power, applied
+        // unconditionally in every engine). Erin is seated -- she holds a
+        // slot in the active set and her bonded stake is tracked -- but
+        // until the IdentityStore marks her Verified she has zero EFFECTIVE
+        // voting power, same as a keyless validator would. This was
+        // previously 2_000_000 (stake-weighted, ungated); that behavior
+        // predates the mandatory-personhood requirement and is no longer
+        // correct.
+        assert_eq!(erin.voting_power, 0,
+            "an unverified entrant must have zero effective voting power even though admitted");
         assert!(!erin.pop_verified, "new entrant starts unverified until IdentityStore says otherwise");
     }
 
@@ -3711,6 +3873,37 @@ mod tests {
         }
     }
 
+    /// Build a Vote signed by `validator`'s deterministic devnet keypair
+    /// (`ClassicalScheme::generate_keypair(address)`), the same derivation
+    /// GENESIS's embedded public keys were produced with (see GENESIS's
+    /// doc comment above). Needed because every genesis validator now
+    /// carries a registered consensus key, so receive_vote/
+    /// verify_vote_signature's fail-closed rule rejects an empty signature
+    /// as a forgery -- tests that simulate gossiped votes from other
+    /// validators must sign them for real, not just construct a bare Vote.
+    fn signed_vote(
+        chain_id: &str, vote_type: VoteType, height: u64, round: u32,
+        validator: &str, block_hash: chain_forge_consensus::BlockHash,
+    ) -> Vote {
+        let mut vote = Vote {
+            vote_type,
+            height,
+            round,
+            validator:  ValidatorId(validator.to_string()),
+            block_hash: Some(block_hash),
+            signature:  vec![],
+        };
+        let kp = ClassicalScheme.generate_keypair(validator)
+            .expect("deterministic devnet keypair generation must not fail");
+        let bytes = vote_signing_bytes(
+            chain_id, &vote.vote_type, vote.height, vote.round,
+            vote.block_hash.as_ref(),
+        );
+        vote.signature = ClassicalScheme.sign(&bytes, &kp)
+            .expect("signing must not fail").bytes;
+        vote
+    }
+
     fn gossip(topic: GossipTopic, payload: Vec<u8>) -> NetworkEvent {
         NetworkEvent::Message(chain_forge_p2p::GossipMessage {
             topic,
@@ -3741,16 +3934,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_chain_seeds_no_identities() {
+    async fn plain_chain_without_identity_module_refuses_to_start() {
+        // Mandatory-personhood migration: gate_voting_power (chain-forge-
+        // consensus) unconditionally zeroes voting power for any validator
+        // that is not pop_verified, in every engine, with no bypass. A
+        // genesis with the "identity" module disabled has no IdentityStore
+        // web of trust at all -- nobody can ever become Verified -- so
+        // every validator's effective voting power is permanently zero and
+        // the chain could never reach quorum or produce a block.
+        //
+        // Before this migration, disabling "identity" just meant personhood
+        // weighting itself was unavailable (personhood_weighted required
+        // identity, enforced separately); voting power was still
+        // stake/slot-based and worked fine. Now that verified personhood is
+        // mandatory rather than optional, "identity module disabled" is no
+        // longer a viable consensus configuration at all -- this is an
+        // intentional, startup-time hard failure (see the "zero eligible
+        // voting power" check in Node::new_with_config), not a bug.
         let plain = GENESIS
             .replace(
                 r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
                 r#""modules": ["bank", "staking"]"#,
             )
             .replace(r#""personhood_weighted": true"#, r#""personhood_weighted": false"#);
-        let node = Node::new(&plain, None).await.unwrap();
-        assert!(node.identity.get("qcb1alice").is_err(),
-            "without the identity module there is no web of trust to seed");
+        let err = Node::new(&plain, None).await.err()
+            .expect("a chain with no identity module can never satisfy mandatory personhood verification");
+        assert!(err.to_string().contains("zero eligible voting power"),
+            "must fail for the personhood/key gate reason, not some unrelated error: {err}");
     }
 
     #[tokio::test]
@@ -3807,6 +4017,18 @@ mod tests {
         // alice's proposal via gossip, cast his own votes, and then commit
         // once enough OTHER validators' precommits arrive over gossip too.
         let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+        // Bob's own prevote/precommit (cast automatically in response to the
+        // proposal, via sign_vote) are now also checked against his
+        // registered genesis key, so he needs a signing key loaded or his
+        // own votes silently go out unsigned and get rejected by the exact
+        // same fail-closed rule as a forged vote. load_signing_key only
+        // verifies against genesis (it no longer backfills), so for this
+        // in-memory test we set the deterministic devnet keypair directly
+        // rather than round-tripping through a real key file.
+        node.signing_key = Some(
+            ClassicalScheme.generate_keypair("qcb1bob")
+                .expect("deterministic devnet keypair generation must not fail")
+        );
 
         let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_test");
         let payload = serde_json::to_vec(&proposal).unwrap();
@@ -3818,13 +4040,10 @@ mod tests {
         assert!(node.pending_proposals.contains_key(&(0, 0)));
 
         // Carol's precommit arrives over gossip -- still only 2 of 3.
-        let carol_vote = Vote {
-            vote_type:  VoteType::Precommit,
-            height: 0, round: 0,
-            validator:  ValidatorId("qcb1carol".into()),
-            block_hash: Some(proposal.block_hash.clone()),
-            signature:  vec![],
-        };
+        let carol_vote = signed_vote(
+            "qcb-testnet-1", VoteType::Precommit, 0, 0, "qcb1carol",
+            proposal.block_hash.clone(),
+        );
         node.handle_event(gossip(
             GossipTopic::ConsensusVote,
             serde_json::to_vec(&carol_vote).unwrap(),
@@ -3832,13 +4051,10 @@ mod tests {
         assert_eq!(node.status.lock().unwrap().height, 0, "2 of 3 -- not yet committed");
 
         // Dave's precommit is the 3rd -- quorum reached, block commits.
-        let dave_vote = Vote {
-            vote_type:  VoteType::Precommit,
-            height: 0, round: 0,
-            validator:  ValidatorId("qcb1dave".into()),
-            block_hash: Some(proposal.block_hash.clone()),
-            signature:  vec![],
-        };
+        let dave_vote = signed_vote(
+            "qcb-testnet-1", VoteType::Precommit, 0, 0, "qcb1dave",
+            proposal.block_hash.clone(),
+        );
         node.handle_event(gossip(
             GossipTopic::ConsensusVote,
             serde_json::to_vec(&dave_vote).unwrap(),
@@ -3875,13 +4091,10 @@ mod tests {
         // The node feeds them to receive_vote(); on the 3rd one it returns
         // Some(cert) but there is no pending proposal, so the cert is parked.
         for validator in &["qcb1alice", "qcb1carol", "qcb1dave"] {
-            let vote = Vote {
-                vote_type:  VoteType::Precommit,
-                height: 0, round: 0,
-                validator:  ValidatorId(validator.to_string()),
-                block_hash: Some(proposal.block_hash.clone()),
-                signature:  vec![],
-            };
+            let vote = signed_vote(
+                "qcb-testnet-1", VoteType::Precommit, 0, 0, validator,
+                proposal.block_hash.clone(),
+            );
             node.handle_event(gossip(
                 GossipTopic::ConsensusVote,
                 serde_json::to_vec(&vote).unwrap(),
