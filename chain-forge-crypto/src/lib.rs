@@ -1242,7 +1242,7 @@ mod tests {
             let scheme = ClassicalScheme;
             let alice = scheme.generate_keypair("alice").unwrap();
             let bob   = scheme.generate_keypair("bob").unwrap();
-            let msg   = b"claim ubi";
+            let msg   = b"transfer funds";
             let sig   = scheme.sign(msg, &alice).unwrap();
             // Bob's key must not verify Alice's signature
             assert!(scheme.verify(msg, &sig, &bob.public_key).is_err(),

@@ -101,8 +101,6 @@ impl GasModel {
                     TxBody::BondValidator { .. }     => op_multiplier * 5,
                     TxBody::UnbondValidator          => op_multiplier * 5,
                     TxBody::Custom  { .. }           => op_multiplier * 10,
-                    TxBody::ClaimUbi { .. }          => op_multiplier * 3,
-                    TxBody::RedirectToUbiPool { .. } => op_multiplier * 3,
                     TxBody::SponsorAgent { .. }      => op_multiplier * 4,
                     TxBody::RevokeAgent  { .. }      => op_multiplier * 2,
                     // Registration writes a new IdentityRecord + account --
@@ -302,17 +300,6 @@ pub enum TxBody {
     Attest {
         claimant_id: String,
     },
-    /// Claim UBI for a verified identity (Section 6.2 / Charm Confinement 5.1).
-    /// Enforces: one claim per epoch, verified tier, liveness.
-    /// The sender must be the identity owner.
-    ClaimUbi {
-        identity_id: String,
-    },
-    /// Proactive redirect of $QRC balance to the UBI pool (Section 6.3 / Q25).
-    /// Triggers BME fee. Holder voluntarily sends balance to pool.
-    RedirectToUbiPool {
-        amount: u128,
-    },
     /// Register a Charmed Agent under a verified human sponsor (Section 5.3).
     /// Enforces: sponsor must be Verified tier.
     SponsorAgent {
@@ -380,7 +367,7 @@ pub enum TxBody {
     /// that does not map cleanly onto the standard participation heartbeat.
     ///
     /// `CharmEvent` captures the distinct events that affect the on-chain
-    /// charm record without going through the normal UBI/transfer paths.
+    /// charm record without going through the normal transfer paths.
     ///
     /// Effects:
     ///   - The event is applied to the sender's `IntrinsicCharm` via the
@@ -958,8 +945,6 @@ impl TxBody {
             TxBody::BondValidator { .. }          => "BondValidator",
             TxBody::UnbondValidator               => "UnbondValidator",
             TxBody::Custom { .. }                 => "Custom",
-            TxBody::ClaimUbi { .. }               => "ClaimUbi",
-            TxBody::RedirectToUbiPool { .. }      => "RedirectToUbiPool",
             TxBody::SponsorAgent { .. }           => "SponsorAgent",
             TxBody::RevokeAgent { .. }            => "RevokeAgent",
             TxBody::RegisterIdentity             => "RegisterIdentity",
@@ -1024,8 +1009,7 @@ pub enum CharmEvent {
 /// types whose handlers don't already do it.
 ///
 /// Transfer, Burn and Stake advance the nonce inside StateStore::transfer /
-/// StateStore::burn, and ClaimUbi / RedirectToUbiPool advance it inside the
-/// QrcEngine calls they make. Every other body type previously advanced
+/// StateStore::burn. Every other body type previously advanced
 /// nothing -- which meant RegisterIdentity, Attest, SponsorAgent,
 /// RevokeAgent and Custom transactions left the sender's nonce unchanged
 /// on success. Consequences: the same signed transaction could be
@@ -1041,8 +1025,6 @@ fn advance_nonce_if_not_already(tx: &Transaction, state: &mut StateStore) {
             | TxBody::Burn { .. }
             | TxBody::Stake { .. }
             | TxBody::BondValidator { .. }
-            | TxBody::ClaimUbi { .. }
-            | TxBody::RedirectToUbiPool { .. }
             // QRC variants mutate account state via the QrcEngine but do NOT
             // call StateStore::burn/transfer directly (the purchase-path burn
             // is done explicitly in the handler), so nonce advancement falls
@@ -1136,8 +1118,6 @@ impl Transaction {
             TxBody::Custom   { module, payload }      => module.len() + payload.len(),
             TxBody::RegisterIdentity                  => 8,
             TxBody::Attest   { claimant_id }          => claimant_id.len() + 8,
-            TxBody::ClaimUbi { identity_id }          => identity_id.len() + 8,
-            TxBody::RedirectToUbiPool { .. }          => 16,
             TxBody::SponsorAgent { agent_address }    => agent_address.len() + 8,
             TxBody::RevokeAgent  { agent_address }    => agent_address.len() + 8,
             TxBody::RevokeAttestation { attested_id }    => attested_id.len() + 8,
@@ -1251,21 +1231,6 @@ impl Transaction {
         }
     }
 
-    /// A UBI claim transaction (Charm Confinement: one per epoch).
-    pub fn claim_ubi(id: &str, sender: &str, identity_id: &str, nonce: u64) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::ClaimUbi { identity_id: identity_id.to_string() },
-            gas_limit: 50_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
     /// Validator Onboarding (ROADMAP.md): bond uqcb as validator stake.
     pub fn bond_validator(id: &str, sender: &str, amount: u128, nonce: u64) -> Self {
         Self {
@@ -1318,21 +1283,6 @@ impl Transaction {
             sender: sender.to_string(),
             nonce,
             body: TxBody::Attest { claimant_id: claimant_id.to_string() },
-            gas_limit: 50_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// A UBI pool redirect transaction (Section 6.3 / Q25).
-    pub fn redirect_to_ubi_pool(id: &str, sender: &str, amount: u128, nonce: u64) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::RedirectToUbiPool { amount },
             gas_limit: 50_000,
             signature: vec![],
             public_key: vec![],
@@ -2031,7 +1981,6 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::ConfirmSybil { .. }
         | TxBody::ReverseSybil { .. }
         | TxBody::ReportSuspectedSybil { .. } => Some("identity"),
-        TxBody::ClaimUbi { .. } | TxBody::RedirectToUbiPool { .. } => Some("qrc"),
         TxBody::QrcPurchase { .. }
         | TxBody::QrcSpend { .. }
         | TxBody::QrcContributionSettle { .. } => Some("qrc"),
@@ -2429,39 +2378,6 @@ impl Executor {
                         state.refresh_leaf(claimant_id);
                     })
                     .map_err(|e| e.to_string())
-            }
-
-            TxBody::ClaimUbi { identity_id } => {
-                // Charm Confinement: one claim per epoch, verified tier, liveness
-                if state.get_account(&tx.sender).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        tx.sender.clone(), "user".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-                // UBI claim is a UBI-era tx type. The QRC engine (v0.1) does not
-                // distribute UBI — QRC is earned by resource contribution or
-                // purchased by burning QCB. This path is preserved in the tx
-                // enum for protocol continuity but is a no-op until the
-                // execution layer is upgraded to the resource-consumption model.
-                let _ = identity_id;
-                Err("ClaimUbi: deprecated in QRC Economic Model v0.1; use contribution-path earning or purchase_qrc".into())
-            }
-
-            TxBody::RedirectToUbiPool { amount } => {
-                // Proactive redirect: triggers BME fee (Section 6.3 / Q25)
-                let epoch = identity.clock.current_epoch;
-                match state.get_account_mut(&tx.sender) {
-                    Ok(_account) => {
-                        // RedirectToUbiPool is a UBI-era tx type, deprecated in
-                        // QRC Economic Model v0.1. The UBI pool concept does not
-                        // exist in the resource-consumption engine. Preserved for
-                        // protocol continuity; no-op until execution is upgraded.
-                        let _ = (epoch, amount);
-                        Err("RedirectToUbiPool: deprecated in QRC Economic Model v0.1".into())
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
             }
 
             TxBody::SponsorAgent { agent_address } => {
@@ -4699,7 +4615,7 @@ impl Executor {
             // Transfer and Stake already call this inside their match arms (so
             // the QRC yield comment lives next to the transfer logic), but
             // all other tx types — RegisterIdentity, Attest, SponsorAgent,
-            // RevokeAgent, ClaimUbi, RedirectToUbiPool — also count: submitting
+            // RevokeAgent — also count: submitting
             // ANY committed tx proves liveness for this epoch. Duplicate calls
             // to record_activity_by_address are idempotent (only the first
             // write per epoch sticks), so the double-call for Transfer/Stake
@@ -4803,8 +4719,6 @@ impl Executor {
             // Identity-gated tx types require execute_tx_with_identity().
             TxBody::RegisterIdentity
             | TxBody::Attest { .. }
-            | TxBody::ClaimUbi { .. }
-            | TxBody::RedirectToUbiPool { .. }
             | TxBody::SponsorAgent { .. }
             | TxBody::RevokeAgent { .. }
             | TxBody::RevokeAttestation { .. }
@@ -4950,8 +4864,8 @@ impl Executor {
     }
 
     /// Execute all transactions for one block, with identity-, QRC-, and
-    /// agent-gated transaction types (RegisterIdentity, Attest, ClaimUbi,
-    /// RedirectToUbiPool, SponsorAgent, RevokeAgent, CharmConfinementUpdate,
+    /// agent-gated transaction types (RegisterIdentity, Attest,
+    /// SponsorAgent, RevokeAgent, CharmConfinementUpdate,
     /// IntrinsicCharmRecord, RegisterAgent, and all QRC variants) actually
     /// processed instead of rejected. This is what a live node needs to call
     /// for those transaction types to work at all -- execute_block() above
@@ -5647,51 +5561,6 @@ mod tests {
         }
     }
 
-    // ── Deprecated UBI-era tx types (QRC Economic Model v0.1) ─────────────────
-    //
-    // ClaimUbi and RedirectToUbiPool were part of the old Circulating Finance
-    // engine. The QRC engine (v0.1) replaces UBI with resource-contribution
-    // earning and purchase-path minting. These tests document that the tx types
-    // are preserved in the enum (protocol continuity) but now return an error.
-    // They will be replaced with resource-consumption tx tests when the
-    // execution layer is upgraded.
-
-    #[test]
-    fn claim_ubi_deprecated_in_qrc_model() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        identity.record_activity("qcb1alice");
-
-        let tx = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        assert!(
-            !result.success,
-            "ClaimUbi must be rejected by QRC Economic Model v0.1 engine"
-        );
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("deprecated"),
-            "error message should mention deprecation, got: {:?}", result.error
-        );
-    }
-
-    #[test]
-    fn redirect_to_ubi_pool_deprecated_in_qrc_model() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        identity.record_activity("qcb1alice");
-
-        let tx = Transaction::redirect_to_ubi_pool("tx1", "qcb1alice", 1_000_000, 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        assert!(
-            !result.success,
-            "RedirectToUbiPool must be rejected by QRC Economic Model v0.1 engine"
-        );
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("deprecated"),
-            "error message should mention deprecation, got: {:?}", result.error
-        );
-    }
-
     #[test]
     fn sponsor_agent_requires_verified_identity() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
@@ -6035,7 +5904,7 @@ mod tests {
         let cases = [
             (Transaction::register_identity("t1", "qcb1alice", 0), "identity"),
             (Transaction::attest("t2", "qcb1alice", "qcb1bob", 0), "identity"),
-            (Transaction::claim_ubi("t3", "qcb1alice", "qcb1alice", 0), "qrc"),
+            (Transaction::qrc_purchase("t3", "qcb1alice", 1_000, 1, 0), "qrc"),
             (Transaction::sponsor_agent("t4", "qcb1alice", "qcb1agent", 0), "agents"),
         ];
         for (tx, module) in cases {
@@ -6061,7 +5930,6 @@ mod tests {
         let bodies = [
             TxBody::RegisterIdentity,
             TxBody::Attest { claimant_id: "x".into() },
-            TxBody::ClaimUbi { identity_id: "x".into() },
             TxBody::SponsorAgent { agent_address: "x".into() },
             TxBody::RevokeAgent { agent_address: "x".into() },
             // Phase D attestation guard tx types

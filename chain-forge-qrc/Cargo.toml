@@ -7,14 +7,15 @@ license.workspace = true
 
 # QRC: QCB resource economy — QRC Economic Model v0.1.
 # Implements:
-#   - $QRC as a resource consumption token (NOT UBI)
+#   - $QRC as a resource consumption token, earned or purchased --
+#     never distributed as a flat per-person drip
 #   - Two minting paths: purchase (QCB burned → QRC) and contribution (VCA-verified providers earn QRC)
 #   - Algorithmic conversion rate Rt = R0 * (U*/U-bar)^gamma (EMA-smoothed utilization)
 #   - Per-resource congestion pricing (7 resource types)
 #   - Consumption split: 60% providers / 25% burn / 15% reserve
 #   - CapacityEvidence_v0 sub-protocol (Byzantine-resistant median aggregation)
 #
-# No dependency on chain-forge-identity or chain-forge-state (those were UBI-era).
+# No dependency on chain-forge-identity or chain-forge-state.
 
 [dependencies]
 chain-forge-core        = { path = "../chain-forge-core" }

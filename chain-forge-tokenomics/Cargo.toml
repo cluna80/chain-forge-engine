@@ -9,7 +9,7 @@ license.workspace = true
 # Implements:
 #   - SupplyRegistry: $QCB hard cap (210,000,000), mint/burn accounting
 #   - $QRC uncapped population-linked issuance tracking
-#   - Genesis allocation per Section 6.7 (70/15/7/5/3 within UBI-majority ceiling)
+#   - Genesis allocation per Section 6.7 (70/15/7/5/3 within community-reserve-majority ceiling)
 #   - Staking module: bond, unbond, per-validator stakes, reward accounting
 #   - Personhood bounds link: stake determines participation, not influence (3.3)
 #

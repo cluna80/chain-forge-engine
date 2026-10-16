@@ -126,7 +126,7 @@ impl AccountState {
     /// Whether this account has a verified identity attached (Section 5.2).
     pub fn is_human(&self) -> bool {
         self.charm.as_ref()
-            .map(|c| c.tier.grants_full_ubi())
+            .map(|c| c.tier.is_verified_or_established())
             .unwrap_or(false)
     }
 

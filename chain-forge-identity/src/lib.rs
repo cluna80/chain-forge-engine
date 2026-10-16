@@ -6,13 +6,12 @@
 /// components of Sections 5.1 (Charm Confinement) and 5.2
 /// (Intrinsic Charm). It is the single dependency that gates:
 ///   - Consensus power weighting (Section 3.3)
-///   - UBI claim eligibility (Section 6.2)
 ///   - Governance vote rights (Section 6.6)
 ///   - Charmed Agent sponsorship (Section 5.3)
 ///   - Sponsored Contract deployment (Section 7.2)
 ///
 /// Phase 0 status: VerificationTier, IdentityRecord, IdentityStore,
-/// UBI epoch clock, liveness enforcement, and IntrinsicCharm are all
+/// the epoch clock, liveness enforcement, and IntrinsicCharm are all
 /// real and tested. The actual PoP proof (web-of-trust graph +
 /// live-challenge ceremony) is stubbed -- the interface is defined so
 /// the consensus and execution layers can depend on it now; the
@@ -38,9 +37,6 @@ pub enum IdentityError {
 
     #[error("identity {0} has lapsed (last active epoch: {1}, current: {2})")]
     Lapsed(String, u64, u64),
-
-    #[error("UBI already claimed by {0} in epoch {1}")]
-    AlreadyClaimed(String, u64),
 
     #[error("agent {0} is not authorized by sponsor {1}")]
     UnauthorizedAgent(String, String),
@@ -115,7 +111,7 @@ pub type IdResult<T> = Result<T, IdentityError>;
 /// Provisional:   registered but not yet verified. Can receive $QRC
 ///                at a reduced rate once pilot allows it. Cannot vote,
 ///                cannot sponsor agents, cannot validate.
-/// Verified:      passed PoP verification. Full UBI, governance, consensus.
+/// Verified:      passed PoP verification. Full governance, consensus.
 /// Established:   Verified + sustained liveness over multiple epochs.
 ///                Future: higher governance weight, lower demurrage tier.
 ///                Phase 0: treated identically to Verified.
@@ -127,8 +123,9 @@ pub enum VerificationTier {
 }
 
 impl VerificationTier {
-    /// Whether this tier grants full UBI (1,000 $QRC/day per Section 6.2).
-    pub fn grants_full_ubi(&self) -> bool {
+    /// Whether this tier has reached Verified or Established status --
+    /// i.e. has passed PoP verification (as opposed to Provisional).
+    pub fn is_verified_or_established(&self) -> bool {
         matches!(self, Self::Verified | Self::Established)
     }
 
@@ -670,7 +667,7 @@ impl IntrinsicCharm {
         self.last_attested_epoch = epoch;
     }
 
-    /// Record a participation event (UBI claim, vote, or transfer).
+    /// Record a participation event (vote, transfer, or other on-chain activity).
     /// Increments consecutive_active_epochs and may graduate to Established.
     pub fn record_participation(&mut self, epoch: u64) {
         self.last_attested_epoch = epoch;
@@ -725,10 +722,6 @@ pub struct IdentityRecord {
     pub charm: IntrinsicCharm,
     /// The attestation that created or last renewed this record.
     pub attestation: PopAttestation,
-    /// Whether this identity has claimed QRC yield in the current epoch.
-    pub claimed_this_epoch: bool,
-    /// Total QRC yield claimed across all epochs (in uqrc base units).
-    pub total_ubi_claimed: u128,
     /// The last epoch in which this identity performed on-chain activity
     /// (sent a tx, validated a block, processed a merchant settlement).
     /// QRC yield requires activity in the current epoch — this is the
@@ -759,8 +752,6 @@ impl IdentityRecord {
             address,
             charm: IntrinsicCharm::provisional(current_epoch),
             attestation,
-            claimed_this_epoch: false,
-            total_ubi_claimed: 0,
             last_active_epoch: None,
             sponsored_agents: Vec::new(),
             attestation_ledger: AttestationLedger::default(),
@@ -786,7 +777,7 @@ impl IdentityRecord {
     }
 
     pub fn is_verified(&self) -> bool {
-        self.charm.tier.grants_full_ubi()
+        self.charm.tier.is_verified_or_established()
     }
 
     pub fn tier(&self) -> &VerificationTier {
@@ -817,33 +808,25 @@ impl IdentityRecord {
     }
 }
 
-// -- UBI epoch clock ----------------------------------------------------------
+// -- Epoch clock ----------------------------------------------------------
 
-/// Tracks the current UBI epoch and manages claim windows.
+/// Tracks the current protocol epoch.
 ///
 /// One epoch = one day (86,400 seconds) in production.
 /// Phase 0: epoch advances manually for testing.
-/// Daily UBI rate: 1,000 $QRC per verified human (Whitepaper 6.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UbiClock {
+pub struct EpochClock {
     pub current_epoch:    u64,
     pub epoch_start_ms:   u64,
     pub epoch_duration_ms: u64,
-    /// Total $QRC distributed across all epochs.
-    pub total_distributed: u128,
 }
 
-/// Daily UBI rate per verified human in base uqrc units.
-/// 1,000 $QRC = 1,000,000,000 uqrc (assuming 6 decimal places).
-pub const DAILY_UBI_RATE_UQRC: u128 = 1_000_000_000;
-
-impl UbiClock {
+impl EpochClock {
     pub fn new(genesis_time_ms: u64) -> Self {
         Self {
             current_epoch:     0,
             epoch_start_ms:    genesis_time_ms,
             epoch_duration_ms: 86_400_000, // 24 hours
-            total_distributed: 0,
         }
     }
 
@@ -853,7 +836,6 @@ impl UbiClock {
             current_epoch:     0,
             epoch_start_ms:    genesis_time_ms,
             epoch_duration_ms: duration_ms,
-            total_distributed: 0,
         }
     }
 
@@ -864,21 +846,11 @@ impl UbiClock {
             let epochs_passed = elapsed / self.epoch_duration_ms;
             self.current_epoch += epochs_passed;
             self.epoch_start_ms += epochs_passed * self.epoch_duration_ms;
-            tracing::info!(epoch = self.current_epoch, "UBI epoch advanced");
+            tracing::info!(epoch = self.current_epoch, "epoch advanced");
             true
         } else {
             false
         }
-    }
-
-    /// Calculate UBI for one verified human for one epoch.
-    pub fn ubi_per_epoch() -> u128 {
-        DAILY_UBI_RATE_UQRC
-    }
-
-    /// Total UBI to distribute to all verified humans this epoch.
-    pub fn total_ubi_for_epoch(&self, verified_count: usize) -> u128 {
-        Self::ubi_per_epoch() * verified_count as u128
     }
 }
 
@@ -887,7 +859,6 @@ impl UbiClock {
 /// The canonical registry of all identity records on QCB.
 ///
 /// CharmConfinement (Section 5.1) is enforced here:
-///   - One UBI claim per verified identity per epoch
 ///   - Agent sponsorship bounded by identity tier
 ///   - Liveness enforcement gates continued rights
 ///
@@ -903,7 +874,7 @@ pub struct IdentityStore {
     records:  HashMap<String, IdentityRecord>,
     /// Index: address -> identity_id for fast lookup by account address.
     by_address: HashMap<String, String>,
-    pub clock: UbiClock,
+    pub clock: EpochClock,
     /// Phase A: per-pair attestation records for penalty and cap tracking.
     ///
     /// Key order: (attester_id, attested_id). This choice is a named trade-off:
@@ -961,7 +932,7 @@ impl IdentityStore {
         Self {
             records:    HashMap::new(),
             by_address: HashMap::new(),
-            clock:      UbiClock::new(genesis_time_ms),
+            clock:      EpochClock::new(genesis_time_ms),
             attestation_records: HashMap::new(),
             coordinator_id: None,
             sybil_confirmations: HashMap::new(),
@@ -974,7 +945,7 @@ impl IdentityStore {
         Self {
             records:    HashMap::new(),
             by_address: HashMap::new(),
-            clock:      UbiClock::with_epoch_duration_ms(genesis_time_ms, epoch_duration_ms),
+            clock:      EpochClock::with_epoch_duration_ms(genesis_time_ms, epoch_duration_ms),
             attestation_records: HashMap::new(),
             coordinator_id: None,
             sybil_confirmations: HashMap::new(),
@@ -1065,7 +1036,7 @@ impl IdentityStore {
             .ok_or_else(|| IdentityError::NotFound(attester_id.to_string()))?
             .tier()
             .clone();
-        if !attester_tier.grants_full_ubi() {
+        if !attester_tier.is_verified_or_established() {
             return Err(IdentityError::AttesterNotVerified(attester_id.to_string()));
         }
 
@@ -1231,61 +1202,6 @@ impl IdentityStore {
             .collect()
     }
 
-    // -- UBI claim gating (Charm Confinement) ---------------------------------
-
-    /// Claim UBI for a verified identity.
-    /// Enforces: one claim per epoch, verified tier, liveness.
-    /// Returns the amount of uqrc to credit to the account.
-    pub fn claim_ubi(&mut self, id: &str) -> IdResult<u128> {
-        let epoch = self.clock.current_epoch;
-        let record = self.records.get_mut(id)
-            .ok_or_else(|| IdentityError::NotFound(id.to_string()))?;
-
-        // Tier check
-        if !record.charm.tier.grants_full_ubi() {
-            return Err(IdentityError::NotVerified(
-                id.to_string(),
-                record.charm.tier.clone(),
-            ));
-        }
-
-        // Liveness check (Q24)
-        if !record.charm.is_lively(epoch) {
-            return Err(IdentityError::Lapsed(
-                id.to_string(),
-                record.charm.last_attested_epoch,
-                epoch,
-            ));
-        }
-
-        // Charm Confinement: one claim per epoch (Section 5.1)
-        if record.claimed_this_epoch {
-            return Err(IdentityError::AlreadyClaimed(id.to_string(), epoch));
-        }
-
-        // Earned-yield gate: QRC is NOT a UBI drip — it must be earned.
-        // The identity must have performed at least one on-chain action this
-        // epoch (tx submission, validator participation, merchant settlement).
-        // record_activity() / record_activity_by_address() are called by the
-        // execution layer whenever such an event occurs.
-        let active_this_epoch = record.last_active_epoch == Some(epoch);
-        if !active_this_epoch {
-            return Err(IdentityError::NotVerified(
-                id.to_string(),
-                record.charm.tier.clone(),
-            ));
-        }
-
-        let amount = UbiClock::ubi_per_epoch();
-        record.claimed_this_epoch = true;
-        record.total_ubi_claimed += amount;
-        record.charm.record_participation(epoch);
-        self.clock.total_distributed += amount;
-
-        tracing::debug!(id, epoch, amount_uqrc = amount, "QRC yield claimed");
-        Ok(amount)
-    }
-
     /// Record on-chain activity for an identity, enabling QRC yield claim
     /// for this epoch. Called by the execution layer whenever a verified
     /// identity submits a tx, participates as a validator, or processes a
@@ -1312,18 +1228,16 @@ impl IdentityStore {
         }
     }
 
-    /// Advance the UBI epoch. Resets claim flags for all identities.
-    /// Also enforces liveness -- lapsed identities are downgraded.
+    /// Advance the epoch. Enforces liveness -- lapsed identities are
+    /// downgraded.
     pub fn advance_epoch(&mut self, now_ms: u64) -> bool {
         if !self.clock.try_advance(now_ms) {
             return false;
         }
         let current = self.clock.current_epoch;
 
-        // Reset claim flags and enforce liveness for all identities
+        // Enforce liveness for all identities
         for record in self.records.values_mut() {
-            record.claimed_this_epoch = false;
-
             // Liveness enforcement (Q24): downgrade if inactive too long
             if record.charm.tier != VerificationTier::Provisional
                 && !record.charm.is_lively(current)
@@ -1332,16 +1246,16 @@ impl IdentityStore {
             }
         }
 
-        tracing::info!(epoch = current, "UBI epoch advanced, claim flags reset");
+        tracing::info!(epoch = current, "epoch advanced");
         true
     }
 
     /// Deterministic sibling of `advance_epoch`: advance directly to an
     /// explicit epoch number the caller already computed, instead of
-    /// deriving one from `now_ms`/`UbiClock::try_advance`.
+    /// deriving one from `now_ms`/`EpochClock::try_advance`.
     ///
     /// `advance_epoch(now_ms)` is driven by each node's own wall clock --
-    /// fine for UBI claim-flag resets (cosmetic, not consensus-critical),
+    /// fine for cosmetic, non-consensus-critical epoch bookkeeping,
     /// but the SAME call also runs liveness enforcement
     /// (`IntrinsicCharm::lapse()`), which feeds `pop_verified` /
     /// `grants_consensus()` and therefore consensus voting power. Two
@@ -1377,8 +1291,6 @@ impl IdentityStore {
         let current = new_epoch;
 
         for record in self.records.values_mut() {
-            record.claimed_this_epoch = false;
-
             // Liveness enforcement (Q24): downgrade if inactive too long.
             // Identical rule to advance_epoch(), just driven by a
             // deterministically-computed epoch instead of a wall-clock one.
@@ -1447,7 +1359,7 @@ impl IdentityStore {
 
     pub fn verified_count(&self) -> usize {
         self.records.values()
-            .filter(|r| r.charm.tier.grants_full_ubi())
+            .filter(|r| r.charm.tier.is_verified_or_established())
             .count()
     }
 
@@ -1788,7 +1700,7 @@ mod tests {
     #[test]
     fn provisional_grants_no_rights() {
         let tier = VerificationTier::Provisional;
-        assert!(!tier.grants_full_ubi());
+        assert!(!tier.is_verified_or_established());
         assert!(!tier.grants_consensus());
         assert!(!tier.grants_governance());
         assert!(!tier.can_sponsor_agents());
@@ -1798,7 +1710,7 @@ mod tests {
     #[test]
     fn verified_grants_all_rights() {
         let tier = VerificationTier::Verified;
-        assert!(tier.grants_full_ubi());
+        assert!(tier.is_verified_or_established());
         assert!(tier.grants_consensus());
         assert!(tier.grants_governance());
         assert!(tier.can_sponsor_agents());
@@ -1912,63 +1824,6 @@ mod tests {
     }
 
     #[test]
-    fn provisional_cannot_claim_ubi() {
-        let mut store = make_store();
-        store.register("h1".into(), "qcb1h1".into(), genesis_attestation("h1")).unwrap();
-        // Not verified yet -- should fail
-        let result = store.claim_ubi("h1");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn verified_but_inactive_cannot_claim_yield() {
-        let mut store = make_store();
-        register_and_verify(&mut store, "h1", "qcb1h1");
-
-        // Verified but no on-chain activity recorded — must fail.
-        let result = store.claim_ubi("h1");
-        assert!(result.is_err(), "QRC yield requires on-chain activity; passive claim must fail");
-    }
-
-    #[test]
-    fn active_verified_identity_claims_yield() {
-        let mut store = make_store();
-        register_and_verify(&mut store, "h1", "qcb1h1");
-
-        // Record activity (simulates tx submission).
-        store.record_activity("h1");
-
-        let amount = store.claim_ubi("h1").unwrap();
-        assert_eq!(amount, DAILY_UBI_RATE_UQRC);
-    }
-
-    #[test]
-    fn charm_confinement_one_claim_per_epoch() {
-        let mut store = make_store();
-        register_and_verify(&mut store, "h1", "qcb1h1");
-        store.record_activity("h1");
-
-        store.claim_ubi("h1").unwrap();
-        let second = store.claim_ubi("h1");
-        assert!(second.is_err(), "should not allow second claim in same epoch");
-    }
-
-    #[test]
-    fn epoch_advance_resets_claim_flags() {
-        let mut store = IdentityStore::with_epoch_ms(0, 1000);
-        register_and_verify(&mut store, "h1", "qcb1h1");
-
-        store.record_activity("h1");
-        store.claim_ubi("h1").unwrap();
-        store.advance_epoch(1001); // advance past 1 epoch duration
-
-        // Must record activity again in the new epoch before claiming.
-        store.record_activity("h1");
-        let result = store.claim_ubi("h1");
-        assert!(result.is_ok(), "should allow claim in new epoch after activity");
-    }
-
-    #[test]
     fn liveness_enforcement_lapses_inactive_identity() {
         let mut store = IdentityStore::with_epoch_ms(0, 1000);
         register_and_verify(&mut store, "h1", "qcb1h1");
@@ -1984,20 +1839,16 @@ mod tests {
     }
 
     #[test]
-    fn advance_epoch_to_resets_claim_flags_like_advance_epoch() {
-        // Deterministic sibling of epoch_advance_resets_claim_flags: same
-        // behavior, but the epoch number is supplied directly rather than
-        // derived from a wall-clock timestamp.
+    fn advance_epoch_to_advances_the_clock() {
+        // Deterministic sibling of advance_epoch: same behavior, but the
+        // epoch number is supplied directly rather than derived from a
+        // wall-clock timestamp.
         let mut store = make_store();
         register_and_verify(&mut store, "h1", "qcb1h1");
 
         store.record_activity("h1");
-        store.claim_ubi("h1").unwrap();
         assert!(store.advance_epoch_to(1), "must report that the epoch changed");
-
-        store.record_activity("h1");
-        let result = store.claim_ubi("h1");
-        assert!(result.is_ok(), "should allow claim in new epoch after activity");
+        assert_eq!(store.clock.current_epoch, 1);
     }
 
     #[test]
@@ -2077,8 +1928,8 @@ mod tests {
     }
 
     #[test]
-    fn ubi_clock_advances_on_time() {
-        let mut clock = UbiClock::with_epoch_duration_ms(0, 1000);
+    fn epoch_clock_advances_on_time() {
+        let mut clock = EpochClock::with_epoch_duration_ms(0, 1000);
         assert_eq!(clock.current_epoch, 0);
 
         let advanced = clock.try_advance(1001);
@@ -2088,21 +1939,6 @@ mod tests {
         let not_advanced = clock.try_advance(1500);
         assert!(!not_advanced);
         assert_eq!(clock.current_epoch, 1);
-    }
-
-    #[test]
-    fn total_ubi_accumulates() {
-        let mut store = make_store();
-        register_and_verify(&mut store, "h1", "qcb1h1");
-        register_and_verify(&mut store, "h2", "qcb1h2");
-
-        store.record_activity("h1");
-        store.record_activity("h2");
-
-        store.claim_ubi("h1").unwrap();
-        store.claim_ubi("h2").unwrap();
-
-        assert_eq!(store.clock.total_distributed, DAILY_UBI_RATE_UQRC * 2);
     }
 
     // -- Web-of-trust quorum (Phase 1 identity pilot mechanism) ----------------

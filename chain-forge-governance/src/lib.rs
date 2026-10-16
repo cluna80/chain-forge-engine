@@ -9,7 +9,7 @@
 ///   What passes: simple majority of votes cast.
 ///   Quorum floor: >3% of verified population (derived from f/(p+f) < 0.5
 ///   at 3% sybil rate — Section 6.6).
-///   Examples: decay rate changes, UBI rate, exemption thresholds.
+///   Examples: decay rate changes, earning rates, exemption thresholds.
 ///
 /// CONSTITUTIONAL GOVERNANCE — for the things Section 7.3 lists as
 ///   requiring a higher bar: the two-token separation, the sovereignty
@@ -84,7 +84,7 @@ pub type GovResult<T> = Result<T, GovError>;
 /// rules are enforced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalKind {
-    /// Change a $QRC monetary parameter (decay rate, UBI rate, etc.).
+    /// Change a $QRC monetary parameter (decay rate, earning rate, etc.).
     /// Ordinary governance: simple majority, >3% quorum.
     QrcParameter {
         parameter: String,

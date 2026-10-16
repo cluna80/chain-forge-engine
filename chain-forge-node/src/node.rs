@@ -114,7 +114,8 @@ pub type SharedExplorer = Arc<Mutex<ExplorerState>>;
 // -- QRC metrics (shared with the API, Section 9.1 / 5.4) -------------------
 
 /// Live snapshot of QRC resource economy metrics.
-/// QRC is a data-consumption / resource-credit token (NOT a UBI coin):
+/// QRC is a data-consumption / resource-credit token (earned or purchased,
+/// not distributed as a flat per-person drip):
 ///   - Purchase path: QCB burned → QRC credits at algorithmic rate Rt
 ///   - Contribution path: verified resource providers earn QRC directly
 ///   - Consumption split: ~60% provider / ~25% permanent burn / ~15% protocol reserve
@@ -260,8 +261,9 @@ pub struct Node {
     /// message once and never replays it.
     chain_store: std::collections::BTreeMap<u64, (chain_forge_consensus::CommitCertificate, BlockProposal)>,
     /// Identity registry (Whitepaper Section 4 / Identity Pilot Design) --
-    /// backs RegisterIdentity and Attest transactions, and ClaimUbi's
-    /// verified-tier gate. Threaded through execute_block_with_identity()
+    /// backs RegisterIdentity and Attest transactions, and the
+    /// verified-tier gates used throughout execution. Threaded through
+    /// execute_block_with_identity()
     /// on every commit so identity state actually persists across blocks.
     identity: IdentityStore,
     /// QRC resource economy engine — tracks conversion rate Rt, per-resource
@@ -402,8 +404,6 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::Custom { .. }              => "custom",
         TxBody::RegisterIdentity            => "register_identity",
         TxBody::Attest { .. }              => "attest",
-        TxBody::ClaimUbi { .. }            => "claim_ubi",
-        TxBody::RedirectToUbiPool { .. }   => "ubi_redirect",
         TxBody::SponsorAgent { .. }        => "sponsor_agent",
         TxBody::RevokeAgent { .. }         => "revoke_agent",
         TxBody::RevokeAttestation { .. }        => "revoke_attestation",
@@ -2892,7 +2892,7 @@ impl Node {
         // chain-forge-identity for why liveness/admission can't be
         // decoupled from the epoch *number* itself, only from how that
         // number is derived). `now_ms` above is still wall-clock -- it only
-        // feeds UBI claim-flag resets and tx execution timestamps now,
+        // feeds cosmetic epoch bookkeeping and tx execution timestamps now,
         // neither of which affects validator membership, voting power, or
         // quorum.
         let validator_epoch = cert.height / self.validator_epoch_blocks;
@@ -4583,7 +4583,7 @@ mod tests {
 
         // advance_epoch lints the lapse; the reconcile sweep (Point 3) revokes pop.
         let epoch_advanced = node.identity.advance_epoch(now_ms);
-        assert!(epoch_advanced, "91-epoch jump must advance the UBI clock");
+        assert!(epoch_advanced, "91-epoch jump must advance the epoch clock");
 
         // Replicate what the commit path does after advance_epoch -- the
         // reconcile sweep from Integration Point 3:

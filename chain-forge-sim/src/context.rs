@@ -259,7 +259,6 @@ impl SimContext {
         tx.sender = self.resolve(&tx.sender);
         match &mut tx.body {
             TxBody::Attest { claimant_id }         => *claimant_id = self.resolve(claimant_id),
-            TxBody::ClaimUbi { identity_id }       => *identity_id = self.resolve(identity_id),
             TxBody::Transfer { to, .. }            => *to = self.resolve(to),
             TxBody::SponsorAgent { agent_address } => *agent_address = self.resolve(agent_address),
             TxBody::RevokeAgent { agent_address }  => *agent_address = self.resolve(agent_address),
