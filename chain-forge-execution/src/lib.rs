@@ -2148,6 +2148,15 @@ impl Executor {
         Self { config }
     }
 
+    /// The chain's native fee/stake denom (e.g. `"uqcb"`). Exposed so
+    /// callers outside this crate -- `chain-forge-node`'s epoch-boundary
+    /// active-set recomputation, in particular -- can query
+    /// `validator_bond::compute_stake_active_set` against the same denom
+    /// the executor itself used to move bonded stake.
+    pub fn native_denom(&self) -> &str {
+        &self.config.native_denom
+    }
+
     /// Execute a single transaction with CharmConfinement enforcement.
     /// Requires identity store, QRC engine, and agent store for identity-gated
     /// and agent-registered tx types.
@@ -5506,6 +5515,61 @@ mod tests {
         let unbond_a = Transaction::unbond_validator("unbondA", "qcb1alice", 1);
         assert!(exec.execute_tx_with_identity(&unbond_a, &mut state, &mut identity, &mut qrc, &mut agents).success);
         assert_eq!(state.get_account("validator-bond:qcb1bob").unwrap().balance_of("uqcb"), 4_000_000);
+    }
+
+    #[test]
+    fn compute_stake_active_set_ranks_live_bonded_stake() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
+        let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
+        let v = Transaction::bond_validator("bondV", "qcb1val", 500_000, 0); // below default min
+        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&v, &mut state, &mut identity, &mut qrc, &mut agents).success);
+
+        let active = validator_bond::compute_stake_active_set(
+            &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+        );
+        // qcb1val's 500_000 is below the 1_000_000 minimum -- excluded.
+        // Bob out-stakes Alice, so he ranks first.
+        assert_eq!(active, vec![
+            ("qcb1bob".to_string(), 4_000_000),
+            ("qcb1alice".to_string(), 2_000_000),
+        ]);
+    }
+
+    #[test]
+    fn compute_stake_active_set_drops_validators_who_fully_unbond() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let active_before = validator_bond::compute_stake_active_set(
+            &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+        );
+        assert_eq!(active_before, vec![("qcb1alice".to_string(), 2_000_000)]);
+
+        // UnbondValidator moves the bond out of validator-bond:qcb1alice
+        // immediately (cooldown only gates when the *funds* return, not
+        // when the validator stops counting toward the active set).
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        assert!(exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        let active_after = validator_bond::compute_stake_active_set(
+            &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+        );
+        assert!(active_after.is_empty());
+    }
+
+    #[test]
+    fn compute_stake_active_set_respects_max_size_cap() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
+        let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
+        exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut qrc, &mut agents);
+        exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        let active = validator_bond::compute_stake_active_set(&state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, 1);
+        // Capped to 1: only the higher-staked validator (Bob) makes it in.
+        assert_eq!(active, vec![("qcb1bob".to_string(), 4_000_000)]);
     }
 
     #[test]

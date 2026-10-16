@@ -412,6 +412,9 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::VerifyJob { .. }                => "verify_job",
         // PoCD Research Reward Settlement (Change Set L)
         TxBody::ClaimResearchReward { .. }      => "claim_research_reward",
+        // Validator Onboarding (ROADMAP.md)
+        TxBody::BondValidator { .. }             => "bond_validator",
+        TxBody::UnbondValidator                  => "unbond_validator",
     }
 }
 
@@ -2722,7 +2725,7 @@ impl Node {
             .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
-        self.identity.advance_epoch(now_ms);
+        let epoch_rolled = self.identity.advance_epoch(now_ms);
 
         // Integration Point 3 (Push): after advancing the epoch, sync the
         // ValidatorRegistry with any identity lapses that just happened.
@@ -2847,6 +2850,80 @@ impl Node {
                     verdict  = verdict,
                     "attestation telemetry emitted"
                 );
+            }
+        }
+
+        // Integration Point 4 (Push): at each identity-epoch boundary,
+        // admit newly stake-bonded validators into the live consensus
+        // ValidatorSet.
+        //
+        // ROADMAP.md, Validator Onboarding: before this, `BondValidator`
+        // could move uqcb into a validator's bond account, but nothing ever
+        // read that back into consensus -- `genesis_vs` was built once at
+        // startup and never grew. A validator could bond the minimum stake
+        // forever and still never be seated. This closes that gap on the
+        // entry side.
+        //
+        // Scope, deliberately: this ADDS newly-qualifying candidates up to
+        // the max active-set size; it does not EVICT an existing validator
+        // whose stake falls below the minimum or who is outranked by a
+        // later, larger staker. Full top-N churn (the "exit" half of
+        // "Top-N stakers automatically enter/exit active set") needs a
+        // product decision this change doesn't make on its own: whether
+        // genesis/synthetic validators (who hold no bond at all, since they
+        // were seated by genesis, not by a BondValidator tx) are exempt from
+        // eviction or get swept out the first time anyone else bonds.
+        // Tracked as follow-up in ROADMAP.md rather than decided here.
+        // Removal of a validator already in the set remains the job of the
+        // existing jailing/tombstoning/liveness-revocation machinery, which
+        // this does not touch.
+        //
+        // New entrants start with pop_verified=false and an empty
+        // public_key (same Phase-0 placeholder convention as a genesis
+        // validator before identity seeding -- see `genesis_vs`
+        // construction in `Node::new`). The PoP refresh block immediately
+        // below corrects pop_verified from IdentityStore before this same
+        // commit finishes; the public key is backfilled later via
+        // `load_signing_key` (operator's own node) or by other validators'
+        // `verify_vote_signature` Phase-0 tolerance in the meantime.
+        if epoch_rolled {
+            let active = chain_forge_execution::validator_bond::compute_stake_active_set(
+                &self.state,
+                self.executor.native_denom(),
+                chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB,
+                chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+            );
+            let mut updated_vs = self.consensus.validator_set().clone();
+            let already_seated: std::collections::HashSet<String> = updated_vs.validators
+                .iter()
+                .map(|v| v.id.0.clone())
+                .collect();
+            let capacity = chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS
+                .saturating_sub(updated_vs.validators.len());
+            let mut admitted = 0usize;
+            for (addr, bonded_uqcb) in &active {
+                if admitted >= capacity {
+                    break;
+                }
+                if already_seated.contains(addr) {
+                    continue;
+                }
+                info!(
+                    validator = %addr,
+                    bonded_uqcb = *bonded_uqcb,
+                    "stake bond: admitting new validator candidate to active set"
+                );
+                updated_vs.validators.push(chain_forge_consensus::ValidatorInfo {
+                    id: chain_forge_consensus::ValidatorId(addr.clone()),
+                    voting_power: (*bonded_uqcb).min(u64::MAX as u128) as u64,
+                    pop_verified: false,
+                    public_key: vec![],
+                });
+                admitted += 1;
+            }
+            if admitted > 0 {
+                updated_vs.height = cert.height;
+                let _ = self.consensus.update_validator_set(updated_vs);
             }
         }
 
@@ -3151,7 +3228,7 @@ impl Node {
             .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
-        self.identity.advance_epoch(now_ms);
+        let epoch_rolled = self.identity.advance_epoch(now_ms);
 
         // Integration Point 3 (Push) — same reconciliation as the multi-node
         // commit path: after advancing the epoch, revoke ValidatorRegistry
@@ -3201,6 +3278,52 @@ impl Node {
             state_root = %exec_result.state_root,
             "block executed and committed"
         );
+
+        // Integration Point 4 (Push) — same stake-bond admission as the
+        // multi-node commit path (see the full design comment there). This
+        // is the devnet/single-node auto-commit path, so it needs its own
+        // copy rather than a shared call: the two paths build/cast votes
+        // differently and don't share a merge point before `on_commit`.
+        if epoch_rolled {
+            let active = chain_forge_execution::validator_bond::compute_stake_active_set(
+                &self.state,
+                self.executor.native_denom(),
+                chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB,
+                chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+            );
+            let mut updated_vs = self.consensus.validator_set().clone();
+            let already_seated: std::collections::HashSet<String> = updated_vs.validators
+                .iter()
+                .map(|v| v.id.0.clone())
+                .collect();
+            let capacity = chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS
+                .saturating_sub(updated_vs.validators.len());
+            let mut admitted = 0usize;
+            for (addr, bonded_uqcb) in &active {
+                if admitted >= capacity {
+                    break;
+                }
+                if already_seated.contains(addr) {
+                    continue;
+                }
+                info!(
+                    validator = %addr,
+                    bonded_uqcb = *bonded_uqcb,
+                    "stake bond: admitting new validator candidate to active set"
+                );
+                updated_vs.validators.push(chain_forge_consensus::ValidatorInfo {
+                    id: chain_forge_consensus::ValidatorId(addr.clone()),
+                    voting_power: (*bonded_uqcb).min(u64::MAX as u128) as u64,
+                    pop_verified: false,
+                    public_key: vec![],
+                });
+                admitted += 1;
+            }
+            if admitted > 0 {
+                updated_vs.height = height;
+                let _ = self.consensus.update_validator_set(updated_vs);
+            }
+        }
 
         // Advance consensus to next height
         self.consensus.on_commit(cert.clone(), None).await
@@ -3392,6 +3515,70 @@ mod tests {
         // Bob should have 5_100_000 after receiving 100_000
         let bob_balance = node.state.get_account("qcb1bob").unwrap().balance_of("uqcb");
         assert_eq!(bob_balance, 5_100_000);
+    }
+
+    #[tokio::test]
+    async fn bonded_stake_admits_new_validator_candidate_at_epoch_boundary() {
+        // ROADMAP.md, Validator Onboarding: a brand-new address with no
+        // genesis role at all should be able to bond stake and actually
+        // enter the live consensus ValidatorSet -- the gap Integration
+        // Point 4 closes. None of the 4 genesis accounts exercise this: all
+        // of them already hold role "validator" and are seated from block
+        // 0, so this test uses a fifth address the genesis set never heard
+        // of.
+        use chain_forge_execution::Transaction;
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        assert!(
+            !node.consensus.validator_set().validators.iter().any(|v| v.id.0 == "qcb1erin"),
+            "qcb1erin must not be seated before bonding anything"
+        );
+
+        // The genesis epoch rolls on its own the first time `advance_epoch`
+        // sees a real wall clock (genesis_time is always in the past), but
+        // `try_advance` then fast-forwards `epoch_start_ms` to "catch up",
+        // so a *second* roll within the same test run isn't guaranteed.
+        // Force every block's epoch check to roll by shrinking the epoch to
+        // effectively zero -- this test is about admission at an epoch
+        // boundary, not about epoch timing itself.
+        node.identity.clock.epoch_duration_ms = 1;
+
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Block 0: fund the new address (it holds nothing at genesis, so
+        // it cannot bond before it has uqcb to bond).
+        node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_000_000, 0));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        // Block 1: bond the min threshold and above.
+        node.submit_tx(Transaction::bond_validator("bond-erin", "qcb1erin", 2_000_000, 0));
+        node.propose_block(cert0.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let erin = vs.validators.iter().find(|v| v.id.0 == "qcb1erin")
+            .expect("qcb1erin must be admitted to the active set after bonding above the minimum");
+        assert_eq!(erin.voting_power, 2_000_000);
+        assert!(!erin.pop_verified, "new entrant starts unverified until IdentityStore says otherwise");
+    }
+
+    #[tokio::test]
+    async fn bonding_below_minimum_does_not_admit_a_validator() {
+        use chain_forge_execution::Transaction;
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 500_000, 0));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        // Below chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB (1_000_000).
+        node.submit_tx(Transaction::bond_validator("bond-erin", "qcb1erin", 500_000, 0));
+        node.propose_block(cert0.block_hash).await.unwrap();
+
+        assert!(
+            !node.consensus.validator_set().validators.iter().any(|v| v.id.0 == "qcb1erin"),
+            "a sub-minimum bond must not seat a new validator"
+        );
     }
 
     #[tokio::test]

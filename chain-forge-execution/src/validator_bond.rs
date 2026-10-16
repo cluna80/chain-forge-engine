@@ -16,16 +16,77 @@
 //! as `DepositToTreasury`).
 //!
 //! Scope note: this module implements bonding, unbonding-with-cooldown, and
-//! the stake-ranked active-set computation (`active_set()`). It does NOT
-//! wire that computed active set into the live consensus engine's
-//! `ValidatorSet` at epoch boundaries -- today, `chain-forge-node` builds
-//! `ValidatorSet` once from genesis and never recomputes it (see
-//! `chain-forge-node/src/node.rs`, `genesis_vs`). Swapping the consensus
-//! engine's live validator set at each epoch boundary from
-//! `ValidatorBondStore::active_set()` is the remaining integration work,
-//! tracked in `ROADMAP.md`.
+//! two independent ways of reading back the current stake ranking:
+//! `ValidatorBondStore::active_set()` over the isolated, unit-testable
+//! in-memory model, and `compute_stake_active_set()` over the live
+//! `StateStore` ledger the executor actually writes to (the one that
+//! matters once transactions are flowing).
+//!
+//! `chain-forge-node::node.rs` calls `compute_stake_active_set()` at each
+//! identity-epoch boundary ("Integration Point 4", next to the existing
+//! PoP-reconciliation code in both the multi-node `commit_block` and the
+//! devnet single-node auto-commit path) and admits any newly-qualifying
+//! address into the live consensus `ValidatorSet` -- closing the gap where
+//! `BondValidator` could move funds but a new staker could never actually
+//! be seated.
+//!
+//! Remaining, deliberately out of scope here: eviction. Integration Point 4
+//! only ADDS candidates up to the max active-set size; it does not remove
+//! a seated validator whose stake falls below the minimum or who is
+//! outranked by a larger, later staker. Full top-N churn needs a product
+//! decision this module doesn't make on its own -- whether genesis/
+//! synthetic validators (seated at genesis, not via a bond) are exempt from
+//! eviction or get swept out the first time anyone else bonds. Tracked as
+//! follow-up in `ROADMAP.md`.
 
 use std::collections::HashMap;
+
+use chain_forge_state::StateStore;
+
+/// Prefix for the deterministic per-validator virtual account that
+/// `TxBody::BondValidator`/`UnbondValidator` actually move funds into and
+/// out of (see `lib.rs`, `execute_tx_with_identity`). `ValidatorBondStore`
+/// above is the isolated, unit-testable model of the same rules; this is
+/// the live StateStore-backed query that reads the real bonded-stake
+/// ledger the executor writes to.
+pub const BOND_ACCOUNT_PREFIX: &str = "validator-bond:";
+
+/// Reads every currently-bonded validator address and its bonded uqcb
+/// directly from `StateStore` -- the actual source of truth once
+/// `BondValidator`/`UnbondValidator` transactions have executed -- and
+/// returns the stake-ranked active set: validators at or above
+/// `min_bond_uqcb`, sorted descending by stake (ascending by address to
+/// break ties), truncated to `max_size`.
+///
+/// This is the function `chain-forge-node` calls at each epoch boundary to
+/// decide which addresses belong in the live consensus `ValidatorSet` (see
+/// `node.rs`, "Integration Point 4" next to the existing PoP-reconciliation
+/// code). It is read-only and side-effect-free: it does not touch
+/// `StateStore`, so it is safe to call speculatively (e.g. for an RPC
+/// preview of the next active set) as well as at the real boundary.
+pub fn compute_stake_active_set(
+    state: &StateStore,
+    denom: &str,
+    min_bond_uqcb: u128,
+    max_size: usize,
+) -> Vec<(String, u128)> {
+    let mut candidates: Vec<(String, u128)> = state
+        .all_accounts()
+        .filter_map(|acct| {
+            acct.address
+                .strip_prefix(BOND_ACCOUNT_PREFIX)
+                .map(|validator_addr| (validator_addr.to_string(), acct.balance_of(denom)))
+        })
+        .filter(|(_, bonded)| *bonded >= min_bond_uqcb)
+        .collect();
+
+    // Descending by stake, then ascending by address -- same deterministic
+    // ordering as `ValidatorBondStore::active_set()`, so every node that
+    // replays the same chain computes the identical active set.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    candidates.truncate(max_size);
+    candidates
+}
 
 /// Deterministic virtual account holding all currently-bonded stake.
 /// Same convention as `treasury:{agent_id}` / `treasury:pocd-research` --
