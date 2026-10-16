@@ -28,6 +28,9 @@ use chain_forge_qrc::QrcEngine;
 use chain_forge_agents::{AgentStore, AgentType, SpendingLimits};
 use chain_forge_pocd::DiscoveryRegistry;
 
+/// FeeSponsor cryptographic primitives (FS-01). See `docs/FeeSponsor.md`.
+pub mod feesponsor;
+
 // -- Error --------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
