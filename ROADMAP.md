@@ -217,12 +217,12 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `BondValidator` tx type | ⬜ | Lock uQCB as validator stake; candidate enters pending set |
-| `UnbondValidator` tx type | ⬜ | Start unbonding timer; stake released after cooldown period (prevents slash-and-run) |
-| Minimum bond threshold | ❓ | Design decision: low enough for individual participation, high enough to make Sybil attacks expensive |
-| Maximum active validator set size | ❓ | BFT doesn't scale to thousands of validators; cap at ~100–200, ranked by stake |
-| Stake-ranked validator set at epoch boundary | ⬜ | Top-N stakers automatically enter/exit active set; replaces manual `ValidatorSetChange` governance votes for routine churn |
-| Unbonding cooldown enforcement | ⬜ | Stake locked for N epochs after `UnbondValidator`; slashable during cooldown |
+| `BondValidator` tx type | ✅ | Shipped on `phase1-validator-onboarding`. Locks uQCB into a per-validator virtual account (`validator-bond:{addr}`); bonding is incremental and accumulates across calls. 10 execution-level tests. |
+| `UnbondValidator` tx type | ✅ | Shipped on `phase1-validator-onboarding`. Moves the full bond into a per-validator `validator-unbonding:{addr}` account with `unlock_epoch = current_epoch + cooldown`; stake stops counting toward the active set immediately. Calling it again after cooldown sweeps funds back to the sender exactly once — double-sweep and "slash-and-run" (a second unbond while one is still cooling down) are both rejected. |
+| Minimum bond threshold | ✅ | `DEFAULT_MIN_BOND_UQCB = 1_000_000` uqcb, set as a constant in `validator_bond.rs`. Can still be revisited, but is no longer an open design question blocking implementation. |
+| Maximum active validator set size | ✅ | `DEFAULT_MAX_ACTIVE_VALIDATORS = 150`, same basis. |
+| Stake-ranked validator set at epoch boundary | 🔲 | `ValidatorBondStore::active_set()` computes the top-N ranking (desc by stake, then asc by address for deterministic tie-breaking) and is unit-tested in isolation — but it is **not wired into the live consensus engine**. `chain-forge-node::node.rs` currently builds `ValidatorSet` once at genesis from `genesis.consensus.validator_set_size` and never recomputes it. Making the active set actually dynamic at epoch boundaries is the next step here. |
+| Unbonding cooldown enforcement | ✅ | `DEFAULT_UNBONDING_COOLDOWN_EPOCHS = 21`, enforced via `identity.clock.current_epoch` in `execute_tx_with_identity()`. (Slashing-during-cooldown is not yet separately implemented — stake sits in the unbonding account, untouched by the existing slashing module.) |
 | Validator commission rate | ⬜ | Validators take a configurable % of PoCD research rewards routed through their node |
 | Validator self-service docs | ⬜ | Operator guide: keygen → bond → run node → monitor → unbond |
 
