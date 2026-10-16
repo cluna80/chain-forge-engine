@@ -18,6 +18,27 @@
 ### The name is Qattice, changed from QCB but still uses $QCB as the token to the ecosystem.
 
 
+## Planned Feature — FeeSponsor (Native Transaction Fee Sponsorship)
+
+**Status:** 🔲 Planned — not implemented. **Placement:** After core deterministic transaction-fee accounting and before broad application onboarding.
+
+**Goal:** Let verified developers, research institutions, enterprises, and Charmed Agents sponsor Qattice transaction fees in QCB on behalf of users. The user authorizes the operation; the sponsor separately authorizes the fee payment. This is a native fee-payer primitive, **not** a second token or a protocol-level resource marketplace.
+
+| Milestone | Status | Acceptance criteria |
+|---|---|---|
+| Fee accounting prerequisite | 🔲 | Deterministic uQCB fees, charge/refund/failure rules, fee recipient policy, and insufficient-funds handling |
+| FeeSponsor account | 🔲 | Pre-funded uQCB balance, distinct from user accounts and PoCD research treasury |
+| Dual authorization | 🔲 | User operation signature and scoped sponsor authorization bound to chain ID, transaction hash, max fee, nonce, and expiration |
+| Sponsor policies | 🔲 | SponsorID linkage without conflating identity sponsorship and fee payment; allowlists, per-tx/epoch budgets, revocation |
+| Deterministic execution | 🔲 | All nodes agree on fee payer, fee debit, nonce use, failed-tx behavior, and atomic state updates |
+| Adversarial tests | 🔲 | Forged signatures, replay/cross-chain replay, budget exhaustion, policy bypass, and double charging rejected |
+| Multi-node devnet | 🔲 | Sponsored and ordinary transactions yield consistent state on multiple nodes, including failures |
+| Developer SDK | 🔲 | Examples for Grand Challenge, Charmed Agents, and third-party applications; verified sponsors first |
+
+**Invariants:** Only existing QCB/uQCB moves; no new minting, no default burn, no changes to PoCD rewards or BFT voting power. Sponsorship grants no control over user funds. Fee rate and recipient policy remain open design decisions.
+
+---
+
 ## Phase 0 — Chain Forge Engine Foundation
 
 **Goal**: A working, partition-tolerant BFT consensus engine plus one complete, adversarially-verified, cross-machine resource purchase and a live PoCD research pipeline — Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios. Separately, external miners submit SHA-256 cryptographic discovery proofs that are independently verified and rewarded in uQCB from `treasury:pocd-research`.
