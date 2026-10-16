@@ -1336,6 +1336,63 @@ impl IdentityStore {
         true
     }
 
+    /// Deterministic sibling of `advance_epoch`: advance directly to an
+    /// explicit epoch number the caller already computed, instead of
+    /// deriving one from `now_ms`/`UbiClock::try_advance`.
+    ///
+    /// `advance_epoch(now_ms)` is driven by each node's own wall clock --
+    /// fine for UBI claim-flag resets (cosmetic, not consensus-critical),
+    /// but the SAME call also runs liveness enforcement
+    /// (`IntrinsicCharm::lapse()`), which feeds `pop_verified` /
+    /// `grants_consensus()` and therefore consensus voting power. Two
+    /// nodes calling `SystemTime::now()` at slightly different real
+    /// moments around an epoch boundary could lapse a validator at
+    /// different heights, or not at all -- a quorum-safety and
+    /// state-divergence risk, not just a cosmetic one.
+    ///
+    /// The fix is not to special-case liveness out of the epoch clock --
+    /// `last_attested_epoch`/`record_participation` are stamped with the
+    /// SAME `self.clock.current_epoch` liveness is checked against, so
+    /// decoupling just the lapse check would compare two different
+    /// numbering schemes. Instead, callers that need determinism (the
+    /// validator-set-affecting commit paths in chain-forge-node) compute
+    /// an epoch number purely from block height -- which every node
+    /// already agrees on by construction of BFT consensus -- and advance
+    /// the SAME clock through this method instead of `advance_epoch`.
+    /// Both methods still write to `self.clock.current_epoch`/do liveness
+    /// enforcement identically; only how the epoch number is derived
+    /// differs. A chain that calls this consistently never calls
+    /// `advance_epoch(now_ms)` in the same process, so the two numbering
+    /// schemes never mix.
+    ///
+    /// No-op (returns false) if `new_epoch` is not strictly greater than
+    /// the current epoch -- mirrors `advance_epoch`'s "did anything
+    /// change" return contract, and makes repeated calls at the same
+    /// height idempotent.
+    pub fn advance_epoch_to(&mut self, new_epoch: u64) -> bool {
+        if new_epoch <= self.clock.current_epoch {
+            return false;
+        }
+        self.clock.current_epoch = new_epoch;
+        let current = new_epoch;
+
+        for record in self.records.values_mut() {
+            record.claimed_this_epoch = false;
+
+            // Liveness enforcement (Q24): downgrade if inactive too long.
+            // Identical rule to advance_epoch(), just driven by a
+            // deterministically-computed epoch instead of a wall-clock one.
+            if record.charm.tier != VerificationTier::Provisional
+                && !record.charm.is_lively(current)
+            {
+                record.charm.lapse();
+            }
+        }
+
+        tracing::info!(epoch = current, "validator epoch advanced (deterministic, block-height-driven)");
+        true
+    }
+
     // -- Agent sponsorship ----------------------------------------------------
 
     /// Authorize an agent under a verified human sponsor.
@@ -1924,6 +1981,57 @@ mod tests {
         // Identity should have lapsed to Provisional
         let record = store.get("h1").unwrap();
         assert_eq!(record.tier(), &VerificationTier::Provisional);
+    }
+
+    #[test]
+    fn advance_epoch_to_resets_claim_flags_like_advance_epoch() {
+        // Deterministic sibling of epoch_advance_resets_claim_flags: same
+        // behavior, but the epoch number is supplied directly rather than
+        // derived from a wall-clock timestamp.
+        let mut store = make_store();
+        register_and_verify(&mut store, "h1", "qcb1h1");
+
+        store.record_activity("h1");
+        store.claim_ubi("h1").unwrap();
+        assert!(store.advance_epoch_to(1), "must report that the epoch changed");
+
+        store.record_activity("h1");
+        let result = store.claim_ubi("h1");
+        assert!(result.is_ok(), "should allow claim in new epoch after activity");
+    }
+
+    #[test]
+    fn advance_epoch_to_lapses_inactive_identity_deterministically() {
+        // Deterministic sibling of liveness_enforcement_lapses_inactive_identity.
+        // No wall clock involved at all -- the caller (chain-forge-node, for
+        // validator-set-affecting decisions) supplies the epoch number
+        // computed purely from block height.
+        let mut store = make_store();
+        register_and_verify(&mut store, "h1", "qcb1h1");
+
+        for epoch in 1..=(LIVENESS_EPOCH_WINDOW + 2) {
+            store.advance_epoch_to(epoch);
+        }
+
+        let record = store.get("h1").unwrap();
+        assert_eq!(record.tier(), &VerificationTier::Provisional);
+    }
+
+    #[test]
+    fn advance_epoch_to_is_noop_for_non_increasing_epoch() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "h1", "qcb1h1");
+
+        assert!(store.advance_epoch_to(5));
+        assert_eq!(store.clock.current_epoch, 5);
+
+        // Same epoch again, and an earlier one: both are no-ops, matching
+        // advance_epoch's "nothing changed" contract -- callers (e.g. two
+        // commits landing in the same validator epoch) can call this
+        // unconditionally every commit without double-processing.
+        assert!(!store.advance_epoch_to(5));
+        assert!(!store.advance_epoch_to(3));
+        assert_eq!(store.clock.current_epoch, 5, "epoch must not move backwards");
     }
 
     #[test]

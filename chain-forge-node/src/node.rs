@@ -349,7 +349,43 @@ pub struct Node {
     /// capacity ad.  0 means "never".  The event loop heartbeat re-broadcasts
     /// every `CAPACITY_AD_INTERVAL_SECS` seconds.
     last_capacity_ad_ms: u64,
+
+    // ── Deterministic block-height validator-set epochs ──────────────────────
+
+    /// Number of blocks per validator-set epoch. Every decision that can
+    /// change validator membership, voting power, or quorum (stake-bond
+    /// admission, liveness-lapse revocation) fires only when
+    /// `height % validator_epoch_blocks == 0`, computed purely from block
+    /// height -- which every node already agrees on by construction of BFT
+    /// consensus -- rather than from any node-local wall clock. A plain
+    /// field (not yet a genesis config knob, matching DEFAULT_MIN_BOND_UQCB
+    /// / DEFAULT_MAX_ACTIVE_VALIDATORS staying plain constants for now too)
+    /// so tests can force an epoch boundary on a specific block without
+    /// waiting out a realistic epoch length, the same way tests used to
+    /// shrink `identity.clock.epoch_duration_ms` back when this was
+    /// wall-clock-driven.
+    validator_epoch_blocks: u64,
+
+    /// The validator set that was actually in force -- and used to reach
+    /// quorum -- at each committed height, keyed by height. Populated
+    /// before any admission/liveness mutation for the *next* height is
+    /// applied, so it reflects exactly what produced that height's
+    /// CommitCertificate.
+    ///
+    /// Needed because the live `self.consensus.validator_set()` is mutated
+    /// in place on every epoch boundary (admissions, liveness lapses): by
+    /// the time anyone asks "was this certificate valid?", the live set may
+    /// already differ from the one that actually voted. A certificate must
+    /// be verified against the set effective at its height, not whatever
+    /// is live now -- see `verify_certificate_against_history`.
+    historical_validator_sets: std::collections::BTreeMap<u64, chain_forge_consensus::ValidatorSet>,
 }
+
+/// Default validator-set epoch length in blocks. Matches the scale PoCD's
+/// own `reward_epoch_blocks` test fixtures already use (100), so devnet
+/// tests see an epoch roll within a reasonable number of commits without
+/// a separate magic number to remember.
+pub const DEFAULT_VALIDATOR_EPOCH_BLOCKS: u64 = 100;
 
 /// Map a transaction body to a short string label for the explorer.
 ///
@@ -982,6 +1018,8 @@ impl Node {
             // Change Set T
             peer_capacity_table: Arc::new(Mutex::new(crate::gossip_capacity::PeerCapacityTable::new())),
             last_capacity_ad_ms: 0,
+            validator_epoch_blocks: DEFAULT_VALIDATOR_EPOCH_BLOCKS,
+            historical_validator_sets: std::collections::BTreeMap::new(),
         })
     }
 
@@ -1397,6 +1435,7 @@ impl Node {
             ("agents.json",     serde_json::to_string_pretty(&self.agents)           .ok()),
             ("slashing.json",   serde_json::to_string_pretty(&self.slasher)          .ok()),
             ("chain_store.json",serde_json::to_string_pretty(&self.chain_store)      .ok()),
+            ("historical_validator_sets.json", serde_json::to_string_pretty(&self.historical_validator_sets).ok()),
         ] {
             if let Some(json) = value {
                 let _ = std::fs::write(persist.join(name), json);
@@ -1419,6 +1458,7 @@ impl Node {
         let agents_path      = persist.join("agents.json");
         let slashing_path    = persist.join("slashing.json");
         let chain_store_path = persist.join("chain_store.json");
+        let historical_vs_path = persist.join("historical_validator_sets.json");
 
         if !snap_path.exists() { return false; }
 
@@ -1455,6 +1495,14 @@ impl Node {
                 tracing::debug!(
                     blocks = self.chain_store.len(),
                     "block history restored from disk"
+                );
+            }
+            if historical_vs_path.exists() {
+                self.historical_validator_sets =
+                    serde_json::from_str(&std::fs::read_to_string(&historical_vs_path)?)?;
+                tracing::debug!(
+                    heights = self.historical_validator_sets.len(),
+                    "historical validator sets restored from disk"
                 );
             }
 
@@ -2831,17 +2879,35 @@ impl Node {
             .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
-        let epoch_rolled = self.identity.advance_epoch(now_ms);
+        // Snapshot the validator set that actually produced this cert
+        // BEFORE any epoch-boundary admission/liveness mutation below --
+        // see `historical_validator_sets`'s doc comment and
+        // `verify_certificate_against_history`.
+        self.historical_validator_sets.insert(cert.height, self.consensus.validator_set().clone());
+
+        // Deterministic, block-height-driven validator epoch -- replaces
+        // the old `self.identity.advance_epoch(now_ms)` wall-clock call for
+        // every decision that can change validator membership, voting
+        // power, or quorum (see `advance_epoch_to`'s doc comment in
+        // chain-forge-identity for why liveness/admission can't be
+        // decoupled from the epoch *number* itself, only from how that
+        // number is derived). `now_ms` above is still wall-clock -- it only
+        // feeds UBI claim-flag resets and tx execution timestamps now,
+        // neither of which affects validator membership, voting power, or
+        // quorum.
+        let validator_epoch = cert.height / self.validator_epoch_blocks;
+        let epoch_rolled = self.identity.advance_epoch_to(validator_epoch);
 
         // Integration Point 3 (Push): after advancing the epoch, sync the
         // ValidatorRegistry with any identity lapses that just happened.
         //
-        // advance_epoch() calls lapse() on any Verified/Established identity
-        // that hasn't been active for LIVENESS_EPOCH_WINDOW epochs, dropping
-        // them to Provisional. The ValidatorRegistry is a separate module that
-        // doesn't hear about this unless we tell it. Without this call, a
-        // lapsed validator stays Active with full consensus power — exactly the
-        // attack Section 3.3's personhood-weighting is supposed to prevent.
+        // advance_epoch_to() calls lapse() on any Verified/Established
+        // identity that hasn't been active for LIVENESS_EPOCH_WINDOW
+        // (validator) epochs, dropping them to Provisional. The
+        // ValidatorRegistry is a separate module that doesn't hear about
+        // this unless we tell it. Without this call, a lapsed validator
+        // stays Active with full consensus power — exactly the attack
+        // Section 3.3's personhood-weighting is supposed to prevent.
         //
         // We use Push: epoch advance fires here, we immediately reconcile the
         // registry. Pull (querying at every round start) is the
@@ -3149,6 +3215,103 @@ impl Node {
         Ok(())
     }
 
+    /// Verify a `CommitCertificate` against the validator set that was
+    /// actually in force at `cert.height` -- NOT whatever validator set is
+    /// live right now.
+    ///
+    /// Why this exists: `self.consensus.validator_set()` is mutated in
+    /// place at every validator-epoch boundary (stake-bond admissions,
+    /// liveness-lapse revocations). A certificate from height 10 was only
+    /// ever valid against the set active at height 10; by height 200 that
+    /// set may have gained or lost members or had voting power rebalanced.
+    /// Checking an old certificate against the CURRENT live set would be
+    /// checking it against rules that didn't exist yet when it was formed
+    /// -- it could wrongly fail (a since-admitted validator's vote looks
+    /// "unknown" to the old set) or wrongly pass (a since-revoked
+    /// validator's old vote still "counts" against the new set's quorum
+    /// math, which is nonsensical once that validator's power has moved).
+    ///
+    /// Returns `Ok(())` if the precommits in `cert` are from validators
+    /// known to the historical set, are correctly signed wherever that
+    /// historical set had a key on file, and their combined voting power
+    /// (as of THAT set, not the live one) meets or exceeds that set's own
+    /// quorum threshold. `Err` otherwise, with a string explaining which
+    /// check failed.
+    pub fn verify_certificate_against_history(
+        &self,
+        cert: &chain_forge_consensus::CommitCertificate,
+    ) -> Result<(), String> {
+        let historical_vs = self.historical_validator_sets.get(&cert.height)
+            .ok_or_else(|| format!(
+                "no historical validator set recorded for height {} -- cannot verify \
+                 this certificate against the set effective at that height",
+                cert.height
+            ))?;
+
+        let quorum = historical_vs.quorum_power();
+        let mut counted_power: u64 = 0;
+        let mut counted_validators = std::collections::HashSet::new();
+
+        for vote in &cert.precommits {
+            // Equivocation/duplicate guard: only count each validator once,
+            // same as a real quorum tally would.
+            if !counted_validators.insert(vote.validator.clone()) {
+                continue;
+            }
+
+            let power = historical_vs.power_of(&vote.validator);
+            if power == 0 {
+                // Unknown to, or zero-power in, the set effective at this
+                // height -- e.g. a validator admitted LATER whose vote
+                // would wrongly look legitimate against today's live set.
+                return Err(format!(
+                    "validator {} has zero power in the validator set effective at \
+                     height {} -- this precommit could not have counted toward \
+                     quorum at that height, whatever it looks like against the \
+                     current live set",
+                    vote.validator, cert.height
+                ));
+            }
+
+            let pub_key = historical_vs.public_key_of(&vote.validator);
+            if !pub_key.is_empty() {
+                if vote.signature.is_empty() {
+                    return Err(format!(
+                        "validator {} had a registered key in the set effective at \
+                         height {}, but this precommit carries an empty signature",
+                        vote.validator, cert.height
+                    ));
+                }
+                let msg = chain_forge_consensus::vote_signing_bytes(
+                    &self.genesis.chain_id, &vote.vote_type, vote.height, vote.round,
+                    vote.block_hash.as_ref(),
+                );
+                let sig = chain_forge_crypto::Signature {
+                    scheme: chain_forge_crypto::SchemeId::Classical,
+                    bytes:  vote.signature.clone(),
+                };
+                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|e| format!(
+                    "validator {}'s precommit signature does not verify against the \
+                     key it had registered at height {}: {e}",
+                    vote.validator, cert.height
+                ))?;
+            }
+
+            counted_power = counted_power.saturating_add(power);
+        }
+
+        if counted_power < quorum {
+            return Err(format!(
+                "certificate for height {} carries only {counted_power} of voting \
+                 power effective at that height, short of the {quorum} needed for \
+                 quorum under the set that was actually active then",
+                cert.height
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Propose a block on the real multi-node path: build it, broadcast it,
     /// cast this node's own votes, and commit immediately if that alone
     /// reached quorum (small validator sets can do this in one round-trip).
@@ -3368,7 +3531,19 @@ impl Node {
             .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
-        let epoch_rolled = self.identity.advance_epoch(now_ms);
+        // Snapshot the validator set that actually produced this cert
+        // BEFORE any epoch-boundary mutation below -- same reasoning as the
+        // multi-node commit_block path (see `historical_validator_sets`'s
+        // doc comment).
+        self.historical_validator_sets.insert(height, self.consensus.validator_set().clone());
+
+        // Deterministic, block-height-driven validator epoch -- same reason
+        // as the multi-node commit_block path: this is the devnet
+        // single-node auto-commit path, so it needs its own copy. See that
+        // path's full design comment for why liveness/admission read from
+        // this instead of `self.identity.advance_epoch(now_ms)`.
+        let validator_epoch = height / self.validator_epoch_blocks;
+        let epoch_rolled = self.identity.advance_epoch_to(validator_epoch);
 
         // Integration Point 3 (Push) — same reconciliation as the multi-node
         // commit path: after advancing the epoch, revoke ValidatorRegistry
@@ -3685,14 +3860,12 @@ mod tests {
             "qcb1erin must not be seated before bonding anything"
         );
 
-        // The genesis epoch rolls on its own the first time `advance_epoch`
-        // sees a real wall clock (genesis_time is always in the past), but
-        // `try_advance` then fast-forwards `epoch_start_ms` to "catch up",
-        // so a *second* roll within the same test run isn't guaranteed.
-        // Force every block's epoch check to roll by shrinking the epoch to
-        // effectively zero -- this test is about admission at an epoch
-        // boundary, not about epoch timing itself.
-        node.identity.clock.epoch_duration_ms = 1;
+        // Deterministic block-height epochs: force every block to be an
+        // epoch boundary (height % 1 == 0, always true) rather than
+        // waiting out DEFAULT_VALIDATOR_EPOCH_BLOCKS real commits -- this
+        // test is about admission at an epoch boundary, not about epoch
+        // timing itself.
+        node.validator_epoch_blocks = 1;
 
         let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
 
@@ -3721,6 +3894,173 @@ mod tests {
         assert_eq!(erin.voting_power, 0,
             "an unverified entrant must have zero effective voting power even though admitted");
         assert!(!erin.pop_verified, "new entrant starts unverified until IdentityStore says otherwise");
+    }
+
+    #[tokio::test]
+    async fn validator_epoch_and_admission_converge_identically_across_nodes() {
+        // Deterministic block-height validator epochs: two INDEPENDENTLY
+        // constructed nodes (simulating two separate processes, each with
+        // its own SystemTime::now() at construction and at every would-be
+        // wall-clock read) must reach IDENTICAL validator-epoch state --
+        // and identical admission outcomes -- after processing the exact
+        // same block sequence, even with real wall-clock skew introduced
+        // between them. Before this migration, `advance_epoch(now_ms)`
+        // read each node's own SystemTime::now() for exactly this
+        // decision, so skew could make one node admit/lapse a validator a
+        // commit earlier or later than the other -- a state-divergence
+        // and quorum-safety risk, not just a cosmetic one.
+        use chain_forge_execution::Transaction;
+
+        async fn fund_and_bond_erin(node: &mut Node) -> chain_forge_consensus::ValidatorSet {
+            node.validator_epoch_blocks = 2;
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_000_000, 0));
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.submit_tx(Transaction::bond_validator("bond-erin", "qcb1erin", 2_000_000, 0));
+            let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
+            // One more "do nothing" block so both nodes land on the same
+            // final height/epoch before comparison.
+            node.propose_block(cert1.block_hash).await.unwrap();
+            node.consensus.validator_set().clone()
+        }
+
+        let mut node_a = Node::new(GENESIS, None).await.unwrap();
+        let vs_a = fund_and_bond_erin(&mut node_a).await;
+
+        // Real wall-clock delay before the second node processes the exact
+        // same sequence -- if anything still read SystemTime for epoch
+        // advancement, this is where it would show up as a divergence.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut node_b = Node::new(GENESIS, None).await.unwrap();
+        let vs_b = fund_and_bond_erin(&mut node_b).await;
+
+        assert_eq!(
+            node_a.identity.clock.current_epoch,
+            node_b.identity.clock.current_epoch,
+            "validator epoch number must be identical across nodes regardless \
+             of real-time skew between them"
+        );
+        assert_eq!(node_a.identity.clock.current_epoch, 1,
+            "height 2 / validator_epoch_blocks(2) == epoch 1");
+
+        let ids_and_power = |vs: &chain_forge_consensus::ValidatorSet| -> Vec<(String, u64)> {
+            let mut v: Vec<(String, u64)> = vs.validators.iter()
+                .map(|vi| (vi.id.0.clone(), vi.voting_power))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            ids_and_power(&vs_a), ids_and_power(&vs_b),
+            "the full active validator set (membership AND voting power) must \
+             converge identically across nodes after the same block sequence"
+        );
+        assert!(
+            vs_a.validators.iter().any(|v| v.id.0 == "qcb1erin"),
+            "sanity check: Erin must actually have been admitted on both nodes"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_certificate_against_history_uses_set_effective_at_height_not_live_set() {
+        // "Preserve historical validator sets: certificates must be
+        // verified against the validator set effective at their height,
+        // not the current live set" -- this is the exact property under
+        // test.
+        //
+        // Scenario: a certificate for height 7 really did reach quorum
+        // under a 4-validator set (quorum = 3 of 4). The live set then
+        // grows to 5 validators (quorum = 4 of 5). The same 3-precommit
+        // certificate must still verify correctly against the HISTORICAL
+        // set it actually belongs to -- it would incorrectly fall short
+        // if checked against today's live quorum instead.
+        use chain_forge_consensus::{vote_signing_bytes, BlockHash, CommitCertificate, ValidatorId, ValidatorInfo, ValidatorSet, Vote, VoteType};
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        let keyed = |addr: &str| -> ValidatorInfo {
+            let kp = ClassicalScheme.generate_keypair(addr).unwrap();
+            ValidatorInfo { id: ValidatorId(addr.to_string()), voting_power: 1, pop_verified: true, public_key: kp.public_key }
+        };
+        let historical = ValidatorSet {
+            height: 7,
+            validators: vec![keyed("qcb1alice"), keyed("qcb1bob"), keyed("qcb1carol"), keyed("qcb1dave")],
+        };
+        assert_eq!(historical.quorum_power(), 3, "4 validators of power 1 each need 3 for quorum");
+        node.historical_validator_sets.insert(7, historical);
+
+        // Grow the LIVE set to 5 validators so its quorum math differs
+        // (5 * 2/3 + 1 = 4) from what was actually in force at height 7.
+        let mut live = node.consensus.validator_set().clone();
+        live.validators.push(keyed("qcb1erin"));
+        live.height = 7;
+        let _ = node.consensus.update_validator_set(live.clone());
+        assert_eq!(node.consensus.validator_set().quorum_power(), 4,
+            "live set must now need 4 of 5 for quorum, different from history");
+
+        let sign = |addr: &str| -> Vote {
+            let mut vote = Vote {
+                vote_type: VoteType::Precommit, height: 7, round: 0,
+                validator: ValidatorId(addr.to_string()),
+                block_hash: Some(BlockHash("block7".to_string())),
+                signature: vec![],
+            };
+            let kp = ClassicalScheme.generate_keypair(addr).unwrap();
+            let bytes = vote_signing_bytes("qcb-testnet-1", &vote.vote_type, vote.height, vote.round, vote.block_hash.as_ref());
+            vote.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+            vote
+        };
+
+        // Exactly 3 of the 4 validators that were ACTUALLY active at height
+        // 7 -- meets that height's real quorum (3), but would fall short of
+        // the live set's quorum (4) if ever (wrongly) checked against it.
+        let cert = CommitCertificate {
+            height: 7, round: 0, block_hash: BlockHash("block7".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob"), sign("qcb1carol")],
+        };
+        assert!(
+            node.verify_certificate_against_history(&cert).is_ok(),
+            "a certificate that met quorum under the set effective at its height \
+             must verify, even though the live set's quorum requirement has \
+             since changed"
+        );
+
+        // Negative check 1: short of even the HISTORICAL quorum (only 2 of
+        // the 3 needed) must fail.
+        let short_cert = CommitCertificate {
+            height: 7, round: 0, block_hash: BlockHash("block7".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob")],
+        };
+        assert!(
+            node.verify_certificate_against_history(&short_cert).is_err(),
+            "2 of 4 historical power must fall short of that height's quorum (3)"
+        );
+
+        // Negative check 2: a validator unknown to (or zero-power in) the
+        // historical set -- e.g. Erin, who was only admitted into the LIVE
+        // set, never the one effective at height 7 -- must not be able to
+        // pad out a certificate's power.
+        let padded_cert = CommitCertificate {
+            height: 7, round: 0, block_hash: BlockHash("block7".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob"), sign("qcb1erin")],
+        };
+        assert!(
+            node.verify_certificate_against_history(&padded_cert).is_err(),
+            "a validator with zero power in the set effective at the cert's \
+             height must not count toward that height's quorum, however much \
+             power it has in the live set"
+        );
+
+        // Negative check 3: no historical entry recorded for the height at
+        // all must be a hard error, not a silent fall-through to the live set.
+        let no_history_cert = CommitCertificate {
+            height: 999, round: 0, block_hash: BlockHash("block999".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob"), sign("qcb1carol")],
+        };
+        let err = node.verify_certificate_against_history(&no_history_cert).err()
+            .expect("missing historical set must be a hard error");
+        assert!(err.contains("no historical validator set recorded"), "got: {err}");
     }
 
     #[tokio::test]
