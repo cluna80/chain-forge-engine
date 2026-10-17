@@ -114,8 +114,15 @@ fn load_keypair(path: &PathBuf) -> Result<(String, KeyPair), String> {
         .as_str()
         .ok_or("key file missing 'private_key' field")?;
 
+    // CS-001-H2: read scheme from key file; fall back to Classical for legacy files.
+    let scheme = match v["scheme"].as_str().unwrap_or("ed25519") {
+        "mldsa65" | "ml-dsa" | "mldsa"   => SchemeId::MlDsa,
+        "hybrid"                           => SchemeId::HybridEd25519MlDsa,
+        _                                  => SchemeId::Classical,
+    };
+
     let kp = KeyPair {
-        scheme:      SchemeId::Classical,
+        scheme,
         public_key:  hex_decode(pub_hex).map_err(|e| format!("public_key: {e}"))?,
         private_key: hex_decode(prv_hex).map_err(|e| format!("private_key: {e}"))?,
     };
@@ -487,6 +494,7 @@ pub fn main() {
         signature:     vec![],
         public_key:    vec![],
         pq_signatures: vec![],
+        sig_scheme:    None,
         pq_public_key: vec![],
     };
 

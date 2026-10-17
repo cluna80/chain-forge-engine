@@ -3669,6 +3669,7 @@ impl Node {
                     signature:    vec![],
                     public_key:   vec![],
                     pq_signatures: vec![],
+                    sig_scheme:    None,
                     pq_public_key: vec![],
                 };
                 let open_tx = Transaction {
@@ -3683,6 +3684,7 @@ impl Node {
                     signature:    vec![],
                     public_key:   vec![],
                     pq_signatures: vec![],
+                    sig_scheme:    None,
                     pq_public_key: vec![],
                 };
 
@@ -4662,6 +4664,7 @@ mod tests {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         };
         tx.sign(consensus_kp, chain_id).unwrap();

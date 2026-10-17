@@ -249,6 +249,7 @@ pub async fn settle_objective(
         signature:      vec![],
         public_key:     vec![],
         pq_signatures:  vec![],
+        sig_scheme:     None,         // set to MlDsa below after signing (CS-001-H2)
         pq_public_key:  vec![],
     };
 
@@ -284,6 +285,7 @@ pub async fn settle_objective(
         .map_err(|e| SettlementError::SigningFailed(e.to_string()))?;
 
     tx.pq_signatures = vec![format!("mldsa65:{}", hex::encode(&sig.bytes))];
+    tx.sig_scheme    = Some(SchemeId::MlDsa);  // CS-001-H2: explicit scheme tag
     tx.pq_public_key = pk_bytes;
 
     // ── 7. POST to node ───────────────────────────────────────────────────────

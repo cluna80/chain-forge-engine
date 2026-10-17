@@ -457,6 +457,7 @@ fn build_register_key_tx(
         signature:   vec![],
         public_key:  vec![],
         pq_signatures: vec![],
+        sig_scheme:    None,
         pq_public_key: vec![],
     };
     tx.sign(wallet_kp, chain_id).unwrap();
@@ -1053,6 +1054,7 @@ fn invalid_proof_of_possession_rejected() {
         signature:   vec![],
         public_key:  vec![],
         pq_signatures: vec![],
+        sig_scheme:    None,
         pq_public_key: vec![],
     };
     tx.sign(&wallet_kp, CHAIN_ID).unwrap();
@@ -1128,6 +1130,7 @@ fn forged_outer_signature_rejected() {
         signature:   vec![],
         public_key:  vec![],
         pq_signatures: vec![],
+        sig_scheme:    None,
         pq_public_key: vec![],
     };
     tx.sign(&attacker_kp, CHAIN_ID).unwrap();  // signed by attacker, not Eve
@@ -1214,6 +1217,7 @@ fn wrong_chain_id_in_pop_rejected() {
         signature:   vec![],
         public_key:  vec![],
         pq_signatures: vec![],
+        sig_scheme:    None,
         pq_public_key: vec![],
     };
     tx.sign(&wallet_kp, CHAIN_ID).unwrap();  // outer tx correctly signed for right chain
