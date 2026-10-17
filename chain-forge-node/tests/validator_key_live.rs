@@ -51,10 +51,18 @@
 //!
 //! ## Quorum maths
 //!
-//! With 4 equal-weight validators at 500 QCB each:
-//!   total_power = 2_000_000_000 uqcb
-//!   quorum      = floor(2_000_000_000 * 2/3) + 1 = 1_333_333_335
-//!   → any 3 of 4 can commit (1_500_000_000 >= quorum)  ✓
+//! Genesis validators each bond 500_000_000 uqcb in Phase 0b so the bond
+//! ledger matches their genesis allocation.  Without this, `compute_stake_active_set`
+//! (which reads `validator-bond:*` accounts) would see them as unbonded and assign
+//! them consensus power=1 (the engine's genesis default), while Eve's 2_000_000 uqcb
+//! bond would dominate total_power → the four live genesis nodes could never reach
+//! quorum.
+//!
+//! With Phase 0b bonds:
+//!   total_power = 4 × 500_000_000 + 2_000_000 = 2_002_000_000 uqcb
+//!   quorum      = floor(2_002_000_000 * 2/3) + 1 = 1_334_666_668
+//!   → any 3 of 4 genesis validators commit (1_500_000_000 >= quorum)  ✓
+//!   → Alice + Bob alone (1_000_000_000) < quorum (deliberate-halt scenario)  ✓
 //!
 //! After Eve bonds 2_000_000 uqcb and is admitted:
 //!   total_power ≈ 2_002_000_000 uqcb
@@ -504,6 +512,41 @@ fn post_genesis_validator_admission() {
     let h0 = height_of(ports.alice_api);
     eprintln!("   Chain live at height {h0}.");
 
+    // ── Phase 0b: bond genesis validators ────────────────────────────────────
+    //
+    // The consensus engine initialises genesis validators with power=1 each.
+    // `compute_stake_active_set` (run at every epoch boundary) reads the bond
+    // ledger (`validator-bond:*` accounts) to assign real voting power.  Without
+    // explicit BondValidator txs, the genesis validators have no bond-ledger entry
+    // and stay at power=1 while Eve's 2_000_000 uqcb bond would dominate
+    // total_power, making the four live nodes permanently unable to reach quorum.
+    //
+    // Bonding 500_000_000 uqcb per genesis validator gives them realistic power
+    // proportional to their genesis allocation and ensures Bob+Carol+Dave
+    // (1_500_000_000 uqcb) always exceeds the quorum threshold (~1_334_666_668).
+
+    eprintln!("\n── Phase 0b: bonding genesis validators to populate bond ledger ─────");
+    const GENESIS_BOND_UQCB: u64 = 500_000_000;
+    let genesis_validators = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+    let mut genesis_bond_ids = Vec::new();
+    for &gv in &genesis_validators {
+        let bond_tx = build_bond_tx(gv, 0, GENESIS_BOND_UQCB);
+        let bond_id = bond_tx.id.clone();
+        submit_tx(ports.alice_api, &bond_tx)
+            .unwrap_or_else(|| panic!("Phase 0b: BondValidator for {gv} rejected"));
+        eprintln!("   BondValidator queued for {gv}: {bond_id}");
+        genesis_bond_ids.push((gv, bond_id));
+    }
+    for (gv, bond_id) in &genesis_bond_ids {
+        let events = wait_tx_executed(ports.alice_api, bond_id, Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("Phase 0b: BondValidator for {gv} never executed"));
+        eprintln!("   BondValidator executed for {gv}: {events:?}");
+    }
+    eprintln!("   ✓ Genesis validators bonded: 4 × {GENESIS_BOND_UQCB} uqcb.");
+    eprintln!("   Quorum maths: total={} quorum≥{}",
+        4 * GENESIS_BOND_UQCB as u128 + EVE_BOND_UQCB as u128,
+        (4 * GENESIS_BOND_UQCB as u128 + EVE_BOND_UQCB as u128) * 2 / 3 + 1);
+
     // Derive Eve's keypairs.
     // wallet_kp signs Eve's transactions (outer tx auth for RegisterValidatorKey).
     // consensus_kp is the key Eve registers for block signing.
@@ -762,7 +805,7 @@ fn post_genesis_validator_admission() {
     // Kill Alice.
     drop(nodes.remove(0));  // Alice is index 0
     eprintln!("   Alice killed. Bob/Carol/Dave continue (Eve is in set but not running).");
-    eprintln!("   Quorum check: Bob+Carol+Dave = 1_500_000_000 uqcb > quorum (~1_334_000_000). ✓");
+    eprintln!("   Quorum check: Bob+Carol+Dave = 1_500_000_000 uqcb > quorum (~1_334_666_668). ✓");
     eprintln!("   NOTE: Eve is in the consensus set with a registered key but no running");
     eprintln!("         process. Every round Eve is proposer times out (~8s). Allowing");
     eprintln!("         120 s for 2 blocks (worst case: Eve proposes both).");
