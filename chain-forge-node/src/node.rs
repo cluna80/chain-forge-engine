@@ -3245,7 +3245,39 @@ impl Node {
                 self.min_bond_uqcb,
                 chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
             );
+            // Build a lookup from the bond ledger for O(1) access below.
+            let bond_map: std::collections::HashMap<&str, u128> = active
+                .iter()
+                .map(|(addr, power)| (addr.as_str(), *power))
+                .collect();
+
             let mut updated_vs = self.consensus.validator_set().clone();
+            let mut any_changed = false;
+
+            // Pass 1: refresh voting_power for already-seated validators whose
+            // bonded stake has changed since they were last admitted.  Genesis
+            // validators start with power=1 (the engine's init default); once
+            // they submit a BondValidator tx their real stake appears in the
+            // bond ledger and must be reflected here so quorum arithmetic stays
+            // proportional to actual stake.
+            for v in &mut updated_vs.validators {
+                if let Some(&bonded_uqcb) = bond_map.get(v.id.0.as_str()) {
+                    let new_power = bonded_uqcb.min(u64::MAX as u128) as u64;
+                    if v.voting_power != new_power {
+                        info!(
+                            validator = %v.id,
+                            old_power = v.voting_power,
+                            new_power,
+                            "stake bond: updating voting power for seated validator"
+                        );
+                        v.voting_power = new_power;
+                        any_changed = true;
+                    }
+                }
+            }
+
+            // Pass 2: admit new validators from the bond ledger that are not
+            // yet seated.
             let already_seated: std::collections::HashSet<String> = updated_vs.validators
                 .iter()
                 .map(|v| v.id.0.clone())
@@ -3287,8 +3319,9 @@ impl Node {
                     public_key,
                 });
                 admitted += 1;
+                any_changed = true;
             }
-            if admitted > 0 {
+            if any_changed {
                 updated_vs.height = cert.height;
                 let _ = self.consensus.update_validator_set(updated_vs);
             }
