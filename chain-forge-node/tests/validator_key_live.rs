@@ -664,10 +664,15 @@ fn post_genesis_validator_admission() {
     let h_after_regkey = height_of(ports.alice_api);
     let admission_epoch = ((h_after_regkey / 10) + 1) * 10;
     eprintln!("   Waiting for height {admission_epoch} (next epoch after key registration)...");
+    eprintln!("   NOTE: quorum grows from 3-of-4 to 4-of-5 at this epoch boundary.");
+    eprintln!("         Allowing 120 s for potential brief stall during validator set transition.");
 
+    // Use a generous timeout: the epoch boundary triggers a validator-set
+    // update that raises quorum from 3/4 to 4/5.  The chain may pause
+    // briefly while the new set takes effect.  2 blocks × 2 s + 90 s slack.
     assert!(
-        poll_height(&ports.all_api(), admission_epoch + 2, Duration::from_secs(60)),
-        "chain did not reach height {}", admission_epoch + 2
+        poll_height(&ports.all_api(), admission_epoch + 3, Duration::from_secs(120)),
+        "chain did not reach height {} after epoch boundary (quorum transition 3/4→4/5)", admission_epoch + 3
     );
 
     // ── Phase 6: all four nodes must agree on Eve's state ────────────────────
