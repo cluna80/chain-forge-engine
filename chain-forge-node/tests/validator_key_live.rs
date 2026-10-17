@@ -505,8 +505,10 @@ fn post_genesis_validator_admission() {
     );
 
     eprintln!("\n   Waiting for height >= 2 (chain is live)...");
+    // Allow 60 s: under concurrent test load (5 devnets × 4 nodes) startup
+    // can be slower than in isolation.
     assert!(
-        poll_height(&ports.all_api(), 2, Duration::from_secs(30)),
+        poll_height(&ports.all_api(), 2, Duration::from_secs(60)),
         "chain did not reach height 2"
     );
     let h0 = height_of(ports.alice_api);
@@ -947,7 +949,8 @@ fn bonded_and_verified_without_key_stays_at_zero_power() {
         ),
         "devnet did not come up"
     );
-    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(30)), "chain stuck");
+    // Allow 60 s: under concurrent test load startup can be slower than in isolation.
+    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(60)), "chain stuck");
 
     // Register Frank (using "qcb1frank" seed). He won't be in genesis so he
     // needs funding first. We fund via Alice (she has plenty of uqcb).
@@ -1031,7 +1034,8 @@ fn invalid_proof_of_possession_rejected() {
         ),
         "devnet did not come up"
     );
-    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(30)), "chain stuck");
+    // Allow 60 s: under concurrent test load startup can be slower than in isolation.
+    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(60)), "chain stuck");
 
     let wallet_kp    = ClassicalScheme.generate_keypair(EVE_ADDR).unwrap();
     let consensus_kp = ClassicalScheme.generate_keypair("qcb1eve-consensus").unwrap();
@@ -1103,7 +1107,8 @@ fn forged_outer_signature_rejected() {
         ),
         "devnet did not come up"
     );
-    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(30)), "chain stuck");
+    // Allow 60 s: under concurrent test load startup can be slower than in isolation.
+    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(60)), "chain stuck");
 
     let attacker_kp  = ClassicalScheme.generate_keypair("qcb1attacker").unwrap();
     let consensus_kp = ClassicalScheme.generate_keypair("qcb1eve-consensus").unwrap();
@@ -1188,7 +1193,8 @@ fn wrong_chain_id_in_pop_rejected() {
         ),
         "devnet did not come up"
     );
-    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(30)), "chain stuck");
+    // Allow 60 s: under concurrent test load startup can be slower than in isolation.
+    assert!(poll_height(&ports.all_api(), 2, Duration::from_secs(60)), "chain stuck");
 
     let wallet_kp    = ClassicalScheme.generate_keypair(EVE_ADDR).unwrap();
     let consensus_kp = ClassicalScheme.generate_keypair("qcb1eve-consensus").unwrap();
