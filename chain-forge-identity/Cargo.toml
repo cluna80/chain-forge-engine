@@ -11,7 +11,7 @@ license.workspace = true
 #   - PopAttestation: the cryptographic proof a human is verified
 #   - IdentityRecord: full per-human state including liveness tracking
 #   - IdentityStore: the canonical registry of all verified humans
-#   - UBI epoch clock and claim gating (one claim per identity per epoch)
+#   - Epoch clock and tier gating
 #   - Liveness enforcement (Q24: participation maintains identity)
 #
 # Phase 0: web-of-trust and live-challenge ceremony are stubbed.

@@ -58,8 +58,8 @@
     "bank",
     "staking",
     "identity",
-    "qrc",
-    "agents"
+    "agents",
+    "pocd"
   ],
   "custom_modules": [],
   "genesis_accounts": [

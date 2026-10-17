@@ -59,7 +59,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chain_forge_consensus::{BlockHash, ValidatorId, Vote, VoteType};
+use chain_forge_consensus::{vote_signing_bytes, BlockHash, ValidatorId, Vote, VoteType};
+use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
 use chain_forge_p2p::{
     GossipTopic, NetworkConfig, NetworkService, OutboundMessage, PeerDiscovery,
     real::Libp2pService,
@@ -284,10 +285,12 @@ fn skip_if_no_binary() -> bool {
 /// Spawn all four devnet nodes.
 ///
 /// `with_keys`: when true, each node is given its `--key-file` so it signs
-/// votes with its Ed25519 private key.  Set true for tests that need real
-/// signature verification (e.g. `adversarial_garbage_signature`).  Set false
-/// for tests that don't care about sig verification and want to avoid the
-/// key-file path dependency.
+/// votes with its Ed25519 private key. Since genesis now registers a real
+/// consensus key for every validator (mandatory-keys migration), every
+/// node needs this to be true to ever produce a block at all -- a keyless
+/// node can't sign, and an unsigned vote from a keyed validator is
+/// rejected as a forgery. `false` remains here only for a future test
+/// that deliberately wants to exercise that rejection path itself.
 fn spawn_devnet(ports: &DevnetPorts, log_dir: &std::path::Path, with_keys: bool) -> Vec<NodeHandle> {
     let kf = |label: &str| -> Option<PathBuf> {
         if with_keys { Some(key_file_for(label)) } else { None }
@@ -363,7 +366,13 @@ async fn adversarial_unknown_validator() {
     println!("   ports: alice_api={} alice_p2p={}", ports.alice_api, ports.alice_p2p);
 
     let log_dir = tempdir("qcb-adv-unknown");
-    let _nodes  = spawn_devnet(&ports, &log_dir, false);
+    // Mandatory-keys migration: genesis now registers a real consensus key
+    // for every validator, so chain-forge-consensus's fail-closed rule
+    // rejects an unsigned vote from a keyed validator as a forgery. A
+    // devnet node spawned without --key-file can never sign its own votes
+    // and the chain would never leave height 0 -- `with_keys: false` is no
+    // longer a viable devnet configuration, with no bypass.
+    let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
     assert!(wait_all_apis_up(&ports), "nodes did not start");
@@ -427,7 +436,9 @@ async fn adversarial_equivocation_over_gossip() {
     println!("   ports: alice_api={} alice_p2p={}", ports.alice_api, ports.alice_p2p);
 
     let log_dir = tempdir("qcb-adv-equivoc");
-    let _nodes  = spawn_devnet(&ports, &log_dir, false);
+    // Same reason as adversarial_unknown_validator: genesis keys are now
+    // mandatory, so every node needs --key-file to sign its own votes.
+    let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
     assert!(wait_all_apis_up(&ports), "nodes did not start");
@@ -451,22 +462,41 @@ async fn adversarial_equivocation_over_gossip() {
     let balance_before = balance_of(ports.alice_api, "qcb1alice");
     eprintln!("   alice balance before: {balance_before:?} uqcb");
 
-    let vote_a = Vote {
-        vote_type:  VoteType::Prevote,
-        height:     attack_height,
-        round:      0,
-        validator:  ValidatorId("qcb1alice".to_string()),
-        block_hash: Some(BlockHash("block_hash_version_AAAAAAAAAAAAA".to_string())),
-        signature:  vec![],
+    // Mandatory-keys migration: genesis now registers a real consensus key
+    // for qcb1alice, so chain-forge-consensus's fail-closed rule rejects an
+    // empty-signature vote claiming to be hers as a forgery -- it never
+    // even reaches equivocation detection. A merely-spoofed, unsigned vote
+    // is no longer a meaningful way to test equivocation; the realistic
+    // attack this test wants to model is a validator (or an attacker who
+    // has somehow obtained her key) actually double-signing two
+    // conflicting blocks with her REAL key. We derive that same
+    // deterministic devnet keypair here (ClassicalScheme::generate_keypair
+    // ("qcb1alice"), the same derivation gen_devnet_keys.rs used to
+    // produce alice.key.json and the public key embedded in genesis) and
+    // sign both conflicting votes with it, so the test still proves what
+    // it always meant to: a validator who double-votes gets caught, now
+    // under the stricter signature regime rather than around it.
+    let alice_kp = ClassicalScheme.generate_keypair("qcb1alice")
+        .expect("deterministic devnet keypair generation must not fail");
+    let sign = |vote_type: VoteType, block_hash: &str| -> Vote {
+        let mut vote = Vote {
+            vote_type,
+            height:     attack_height,
+            round:      0,
+            validator:  ValidatorId("qcb1alice".to_string()),
+            block_hash: Some(BlockHash(block_hash.to_string())),
+            signature:  vec![],
+        };
+        let bytes = vote_signing_bytes(
+            "qcb-devnet-4node", &vote.vote_type, vote.height, vote.round,
+            vote.block_hash.as_ref(),
+        );
+        vote.signature = ClassicalScheme.sign(&bytes, &alice_kp)
+            .expect("signing must not fail").bytes;
+        vote
     };
-    let vote_b = Vote {
-        vote_type:  VoteType::Prevote,
-        height:     attack_height,
-        round:      0,
-        validator:  ValidatorId("qcb1alice".to_string()),
-        block_hash: Some(BlockHash("block_hash_version_BBBBBBBBBBBBB".to_string())),
-        signature:  vec![],
-    };
+    let vote_a = sign(VoteType::Prevote, "block_hash_version_AAAAAAAAAAAAA");
+    let vote_b = sign(VoteType::Prevote, "block_hash_version_BBBBBBBBBBBBB");
 
     eprintln!("   [attacker] sending equivocating prevotes A then B...");
     attacker.publish(OutboundMessage {

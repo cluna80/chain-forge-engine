@@ -14,7 +14,7 @@
 ///
 /// The scope note from Section 5.3 applies here too: Phase 0 Charmed Agents
 /// cover scheduled, rule-bound operational roles -- merchant settlement and
-/// UBI distribution -- not open-ended autonomous behavior. The data structures
+/// scheduled QRC distribution -- not open-ended autonomous behavior. The data structures
 /// are designed for the broader AEI vision; the enforcement in Phase 0 is
 /// the lifecycle and spending-limit layer only.
 ///
@@ -70,14 +70,17 @@ pub type AgentResult<T> = Result<T, AgentError>;
 /// What a Charmed Agent is authorized to do (Section 5.3).
 /// This is the CapabilitySet from the AEI specification (Section 4.6 Phase B).
 ///
-/// Phase 0: MerchantSettlement and UbiDistribution are the operational roles
+/// Phase 0: MerchantSettlement and QrcDistribution are the operational roles
 /// described in Section 5.3's scope note. The others are framework for Phase 1+.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentCapability {
     /// Accept $QRC payments on behalf of a merchant and trigger fiat settlement.
     MerchantSettlement,
-    /// Claim and distribute $QRC UBI to verified humans.
-    UbiDistribution,
+    /// Distribute $QRC payouts to verified humans on a schedule (e.g. earned
+    /// contribution-path yield). QRC Economic Model v0.1: not a flat
+    /// per-person drip -- the agent distributes amounts the protocol has
+    /// already credited as earned.
+    QrcDistribution,
     /// Hold $QRC balance up to the agent's spending limit.
     HoldBalance,
     /// Transfer $QRC to other verified accounts (not agents, unless authorized).
@@ -108,7 +111,7 @@ impl AgentCapability {
     pub fn is_phase0(&self) -> bool {
         matches!(
             self,
-            Self::MerchantSettlement | Self::UbiDistribution
+            Self::MerchantSettlement | Self::QrcDistribution
             | Self::HoldBalance | Self::Transfer | Self::ReadState
             | Self::BuyCompute | Self::ContributeToChallenge
         )
@@ -119,7 +122,7 @@ impl std::fmt::Display for AgentCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MerchantSettlement    => write!(f, "MerchantSettlement"),
-            Self::UbiDistribution       => write!(f, "UbiDistribution"),
+            Self::QrcDistribution       => write!(f, "QrcDistribution"),
             Self::HoldBalance           => write!(f, "HoldBalance"),
             Self::Transfer              => write!(f, "Transfer"),
             Self::SponsoredContractCall => write!(f, "SponsoredContractCall"),
@@ -178,9 +181,9 @@ impl SpendingLimits {
         }
     }
 
-    /// UBI distributor: bounded by daily issuance.
-    pub fn ubi_distributor(daily_issuance_uqrc: u128, population: u64) -> Self {
-        let epoch = daily_issuance_uqrc * population as u128;
+    /// QRC distributor: bounded by per-recipient issuance for this epoch.
+    pub fn qrc_distributor(per_recipient_issuance_uqrc: u128, population: u64) -> Self {
+        let epoch = per_recipient_issuance_uqrc * population as u128;
         Self {
             epoch_limit_uqrc:    epoch,
             lifetime_limit_uqrc: 0,
@@ -264,7 +267,7 @@ impl std::fmt::Display for AgentStatus {
 /// Whether this is a native Charmed Agent or a Sponsored Contract (Section 7.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentType {
-    /// A native Charmed Agent (merchant settlement, UBI distribution, etc.).
+    /// A native Charmed Agent (merchant settlement, QRC distribution, etc.).
     /// Phase 0 and Phase 1.
     Native,
     /// A Sponsored Contract -- a Solidity contract deployed via the permissioned EVM.
@@ -627,12 +630,12 @@ pub fn merchant_agent(
     )
 }
 
-/// Build a UBI distributor agent AEI.
-pub fn ubi_distributor_agent(
+/// Build a QRC distributor agent AEI.
+pub fn qrc_distributor_agent(
     agent_id:           &str,
     address:            &str,
     sponsor_id:         &str,
-    daily_issuance:     u128,
+    per_recipient_issuance: u128,
     population:         u64,
     epoch:              u64,
 ) -> (String, String, String, Vec<AgentCapability>, SpendingLimits, Option<String>, String, AgentType) {
@@ -642,14 +645,14 @@ pub fn ubi_distributor_agent(
         address.to_string(),
         sponsor_id.to_string(),
         vec![
-            AgentCapability::UbiDistribution,
+            AgentCapability::QrcDistribution,
             AgentCapability::HoldBalance,
             AgentCapability::Transfer,
             AgentCapability::ReadState,
         ],
-        SpendingLimits::ubi_distributor(daily_issuance, population),
+        SpendingLimits::qrc_distributor(per_recipient_issuance, population),
         None,
-        format!("UBI distributor agent for sponsor {sponsor_id}"),
+        format!("QRC distributor agent for sponsor {sponsor_id}"),
         AgentType::Native,
     )
 }
@@ -673,7 +676,7 @@ mod tests {
     #[test]
     fn phase0_capabilities_identified() {
         assert!(AgentCapability::MerchantSettlement.is_phase0());
-        assert!(AgentCapability::UbiDistribution.is_phase0());
+        assert!(AgentCapability::QrcDistribution.is_phase0());
         assert!(!AgentCapability::SponsoredContractCall.is_phase0());
         assert!(!AgentCapability::RwaSettlement.is_phase0());
     }
@@ -758,7 +761,7 @@ mod tests {
         );
         assert!(record.has_capability(&AgentCapability::MerchantSettlement));
         assert!(record.has_capability(&AgentCapability::HoldBalance));
-        assert!(!record.has_capability(&AgentCapability::UbiDistribution));
+        assert!(!record.has_capability(&AgentCapability::QrcDistribution));
     }
 
     #[test]
@@ -817,7 +820,7 @@ mod tests {
         store.authorize("m1", 1).unwrap();
 
         assert!(store.check_capability("m1", &AgentCapability::MerchantSettlement).is_ok());
-        assert!(store.check_capability("m1", &AgentCapability::UbiDistribution).is_err());
+        assert!(store.check_capability("m1", &AgentCapability::QrcDistribution).is_err());
     }
 
     #[test]
@@ -952,13 +955,13 @@ mod tests {
     }
 
     #[test]
-    fn ubi_distributor_limits_match_population() {
-        use chain_forge_identity::DAILY_UBI_RATE_UQRC;
+    fn qrc_distributor_limits_match_population() {
+        const PER_RECIPIENT_ISSUANCE_UQRC: u128 = 1_000_000_000;
         let (_, _, _, _, limits, _, _, _) =
-            ubi_distributor_agent("ubi1", "qcb1ubi", "qcb1alice",
-                DAILY_UBI_RATE_UQRC, 1000, 0);
+            qrc_distributor_agent("qrc1", "qcb1qrc", "qcb1alice",
+                PER_RECIPIENT_ISSUANCE_UQRC, 1000, 0);
 
-        let expected_epoch = DAILY_UBI_RATE_UQRC * 1000;
+        let expected_epoch = PER_RECIPIENT_ISSUANCE_UQRC * 1000;
         assert_eq!(limits.epoch_limit_uqrc, expected_epoch);
     }
 
@@ -971,6 +974,6 @@ mod tests {
         assert!(store.check_capability("m1", &AgentCapability::MerchantSettlement).is_ok());
         assert!(store.check_capability("m1", &AgentCapability::HoldBalance).is_ok());
         assert!(store.check_capability("m1", &AgentCapability::Transfer).is_ok());
-        assert!(store.check_capability("m1", &AgentCapability::UbiDistribution).is_err());
+        assert!(store.check_capability("m1", &AgentCapability::QrcDistribution).is_err());
     }
 }

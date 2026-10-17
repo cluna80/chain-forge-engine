@@ -292,6 +292,47 @@ pub struct GenesisConfig {
     /// Change Set L: initial set populated at devnet genesis.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settlement_operators: Vec<String>,
+
+    /// Optional overrides for the permissionless stake-bond validator-
+    /// onboarding module (`chain-forge-execution::validator_bond`) and the
+    /// deterministic block-height validator-set epoch length
+    /// (`chain-forge-node`'s `validator_epoch_blocks`).
+    ///
+    /// Entirely additive and backward compatible: omitting this field (as
+    /// every genesis file predating it does) is identical to supplying
+    /// `GenesisValidatorBonding { min_bond_amount: None, validator_epoch_blocks: None }`
+    /// -- the engine falls back to its existing compiled-in defaults
+    /// (`DEFAULT_MIN_BOND_UQCB`, `DEFAULT_VALIDATOR_EPOCH_BLOCKS`) exactly as
+    /// it did before this field existed. No existing genesis JSON needs to
+    /// change, and no running devnet needs to reset, to pick this change up.
+    ///
+    /// This is generic Chain Forge engine configuration, not a
+    /// Qattice-specific policy: any chain built on Chain Forge that enables
+    /// the "staking" module can set these independently of QCB's token
+    /// economics. `chain-forge-core` deliberately does not depend on
+    /// `chain-forge-execution` or `chain-forge-node`, so it cannot name
+    /// their default constants directly -- it only carries the override;
+    /// resolving "override, or the engine's own default" is the caller's
+    /// job (see `chain-forge-node::Node::new_with_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_bonding: Option<GenesisValidatorBonding>,
+}
+
+/// See `GenesisConfig::validator_bonding`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenesisValidatorBonding {
+    /// Minimum stake, in the chain's `native_token.denom`, a candidate must
+    /// hold to be eligible for the active validator set. `None` means "use
+    /// the engine's compiled-in default."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_bond_amount: Option<u128>,
+
+    /// Number of blocks per validator-set epoch. Every decision that can
+    /// change validator membership, voting power, or quorum fires only at a
+    /// height where `height % validator_epoch_blocks == 0`. `None` means
+    /// "use the engine's compiled-in default."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_epoch_blocks: Option<u64>,
 }
 
 // -- Modules ----------------------------------------------------------------------
@@ -304,8 +345,10 @@ pub const KNOWN_MODULES: &[(&str, &str)] = &[
     ("bank",     "accounts, transfers and burns (always on)"),
     ("staking",  "Stake transactions"),
     ("identity", "proof of personhood: RegisterIdentity and web-of-trust Attest"),
-    ("qrc",    "UBI claims and the UBI pool (requires identity)"),
+    ("qrc",    "dormant legacy QRC-token purchase/spend/contribution/capacity paths -- not part of the active single-token ($QCB) protocol (requires identity)"),
     ("agents",   "sponsored agents (requires identity)"),
+    ("market",   "resource job/escrow marketplace (LockQrcForJob, CreateJob..VerifyJob, etc.) -- not part of the active single-token ($QCB) protocol (requires identity)"),
+    ("pocd",     "Proof-of-Compute-Discovery / Grand Challenge research rewards (RegisterMachine, SubmitUsefulWork, ClaimResearchReward) -- active, uqcb-denominated (requires identity)"),
 ];
 
 /// Which optional engine modules a chain has switched on. The core (bank:
@@ -314,14 +357,28 @@ pub const KNOWN_MODULES: &[(&str, &str)] = &[
 pub struct EnabledModules {
     pub staking:  bool,
     pub identity: bool,
+    /// Legacy QRC-token ops (QrcPurchase, QrcSpend, QrcContributionSettle,
+    /// EpochOpen/EpochClose, RecordCapacity). Dormant in the single-token
+    /// ($QCB-only) protocol -- see market/pocd for the active split-out paths.
     pub qrc:    bool,
     pub agents:   bool,
+    /// The resource job/escrow marketplace (LockQrcForJob, ReleaseQrcForJob,
+    /// RefundQrcForJob, CreateJob, AcceptJob, CompleteJob, VerifyJob,
+    /// PurchaseQrc, CreditProvider). Not part of the active QCB-only protocol.
+    pub market: bool,
+    /// Proof-of-Compute-Discovery / Grand Challenge research-reward path
+    /// (RegisterMachine, SubmitUsefulWork, ClaimResearchReward). Active,
+    /// uqcb-denominated, and considered core to the protocol.
+    pub pocd:   bool,
 }
 
 impl EnabledModules {
-    /// Everything on -- the QCB module set.
+    /// Everything on -- every module this engine knows how to run.
     pub fn all() -> Self {
-        Self { staking: true, identity: true, qrc: true, agents: true }
+        Self {
+            staking: true, identity: true, qrc: true, agents: true,
+            market: true, pocd: true,
+        }
     }
 }
 
@@ -452,6 +509,8 @@ impl GenesisConfig {
                 "identity" => m.identity = true,
                 "qrc"    => m.qrc = true,
                 "agents"   => m.agents = true,
+                "market"   => m.market = true,
+                "pocd"     => m.pocd = true,
                 other => errors.push(format!(
                     "unknown module \"{other}\" (known modules: {})", known.join(", ")
                 )),
@@ -463,7 +522,13 @@ impl GenesisConfig {
             ));
         }
         if m.qrc && !m.identity {
-            errors.push("module \"qrc\" requires \"identity\": UBI is paid only to verified humans".into());
+            errors.push("module \"qrc\" requires \"identity\": legacy QRC-token ops are gated by verified identity".into());
+        }
+        if m.market && !m.identity {
+            errors.push("module \"market\" requires \"identity\": the resource marketplace gates jobs and settlement by verified identity".into());
+        }
+        if m.pocd && !m.identity {
+            errors.push("module \"pocd\" requires \"identity\": ClaimResearchReward settlement operators are verified DIS identities".into());
         }
         if self.consensus.personhood_weighted && !m.identity {
             errors.push("consensus.personhood_weighted requires the \"identity\" module: personhood needs an identity layer".into());
@@ -530,6 +595,119 @@ impl GenesisConfig {
         }
 
         errors
+    }
+
+    /// Hard validation (unlike `validate()` above, which only produces
+    /// warnings today): every genesis account with `role == "validator"`
+    /// must carry a well-formed `public_key`.
+    ///
+    /// This is the security-change-set fix for mandatory validator keys
+    /// (Decision: Option B, "mandatory registered consensus keys... for
+    /// all validators, including genesis validators" -- no devnet bypass).
+    /// `chain-forge-node::Node::new` calls this as a hard error, before
+    /// consensus begins, rather than folding it into `validate()`'s
+    /// warning-only list: a chain that cannot seat any validator with real
+    /// voting power is not a "proceed with a warning" situation.
+    ///
+    /// "Well-formed" here means structurally valid -- present, valid hex,
+    /// and at least 32 bytes (the Ed25519/ML-DSA-class floor; this is a
+    /// sanity floor, not a scheme-specific length check, since
+    /// `cryptography.validator_scheme` can vary). It does NOT verify the
+    /// key is a valid point on any particular curve, or that a matching
+    /// private key exists anywhere -- that half of the check
+    /// (`local private key corresponds to the registered public key`) is
+    /// `Node::load_signing_key`'s job, once an operator's node starts up
+    /// and loads its own key file.
+    pub fn validate_validator_keys(&self) -> Result<(), String> {
+        for acct in &self.genesis_accounts {
+            if acct.role != "validator" {
+                continue;
+            }
+            let hex = match &acct.public_key {
+                None => {
+                    return Err(format!(
+                        "genesis validator {:?} ({}) has no public_key -- \
+                         every validator must carry a registered consensus \
+                         key before consensus begins (no keyless validators, \
+                         genesis included)",
+                        acct.label, acct.address
+                    ));
+                }
+                Some(h) if h.is_empty() => {
+                    return Err(format!(
+                        "genesis validator {:?} ({}) has an empty public_key",
+                        acct.label, acct.address
+                    ));
+                }
+                Some(h) => h,
+            };
+            if hex.len() % 2 != 0 {
+                return Err(format!(
+                    "genesis validator {:?} ({}) public_key is not valid hex \
+                     (odd length: {} characters)",
+                    acct.label, acct.address, hex.len()
+                ));
+            }
+            let bytes: Option<Vec<u8>> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                .collect();
+            let bytes = match bytes {
+                Some(b) => b,
+                None => {
+                    return Err(format!(
+                        "genesis validator {:?} ({}) public_key is not valid hex",
+                        acct.label, acct.address
+                    ));
+                }
+            };
+            if bytes.len() < 32 {
+                return Err(format!(
+                    "genesis validator {:?} ({}) public_key is only {} bytes \
+                     -- too short to be a real consensus key (expected >= 32)",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Hard validation of the optional `validator_bonding` override block.
+    /// Unlike `validate()`'s warning-only list, this stops the node before
+    /// consensus begins: an accepted-but-nonsensical value here is not a
+    /// "proceed with a warning" situation, the same reasoning as
+    /// `validate_validator_keys()`.
+    ///
+    /// - `min_bond_amount: Some(0)` is rejected -- a minimum of zero is not
+    ///   a minimum at all; it defeats the entire point of a stake-based
+    ///   Sybil defense (ROADMAP "Validator Onboarding" design decision).
+    /// - `validator_epoch_blocks: Some(0)` is rejected -- `chain-forge-node`
+    ///   computes `height / validator_epoch_blocks` on every commit; zero
+    ///   would be a division-by-zero panic at runtime, not a graceful
+    ///   degradation.
+    ///
+    /// `None` for either field is always valid (falls back to the engine
+    /// default), so a genesis file that omits `validator_bonding` entirely
+    /// always passes this check.
+    pub fn validate_validator_bonding(&self) -> Result<(), String> {
+        let Some(ref vb) = self.validator_bonding else { return Ok(()); };
+
+        if vb.min_bond_amount == Some(0) {
+            return Err(
+                "validator_bonding.min_bond_amount is 0 -- a zero minimum \
+                 bond provides no Sybil-resistance; omit the field to use \
+                 the engine default, or set a positive value".into()
+            );
+        }
+        if vb.validator_epoch_blocks == Some(0) {
+            return Err(
+                "validator_bonding.validator_epoch_blocks is 0 -- epoch \
+                 number is computed as height / validator_epoch_blocks, so \
+                 zero would divide by zero at the first commit; omit the \
+                 field to use the engine default, or set a positive value".into()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -682,8 +860,18 @@ mod tests {
 
     #[test]
     fn qcb_module_set_enables_everything() {
-        let m = with_modules(&["bank", "staking", "identity", "qrc", "agents"], &[]).enabled_modules().unwrap();
+        let m = with_modules(&["bank", "staking", "identity", "qrc", "agents", "market", "pocd"], &[]).enabled_modules().unwrap();
         assert_eq!(m, EnabledModules::all());
+    }
+
+    #[test]
+    fn single_token_module_set_excludes_market_and_qrc() {
+        // The active QCB-only protocol: identity, staking, agents, and PoCD
+        // research rewards, but not the legacy QRC-token paths or the
+        // resource job/escrow marketplace.
+        let m = with_modules(&["bank", "staking", "identity", "agents", "pocd"], &[]).enabled_modules().unwrap();
+        assert!(m.staking && m.identity && m.agents && m.pocd);
+        assert!(!m.qrc && !m.market);
     }
 
     #[test]
@@ -696,9 +884,11 @@ mod tests {
 
     #[test]
     fn modules_that_need_identity_are_refused_without_it() {
-        let e = with_modules(&["bank", "qrc", "agents"], &[]).enabled_modules().unwrap_err();
+        let e = with_modules(&["bank", "qrc", "agents", "market", "pocd"], &[]).enabled_modules().unwrap_err();
         assert!(e.contains("\"qrc\" requires \"identity\""));
         assert!(e.contains("\"agents\" requires \"identity\""));
+        assert!(e.contains("\"market\" requires \"identity\""));
+        assert!(e.contains("\"pocd\" requires \"identity\""));
     }
 
     #[test]
@@ -709,7 +899,7 @@ mod tests {
         let e = cfg.enabled_modules().unwrap_err();
         assert!(e.contains("personhood_weighted requires"));
 
-        let mut qcb = with_modules(&["bank", "staking", "identity", "qrc", "agents"], &[]);
+        let mut qcb = with_modules(&["bank", "staking", "identity", "qrc", "agents", "market", "pocd"], &[]);
         qcb.consensus.personhood_weighted = true;
         assert!(qcb.enabled_modules().is_ok());
     }
@@ -775,6 +965,155 @@ mod tests {
         let errors = cfg.validate();
         assert!(errors.iter().any(|e| e.contains("ml-dsa")),
             "should warn about ml-dsa tx size: {errors:?}");
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_missing_public_key() {
+        // minimal_genesis_json()'s validator deliberately has no public_key
+        // (the pre-migration Phase-0 fixture) -- validate_validator_keys()
+        // must hard-reject it, unlike validate() which only warns.
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let err = cfg.validate_validator_keys().expect_err(
+            "a validator with no public_key must be a hard error"
+        );
+        assert!(err.contains("qcb1abc123"), "error should name the offending validator: {err}");
+        assert!(err.contains("no public_key"), "error should say why: {err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_accepts_well_formed_key() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            &format!(
+                "\"role\": \"validator\",\n                    \"public_key\": \"{}\"\n                }},",
+                "aa".repeat(32)
+            ),
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        assert!(cfg.validate_validator_keys().is_ok());
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_empty_string_key() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            "\"role\": \"validator\",\n                    \"public_key\": \"\"\n                },",
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_keys().expect_err("empty public_key must be rejected");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_invalid_hex() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            "\"role\": \"validator\",\n                    \"public_key\": \"not-hex!!\"\n                },",
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_keys().expect_err("non-hex public_key must be rejected");
+        assert!(err.contains("not valid hex"), "{err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_rejects_too_short_key() {
+        let json = minimal_genesis_json().replace(
+            r#""role": "validator"
+                },"#,
+            "\"role\": \"validator\",\n                    \"public_key\": \"aabbcc\"\n                },",
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_keys().expect_err("a 3-byte key must be rejected as too short");
+        assert!(err.contains("too short"), "{err}");
+    }
+
+    #[test]
+    fn validate_validator_keys_ignores_non_validator_roles() {
+        // The treasury account in minimal_genesis_json() has no public_key
+        // either -- that's fine, the check is scoped to role == "validator".
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let treasury_only = cfg.genesis_accounts.iter().all(|a| a.role == "validator" || a.public_key.is_none());
+        assert!(treasury_only, "sanity: fixture's treasury account has no key either");
+        // The only reason validate_validator_keys() fails on this fixture is
+        // the validator's missing key, not the treasury's.
+        let err = cfg.validate_validator_keys().unwrap_err();
+        assert!(!err.contains("qcb1def456"), "must not flag the treasury account: {err}");
+    }
+
+    #[test]
+    fn validator_bonding_defaults_to_none_when_omitted() {
+        // minimal_genesis_json() predates this field entirely -- every
+        // existing genesis file on disk looks like this. Confirms the
+        // field is additive: absence parses fine and resolves to "no
+        // override", not an error and not a forced value.
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        assert!(cfg.validator_bonding.is_none());
+        assert!(cfg.validate_validator_bonding().is_ok());
+    }
+
+    #[test]
+    fn validator_bonding_accepts_valid_overrides() {
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "min_bond_amount": 5000000, "validator_epoch_blocks": 50 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let vb = cfg.validator_bonding.as_ref().expect("validator_bonding should parse");
+        assert_eq!(vb.min_bond_amount, Some(5_000_000));
+        assert_eq!(vb.validator_epoch_blocks, Some(50));
+        assert!(cfg.validate_validator_bonding().is_ok());
+    }
+
+    #[test]
+    fn validator_bonding_round_trips_through_json() {
+        // Serialization check (change-set requirement #8): a config built
+        // with an override survives to_json_pretty() -> from_json() with
+        // the same values, and a config with no override omits the key
+        // entirely rather than writing `"validator_bonding": null`.
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "min_bond_amount": 2500000, "validator_epoch_blocks": 200 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let round_tripped_json = cfg.to_json_pretty().unwrap();
+        let cfg2 = GenesisConfig::from_json(&round_tripped_json).unwrap();
+        assert_eq!(cfg2.validator_bonding.unwrap().min_bond_amount, Some(2_500_000));
+
+        let cfg_no_override = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let no_override_json = cfg_no_override.to_json_pretty().unwrap();
+        assert!(
+            !no_override_json.contains("validator_bonding"),
+            "omitted validator_bonding must not round-trip as an explicit null"
+        );
+    }
+
+    #[test]
+    fn validator_bonding_rejects_zero_min_bond_amount() {
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "min_bond_amount": 0 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_bonding().expect_err("a zero minimum bond must be rejected");
+        assert!(err.contains("min_bond_amount"), "{err}");
+    }
+
+    #[test]
+    fn validator_bonding_rejects_zero_epoch_blocks() {
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "validator_epoch_blocks": 0 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_bonding().expect_err("zero validator_epoch_blocks must be rejected (division by zero)");
+        assert!(err.contains("validator_epoch_blocks"), "{err}");
     }
 
     #[test]

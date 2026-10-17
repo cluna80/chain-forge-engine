@@ -395,14 +395,16 @@ The existing `phase0_job_test.py` is preserved as-is (QRC legacy prototype).
 
 **Prerequisite:** Resolve UED-001 (escrow residual destination) at the level needed for devnet testing. Recommendation: use 100% provider payment (no fee) for Phase 1 test clarity.
 
-- [ ] **P1-1** Apply Change Set A to `chain-forge-execution/src/lib.rs` — replace `"uqrc"`/`"locked_uqrc"` with `"uqcb"`/`"locked_uqcb"` in the five handlers above
-- [ ] **P1-2** Verify existing Phase 0 tests still pass (no regression in QRC legacy path)
-- [ ] **P1-3** Verify devnet nodes start with updated binary and reach consensus
-- [ ] **P1-4** Write `scripts/phase0_qcb_job_test.py` — full QCB-native lifecycle test (Change Set B)
-- [ ] **P1-5** Run new test on 3-node devnet; confirm INV-002 (conservation), INV-005 (cross-node)
-- [ ] **P1-6** Add Change Set C documentation comments
-- [ ] **P1-7** Add code comments to legacy `EpochClose` PoCD path noting it uses `uqrc`
-- [ ] **P1-8** Update `docs/QCB-Single-Token-Migration-Audit.md` with any findings from implementation
+- [x] **P1-1** Apply Change Set A to `chain-forge-execution/src/lib.rs` — replace `"uqrc"`/`"locked_uqrc"` with `"uqcb"`/`"locked_uqcb"` in the five handlers above. **Done** (found already applied as of 2026-10-16: `LockQrcForJob`, `ReleaseQrcForJob`, `RefundQrcForJob`, `VerifyJob`, and `DepositToTreasury` all read/write `uqcb`/`locked_uqcb` exclusively; no `uqrc` remains in any of the five).
+- [x] **P1-2** Verify existing Phase 0 tests still pass (no regression in QRC legacy path). **Done** 2026-10-16 — full `chain-forge-execution` suite (102/102) and workspace build green.
+- [ ] **P1-3** Verify devnet nodes start with updated binary and reach consensus. **Not re-verified this pass** — no multi-node devnet was started in this session; only unit/lib tests were run.
+- [x] **P1-4** Write `scripts/phase0_qcb_job_test.py` — full QCB-native lifecycle test (Change Set B). **Done** — file exists in `scripts/`.
+- [ ] **P1-5** Run new test on 3-node devnet; confirm INV-002 (conservation), INV-005 (cross-node). **Not re-verified this pass** — same reason as P1-3.
+- [x] **P1-6** Add Change Set C documentation comments. **Done** 2026-10-16: `QrcPurchase` handler now documents that it mints inert `uqrc` and should not be used to fund anything; module-level doc comment rewritten for the single-token architecture.
+- [x] **P1-7** Add code comments to legacy `EpochClose` PoCD path noting it uses `uqrc`. **Done** 2026-10-16.
+- [x] **P1-8** Update `docs/QCB-Single-Token-Migration-Audit.md` with any findings from implementation. **This edit.**
+
+**2026-10-16 finding:** Change Set A (the actual `uqrc` → `uqcb` handler migration) and the Change Set B test script were already complete by the time this note was written — likely from work done between this audit's original date (2026-10-10) and now. What was still missing, and is now done, is Change Set C (the documentation trail): the `QrcPurchase` handler, the legacy `EpochClose` PoCD path, and the crate's module-level doc comment did not yet say, in the code itself, that `uqrc`/`QrcPurchase`/`QrcSpend`/`QrcContributionSettle`/`EpochOpen`/`EpochClose` are the dormant two-token prototype and that the live resource marketplace is `uqcb`-denominated. A separate, unrelated decision this same day: the genesis `"qrc"` module flag was confirmed to stay enabled, since it is the module gate for the (now `uqcb`-denominated) resource marketplace, not specifically a QRC-token switch — disabling it would have taken down escrow/job settlement along with QRC.
 
 ### Phase 2 — Economic Conservation Integration Tests
 

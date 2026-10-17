@@ -13,8 +13,19 @@
 /// It receives an ordered list of transactions from the consensus layer
 /// (after they have been committed to a block) and applies them to state.
 ///
+/// Single-token architecture (whitepaper, October 2026 revision): $QCB is
+/// the sole active protocol token. The resource marketplace (LockQrcForJob,
+/// ReleaseQrcForJob, RefundQrcForJob, VerifyJob, DepositToTreasury -- still
+/// named for their QRC-prototype origin) escrows and settles in `uqcb`/
+/// `locked_uqcb`, not a separate resource-credit denom. The `QrcPurchase`,
+/// `QrcSpend`, `QrcContributionSettle`, `EpochOpen`/`EpochClose` handlers and
+/// the `uqrc` denom they mint/spend are the earlier two-token prototype --
+/// preserved and still functional, but dormant: nothing in the active
+/// devnet lifecycle calls them, and new code should not build on `uqrc`.
+/// See docs/QCB-Single-Token-Migration-Audit.md for the full audit.
+///
 /// Whitepaper refs:
-///   - Section 6.2 ($QRC transfers, demurrage)
+///   - Section 6.2 (legacy $QRC transfers, demurrage -- prototype, dormant)
 ///   - Section 6.3 ($QCB burns via BME)
 ///   - Section 6.6 (gas fees -> staking yield)
 ///   - Section 8 (merchant payment flow)
@@ -27,6 +38,10 @@ use chain_forge_identity::IdentityStore;
 use chain_forge_qrc::QrcEngine;
 use chain_forge_agents::{AgentStore, AgentType, SpendingLimits};
 use chain_forge_pocd::DiscoveryRegistry;
+
+/// Validator Onboarding — Permissionless Entry via Stake Bond. See
+/// ROADMAP.md, "Validator Onboarding" section.
+pub mod validator_bond;
 
 // -- Error --------------------------------------------------------------------
 
@@ -94,9 +109,12 @@ impl GasModel {
                     TxBody::Transfer { .. }          => op_multiplier * 2,
                     TxBody::Burn    { .. }           => op_multiplier * 3,
                     TxBody::Stake   { .. }           => op_multiplier * 5,
+                    TxBody::BondValidator { .. }     => op_multiplier * 5,
+                    TxBody::UnbondValidator          => op_multiplier * 5,
+                    // Verifying a proof-of-possession signature is real
+                    // crypto work, comparable to the other key/identity ops.
+                    TxBody::RegisterValidatorKey { .. } => op_multiplier * 5,
                     TxBody::Custom  { .. }           => op_multiplier * 10,
-                    TxBody::ClaimUbi { .. }          => op_multiplier * 3,
-                    TxBody::RedirectToUbiPool { .. } => op_multiplier * 3,
                     TxBody::SponsorAgent { .. }      => op_multiplier * 4,
                     TxBody::RevokeAgent  { .. }      => op_multiplier * 2,
                     // Registration writes a new IdentityRecord + account --
@@ -194,6 +212,52 @@ pub enum TxBody {
         validator: String,
         amount:    u128,
     },
+    /// Validator Onboarding (ROADMAP.md): bond uqcb as validator stake.
+    /// Sender is the validator candidate; incremental bonding is allowed --
+    /// whether the resulting total clears the minimum bond threshold only
+    /// matters for active-set eligibility, not for this tx succeeding.
+    /// See `validator_bond::ValidatorBondStore::bond()`.
+    BondValidator {
+        amount: u128,
+    },
+    /// Validator Onboarding (ROADMAP.md): begin unbonding the sender's
+    /// entire current validator stake. Stops counting toward the active
+    /// set immediately; funds remain locked (and slashable) for the
+    /// unbonding cooldown before a later `UnbondValidator` call sweeps
+    /// the matured amount back to the sender's balance. See
+    /// `validator_bond::ValidatorBondStore::start_unbond()` /
+    /// `sweep_matured()`.
+    UnbondValidator,
+    /// CF-VAL-KEY-002: register (or rotate) the sender's authenticated
+    /// consensus public key -- the key that signs block proposals and
+    /// votes, as distinct from the account key used to sign ordinary
+    /// transactions (which may be the same key, but isn't required to be).
+    ///
+    /// `BondValidator` moves funds but has never carried any key material;
+    /// this is the transaction that actually establishes the authenticated
+    /// binding `consensus key -> validator identity` that mandatory
+    /// signature verification depends on. Reusable across any Chain Forge
+    /// chain -- there is nothing Qattice-specific here.
+    ///
+    /// Authentication (enforced unconditionally in the executor,
+    /// independent of this chain's general `require_signatures` setting --
+    /// see `verify_authorization_for`): the transaction's own signature
+    /// must authenticate `sender` (so only the address that controls this
+    /// validator's account can call this for itself), AND
+    /// `proof_of_possession` must be a valid signature, made with the
+    /// private key corresponding to `consensus_pubkey`, over
+    /// `validator_key_registration_signing_bytes(chain_id, sender)` -- so
+    /// the registrant has actually proven they hold the new key's private
+    /// half, not merely asserted its public bytes. Both conditions must
+    /// hold for every registration, including a later key rotation, which
+    /// is what makes an unauthorized replacement impossible: nobody else's
+    /// transaction can authenticate as `sender`, and nobody who doesn't
+    /// hold the target private key can produce a valid proof of possession
+    /// for it.
+    RegisterValidatorKey {
+        consensus_pubkey:     Vec<u8>,
+        proof_of_possession:  Vec<u8>,
+    },
     /// Custom operation -- opaque payload for module-specific logic.
     /// Used by Charm Confinement, Intrinsic Charm, Charmed Agents.
     /// QRC operations now use typed variants below.
@@ -280,17 +344,6 @@ pub enum TxBody {
     Attest {
         claimant_id: String,
     },
-    /// Claim UBI for a verified identity (Section 6.2 / Charm Confinement 5.1).
-    /// Enforces: one claim per epoch, verified tier, liveness.
-    /// The sender must be the identity owner.
-    ClaimUbi {
-        identity_id: String,
-    },
-    /// Proactive redirect of $QRC balance to the UBI pool (Section 6.3 / Q25).
-    /// Triggers BME fee. Holder voluntarily sends balance to pool.
-    RedirectToUbiPool {
-        amount: u128,
-    },
     /// Register a Charmed Agent under a verified human sponsor (Section 5.3).
     /// Enforces: sponsor must be Verified tier.
     SponsorAgent {
@@ -358,7 +411,7 @@ pub enum TxBody {
     /// that does not map cleanly onto the standard participation heartbeat.
     ///
     /// `CharmEvent` captures the distinct events that affect the on-chain
-    /// charm record without going through the normal UBI/transfer paths.
+    /// charm record without going through the normal transfer paths.
     ///
     /// Effects:
     ///   - The event is applied to the sender's `IntrinsicCharm` via the
@@ -933,9 +986,10 @@ impl TxBody {
             TxBody::Transfer { .. }               => "Transfer",
             TxBody::Burn { .. }                   => "Burn",
             TxBody::Stake { .. }                  => "Stake",
+            TxBody::BondValidator { .. }          => "BondValidator",
+            TxBody::UnbondValidator               => "UnbondValidator",
+            TxBody::RegisterValidatorKey { .. }   => "RegisterValidatorKey",
             TxBody::Custom { .. }                 => "Custom",
-            TxBody::ClaimUbi { .. }               => "ClaimUbi",
-            TxBody::RedirectToUbiPool { .. }      => "RedirectToUbiPool",
             TxBody::SponsorAgent { .. }           => "SponsorAgent",
             TxBody::RevokeAgent { .. }            => "RevokeAgent",
             TxBody::RegisterIdentity             => "RegisterIdentity",
@@ -1000,8 +1054,7 @@ pub enum CharmEvent {
 /// types whose handlers don't already do it.
 ///
 /// Transfer, Burn and Stake advance the nonce inside StateStore::transfer /
-/// StateStore::burn, and ClaimUbi / RedirectToUbiPool advance it inside the
-/// QrcEngine calls they make. Every other body type previously advanced
+/// StateStore::burn. Every other body type previously advanced
 /// nothing -- which meant RegisterIdentity, Attest, SponsorAgent,
 /// RevokeAgent and Custom transactions left the sender's nonce unchanged
 /// on success. Consequences: the same signed transaction could be
@@ -1016,8 +1069,7 @@ fn advance_nonce_if_not_already(tx: &Transaction, state: &mut StateStore) {
         TxBody::Transfer { .. }
             | TxBody::Burn { .. }
             | TxBody::Stake { .. }
-            | TxBody::ClaimUbi { .. }
-            | TxBody::RedirectToUbiPool { .. }
+            | TxBody::BondValidator { .. }
             // QRC variants mutate account state via the QrcEngine but do NOT
             // call StateStore::burn/transfer directly (the purchase-path burn
             // is done explicitly in the handler), so nonce advancement falls
@@ -1106,11 +1158,13 @@ impl Transaction {
             TxBody::Transfer { to, denom, .. }       => to.len() + denom.len() + 16,
             TxBody::Burn     { denom, .. }            => denom.len() + 16,
             TxBody::Stake    { validator, .. }        => validator.len() + 16,
+            TxBody::BondValidator { .. }               => 16,
+            TxBody::UnbondValidator                    => 8,
+            TxBody::RegisterValidatorKey { consensus_pubkey, proof_of_possession } =>
+                consensus_pubkey.len() + proof_of_possession.len(),
             TxBody::Custom   { module, payload }      => module.len() + payload.len(),
             TxBody::RegisterIdentity                  => 8,
             TxBody::Attest   { claimant_id }          => claimant_id.len() + 8,
-            TxBody::ClaimUbi { identity_id }          => identity_id.len() + 8,
-            TxBody::RedirectToUbiPool { .. }          => 16,
             TxBody::SponsorAgent { agent_address }    => agent_address.len() + 8,
             TxBody::RevokeAgent  { agent_address }    => agent_address.len() + 8,
             TxBody::RevokeAttestation { attested_id }    => attested_id.len() + 8,
@@ -1224,13 +1278,28 @@ impl Transaction {
         }
     }
 
-    /// A UBI claim transaction (Charm Confinement: one per epoch).
-    pub fn claim_ubi(id: &str, sender: &str, identity_id: &str, nonce: u64) -> Self {
+    /// Validator Onboarding (ROADMAP.md): bond uqcb as validator stake.
+    pub fn bond_validator(id: &str, sender: &str, amount: u128, nonce: u64) -> Self {
         Self {
             id: id.to_string(),
             sender: sender.to_string(),
             nonce,
-            body: TxBody::ClaimUbi { identity_id: identity_id.to_string() },
+            body: TxBody::BondValidator { amount },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        }
+    }
+
+    /// Validator Onboarding (ROADMAP.md): begin/complete unbonding.
+    pub fn unbond_validator(id: &str, sender: &str, nonce: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            sender: sender.to_string(),
+            nonce,
+            body: TxBody::UnbondValidator,
             gas_limit: 50_000,
             signature: vec![],
             public_key: vec![],
@@ -1261,21 +1330,6 @@ impl Transaction {
             sender: sender.to_string(),
             nonce,
             body: TxBody::Attest { claimant_id: claimant_id.to_string() },
-            gas_limit: 50_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// A UBI pool redirect transaction (Section 6.3 / Q25).
-    pub fn redirect_to_ubi_pool(id: &str, sender: &str, amount: u128, nonce: u64) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::RedirectToUbiPool { amount },
             gas_limit: 50_000,
             signature: vec![],
             public_key: vec![],
@@ -1841,6 +1895,28 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
     if !config.require_signatures {
         return Ok(());
     }
+    verify_authorization_signed(config, tx, state)
+}
+
+/// CF-VAL-KEY-002: like `verify_authorization`, but used for transaction
+/// types whose authentication must never be relaxed by this chain's general
+/// `require_signatures` setting. `require_signatures = false` exists for
+/// devnet/faucet convenience on ordinary transfers; it must never be read
+/// as permission to bind an unauthenticated consensus key to a validator
+/// identity. Callers pick this over `verify_authorization` for exactly
+/// those tx types (currently: `RegisterValidatorKey`).
+fn verify_authorization_for(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
+    if matches!(tx.body, TxBody::RegisterValidatorKey { .. }) {
+        return verify_authorization_signed(config, tx, state);
+    }
+    verify_authorization(config, tx, state)
+}
+
+/// The actual signature/key-binding check, unconditionally (no
+/// `require_signatures` escape hatch). Factored out of `verify_authorization`
+/// so `verify_authorization_for` can force it for specific tx types
+/// regardless of chain config.
+fn verify_authorization_signed(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
 
     // -- ML-DSA path -----------------------------------------------------------
     // If the transaction carries an mldsa65: signature tag, verify it before
@@ -1879,6 +1955,25 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
             }
         }
     }
+}
+
+/// CF-VAL-KEY-002: domain-separated signing bytes for a validator
+/// consensus-key registration proof-of-possession. Binds the registration
+/// to a specific chain and a specific sender address, so a
+/// proof-of-possession signature cannot be replayed against a different
+/// chain, nor reused to register the same key under a different sender's
+/// name. Reusable across any Chain Forge chain -- not Qattice-specific.
+pub fn validator_key_registration_signing_bytes(chain_id: &str, sender: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFVK|"); // Chain Forge Validator Key registration
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(sender.as_bytes());
+    b
+}
+
+fn hex_encode_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Verify an ML-DSA-65 signature on a transaction.
@@ -1965,13 +2060,21 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
     match body {
         TxBody::Transfer { .. } | TxBody::Burn { .. } | TxBody::Custom { .. } => None,
         TxBody::Stake { .. } => Some("staking"),
+        // Validator Onboarding (ROADMAP.md) reuses the "staking" module --
+        // bonding/unbonding is the same economic gate as TxBody::Stake.
+        TxBody::BondValidator { .. } | TxBody::UnbondValidator => Some("staking"),
+        // Key registration is the authentication half of validator
+        // onboarding, same module gate as bonding (the economic half).
+        TxBody::RegisterValidatorKey { .. } => Some("staking"),
         TxBody::RegisterIdentity
         | TxBody::Attest { .. }
         | TxBody::RevokeAttestation { .. }
         | TxBody::ConfirmSybil { .. }
         | TxBody::ReverseSybil { .. }
         | TxBody::ReportSuspectedSybil { .. } => Some("identity"),
-        TxBody::ClaimUbi { .. } | TxBody::RedirectToUbiPool { .. } => Some("qrc"),
+        // Legacy QRC-token ops (dormant in the single-token/$QCB-only
+        // protocol -- see "market" and "pocd" below for the active,
+        // uqcb-denominated paths that used to share this module).
         TxBody::QrcPurchase { .. }
         | TxBody::QrcSpend { .. }
         | TxBody::QrcContributionSettle { .. } => Some("qrc"),
@@ -1979,7 +2082,7 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Phase 1 typed variants.
         TxBody::CharmConfinementUpdate { .. } | TxBody::IntrinsicCharmRecord { .. } => Some("identity"),
         TxBody::RegisterAgent { .. } => Some("agents"),
-        // QRC v0.2 epoch boundary signals + Control 5 require the QRC module.
+        // QRC v0.2 epoch boundary signals + Control 5: legacy QRC-token module.
         TxBody::EpochOpen { .. } | TxBody::EpochClose { .. }
         | TxBody::RecordCapacity { .. } => Some("qrc"),
         // AEI Phase 2 lifecycle operations all require the agents module.
@@ -1988,26 +2091,31 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::RevokeAgentFull { .. }
         | TxBody::RecordAgentSpend { .. }
         | TxBody::SpawnChildAgent { .. } => Some("agents"),
-        // Resource Network v0.2 marketplace tx types belong to the QRC module.
+        // Resource Network v0.2 marketplace tx types: job-scoped QRC minting,
+        // part of the resource marketplace, not the legacy standalone
+        // QRC-token purchase path.
         TxBody::PurchaseQrc { .. }
-        | TxBody::CreditProvider { .. } => Some("qrc"),
-        // QRC Escrow is part of the Resource Marketplace (QRC module).
+        | TxBody::CreditProvider { .. } => Some("market"),
+        // QRC Escrow is part of the Resource Marketplace.
         TxBody::LockQrcForJob { .. }
         | TxBody::ReleaseQrcForJob { .. }
-        | TxBody::RefundQrcForJob { .. } => Some("qrc"),
+        | TxBody::RefundQrcForJob { .. } => Some("market"),
         // Agent Treasury is part of the agents module (modifies agent records).
         TxBody::DepositToTreasury { .. } => Some("agents"),
-        // Contribution Layer belongs to the QRC module.
-        TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => Some("qrc"),
-        // Resource Job Lifecycle belongs to the QRC module.
+        // Contribution Layer (machine registration + useful-work submission)
+        // belongs to PoCD / Grand Challenge research rewards -- active and
+        // uqcb-denominated, distinct from the resource marketplace.
+        TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => Some("pocd"),
+        // Resource Job Lifecycle belongs to the Resource Marketplace.
         TxBody::CreateJob { .. }
         | TxBody::AcceptJob { .. }
         | TxBody::CompleteJob { .. }
-        | TxBody::VerifyJob { .. } => Some("qrc"),
-        // ClaimResearchReward (Change Set L): requires both QRC module (balance
-        // ops) and identity module (settlement_operators are DIS identities).
-        // Guard on QRC since that also gates the treasury and balance transfers.
-        TxBody::ClaimResearchReward { .. } => Some("qrc"),
+        | TxBody::VerifyJob { .. } => Some("market"),
+        // ClaimResearchReward (Change Set L): requires both the PoCD module
+        // (treasury/balance ops) and identity module (settlement_operators
+        // are DIS identities). Guard on PoCD since that also gates the
+        // treasury and balance transfers for this reward path.
+        TxBody::ClaimResearchReward { .. } => Some("pocd"),
     }
 }
 
@@ -2020,6 +2128,8 @@ pub fn module_check(tx: &Transaction, modules: &EnabledModules) -> Result<(), St
         "identity" => modules.identity,
         "qrc"    => modules.qrc,
         "agents"   => modules.agents,
+        "market" => modules.market,
+        "pocd"   => modules.pocd,
         _ => false,
     };
     if on { Ok(()) } else { Err(format!("module \"{name}\" is not enabled on this chain")) }
@@ -2088,6 +2198,15 @@ impl Executor {
         Self { config }
     }
 
+    /// The chain's native fee/stake denom (e.g. `"uqcb"`). Exposed so
+    /// callers outside this crate -- `chain-forge-node`'s epoch-boundary
+    /// active-set recomputation, in particular -- can query
+    /// `validator_bond::compute_stake_active_set` against the same denom
+    /// the executor itself used to move bonded stake.
+    pub fn native_denom(&self) -> &str {
+        &self.config.native_denom
+    }
+
     /// Execute a single transaction with CharmConfinement enforcement.
     /// Requires identity store, QRC engine, and agent store for identity-gated
     /// and agent-registered tx types.
@@ -2121,7 +2240,7 @@ impl Executor {
         if let Err(e) = module_check(tx, &self.config.modules) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
-        if let Err(e) = verify_authorization(&self.config, tx, state) {
+        if let Err(e) = verify_authorization_for(&self.config, tx, state) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
@@ -2172,6 +2291,152 @@ impl Executor {
                     identity.record_activity_by_address(&tx.sender);
                 }
                 result
+            }
+
+            // Validator Onboarding (ROADMAP.md). Bonded stake and the
+            // unbonding cooldown are tracked as on-chain balances of two
+            // deterministic virtual accounts per validator -- no private
+            // key ever controls them, same convention as `treasury:*`:
+            //   `validator-bond:{address}`      balance["uqcb"] = currently bonded
+            //   `validator-unbonding:{address}` balance["uqcb"] = amount cooling down
+            //                                    balance["unlock_epoch"] = epoch it unlocks at
+            // This keeps the rule set identical to what
+            // `validator_bond::ValidatorBondStore` specifies and tests in
+            // isolation, without threading a new store parameter through
+            // every call site of this function. Computing the stake-ranked
+            // active set (`validator_bond::ValidatorBondStore::active_set()`)
+            // from these accounts, and swapping it into the live
+            // ConsensusEngine's ValidatorSet at epoch boundaries, is the
+            // remaining integration work -- see the module doc comment in
+            // `validator_bond.rs` and ROADMAP.md.
+            TxBody::BondValidator { amount } => {
+                let bond_account = format!("validator-bond:{}", tx.sender);
+                state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
+                    .map(|_| {
+                        events.push(format!(
+                            "bond_validator: {} {} bonded by {}",
+                            amount, self.config.native_denom, tx.sender
+                        ));
+                        identity.record_activity_by_address(&tx.sender);
+                    })
+                    .map_err(|e| e.to_string())
+            }
+
+            TxBody::UnbondValidator => {
+                let bond_account = format!("validator-bond:{}", tx.sender);
+                let unbonding_account = format!("validator-unbonding:{}", tx.sender);
+                let current_epoch = identity.clock.current_epoch;
+
+                let currently_bonded = state.get_account(&bond_account)
+                    .map(|a| a.balance_of(&self.config.native_denom))
+                    .unwrap_or(0);
+
+                if currently_bonded > 0 {
+                    // New unbonding request: move the entire bonded amount
+                    // into the cooldown-locked account and stamp its
+                    // unlock_epoch. Only reachable when currently_bonded > 0,
+                    // which is already false while a prior unbonding entry
+                    // is outstanding (start_unbond zeroes the bond account),
+                    // so this inherently forbids queuing a second cooldown
+                    // on top of one already in flight.
+                    let cooldown_epochs = validator_bond::DEFAULT_UNBONDING_COOLDOWN_EPOCHS;
+                    let unlock_epoch = current_epoch.saturating_add(cooldown_epochs);
+                    state.transfer(&bond_account, &unbonding_account, &self.config.native_denom, currently_bonded)
+                        .map_err(|e| e.to_string())
+                        .map(|_| {
+                            if let Ok(acct) = state.get_account_mut(&unbonding_account) {
+                                acct.balances.insert("unlock_epoch".to_string(), unlock_epoch as u128);
+                            }
+                            events.push(format!(
+                                "unbond_validator: {} started unbonding {} {}, unlocks at epoch {}",
+                                tx.sender, currently_bonded, self.config.native_denom, unlock_epoch
+                            ));
+                            identity.record_activity_by_address(&tx.sender);
+                        })
+                } else {
+                    // No active bond -- either there's a matured cooldown to
+                    // sweep back to the owner, or there's genuinely nothing
+                    // bonded or unbonding at all.
+                    let unlock_epoch = state.get_account(&unbonding_account)
+                        .map(|a| a.balances.get("unlock_epoch").copied().unwrap_or(0))
+                        .unwrap_or(0);
+                    let unbonding_amount = state.get_account(&unbonding_account)
+                        .map(|a| a.balance_of(&self.config.native_denom))
+                        .unwrap_or(0);
+
+                    if unbonding_amount == 0 {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!("{} has no bonded stake and no unbonding entry to sweep", tx.sender),
+                        );
+                    }
+                    if (current_epoch as u128) < unlock_epoch {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "{} unbonding cooldown not complete: unlocks at epoch {}, current epoch {}",
+                                tx.sender, unlock_epoch, current_epoch
+                            ),
+                        );
+                    }
+                    // Matured: sweep back to the owner's own balance.
+                    state.transfer(&unbonding_account, &tx.sender, &self.config.native_denom, unbonding_amount)
+                        .map_err(|e| e.to_string())
+                        .map(|_| {
+                            if let Ok(acct) = state.get_account_mut(&unbonding_account) {
+                                acct.balances.insert("unlock_epoch".to_string(), 0);
+                            }
+                            events.push(format!(
+                                "unbond_validator: {} swept {} {} back to balance after cooldown",
+                                tx.sender, unbonding_amount, self.config.native_denom
+                            ));
+                        })
+                }
+            }
+
+            // CF-VAL-KEY-002: authenticate and register the sender's
+            // consensus public key. Sender-authentication for this specific
+            // transaction was already forced to run unconditionally (see
+            // `verify_authorization_for`, called above instead of the
+            // general `require_signatures`-gated `verify_authorization` --
+            // a chain running devnet-permissive for ordinary transactions
+            // must never extend that leniency to binding a validator's
+            // consensus identity). What remains to check here is
+            // proof-of-possession: that the sender actually holds the
+            // *private* half of `consensus_pubkey`, not just its bytes.
+            //
+            // This only validates and emits an event; chain-forge-execution
+            // has no dependency on chain-forge-validators (and must not
+            // gain one -- ValidatorRegistry is a node-level concern, this
+            // crate is the reusable, chain-agnostic execution engine). The
+            // caller (`chain-forge-node`, after a successful commit) reads
+            // this event back and mirrors the now-authenticated key into
+            // `ValidatorRegistry::register_consensus_key()`.
+            TxBody::RegisterValidatorKey { consensus_pubkey, proof_of_possession } => {
+                if consensus_pubkey.is_empty() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        "consensus_pubkey must not be empty".to_string(),
+                    );
+                }
+                let msg = validator_key_registration_signing_bytes(&self.config.chain_id, &tx.sender);
+                let sig = Signature { scheme: SchemeId::Classical, bytes: proof_of_possession.clone() };
+                match ClassicalScheme.verify(&msg, &sig, consensus_pubkey) {
+                    Ok(()) => {
+                        events.push(format!(
+                            "register_validator_key: {} registered consensus key {}",
+                            tx.sender, hex_encode_bytes(consensus_pubkey),
+                        ));
+                        identity.record_activity_by_address(&tx.sender);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!(
+                        "proof-of-possession verification failed for {}: {e} -- the \
+                         sender does not appear to hold the private key corresponding \
+                         to the consensus_pubkey it is trying to register",
+                        tx.sender
+                    )),
+                }
             }
 
             TxBody::Custom { module, payload } => {
@@ -2259,39 +2524,6 @@ impl Executor {
                         state.refresh_leaf(claimant_id);
                     })
                     .map_err(|e| e.to_string())
-            }
-
-            TxBody::ClaimUbi { identity_id } => {
-                // Charm Confinement: one claim per epoch, verified tier, liveness
-                if state.get_account(&tx.sender).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        tx.sender.clone(), "user".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-                // UBI claim is a UBI-era tx type. The QRC engine (v0.1) does not
-                // distribute UBI — QRC is earned by resource contribution or
-                // purchased by burning QCB. This path is preserved in the tx
-                // enum for protocol continuity but is a no-op until the
-                // execution layer is upgraded to the resource-consumption model.
-                let _ = identity_id;
-                Err("ClaimUbi: deprecated in QRC Economic Model v0.1; use contribution-path earning or purchase_qrc".into())
-            }
-
-            TxBody::RedirectToUbiPool { amount } => {
-                // Proactive redirect: triggers BME fee (Section 6.3 / Q25)
-                let epoch = identity.clock.current_epoch;
-                match state.get_account_mut(&tx.sender) {
-                    Ok(_account) => {
-                        // RedirectToUbiPool is a UBI-era tx type, deprecated in
-                        // QRC Economic Model v0.1. The UBI pool concept does not
-                        // exist in the resource-consumption engine. Preserved for
-                        // protocol continuity; no-op until execution is upgraded.
-                        let _ = (epoch, amount);
-                        Err("RedirectToUbiPool: deprecated in QRC Economic Model v0.1".into())
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
             }
 
             TxBody::SponsorAgent { agent_address } => {
@@ -2412,6 +2644,14 @@ impl Executor {
 
             // -- QRC Economic Model v0.1 typed tx types -----------------------
 
+            // Single-token model: $QCB is the sole live protocol token right
+            // now; $QRC is reserved for possible future use, not actively
+            // built on. This burns real uqcb but the uqrc it mints has no
+            // on-chain spending utility in the current resource-marketplace
+            // path (that path is uqcb-denominated -- see LockQrcForJob et
+            // al.). Preserved, not removed, so the two-token mechanism still
+            // works if QRC is reactivated later; new code should not call
+            // this to fund anything.
             TxBody::QrcPurchase { qcb_amount, min_qrc_out } => {
                 // Validate the purchase amount is non-zero.
                 if *qcb_amount == 0 {
@@ -2817,6 +3057,14 @@ impl Executor {
                 }
             }
 
+            // LEGACY: this PoCD reward path pays out in "uqrc" via the dormant
+            // QrcEngine/QcbRewardPolicy epoch-close flow. It is superseded by
+            // the active, uqcb-denominated PoCD path (the SubmitUsefulWork /
+            // epoch-boundary handler below) that the devnet actually uses and
+            // that has been confirmed working end-to-end. Single-token model:
+            // $QCB is the one live token; this path is preserved for QRC's
+            // possible future reactivation but is not exercised by any
+            // current devnet flow.
             TxBody::EpochClose { epoch } => {
                 if qrc.current_epoch != *epoch {
                     return TransactionResult::err(
@@ -4529,7 +4777,7 @@ impl Executor {
             // Transfer and Stake already call this inside their match arms (so
             // the QRC yield comment lives next to the transfer logic), but
             // all other tx types — RegisterIdentity, Attest, SponsorAgent,
-            // RevokeAgent, ClaimUbi, RedirectToUbiPool — also count: submitting
+            // RevokeAgent — also count: submitting
             // ANY committed tx proves liveness for this epoch. Duplicate calls
             // to record_activity_by_address are idempotent (only the first
             // write per epoch sticks), so the double-call for Transfer/Stake
@@ -4566,7 +4814,7 @@ impl Executor {
         if let Err(e) = module_check(tx, &self.config.modules) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
-        if let Err(e) = verify_authorization(&self.config, tx, state) {
+        if let Err(e) = verify_authorization_for(&self.config, tx, state) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
@@ -4633,8 +4881,6 @@ impl Executor {
             // Identity-gated tx types require execute_tx_with_identity().
             TxBody::RegisterIdentity
             | TxBody::Attest { .. }
-            | TxBody::ClaimUbi { .. }
-            | TxBody::RedirectToUbiPool { .. }
             | TxBody::SponsorAgent { .. }
             | TxBody::RevokeAgent { .. }
             | TxBody::RevokeAttestation { .. }
@@ -4642,6 +4888,13 @@ impl Executor {
             | TxBody::ReverseSybil { .. }
             | TxBody::ReportSuspectedSybil { .. } => {
                 Err("identity-gated transaction requires identity-aware executor".to_string())
+            }
+            // Validator Onboarding (ROADMAP.md): the unbonding cooldown is
+            // tracked in epochs, so this needs identity.clock.current_epoch
+            // -- execute_tx_with_identity() only.
+            TxBody::BondValidator { .. } | TxBody::UnbondValidator
+            | TxBody::RegisterValidatorKey { .. } => {
+                Err("validator bonding transaction requires identity-aware executor".to_string())
             }
             // QRC typed tx types require the QRC engine (execute_tx_with_identity).
             TxBody::QrcPurchase { .. }
@@ -4774,8 +5027,8 @@ impl Executor {
     }
 
     /// Execute all transactions for one block, with identity-, QRC-, and
-    /// agent-gated transaction types (RegisterIdentity, Attest, ClaimUbi,
-    /// RedirectToUbiPool, SponsorAgent, RevokeAgent, CharmConfinementUpdate,
+    /// agent-gated transaction types (RegisterIdentity, Attest,
+    /// SponsorAgent, RevokeAgent, CharmConfinementUpdate,
     /// IntrinsicCharmRecord, RegisterAgent, and all QRC variants) actually
     /// processed instead of rejected. This is what a live node needs to call
     /// for those transaction types to work at all -- execute_block() above
@@ -4970,7 +5223,7 @@ mod tests {
             "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
             "network": { "network_id": "qcb-testnet-1-net", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "both", "max_peers": 50 },
             "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 5000, "mempool_ttl_seconds": 300 },
-            "modules": ["bank", "staking", "identity", "qrc", "agents"],
+            "modules": ["bank", "staking", "identity", "qrc", "agents", "market", "pocd"],
             "custom_modules": [],
             "genesis_accounts": [
                 { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "user" },
@@ -5199,6 +5452,216 @@ mod tests {
         (Executor::new(config), state, identity, qrc, agents)
     }
 
+    // -- Validator Onboarding (ROADMAP.md): BondValidator / UnbondValidator --
+
+    #[test]
+    fn bond_validator_moves_funds_into_bond_account() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+    }
+
+    #[test]
+    fn bonding_is_incremental_and_accumulates() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx1 = Transaction::bond_validator("bond1", "qcb1alice", 500_000, 0);
+        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r1.success, "{:?}", r1.error);
+        let tx2 = Transaction::bond_validator("bond2", "qcb1alice", 300_000, 1);
+        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r2.success, "{:?}", r2.error);
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 800_000);
+    }
+
+    #[test]
+    fn bond_fails_cleanly_on_insufficient_balance() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // Alice only has 5_000_000 at genesis.
+        let tx = Transaction::bond_validator("bond1", "qcb1alice", 50_000_000, 0);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        // No partial debit: balance and bond account both untouched.
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        assert!(state.get_account("validator-bond:qcb1alice").is_err());
+    }
+
+    #[test]
+    fn unbond_without_any_bond_is_rejected() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let tx = Transaction::unbond_validator("unbond1", "qcb1alice", 0);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("no bonded stake"));
+    }
+
+    #[test]
+    fn unbond_starts_cooldown_and_removes_from_bond_account() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        let r = exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        // No longer counted as bonded -- stops counting toward the active set immediately.
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 0);
+        // Funds are locked in the unbonding account, not back in Alice's spendable balance yet.
+        assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+    }
+
+    #[test]
+    fn claiming_unbonded_stake_before_cooldown_elapses_is_rejected() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Still epoch 0 -- cooldown (21 epochs) has not elapsed. A second
+        // UnbondValidator call (the only way to attempt a sweep) must be
+        // rejected, and must NOT move any funds.
+        let sweep_attempt = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let r = exec.execute_tx_with_identity(&sweep_attempt, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("cooldown not complete"));
+        assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+    }
+
+    #[test]
+    fn claiming_unbonded_stake_after_cooldown_elapses_releases_funds_exactly_once() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Advance past the 21-epoch cooldown.
+        identity.clock.current_epoch = 21;
+
+        let sweep = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let r = exec.execute_tx_with_identity(&sweep, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 0);
+
+        // Calling UnbondValidator again finds nothing bonded and nothing
+        // matured left to sweep -- it must not double-release funds.
+        let double_sweep = Transaction::unbond_validator("unbond3", "qcb1alice", 3);
+        let r2 = exec.execute_tx_with_identity(&double_sweep, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r2.success);
+        assert!(r2.error.unwrap().contains("no bonded stake"));
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+    }
+
+    #[test]
+    fn second_unbond_while_one_already_cooling_down_is_rejected() {
+        // Exercises the "slash-and-run" guard: a validator cannot queue a
+        // second, overlapping unbonding request while the first is still
+        // locked -- there is nothing bonded left to start a new one from.
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let unbond1 = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        exec.execute_tx_with_identity(&unbond1, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        // Still cooling down (epoch 0 < unlock epoch 21); a second attempt
+        // at the same nonce-advancing call correctly reports "not complete",
+        // not a fresh, separately-tracked unbonding request.
+        let unbond2 = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let r = exec.execute_tx_with_identity(&unbond2, &mut state, &mut identity, &mut qrc, &mut agents);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("cooldown not complete"));
+    }
+
+    #[test]
+    fn bonding_by_different_validators_is_independent() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
+        let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
+        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
+        assert_eq!(state.get_account("validator-bond:qcb1bob").unwrap().balance_of("uqcb"), 4_000_000);
+
+        // Unbonding Alice must not touch Bob's independent bond.
+        let unbond_a = Transaction::unbond_validator("unbondA", "qcb1alice", 1);
+        assert!(exec.execute_tx_with_identity(&unbond_a, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert_eq!(state.get_account("validator-bond:qcb1bob").unwrap().balance_of("uqcb"), 4_000_000);
+    }
+
+    #[test]
+    fn compute_stake_active_set_ranks_live_bonded_stake() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
+        let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
+        let v = Transaction::bond_validator("bondV", "qcb1val", 500_000, 0); // below default min
+        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&v, &mut state, &mut identity, &mut qrc, &mut agents).success);
+
+        let active = validator_bond::compute_stake_active_set(
+            &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+        );
+        // qcb1val's 500_000 is below the 1_000_000 minimum -- excluded.
+        // Bob out-stakes Alice, so he ranks first.
+        assert_eq!(active, vec![
+            ("qcb1bob".to_string(), 4_000_000),
+            ("qcb1alice".to_string(), 2_000_000),
+        ]);
+    }
+
+    #[test]
+    fn compute_stake_active_set_drops_validators_who_fully_unbond() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
+        let active_before = validator_bond::compute_stake_active_set(
+            &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+        );
+        assert_eq!(active_before, vec![("qcb1alice".to_string(), 2_000_000)]);
+
+        // UnbondValidator moves the bond out of validator-bond:qcb1alice
+        // immediately (cooldown only gates when the *funds* return, not
+        // when the validator stops counting toward the active set).
+        let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        assert!(exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents).success);
+        let active_after = validator_bond::compute_stake_active_set(
+            &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+        );
+        assert!(active_after.is_empty());
+    }
+
+    #[test]
+    fn compute_stake_active_set_respects_max_size_cap() {
+        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
+        let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
+        exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut qrc, &mut agents);
+        exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut qrc, &mut agents);
+
+        let active = validator_bond::compute_stake_active_set(&state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, 1);
+        // Capped to 1: only the higher-staked validator (Bob) makes it in.
+        assert_eq!(active, vec![("qcb1bob".to_string(), 4_000_000)]);
+    }
+
+    #[test]
+    fn simple_executor_rejects_bonding_tx_types() {
+        // BondValidator/UnbondValidator need identity.clock.current_epoch
+        // for the cooldown and are only supported via
+        // execute_tx_with_identity(); the plain execute_tx() path must
+        // reject them explicitly rather than silently no-op or panic.
+        let (exec, mut state) = setup();
+        let tx = Transaction::bond_validator("bond1", "qcb1alice", 1_000_000, 0);
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("identity-aware executor"));
+    }
+
     #[test]
     fn escrow_settlement_conserves_qrc_and_rejects_repeat_payouts() {
         for treasury_funded in [false, true] {
@@ -5259,51 +5722,6 @@ mod tests {
             assert_eq!(state.get_account("worker").unwrap().balance_of("uqcb"), 200);
             assert!(state.get_account("provider").is_err());
         }
-    }
-
-    // ── Deprecated UBI-era tx types (QRC Economic Model v0.1) ─────────────────
-    //
-    // ClaimUbi and RedirectToUbiPool were part of the old Circulating Finance
-    // engine. The QRC engine (v0.1) replaces UBI with resource-contribution
-    // earning and purchase-path minting. These tests document that the tx types
-    // are preserved in the enum (protocol continuity) but now return an error.
-    // They will be replaced with resource-consumption tx tests when the
-    // execution layer is upgraded.
-
-    #[test]
-    fn claim_ubi_deprecated_in_qrc_model() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        identity.record_activity("qcb1alice");
-
-        let tx = Transaction::claim_ubi("tx1", "qcb1alice", "qcb1alice", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        assert!(
-            !result.success,
-            "ClaimUbi must be rejected by QRC Economic Model v0.1 engine"
-        );
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("deprecated"),
-            "error message should mention deprecation, got: {:?}", result.error
-        );
-    }
-
-    #[test]
-    fn redirect_to_ubi_pool_deprecated_in_qrc_model() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        identity.record_activity("qcb1alice");
-
-        let tx = Transaction::redirect_to_ubi_pool("tx1", "qcb1alice", 1_000_000, 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        assert!(
-            !result.success,
-            "RedirectToUbiPool must be rejected by QRC Economic Model v0.1 engine"
-        );
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("deprecated"),
-            "error message should mention deprecation, got: {:?}", result.error
-        );
     }
 
     #[test]
@@ -5527,6 +5945,121 @@ mod tests {
         assert!(r.error.unwrap().contains("invalid signature"));
     }
 
+    // -- CF-VAL-KEY-002: RegisterValidatorKey authentication ----------------
+
+    fn register_key_tx(
+        sender: &str, nonce: u64, consensus_kp: &KeyPair, pop_signer: &KeyPair, chain_id: &str,
+    ) -> Transaction {
+        let pop_msg = validator_key_registration_signing_bytes(chain_id, sender);
+        let pop_sig = ClassicalScheme.sign(&pop_msg, pop_signer).unwrap();
+        Transaction {
+            id:        format!("regkey-{sender}-{nonce}"),
+            sender:    sender.to_string(),
+            nonce,
+            body:      TxBody::RegisterValidatorKey {
+                consensus_pubkey:    consensus_kp.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+            },
+            gas_limit: 10_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        }
+    }
+
+    #[test]
+    fn register_validator_key_succeeds_with_valid_proof_of_possession() {
+        let (exec, mut state, alice) = signed_setup();
+        let consensus_kp = key("alice-consensus-key");
+        let mut tx = register_key_tx("qcb1alice", 0, &consensus_kp, &consensus_kp, "qcb-testnet-1");
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(r.success, "{:?}", r.error);
+        assert!(r.events.iter().any(|e| e.starts_with("register_validator_key:")));
+    }
+
+    #[test]
+    fn register_validator_key_rejects_forged_proof_of_possession() {
+        // CF-VAL-KEY-002 Phase 4 test #3: "A forged key registration is
+        // rejected." The sender authenticates itself correctly, but signs
+        // the proof-of-possession with a DIFFERENT key than the one it is
+        // trying to register as `consensus_pubkey` -- i.e. it does not
+        // actually hold the private half of the key being registered.
+        let (exec, mut state, alice) = signed_setup();
+        let real_consensus_kp = key("alice-consensus-key");
+        let attacker_kp       = key("not-alices-key-at-all");
+        let mut tx = register_key_tx("qcb1alice", 0, &real_consensus_kp, &attacker_kp, "qcb-testnet-1");
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("proof-of-possession"));
+    }
+
+    #[test]
+    fn register_validator_key_requires_authentication_even_when_chain_allows_unsigned_txs() {
+        // The general `require_signatures = false` devnet convenience must
+        // never extend to binding an unauthenticated consensus key. Using
+        // the permissive `setup()` fixture (require_signatures: false in
+        // genesis) and submitting a completely unsigned RegisterValidatorKey
+        // tx must still fail -- unlike an ordinary unsigned Transfer, which
+        // `setup()`'s chain would accept.
+        let (exec, mut state) = setup();
+        let consensus_kp = key("some-consensus-key");
+        // Unsigned: tx.signature and tx.public_key both left empty.
+        let tx = register_key_tx("qcb1val", 0, &consensus_kp, &consensus_kp, "qcb-testnet-1");
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(
+            !r.success,
+            "a RegisterValidatorKey tx must require real sender authentication \
+             even on a chain configured with require_signatures = false"
+        );
+
+        // Sanity: the SAME chain really does accept an unsigned ordinary
+        // transfer, confirming the rejection above is specific to
+        // RegisterValidatorKey's unconditional check, not an accidental
+        // side effect of some other change.
+        let transfer = Transaction::transfer("t1", "qcb1val", "qcb1alice", "uqcb", 10, 0);
+        let r2 = exec.execute_tx(&transfer, &mut state);
+        assert!(r2.success, "{:?}", r2.error);
+    }
+
+    #[test]
+    fn register_validator_key_rejects_empty_consensus_pubkey() {
+        let (exec, mut state, alice) = signed_setup();
+        let consensus_kp = key("alice-consensus-key");
+        let mut tx = register_key_tx("qcb1alice", 0, &consensus_kp, &consensus_kp, "qcb-testnet-1");
+        tx.body = TxBody::RegisterValidatorKey { consensus_pubkey: vec![], proof_of_possession: vec![1,2,3] };
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("must not be empty"));
+    }
+
     #[test]
     fn signature_from_another_chain_rejected() {
         let (exec, mut state, alice) = signed_setup();
@@ -5649,7 +6182,7 @@ mod tests {
         let cases = [
             (Transaction::register_identity("t1", "qcb1alice", 0), "identity"),
             (Transaction::attest("t2", "qcb1alice", "qcb1bob", 0), "identity"),
-            (Transaction::claim_ubi("t3", "qcb1alice", "qcb1alice", 0), "qrc"),
+            (Transaction::qrc_purchase("t3", "qcb1alice", 1_000, 1, 0), "qrc"),
             (Transaction::sponsor_agent("t4", "qcb1alice", "qcb1agent", 0), "agents"),
         ];
         for (tx, module) in cases {
@@ -5675,7 +6208,6 @@ mod tests {
         let bodies = [
             TxBody::RegisterIdentity,
             TxBody::Attest { claimant_id: "x".into() },
-            TxBody::ClaimUbi { identity_id: "x".into() },
             TxBody::SponsorAgent { agent_address: "x".into() },
             TxBody::RevokeAgent { agent_address: "x".into() },
             // Phase D attestation guard tx types

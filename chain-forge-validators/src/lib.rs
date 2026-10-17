@@ -61,6 +61,23 @@ pub enum ValidatorError {
 
 pub type ValResult<T> = Result<T, ValidatorError>;
 
+/// Minimal hex helpers -- `KeyBundle.consensus_pubkey` is stored hex-encoded
+/// (see its doc comment), and CF-VAL-KEY-002's key registration needs to
+/// convert between that and the raw bytes `chain_forge_consensus::ValidatorInfo`
+/// and the crypto scheme actually operate on. No external hex dependency is
+/// pulled in for two tiny, allocation-free functions.
+fn hex_encode_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn hex_decode_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 // -- StakeTier ----------------------------------------------------------------
 
 /// Minimum bond tiers for validator participation (Section 3.3 / tokenomics).
@@ -653,6 +670,138 @@ impl ValidatorRegistry {
         tracing::info!(id, "genesis validator registered as Candidate");
     }
 
+    /// Register (or rotate) the authenticated consensus public key for a
+    /// validator address — CF-VAL-KEY-002.
+    ///
+    /// This is deliberately narrow: unlike `register()`, it does not touch
+    /// stake, commission, or lifecycle status. Those remain the job of
+    /// `BondValidator`/`compute_stake_active_set()` (stake) and
+    /// `confirm_pop()`/identity (personhood) respectively -- this method
+    /// maintains exactly one thing: the authenticated binding from a
+    /// validator identity to the consensus public key it has proven it
+    /// controls.
+    ///
+    /// The caller (chain-forge-node, after executing a `RegisterValidatorKey`
+    /// transaction) is responsible for having already verified that:
+    ///   1. The transaction's sender signature authenticates `validator_id`
+    ///      (so only that validator's own account can call this for itself --
+    ///      this is what makes a replacement "authorized": nobody else's
+    ///      transaction can reach this method for an address they don't
+    ///      control).
+    ///   2. A proof-of-possession signature over `consensus_pubkey` verified
+    ///      against `consensus_pubkey` itself (so the registrant actually
+    ///      holds the new key's private half, not merely its public bytes --
+    ///      this is what makes registering a forged/stolen key impossible).
+    ///
+    /// This method itself only enforces the one invariant it is positioned
+    /// to enforce: no two validators may ever share a registered consensus
+    /// key (duplicate-key protection via the `by_pubkey` index, same rule
+    /// `register()` already applies for first-time registration).
+    ///
+    /// If `validator_id` has no existing record (the common case today,
+    /// since the live stake-bond admission path in `chain-forge-node`
+    /// doesn't call `register()`), a minimal `Candidate` record is created
+    /// so the key has somewhere to live; `bonded_uqcb`/status are left at
+    /// their defaults because this method has no visibility into (and must
+    /// not duplicate) the StateStore-backed bonding ledger that is the real
+    /// source of truth for stake.
+    pub fn register_consensus_key(
+        &mut self,
+        validator_id:      &str,
+        consensus_pubkey:  &[u8],
+        epoch:             u64,
+    ) -> ValResult<()> {
+        if consensus_pubkey.is_empty() {
+            return Err(ValidatorError::InvalidKeyBundle(
+                "consensus_pubkey must not be empty".into()
+            ));
+        }
+        let hex_key = hex_encode_bytes(consensus_pubkey);
+
+        // Duplicate-key protection: the same consensus key may not be
+        // registered for two different validator identities.
+        if let Some(existing_owner) = self.by_pubkey.get(&hex_key) {
+            if existing_owner != validator_id {
+                return Err(ValidatorError::InvalidKeyBundle(format!(
+                    "consensus_pubkey already registered to validator {existing_owner} \
+                     -- cannot also register it to {validator_id}"
+                )));
+            }
+            // Re-registering the exact same key for the same validator
+            // (e.g. a retried tx) is a harmless no-op past this point.
+        }
+
+        match self.validators.get_mut(validator_id) {
+            Some(record) => {
+                // Rotating an existing key: drop the old by_pubkey entry
+                // first so it doesn't linger and block re-use, then bind
+                // the new one.
+                let old_key = record.keys.consensus_pubkey.clone();
+                if !old_key.is_empty() && old_key != hex_key {
+                    self.by_pubkey.remove(&old_key);
+                }
+                record.keys.consensus_pubkey = hex_key.clone();
+            }
+            None => {
+                let seq = self.next_registration_seq;
+                self.next_registration_seq += 1;
+                let record = ValidatorRecord {
+                    id:                ValidatorId(validator_id.to_string()),
+                    keys:              KeyBundle {
+                        consensus_pubkey: hex_key.clone(),
+                        account_address:  validator_id.to_string(),
+                        pqc_pubkey:       None,
+                        scheme:           "Ed25519".to_string(),
+                    },
+                    commission:        Commission {
+                        rate_bps:           0,
+                        max_rate_bps:       MAX_COMMISSION_RATE_BPS,
+                        last_changed_epoch: epoch,
+                    },
+                    // Stake lives in StateStore (validator-bond:<addr>), not
+                    // here -- this registry entry exists only to carry the
+                    // authenticated key. 0/None here does not mean "has no
+                    // stake"; it means "this registry doesn't track stake
+                    // for bond-admitted validators".
+                    bonded_uqcb:       0,
+                    stake_tier:        None,
+                    status:            ValidatorStatus::Candidate,
+                    pop_verified:      false,
+                    verification_tier: None,
+                    registered_epoch:  epoch,
+                    registration_seq:  seq,
+                    last_status_epoch: epoch,
+                    blocks_proposed:   0,
+                    blocks_missed:     0,
+                    jail_records:      Vec::new(),
+                    moniker:           validator_id.to_string(),
+                    website:           None,
+                    owner_identity_id: None,
+                };
+                self.validators_by_human
+                    .entry(validator_id.to_string())
+                    .or_default()
+                    .push(validator_id.to_string());
+                self.validators.insert(validator_id.to_string(), record);
+            }
+        }
+
+        self.by_pubkey.insert(hex_key, validator_id.to_string());
+        tracing::info!(id = validator_id, "consensus key registered");
+        Ok(())
+    }
+
+    /// Look up a validator's registered consensus public key, hex-decoded
+    /// back to raw bytes. `None` if the validator is unknown or has no key
+    /// registered yet.
+    pub fn consensus_pubkey_bytes(&self, validator_id: &str) -> Option<Vec<u8>> {
+        let rec = self.validators.get(validator_id)?;
+        if rec.keys.consensus_pubkey.is_empty() {
+            return None;
+        }
+        hex_decode_bytes(&rec.keys.consensus_pubkey)
+    }
+
     // -- PoP verification gate ------------------------------------------------
 
     /// Called by the identity layer when a validator's PoP is confirmed.
@@ -856,11 +1005,23 @@ impl ValidatorRegistry {
                     );
                 }
 
+                // CF-VAL-KEY-002: read back the authenticated consensus key
+                // this validator actually has on file (via
+                // `register_consensus_key`/the genesis seeding path), rather
+                // than the previous hardcoded `vec![]`. If none is
+                // registered yet, this stays empty -- `gate_voting_power()`
+                // (applied by every consensus engine's `update_validator_set`)
+                // then forces `voting_power` to 0 for this entry regardless
+                // of what `granted` says here, so an unkeyed validator can
+                // never carry real consensus weight.
+                let public_key = hex_decode_bytes(&r.keys.consensus_pubkey)
+                    .unwrap_or_default();
+
                 ValidatorInfo {
                     id:           r.id.clone(),
                     voting_power: granted,
                     pop_verified: r.pop_verified,
-                    public_key:   vec![],
+                    public_key,
                 }
             }).collect()
         };
@@ -1483,5 +1644,94 @@ mod tests {
 
         let vs = reg.build_validator_set(1);
         assert_eq!(vs.validators.len(), 3);
+    }
+
+    // -- CF-VAL-KEY-002: register_consensus_key ------------------------------
+
+    #[test]
+    fn register_consensus_key_creates_minimal_record_for_an_unknown_validator() {
+        // The live stake-bond admission path (chain-forge-node) never calls
+        // `register()`, so this is the common case: the first thing the
+        // registry ever hears about a bonded validator is its key.
+        let mut reg = registry();
+        reg.register_consensus_key("qcb1newval", b"real-consensus-key-bytes", 3).unwrap();
+
+        let rec = reg.get("qcb1newval").unwrap();
+        assert_eq!(
+            rec.keys.consensus_pubkey,
+            hex_encode_bytes(b"real-consensus-key-bytes"),
+        );
+        assert_eq!(reg.consensus_pubkey_bytes("qcb1newval"), Some(b"real-consensus-key-bytes".to_vec()));
+    }
+
+    #[test]
+    fn register_consensus_key_rejects_empty_key() {
+        let mut reg = registry();
+        let err = reg.register_consensus_key("qcb1newval", &[], 0).unwrap_err();
+        assert!(matches!(err, ValidatorError::InvalidKeyBundle(_)));
+    }
+
+    #[test]
+    fn register_consensus_key_rejects_registering_another_validators_key() {
+        // CF-VAL-KEY-002 Phase 4 test #6: "An unauthorized key replacement
+        // is rejected." The same consensus key cannot be bound to two
+        // different validator identities -- this is the registry-level
+        // half of that guarantee (the tx-level half is that nobody but
+        // `sender` can even reach this method for `sender`'s own id, since
+        // the executor authenticates the transaction's sender first).
+        let mut reg = registry();
+        reg.register_consensus_key("qcb1alice", b"alices-real-key", 0).unwrap();
+
+        let err = reg.register_consensus_key("qcb1mallory", b"alices-real-key", 0).unwrap_err();
+        assert!(matches!(err, ValidatorError::InvalidKeyBundle(_)));
+
+        // Alice's own binding is untouched by the rejected attempt.
+        assert_eq!(
+            reg.consensus_pubkey_bytes("qcb1alice"),
+            Some(b"alices-real-key".to_vec())
+        );
+        // Mallory never got a record created for her at all.
+        assert!(reg.get("qcb1mallory").is_err());
+    }
+
+    #[test]
+    fn register_consensus_key_allows_authorized_rotation_by_the_same_validator() {
+        // "Reject unauthorized key replacement" implies an *authorized*
+        // replacement (the validator rotating its own key) must still work.
+        let mut reg = registry();
+        reg.register_consensus_key("qcb1alice", b"old-key", 0).unwrap();
+        reg.register_consensus_key("qcb1alice", b"new-key", 5).unwrap();
+
+        assert_eq!(reg.consensus_pubkey_bytes("qcb1alice"), Some(b"new-key".to_vec()));
+        // The old key is freed from the duplicate-key index, not left
+        // dangling to block its own validator's next rotation or anyone
+        // else's legitimate (new) use of that exact byte string.
+        assert!(reg.get_by_pubkey(&hex_encode_bytes(b"old-key")).is_none());
+    }
+
+    #[test]
+    fn build_validator_set_reads_back_the_registered_consensus_key() {
+        // Closes the actual CF-VAL-KEY-002 gap: build_validator_set() used
+        // to hardcode public_key: vec![] for every validator regardless of
+        // what was registered. Now it must read the real key back.
+        let mut reg = registry();
+        reg.register(req("v1", "qcb1v1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.register_consensus_key("v1", b"v1-real-key", 0).unwrap();
+        reg.confirm_pop("v1", VerificationTier::Verified, 0).unwrap();
+
+        let vs = reg.build_validator_set(1);
+        let v1 = vs.validators.iter().find(|v| v.id.0 == "v1").unwrap();
+        assert_eq!(v1.public_key, b"v1-real-key".to_vec());
+    }
+
+    #[test]
+    fn build_validator_set_leaves_public_key_empty_when_none_registered() {
+        let mut reg = registry();
+        reg.register(req("v1", "qcb1v1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("v1", VerificationTier::Verified, 0).unwrap();
+
+        let vs = reg.build_validator_set(1);
+        let v1 = vs.validators.iter().find(|v| v.id.0 == "v1").unwrap();
+        assert!(v1.public_key.is_empty());
     }
 }

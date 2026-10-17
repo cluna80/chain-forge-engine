@@ -578,6 +578,30 @@ pub trait ConsensusEngine: Send + Sync {
 
 // ── Personhood power cap enforcement ─────────────────────────────────────────
 
+/// Unconditionally zeroes `voting_power` for any validator missing a
+/// registered consensus key or verified personhood.
+///
+/// Unlike `apply_personhood_cap` below, this is NOT gated by whether
+/// `PersonhoodConfig` is configured: an unverified-personhood or unkeyed
+/// validator must never carry real consensus weight, regardless of
+/// whether personhood-weighted BFT is turned on for this chain. Stake (or
+/// any other raw power source) decides whether a validator holds a *seat*;
+/// this decides whether that seat casts a vote that counts.
+///
+/// `update_validator_set` on every consensus engine (`FbaEngine`,
+/// `TendermintEngine`, `HotStuffEngine`) calls this first, unconditionally,
+/// before any engine-specific or personhood-specific adjustment -- so the
+/// rule is enforced once, at the one place `ValidatorSet` gets written,
+/// rather than depending on every caller remembering to check it.
+pub fn gate_voting_power(mut validator_set: ValidatorSet) -> ValidatorSet {
+    for v in &mut validator_set.validators {
+        if !v.pop_verified || v.public_key.is_empty() {
+            v.voting_power = 0;
+        }
+    }
+    validator_set
+}
+
 /// Applies the personhood power cap from `config` to a raw validator set.
 /// Any PoP-verified validator whose `voting_power` exceeds `config.power_cap`
 /// is clamped to that cap. Unverified validators are clamped to 0 if
@@ -585,6 +609,11 @@ pub trait ConsensusEngine: Send + Sync {
 ///
 /// Call this when building the validator set for a new epoch so the cap
 /// is enforced at the data layer, not scattered through algorithm code.
+///
+/// Note: this is the *optional*, personhood-weighting-specific cap: it only
+/// runs when a chain has `PersonhoodConfig` configured at all. The
+/// unconditional key/verification gate above (`gate_voting_power`) always
+/// runs first regardless, in every engine.
 pub fn apply_personhood_cap(
     mut validator_set: ValidatorSet,
     config: &PersonhoodConfig,
@@ -1090,7 +1119,14 @@ impl ConsensusEngine for FbaEngine {
         // 2. VCA weights + adaptive quorum.
         vs = self.apply_vca(vs);
 
-        // 3. Enforce minimum UNL size.
+        // 3. Unconditional key/verification gate -- runs LAST, after every
+        // other adjustment (personhood cap, VCA reweighting), so nothing
+        // upstream can hand real voting power back to a validator missing
+        // a registered consensus key or verified personhood. This is the
+        // final, non-bypassable enforcement point, not an optional step.
+        vs = gate_voting_power(vs);
+
+        // 4. Enforce minimum UNL size.
         if vs.validators.len() < self.fba.min_unl_size {
             tracing::warn!(
                 "FBA update_validator_set: new set has {} validators < min_unl_size {}; keeping current",
@@ -1534,7 +1570,21 @@ impl ConsensusEngine for TendermintEngine {
             .expect("validator_set() called before init()")
     }
 
-    fn update_validator_set(&mut self, vs: ValidatorSet) -> Result<(), ConsensusError> {
+    fn update_validator_set(&mut self, mut vs: ValidatorSet) -> Result<(), ConsensusError> {
+        // 1. Personhood cap, if this chain has one configured.
+        if let Some(pc) = self.config.as_ref().and_then(|c| c.personhood.clone()) {
+            vs = apply_personhood_cap(vs, &pc);
+        }
+
+        // 2. Unconditional key/verification gate -- runs LAST, after the
+        // optional personhood cap, so nothing upstream can hand real
+        // voting power back to a validator missing a registered consensus
+        // key or verified personhood. Previously this engine applied no
+        // gating at all on write; every validator's raw `voting_power`
+        // (e.g. bonded stake, from stake-based admission) went straight to
+        // consensus unexamined. That gap is closed here.
+        vs = gate_voting_power(vs);
+
         self.validator_set = Some(vs);
         Ok(())
     }
@@ -2090,6 +2140,20 @@ impl ConsensusEngine for TendermintEngine {
         // voting at `height + 1` rather than re-running already-committed
         // heights.  Per-round state (votes, proposals, locks) is for the old
         // height and is no longer valid, so clear it.
+        // CF-VAL-KEY-002 hardening: `update_validator_set()` always runs
+        // every incoming set through `gate_voting_power()` before installing
+        // it, so nothing upstream can hand real voting power back to a
+        // validator missing a registered consensus key or verified
+        // personhood (see that function's doc comment). `reset_to_height()`
+        // is a second, separate place the live validator_set gets written
+        // -- restart recovery -- and it did not go through that same gate.
+        // In practice the set handed in here should already be clean (the
+        // caller is expected to pass a correctly key-backfilled set), but
+        // defense-in-depth means this write path enforces the identical
+        // invariant rather than trusting every future caller to remember
+        // to pre-gate it themselves.
+        let validator_set = gate_voting_power(validator_set);
+
         self.height           = height;
         self.round            = 0;
         self.validator_set    = Some(validator_set);
@@ -2519,6 +2583,11 @@ impl ConsensusEngine for HotStuffEngine {
                 apply_vca_weights_to_validator_set(&mut vs, &registry);
             }
         }
+        // Unconditional key/verification gate -- runs LAST, after the
+        // personhood cap and VCA reweighting, so neither can hand real
+        // voting power back to a validator missing a registered consensus
+        // key or verified personhood.
+        vs = gate_voting_power(vs);
         self.validators = vs;
         Ok(())
     }
@@ -2836,6 +2905,73 @@ mod tests {
             personhood:          None,
             vca:                 None,
         }
+    }
+
+    /// CF-VAL-KEY-002 Phase 4 test #10: "All three consensus engines reject
+    /// ineligible validators." `update_validator_set()` on every engine
+    /// (FbaEngine, TendermintEngine, HotStuffEngine) must run
+    /// `gate_voting_power()` unconditionally before installing a set it is
+    /// handed -- a validator missing a registered consensus key, or
+    /// missing verified personhood, must come out with zero voting power
+    /// on EVERY engine, not just the one this chain happens to be
+    /// configured with. This is what actually makes "no voting power
+    /// without a key" true chain-wide, rather than true only for whichever
+    /// engine someone remembered to add the check to.
+    #[tokio::test]
+    async fn all_three_engines_zero_voting_power_for_ineligible_validators() {
+        let mixed = ValidatorSet {
+            height: 0,
+            validators: vec![
+                // Eligible: verified personhood AND a registered key.
+                ValidatorInfo {
+                    id: ValidatorId("eligible".into()), voting_power: 10,
+                    pop_verified: true, public_key: vec![1, 2, 3],
+                },
+                // Ineligible: no registered consensus key (CF-VAL-KEY-002's
+                // exact scenario -- a bonded validator who hasn't
+                // registered a key yet).
+                ValidatorInfo {
+                    id: ValidatorId("no-key".into()), voting_power: 10,
+                    pop_verified: true, public_key: vec![],
+                },
+                // Ineligible: has a key but no verified personhood.
+                ValidatorInfo {
+                    id: ValidatorId("no-personhood".into()), voting_power: 10,
+                    pop_verified: false, public_key: vec![4, 5, 6],
+                },
+            ],
+        };
+
+        // -- TendermintEngine ---------------------------------------------
+        let mut tendermint = TendermintEngine::new();
+        tendermint.init(default_config(), mixed.clone()).await.unwrap();
+        tendermint.update_validator_set(mixed.clone()).unwrap();
+        let vs = tendermint.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("eligible".into())), 10);
+        assert_eq!(vs.power_of(&ValidatorId("no-key".into())), 0);
+        assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
+
+        // -- HotStuffEngine ------------------------------------------------
+        let mut hotstuff = HotStuffEngine::new();
+        let mut hs_config = default_config();
+        hs_config.variant = ConsensusVariant::HotStuffStyle;
+        hotstuff.init(hs_config, mixed.clone()).await.unwrap();
+        hotstuff.update_validator_set(mixed.clone()).unwrap();
+        let vs = hotstuff.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("eligible".into())), 10);
+        assert_eq!(vs.power_of(&ValidatorId("no-key".into())), 0);
+        assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
+
+        // -- FbaEngine ------------------------------------------------------
+        let mut fba = FbaEngine::new();
+        let mut fba_config = default_config();
+        fba_config.variant = ConsensusVariant::XrplInspired;
+        fba.init(fba_config, mixed.clone()).await.unwrap();
+        fba.update_validator_set(mixed.clone()).unwrap();
+        let vs = fba.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("eligible".into())), 10);
+        assert_eq!(vs.power_of(&ValidatorId("no-key".into())), 0);
+        assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
     }
 
     #[tokio::test]
@@ -4077,14 +4213,19 @@ mod tests {
         });
         engine.init(config, fba_validators(4)).await.unwrap();
 
-        // New set with one whale validator.
+        // New set with one whale validator. All four are PoP-verified AND
+        // carry a registered consensus key -- the gate added alongside
+        // this test (every validator with an empty key or no PoP now
+        // always gets voting_power 0, regardless of personhood config) is
+        // deliberately not what's under test here, so give every
+        // validator a non-empty key.
         let new_vs = ValidatorSet {
             height: 1,
             validators: vec![
-                ValidatorInfo { id: ValidatorId("whale".into()),  voting_power: 100, pop_verified: true,  public_key: vec![] },
-                ValidatorInfo { id: ValidatorId("v2".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![] },
-                ValidatorInfo { id: ValidatorId("v3".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![] },
-                ValidatorInfo { id: ValidatorId("v4".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("whale".into()),  voting_power: 100, pop_verified: true,  public_key: vec![1] },
+                ValidatorInfo { id: ValidatorId("v2".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![2] },
+                ValidatorInfo { id: ValidatorId("v3".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![3] },
+                ValidatorInfo { id: ValidatorId("v4".into()),     voting_power: 1,   pop_verified: true,  public_key: vec![4] },
             ],
         };
         engine.update_validator_set(new_vs).unwrap();
@@ -4092,6 +4233,32 @@ mod tests {
         let whale = engine.validator_set().validators.iter()
             .find(|v| v.id.0 == "whale").unwrap();
         assert_eq!(whale.voting_power, 1, "update_validator_set must apply personhood cap");
+    }
+
+    #[tokio::test]
+    async fn fba_update_validator_set_zeroes_power_for_missing_key_or_pop() {
+        // The unconditional gate (`gate_voting_power`) must zero voting
+        // power for a validator with no registered consensus key or no
+        // PoP verification, regardless of whether personhood weighting is
+        // even configured on this chain (no PersonhoodConfig here at all).
+        let mut engine = FbaEngine::new();
+        engine.init(fba_config(), fba_validators(4)).await.unwrap();
+
+        let new_vs = ValidatorSet {
+            height: 1,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("no_key".into()),      voting_power: 50, pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("unverified".into()),  voting_power: 50, pop_verified: false, public_key: vec![9] },
+                ValidatorInfo { id: ValidatorId("fully_eligible".into()), voting_power: 50, pop_verified: true, public_key: vec![9] },
+                ValidatorInfo { id: ValidatorId("v4".into()),          voting_power: 1,  pop_verified: true,  public_key: vec![4] },
+            ],
+        };
+        engine.update_validator_set(new_vs).unwrap();
+
+        let vs = engine.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("no_key".into())), 0, "no registered key -- must never carry voting power");
+        assert_eq!(vs.power_of(&ValidatorId("unverified".into())), 0, "no PoP verification -- must never carry voting power");
+        assert_eq!(vs.power_of(&ValidatorId("fully_eligible".into())), 50, "verified + keyed validator keeps its power");
     }
 
     #[tokio::test]
@@ -4686,7 +4853,12 @@ mod tests {
         engine.init(config, hotstuff_validators(4)).await.unwrap();
 
         // Push a new validator set where one validator has huge power.
+        // Every validator needs a registered key for the cap (not the
+        // unconditional key/verification gate) to be what's under test.
         let mut new_vs = hotstuff_validators(4);
+        for (i, v) in new_vs.validators.iter_mut().enumerate() {
+            v.public_key = vec![i as u8 + 1];
+        }
         new_vs.validators[0].voting_power = 100;
         new_vs.validators[0].pop_verified = true;
 
@@ -4697,6 +4869,54 @@ mod tests {
             .find(|v| v.id == ValidatorId("hs_val_1".into())).unwrap();
         assert_eq!(capped.voting_power, 1,
             "update_validator_set must apply personhood cap");
+    }
+
+    #[tokio::test]
+    async fn hotstuff_update_validator_set_zeroes_power_for_missing_key_or_pop() {
+        let mut engine = HotStuffEngine::new();
+        engine.init(hotstuff_config(), hotstuff_validators(4)).await.unwrap();
+
+        let mut new_vs = hotstuff_validators(4);
+        new_vs.validators[0].public_key = vec![]; // no key, even though PoP-verified
+        new_vs.validators[0].pop_verified = true;
+        new_vs.validators[0].voting_power = 50;
+        new_vs.validators[1].public_key = vec![9]; // keyed, but not PoP-verified
+        new_vs.validators[1].pop_verified = false;
+        new_vs.validators[1].voting_power = 50;
+        new_vs.validators[2].public_key = vec![9]; // both -- keeps its power
+        new_vs.validators[2].pop_verified = true;
+        new_vs.validators[2].voting_power = 50;
+
+        engine.update_validator_set(new_vs).unwrap();
+        let vs = engine.validator_set();
+        assert_eq!(vs.validators[0].voting_power, 0, "no registered key -- must never carry voting power");
+        assert_eq!(vs.validators[1].voting_power, 0, "no PoP verification -- must never carry voting power");
+        assert_eq!(vs.validators[2].voting_power, 50, "verified + keyed validator keeps its power");
+    }
+
+    #[tokio::test]
+    async fn tendermint_update_validator_set_gates_voting_power() {
+        // Tendermint previously applied NO gating at all on write --
+        // whatever voting_power the caller handed it went straight to
+        // consensus. This is the regression guard for that gap.
+        let (mut engine, vs) = make_engine_and_vs(4);
+        engine.init(default_config(), vs).await.unwrap();
+
+        let new_vs = ValidatorSet {
+            height: 1,
+            validators: vec![
+                ValidatorInfo { id: ValidatorId("no_key".into()),        voting_power: 2_000_000, pop_verified: true,  public_key: vec![] },
+                ValidatorInfo { id: ValidatorId("unverified".into()),    voting_power: 2_000_000, pop_verified: false, public_key: vec![9] },
+                ValidatorInfo { id: ValidatorId("fully_eligible".into()), voting_power: 2_000_000, pop_verified: true, public_key: vec![9] },
+                ValidatorInfo { id: ValidatorId("v4".into()),            voting_power: 1,          pop_verified: true,  public_key: vec![4] },
+            ],
+        };
+        engine.update_validator_set(new_vs).unwrap();
+
+        let vs = engine.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("no_key".into())), 0, "no registered key -- must never carry voting power");
+        assert_eq!(vs.power_of(&ValidatorId("unverified".into())), 0, "no PoP verification -- must never carry voting power");
+        assert_eq!(vs.power_of(&ValidatorId("fully_eligible".into())), 2_000_000, "verified + keyed validator keeps its power");
     }
 
 }

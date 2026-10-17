@@ -27,6 +27,19 @@ use chain_forge_p2p::{
     GossipTopic, OutboundMessage, PeerInfo,
 };
 
+/// Decode a hex-encoded genesis/key-file public key into raw bytes.
+/// Returns `None` on malformed hex rather than panicking -- callers treat
+/// that the same as "no key available" rather than crashing node startup
+/// over a malformed genesis field that `GenesisConfig::validate()` should
+/// already have caught earlier in the startup sequence.
+fn hex_decode_genesis_key(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.is_empty() || s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 // -- Node status (shared with the API) ----------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -86,6 +99,8 @@ pub struct ValidatorPowerSummary {
     pub id:           String,
     pub voting_power: u64,
     pub pop_verified: bool,
+    /// Hex-encoded registered consensus public key, or empty string if none.
+    pub consensus_pubkey: String,
 }
 
 /// Explorer state, updated by the node on each committed block.
@@ -114,7 +129,8 @@ pub type SharedExplorer = Arc<Mutex<ExplorerState>>;
 // -- QRC metrics (shared with the API, Section 9.1 / 5.4) -------------------
 
 /// Live snapshot of QRC resource economy metrics.
-/// QRC is a data-consumption / resource-credit token (NOT a UBI coin):
+/// QRC is a data-consumption / resource-credit token (earned or purchased,
+/// not distributed as a flat per-person drip):
 ///   - Purchase path: QCB burned → QRC credits at algorithmic rate Rt
 ///   - Contribution path: verified resource providers earn QRC directly
 ///   - Consumption split: ~60% provider / ~25% permanent burn / ~15% protocol reserve
@@ -260,8 +276,9 @@ pub struct Node {
     /// message once and never replays it.
     chain_store: std::collections::BTreeMap<u64, (chain_forge_consensus::CommitCertificate, BlockProposal)>,
     /// Identity registry (Whitepaper Section 4 / Identity Pilot Design) --
-    /// backs RegisterIdentity and Attest transactions, and ClaimUbi's
-    /// verified-tier gate. Threaded through execute_block_with_identity()
+    /// backs RegisterIdentity and Attest transactions, and the
+    /// verified-tier gates used throughout execution. Threaded through
+    /// execute_block_with_identity()
     /// on every commit so identity state actually persists across blocks.
     identity: IdentityStore,
     /// QRC resource economy engine — tracks conversion rate Rt, per-resource
@@ -349,7 +366,58 @@ pub struct Node {
     /// capacity ad.  0 means "never".  The event loop heartbeat re-broadcasts
     /// every `CAPACITY_AD_INTERVAL_SECS` seconds.
     last_capacity_ad_ms: u64,
+
+    // ── Deterministic block-height validator-set epochs ──────────────────────
+
+    /// Number of blocks per validator-set epoch. Every decision that can
+    /// change validator membership, voting power, or quorum (stake-bond
+    /// admission, liveness-lapse revocation) fires only when
+    /// `height % validator_epoch_blocks == 0`, computed purely from block
+    /// height -- which every node already agrees on by construction of BFT
+    /// consensus -- rather than from any node-local wall clock. A plain
+    /// field, resolved once at construction from the optional
+    /// `genesis.validator_bonding.validator_epoch_blocks` override (falls
+    /// back to `DEFAULT_VALIDATOR_EPOCH_BLOCKS` below when absent --
+    /// `DEFAULT_MAX_ACTIVE_VALIDATORS` stays a plain, not-yet-configurable
+    /// constant, out of scope for "Configurable validator genesis
+    /// parameters"). Still a directly-settable field after construction
+    /// so tests can force an epoch boundary on a specific block without
+    /// waiting out a realistic epoch length, the same way tests used to
+    /// shrink `identity.clock.epoch_duration_ms` back when this was
+    /// wall-clock-driven.
+    validator_epoch_blocks: u64,
+
+    /// Minimum stake (in the chain's native denom) a candidate must hold to
+    /// be eligible for the active validator set. Resolved once at
+    /// construction from `genesis.validator_bonding.min_bond_amount`,
+    /// falling back to
+    /// `chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB` when
+    /// the genesis override is absent -- see "Configurable validator
+    /// genesis parameters" in ROADMAP.md. A plain field, same convention as
+    /// `validator_epoch_blocks` above, so tests can override it directly
+    /// without round-tripping through a genesis JSON string.
+    min_bond_uqcb: u128,
+
+    /// The validator set that was actually in force -- and used to reach
+    /// quorum -- at each committed height, keyed by height. Populated
+    /// before any admission/liveness mutation for the *next* height is
+    /// applied, so it reflects exactly what produced that height's
+    /// CommitCertificate.
+    ///
+    /// Needed because the live `self.consensus.validator_set()` is mutated
+    /// in place on every epoch boundary (admissions, liveness lapses): by
+    /// the time anyone asks "was this certificate valid?", the live set may
+    /// already differ from the one that actually voted. A certificate must
+    /// be verified against the set effective at its height, not whatever
+    /// is live now -- see `verify_certificate_against_history`.
+    historical_validator_sets: std::collections::BTreeMap<u64, chain_forge_consensus::ValidatorSet>,
 }
+
+/// Default validator-set epoch length in blocks. Matches the scale PoCD's
+/// own `reward_epoch_blocks` test fixtures already use (100), so devnet
+/// tests see an epoch roll within a reasonable number of commits without
+/// a separate magic number to remember.
+pub const DEFAULT_VALIDATOR_EPOCH_BLOCKS: u64 = 100;
 
 /// Map a transaction body to a short string label for the explorer.
 ///
@@ -366,8 +434,6 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::Custom { .. }              => "custom",
         TxBody::RegisterIdentity            => "register_identity",
         TxBody::Attest { .. }              => "attest",
-        TxBody::ClaimUbi { .. }            => "claim_ubi",
-        TxBody::RedirectToUbiPool { .. }   => "ubi_redirect",
         TxBody::SponsorAgent { .. }        => "sponsor_agent",
         TxBody::RevokeAgent { .. }         => "revoke_agent",
         TxBody::RevokeAttestation { .. }        => "revoke_attestation",
@@ -412,6 +478,10 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::VerifyJob { .. }                => "verify_job",
         // PoCD Research Reward Settlement (Change Set L)
         TxBody::ClaimResearchReward { .. }      => "claim_research_reward",
+        // Validator Onboarding (ROADMAP.md)
+        TxBody::BondValidator { .. }             => "bond_validator",
+        TxBody::UnbondValidator                  => "unbond_validator",
+        TxBody::RegisterValidatorKey { .. }      => "register_validator_key",
     }
 }
 
@@ -462,6 +532,36 @@ impl Node {
             }
         }
 
+        // Hard error, in every environment: mandatory validator keys
+        // (security change set, Decision Option B -- "no devnet bypass
+        // that allows unverified or keyless validators to participate in
+        // consensus"). A chain that cannot seat any validator with a real
+        // registered key is not a "proceed with a warning" situation --
+        // nothing could ever reach quorum (see gate_voting_power in
+        // chain-forge-consensus), so refuse to start at all rather than
+        // boot into a validator set that can never vote.
+        genesis.validate_validator_keys().map_err(NodeError::Genesis)?;
+
+        // Hard error, in every environment: an accepted-but-nonsensical
+        // `validator_bonding` override (zero minimum bond, zero epoch
+        // length) is not a "proceed with a warning" situation -- the
+        // latter would panic on the first `height / validator_epoch_blocks`
+        // division. See `GenesisConfig::validate_validator_bonding`.
+        genesis.validate_validator_bonding().map_err(NodeError::Genesis)?;
+
+        // Resolve the validator-onboarding knobs once here: genesis
+        // override if present, else the engine's compiled-in default.
+        // Every node that parses the same genesis JSON computes the exact
+        // same two values -- "Configurable validator genesis parameters"
+        // requirement #5 (every node derives the same epoch boundaries and
+        // minimum-bond rule from the same genesis).
+        let validator_epoch_blocks = genesis.validator_bonding.as_ref()
+            .and_then(|vb| vb.validator_epoch_blocks)
+            .unwrap_or(DEFAULT_VALIDATOR_EPOCH_BLOCKS);
+        let min_bond_uqcb = genesis.validator_bonding.as_ref()
+            .and_then(|vb| vb.min_bond_amount)
+            .unwrap_or(chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB);
+
         // Hard error, in every environment: running with a module list the
         // engine can't honour would mean the chain behaves differently
         // from what its genesis says.
@@ -469,6 +569,7 @@ impl Node {
         info!(
             staking = modules.staking, identity = modules.identity,
             qrc = modules.qrc, agents = modules.agents,
+            market = modules.market, pocd = modules.pocd,
             personhood_weighted = genesis.consensus.personhood_weighted,
             "modules enabled"
         );
@@ -720,6 +821,59 @@ impl Node {
             let _ = engine.update_validator_set(vs);
         }
 
+        // Hard error: confirm the genesis validator set can actually reach
+        // quorum before this node enters consensus at all.
+        //
+        // `update_validator_set` just above runs every validator through
+        // `gate_voting_power` (chain-forge-consensus): a validator with no
+        // registered key or no verified personhood now has voting_power
+        // forced to 0, unconditionally, in every engine. Genesis key
+        // validation (`validate_validator_keys`, checked earlier in this
+        // function) guarantees every validator HAS a key; this check
+        // confirms the other half actually held -- enough of them are also
+        // verified -- rather than assuming it did. Catches a genesis that
+        // is structurally valid (real keys) but operationally dead (e.g.
+        // identity seeding silently failed, or every genesis account's role
+        // doesn't match an actual Verified IdentityRecord): better to
+        // refuse to start than to boot into a validator set that can never
+        // vote.
+        {
+            let vs = engine.validator_set();
+            let eligible = vs.validators.iter().filter(|v| v.voting_power > 0).count();
+            if eligible == 0 {
+                return Err(NodeError::Consensus(format!(
+                    "genesis validator set has zero eligible voting power after \
+                     the personhood/key gate -- every one of its {} validator(s) \
+                     is missing a registered key, lacks verified personhood, or \
+                     both. The chain cannot reach quorum and will never produce \
+                     a block. Fix genesis identity seeding or validator_scheme \
+                     before starting this node.",
+                    vs.validators.len()
+                )));
+            }
+            if eligible < vs.validators.len() {
+                warn!(
+                    eligible,
+                    total = vs.validators.len(),
+                    "{} of {} genesis validators have zero effective voting \
+                     power (missing key or unverified personhood) -- starting \
+                     anyway since at least one is eligible, but BFT safety \
+                     margin is computed over the eligible set, not the nominal \
+                     one",
+                    vs.validators.len() - eligible, vs.validators.len()
+                );
+            }
+            if eligible < 4 {
+                warn!(
+                    eligible,
+                    "fewer than 4 validators have effective voting power -- \
+                     byzantine_fault_tolerance() is 0 for sets this small \
+                     regardless of nominal size; this chain has no real BFT \
+                     safety margin yet"
+                );
+            }
+        }
+
         // Pilot-phase attestation coordinator. If genesis names one, wire it
         // into the identity store so ConfirmSybil / ReverseSybil txs work.
         // Without this, both tx types return NotCoordinator immediately.
@@ -771,6 +925,24 @@ impl Node {
                     // Register as Candidate first (no-op if already present).
                     // Block height 0: we are in node startup, before block 1 is produced.
                     validator_registry.register_genesis_validator(id, 0);
+
+                    // CF-VAL-KEY-002: register_genesis_validator() leaves
+                    // KeyBundle.consensus_pubkey empty ("genesis-stub") --
+                    // genesis itself is the authenticated source for a
+                    // genesis validator's key (validate_validator_keys()
+                    // already required every genesis validator to have one
+                    // before the node got this far), so there is no separate
+                    // proof-of-possession to check here; just carry that
+                    // already-verified key into the registry so
+                    // build_validator_set() -- which now reads keys back
+                    // from here instead of hardcoding empty -- has it too.
+                    if let Some(hex_key) = acct.public_key.as_ref() {
+                        if let Some(key_bytes) = hex_decode_genesis_key(hex_key) {
+                            if let Err(e) = validator_registry.register_consensus_key(id, &key_bytes, epoch) {
+                                warn!(validator = id, error = %e, "failed to seed genesis validator's consensus key into registry");
+                            }
+                        }
+                    }
 
                     // Verify identity against IdentityStore (Integration Point 1).
                     // Only if verification succeeds does the validator enter Active.
@@ -916,6 +1088,9 @@ impl Node {
             // Change Set T
             peer_capacity_table: Arc::new(Mutex::new(crate::gossip_capacity::PeerCapacityTable::new())),
             last_capacity_ad_ms: 0,
+            validator_epoch_blocks,
+            min_bond_uqcb,
+            historical_validator_sets: std::collections::BTreeMap::new(),
         })
     }
 
@@ -1161,11 +1336,14 @@ impl Node {
     ///                     or the validator is not in the active set at all.
     ///                     Caller must drop the vote.
     ///
-    /// Design: we look up the sender's public key from the consensus ValidatorSet
-    /// (populated from genesis or backfilled by `load_signing_key`). If the key
-    /// is non-empty we MUST verify — an empty signature against a known key is
-    /// treated as a forgery. If the key is empty we allow through so a mixed
-    /// key/no-key devnet still works.
+    /// Design: we look up the sender's public key from the consensus ValidatorSet,
+    /// which genesis is now required to populate for every validator
+    /// (`load_signing_key` only verifies a local private key against that
+    /// registered key -- it no longer backfills it; see that function's
+    /// doc comment). If the key is non-empty we MUST verify — an empty
+    /// signature against a known key is treated as a forgery. If the key
+    /// is empty (should not happen post-migration for a real validator) we
+    /// allow through so a mixed key/no-key devnet still works.
     ///
     /// Whitepaper refs: Section 7.5 (validator identity), Section 8.1 (vote rules).
     fn verify_vote_signature(&self, vote: &Vote) -> Result<(), String> {
@@ -1228,6 +1406,9 @@ impl Node {
                 .map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
                 .collect()
         }
+        fn hex_encode(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read key file {:?}: {e}", path))?;
         let k: serde_json::Value = serde_json::from_str(&text)
@@ -1241,24 +1422,59 @@ impl Node {
             public_key:  field("public_key")?,
             private_key: field("private_key")?,
         };
-        // Bind the keypair to the consensus layer so it can verify peer keys
-        // Look up this validator's address from the key file to match genesis
+        // Look up this validator's address from the key file to match genesis.
         let address = k["address"].as_str()
             .unwrap_or_default().to_string();
-        // Backfill the public key into the consensus ValidatorSet so that
-        // peer validators can verify our proposals and votes immediately.
         let my_id = chain_forge_consensus::ValidatorId(address.clone());
-        let mut vs = self.consensus.validator_set().clone();
-        if let Some(vi) = vs.validators.iter_mut().find(|v| v.id == my_id) {
-            vi.public_key = kp.public_key.clone();
-            self.consensus.update_validator_set(vs).ok();
+
+        // Security change set (mandatory validator keys, Decision Option B):
+        // genesis is now the SOLE authority for a validator's registered
+        // public key -- validate_validator_keys() guarantees every genesis
+        // validator already has one before this node ever reaches consensus.
+        // This function's job changed from "backfill the missing key" to
+        // "verify the local private key actually corresponds to the key
+        // genesis already published for this address" (requirement #3: the
+        // local private signing key must correspond to the registered
+        // public key; this is where that's enforced). It no longer writes
+        // into the live ValidatorSet at all -- a key file cannot rebind
+        // another validator's public identity, intentionally or by mistake.
+        let vs = self.consensus.validator_set();
+        let registered = vs.validators.iter().find(|v| v.id == my_id)
+            .ok_or_else(|| format!(
+                "key file {:?} claims address {address:?}, which is not in \
+                 this chain's validator set at all -- cannot load a signing \
+                 key for a validator genesis never registered",
+                path
+            ))?;
+        if registered.public_key.is_empty() {
+            // Should be unreachable post-migration (genesis validation
+            // requires every validator to have a key), but fail loudly
+            // rather than silently trusting an unverifiable key file if it
+            // somehow is reached.
+            return Err(format!(
+                "validator {address} has no public_key registered in genesis \
+                 at all -- refusing to load a local signing key for it \
+                 (genesis must register every validator's key; this node \
+                 will not backfill one from a private key file)"
+            ));
         }
+        if registered.public_key != kp.public_key {
+            return Err(format!(
+                "key mismatch for validator {address}: the local private key \
+                 in {path:?} corresponds to public key {}, but genesis has \
+                 {} registered for this address. Refusing to load -- either \
+                 the wrong key file was supplied, or this address's genesis \
+                 registration doesn't belong to this operator.",
+                hex_encode(&kp.public_key), hex_encode(&registered.public_key),
+            ));
+        }
+
         // Set this node's validator identity so the event loop participates
         // in consensus (casts prevotes / precommits) rather than running as
         // an observer. Without this, the node logs "validator=None" and never
         // votes, so the network cannot reach quorum.
-        self.validator_id = Some(chain_forge_consensus::ValidatorId(address.clone()));
-        tracing::info!(address = %address, "validator signing key loaded");
+        self.validator_id = Some(my_id);
+        tracing::info!(address = %address, "validator signing key loaded and verified against genesis");
         self.signing_key = Some(kp);
         Ok(())
     }
@@ -1290,6 +1506,23 @@ impl Node {
             ("agents.json",     serde_json::to_string_pretty(&self.agents)           .ok()),
             ("slashing.json",   serde_json::to_string_pretty(&self.slasher)          .ok()),
             ("chain_store.json",serde_json::to_string_pretty(&self.chain_store)      .ok()),
+            ("historical_validator_sets.json", serde_json::to_string_pretty(&self.historical_validator_sets).ok()),
+            // CF-VAL-KEY-002: the live consensus ValidatorSet, exactly as
+            // `self.consensus` holds it right now -- real keys, real
+            // voting power, every currently-seated validator whether seated
+            // at genesis or admitted later by stake bonding. This is
+            // authoritative in a way `validator_registry.build_validator_set()`
+            // is not: that function only knows about validators that went
+            // through `ValidatorRegistry::register()`/`register_genesis_validator()`,
+            // which the live stake-bond admission path (`compute_stake_active_set`,
+            // node.rs) never calls -- so a bonded validator admitted after
+            // genesis is entirely absent from `build_validator_set()`'s
+            // output, not merely missing its key. Persisting the real,
+            // live set directly and restoring it verbatim at restart
+            // (`load_persisted_state`) is what actually satisfies "a
+            // bonded validator's key and seat survive restart" -- see
+            // that function for how this file is used.
+            ("live_validator_set.json", serde_json::to_string_pretty(self.consensus.validator_set()).ok()),
         ] {
             if let Some(json) = value {
                 let _ = std::fs::write(persist.join(name), json);
@@ -1312,6 +1545,8 @@ impl Node {
         let agents_path      = persist.join("agents.json");
         let slashing_path    = persist.join("slashing.json");
         let chain_store_path = persist.join("chain_store.json");
+        let historical_vs_path = persist.join("historical_validator_sets.json");
+        let live_vs_path      = persist.join("live_validator_set.json");
 
         if !snap_path.exists() { return false; }
 
@@ -1350,6 +1585,14 @@ impl Node {
                     "block history restored from disk"
                 );
             }
+            if historical_vs_path.exists() {
+                self.historical_validator_sets =
+                    serde_json::from_str(&std::fs::read_to_string(&historical_vs_path)?)?;
+                tracing::debug!(
+                    heights = self.historical_validator_sets.len(),
+                    "historical validator sets restored from disk"
+                );
+            }
 
             // ── Rebuild ExplorerState from persisted chain_store + state ─────
             // ExplorerState is not persisted separately; it is reconstructed
@@ -1371,13 +1614,17 @@ impl Node {
                     });
                 }
 
-                // Validators: derive from the restored validator registry.
-                let vs = self.validator_registry.build_validator_set(height);
-                ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
-                    id:           v.id.0.clone(),
-                    voting_power: v.voting_power,
-                    pop_verified: v.pop_verified,
-                }).collect();
+                // Validators: use the live consensus set (restored from
+                // live_validator_set.json), which carries real public keys.
+                {
+                    let live = self.consensus.validator_set();
+                    ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
+                        id:           v.id.0.clone(),
+                        voting_power: v.voting_power,
+                        pop_verified: v.pop_verified,
+                        consensus_pubkey: hex::encode(&v.public_key),
+                    }).collect();
+                }
 
                 // Blocks + txs: walk chain_store in ascending height order so
                 // push_front leaves them newest-first (matching live behaviour).
@@ -1426,7 +1673,46 @@ impl Node {
 
             // Rebuild the consensus engine's view of the current height and
             // validator set so it does not re-propose already-committed blocks.
-            let vs = self.validator_registry.build_validator_set(height);
+            //
+            // CF-VAL-KEY-002 supersedes the original CF-DEVNET-VAL-001 fix
+            // here. That fix backfilled real public keys from this node's
+            // pre-restore in-memory set into `build_validator_set()`'s
+            // output, which correctly solved the problem for GENESIS
+            // validators (whose keys are always present pre-restore,
+            // because genesis itself is their key authority). But
+            // `ValidatorRegistry::build_validator_set()` only knows about
+            // validators that went through `register()`/
+            // `register_genesis_validator()` -- the live stake-bond
+            // admission path (`compute_stake_active_set`, elsewhere in this
+            // file) never calls either, so a validator admitted after
+            // genesis via `BondValidator`/`RegisterValidatorKey` is not
+            // merely missing its key in `build_validator_set()`'s output,
+            // it is ENTIRELY ABSENT from it. The old fix could only backfill
+            // keys onto entries that existed; it could not resurrect an
+            // entry `build_validator_set()` never produced in the first
+            // place. This went unnoticed because the original devnet
+            // restart test used only genesis validators.
+            //
+            // Fix: use the live ValidatorSet snapshot persisted verbatim at
+            // every commit (`persist_state()`, "live_validator_set.json") --
+            // the actual, authoritative, in-memory set this node was
+            // running with the moment before it stopped, correct keys,
+            // correct voting power, every seat it actually had, genesis or
+            // bonded alike. `build_validator_set()` remains the fallback for
+            // a data directory written before this change existed (no
+            // live_validator_set.json yet), so an old devnet data dir still
+            // restarts rather than refusing to start.
+            let vs = if live_vs_path.exists() {
+                serde_json::from_str(&std::fs::read_to_string(&live_vs_path)?)?
+            } else {
+                tracing::warn!(
+                    "no live_validator_set.json found (data dir predates CF-VAL-KEY-002) \
+                     -- falling back to validator_registry.build_validator_set(), which \
+                     will not include any validator admitted after genesis by stake bonding"
+                );
+                self.validator_registry.build_validator_set(height)
+            };
+
             if let Err(e) = self.consensus.reset_to_height(height, vs) {
                 tracing::warn!(
                     height,
@@ -1842,8 +2128,10 @@ impl Node {
                         // consensus. This stops forged votes from being counted
                         // toward quorum — the first line of vote security.
                         // Only verified when the sending validator has a public
-                        // key in the ValidatorSet (loaded from genesis or via
-                        // load_signing_key). Validators without a key on file
+                        // key in the ValidatorSet -- genesis is now required to
+                        // register one for every validator (load_signing_key
+                        // only checks a local private key against it, it
+                        // doesn't backfill). Validators without a key on file
                         // are allowed through with a warn so a mixed key/no-key
                         // network (Phase 0 devnet) doesn't hard-break.
                         if let Err(reject) = self.verify_vote_signature(&vote) {
@@ -2722,17 +3010,35 @@ impl Node {
             .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
-        self.identity.advance_epoch(now_ms);
+        // Snapshot the validator set that actually produced this cert
+        // BEFORE any epoch-boundary admission/liveness mutation below --
+        // see `historical_validator_sets`'s doc comment and
+        // `verify_certificate_against_history`.
+        self.historical_validator_sets.insert(cert.height, self.consensus.validator_set().clone());
+
+        // Deterministic, block-height-driven validator epoch -- replaces
+        // the old `self.identity.advance_epoch(now_ms)` wall-clock call for
+        // every decision that can change validator membership, voting
+        // power, or quorum (see `advance_epoch_to`'s doc comment in
+        // chain-forge-identity for why liveness/admission can't be
+        // decoupled from the epoch *number* itself, only from how that
+        // number is derived). `now_ms` above is still wall-clock -- it only
+        // feeds cosmetic epoch bookkeeping and tx execution timestamps now,
+        // neither of which affects validator membership, voting power, or
+        // quorum.
+        let validator_epoch = cert.height / self.validator_epoch_blocks;
+        let epoch_rolled = self.identity.advance_epoch_to(validator_epoch);
 
         // Integration Point 3 (Push): after advancing the epoch, sync the
         // ValidatorRegistry with any identity lapses that just happened.
         //
-        // advance_epoch() calls lapse() on any Verified/Established identity
-        // that hasn't been active for LIVENESS_EPOCH_WINDOW epochs, dropping
-        // them to Provisional. The ValidatorRegistry is a separate module that
-        // doesn't hear about this unless we tell it. Without this call, a
-        // lapsed validator stays Active with full consensus power — exactly the
-        // attack Section 3.3's personhood-weighting is supposed to prevent.
+        // advance_epoch_to() calls lapse() on any Verified/Established
+        // identity that hasn't been active for LIVENESS_EPOCH_WINDOW
+        // (validator) epochs, dropping them to Provisional. The
+        // ValidatorRegistry is a separate module that doesn't hear about
+        // this unless we tell it. Without this call, a lapsed validator
+        // stays Active with full consensus power — exactly the attack
+        // Section 3.3's personhood-weighting is supposed to prevent.
         //
         // We use Push: epoch advance fires here, we immediately reconcile the
         // registry. Pull (querying at every round start) is the
@@ -2779,6 +3085,24 @@ impl Node {
             .filter_map(|t| {
                 if let chain_forge_execution::TxBody::Attest { claimant_id } = &t.body {
                     Some((t.sender.clone(), claimant_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // CF-VAL-KEY-002: same snapshot-before-consume pattern, for
+        // RegisterValidatorKey. Keeps the original position in `txs` (not
+        // just a filtered index) so the result lookup below is a direct,
+        // unambiguous positional match against `exec_result.tx_results`
+        // (one result per input tx, same order -- see
+        // `execute_block_with_identity`) rather than a separately-filtered
+        // zip that could silently misalign if two such txs land in one
+        // block.
+        let register_key_attempts: Vec<(usize, String, Vec<u8>)> = txs.iter().enumerate()
+            .filter_map(|(i, t)| {
+                if let chain_forge_execution::TxBody::RegisterValidatorKey { consensus_pubkey, .. } = &t.body {
+                    Some((i, t.sender.clone(), consensus_pubkey.clone()))
                 } else {
                     None
                 }
@@ -2850,6 +3174,159 @@ impl Node {
             }
         }
 
+        // CF-VAL-KEY-002: mirror every successfully-executed
+        // RegisterValidatorKey tx into the ValidatorRegistry's key store.
+        // The executor (chain-forge-execution) already did the actual
+        // authentication -- unconditional sender-signature verification
+        // plus proof-of-possession against consensus_pubkey -- and has no
+        // dependency on chain-forge-validators to write the result
+        // anywhere itself, so this is purely "trust what the executor
+        // already verified, now record it". Must run before both the
+        // epoch-boundary admission block and the pop_verified/public_key
+        // refresh block immediately below, so a key registered in this
+        // very block is visible to both this block's admission decisions
+        // and the live ValidatorSet refresh.
+        {
+            let epoch = self.identity.clock.current_epoch;
+            for (idx, sender, pubkey) in &register_key_attempts {
+                let Some(result) = exec_result.tx_results.get(*idx) else { continue };
+                if !result.success {
+                    continue;
+                }
+                if let Err(e) = self.validator_registry.register_consensus_key(sender, pubkey, epoch) {
+                    warn!(
+                        validator = %sender,
+                        error     = %e,
+                        "consensus key registration mirror failed after a transaction the \
+                         executor already authenticated -- this should only happen on a \
+                         genuine duplicate-key conflict"
+                    );
+                }
+            }
+        }
+
+        // Integration Point 4 (Push): at each identity-epoch boundary,
+        // admit newly stake-bonded validators into the live consensus
+        // ValidatorSet.
+        //
+        // ROADMAP.md, Validator Onboarding: before this, `BondValidator`
+        // could move uqcb into a validator's bond account, but nothing ever
+        // read that back into consensus -- `genesis_vs` was built once at
+        // startup and never grew. A validator could bond the minimum stake
+        // forever and still never be seated. This closes that gap on the
+        // entry side.
+        //
+        // Scope, deliberately: this ADDS newly-qualifying candidates up to
+        // the max active-set size; it does not EVICT an existing validator
+        // whose stake falls below the minimum or who is outranked by a
+        // later, larger staker. Full top-N churn (the "exit" half of
+        // "Top-N stakers automatically enter/exit active set") needs a
+        // product decision this change doesn't make on its own: whether
+        // genesis/synthetic validators (who hold no bond at all, since they
+        // were seated by genesis, not by a BondValidator tx) are exempt from
+        // eviction or get swept out the first time anyone else bonds.
+        // Tracked as follow-up in ROADMAP.md rather than decided here.
+        // Removal of a validator already in the set remains the job of the
+        // existing jailing/tombstoning/liveness-revocation machinery, which
+        // this does not touch.
+        //
+        // New entrants start with pop_verified=false and an empty
+        // public_key (same Phase-0 placeholder convention as a genesis
+        // validator before identity seeding -- see `genesis_vs`
+        // construction in `Node::new`). The PoP refresh block immediately
+        // below corrects pop_verified from IdentityStore before this same
+        // commit finishes; the public key is backfilled later via
+        // `load_signing_key` (operator's own node) or by other validators'
+        // `verify_vote_signature` Phase-0 tolerance in the meantime.
+        if epoch_rolled {
+            let active = chain_forge_execution::validator_bond::compute_stake_active_set(
+                &self.state,
+                self.executor.native_denom(),
+                self.min_bond_uqcb,
+                chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+            );
+            // Build a lookup from the bond ledger for O(1) access below.
+            let bond_map: std::collections::HashMap<&str, u128> = active
+                .iter()
+                .map(|(addr, power)| (addr.as_str(), *power))
+                .collect();
+
+            let mut updated_vs = self.consensus.validator_set().clone();
+            let mut any_changed = false;
+
+            // Pass 1: refresh voting_power for already-seated validators whose
+            // bonded stake has changed since they were last admitted.  Genesis
+            // validators start with power=1 (the engine's init default); once
+            // they submit a BondValidator tx their real stake appears in the
+            // bond ledger and must be reflected here so quorum arithmetic stays
+            // proportional to actual stake.
+            for v in &mut updated_vs.validators {
+                if let Some(&bonded_uqcb) = bond_map.get(v.id.0.as_str()) {
+                    let new_power = bonded_uqcb.min(u64::MAX as u128) as u64;
+                    if v.voting_power != new_power {
+                        info!(
+                            validator = %v.id,
+                            old_power = v.voting_power,
+                            new_power,
+                            "stake bond: updating voting power for seated validator"
+                        );
+                        v.voting_power = new_power;
+                        any_changed = true;
+                    }
+                }
+            }
+
+            // Pass 2: admit new validators from the bond ledger that are not
+            // yet seated.
+            let already_seated: std::collections::HashSet<String> = updated_vs.validators
+                .iter()
+                .map(|v| v.id.0.clone())
+                .collect();
+            let capacity = chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS
+                .saturating_sub(updated_vs.validators.len());
+            let mut admitted = 0usize;
+            for (addr, bonded_uqcb) in &active {
+                if admitted >= capacity {
+                    break;
+                }
+                if already_seated.contains(addr) {
+                    continue;
+                }
+                info!(
+                    validator = %addr,
+                    bonded_uqcb = *bonded_uqcb,
+                    "stake bond: admitting new validator candidate to active set"
+                );
+                // CF-VAL-KEY-002: read back whatever consensus key this
+                // address has authenticated via `RegisterValidatorKey`
+                // (mirrored into the registry just above, before this
+                // epoch-boundary admission block runs -- see the
+                // `register_validator_key_senders` handling earlier in this
+                // function). Empty if none has been registered yet: that is
+                // the correct, intentional state -- `gate_voting_power()`
+                // (applied unconditionally by `update_validator_set()` just
+                // below) forces this entry's voting_power to 0 regardless of
+                // `bonded_uqcb` until a key is on file. The validator keeps
+                // its seat and its bond; it simply cannot vote until it
+                // proves it holds a consensus key.
+                let public_key = self.validator_registry
+                    .consensus_pubkey_bytes(addr)
+                    .unwrap_or_default();
+                updated_vs.validators.push(chain_forge_consensus::ValidatorInfo {
+                    id: chain_forge_consensus::ValidatorId(addr.clone()),
+                    voting_power: (*bonded_uqcb).min(u64::MAX as u128) as u64,
+                    pop_verified: false,
+                    public_key,
+                });
+                admitted += 1;
+                any_changed = true;
+            }
+            if any_changed {
+                updated_vs.height = cert.height;
+                let _ = self.consensus.update_validator_set(updated_vs);
+            }
+        }
+
         // Refresh pop_verified in the live validator set from IdentityStore.
         //
         // This is the per-block PoP admission check: if an identity was
@@ -2875,6 +3352,50 @@ impl Node {
                     }
                     v.pop_verified = now_verified;
                     any_changed = true;
+                }
+
+                // CF-VAL-KEY-002: same idea, for consensus keys. A
+                // validator that was seated before it had registered a key
+                // (or before this field existed at all, for genesis
+                // validators seeded from an older data dir) picks up its
+                // real key here the moment one appears in the registry --
+                // every block, not just at admission, so a
+                // `RegisterValidatorKey` tx submitted well after a
+                // validator was first seated still takes effect.
+                if v.public_key.is_empty() {
+                    if let Some(real_key) = self.validator_registry.consensus_pubkey_bytes(&v.id.0) {
+                        v.public_key = real_key;
+                        any_changed = true;
+                        info!(validator = %v.id, "consensus key gate: registered key found — validator can now vote");
+                    }
+                }
+
+                // CF-VAL-KEY-002: restore real voting power once both gates
+                // are satisfied. `update_validator_set()`'s unconditional
+                // `gate_voting_power()` call OVERWRITES `voting_power` with
+                // 0 in place for any validator missing a key or personhood
+                // -- it does not merely mask it -- so the moment a
+                // bonded-but-not-yet-keyed validator was first admitted and
+                // gated, its original bonded-stake weight was gone from
+                // this struct for good unless something re-reads it from
+                // the real bond ledger. This is that re-read: only when
+                // both gates are now satisfied AND voting_power is
+                // currently zero (never touches a validator already
+                // carrying real power, so genesis validators are
+                // unaffected), look up the actual bonded amount from
+                // state and restore it.
+                if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
+                    let bond_addr = format!(
+                        "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
+                    );
+                    let bonded = self.state.get_account(&bond_addr)
+                        .map(|a| a.balance_of(self.executor.native_denom()))
+                        .unwrap_or(0);
+                    if bonded > 0 {
+                        v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                        any_changed = true;
+                        info!(validator = %v.id, voting_power = v.voting_power, "consensus key gate: voting power restored from bonded stake");
+                    }
                 }
             }
             if any_changed {
@@ -2934,12 +3455,18 @@ impl Node {
             }
 
             // Sync validator power snapshot for GET /api/validators.
-            let vs = self.validator_registry.build_validator_set(exec_result.height);
-            ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
-                id:           v.id.0.clone(),
-                voting_power: v.voting_power,
-                pop_verified: v.pop_verified,
-            }).collect();
+            // Use the live consensus ValidatorSet (not build_validator_set) so
+            // registered consensus keys are reflected immediately after
+            // RegisterValidatorKey commits. The live set is authoritative.
+            {
+                let live = self.consensus.validator_set();
+                ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
+                    id:           v.id.0.clone(),
+                    voting_power: v.voting_power,
+                    pop_verified: v.pop_verified,
+                    consensus_pubkey: hex::encode(&v.public_key),
+                }).collect();
+            }
         }
 
         // Drop proposals and parked certs at or below the height we just
@@ -2962,6 +3489,103 @@ impl Node {
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
         self.persist_state();
+
+        Ok(())
+    }
+
+    /// Verify a `CommitCertificate` against the validator set that was
+    /// actually in force at `cert.height` -- NOT whatever validator set is
+    /// live right now.
+    ///
+    /// Why this exists: `self.consensus.validator_set()` is mutated in
+    /// place at every validator-epoch boundary (stake-bond admissions,
+    /// liveness-lapse revocations). A certificate from height 10 was only
+    /// ever valid against the set active at height 10; by height 200 that
+    /// set may have gained or lost members or had voting power rebalanced.
+    /// Checking an old certificate against the CURRENT live set would be
+    /// checking it against rules that didn't exist yet when it was formed
+    /// -- it could wrongly fail (a since-admitted validator's vote looks
+    /// "unknown" to the old set) or wrongly pass (a since-revoked
+    /// validator's old vote still "counts" against the new set's quorum
+    /// math, which is nonsensical once that validator's power has moved).
+    ///
+    /// Returns `Ok(())` if the precommits in `cert` are from validators
+    /// known to the historical set, are correctly signed wherever that
+    /// historical set had a key on file, and their combined voting power
+    /// (as of THAT set, not the live one) meets or exceeds that set's own
+    /// quorum threshold. `Err` otherwise, with a string explaining which
+    /// check failed.
+    pub fn verify_certificate_against_history(
+        &self,
+        cert: &chain_forge_consensus::CommitCertificate,
+    ) -> Result<(), String> {
+        let historical_vs = self.historical_validator_sets.get(&cert.height)
+            .ok_or_else(|| format!(
+                "no historical validator set recorded for height {} -- cannot verify \
+                 this certificate against the set effective at that height",
+                cert.height
+            ))?;
+
+        let quorum = historical_vs.quorum_power();
+        let mut counted_power: u64 = 0;
+        let mut counted_validators = std::collections::HashSet::new();
+
+        for vote in &cert.precommits {
+            // Equivocation/duplicate guard: only count each validator once,
+            // same as a real quorum tally would.
+            if !counted_validators.insert(vote.validator.clone()) {
+                continue;
+            }
+
+            let power = historical_vs.power_of(&vote.validator);
+            if power == 0 {
+                // Unknown to, or zero-power in, the set effective at this
+                // height -- e.g. a validator admitted LATER whose vote
+                // would wrongly look legitimate against today's live set.
+                return Err(format!(
+                    "validator {} has zero power in the validator set effective at \
+                     height {} -- this precommit could not have counted toward \
+                     quorum at that height, whatever it looks like against the \
+                     current live set",
+                    vote.validator, cert.height
+                ));
+            }
+
+            let pub_key = historical_vs.public_key_of(&vote.validator);
+            if !pub_key.is_empty() {
+                if vote.signature.is_empty() {
+                    return Err(format!(
+                        "validator {} had a registered key in the set effective at \
+                         height {}, but this precommit carries an empty signature",
+                        vote.validator, cert.height
+                    ));
+                }
+                let msg = chain_forge_consensus::vote_signing_bytes(
+                    &self.genesis.chain_id, &vote.vote_type, vote.height, vote.round,
+                    vote.block_hash.as_ref(),
+                );
+                let sig = chain_forge_crypto::Signature {
+                    scheme: chain_forge_crypto::SchemeId::Classical,
+                    bytes:  vote.signature.clone(),
+                };
+                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|e| format!(
+                    "validator {}'s precommit signature does not verify against the \
+                     key it had registered at height {}: {e}",
+                    vote.validator, cert.height
+                ))?;
+            }
+
+            counted_power = counted_power.saturating_add(power);
+        }
+
+        if counted_power < quorum {
+            return Err(format!(
+                "certificate for height {} carries only {counted_power} of voting \
+                 power effective at that height, short of the {quorum} needed for \
+                 quorum under the set that was actually active then",
+                cert.height
+            ));
+        }
 
         Ok(())
     }
@@ -3110,26 +3734,60 @@ impl Node {
             let power = validator.voting_power;
             if power == 0 { continue; }
 
-            // Cast prevote
-            let prevote = Vote {
-                vote_type:  VoteType::Prevote,
-                height,
-                round,
-                validator:  validator.id.clone(),
-                block_hash: Some(proposal.block_hash.clone()),
-                signature:  vec![],
+            // Every genesis validator now carries a registered consensus
+            // key (mandatory-keys migration), so receive_vote's fail-closed
+            // rule treats an empty signature on a keyed validator as a
+            // forgery and rejects it (chain-forge-consensus::TendermintEngine
+            // ::receive_vote and friends). Before this migration no genesis
+            // validator had a key, so an empty signature here was silently
+            // accepted; it no longer is.
+            //
+            // This loop simulates ALL validators voting from a single
+            // process (devnet/single-node mode has no real peers), so we
+            // cannot sign with "the" operator key -- there isn't one key
+            // for four identities. We also must never place other
+            // validators' private keys in genesis. Instead we re-derive
+            // the same deterministic keypair devnet genesis tooling already
+            // uses (chain-forge-crypto/src/bin/gen_devnet_keys.rs derives
+            // every devnet validator's keypair from `generate_keypair
+            // (address)`), strictly in memory, for this simulation only.
+            // We only use it if it reproduces the exact public key genesis
+            // registered for that validator -- if some other, externally
+            // supplied key was registered instead, the derived key won't
+            // match and the vote is correctly left unsigned (and will then
+            // be rejected, same as a real forged vote would be), rather
+            // than silently trusted.
+            let devnet_sim_key = ClassicalScheme.generate_keypair(&validator.id.0)
+                .ok()
+                .filter(|kp| kp.public_key == validator.public_key);
+
+            let sign_devnet_vote = |vote_type: VoteType| -> Vote {
+                let mut vote = Vote {
+                    vote_type,
+                    height,
+                    round,
+                    validator:  validator.id.clone(),
+                    block_hash: Some(proposal.block_hash.clone()),
+                    signature:  vec![],
+                };
+                if let Some(ref kp) = devnet_sim_key {
+                    let bytes = vote_signing_bytes(
+                        &self.genesis.chain_id, &vote.vote_type, vote.height,
+                        vote.round, vote.block_hash.as_ref(),
+                    );
+                    if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
+                        vote.signature = sig.bytes;
+                    }
+                }
+                vote
             };
+
+            // Cast prevote
+            let prevote = sign_devnet_vote(VoteType::Prevote);
             let _ = self.consensus.receive_vote(prevote).await;
 
             // Cast precommit
-            let precommit = Vote {
-                vote_type:  VoteType::Precommit,
-                height,
-                round,
-                validator:  validator.id.clone(),
-                block_hash: Some(proposal.block_hash.clone()),
-                signature:  vec![],
-            };
+            let precommit = sign_devnet_vote(VoteType::Precommit);
 
             match self.consensus.receive_vote(precommit).await {
                 Ok(Some(c)) => { cert = Some(c); break; }
@@ -3151,7 +3809,31 @@ impl Node {
             .map(|t| (t.id.clone(), t.sender.clone(), tx_kind_label(&t.body).to_string()))
             .collect();
 
-        self.identity.advance_epoch(now_ms);
+        // CF-VAL-KEY-002: same snapshot-before-consume as the multi-node
+        // commit_block path -- see that path's full comment.
+        let register_key_attempts: Vec<(usize, String, Vec<u8>)> = txs.iter().enumerate()
+            .filter_map(|(i, t)| {
+                if let chain_forge_execution::TxBody::RegisterValidatorKey { consensus_pubkey, .. } = &t.body {
+                    Some((i, t.sender.clone(), consensus_pubkey.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Snapshot the validator set that actually produced this cert
+        // BEFORE any epoch-boundary mutation below -- same reasoning as the
+        // multi-node commit_block path (see `historical_validator_sets`'s
+        // doc comment).
+        self.historical_validator_sets.insert(height, self.consensus.validator_set().clone());
+
+        // Deterministic, block-height-driven validator epoch -- same reason
+        // as the multi-node commit_block path: this is the devnet
+        // single-node auto-commit path, so it needs its own copy. See that
+        // path's full design comment for why liveness/admission read from
+        // this instead of `self.identity.advance_epoch(now_ms)`.
+        let validator_epoch = height / self.validator_epoch_blocks;
+        let epoch_rolled = self.identity.advance_epoch_to(validator_epoch);
 
         // Integration Point 3 (Push) — same reconciliation as the multi-node
         // commit path: after advancing the epoch, revoke ValidatorRegistry
@@ -3201,6 +3883,123 @@ impl Node {
             state_root = %exec_result.state_root,
             "block executed and committed"
         );
+
+        // CF-VAL-KEY-002: mirror successful RegisterValidatorKey txs into
+        // the registry -- see the multi-node commit_block path's full
+        // comment for why this runs here and what the executor already
+        // verified before this tx could succeed at all.
+        {
+            let epoch = self.identity.clock.current_epoch;
+            for (idx, sender, pubkey) in &register_key_attempts {
+                let Some(result) = exec_result.tx_results.get(*idx) else { continue };
+                if !result.success {
+                    continue;
+                }
+                if let Err(e) = self.validator_registry.register_consensus_key(sender, pubkey, epoch) {
+                    warn!(validator = %sender, error = %e, "consensus key registration mirror failed");
+                }
+            }
+        }
+
+        // Integration Point 4 (Push) — same stake-bond admission as the
+        // multi-node commit path (see the full design comment there). This
+        // is the devnet/single-node auto-commit path, so it needs its own
+        // copy rather than a shared call: the two paths build/cast votes
+        // differently and don't share a merge point before `on_commit`.
+        if epoch_rolled {
+            let active = chain_forge_execution::validator_bond::compute_stake_active_set(
+                &self.state,
+                self.executor.native_denom(),
+                self.min_bond_uqcb,
+                chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
+            );
+            let mut updated_vs = self.consensus.validator_set().clone();
+            let already_seated: std::collections::HashSet<String> = updated_vs.validators
+                .iter()
+                .map(|v| v.id.0.clone())
+                .collect();
+            let capacity = chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS
+                .saturating_sub(updated_vs.validators.len());
+            let mut admitted = 0usize;
+            for (addr, bonded_uqcb) in &active {
+                if admitted >= capacity {
+                    break;
+                }
+                if already_seated.contains(addr) {
+                    continue;
+                }
+                info!(
+                    validator = %addr,
+                    bonded_uqcb = *bonded_uqcb,
+                    "stake bond: admitting new validator candidate to active set"
+                );
+                // CF-VAL-KEY-002: same real-key lookup as the multi-node
+                // commit_block path -- see that path's comment.
+                let public_key = self.validator_registry
+                    .consensus_pubkey_bytes(addr)
+                    .unwrap_or_default();
+                updated_vs.validators.push(chain_forge_consensus::ValidatorInfo {
+                    id: chain_forge_consensus::ValidatorId(addr.clone()),
+                    voting_power: (*bonded_uqcb).min(u64::MAX as u128) as u64,
+                    pop_verified: false,
+                    public_key,
+                });
+                admitted += 1;
+            }
+            if admitted > 0 {
+                updated_vs.height = height;
+                let _ = self.consensus.update_validator_set(updated_vs);
+            }
+        }
+
+        // CF-VAL-KEY-002: same per-block pop_verified/public_key refresh as
+        // the multi-node commit_block path (see that path's full design
+        // comment) -- this devnet/single-node auto-commit path previously
+        // had no equivalent of this step at all, so a validator admitted
+        // here before it had a key (or before its identity was Verified)
+        // could never pick either one up later except at its own admission
+        // moment. That gap is exactly the kind of restart/refresh hole
+        // CF-VAL-KEY-002 exists to close, and test7-restart-recovery-local.sh
+        // runs exclusively through this path, so it must get the same
+        // ongoing refresh the multi-node path already has.
+        {
+            let current_vs = self.consensus.validator_set().clone();
+            let mut updated_vs = current_vs;
+            let mut any_changed = false;
+            for v in &mut updated_vs.validators {
+                let now_verified = self.identity.get(&v.id.0)
+                    .map(|r| r.charm.tier.grants_consensus())
+                    .unwrap_or(false);
+                if v.pop_verified != now_verified {
+                    v.pop_verified = now_verified;
+                    any_changed = true;
+                }
+                if v.public_key.is_empty() {
+                    if let Some(real_key) = self.validator_registry.consensus_pubkey_bytes(&v.id.0) {
+                        v.public_key = real_key;
+                        any_changed = true;
+                    }
+                }
+                // CF-VAL-KEY-002: same voting-power restoration as the
+                // multi-node commit_block path -- see that path's comment.
+                if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
+                    let bond_addr = format!(
+                        "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
+                    );
+                    let bonded = self.state.get_account(&bond_addr)
+                        .map(|a| a.balance_of(self.executor.native_denom()))
+                        .unwrap_or(0);
+                    if bonded > 0 {
+                        v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                        any_changed = true;
+                    }
+                }
+            }
+            if any_changed {
+                updated_vs.height = height;
+                let _ = self.consensus.update_validator_set(updated_vs);
+            }
+        }
 
         // Advance consensus to next height
         self.consensus.on_commit(cert.clone(), None).await
@@ -3260,12 +4059,17 @@ impl Node {
             }
 
             // Sync validator power snapshot for GET /api/validators.
-            let vs = self.validator_registry.build_validator_set(exec_result.height);
-            ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
-                id:           v.id.0.clone(),
-                voting_power: v.voting_power,
-                pop_verified: v.pop_verified,
-            }).collect();
+            // Use the live consensus ValidatorSet so registered consensus
+            // keys (from RegisterValidatorKey) are reflected immediately.
+            {
+                let live = self.consensus.validator_set();
+                ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
+                    id:           v.id.0.clone(),
+                    voting_power: v.voting_power,
+                    pop_verified: v.pop_verified,
+                    consensus_pubkey: hex::encode(&v.public_key),
+                }).collect();
+            }
         }
 
         // Update QRC resource economy metrics snapshot (Section 9.1 / 5.4 / 5.5)
@@ -3310,15 +4114,26 @@ mod tests {
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
-        "modules": ["bank", "staking", "identity", "qrc", "agents"],
+        "modules": ["bank", "staking", "identity", "agents", "pocd"],
         "custom_modules": [],
         "genesis_accounts": [
-            { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator" },
-            { "label": "Bob",   "address": "qcb1bob",   "balance": "5000000", "role": "validator" },
-            { "label": "Carol", "address": "qcb1carol", "balance": "5000000", "role": "validator" },
-            { "label": "Dave",  "address": "qcb1dave",  "balance": "5000000", "role": "validator" }
+            { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator", "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8" },
+            { "label": "Bob",   "address": "qcb1bob",   "balance": "5000000", "role": "validator", "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0" },
+            { "label": "Carol", "address": "qcb1carol", "balance": "5000000", "role": "validator", "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692" },
+            { "label": "Dave",  "address": "qcb1dave",  "balance": "5000000", "role": "validator", "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0" }
         ]
     }"#;
+    // The four public keys above are not arbitrary: they are
+    // ClassicalScheme.generate_keypair("qcb1<name>") under the real-crypto
+    // feature (SHA-256(address) -> deterministic Ed25519 seed) -- the exact
+    // same values already committed in tests/devnet/genesis-4node.json for
+    // the real 4-node devnet harness. Reusing them keeps every genesis
+    // fixture in this codebase internally consistent with one
+    // deterministic, reproducible keygen path, rather than introducing a
+    // third, disconnected set of test-only keys. Verified independently
+    // against the current chain-forge-crypto::ClassicalScheme::generate_keypair
+    // implementation while building this migration -- see the "Mandatory
+    // validator keys" migration notes.
 
     #[tokio::test]
     async fn node_initialises_from_genesis() {
@@ -3327,6 +4142,307 @@ mod tests {
         assert_eq!(node.environment(), "devnet");
         assert_eq!(node.consensus.current_height(), 0);
         assert_eq!(node.state.account_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn node_resolves_default_bonding_params_when_genesis_omits_the_override() {
+        // GENESIS (above) predates `validator_bonding` entirely -- same
+        // shape as every genesis file on disk today. Confirms the engine
+        // falls back to its compiled-in defaults byte-for-byte, i.e. this
+        // change set does not alter behavior for any existing genesis file.
+        let node = Node::new(GENESIS, None).await.unwrap();
+        assert_eq!(node.validator_epoch_blocks, DEFAULT_VALIDATOR_EPOCH_BLOCKS);
+        assert_eq!(
+            node.min_bond_uqcb,
+            chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB
+        );
+    }
+
+    #[tokio::test]
+    async fn node_resolves_validator_bonding_overrides_from_genesis() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "min_bond_amount": 7000000, "validator_epoch_blocks": 42 },"#,
+        );
+        let node = Node::new(&json, None).await.unwrap();
+        assert_eq!(node.validator_epoch_blocks, 42);
+        assert_eq!(node.min_bond_uqcb, 7_000_000);
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_registered_validator_public_keys() {
+        // CF-DEVNET-VAL-001 regression (found live via
+        // tests/devnet/test7-restart-recovery-local.sh on a real 4-node
+        // devnet): after a node restarts with --data-dir, the first new
+        // block it helps commit can carry an empty signature for its own
+        // precommit -- despite the validator having a registered genesis
+        // key and a real --key-file -- which every peer that never
+        // restarted then correctly rejects as a forgery:
+        //   "validator qcb1alice has a registered key but precommit in
+        //    commit certificate carries an empty signature (possible
+        //    forgery)"
+        //
+        // Root cause: `Node::load_persisted_state()` rebuilds the live
+        // consensus ValidatorSet after restoring from disk by calling
+        // `ValidatorRegistry::build_validator_set()`, which unconditionally
+        // emits `public_key: vec![]` for every validator (ValidatorRegistry
+        // was never wired to carry the real genesis-registered key --
+        // `register_genesis_validator` stores an empty "genesis-stub"
+        // KeyBundle). This wipes every validator's real public key from the
+        // live set on restart, which does two things: (1) load_signing_key
+        // (called right after, from main.rs) looks up the now-keyless entry
+        // and refuses to load a real signing key at all, even with a
+        // correct --key-file; (2) with no key on file, both
+        // node.rs::verify_vote_signature and
+        // chain_forge_consensus::TendermintEngine::receive_vote fall back
+        // to their Phase-0 "no key on file -> tolerate empty signature"
+        // path -- meant for the pre-mandatory-keys era, not a restarted
+        // node -- so the restarted node locally accepts and commits an
+        // empty-signature "vote" from itself. Any peer that never
+        // restarted still has the correct, non-wiped key and rejects the
+        // resulting certificate. A local-quorum / remote-verification
+        // divergence, not a cosmetic bug.
+        //
+        // This test reproduces the defect without any real OS process
+        // restart or networking: it exercises the exact same
+        // set_data_dir -> commit -> drop -> set_data_dir -> load_persisted_state
+        // sequence main.rs uses, in-process.
+        let dir = std::env::temp_dir()
+            .join(format!("cf-restart-regression-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Phase 1: a node with a data dir commits a couple of blocks.
+        {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.propose_block(cert0.block_hash).await.unwrap();
+            // propose_block()'s devnet/single-node auto-commit path does not
+            // itself call persist_state() (only the real multi-node
+            // commit_block() path does, right after committing each block).
+            // Call it explicitly here so this test persists to disk exactly
+            // what a real node's commit_block() would have persisted after
+            // these same two blocks.
+            node.persist_state();
+
+            // Sanity: before any restart, every genesis validator's real
+            // public key is present in the live set (as seeded from
+            // genesis at construction).
+            for v in &node.consensus.validator_set().validators {
+                assert!(
+                    !v.public_key.is_empty(),
+                    "sanity check failed: {} should have a public key \
+                     before any restart ever happens",
+                    v.id
+                );
+            }
+        } // node dropped -- simulates process exit.
+
+        // Phase 2: a fresh node instance ("restart") resumes from the same
+        // data dir, exactly as main.rs does: set_data_dir then
+        // load_persisted_state.
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(
+            restarted.load_persisted_state(),
+            "persisted state from phase 1 must be found and loaded"
+        );
+
+        // The actual defect: every validator's public key must survive the
+        // restart. Before the fix, this fails -- build_validator_set()
+        // replaces the whole set with public_key: vec![] for everyone.
+        for v in &restarted.consensus.validator_set().validators {
+            assert!(
+                !v.public_key.is_empty(),
+                "validator {} lost its registered public key across restart \
+                 -- this is what lets a restarted node locally accept and \
+                 commit an empty-signature vote that peers who never \
+                 restarted will correctly reject as a forgery",
+                v.id
+            );
+        }
+
+        // Closing the loop on the actual observed symptom: load_signing_key
+        // (called right after load_persisted_state in main.rs, with a real
+        // key file on disk) must still succeed post-restart.
+        let key_dir = dir.join("test-keys");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("alice.key.json");
+        // Same deterministic devnet keypair the GENESIS fixture's
+        // registered public key for qcb1alice comes from (see the comment
+        // above the GENESIS constant).
+        let kp = chain_forge_crypto::ClassicalScheme
+            .generate_keypair("qcb1alice")
+            .unwrap();
+        fn hex_encode(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        std::fs::write(
+            &key_path,
+            serde_json::json!({
+                "address": "qcb1alice",
+                "public_key": hex_encode(&kp.public_key),
+                "private_key": hex_encode(&kp.private_key),
+                "scheme": "classical-ed25519",
+            }).to_string(),
+        ).unwrap();
+
+        restarted.load_signing_key(&key_path).unwrap_or_else(|e| {
+            panic!("load_signing_key must succeed post-restart with a correct \
+                    key file, matching the genesis-registered key: {e}")
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restart_still_rejects_forged_or_unsigned_precommit_after_fix() {
+        // Adversarial counterpart to
+        // `restart_preserves_registered_validator_public_keys`: the fix for
+        // CF-DEVNET-VAL-001 only backfills a validator's REAL, already
+        // genesis-verified public key across restart -- it must not
+        // loosen signature verification itself. Prove that, post-restart,
+        // a validator whose key WAS correctly preserved still has every
+        // vote checked against it: an empty signature and a tampered
+        // signature are both still rejected, exactly as they would be for
+        // a node that never restarted at all.
+        let dir = std::env::temp_dir()
+            .join(format!("cf-restart-adversarial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.propose_block(cert0.block_hash).await.unwrap();
+            node.persist_state();
+        }
+
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+
+        let alice = chain_forge_consensus::ValidatorId("qcb1alice".into());
+        let height = restarted.consensus.current_height();
+        let round = restarted.consensus.current_round();
+        let block_hash = chain_forge_consensus::BlockHash("deadbeefdeadbeef".into());
+
+        // 1. Genuinely unsigned (empty-signature) precommit for a validator
+        //    the fix just restored a real key for -- must still be
+        //    rejected, not silently tolerated by the Phase-0 no-key
+        //    allowance (that allowance only applies when public_key really
+        //    is empty, which it no longer is for alice post-fix).
+        let unsigned = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  alice.clone(),
+            block_hash: Some(block_hash.clone()),
+            signature:  vec![],
+        };
+        assert!(
+            restarted.verify_vote_signature(&unsigned).is_err(),
+            "an empty-signature precommit for a validator with a (now correctly \
+             restored) registered key must still be rejected after the fix"
+        );
+
+        // 2. A forged precommit: signed with a key that is NOT alice's real
+        //    genesis key, claiming to be alice. Must still be rejected.
+        let forger_kp = ClassicalScheme.generate_keypair("not-the-real-alice-key")
+            .unwrap();
+        let bytes = chain_forge_consensus::vote_signing_bytes(
+            &restarted.genesis.chain_id, &VoteType::Precommit, height, round,
+            Some(&block_hash),
+        );
+        let forged_sig = ClassicalScheme.sign(&bytes, &forger_kp).unwrap();
+        let forged = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  alice.clone(),
+            block_hash: Some(block_hash.clone()),
+            signature:  forged_sig.bytes,
+        };
+        assert!(
+            restarted.verify_vote_signature(&forged).is_err(),
+            "a precommit for alice signed with any key other than alice's real \
+             registered key must still be rejected after the fix"
+        );
+
+        // 3. Sanity: a precommit genuinely signed with alice's real
+        //    genesis-registered key (same key the fix preserved) must
+        //    still verify successfully -- the fix did not also break the
+        //    honest path.
+        let real_kp = ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+        let real_sig = ClassicalScheme.sign(&bytes, &real_kp).unwrap();
+        let honest = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  alice,
+            block_hash: Some(block_hash),
+            signature:  real_sig.bytes,
+        };
+        assert!(
+            restarted.verify_vote_signature(&honest).is_ok(),
+            "a precommit genuinely signed with alice's real registered key \
+             must still verify successfully after the fix"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_zero_min_bond_amount_in_genesis() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "min_bond_amount": 0 },"#,
+        );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a genesis with min_bond_amount=0 must refuse to start");
+        assert!(matches!(err, NodeError::Genesis(_)));
+        assert!(err.to_string().contains("min_bond_amount"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_zero_validator_epoch_blocks_in_genesis() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "validator_epoch_blocks": 0 },"#,
+        );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a genesis with validator_epoch_blocks=0 must refuse to start -- it would divide by zero on the first commit");
+        assert!(matches!(err, NodeError::Genesis(_)));
+        assert!(err.to_string().contains("validator_epoch_blocks"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn two_nodes_from_the_same_overriding_genesis_agree_on_epoch_boundaries() {
+        // Requirement #5: every node must derive the SAME validator epoch
+        // boundary and minimum-bond rule from the SAME genesis -- not from
+        // a locally-set field. Two independently-constructed nodes parsing
+        // the identical overriding genesis JSON must compute identical
+        // `validator_epoch_blocks`/`min_bond_uqcb`, and therefore roll an
+        // epoch at the identical height, with no coordination between them
+        // beyond the genesis bytes itself.
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "min_bond_amount": 3000000, "validator_epoch_blocks": 2 },"#,
+        );
+        let node_a = Node::new(&json, None).await.unwrap();
+        let node_b = Node::new(&json, None).await.unwrap();
+        assert_eq!(node_a.validator_epoch_blocks, node_b.validator_epoch_blocks);
+        assert_eq!(node_a.min_bond_uqcb, node_b.min_bond_uqcb);
+        assert_eq!(node_a.validator_epoch_blocks, 2);
+        assert_eq!(node_a.min_bond_uqcb, 3_000_000);
     }
 
     #[tokio::test]
@@ -3392,6 +4508,548 @@ mod tests {
         // Bob should have 5_100_000 after receiving 100_000
         let bob_balance = node.state.get_account("qcb1bob").unwrap().balance_of("uqcb");
         assert_eq!(bob_balance, 5_100_000);
+    }
+
+    #[tokio::test]
+    async fn bonded_stake_admits_new_validator_candidate_at_epoch_boundary() {
+        // ROADMAP.md, Validator Onboarding: a brand-new address with no
+        // genesis role at all should be able to bond stake and actually
+        // enter the live consensus ValidatorSet -- the gap Integration
+        // Point 4 closes. None of the 4 genesis accounts exercise this: all
+        // of them already hold role "validator" and are seated from block
+        // 0, so this test uses a fifth address the genesis set never heard
+        // of.
+        use chain_forge_execution::Transaction;
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        assert!(
+            !node.consensus.validator_set().validators.iter().any(|v| v.id.0 == "qcb1erin"),
+            "qcb1erin must not be seated before bonding anything"
+        );
+
+        // Deterministic block-height epochs: force every block to be an
+        // epoch boundary (height % 1 == 0, always true) rather than
+        // waiting out DEFAULT_VALIDATOR_EPOCH_BLOCKS real commits -- this
+        // test is about admission at an epoch boundary, not about epoch
+        // timing itself.
+        node.validator_epoch_blocks = 1;
+
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Block 0: fund the new address (it holds nothing at genesis, so
+        // it cannot bond before it has uqcb to bond).
+        node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_000_000, 0));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        // Block 1: bond the min threshold and above.
+        node.submit_tx(Transaction::bond_validator("bond-erin", "qcb1erin", 2_000_000, 0));
+        node.propose_block(cert0.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let erin = vs.validators.iter().find(|v| v.id.0 == "qcb1erin")
+            .expect("qcb1erin must be admitted to the active set after bonding above the minimum");
+        // Mandatory-personhood migration: stake determines admission
+        // eligibility and ranking, but voting power is bounded by verified
+        // personhood (chain-forge-consensus::gate_voting_power, applied
+        // unconditionally in every engine). Erin is seated -- she holds a
+        // slot in the active set and her bonded stake is tracked -- but
+        // until the IdentityStore marks her Verified she has zero EFFECTIVE
+        // voting power, same as a keyless validator would. This was
+        // previously 2_000_000 (stake-weighted, ungated); that behavior
+        // predates the mandatory-personhood requirement and is no longer
+        // correct.
+        assert_eq!(erin.voting_power, 0,
+            "an unverified entrant must have zero effective voting power even though admitted");
+        assert!(!erin.pop_verified, "new entrant starts unverified until IdentityStore says otherwise");
+    }
+
+    #[tokio::test]
+    async fn validator_epoch_and_admission_converge_identically_across_nodes() {
+        // Deterministic block-height validator epochs: two INDEPENDENTLY
+        // constructed nodes (simulating two separate processes, each with
+        // its own SystemTime::now() at construction and at every would-be
+        // wall-clock read) must reach IDENTICAL validator-epoch state --
+        // and identical admission outcomes -- after processing the exact
+        // same block sequence, even with real wall-clock skew introduced
+        // between them. Before this migration, `advance_epoch(now_ms)`
+        // read each node's own SystemTime::now() for exactly this
+        // decision, so skew could make one node admit/lapse a validator a
+        // commit earlier or later than the other -- a state-divergence
+        // and quorum-safety risk, not just a cosmetic one.
+        use chain_forge_execution::Transaction;
+
+        async fn fund_and_bond_erin(node: &mut Node) -> chain_forge_consensus::ValidatorSet {
+            node.validator_epoch_blocks = 2;
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_000_000, 0));
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.submit_tx(Transaction::bond_validator("bond-erin", "qcb1erin", 2_000_000, 0));
+            let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
+            // One more "do nothing" block so both nodes land on the same
+            // final height/epoch before comparison.
+            node.propose_block(cert1.block_hash).await.unwrap();
+            node.consensus.validator_set().clone()
+        }
+
+        let mut node_a = Node::new(GENESIS, None).await.unwrap();
+        let vs_a = fund_and_bond_erin(&mut node_a).await;
+
+        // Real wall-clock delay before the second node processes the exact
+        // same sequence -- if anything still read SystemTime for epoch
+        // advancement, this is where it would show up as a divergence.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut node_b = Node::new(GENESIS, None).await.unwrap();
+        let vs_b = fund_and_bond_erin(&mut node_b).await;
+
+        assert_eq!(
+            node_a.identity.clock.current_epoch,
+            node_b.identity.clock.current_epoch,
+            "validator epoch number must be identical across nodes regardless \
+             of real-time skew between them"
+        );
+        assert_eq!(node_a.identity.clock.current_epoch, 1,
+            "height 2 / validator_epoch_blocks(2) == epoch 1");
+
+        let ids_and_power = |vs: &chain_forge_consensus::ValidatorSet| -> Vec<(String, u64)> {
+            let mut v: Vec<(String, u64)> = vs.validators.iter()
+                .map(|vi| (vi.id.0.clone(), vi.voting_power))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            ids_and_power(&vs_a), ids_and_power(&vs_b),
+            "the full active validator set (membership AND voting power) must \
+             converge identically across nodes after the same block sequence"
+        );
+        assert!(
+            vs_a.validators.iter().any(|v| v.id.0 == "qcb1erin"),
+            "sanity check: Erin must actually have been admitted on both nodes"
+        );
+    }
+
+    // -- CF-VAL-KEY-002: Mandatory Consensus Public Keys for Post-Genesis
+    //    Validators -- Phase 4 regression tests ----------------------------
+
+    /// A validator identity derived from a real keypair (not a human label
+    /// like "qcb1erin") -- required because `RegisterValidatorKey` now
+    /// enforces real signature authentication unconditionally, and an
+    /// unbound, non-derived named address can never pass that check (see
+    /// `verify_authorization_signed`'s first-use derivation rule).
+    fn keyed_candidate(seed: &str) -> (chain_forge_crypto::KeyPair, String) {
+        let kp = ClassicalScheme.generate_keypair(seed).unwrap();
+        let addr = chain_forge_core::Address::from_public_key(
+            &kp.public_key, "qcb", chain_forge_core::HashWidth::Bits256,
+        ).to_string();
+        (kp, addr)
+    }
+
+    fn register_key_tx(
+        sender: &str, nonce: u64, consensus_kp: &chain_forge_crypto::KeyPair, chain_id: &str,
+    ) -> Transaction {
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes(chain_id, sender);
+        let pop_sig = ClassicalScheme.sign(&pop_msg, consensus_kp).unwrap();
+        let mut tx = Transaction {
+            id:        format!("regkey-{sender}-{nonce}"),
+            sender:    sender.to_string(),
+            nonce,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    consensus_kp.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+            },
+            gas_limit: 10_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        tx.sign(consensus_kp, chain_id).unwrap();
+        tx
+    }
+
+    /// Funds, bonds, and grants verified personhood to a brand-new
+    /// candidate, driving the node through blocks until they are admitted
+    /// into the live consensus ValidatorSet. Does NOT register a consensus
+    /// key -- callers add that step themselves so both "has a key" and
+    /// "has no key" scenarios share this setup.
+    async fn fund_bond_and_verify_personhood(
+        node: &mut Node, addr: &str, amount: u128, parent_hash: chain_forge_consensus::BlockHash,
+    ) -> chain_forge_consensus::CommitCertificate {
+        node.validator_epoch_blocks = 2;
+        node.submit_tx(Transaction::transfer("fund", "qcb1alice", addr, "uqcb", amount, 0));
+        let cert0 = node.propose_block(parent_hash).await.unwrap();
+
+        node.submit_tx(Transaction::bond_validator("bond", addr, amount, 0));
+        let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
+
+        // Grant verified personhood directly via the identity layer, same
+        // mechanism used to seed genesis validators (Node::new_with_config) --
+        // bypasses the full on-chain Attest-quorum flow, which is a separate
+        // concern from this test's focus (key registration).
+        let epoch = node.identity.clock.current_epoch;
+        let att = chain_forge_identity::PopAttestation::genesis(addr, epoch);
+        let _ = node.identity.register(addr.to_string(), addr.to_string(), att.clone());
+        node.identity.verify_identity(addr, att, None).unwrap();
+
+        // One more block: this is the epoch boundary (validator_epoch_blocks=2,
+        // height now 2) where Integration Point 4 admits the new candidate
+        // and the pop_verified refresh picks up the just-granted personhood.
+        node.propose_block(cert1.block_hash).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn bonded_validator_with_key_and_personhood_becomes_eligible() {
+        // CF-VAL-KEY-002 Phase 4 test #1.
+        let (kp, addr) = keyed_candidate("seed-eligible-validator");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        // One more block to execute the registration and let the refresh
+        // loop pick the new key up into the live ValidatorSet.
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr)
+            .expect("validator must be seated in the active set");
+        assert!(!v.public_key.is_empty(), "validator must have a real key on file");
+        assert_eq!(v.public_key, kp.public_key);
+        assert!(v.pop_verified, "validator must have verified personhood");
+        assert!(
+            v.voting_power > 0,
+            "a validator with BOTH a registered key AND verified personhood \
+             must carry real voting power"
+        );
+    }
+
+    #[tokio::test]
+    async fn bonded_validator_without_key_has_zero_voting_power() {
+        // CF-VAL-KEY-002 Phase 4 test #2. Same setup as the test above --
+        // funded, bonded, personhood verified -- EXCEPT no
+        // RegisterValidatorKey tx is ever submitted.
+        let (_, addr) = keyed_candidate("seed-keyless-validator");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr)
+            .expect("validator must still hold a seat (its bond record) even without a key");
+        assert!(v.public_key.is_empty(), "sanity: no key was ever registered");
+        assert_eq!(
+            v.voting_power, 0,
+            "a bonded validator with verified personhood but NO registered \
+             consensus key must carry zero voting power -- it may keep its \
+             bond record but cannot participate in consensus"
+        );
+    }
+
+    #[tokio::test]
+    async fn bonded_validators_unsigned_precommit_is_rejected() {
+        // CF-VAL-KEY-002 Phase 4 test #4, for a validator admitted AFTER
+        // genesis through this new mechanism specifically (the existing
+        // `receive_vote_rejects_empty_sig_when_key_registered` in
+        // chain-forge-consensus already covers this generically; this
+        // closes the loop end-to-end through the actual bonding + key
+        // registration path).
+        let (kp, addr) = keyed_candidate("seed-unsigned-precommit-validator");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        assert!(vs.validators.iter().any(|v| v.id.0 == addr && !v.public_key.is_empty()));
+
+        let height = node.consensus.current_height();
+        let round  = node.consensus.current_round();
+        let unsigned = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  chain_forge_consensus::ValidatorId(addr.clone()),
+            block_hash: Some(cert.block_hash.clone()),
+            signature:  vec![],
+        };
+        let result = node.consensus.receive_vote(unsigned).await;
+        assert!(
+            result.is_err(),
+            "an unsigned precommit from a validator with a registered key \
+             must be rejected, whether that validator was seated at genesis \
+             or admitted later via BondValidator + RegisterValidatorKey"
+        );
+    }
+
+    #[tokio::test]
+    async fn bonded_validators_vote_signed_by_wrong_key_is_rejected() {
+        // CF-VAL-KEY-002 Phase 4 test #5.
+        let (kp, addr) = keyed_candidate("seed-wrong-key-validator");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+
+        let height = node.consensus.current_height();
+        let round  = node.consensus.current_round();
+        let wrong_kp = ClassicalScheme.generate_keypair("an-impostor-key").unwrap();
+        let bytes = vote_signing_bytes(
+            node.chain_id(), &VoteType::Precommit, height, round, Some(&cert.block_hash),
+        );
+        let forged_sig = ClassicalScheme.sign(&bytes, &wrong_kp).unwrap();
+        let forged = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  chain_forge_consensus::ValidatorId(addr.clone()),
+            block_hash: Some(cert.block_hash.clone()),
+            signature:  forged_sig.bytes,
+        };
+        let result = node.consensus.receive_vote(forged).await;
+        assert!(
+            result.is_err(),
+            "a precommit claiming to be this validator but signed with a \
+             different key must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_nodes_compute_identical_validator_sets_after_key_registration() {
+        // CF-VAL-KEY-002 Phase 4 test #7.
+        let (kp, addr) = keyed_candidate("seed-convergence-validator");
+
+        async fn run(node: &mut Node, addr: &str, kp: &chain_forge_crypto::KeyPair) -> chain_forge_consensus::ValidatorSet {
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert = fund_bond_and_verify_personhood(node, addr, 2_000_000, genesis_hash).await;
+            node.submit_tx(register_key_tx(addr, 1, kp, node.chain_id()));
+            node.propose_block(cert.block_hash).await.unwrap();
+            node.consensus.validator_set().clone()
+        }
+
+        let mut node_a = Node::new(GENESIS, None).await.unwrap();
+        let vs_a = run(&mut node_a, &addr, &kp).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let mut node_b = Node::new(GENESIS, None).await.unwrap();
+        let vs_b = run(&mut node_b, &addr, &kp).await;
+
+        let fingerprint = |vs: &chain_forge_consensus::ValidatorSet| -> Vec<(String, u64, bool, Vec<u8>)> {
+            let mut v: Vec<_> = vs.validators.iter()
+                .map(|vi| (vi.id.0.clone(), vi.voting_power, vi.pop_verified, vi.public_key.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            fingerprint(&vs_a), fingerprint(&vs_b),
+            "membership, voting power, personhood, AND the registered key \
+             itself must converge identically across independently-run nodes \
+             processing the same transaction sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn bonded_validators_key_survives_restart_and_epoch_transition() {
+        // CF-VAL-KEY-002 Phase 4 test #8.
+        let (kp, addr) = keyed_candidate("seed-restart-validator");
+        let dir = std::env::temp_dir()
+            .join(format!("cf-val-key-002-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (vs_before, height_before) = {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+            node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+            node.propose_block(cert.block_hash).await.unwrap();
+            node.persist_state();
+            // `persist_state()`/`load_persisted_state()` key off the
+            // StateStore's own committed height (the last EXECUTED block),
+            // not `consensus.current_height()` (the NEXT height to
+            // propose, already one ahead after `on_commit`) -- so that is
+            // the value to compare against post-restart, not the
+            // consensus engine's counter.
+            (node.consensus.validator_set().clone(), node.state.current_height())
+        };
+        let v_before = vs_before.validators.iter().find(|v| v.id.0 == addr).unwrap();
+        assert!(!v_before.public_key.is_empty());
+        assert!(v_before.voting_power > 0, "sanity: validator had real power before restart");
+
+        let mut restarted = Node::new(GENESIS, None).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+        assert_eq!(restarted.consensus.current_height(), height_before);
+
+        let vs_after = restarted.consensus.validator_set();
+        let v_after = vs_after.validators.iter().find(|v| v.id.0 == addr)
+            .expect(
+                "the bonded validator must still hold its seat after restart -- \
+                 before CF-VAL-KEY-002's restart-persistence fix, a validator \
+                 admitted after genesis was entirely absent from the \
+                 reconstructed set, not merely missing its key"
+            );
+        assert_eq!(v_after.public_key, kp.public_key, "key must survive restart");
+        assert_eq!(v_after.voting_power, v_before.voting_power, "voting power must survive restart");
+        assert_eq!(v_after.pop_verified, v_before.pop_verified);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn historical_validator_set_retains_the_registered_key() {
+        // CF-VAL-KEY-002 Phase 4 test #9.
+        let (kp, addr) = keyed_candidate("seed-historical-validator");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+
+        // historical_validator_sets[height] is snapshotted BEFORE that
+        // height's own admission/refresh mutations (see commit_block's
+        // design comment), so the snapshot that actually carries this
+        // validator's key is the one taken for the height immediately
+        // AFTER the block that registered it.
+        let next_height = node.consensus.current_height();
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let snapshot = node.historical_validator_sets.get(&next_height)
+            .expect("a historical snapshot must exist for the height after key registration");
+        let v = snapshot.validators.iter().find(|v| v.id.0 == addr)
+            .expect("validator must be present in the historical snapshot");
+        assert_eq!(
+            v.public_key, kp.public_key,
+            "the historical validator set used for certificate verification \
+             must retain the real registered key, not an empty placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_certificate_against_history_uses_set_effective_at_height_not_live_set() {
+        // "Preserve historical validator sets: certificates must be
+        // verified against the validator set effective at their height,
+        // not the current live set" -- this is the exact property under
+        // test.
+        //
+        // Scenario: a certificate for height 7 really did reach quorum
+        // under a 4-validator set (quorum = 3 of 4). The live set then
+        // grows to 5 validators (quorum = 4 of 5). The same 3-precommit
+        // certificate must still verify correctly against the HISTORICAL
+        // set it actually belongs to -- it would incorrectly fall short
+        // if checked against today's live quorum instead.
+        use chain_forge_consensus::{vote_signing_bytes, BlockHash, CommitCertificate, ValidatorId, ValidatorInfo, ValidatorSet, Vote, VoteType};
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+
+        let keyed = |addr: &str| -> ValidatorInfo {
+            let kp = ClassicalScheme.generate_keypair(addr).unwrap();
+            ValidatorInfo { id: ValidatorId(addr.to_string()), voting_power: 1, pop_verified: true, public_key: kp.public_key }
+        };
+        let historical = ValidatorSet {
+            height: 7,
+            validators: vec![keyed("qcb1alice"), keyed("qcb1bob"), keyed("qcb1carol"), keyed("qcb1dave")],
+        };
+        assert_eq!(historical.quorum_power(), 3, "4 validators of power 1 each need 3 for quorum");
+        node.historical_validator_sets.insert(7, historical);
+
+        // Grow the LIVE set to 5 validators so its quorum math differs
+        // (5 * 2/3 + 1 = 4) from what was actually in force at height 7.
+        let mut live = node.consensus.validator_set().clone();
+        live.validators.push(keyed("qcb1erin"));
+        live.height = 7;
+        let _ = node.consensus.update_validator_set(live.clone());
+        assert_eq!(node.consensus.validator_set().quorum_power(), 4,
+            "live set must now need 4 of 5 for quorum, different from history");
+
+        let sign = |addr: &str| -> Vote {
+            let mut vote = Vote {
+                vote_type: VoteType::Precommit, height: 7, round: 0,
+                validator: ValidatorId(addr.to_string()),
+                block_hash: Some(BlockHash("block7".to_string())),
+                signature: vec![],
+            };
+            let kp = ClassicalScheme.generate_keypair(addr).unwrap();
+            let bytes = vote_signing_bytes("qcb-testnet-1", &vote.vote_type, vote.height, vote.round, vote.block_hash.as_ref());
+            vote.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+            vote
+        };
+
+        // Exactly 3 of the 4 validators that were ACTUALLY active at height
+        // 7 -- meets that height's real quorum (3), but would fall short of
+        // the live set's quorum (4) if ever (wrongly) checked against it.
+        let cert = CommitCertificate {
+            height: 7, round: 0, block_hash: BlockHash("block7".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob"), sign("qcb1carol")],
+        };
+        assert!(
+            node.verify_certificate_against_history(&cert).is_ok(),
+            "a certificate that met quorum under the set effective at its height \
+             must verify, even though the live set's quorum requirement has \
+             since changed"
+        );
+
+        // Negative check 1: short of even the HISTORICAL quorum (only 2 of
+        // the 3 needed) must fail.
+        let short_cert = CommitCertificate {
+            height: 7, round: 0, block_hash: BlockHash("block7".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob")],
+        };
+        assert!(
+            node.verify_certificate_against_history(&short_cert).is_err(),
+            "2 of 4 historical power must fall short of that height's quorum (3)"
+        );
+
+        // Negative check 2: a validator unknown to (or zero-power in) the
+        // historical set -- e.g. Erin, who was only admitted into the LIVE
+        // set, never the one effective at height 7 -- must not be able to
+        // pad out a certificate's power.
+        let padded_cert = CommitCertificate {
+            height: 7, round: 0, block_hash: BlockHash("block7".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob"), sign("qcb1erin")],
+        };
+        assert!(
+            node.verify_certificate_against_history(&padded_cert).is_err(),
+            "a validator with zero power in the set effective at the cert's \
+             height must not count toward that height's quorum, however much \
+             power it has in the live set"
+        );
+
+        // Negative check 3: no historical entry recorded for the height at
+        // all must be a hard error, not a silent fall-through to the live set.
+        let no_history_cert = CommitCertificate {
+            height: 999, round: 0, block_hash: BlockHash("block999".to_string()),
+            precommits: vec![sign("qcb1alice"), sign("qcb1bob"), sign("qcb1carol")],
+        };
+        let err = node.verify_certificate_against_history(&no_history_cert).err()
+            .expect("missing historical set must be a hard error");
+        assert!(err.contains("no historical validator set recorded"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn bonding_below_minimum_does_not_admit_a_validator() {
+        use chain_forge_execution::Transaction;
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 500_000, 0));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        // Below chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB (1_000_000).
+        node.submit_tx(Transaction::bond_validator("bond-erin", "qcb1erin", 500_000, 0));
+        node.propose_block(cert0.block_hash).await.unwrap();
+
+        assert!(
+            !node.consensus.validator_set().validators.iter().any(|v| v.id.0 == "qcb1erin"),
+            "a sub-minimum bond must not seat a new validator"
+        );
     }
 
     #[tokio::test]
@@ -3524,6 +5182,37 @@ mod tests {
         }
     }
 
+    /// Build a Vote signed by `validator`'s deterministic devnet keypair
+    /// (`ClassicalScheme::generate_keypair(address)`), the same derivation
+    /// GENESIS's embedded public keys were produced with (see GENESIS's
+    /// doc comment above). Needed because every genesis validator now
+    /// carries a registered consensus key, so receive_vote/
+    /// verify_vote_signature's fail-closed rule rejects an empty signature
+    /// as a forgery -- tests that simulate gossiped votes from other
+    /// validators must sign them for real, not just construct a bare Vote.
+    fn signed_vote(
+        chain_id: &str, vote_type: VoteType, height: u64, round: u32,
+        validator: &str, block_hash: chain_forge_consensus::BlockHash,
+    ) -> Vote {
+        let mut vote = Vote {
+            vote_type,
+            height,
+            round,
+            validator:  ValidatorId(validator.to_string()),
+            block_hash: Some(block_hash),
+            signature:  vec![],
+        };
+        let kp = ClassicalScheme.generate_keypair(validator)
+            .expect("deterministic devnet keypair generation must not fail");
+        let bytes = vote_signing_bytes(
+            chain_id, &vote.vote_type, vote.height, vote.round,
+            vote.block_hash.as_ref(),
+        );
+        vote.signature = ClassicalScheme.sign(&bytes, &kp)
+            .expect("signing must not fail").bytes;
+        vote
+    }
+
     fn gossip(topic: GossipTopic, payload: Vec<u8>) -> NetworkEvent {
         NetworkEvent::Message(chain_forge_p2p::GossipMessage {
             topic,
@@ -3554,22 +5243,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_chain_seeds_no_identities() {
+    async fn plain_chain_without_identity_module_refuses_to_start() {
+        // Mandatory-personhood migration: gate_voting_power (chain-forge-
+        // consensus) unconditionally zeroes voting power for any validator
+        // that is not pop_verified, in every engine, with no bypass. A
+        // genesis with the "identity" module disabled has no IdentityStore
+        // web of trust at all -- nobody can ever become Verified -- so
+        // every validator's effective voting power is permanently zero and
+        // the chain could never reach quorum or produce a block.
+        //
+        // Before this migration, disabling "identity" just meant personhood
+        // weighting itself was unavailable (personhood_weighted required
+        // identity, enforced separately); voting power was still
+        // stake/slot-based and worked fine. Now that verified personhood is
+        // mandatory rather than optional, "identity module disabled" is no
+        // longer a viable consensus configuration at all -- this is an
+        // intentional, startup-time hard failure (see the "zero eligible
+        // voting power" check in Node::new_with_config), not a bug.
         let plain = GENESIS
             .replace(
-                r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
+                r#""modules": ["bank", "staking", "identity", "agents", "pocd"]"#,
                 r#""modules": ["bank", "staking"]"#,
             )
             .replace(r#""personhood_weighted": true"#, r#""personhood_weighted": false"#);
-        let node = Node::new(&plain, None).await.unwrap();
-        assert!(node.identity.get("qcb1alice").is_err(),
-            "without the identity module there is no web of trust to seed");
+        let err = Node::new(&plain, None).await.err()
+            .expect("a chain with no identity module can never satisfy mandatory personhood verification");
+        assert!(err.to_string().contains("zero eligible voting power"),
+            "must fail for the personhood/key gate reason, not some unrelated error: {err}");
     }
 
     #[tokio::test]
     async fn node_refuses_to_start_with_an_unknown_module() {
         let bad = GENESIS.replace(
-            r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
+            r#""modules": ["bank", "staking", "identity", "agents", "pocd"]"#,
             r#""modules": ["bank", "dex"]"#,
         );
         let err = Node::new(&bad, None).await.err().expect("must refuse to start");
@@ -3579,7 +5285,7 @@ mod tests {
     #[tokio::test]
     async fn node_refuses_personhood_consensus_without_identity() {
         let bad = GENESIS.replace(
-            r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
+            r#""modules": ["bank", "staking", "identity", "agents", "pocd"]"#,
             r#""modules": ["bank", "staking"]"#,
         ); // fixture keeps personhood_weighted: true
         let err = Node::new(&bad, None).await.err().expect("must refuse to start");
@@ -3620,6 +5326,18 @@ mod tests {
         // alice's proposal via gossip, cast his own votes, and then commit
         // once enough OTHER validators' precommits arrive over gossip too.
         let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+        // Bob's own prevote/precommit (cast automatically in response to the
+        // proposal, via sign_vote) are now also checked against his
+        // registered genesis key, so he needs a signing key loaded or his
+        // own votes silently go out unsigned and get rejected by the exact
+        // same fail-closed rule as a forged vote. load_signing_key only
+        // verifies against genesis (it no longer backfills), so for this
+        // in-memory test we set the deterministic devnet keypair directly
+        // rather than round-tripping through a real key file.
+        node.signing_key = Some(
+            ClassicalScheme.generate_keypair("qcb1bob")
+                .expect("deterministic devnet keypair generation must not fail")
+        );
 
         let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_test");
         let payload = serde_json::to_vec(&proposal).unwrap();
@@ -3631,13 +5349,10 @@ mod tests {
         assert!(node.pending_proposals.contains_key(&(0, 0)));
 
         // Carol's precommit arrives over gossip -- still only 2 of 3.
-        let carol_vote = Vote {
-            vote_type:  VoteType::Precommit,
-            height: 0, round: 0,
-            validator:  ValidatorId("qcb1carol".into()),
-            block_hash: Some(proposal.block_hash.clone()),
-            signature:  vec![],
-        };
+        let carol_vote = signed_vote(
+            "qcb-testnet-1", VoteType::Precommit, 0, 0, "qcb1carol",
+            proposal.block_hash.clone(),
+        );
         node.handle_event(gossip(
             GossipTopic::ConsensusVote,
             serde_json::to_vec(&carol_vote).unwrap(),
@@ -3645,13 +5360,10 @@ mod tests {
         assert_eq!(node.status.lock().unwrap().height, 0, "2 of 3 -- not yet committed");
 
         // Dave's precommit is the 3rd -- quorum reached, block commits.
-        let dave_vote = Vote {
-            vote_type:  VoteType::Precommit,
-            height: 0, round: 0,
-            validator:  ValidatorId("qcb1dave".into()),
-            block_hash: Some(proposal.block_hash.clone()),
-            signature:  vec![],
-        };
+        let dave_vote = signed_vote(
+            "qcb-testnet-1", VoteType::Precommit, 0, 0, "qcb1dave",
+            proposal.block_hash.clone(),
+        );
         node.handle_event(gossip(
             GossipTopic::ConsensusVote,
             serde_json::to_vec(&dave_vote).unwrap(),
@@ -3688,13 +5400,10 @@ mod tests {
         // The node feeds them to receive_vote(); on the 3rd one it returns
         // Some(cert) but there is no pending proposal, so the cert is parked.
         for validator in &["qcb1alice", "qcb1carol", "qcb1dave"] {
-            let vote = Vote {
-                vote_type:  VoteType::Precommit,
-                height: 0, round: 0,
-                validator:  ValidatorId(validator.to_string()),
-                block_hash: Some(proposal.block_hash.clone()),
-                signature:  vec![],
-            };
+            let vote = signed_vote(
+                "qcb-testnet-1", VoteType::Precommit, 0, 0, validator,
+                proposal.block_hash.clone(),
+            );
             node.handle_event(gossip(
                 GossipTopic::ConsensusVote,
                 serde_json::to_vec(&vote).unwrap(),
@@ -3843,7 +5552,7 @@ mod tests {
 
         // advance_epoch lints the lapse; the reconcile sweep (Point 3) revokes pop.
         let epoch_advanced = node.identity.advance_epoch(now_ms);
-        assert!(epoch_advanced, "91-epoch jump must advance the UBI clock");
+        assert!(epoch_advanced, "91-epoch jump must advance the epoch clock");
 
         // Replicate what the commit path does after advance_epoch -- the
         // reconcile sweep from Integration Point 3:

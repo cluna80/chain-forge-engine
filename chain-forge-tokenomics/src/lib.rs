@@ -7,7 +7,8 @@
 ///   - SupplyRegistry: $QCB hard cap at 210,000,000 (in uqcb base units),
 ///     mint/burn accounting, cap enforcement at the protocol layer
 ///   - $QRC uncapped, population-linked issuance tracking
-///   - Genesis allocation per Section 6.7: UBI-majority by construction
+///   - Genesis allocation per Section 6.7: community-reserve-majority by
+///     construction
 ///   - Staking: bond/unbond $QCB to validators, reward accounting
 ///   - Section 3.3 personhood bound: stake determines participation and
 ///     reward share, NOT consensus influence (that cap lives in consensus)
@@ -42,10 +43,10 @@ pub enum TokenomicsError {
     #[error("genesis allocation percentages must sum to 100, got {0}")]
     BadAllocationSum(u32),
 
-    #[error("UBI allocation {ubi_pct}% must be the majority share (>50%)")]
-    UbiNotMajority { ubi_pct: u32 },
+    #[error("community reserve allocation {reserve_pct}% must be the majority share (>50%)")]
+    CommunityReserveNotMajority { reserve_pct: u32 },
 
-    #[error("non-UBI allocation {name} at {pct}% exceeds low-double-digit ceiling (max {max}%)")]
+    #[error("allocation {name} at {pct}% exceeds low-double-digit ceiling (max {max}%)")]
     AllocationCeilingExceeded { name: String, pct: u32, max: u32 },
 
     #[error("insufficient stake: {have} < {need}")]
@@ -77,7 +78,7 @@ pub struct SupplyRegistry {
     pub qcb_burned_uqcb: u128,
     /// Total $QRC ever minted (uqrc). Uncapped by design.
     pub qrc_minted_uqrc: u128,
-    /// Total $QRC recycled through demurrage into the UBI pool.
+    /// Total $QRC recycled through demurrage into the community pool.
     /// NOT burned -- tracked separately to audit the recycle loop.
     pub qrc_recycled_uqrc: u128,
 }
@@ -144,7 +145,7 @@ impl SupplyRegistry {
         self.qrc_minted_uqrc += amount;
     }
 
-    /// Record $QRC recycled through demurrage (flows to UBI pool, not burned).
+    /// Record $QRC recycled through demurrage (flows to community pool, not burned).
     pub fn record_qrc_recycle(&mut self, amount: u128) {
         self.qrc_recycled_uqrc += amount;
     }
@@ -160,14 +161,14 @@ impl Default for SupplyRegistry {
 /// Percentages are of the total genesis allocation.
 ///
 /// Constraints enforced:
-///   - UBI reserve must be the majority share (>50%) -- by construction
-///   - No single non-UBI allocation may exceed the low-double-digit ceiling
+///   - Community reserve must be the majority share (>50%) -- by construction
+///   - No single other allocation may exceed the low-double-digit ceiling
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisAllocation {
     /// Total genesis allocation in uqcb.
     pub total_uqcb: u128,
-    /// UBI distributions seed (majority by construction). Illustrative: 70%.
-    pub ubi_reserve_pct: u32,
+    /// Community reserve seed (majority by construction). Illustrative: 70%.
+    pub community_reserve_pct: u32,
     /// Reserve pool (yield-bearing stability backing). Illustrative: 15%.
     pub reserve_pool_pct: u32,
     /// Development (vested, disclosed on-chain). Illustrative: 7%.
@@ -178,15 +179,15 @@ pub struct GenesisAllocation {
     pub validator_rewards_pct: u32,
 }
 
-/// The low-double-digit ceiling for non-UBI allocations (Section 6.7).
-pub const NON_UBI_CEILING_PCT: u32 = 15;
+/// The low-double-digit ceiling for non-majority allocations (Section 6.7).
+pub const OTHER_ALLOCATION_CEILING_PCT: u32 = 15;
 
 impl GenesisAllocation {
     /// The whitepaper's illustrative allocation: 70/15/7/5/3.
     pub fn whitepaper_default(total_uqcb: u128) -> Self {
         Self {
             total_uqcb,
-            ubi_reserve_pct:         70,
+            community_reserve_pct:  70,
             reserve_pool_pct:        15,
             development_pct:         7,
             merchant_incentives_pct: 5,
@@ -196,27 +197,27 @@ impl GenesisAllocation {
 
     /// Validate the allocation against Section 6.7's founding commitments.
     pub fn validate(&self) -> TkResult<()> {
-        let sum = self.ubi_reserve_pct + self.reserve_pool_pct
+        let sum = self.community_reserve_pct + self.reserve_pool_pct
             + self.development_pct + self.merchant_incentives_pct
             + self.validator_rewards_pct;
         if sum != 100 {
             return Err(TokenomicsError::BadAllocationSum(sum));
         }
-        if self.ubi_reserve_pct <= 50 {
-            return Err(TokenomicsError::UbiNotMajority {
-                ubi_pct: self.ubi_reserve_pct,
+        if self.community_reserve_pct <= 50 {
+            return Err(TokenomicsError::CommunityReserveNotMajority {
+                reserve_pct: self.community_reserve_pct,
             });
         }
-        let non_ubi = [
+        let other = [
             ("reserve_pool",        self.reserve_pool_pct),
             ("development",         self.development_pct),
             ("merchant_incentives", self.merchant_incentives_pct),
             ("validator_rewards",   self.validator_rewards_pct),
         ];
-        for (name, pct) in non_ubi {
-            if pct > NON_UBI_CEILING_PCT {
+        for (name, pct) in other {
+            if pct > OTHER_ALLOCATION_CEILING_PCT {
                 return Err(TokenomicsError::AllocationCeilingExceeded {
-                    name: name.to_string(), pct, max: NON_UBI_CEILING_PCT,
+                    name: name.to_string(), pct, max: OTHER_ALLOCATION_CEILING_PCT,
                 });
             }
         }
@@ -224,8 +225,8 @@ impl GenesisAllocation {
     }
 
     /// Amount for each allocation in uqcb.
-    pub fn ubi_reserve_uqcb(&self) -> u128 {
-        self.total_uqcb * self.ubi_reserve_pct as u128 / 100
+    pub fn community_reserve_uqcb(&self) -> u128 {
+        self.total_uqcb * self.community_reserve_pct as u128 / 100
     }
     pub fn reserve_pool_uqcb(&self) -> u128 {
         self.total_uqcb * self.reserve_pool_pct as u128 / 100
@@ -512,7 +513,7 @@ mod tests {
     #[test]
     fn allocation_amounts_sum_to_total() {
         let alloc = GenesisAllocation::whitepaper_default(100_000_000);
-        let sum = alloc.ubi_reserve_uqcb()
+        let sum = alloc.community_reserve_uqcb()
             + alloc.reserve_pool_uqcb()
             + alloc.development_uqcb()
             + alloc.merchant_incentives_uqcb()
@@ -521,17 +522,17 @@ mod tests {
     }
 
     #[test]
-    fn ubi_must_be_majority() {
+    fn community_reserve_must_be_majority() {
         let mut alloc = GenesisAllocation::whitepaper_default(1_000_000);
-        alloc.ubi_reserve_pct = 40;
+        alloc.community_reserve_pct = 40;
         alloc.reserve_pool_pct = 45; // sum still 100
-        assert!(alloc.validate().is_err(), "UBI below 50% must fail validation");
+        assert!(alloc.validate().is_err(), "community reserve below 50% must fail validation");
     }
 
     #[test]
-    fn non_ubi_ceiling_enforced() {
+    fn other_allocation_ceiling_enforced() {
         let mut alloc = GenesisAllocation::whitepaper_default(1_000_000);
-        alloc.ubi_reserve_pct = 55;
+        alloc.community_reserve_pct = 55;
         alloc.development_pct = 22; // exceeds 15% ceiling
         alloc.reserve_pool_pct = 15;
         alloc.merchant_incentives_pct = 5;
@@ -547,10 +548,10 @@ mod tests {
     }
 
     #[test]
-    fn ubi_reserve_is_70_percent_of_total() {
+    fn community_reserve_is_70_percent_of_total() {
         let alloc = GenesisAllocation::whitepaper_default(210_000_000 * UNITS_PER_TOKEN);
         let expected = 210_000_000 * UNITS_PER_TOKEN * 70 / 100;
-        assert_eq!(alloc.ubi_reserve_uqcb(), expected);
+        assert_eq!(alloc.community_reserve_uqcb(), expected);
     }
 
     // -- StakingModule --------------------------------------------------------

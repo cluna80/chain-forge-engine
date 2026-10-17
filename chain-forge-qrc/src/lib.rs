@@ -4,7 +4,8 @@
 //!
 //! ## What $QRC is
 //!
-//! $QRC is a **resource consumption token**, not a UBI token.
+//! $QRC is a **resource consumption token**, earned or purchased --
+//! never distributed as a flat per-person drip.
 //! It is the unit of account for all network resource usage:
 //! compute, storage, ZK proving, bandwidth, oracle data, AI inference,
 //! and external verification.
