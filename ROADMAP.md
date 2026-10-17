@@ -217,26 +217,33 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `BondValidator` tx type | ⬜ | Lock uQCB as validator stake; candidate enters pending set |
-| `UnbondValidator` tx type | ⬜ | Start unbonding timer; stake released after cooldown period (prevents slash-and-run) |
-| Minimum bond threshold | ❓ | Design decision: low enough for individual participation, high enough to make Sybil attacks expensive |
-| Maximum active validator set size | ❓ | BFT doesn't scale to thousands of validators; cap at ~100–200, ranked by stake |
-| Stake-ranked validator set at epoch boundary | ⬜ | Top-N stakers automatically enter/exit active set; replaces manual `ValidatorSetChange` governance votes for routine churn |
-| Unbonding cooldown enforcement | ⬜ | Stake locked for N epochs after `UnbondValidator`; slashable during cooldown |
+| `BondValidator` tx type | ✅ | Shipped on `phase1-validator-onboarding` (`3862d60`). Locks uQCB into a per-validator virtual account (`validator-bond:{addr}`); bonding is incremental and accumulates across calls. |
+| `UnbondValidator` tx type | ✅ | Shipped (`3862d60`). Moves the full bond into `validator-unbonding:{addr}` with `unlock_epoch = current_epoch + cooldown`; stake stops counting toward the active set immediately. Double-sweep and slash-and-run (re-unbonding mid-cooldown) both rejected. |
+| Minimum bond threshold | ✅ | `DEFAULT_MIN_BOND_UQCB = 1_000_000` uqcb, a constant in `validator_bond.rs`. Not yet promoted to a genesis config field — explicitly deferred, not blocking. |
+| Maximum active validator set size | ✅ | `DEFAULT_MAX_ACTIVE_VALIDATORS = 150`, same basis as above. |
+| Stake-ranked validator set at epoch boundary (entry) | ✅ | Shipped (`99fb3ce`). `compute_stake_active_set()` reads the live bonded-stake ledger from `StateStore`; `chain-forge-node` admits newly-qualifying addresses into the live `ValidatorSet` at each epoch boundary ("Integration Point 4"). |
+| Stake-ranked validator set at epoch boundary (exit/eviction) | 🔲 | **Not implemented — explicitly out of scope.** Entry admits candidates but never evicts a seated validator whose stake later drops below minimum or is outranked. Blocked on an explicit product decision (are genesis/synthetic validators exempt forever, or swept on first outbid?) that has not been authorized; do not implement without that decision. |
+| Unbonding cooldown enforcement | ✅ | `DEFAULT_UNBONDING_COOLDOWN_EPOCHS = 21`, enforced via `identity.clock.current_epoch` in `execute_tx_with_identity()`. Slashing-during-cooldown is not separately implemented — unbonding stake sits untouched by the slashing module. |
+| Mandatory registered consensus keys at genesis | ✅ | Shipped (`fa215d0`). `GenesisConfig::validate_validator_keys()` hard-rejects any genesis `role=="validator"` account missing a valid ≥32-byte hex public key; enforced at `Node::new_with_config` startup, not just a warning. All 4 real genesis files (`genesis-3node.json`, `genesis-4node.json`, and both under `tests/devnet/`) already carry keys for every validator. 6 `chain-forge-core` tests. |
+| Deterministic block-height validator-set epochs | ✅ | Shipped (`61436a9`). Replaced `IdentityStore::advance_epoch(now_ms)` (wall-clock-driven, divergence-prone across nodes) with `advance_epoch_to(height / validator_epoch_blocks)` on both commit paths — same epoch number on every node from the same block sequence, independent of wall-clock skew. Verified by `validator_epoch_and_admission_converge_identically_across_nodes` (two independently-constructed nodes with a real 50ms clock offset reach identical epoch + validator-set state). |
+| Historical validator-set preservation for certificate verification | ✅ | Shipped (`61436a9`). `historical_validator_sets: BTreeMap<height, ValidatorSet>` snapshots the set that actually produced each height's certificate, persisted to disk; `Node::verify_certificate_against_history(cert)` verifies a cert against the set effective at `cert.height`, not whatever is live now. Verified by `verify_certificate_against_history_uses_set_effective_at_height_not_live_set`. Exposed as infrastructure; not yet called from a production code path (the one live sync site, `GossipTopic::SyncResponse`, only ever requests the immediate next height, where the live set is still the effective one) — available for light-client / out-of-order verification use when needed. |
 | Validator commission rate | ⬜ | Validators take a configurable % of PoCD research rewards routed through their node |
 | Validator self-service docs | ⬜ | Operator guide: keygen → bond → run node → monitor → unbond |
 
-> **Relationship to personhood weighting**: Stake determines who is in the active set; personhood cap determines how much influence any one human can accumulate within that set. Both constraints apply simultaneously.
+> **Relationship to personhood weighting**: Stake determines who is in the active set; personhood cap determines how much influence any one human can accumulate within that set. Both constraints apply simultaneously — enforced in code, not just in this doc's framing (see below).
 
 ### Consensus — Personhood Weighting
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Personhood-weighting overlay on TendermintEngine | ⬜ | Cap per-human validator influence regardless of stake |
-| `ValidatorInfo.pop_verified` gating in consensus | ⬜ | Only PoP-confirmed validators counted for quorum |
-| Stake → influence cap enforcement | ⬜ | See whitepaper §3.3 |
+| Unconditional voting-power gate across all three engines | ✅ | Shipped (`fddcfa6`). `gate_voting_power()` zeroes voting power for any validator missing a registered public key or `pop_verified=true` — unconditional, not dependent on whether `PersonhoodConfig` is even set. Wired into `FbaEngine`, `TendermintEngine`, and `HotStuffEngine`'s `update_validator_set()`, always applied last. `TendermintEngine` previously had no such gating on write; that gap is closed. 66 `chain-forge-consensus` tests pass. |
+| `ValidatorInfo.pop_verified` gating in consensus | ✅ | Only verified-identity validators carry non-zero voting power (see gate above); genesis validators are seeded through a documented bootstrap attestation path (`PopAttestation::genesis` + `verify_identity`, `Node::new_with_config`) — a real identity record, not a bypass of the requirement. |
+| Mandatory personhood for ALL validators, including genesis | ✅ | Shipped (`fa215d0`), staged as a coordinated migration rather than an immediate break. Node startup now hard-refuses to boot if the genesis set has zero eligible (`voting_power > 0`) validators, and warns if some-but-not-all are eligible or eligible count < 4 (BFT has zero fault tolerance below that regardless of nominal set size). |
+| Stake → influence cap enforcement | ✅ | Stake (via `BondValidator`/admission) determines who is seated and ranked; personhood verification (via the gate above) determines whether that seat carries any voting power. A newly-bonded, unverified entrant is seated with `voting_power == 0` until `IdentityStore` marks it verified — confirmed by `bonded_stake_admits_new_validator_candidate_at_epoch_boundary`. |
 | Validator liveness under partial-participation (Open Q14) | ❓ | How does finality behave if large fraction of verified humans go offline? |
 | Governance quorum floor enforcement | ⬜ | >3% turnout for ordinary votes; >6% for constitutional (derived from §6.6) |
+
+**Evidence for the rows above (2026-10-16, this branch, commit `dc0db3a` + docs-only update):** `cargo build --workspace` clean. `chain-forge-core` 27/27, `chain-forge-identity` 62/62, `chain-forge-consensus` 66/66, `chain-forge-execution` 102/102, `chain-forge-node` (unit, `--bins`) 71/71 — all pass. Integration tests `devnet_4node_reaches_target_height` / `devnet_4node_partition_recovery`: fail in this sandbox (nodes never reach height 3 in 30s) — traced to non-routable P2P addresses in this container's network namespace (peers "discover" each other but real TCP gossip can't complete), not a validator-onboarding regression; pre-existing per commit `61436a9`'s own test run. `attestation_live::attestation_guard_live`: fails on a documented, pre-existing nonce-ordering bug in the *test script itself* (`KNOWN_ISSUES.md` §4, resolved-at-protocol-level 2026-09-30, harness fix still outstanding) — unrelated to this work.
 
 ### Identity — Charm Confinement
 
