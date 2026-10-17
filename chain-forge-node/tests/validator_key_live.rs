@@ -618,10 +618,16 @@ fn post_genesis_validator_admission() {
         .expect("attest3 not executed");
     eprintln!("   attest3 executed: {e3:?}");
 
-    // Third attestation must cross quorum → Verified.
+    // One of the three attestations must cross quorum → Verified.
+    // We submit all three nearly simultaneously; the execution order within a
+    // block is not guaranteed to match submission order, so the quorum event
+    // may appear on any of the three attest results.
+    let all_attest_events: Vec<String> = [&e1, &e2, &e3].iter()
+        .flat_map(|evs| evs.iter().cloned())
+        .collect();
     assert!(
-        e3.iter().any(|e| e.contains("quorum reached") || e.contains("Verified")),
-        "expected third attestation to trigger quorum upgrade; events: {e3:?}"
+        all_attest_events.iter().any(|e| e.contains("quorum reached") || e.contains("Verified")),
+        "expected one of the three attestations to trigger quorum upgrade; events: e1={e1:?} e2={e2:?} e3={e3:?}"
     );
 
     // Confirm identity tier is now Verified.
