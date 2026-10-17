@@ -1098,6 +1098,23 @@ pub struct Transaction {
     pub body: TxBody,
     /// Maximum gas the sender is willing to pay.
     pub gas_limit: u64,
+    /// **Versioned signature scheme identifier (CS-001-H2).**
+    ///
+    /// Explicitly tags which cryptographic algorithm produced `signature` /
+    /// `pq_signatures` so the verifier never has to guess.  This makes live
+    /// algorithm migration possible without a hard fork: the executor reads
+    /// this field first and dispatches to the correct verification path.
+    ///
+    /// - `None`  → legacy / unsigned tx (backward-compatible; verifier falls
+    ///             back to the implicit `pq_signatures` prefix scan).
+    /// - `Some(SchemeId::Classical)`          → Ed25519 in `signature`.
+    /// - `Some(SchemeId::MlDsa)`              → ML-DSA-65 in `pq_signatures`.
+    /// - `Some(SchemeId::HybridEd25519MlDsa)` → both fields must be present.
+    ///
+    /// New signers MUST set this field.  Verifiers accept `None` only for
+    /// backward compatibility with pre-CS-001 transactions already on-chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig_scheme: Option<SchemeId>,
     /// Ed25519 signature over signing_bytes(chain_id). Empty when unsigned.
     #[serde(default)]
     pub signature: Vec<u8>,
@@ -1144,7 +1161,12 @@ impl Transaction {
 
     /// Set public_key from `keypair` and sign. Clients call this last,
     /// after every other field is final.
+    ///
+    /// Sets `sig_scheme` from the keypair so verifiers know which algorithm
+    /// to use without having to inspect signature byte lengths or tags
+    /// (CS-001-H2: versioned signature envelope).
     pub fn sign(&mut self, keypair: &KeyPair, chain_id: &str) -> Result<(), String> {
+        self.sig_scheme  = Some(keypair.scheme.clone());
         self.public_key = keypair.public_key.clone();
         let sig = ClassicalScheme.sign(&self.signing_bytes(chain_id), keypair)
             .map_err(|e| e.to_string())?;
@@ -1259,6 +1281,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1274,6 +1297,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1289,6 +1313,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1304,6 +1329,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1319,6 +1345,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1334,6 +1361,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1349,6 +1377,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1364,6 +1393,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1379,6 +1409,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1394,6 +1425,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1409,6 +1441,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1436,6 +1469,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1461,6 +1495,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1485,6 +1520,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1505,6 +1541,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1540,6 +1577,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1575,6 +1613,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1595,6 +1634,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1616,6 +1656,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1649,6 +1690,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1685,6 +1727,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1717,6 +1760,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1746,6 +1790,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1781,6 +1826,7 @@ impl Transaction {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -1918,21 +1964,49 @@ fn verify_authorization_for(config: &ExecutionConfig, tx: &Transaction, state: &
 /// regardless of chain config.
 fn verify_authorization_signed(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
 
-    // -- ML-DSA path -----------------------------------------------------------
-    // If the transaction carries an mldsa65: signature tag, verify it before
-    // (or instead of) the classical Ed25519 check.  This path is taken by
-    // wallets produced by chain-forge-wallet (QCB-WALLET-001) which always
-    // use the "mldsa65:<hex>" tagging convention.
-    let mldsa_tag = tx.pq_signatures.iter()
-        .find(|s| s.starts_with("mldsa65:"))
-        .map(|s| s.trim_start_matches("mldsa65:"));
-
-    if let Some(sig_hex) = mldsa_tag {
-        return verify_mldsa_authorization(config, tx, state, sig_hex);
+    // -- Scheme dispatch (CS-001-H2: versioned signature envelope) -------------
+    //
+    // Primary dispatch: use the explicit sig_scheme tag when present (set by
+    // all signers post-CS-001).  Fall back to the legacy implicit detection
+    // (pq_signatures prefix scan / presence of classical signature bytes) for
+    // backward compatibility with pre-CS-001 transactions already on-chain.
+    //
+    // This allows live algorithm migration: adding a new SchemeId variant and
+    // a new verify_* function is sufficient — no format change, no hard fork.
+    match &tx.sig_scheme {
+        Some(SchemeId::MlDsa)
+        | Some(SchemeId::SlhDsa)
+        | Some(SchemeId::FnDsa)
+        | Some(SchemeId::HybridEd25519MlDsa) => {
+            // Explicit PQ path: sig_scheme tag says a PQ algorithm is authoritative.
+            // Currently only ML-DSA-65 has a live verifier; SLH-DSA and FN-DSA are
+            // reserved for future activation and will fail cleanly here until wired.
+            let sig_hex = tx.pq_signatures.iter()
+                .find(|s| s.starts_with("mldsa65:"))
+                .map(|s| s.trim_start_matches("mldsa65:"))
+                .ok_or_else(|| format!(
+                    "sig_scheme={:?} but no mldsa65: entry in pq_signatures for {}",
+                    tx.sig_scheme, tx.sender
+                ))?;
+            return verify_mldsa_authorization(config, tx, state, sig_hex);
+        }
+        Some(SchemeId::Classical) => {
+            // Explicit classical path: skip the pq_signatures scan entirely.
+        }
+        None => {
+            // Legacy path: implicit detection for pre-CS-001 transactions.
+            // ML-DSA: presence of "mldsa65:" tag in pq_signatures → PQ path.
+            let mldsa_tag = tx.pq_signatures.iter()
+                .find(|s| s.starts_with("mldsa65:"))
+                .map(|s| s.trim_start_matches("mldsa65:"));
+            if let Some(sig_hex) = mldsa_tag {
+                return verify_mldsa_authorization(config, tx, state, sig_hex);
+            }
+            // Fall through to classical Ed25519 path below.
+        }
     }
 
     // -- Classical Ed25519 path -----------------------------------------------
-    // Skip when signature is empty (devnet scripts that don't sign).
     if tx.signature.is_empty() && tx.public_key.is_empty() {
         return Err(format!(
             "transaction from {} has no signature and no pq_signature; \
@@ -2156,8 +2230,9 @@ fn bind_key_if_unbound(config: &ExecutionConfig, tx: &Transaction, state: &mut S
     if !config.require_signatures {
         return;
     }
-    // ML-DSA path: if a pq_public_key was supplied and no key is bound yet, bind it.
-    let has_mldsa = tx.pq_signatures.iter().any(|s| s.starts_with("mldsa65:"));
+    // ML-DSA path: sig_scheme tag (CS-001-H2) or legacy prefix scan.
+    let has_mldsa = matches!(tx.sig_scheme, Some(SchemeId::MlDsa) | Some(SchemeId::HybridEd25519MlDsa))
+        || tx.pq_signatures.iter().any(|s| s.starts_with("mldsa65:"));
     if has_mldsa && !tx.pq_public_key.is_empty() {
         if let Ok(acct) = state.get_account_mut(&tx.sender) {
             if acct.public_key.is_none() {
@@ -5388,6 +5463,7 @@ mod tests {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         };
 
@@ -5411,6 +5487,7 @@ mod tests {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         };
 
@@ -5964,6 +6041,7 @@ mod tests {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         }
     }
@@ -6068,6 +6146,85 @@ mod tests {
         let r = exec.execute_tx(&tx, &mut state);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("invalid signature"));
+    }
+
+    // ── CS-001-H2: versioned signature envelope tests ─────────────────────────
+
+    /// sig_scheme = Classical is set by sign() and the verifier accepts it.
+    #[test]
+    fn cs001_h2_sign_sets_sig_scheme_classical() {
+        let (exec, mut state, alice) = signed_setup();
+        let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+        assert_eq!(tx.sig_scheme, Some(SchemeId::Classical),
+            "sign() must set sig_scheme = Classical for a classical keypair");
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(r.success, "tx with explicit Classical scheme tag must succeed");
+    }
+
+    /// sig_scheme = Classical on a tx with no actual signature body → rejected.
+    #[test]
+    fn cs001_h2_explicit_classical_scheme_with_empty_sig_rejected() {
+        let (exec, mut state, _) = signed_setup();
+        let mut tx = Transaction::transfer("tx2", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sig_scheme = Some(SchemeId::Classical);  // claim classical but no sig bytes
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success, "Classical scheme tag with empty signature must fail");
+    }
+
+    /// Legacy tx (sig_scheme = None, pq_signatures prefix present) still routes
+    /// to ML-DSA path — backward compatibility with pre-CS-001 transactions.
+    #[test]
+    fn cs001_h2_legacy_mldsa_prefix_still_accepted_when_scheme_absent() {
+        // Build an ML-DSA tx the old way (no sig_scheme tag) and verify it routes correctly.
+        let (tx, pk) = make_pq_tx_with_chain("qcb-testnet-1", "qcb1alice", 0, "alice-pq");
+        // tx has sig_scheme = Some(MlDsa) from make_pq_tx_with_chain; strip it to test legacy path
+        let mut legacy_tx = tx;
+        legacy_tx.sig_scheme = None;  // simulate a pre-CS-001 tx
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut config = ExecutionConfig::from_genesis(&genesis);
+        config.require_signatures = true;
+        config.chain_id = "qcb-testnet-1".to_string();
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+
+        // Derive alice's address from her ML-DSA pubkey and fund it
+        let alice_addr = Address::from_public_key(&pk, "qcb", HashWidth::Bits256);
+        {
+            let mut acct = chain_forge_state::AccountState::new(
+                alice_addr.as_str().to_string(), "user".to_string()
+            );
+            acct.credit("uqcb", 1_000_000);
+            state.upsert_account(acct);
+        }
+        legacy_tx.sender = alice_addr.as_str().to_string();
+
+        let exec = Executor::new(config);
+        let r = exec.execute_tx(&legacy_tx, &mut state);
+        // Should succeed: verifier falls back to pq_signatures prefix scan
+        assert!(r.success,
+            "legacy ML-DSA tx without sig_scheme tag must still be accepted (backward compat): {:?}",
+            r.error);
+    }
+
+    /// sig_scheme = MlDsa but pq_signatures is empty → verifier rejects cleanly.
+    #[test]
+    fn cs001_h2_explicit_mldsa_scheme_with_no_pq_signatures_rejected() {
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut config = ExecutionConfig::from_genesis(&genesis);
+        config.require_signatures = true;
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let exec = Executor::new(config);
+
+        let mut tx = Transaction::transfer("tx3", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sig_scheme = Some(SchemeId::MlDsa);  // claim ML-DSA but provide no pq_signatures
+        let r = exec.execute_tx(&tx, &mut state);
+        assert!(!r.success, "MlDsa scheme tag with empty pq_signatures must fail");
+        let err = r.error.unwrap();
+        assert!(err.contains("mldsa65") || err.contains("pq_signatures"),
+            "error should mention missing pq_signatures, got: {err}");
     }
 
     #[test]
@@ -6727,7 +6884,7 @@ mod tests {
         let tx_auth = Transaction {
             id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
             body: TxBody::AuthorizeAgent { agent_id: "agent-a1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "AuthorizeAgent must succeed: {:?}", r.error);
@@ -6750,7 +6907,7 @@ mod tests {
         let tx_auth = Transaction {
             id: "auth2".into(), sender: "qcb1bob".into(), nonce: 0,
             body: TxBody::AuthorizeAgent { agent_id: "agent-a2".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "wrong sponsor must be rejected");
@@ -6774,7 +6931,7 @@ mod tests {
         let tx_auth = Transaction {
             id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
             body: TxBody::AuthorizeAgent { agent_id: "agent-s1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
         assert_eq!(agents.get("agent-s1").unwrap().status, chain_forge_agents::AgentStatus::Active);
@@ -6786,7 +6943,7 @@ mod tests {
                 agent_id: "agent-s1".into(),
                 reason: "compliance review".into(),
             },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(&tx_sus, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "SuspendAgent must succeed: {:?}", r.error);
@@ -6810,7 +6967,7 @@ mod tests {
         let tx_rev = Transaction {
             id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
             body: TxBody::RevokeAgentFull { agent_id: "agent-r1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(&tx_rev, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "RevokeAgentFull must succeed: {:?}", r.error);
@@ -6843,7 +7000,7 @@ mod tests {
         let tx_auth = Transaction {
             id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
             body: TxBody::AuthorizeAgent { agent_id: "agent-sp1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
 
@@ -6851,7 +7008,7 @@ mod tests {
         let tx_spend = Transaction {
             id: "sp1".into(), sender: "qcb1alice".into(), nonce: 2,
             body: TxBody::RecordAgentSpend { agent_id: "agent-sp1".into(), amount_uqrc: 300 },
-            gas_limit: 50_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 50_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(&tx_spend, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "spend within limit must succeed: {:?}", r.error);
@@ -6861,7 +7018,7 @@ mod tests {
         let tx_spend2 = Transaction {
             id: "sp2".into(), sender: "qcb1alice".into(), nonce: 3,
             body: TxBody::RecordAgentSpend { agent_id: "agent-sp1".into(), amount_uqrc: 300 },
-            gas_limit: 50_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 50_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r2 = exec.execute_tx_with_identity(&tx_spend2, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r2.success, "spend exceeding epoch limit must fail");
@@ -6884,7 +7041,7 @@ mod tests {
         let tx_auth = Transaction {
             id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
             body: TxBody::AuthorizeAgent { agent_id: "parent-no-cap".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
 
@@ -6899,7 +7056,7 @@ mod tests {
                 spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
                 description:         "child".into(),
             },
-            gas_limit: 300_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 300_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(&tx_spawn, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "spawn without capability must fail");
@@ -6925,7 +7082,7 @@ mod tests {
         let tx_auth = Transaction {
             id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
             body: TxBody::AuthorizeAgent { agent_id: "parent-cap".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
 
@@ -6940,7 +7097,7 @@ mod tests {
                 spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
                 description:         "child agent".into(),
             },
-            gas_limit: 300_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+            gas_limit: 300_000, signature: vec![], public_key: vec![], pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(&tx_spawn, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "SpawnChildAgent must succeed: {:?}", r.error);
@@ -7390,6 +7547,7 @@ mod tests {
             signature:     vec![],
             public_key:    vec![],
             pq_signatures: vec![format!("mldsa65:{sig_hex}")],
+            sig_scheme:    Some(SchemeId::MlDsa),  // CS-001-H2
             pq_public_key: pk.clone(),
         };
         (tx, pk)
@@ -7499,6 +7657,7 @@ mod tests {
             signature:     vec![],
             public_key:    vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
@@ -7552,6 +7711,7 @@ mod tests {
             signature:     vec![],
             public_key:    vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
