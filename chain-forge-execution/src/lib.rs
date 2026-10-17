@@ -32,7 +32,10 @@
 
 use serde::{Deserialize, Serialize};
 use chain_forge_core::{Address, EnabledModules, GenesisConfig, HashWidth};
-use chain_forge_crypto::{ClassicalScheme, KeyPair, MlDsaScheme, SchemeId, Signature, SignatureScheme};
+use chain_forge_crypto::{
+    ClassicalScheme, KeyPair, MlDsaScheme, SchemeId, Signature, SignatureScheme,
+    mldsa_tx_prehash, ED25519_TX_DOMAIN_V1,
+};
 use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
 use chain_forge_qrc::QrcEngine;
@@ -1152,7 +1155,7 @@ impl Transaction {
             &self.id, &self.sender, self.nonce, &self.body, self.gas_limit, &self.public_key,
         )).expect("transaction fields always serialise");
         let mut out = Vec::with_capacity(payload.len() + chain_id.len() + 24);
-        out.extend_from_slice(b"chain-forge/tx/v1\n");
+        out.extend_from_slice(ED25519_TX_DOMAIN_V1);  // CS-001-M1: "chain-forge/tx/v1\n"
         out.extend_from_slice(chain_id.as_bytes());
         out.push(b'\n');
         out.extend_from_slice(&payload);
@@ -2069,23 +2072,17 @@ fn verify_mldsa_authorization(
     state:    &StateStore,
     sig_hex:  &str,
 ) -> Result<(), String> {
-    use sha2::{Sha256, Digest};
     use chain_forge_crypto::Signature as CfSig;
 
     // Decode the signature
     let sig_bytes = hex_decode_str(sig_hex)
         .map_err(|e| format!("mldsa65 signature hex decode failed: {e}"))?;
 
-    // Compute signing message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || body_json)
-    // This domain separator binds the signature to this specific chain (B4).
+    // Compute signing message via the canonical pre-hash helper (CS-001-M2).
+    // Domain: MLDSA_TX_DOMAIN_V1 = "chain-forge/pq-tx/v1\n"; binds signature to chain_id.
     let body_json = serde_json::to_string(&tx.body)
         .map_err(|e| format!("cannot serialise tx.body for ML-DSA verification: {e}"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"chain-forge/pq-tx/v1\n");
-    hasher.update(config.chain_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(body_json.as_bytes());
-    let message: [u8; 32] = hasher.finalize().into();
+    let message = mldsa_tx_prehash(&config.chain_id, body_json.as_bytes());
 
     // Resolve the public key: prefer the account's bound key, fall back to pq_public_key.
     let bound_key = state.get_account(&tx.sender).ok().and_then(|a| a.public_key.clone());
@@ -7518,8 +7515,6 @@ mod tests {
         nonce:    u64,
         seed:     &str,
     ) -> (Transaction, Vec<u8>) {
-        use sha2::{Sha256, Digest};
-
         let kp = MlDsaScheme.generate_keypair(seed).expect("ML-DSA keygen");
         let pk = kp.public_key.clone();
 
@@ -7531,12 +7526,8 @@ mod tests {
         };
         let body_json = serde_json::to_string(&body).expect("body serialise");
 
-        let mut hasher = Sha256::new();
-        hasher.update(b"chain-forge/pq-tx/v1\n");
-        hasher.update(chain_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(body_json.as_bytes());
-        let message: [u8; 32] = hasher.finalize().into();
+        // CS-001-M2: use the canonical pre-hash helper (matches the verifier exactly).
+        let message = mldsa_tx_prehash(chain_id, body_json.as_bytes());
 
         let sig = MlDsaScheme.sign(&message, &kp).expect("ML-DSA sign");
         let sig_hex = sig.bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();

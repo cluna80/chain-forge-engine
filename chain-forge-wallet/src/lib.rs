@@ -18,6 +18,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme};
+use chain_forge_crypto::mldsa_tx_prehash;  // CS-001-M2: canonical PQ pre-hash helper
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -275,19 +276,10 @@ pub fn load_wallet(path: &str, passphrase: &str) -> WalletResult<(WalletKeyFile,
 /// # Returns
 /// Hex-encoded ML-DSA-65 detached signature (3293 bytes).
 pub fn sign_transaction(tx_body_json: &str, chain_id: &str, kp: &KeyPair) -> WalletResult<String> {
-    use sha2::{Sha256, Digest};
-
-    // Message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || tx_body_json)
-    let mut hasher = Sha256::new();
-    hasher.update(b"chain-forge/pq-tx/v1\n");
-    hasher.update(chain_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(tx_body_json.as_bytes());
-    let message: [u8; 32] = hasher.finalize().into();
-
+    // CS-001-M2: canonical pre-hash — MLDSA_TX_DOMAIN_V1 || chain_id || "\n" || body_json
+    let message = mldsa_tx_prehash(chain_id, tx_body_json.as_bytes());
     let scheme = MlDsaScheme;
     let sig = scheme.sign(&message, kp)?;
-
     Ok(hex_encode(&sig.bytes))
 }
 
@@ -335,16 +327,10 @@ pub fn verify_transaction(
     sig_hex:      &str,
     public_key:   &[u8],
 ) -> WalletResult<()> {
-    use sha2::{Sha256, Digest};
     use chain_forge_crypto::Signature;
 
-    // Message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || tx_body_json)
-    let mut hasher = Sha256::new();
-    hasher.update(b"chain-forge/pq-tx/v1\n");
-    hasher.update(chain_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(tx_body_json.as_bytes());
-    let message: [u8; 32] = hasher.finalize().into();
+    // CS-001-M2: canonical pre-hash — MLDSA_TX_DOMAIN_V1 || chain_id || "\n" || body_json
+    let message = mldsa_tx_prehash(chain_id, tx_body_json.as_bytes());
 
     let sig_bytes = hex_decode(sig_hex)?;
     let sig = Signature { scheme: SchemeId::MlDsa, bytes: sig_bytes };

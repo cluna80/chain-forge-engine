@@ -36,7 +36,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme};
+use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
 use chain_forge_execution::{Transaction, TxBody};
 use chain_forge_qrc::{QcbResearchRewardPolicy, ResearchRewardError};
 use chain_forge_research_db::{
@@ -268,17 +268,10 @@ pub async fn settle_objective(
         private_key: sk_bytes,
     };
 
-    // Build the PQ signing message: SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || body_json)
+    // CS-001-M2: canonical pre-hash via mldsa_tx_prehash (MLDSA_TX_DOMAIN_V1 || chain_id || body).
     let body_json = serde_json::to_vec(&tx.body)
         .map_err(|e| SettlementError::SigningFailed(format!("body serialization: {e}")))?;
-    let pq_message = {
-        let mut h = Sha256::new();
-        h.update(b"chain-forge/pq-tx/v1\n");
-        h.update(req.chain_id.as_bytes());
-        h.update(b"\n");
-        h.update(&body_json);
-        h.finalize().to_vec()
-    };
+    let pq_message = mldsa_tx_prehash(&req.chain_id, &body_json);
 
     let sig = MlDsaScheme
         .sign(&pq_message, &keypair)

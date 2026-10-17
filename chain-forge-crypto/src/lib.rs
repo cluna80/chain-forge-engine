@@ -898,6 +898,66 @@ fn hex_prefix(bytes: &[u8]) -> String {
     bytes[..len].iter().map(|b| format!("{b:02x}")).collect::<String>() + "..."
 }
 
+// -- CS-001-M1/M2: Domain separator constants and pre-hash helper -------------
+
+/// **CS-001-M1** — Canonical domain separator for ML-DSA-65 (and other PQ)
+/// transaction signing messages.
+///
+/// The full signing message is:
+/// ```text
+/// SHA-256(MLDSA_TX_DOMAIN_V1 || chain_id || "\n" || body_json)
+/// ```
+/// Used by: chain-forge-wallet (sign + verify), chain-forge-execution
+/// (verify_mldsa_authorization), chain-forge-scheduler (settlement signing).
+///
+/// **Upgrade path to SHA3-256 (CS-001-M2 follow-up):**
+/// When the protocol is ready to switch the pre-hash from SHA-256 to SHA3-256,
+/// bump the version token to `chain-forge/pq-tx/v2\n`, define
+/// `MLDSA_TX_DOMAIN_V2`, and route `SchemeId::MlDsa` v2 transactions through a
+/// new helper that calls `sha3::Sha3_256` instead of `sha2::Sha256`.  The domain
+/// version string is the migration seam — no other change is required.
+pub const MLDSA_TX_DOMAIN_V1: &[u8] = b"chain-forge/pq-tx/v1\n";
+
+/// **CS-001-M1** — Canonical domain separator for Ed25519 (classical)
+/// transaction signing bytes.
+///
+/// The full signing message is:
+/// ```text
+/// ED25519_TX_DOMAIN_V1 || chain_id || "\n" || canonical_json(id, sender, nonce, body, gas_limit, public_key)
+/// ```
+/// Used by: chain-forge-execution (Transaction::signing_bytes).
+pub const ED25519_TX_DOMAIN_V1: &[u8] = b"chain-forge/tx/v1\n";
+
+/// **CS-001-M2** — Compute the ML-DSA-65 transaction pre-hash.
+///
+/// This is the single place where the pre-hash algorithm for PQ transaction
+/// signatures is defined. Every signer (wallet, scheduler) and verifier
+/// (execution, wallet/verify) calls this function — no inline SHA-256 blocks.
+///
+/// Current algorithm: SHA-256 (adequate; ML-DSA provides 128-bit PQ security
+/// regardless of the pre-hash, and SHA-256 collision resistance is not needed
+/// here — only second-preimage, which Grover doesn't touch for 256-bit output).
+///
+/// To upgrade to SHA3-256, change this function's body and bump the domain
+/// version to `MLDSA_TX_DOMAIN_V2`.  All callers update automatically.
+///
+/// # Arguments
+/// * `chain_id`   — chain identifier from genesis (e.g. `"qcb-testnet-1"`)
+/// * `body_json`  — canonical JSON bytes of the transaction body
+///
+/// # Returns
+/// 32-byte pre-hash digest suitable for passing directly to `MlDsaScheme::sign`
+/// or `MlDsaScheme::verify`.
+pub fn mldsa_tx_prehash(chain_id: &str, body_json: &[u8]) -> [u8; 32] {
+    use sha2::{Sha256, Digest};
+    let mut h = Sha256::new();
+    h.update(MLDSA_TX_DOMAIN_V1);
+    h.update(chain_id.as_bytes());
+    h.update(b"\n");
+    h.update(body_json);
+    h.finalize().into()
+}
+
 // -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1293,6 +1353,47 @@ mod tests {
             assert!(scheme.verify(b"tampered message", &sig, &kp.public_key).is_err(),
                 "hybrid must reject tampered message");
         }
+    }
+
+    // -- CS-001-M1/M2: domain separator constants and pre-hash helper ---------
+
+    #[test]
+    fn mldsa_tx_domain_v1_is_correct_literal() {
+        assert_eq!(MLDSA_TX_DOMAIN_V1, b"chain-forge/pq-tx/v1\n");
+    }
+
+    #[test]
+    fn ed25519_tx_domain_v1_is_correct_literal() {
+        assert_eq!(ED25519_TX_DOMAIN_V1, b"chain-forge/tx/v1\n");
+    }
+
+    #[test]
+    fn mldsa_tx_prehash_is_deterministic() {
+        let h1 = mldsa_tx_prehash("qcb-testnet-1", b"{\"Transfer\":{\"to\":\"qcb1bob\",\"denom\":\"uqcb\",\"amount\":100}}");
+        let h2 = mldsa_tx_prehash("qcb-testnet-1", b"{\"Transfer\":{\"to\":\"qcb1bob\",\"denom\":\"uqcb\",\"amount\":100}}");
+        assert_eq!(h1, h2, "prehash must be deterministic");
+    }
+
+    #[test]
+    fn mldsa_tx_prehash_varies_by_chain_id() {
+        let body = b"{\"Transfer\":{\"to\":\"qcb1bob\",\"denom\":\"uqcb\",\"amount\":100}}";
+        let h1 = mldsa_tx_prehash("qcb-testnet-1", body);
+        let h2 = mldsa_tx_prehash("qcb-mainnet-1", body);
+        assert_ne!(h1, h2, "prehash must bind to chain_id");
+    }
+
+    #[test]
+    fn mldsa_tx_prehash_varies_by_body() {
+        let h1 = mldsa_tx_prehash("qcb-testnet-1", b"{\"amount\":100}");
+        let h2 = mldsa_tx_prehash("qcb-testnet-1", b"{\"amount\":101}");
+        assert_ne!(h1, h2, "prehash must bind to body");
+    }
+
+    #[test]
+    fn domains_do_not_overlap() {
+        // Ensure the PQ and classical domain strings are distinct so a
+        // classical tx signature can never be replayed as a PQ signature.
+        assert_ne!(MLDSA_TX_DOMAIN_V1, ED25519_TX_DOMAIN_V1);
     }
 
 }
