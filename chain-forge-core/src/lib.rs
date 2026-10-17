@@ -153,10 +153,35 @@ impl<'de> Deserialize<'de> for ChainHash {
     }
 }
 
+// -- Address scheme -----------------------------------------------------------
+
+/// Which signature scheme produced the public key being used for address
+/// derivation. Drives the `qcb1` vs `qcb1pq` namespace split so that a
+/// ML-DSA (post-quantum) address can never collide with an Ed25519 (classical)
+/// address even when both are expressed with the same chain prefix.
+///
+/// **CS-001-H1** — this enum is the single authoritative discriminant for
+/// address namespace versioning. Every derivation path must use it:
+/// - Classical  → `{prefix}1{hex}`   (e.g. `qcb1a2b3…`)
+/// - PostQuantum → `{prefix}1pq{hex}` (e.g. `qcb1pq7f9e…`)
+///
+/// The infix `pq` is fixed for this version of the protocol. A future
+/// algorithm version would introduce a new infix (e.g. `pq2`) via a
+/// separate `AddressScheme` variant, not by changing `PostQuantum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressScheme {
+    /// Ed25519 or any other pre-quantum classical key.
+    Classical,
+    /// ML-DSA-65, SLH-DSA, or any other NIST post-quantum key.
+    PostQuantum,
+}
+
 // -- Address ------------------------------------------------------------------
 
-/// A chain address. Format: `{prefix}{hex_of_hash_prefix}`.
-/// Example for QCB: `qcb1a2b3c4d5...`
+/// A chain address. Format: `{prefix}1{hex_of_hash_prefix}` (classical) or
+/// `{prefix}1pq{hex_of_hash_prefix}` (post-quantum).
+/// Example for QCB: `qcb1a2b3c4d5...` (classical) / `qcb1pq7f9e...` (PQ)
 ///
 /// In a full implementation this would use bech32 encoding with a checksum.
 /// For Phase 0 we use a simpler `{prefix}1{hex}` format that is checksum-free
@@ -176,12 +201,48 @@ impl Address {
         Self(format!("{prefix}1{hex}"))
     }
 
-    /// Derive the address a public key controls: hash the raw key bytes,
-    /// then apply from_pubkey_hash. The single place this rule lives, so
-    /// the executor and any client derive addresses identically.
+    /// Derive the address a public key controls: hash the raw key bytes with
+    /// SHA-3, then apply from_pubkey_hash.  Always produces a classical-scheme
+    /// address (`{prefix}1{hex}`).
+    ///
+    /// For post-quantum keys use [`Address::from_public_key_schemed`] with
+    /// [`AddressScheme::PostQuantum`] so the address lands in the `{prefix}1pq`
+    /// namespace and cannot collide with classical addresses.
     pub fn from_public_key(public_key: &[u8], prefix: &str, width: HashWidth) -> Self {
         let hash = ChainHash::digest(public_key, width);
         Self::from_pubkey_hash(&hash, prefix)
+    }
+
+    /// **CS-001-H1** — scheme-versioned address derivation.
+    ///
+    /// The single authoritative function for deriving an on-chain address from
+    /// a public key when the key's algorithm is known. Callers that know they
+    /// are handling an ML-DSA (or other PQ) key MUST use this function with
+    /// `AddressScheme::PostQuantum` so the derived address is in the `pq`
+    /// namespace and cannot collide with a classical Ed25519 address.
+    ///
+    /// Hash function: SHA-3 (via `ChainHash::digest`) for both variants —
+    /// consistent with block/tx hashing and PQ-safe against Grover.
+    ///
+    /// Address formats:
+    /// - `Classical`    → `{prefix}1{hex(SHA3(key)[..20])}`
+    /// - `PostQuantum`  → `{prefix}1pq{hex(SHA3(key)[..20])}`
+    pub fn from_public_key_schemed(
+        public_key: &[u8],
+        prefix:     &str,
+        width:      HashWidth,
+        scheme:     AddressScheme,
+    ) -> Self {
+        let hash = ChainHash::digest(public_key, width);
+        let hex: String = hash.as_bytes()
+            .iter()
+            .take(20)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        match scheme {
+            AddressScheme::Classical    => Self(format!("{prefix}1{hex}")),
+            AddressScheme::PostQuantum  => Self(format!("{prefix}1pq{hex}")),
+        }
     }
 
     /// Parse a raw address string. Only validates that it is non-empty.
@@ -843,6 +904,52 @@ mod tests {
         assert_eq!(a1.as_str(), a2.as_str());
         assert_ne!(a1.as_str(), b.as_str());
         assert!(a1.as_str().starts_with("qcb1"));
+    }
+
+    // CS-001-H1: scheme-versioned address derivation
+    #[test]
+    fn classical_scheme_produces_qcb1_prefix() {
+        let addr = Address::from_public_key_schemed(
+            &[1u8; 32], "qcb", HashWidth::Bits256, AddressScheme::Classical,
+        );
+        assert!(addr.as_str().starts_with("qcb1"),
+            "Classical address must start with qcb1, got: {}", addr.as_str());
+        assert!(!addr.as_str().starts_with("qcb1pq"),
+            "Classical address must NOT have pq infix, got: {}", addr.as_str());
+    }
+
+    #[test]
+    fn post_quantum_scheme_produces_qcb1pq_prefix() {
+        let addr = Address::from_public_key_schemed(
+            &[1u8; 32], "qcb", HashWidth::Bits256, AddressScheme::PostQuantum,
+        );
+        assert!(addr.as_str().starts_with("qcb1pq"),
+            "PQ address must start with qcb1pq, got: {}", addr.as_str());
+    }
+
+    #[test]
+    fn classical_and_pq_addresses_never_collide_for_same_key() {
+        let key = [0xabu8; 64]; // arbitrary key bytes
+        let classical = Address::from_public_key_schemed(
+            &key, "qcb", HashWidth::Bits256, AddressScheme::Classical,
+        );
+        let pq = Address::from_public_key_schemed(
+            &key, "qcb", HashWidth::Bits256, AddressScheme::PostQuantum,
+        );
+        assert_ne!(classical.as_str(), pq.as_str(),
+            "Classical and PQ addresses must never collide even for the same key bytes");
+    }
+
+    #[test]
+    fn scheme_address_is_deterministic() {
+        let key = [0x42u8; 32];
+        let a = Address::from_public_key_schemed(
+            &key, "qcb", HashWidth::Bits256, AddressScheme::PostQuantum,
+        );
+        let b = Address::from_public_key_schemed(
+            &key, "qcb", HashWidth::Bits256, AddressScheme::PostQuantum,
+        );
+        assert_eq!(a.as_str(), b.as_str(), "derivation must be deterministic");
     }
 
     fn with_modules(modules: &[&str], custom: &[&str]) -> GenesisConfig {

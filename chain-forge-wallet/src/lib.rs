@@ -430,18 +430,27 @@ pub fn submit_tx(host: &str, port: u16, tx: &SignedTxEnvelope) -> WalletResult<s
 
 // ── Address derivation ────────────────────────────────────────────────────────
 
-/// Derive a QCB bech32-style address from an ML-DSA public key.
+/// Derive a QCB bech32-style address from an ML-DSA (or other PQ) public key.
 ///
-/// Address = "qcb1" + lowercase_hex(SHA-256(SHA-256(public_key))[..20])
-/// This matches the `chain-forge-core` Address::from_public_key convention
-/// adapted for the larger ML-DSA-65 public key (1952 bytes → 20-byte hash).
+/// **CS-001-H1**: Delegates to `chain_forge_core::Address::from_public_key_schemed`
+/// with `AddressScheme::PostQuantum`, which produces:
+///   `qcb1pq{hex(SHA3-256(public_key)[..20])}`
+///
+/// Using SHA-3 (consistent with block/tx hashing) instead of the earlier
+/// double-SHA-256 construction.  The `pq` infix is the permanent namespace
+/// discriminant — Ed25519 addresses (`qcb1…`) can never collide with ML-DSA
+/// addresses (`qcb1pq…`) even if the hash output happened to match.
+///
+/// **Breaking change from pre-CS-001-H1 devnet**: old addresses used
+/// double-SHA-256; new addresses use SHA3-256.  Devnet state is not migrated —
+/// regenerate keys and re-derive addresses after this commit.
 pub fn derive_address_from_pq_key(public_key: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
-
-    let round1 = Sha256::digest(public_key);
-    let round2 = Sha256::digest(&round1);
-    let payload: String = round2[..20].iter().map(|b| format!("{b:02x}")).collect();
-    format!("qcb1pq{payload}") // "pq" infix distinguishes ML-DSA from Ed25519 addresses
+    chain_forge_core::Address::from_public_key_schemed(
+        public_key,
+        "qcb",
+        chain_forge_core::HashWidth::Bits256,
+        chain_forge_core::AddressScheme::PostQuantum,
+    ).as_str().to_string()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

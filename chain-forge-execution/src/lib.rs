@@ -6189,8 +6189,11 @@ mod tests {
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
 
-        // Derive alice's address from her ML-DSA pubkey and fund it
-        let alice_addr = Address::from_public_key(&pk, "qcb", HashWidth::Bits256);
+        // Derive alice's address from her ML-DSA pubkey and fund it.
+        // CS-001-H1: ML-DSA keys use AddressScheme::PostQuantum → qcb1pq… namespace.
+        let alice_addr = Address::from_public_key_schemed(
+            &pk, "qcb", HashWidth::Bits256, chain_forge_core::AddressScheme::PostQuantum,
+        );
         {
             let mut acct = chain_forge_state::AccountState::new(
                 alice_addr.as_str().to_string(), "user".to_string()

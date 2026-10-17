@@ -238,13 +238,17 @@ pub fn verify_challenge_signature(
 }
 
 /// Derive a QCB post-quantum address from an ML-DSA-65 public key.
-/// Format: "qcb1pq" + hex(SHA-256(SHA-256(public_key))[..20])
-/// Matches the derivation in chain-forge-wallet::derive_address_from_pq_key.
+///
+/// **CS-001-H1**: Delegates to `chain_forge_core::Address::from_public_key_schemed`
+/// with `AddressScheme::PostQuantum`.  Format: `qcb1pq{hex(SHA3-256(key)[..20])}`.
+///
+/// Previously used double-SHA-256; now uses SHA-3 for consistency with
+/// block/tx hashing and PQ safety.  Must match `chain-forge-wallet::derive_address_from_pq_key`.
 fn pq_address_from_key(public_key: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
-    let h1 = Sha256::digest(public_key);
-    let h2 = Sha256::digest(h1);
-    format!("qcb1pq{}", hex::encode(&h2[..20]))
+    use chain_forge_core::{Address, AddressScheme, HashWidth};
+    Address::from_public_key_schemed(public_key, "qcb", HashWidth::Bits256, AddressScheme::PostQuantum)
+        .as_str()
+        .to_string()
 }
 
 // ─── unit tests ─────────────────────────────────────────────────────────────
