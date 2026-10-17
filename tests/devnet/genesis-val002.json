@@ -19,7 +19,7 @@
     "type": "proof-of-stake",
     "validator_set_size": 4,
     "block_time_ms": 2000,
-    "personhood_weighted": true
+    "personhood_weighted": false
   },
   "execution": {
     "state_model": "account",
