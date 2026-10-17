@@ -360,13 +360,28 @@ pub struct Node {
     /// `height % validator_epoch_blocks == 0`, computed purely from block
     /// height -- which every node already agrees on by construction of BFT
     /// consensus -- rather than from any node-local wall clock. A plain
-    /// field (not yet a genesis config knob, matching DEFAULT_MIN_BOND_UQCB
-    /// / DEFAULT_MAX_ACTIVE_VALIDATORS staying plain constants for now too)
+    /// field, resolved once at construction from the optional
+    /// `genesis.validator_bonding.validator_epoch_blocks` override (falls
+    /// back to `DEFAULT_VALIDATOR_EPOCH_BLOCKS` below when absent --
+    /// `DEFAULT_MAX_ACTIVE_VALIDATORS` stays a plain, not-yet-configurable
+    /// constant, out of scope for "Configurable validator genesis
+    /// parameters"). Still a directly-settable field after construction
     /// so tests can force an epoch boundary on a specific block without
     /// waiting out a realistic epoch length, the same way tests used to
     /// shrink `identity.clock.epoch_duration_ms` back when this was
     /// wall-clock-driven.
     validator_epoch_blocks: u64,
+
+    /// Minimum stake (in the chain's native denom) a candidate must hold to
+    /// be eligible for the active validator set. Resolved once at
+    /// construction from `genesis.validator_bonding.min_bond_amount`,
+    /// falling back to
+    /// `chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB` when
+    /// the genesis override is absent -- see "Configurable validator
+    /// genesis parameters" in ROADMAP.md. A plain field, same convention as
+    /// `validator_epoch_blocks` above, so tests can override it directly
+    /// without round-tripping through a genesis JSON string.
+    min_bond_uqcb: u128,
 
     /// The validator set that was actually in force -- and used to reach
     /// quorum -- at each committed height, keyed by height. Populated
@@ -510,6 +525,26 @@ impl Node {
         // chain-forge-consensus), so refuse to start at all rather than
         // boot into a validator set that can never vote.
         genesis.validate_validator_keys().map_err(NodeError::Genesis)?;
+
+        // Hard error, in every environment: an accepted-but-nonsensical
+        // `validator_bonding` override (zero minimum bond, zero epoch
+        // length) is not a "proceed with a warning" situation -- the
+        // latter would panic on the first `height / validator_epoch_blocks`
+        // division. See `GenesisConfig::validate_validator_bonding`.
+        genesis.validate_validator_bonding().map_err(NodeError::Genesis)?;
+
+        // Resolve the validator-onboarding knobs once here: genesis
+        // override if present, else the engine's compiled-in default.
+        // Every node that parses the same genesis JSON computes the exact
+        // same two values -- "Configurable validator genesis parameters"
+        // requirement #5 (every node derives the same epoch boundaries and
+        // minimum-bond rule from the same genesis).
+        let validator_epoch_blocks = genesis.validator_bonding.as_ref()
+            .and_then(|vb| vb.validator_epoch_blocks)
+            .unwrap_or(DEFAULT_VALIDATOR_EPOCH_BLOCKS);
+        let min_bond_uqcb = genesis.validator_bonding.as_ref()
+            .and_then(|vb| vb.min_bond_amount)
+            .unwrap_or(chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB);
 
         // Hard error, in every environment: running with a module list the
         // engine can't honour would mean the chain behaves differently
@@ -1019,7 +1054,8 @@ impl Node {
             // Change Set T
             peer_capacity_table: Arc::new(Mutex::new(crate::gossip_capacity::PeerCapacityTable::new())),
             last_capacity_ad_ms: 0,
-            validator_epoch_blocks: DEFAULT_VALIDATOR_EPOCH_BLOCKS,
+            validator_epoch_blocks,
+            min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
         })
     }
@@ -3063,7 +3099,7 @@ impl Node {
             let active = chain_forge_execution::validator_bond::compute_stake_active_set(
                 &self.state,
                 self.executor.native_denom(),
-                chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB,
+                self.min_bond_uqcb,
                 chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
             );
             let mut updated_vs = self.consensus.validator_set().clone();
@@ -3604,7 +3640,7 @@ impl Node {
             let active = chain_forge_execution::validator_bond::compute_stake_active_set(
                 &self.state,
                 self.executor.native_denom(),
-                chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB,
+                self.min_bond_uqcb,
                 chain_forge_execution::validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
             );
             let mut updated_vs = self.consensus.validator_set().clone();
@@ -3777,6 +3813,82 @@ mod tests {
         assert_eq!(node.environment(), "devnet");
         assert_eq!(node.consensus.current_height(), 0);
         assert_eq!(node.state.account_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn node_resolves_default_bonding_params_when_genesis_omits_the_override() {
+        // GENESIS (above) predates `validator_bonding` entirely -- same
+        // shape as every genesis file on disk today. Confirms the engine
+        // falls back to its compiled-in defaults byte-for-byte, i.e. this
+        // change set does not alter behavior for any existing genesis file.
+        let node = Node::new(GENESIS, None).await.unwrap();
+        assert_eq!(node.validator_epoch_blocks, DEFAULT_VALIDATOR_EPOCH_BLOCKS);
+        assert_eq!(
+            node.min_bond_uqcb,
+            chain_forge_execution::validator_bond::DEFAULT_MIN_BOND_UQCB
+        );
+    }
+
+    #[tokio::test]
+    async fn node_resolves_validator_bonding_overrides_from_genesis() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "min_bond_amount": 7000000, "validator_epoch_blocks": 42 },"#,
+        );
+        let node = Node::new(&json, None).await.unwrap();
+        assert_eq!(node.validator_epoch_blocks, 42);
+        assert_eq!(node.min_bond_uqcb, 7_000_000);
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_zero_min_bond_amount_in_genesis() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "min_bond_amount": 0 },"#,
+        );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a genesis with min_bond_amount=0 must refuse to start");
+        assert!(matches!(err, NodeError::Genesis(_)));
+        assert!(err.to_string().contains("min_bond_amount"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_zero_validator_epoch_blocks_in_genesis() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "validator_epoch_blocks": 0 },"#,
+        );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a genesis with validator_epoch_blocks=0 must refuse to start -- it would divide by zero on the first commit");
+        assert!(matches!(err, NodeError::Genesis(_)));
+        assert!(err.to_string().contains("validator_epoch_blocks"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn two_nodes_from_the_same_overriding_genesis_agree_on_epoch_boundaries() {
+        // Requirement #5: every node must derive the SAME validator epoch
+        // boundary and minimum-bond rule from the SAME genesis -- not from
+        // a locally-set field. Two independently-constructed nodes parsing
+        // the identical overriding genesis JSON must compute identical
+        // `validator_epoch_blocks`/`min_bond_uqcb`, and therefore roll an
+        // epoch at the identical height, with no coordination between them
+        // beyond the genesis bytes itself.
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "validator_bonding": { "min_bond_amount": 3000000, "validator_epoch_blocks": 2 },"#,
+        );
+        let node_a = Node::new(&json, None).await.unwrap();
+        let node_b = Node::new(&json, None).await.unwrap();
+        assert_eq!(node_a.validator_epoch_blocks, node_b.validator_epoch_blocks);
+        assert_eq!(node_a.min_bond_uqcb, node_b.min_bond_uqcb);
+        assert_eq!(node_a.validator_epoch_blocks, 2);
+        assert_eq!(node_a.min_bond_uqcb, 3_000_000);
     }
 
     #[tokio::test]

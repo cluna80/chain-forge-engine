@@ -292,6 +292,47 @@ pub struct GenesisConfig {
     /// Change Set L: initial set populated at devnet genesis.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settlement_operators: Vec<String>,
+
+    /// Optional overrides for the permissionless stake-bond validator-
+    /// onboarding module (`chain-forge-execution::validator_bond`) and the
+    /// deterministic block-height validator-set epoch length
+    /// (`chain-forge-node`'s `validator_epoch_blocks`).
+    ///
+    /// Entirely additive and backward compatible: omitting this field (as
+    /// every genesis file predating it does) is identical to supplying
+    /// `GenesisValidatorBonding { min_bond_amount: None, validator_epoch_blocks: None }`
+    /// -- the engine falls back to its existing compiled-in defaults
+    /// (`DEFAULT_MIN_BOND_UQCB`, `DEFAULT_VALIDATOR_EPOCH_BLOCKS`) exactly as
+    /// it did before this field existed. No existing genesis JSON needs to
+    /// change, and no running devnet needs to reset, to pick this change up.
+    ///
+    /// This is generic Chain Forge engine configuration, not a
+    /// Qattice-specific policy: any chain built on Chain Forge that enables
+    /// the "staking" module can set these independently of QCB's token
+    /// economics. `chain-forge-core` deliberately does not depend on
+    /// `chain-forge-execution` or `chain-forge-node`, so it cannot name
+    /// their default constants directly -- it only carries the override;
+    /// resolving "override, or the engine's own default" is the caller's
+    /// job (see `chain-forge-node::Node::new_with_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_bonding: Option<GenesisValidatorBonding>,
+}
+
+/// See `GenesisConfig::validator_bonding`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenesisValidatorBonding {
+    /// Minimum stake, in the chain's `native_token.denom`, a candidate must
+    /// hold to be eligible for the active validator set. `None` means "use
+    /// the engine's compiled-in default."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_bond_amount: Option<u128>,
+
+    /// Number of blocks per validator-set epoch. Every decision that can
+    /// change validator membership, voting power, or quorum fires only at a
+    /// height where `height % validator_epoch_blocks == 0`. `None` means
+    /// "use the engine's compiled-in default."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_epoch_blocks: Option<u64>,
 }
 
 // -- Modules ----------------------------------------------------------------------
@@ -630,6 +671,44 @@ impl GenesisConfig {
         }
         Ok(())
     }
+
+    /// Hard validation of the optional `validator_bonding` override block.
+    /// Unlike `validate()`'s warning-only list, this stops the node before
+    /// consensus begins: an accepted-but-nonsensical value here is not a
+    /// "proceed with a warning" situation, the same reasoning as
+    /// `validate_validator_keys()`.
+    ///
+    /// - `min_bond_amount: Some(0)` is rejected -- a minimum of zero is not
+    ///   a minimum at all; it defeats the entire point of a stake-based
+    ///   Sybil defense (ROADMAP "Validator Onboarding" design decision).
+    /// - `validator_epoch_blocks: Some(0)` is rejected -- `chain-forge-node`
+    ///   computes `height / validator_epoch_blocks` on every commit; zero
+    ///   would be a division-by-zero panic at runtime, not a graceful
+    ///   degradation.
+    ///
+    /// `None` for either field is always valid (falls back to the engine
+    /// default), so a genesis file that omits `validator_bonding` entirely
+    /// always passes this check.
+    pub fn validate_validator_bonding(&self) -> Result<(), String> {
+        let Some(ref vb) = self.validator_bonding else { return Ok(()); };
+
+        if vb.min_bond_amount == Some(0) {
+            return Err(
+                "validator_bonding.min_bond_amount is 0 -- a zero minimum \
+                 bond provides no Sybil-resistance; omit the field to use \
+                 the engine default, or set a positive value".into()
+            );
+        }
+        if vb.validator_epoch_blocks == Some(0) {
+            return Err(
+                "validator_bonding.validator_epoch_blocks is 0 -- epoch \
+                 number is computed as height / validator_epoch_blocks, so \
+                 zero would divide by zero at the first commit; omit the \
+                 field to use the engine default, or set a positive value".into()
+            );
+        }
+        Ok(())
+    }
 }
 
 // -- Tests --------------------------------------------------------------------
@@ -962,6 +1041,79 @@ mod tests {
         // the validator's missing key, not the treasury's.
         let err = cfg.validate_validator_keys().unwrap_err();
         assert!(!err.contains("qcb1def456"), "must not flag the treasury account: {err}");
+    }
+
+    #[test]
+    fn validator_bonding_defaults_to_none_when_omitted() {
+        // minimal_genesis_json() predates this field entirely -- every
+        // existing genesis file on disk looks like this. Confirms the
+        // field is additive: absence parses fine and resolves to "no
+        // override", not an error and not a forced value.
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        assert!(cfg.validator_bonding.is_none());
+        assert!(cfg.validate_validator_bonding().is_ok());
+    }
+
+    #[test]
+    fn validator_bonding_accepts_valid_overrides() {
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "min_bond_amount": 5000000, "validator_epoch_blocks": 50 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let vb = cfg.validator_bonding.as_ref().expect("validator_bonding should parse");
+        assert_eq!(vb.min_bond_amount, Some(5_000_000));
+        assert_eq!(vb.validator_epoch_blocks, Some(50));
+        assert!(cfg.validate_validator_bonding().is_ok());
+    }
+
+    #[test]
+    fn validator_bonding_round_trips_through_json() {
+        // Serialization check (change-set requirement #8): a config built
+        // with an override survives to_json_pretty() -> from_json() with
+        // the same values, and a config with no override omits the key
+        // entirely rather than writing `"validator_bonding": null`.
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "min_bond_amount": 2500000, "validator_epoch_blocks": 200 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let round_tripped_json = cfg.to_json_pretty().unwrap();
+        let cfg2 = GenesisConfig::from_json(&round_tripped_json).unwrap();
+        assert_eq!(cfg2.validator_bonding.unwrap().min_bond_amount, Some(2_500_000));
+
+        let cfg_no_override = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let no_override_json = cfg_no_override.to_json_pretty().unwrap();
+        assert!(
+            !no_override_json.contains("validator_bonding"),
+            "omitted validator_bonding must not round-trip as an explicit null"
+        );
+    }
+
+    #[test]
+    fn validator_bonding_rejects_zero_min_bond_amount() {
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "min_bond_amount": 0 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_bonding().expect_err("a zero minimum bond must be rejected");
+        assert!(err.contains("min_bond_amount"), "{err}");
+    }
+
+    #[test]
+    fn validator_bonding_rejects_zero_epoch_blocks() {
+        let json = minimal_genesis_json().replace(
+            r#""modules": ["bank", "staking"],"#,
+            r#""modules": ["bank", "staking"],
+            "validator_bonding": { "validator_epoch_blocks": 0 },"#,
+        );
+        let cfg = GenesisConfig::from_json(&json).unwrap();
+        let err = cfg.validate_validator_bonding().expect_err("zero validator_epoch_blocks must be rejected (division by zero)");
+        assert!(err.contains("validator_epoch_blocks"), "{err}");
     }
 
     #[test]
