@@ -1,0 +1,193 @@
+{
+  "chain_id": "qcb-devnet-val002",
+  "chain_name": "QuarkCharmBit CF-DEVNET-VAL-002 Fixture",
+  "engine_version": "0.1.0",
+  "genesis_time": "2026-09-29T00:00:00Z",
+  "environment": {
+    "mode": "testnet",
+    "faucet_enabled": true,
+    "relaxed_limits": true
+  },
+  "native_token": {
+    "name": "QuarkCharm",
+    "symbol": "QCB",
+    "denom": "uqcb",
+    "max_supply": "210000000"
+  },
+  "address_prefix": "qcb",
+  "consensus": {
+    "type": "proof-of-stake",
+    "validator_set_size": 4,
+    "block_time_ms": 2000,
+    "personhood_weighted": true
+  },
+  "execution": {
+    "state_model": "account",
+    "parallel_execution": false,
+    "gas_model": "dynamic",
+    "require_signatures": false
+  },
+  "cryptography": {
+    "signature_scheme": "hybrid",
+    "pqc_algorithm": "ml-dsa",
+    "migration_trigger": "nist-guidance",
+    "hash_width": 256,
+    "validator_scheme": "pqc-native"
+  },
+  "network": {
+    "network_id": "qcb-devnet-4node",
+    "p2p_port": 27000,
+    "rpc_port": 27001,
+    "bootstrap_nodes": [],
+    "peer_discovery": "bootstrap",
+    "max_peers": 10
+  },
+  "limits": {
+    "max_block_bytes": 1048576,
+    "max_tx_bytes": 65536,
+    "block_gas_limit": 10000000,
+    "mempool_size": 100,
+    "mempool_ttl_seconds": 60
+  },
+  "modules": [
+    "bank",
+    "staking",
+    "identity",
+    "agents",
+    "pocd"
+  ],
+  "custom_modules": [],
+  "genesis_accounts": [
+    {
+      "label": "Alice",
+      "address": "qcb1alice",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8",
+      "_comment": "500 QCB = 500_000_000 uqcb; 10x the max equivocation slash (5% of 500 QCB = 25 QCB). Raised from 5 QCB to fix KNOWN_ISSUES \u00a71. public_key = Ed25519 verifying key for tests/devnet/keys/alice.key.json (Phase 1 \u00a73)."
+    },
+    {
+      "label": "Bob",
+      "address": "qcb1bob",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0",
+      "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/bob.key.json"
+    },
+    {
+      "label": "Carol",
+      "address": "qcb1carol",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692",
+      "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/carol.key.json"
+    },
+    {
+      "label": "Dave",
+      "address": "qcb1dave",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0",
+      "_comment": "public_key = Ed25519 verifying key for tests/devnet/keys/dave.key.json"
+    },
+    {
+      "label": "Eve",
+      "address": "qcb1eve",
+      "balance": "10000000",
+      "role": "user",
+      "_comment": "10 QCB = 10_000_000 uqcb. Ordinary user \u2014 not a genesis validator. Used by CF-DEVNET-VAL-002 to test post-genesis validator admission via BondValidator + RegisterValidatorKey."
+    },
+    {
+      "label": "PoCD Treasury",
+      "address": "treasury:pocd",
+      "balance": "50000000000",
+      "role": "treasury",
+      "_comment": "PoCD epoch reward treasury: 50 billion uqcb (50,000 QCB) for miner reward distribution"
+    },
+    {
+      "label": "PoCD Research Treasury",
+      "address": "treasury:pocd-research",
+      "balance": "10000000000",
+      "role": "treasury",
+      "_comment": "PoCD research reward treasury: 10 billion uqcb (10,000 QCB) for QcbResearchRewardPolicy-v1 settlement"
+    }
+  ],
+  "attestation_coordinator": "qcb1alice",
+  "pocd": {
+    "enabled": true,
+    "chain_id": "qcb-devnet-4node",
+    "challenge_tracks": [
+      "Mathematics",
+      "Cryptography",
+      "ComputationalEfficiency",
+      "PhysicsAndOpenScience",
+      "AiAssistedDiscovery"
+    ],
+    "reward_epoch_blocks": 720,
+    "require_verified_identity": false,
+    "min_seal_difficulty_bits": 8
+  },
+  "genesis_challenges": [
+    {
+      "challenge_id": "qcb-devnet-4node::Mathematics::testnet-pilot-1",
+      "chain_id": "qcb-devnet-4node",
+      "track": "Mathematics",
+      "name": "Testnet Pilot \u2014 Fibonacci Discovery",
+      "verification_criteria": "Compute Fibonacci(n) for n derived from challenge_id seed (range 100-200). Submit SHA256 of decimal string representation as output_hash. Verifiers reproduce n = 100 + (SHA256(challenge_id+'fib')[0:16] as uint64) % 101, then check SHA256(str(fib(n)).encode()).",
+      "seal_difficulty_bits": 8,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-4node::Cryptography::testnet-crypto-1",
+      "chain_id": "qcb-devnet-4node",
+      "track": "Cryptography",
+      "name": "Testnet Crypto \u2014 Hash Pre-image Search",
+      "verification_criteria": "Find an input x = 'qcb-preimage-{N}' such that SHA256(x) starts with nibble 0 (4 leading zero bits). Submit SHA256(x) as output_hash. Starting nonce N = SHA256(challenge_id+'preimage')[0:16] as uint64 & 0xFFFFFFFF. Verifiers check output_hash starts with '0'.",
+      "seal_difficulty_bits": 8,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-4node::ComputationalEfficiency::testnet-perf-1",
+      "chain_id": "qcb-devnet-4node",
+      "track": "ComputationalEfficiency",
+      "name": "Testnet Perf \u2014 Matrix Multiply Benchmark",
+      "verification_criteria": "Run 16\u00d716 integer matrix multiply (seeded from challenge_id). Seed = SHA256(challenge_id+'matmul')[0:16] as uint64 & 0xFFFF. Entries mod 997; compute diagonal sum of C=A\u00d7B mod 2^31. Submit SHA256('matmul-16x16-seed{S}-diag{D}') as output_hash.",
+      "seal_difficulty_bits": 8,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-4node::PhysicsAndOpenScience::testnet-lattice-1",
+      "chain_id": "qcb-devnet-4node",
+      "track": "PhysicsAndOpenScience",
+      "name": "Testnet Lattice \u2014 Shortest Vector Problem (4-dim)",
+      "verification_criteria": "Find shortest non-zero vector in the 4-dimensional integer lattice with basis B derived from challenge_id seed. Seed = SHA256(challenge_id+'lattice')[0:16] as uint64. Build 4\u00d74 basis using LCG (mult=6364136223846793005, add=1442695040888963407, entries = (state>>32)%31 - 15). Exhaustively search coefficient vectors in [-6,6]^4; find minimum non-zero ||Bv||^2. Submit SHA256('svp-dim4-seed{S}-vec{V}-norm{N}') as output_hash. Any verifier can reproduce B and check the submitted vector is genuinely shortest.",
+      "seal_difficulty_bits": 8,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    },
+    {
+      "challenge_id": "qcb-devnet-4node::AiAssistedDiscovery::testnet-primes-1",
+      "chain_id": "qcb-devnet-4node",
+      "track": "AiAssistedDiscovery",
+      "name": "Testnet Primes \u2014 Prime Counting Function \u03c0(n)",
+      "verification_criteria": "Compute \u03c0(n) \u2014 number of primes \u2264 n \u2014 for challenge-seeded n. n = 10000 + (SHA256(challenge_id+'primes')[0:16] as uint64) % 40001, so 10000 \u2264 n \u2264 50000. Submit SHA256('pi(n)={count}') as output_hash. Verifiers run a sieve and check pi_n independently.",
+      "seal_difficulty_bits": 8,
+      "search_space_size": null,
+      "activated_at_block": null,
+      "status": "Active"
+    }
+  ],
+  "settlement_operators": [
+    "qcb1alice"
+  ],
+  "validator_bonding": {
+    "validator_epoch_blocks": 10
+  }
+}

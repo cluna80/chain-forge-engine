@@ -99,6 +99,8 @@ pub struct ValidatorPowerSummary {
     pub id:           String,
     pub voting_power: u64,
     pub pop_verified: bool,
+    /// Hex-encoded registered consensus public key, or empty string if none.
+    pub consensus_pubkey: String,
 }
 
 /// Explorer state, updated by the node on each committed block.
@@ -1612,13 +1614,17 @@ impl Node {
                     });
                 }
 
-                // Validators: derive from the restored validator registry.
-                let vs = self.validator_registry.build_validator_set(height);
-                ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
-                    id:           v.id.0.clone(),
-                    voting_power: v.voting_power,
-                    pop_verified: v.pop_verified,
-                }).collect();
+                // Validators: use the live consensus set (restored from
+                // live_validator_set.json), which carries real public keys.
+                {
+                    let live = self.consensus.validator_set();
+                    ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
+                        id:           v.id.0.clone(),
+                        voting_power: v.voting_power,
+                        pop_verified: v.pop_verified,
+                        consensus_pubkey: hex::encode(&v.public_key),
+                    }).collect();
+                }
 
                 // Blocks + txs: walk chain_store in ascending height order so
                 // push_front leaves them newest-first (matching live behaviour).
@@ -3416,12 +3422,18 @@ impl Node {
             }
 
             // Sync validator power snapshot for GET /api/validators.
-            let vs = self.validator_registry.build_validator_set(exec_result.height);
-            ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
-                id:           v.id.0.clone(),
-                voting_power: v.voting_power,
-                pop_verified: v.pop_verified,
-            }).collect();
+            // Use the live consensus ValidatorSet (not build_validator_set) so
+            // registered consensus keys are reflected immediately after
+            // RegisterValidatorKey commits. The live set is authoritative.
+            {
+                let live = self.consensus.validator_set();
+                ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
+                    id:           v.id.0.clone(),
+                    voting_power: v.voting_power,
+                    pop_verified: v.pop_verified,
+                    consensus_pubkey: hex::encode(&v.public_key),
+                }).collect();
+            }
         }
 
         // Drop proposals and parked certs at or below the height we just
@@ -4014,12 +4026,17 @@ impl Node {
             }
 
             // Sync validator power snapshot for GET /api/validators.
-            let vs = self.validator_registry.build_validator_set(exec_result.height);
-            ex.validator_powers = vs.validators.iter().map(|v| ValidatorPowerSummary {
-                id:           v.id.0.clone(),
-                voting_power: v.voting_power,
-                pop_verified: v.pop_verified,
-            }).collect();
+            // Use the live consensus ValidatorSet so registered consensus
+            // keys (from RegisterValidatorKey) are reflected immediately.
+            {
+                let live = self.consensus.validator_set();
+                ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
+                    id:           v.id.0.clone(),
+                    voting_power: v.voting_power,
+                    pop_verified: v.pop_verified,
+                    consensus_pubkey: hex::encode(&v.public_key),
+                }).collect();
+            }
         }
 
         // Update QRC resource economy metrics snapshot (Section 9.1 / 5.4 / 5.5)
