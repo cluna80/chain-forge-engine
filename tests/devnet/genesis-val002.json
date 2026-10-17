@@ -95,7 +95,8 @@
       "address": "qcb1eve",
       "balance": "10000000",
       "role": "user",
-      "_comment": "10 QCB = 10_000_000 uqcb. Ordinary user \u2014 not a genesis validator. Used by CF-DEVNET-VAL-002 to test post-genesis validator admission via BondValidator + RegisterValidatorKey."
+      "public_key": "1bda5a2f4ab36a814484acb058b00cd5909c50eecc68eda1a5e4029f149338d8",
+      "_comment": "10 QCB = 10_000_000 uqcb. Ordinary user \u2014 not a genesis validator. public_key = Ed25519 verifying key from ClassicalScheme.generate_keypair(\"qcb1eve\") so txs signed in tests are authorized. Used by CF-DEVNET-VAL-002."
     },
     {
       "label": "PoCD Treasury",
