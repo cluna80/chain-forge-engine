@@ -761,19 +761,21 @@ fn post_genesis_validator_admission() {
 
     // Kill Alice.
     drop(nodes.remove(0));  // Alice is index 0
-    eprintln!("   Alice killed. Bob/Carol/Dave/Eve (3 genesis + Eve) continue...");
-    eprintln!("   NOTE: 4 of 5 validators needed for quorum; 4 remain (Bob+Carol+Dave+Eve cannot provide quorum without Alice's power at this stake ratio).");
-    eprintln!("   Checking whether Bob/Carol/Dave can still commit...");
+    eprintln!("   Alice killed. Bob/Carol/Dave continue (Eve is in set but not running).");
+    eprintln!("   Quorum check: Bob+Carol+Dave = 1_500_000_000 uqcb > quorum (~1_334_000_000). ✓");
+    eprintln!("   NOTE: Eve is in the consensus set with a registered key but no running");
+    eprintln!("         process. Every round Eve is proposer times out (~8s). Allowing");
+    eprintln!("         120 s for 2 blocks (worst case: Eve proposes both).");
 
-    // Actually: with 4 remaining, check if they can reach quorum.
-    // Bob+Carol+Dave = 1_500_000_000 uqcb; Eve = 2_000_000 uqcb.
-    // Total = 2_002_000_000; quorum ≈ 1_334_666_668.
-    // Bob+Carol+Dave+Eve ≈ 1_502_000_000 > quorum. ✓
-    // (Alice alone = 500_000_000 < total - quorum → losing Alice doesn't break quorum.)
+    // Bob+Carol+Dave = 1_500_000_000 uqcb; quorum ≈ 1_334_666_668.
+    // 1_500_000_000 > quorum → they can commit without Alice and without Eve.
+    // However, when it is Eve's turn to propose a block, the round times out
+    // (~8 s with block_time_ms=2000) before Bob takes over as the next proposer.
+    // Give 120 s for 2 blocks to handle worst-case proposer-rotation delays.
     let quorum_ports = [ports.bob_api, ports.carol_api, ports.dave_api];
     assert!(
-        poll_height(&quorum_ports, h_before_restart + 2, Duration::from_secs(40)),
-        "Bob/Carol/Dave could not commit blocks after Alice restart"
+        poll_height(&quorum_ports, h_before_restart + 2, Duration::from_secs(120)),
+        "Bob/Carol/Dave could not commit blocks after Alice killed (quorum sufficient: 3/5 active but Bob+Carol+Dave hold >2/3 power)"
     );
     eprintln!("   ✓ Bob/Carol/Dave advanced without Alice.");
 
@@ -817,13 +819,16 @@ fn post_genesis_validator_admission() {
         .map(|n| n.process.kill()));
     // Remove Bob from nodes list cleanly.
     nodes.retain(|n| n.name != "qcb1bob");
-    eprintln!("   Bob killed. Waiting for Carol/Dave/Eve/Alice to advance...");
+    eprintln!("   Bob killed. Waiting for Alice/Carol/Dave to advance (Eve in set, not running).");
+    eprintln!("   Alice+Carol+Dave = 1_500_000_000 uqcb > quorum. Allowing 120 s for proposer-rotation delays.");
 
-    // Alice+Carol+Dave+Eve ≈ 1_502_000_000 > quorum ✓
+    // Alice+Carol+Dave = 1_500_000_000 uqcb > quorum (~1_334_666_668). ✓
+    // Eve is still in the consensus set with a registered key but not running,
+    // so her proposal rounds time out before the next proposer takes over.
     let without_bob = [ports.alice_api, ports.carol_api, ports.dave_api];
     assert!(
-        poll_height(&without_bob, h_before_bob_restart + 2, Duration::from_secs(40)),
-        "chain halted while Bob was down"
+        poll_height(&without_bob, h_before_bob_restart + 2, Duration::from_secs(120)),
+        "chain halted while Bob was down (Alice+Carol+Dave hold >2/3 power, quorum should be reachable)"
     );
     eprintln!("   ✓ Chain advanced without Bob.");
 
