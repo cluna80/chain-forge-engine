@@ -13,8 +13,19 @@
 /// It receives an ordered list of transactions from the consensus layer
 /// (after they have been committed to a block) and applies them to state.
 ///
+/// Single-token architecture (whitepaper, October 2026 revision): $QCB is
+/// the sole active protocol token. The resource marketplace (LockQrcForJob,
+/// ReleaseQrcForJob, RefundQrcForJob, VerifyJob, DepositToTreasury -- still
+/// named for their QRC-prototype origin) escrows and settles in `uqcb`/
+/// `locked_uqcb`, not a separate resource-credit denom. The `QrcPurchase`,
+/// `QrcSpend`, `QrcContributionSettle`, `EpochOpen`/`EpochClose` handlers and
+/// the `uqrc` denom they mint/spend are the earlier two-token prototype --
+/// preserved and still functional, but dormant: nothing in the active
+/// devnet lifecycle calls them, and new code should not build on `uqrc`.
+/// See docs/QCB-Single-Token-Migration-Audit.md for the full audit.
+///
 /// Whitepaper refs:
-///   - Section 6.2 ($QRC transfers, demurrage)
+///   - Section 6.2 (legacy $QRC transfers, demurrage -- prototype, dormant)
 ///   - Section 6.3 ($QCB burns via BME)
 ///   - Section 6.6 (gas fees -> staking yield)
 ///   - Section 8 (merchant payment flow)
@@ -2498,6 +2509,14 @@ impl Executor {
 
             // -- QRC Economic Model v0.1 typed tx types -----------------------
 
+            // Single-token model: $QCB is the sole live protocol token right
+            // now; $QRC is reserved for possible future use, not actively
+            // built on. This burns real uqcb but the uqrc it mints has no
+            // on-chain spending utility in the current resource-marketplace
+            // path (that path is uqcb-denominated -- see LockQrcForJob et
+            // al.). Preserved, not removed, so the two-token mechanism still
+            // works if QRC is reactivated later; new code should not call
+            // this to fund anything.
             TxBody::QrcPurchase { qcb_amount, min_qrc_out } => {
                 // Validate the purchase amount is non-zero.
                 if *qcb_amount == 0 {
@@ -2903,6 +2922,14 @@ impl Executor {
                 }
             }
 
+            // LEGACY: this PoCD reward path pays out in "uqrc" via the dormant
+            // QrcEngine/QcbRewardPolicy epoch-close flow. It is superseded by
+            // the active, uqcb-denominated PoCD path (the SubmitUsefulWork /
+            // epoch-boundary handler below) that the devnet actually uses and
+            // that has been confirmed working end-to-end. Single-token model:
+            // $QCB is the one live token; this path is preserved for QRC's
+            // possible future reactivation but is not exercised by any
+            // current devnet flow.
             TxBody::EpochClose { epoch } => {
                 if qrc.current_epoch != *epoch {
                     return TransactionResult::err(

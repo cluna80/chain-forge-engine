@@ -304,7 +304,7 @@ pub const KNOWN_MODULES: &[(&str, &str)] = &[
     ("bank",     "accounts, transfers and burns (always on)"),
     ("staking",  "Stake transactions"),
     ("identity", "proof of personhood: RegisterIdentity and web-of-trust Attest"),
-    ("qrc",    "QRC purchase, spend, and contribution-earning (requires identity)"),
+    ("qrc",    "resource marketplace: escrow/job settlement in uqcb, plus the dormant legacy QRC purchase/spend/contribution paths (requires identity)"),
     ("agents",   "sponsored agents (requires identity)"),
 ];
 
@@ -463,7 +463,7 @@ impl GenesisConfig {
             ));
         }
         if m.qrc && !m.identity {
-            errors.push("module \"qrc\" requires \"identity\": QRC is earned or purchased only by verified humans".into());
+            errors.push("module \"qrc\" requires \"identity\": the resource marketplace gates jobs and settlement by verified identity".into());
         }
         if self.consensus.personhood_weighted && !m.identity {
             errors.push("consensus.personhood_weighted requires the \"identity\" module: personhood needs an identity layer".into());

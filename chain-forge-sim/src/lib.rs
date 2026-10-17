@@ -19,7 +19,7 @@
 //!
 //! What this crate IS good for, honestly:
 //! - Confirming the mechanical loop (register -> attest -> quorum -> tier
-//!   upgrade -> QRC purchase/earning) works correctly against the live API,
+//!   upgrade -> $QCB transfer) works correctly against the live API,
 //!   not just in isolated unit tests
 //! - Exercising liveness/epoch logic over real, sustained time rather than
 //!   synthetic epoch jumps

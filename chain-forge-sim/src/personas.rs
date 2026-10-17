@@ -81,7 +81,7 @@ fn tier_check(actual: Option<String>, expected: &str, label: &str) -> CheckResul
     }
 }
 
-// -- 1. Happy path: full registration -> quorum -> QRC purchase ---------------
+// -- 1. Happy path: full registration -> quorum -> QCB transfer ---------------
 
 pub struct HonestEarlyAdopter;
 
@@ -102,11 +102,14 @@ impl Persona for HonestEarlyAdopter {
             3 => {
                 ctx.sync_nonce(self.id()).await?;
                 let nonce = ctx.next_nonce(self.id());
-                // QRC Economic Model v0.1: QRC is earned by resource
-                // contribution or purchased by burning QCB -- there is no
-                // UBI drip. This exercises the purchase path.
-                let tx = Transaction::qrc_purchase("sim-alice-qrc", self.id(), 1_000, 1, nonce);
-                ctx.submit_tx(self.id(), "qrc_purchase", tx).await?;
+                // Single-token model: QCB is the only live token right now
+                // (QRC is reserved for future use, not active). Exercise a
+                // plain transfer to demonstrate a verified identity moving
+                // $QCB.
+                let tx = Transaction::transfer(
+                    "sim-alice-xfer", self.id(), "sim-alice-wallet2", "uqcb", 1_000, nonce,
+                );
+                ctx.submit_tx(self.id(), "transfer", tx).await?;
             }
             _ => {}
         }
@@ -124,12 +127,12 @@ impl Persona for HonestEarlyAdopter {
             checks.push(tier_check(acct.and_then(|a| a.tier), "Verified", "sim-alice post-quorum"));
         }
         if epoch == 4 {
-            if let Ok(Some(acct)) = ctx.get_account(self.id()).await {
-                let has_qrc = acct.balances.get("uqrc").copied().unwrap_or(0) > 0;
-                checks.push(if has_qrc {
-                    CheckResult::pass("sim-alice: QRC purchase credited uqrc balance")
+            if let Ok(Some(acct)) = ctx.get_account("sim-alice-wallet2").await {
+                let received = acct.balances.get("uqcb").copied().unwrap_or(0) >= 1_000;
+                checks.push(if received {
+                    CheckResult::pass("sim-alice: transfer credited recipient's uqcb balance")
                 } else {
-                    CheckResult::fail("sim-alice: QRC purchase credited uqrc balance", "balance is zero")
+                    CheckResult::fail("sim-alice: transfer credited recipient's uqcb balance", "balance is below expected amount")
                 });
             }
         }
