@@ -841,9 +841,13 @@ fn post_genesis_validator_admission() {
     eprintln!("   Alice API up.");
 
     // Wait for all nodes including restarted Alice to advance.
+    // Alice must replay ~38 blocks from her persisted WAL before she can
+    // participate.  At 2 s/block that is up to ~76 s of replay alone, plus
+    // the time to commit 2 new blocks (with potential Eve-proposer timeouts).
+    // Allow 180 s total; this is still bounded and the happy path is much faster.
     let h_alice_restart_target = height_of(ports.bob_api) + 2;
     assert!(
-        poll_height(&ports.all_api(), h_alice_restart_target, Duration::from_secs(60)),
+        poll_height(&ports.all_api(), h_alice_restart_target, Duration::from_secs(180)),
         "Not all nodes advanced after Alice restart"
     );
 
