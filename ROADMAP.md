@@ -264,7 +264,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 | Milestone | Technology | Status |
 |---|---|---|
-| **QCB-CS-001** | Cryptographic Survivability and Migration | ⬜ Phase 1 |
+| **QCB-CS-001** | Cryptographic Survivability and Migration | 🔄 P1+P2+P3 complete; P4 tracked |
 | **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B complete |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
@@ -274,16 +274,28 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 *Goal: Ensure QCB can safely migrate to different cryptographic algorithms if an existing algorithm becomes vulnerable to AI-assisted cryptanalysis, quantum computing, or other attacks.*
 
+**Branch:** `security/cs-001-crypto-hardening` | **Full inventory:** `docs/security/QCB-CS-001-crypto-inventory.md`
+
+**Completed this branch (2026-10-17):**
+- ✅ **CS-001-H1** — Scheme-versioned address derivation: `AddressScheme` enum in core; `qcb1pq{hex}` namespace for PQ keys; classical addresses remain `qcb1{hex}`. All derivation sites delegate to `Address::from_public_key_schemed()`. Eliminates double-SHA-256 address derivation.
+- ✅ **CS-001-H2** — Versioned `sig_scheme: Option<SchemeId>` field on `Transaction`; signer stamps it, verifier dispatches explicitly; legacy `None` falls back to prefix scan. Enables live algorithm migration without hard fork.
+- ✅ **CS-001-M1** — `MLDSA_TX_DOMAIN_V1` and `ED25519_TX_DOMAIN_V1` as `pub const` in `chain-forge-crypto`. Single authoritative source; eliminates risk of divergence between signers and verifiers.
+- ✅ **CS-001-M2** — `mldsa_tx_prehash(chain_id, body_json) -> [u8; 32]` helper. Replaced 5 independent inline SHA-256 signing blocks across execution, wallet, scheduler. Upgrade to SHA3-256 is a one-line change + domain version bump.
+- ✅ **CS-001-L1** — `chain-forge-qrc/pocd_reward.rs` claim_id derivation routes through `ChainHash` (SHA-3-256); raw `sha2` dep removed from that crate.
+
 | Requirement | Status | Notes |
 |---|---|---|
-| Complete cryptographic dependency inventory | ⬜ | Audit every hash function, signature scheme, and KDF used across all Chain Forge / QCB crates |
-| Public-key exposure audit across QCB | ⬜ | Identify every place a public key is stored on-chain or transmitted; classify exposure risk |
-| Post-quantum authentication for critical operations | ⬜ | Validator signing, treasury multisig, governance votes — must tolerate PQ threat model |
-| Pluggable signature algorithms (`chain-forge-crypto`) | ⬜ | `SignatureScheme` trait with versioned algorithm identifiers; builds on existing `chain-forge-consensus` pluggability work |
-| Safe cryptographic migration procedures | ⬜ | Documented + tested path: old algorithm → new algorithm without disrupting in-flight transactions or active multisig sets |
-| Emergency algorithm-deprecation mechanism | ⬜ | Governance tx to flag an algorithm as deprecated; grace period for key rotation; hard cutoff enforcement in consensus |
-| Simulated cryptographic compromise tests | ⬜ | Deliberately treat one scheme as "broken"; verify network migrates cleanly under simulated adversarial conditions |
-| Independent security review | 🔲 | Prerequisite: all above items pass; external review before mainnet |
+| Complete cryptographic dependency inventory | ✅ | `docs/security/QCB-CS-001-crypto-inventory.md` — 14 crates audited |
+| Scheme-versioned address derivation (CS-001-H1) | ✅ | `qcb1pq` namespace for PQ; `qcb1` for classical; breaking devnet change, intentional |
+| Versioned signature scheme tag on all transactions (CS-001-H2) | ✅ | `sig_scheme: Option<SchemeId>` — live migration path now exists without hard fork |
+| Canonical domain constants + pre-hash helper (CS-001-M1/M2) | ✅ | `MLDSA_TX_DOMAIN_V1`, `mldsa_tx_prehash()` in `chain-forge-crypto`; 5 inline blocks replaced |
+| Route non-signing hash sites through `ChainHash` (CS-001-L1) | ✅ | `pocd_reward.rs` claim_id now uses SHA-3-256 via `ChainHash` |
+| BLS12-381 / Groth16 PQ migration (CS-001-L2) | 🔲 | Long-horizon (10–15 yr); tracked; requires new ZK proof system |
+| libp2p PQ transport (CS-001-L3) | 🔲 | Follow upstream libp2p NIST PQC adoption; ephemeral key, not on-chain |
+| Safe cryptographic migration procedures | ⬜ | Documented + tested path: old algorithm → new without disrupting in-flight txs |
+| Emergency algorithm-deprecation governance tx | ⬜ | Flag an algorithm deprecated; grace period for key rotation; hard cutoff in consensus |
+| Simulated cryptographic compromise tests | ⬜ | Treat one scheme as "broken"; verify network migrates cleanly under adversarial conditions |
+| Independent security review | 🔲 | Prerequisite: migration procedures + adversarial tests pass; external review before mainnet |
 
 #### QCB-DIS-001 — Digital Identity Stone (QCB Native Wallet)
 
