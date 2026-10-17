@@ -1992,6 +1992,9 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::ConfirmSybil { .. }
         | TxBody::ReverseSybil { .. }
         | TxBody::ReportSuspectedSybil { .. } => Some("identity"),
+        // Legacy QRC-token ops (dormant in the single-token/$QCB-only
+        // protocol -- see "market" and "pocd" below for the active,
+        // uqcb-denominated paths that used to share this module).
         TxBody::QrcPurchase { .. }
         | TxBody::QrcSpend { .. }
         | TxBody::QrcContributionSettle { .. } => Some("qrc"),
@@ -1999,7 +2002,7 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Phase 1 typed variants.
         TxBody::CharmConfinementUpdate { .. } | TxBody::IntrinsicCharmRecord { .. } => Some("identity"),
         TxBody::RegisterAgent { .. } => Some("agents"),
-        // QRC v0.2 epoch boundary signals + Control 5 require the QRC module.
+        // QRC v0.2 epoch boundary signals + Control 5: legacy QRC-token module.
         TxBody::EpochOpen { .. } | TxBody::EpochClose { .. }
         | TxBody::RecordCapacity { .. } => Some("qrc"),
         // AEI Phase 2 lifecycle operations all require the agents module.
@@ -2008,26 +2011,31 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         | TxBody::RevokeAgentFull { .. }
         | TxBody::RecordAgentSpend { .. }
         | TxBody::SpawnChildAgent { .. } => Some("agents"),
-        // Resource Network v0.2 marketplace tx types belong to the QRC module.
+        // Resource Network v0.2 marketplace tx types: job-scoped QRC minting,
+        // part of the resource marketplace, not the legacy standalone
+        // QRC-token purchase path.
         TxBody::PurchaseQrc { .. }
-        | TxBody::CreditProvider { .. } => Some("qrc"),
-        // QRC Escrow is part of the Resource Marketplace (QRC module).
+        | TxBody::CreditProvider { .. } => Some("market"),
+        // QRC Escrow is part of the Resource Marketplace.
         TxBody::LockQrcForJob { .. }
         | TxBody::ReleaseQrcForJob { .. }
-        | TxBody::RefundQrcForJob { .. } => Some("qrc"),
+        | TxBody::RefundQrcForJob { .. } => Some("market"),
         // Agent Treasury is part of the agents module (modifies agent records).
         TxBody::DepositToTreasury { .. } => Some("agents"),
-        // Contribution Layer belongs to the QRC module.
-        TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => Some("qrc"),
-        // Resource Job Lifecycle belongs to the QRC module.
+        // Contribution Layer (machine registration + useful-work submission)
+        // belongs to PoCD / Grand Challenge research rewards -- active and
+        // uqcb-denominated, distinct from the resource marketplace.
+        TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => Some("pocd"),
+        // Resource Job Lifecycle belongs to the Resource Marketplace.
         TxBody::CreateJob { .. }
         | TxBody::AcceptJob { .. }
         | TxBody::CompleteJob { .. }
-        | TxBody::VerifyJob { .. } => Some("qrc"),
-        // ClaimResearchReward (Change Set L): requires both QRC module (balance
-        // ops) and identity module (settlement_operators are DIS identities).
-        // Guard on QRC since that also gates the treasury and balance transfers.
-        TxBody::ClaimResearchReward { .. } => Some("qrc"),
+        | TxBody::VerifyJob { .. } => Some("market"),
+        // ClaimResearchReward (Change Set L): requires both the PoCD module
+        // (treasury/balance ops) and identity module (settlement_operators
+        // are DIS identities). Guard on PoCD since that also gates the
+        // treasury and balance transfers for this reward path.
+        TxBody::ClaimResearchReward { .. } => Some("pocd"),
     }
 }
 
@@ -2040,6 +2048,8 @@ pub fn module_check(tx: &Transaction, modules: &EnabledModules) -> Result<(), St
         "identity" => modules.identity,
         "qrc"    => modules.qrc,
         "agents"   => modules.agents,
+        "market" => modules.market,
+        "pocd"   => modules.pocd,
         _ => false,
     };
     if on { Ok(()) } else { Err(format!("module \"{name}\" is not enabled on this chain")) }
@@ -5087,7 +5097,7 @@ mod tests {
             "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
             "network": { "network_id": "qcb-testnet-1-net", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "both", "max_peers": 50 },
             "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 5000, "mempool_ttl_seconds": 300 },
-            "modules": ["bank", "staking", "identity", "qrc", "agents"],
+            "modules": ["bank", "staking", "identity", "qrc", "agents", "market", "pocd"],
             "custom_modules": [],
             "genesis_accounts": [
                 { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "user" },

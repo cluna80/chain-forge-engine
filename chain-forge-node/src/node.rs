@@ -518,6 +518,7 @@ impl Node {
         info!(
             staking = modules.staking, identity = modules.identity,
             qrc = modules.qrc, agents = modules.agents,
+            market = modules.market, pocd = modules.pocd,
             personhood_weighted = genesis.consensus.personhood_weighted,
             "modules enabled"
         );
@@ -3748,7 +3749,7 @@ mod tests {
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
-        "modules": ["bank", "staking", "identity", "qrc", "agents"],
+        "modules": ["bank", "staking", "identity", "agents", "pocd"],
         "custom_modules": [],
         "genesis_accounts": [
             { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator", "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8" },
@@ -4293,7 +4294,7 @@ mod tests {
         // voting power" check in Node::new_with_config), not a bug.
         let plain = GENESIS
             .replace(
-                r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
+                r#""modules": ["bank", "staking", "identity", "agents", "pocd"]"#,
                 r#""modules": ["bank", "staking"]"#,
             )
             .replace(r#""personhood_weighted": true"#, r#""personhood_weighted": false"#);
@@ -4306,7 +4307,7 @@ mod tests {
     #[tokio::test]
     async fn node_refuses_to_start_with_an_unknown_module() {
         let bad = GENESIS.replace(
-            r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
+            r#""modules": ["bank", "staking", "identity", "agents", "pocd"]"#,
             r#""modules": ["bank", "dex"]"#,
         );
         let err = Node::new(&bad, None).await.err().expect("must refuse to start");
@@ -4316,7 +4317,7 @@ mod tests {
     #[tokio::test]
     async fn node_refuses_personhood_consensus_without_identity() {
         let bad = GENESIS.replace(
-            r#""modules": ["bank", "staking", "identity", "qrc", "agents"]"#,
+            r#""modules": ["bank", "staking", "identity", "agents", "pocd"]"#,
             r#""modules": ["bank", "staking"]"#,
         ); // fixture keeps personhood_weighted: true
         let err = Node::new(&bad, None).await.err().expect("must refuse to start");
