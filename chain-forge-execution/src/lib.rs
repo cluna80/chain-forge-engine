@@ -111,6 +111,9 @@ impl GasModel {
                     TxBody::Stake   { .. }           => op_multiplier * 5,
                     TxBody::BondValidator { .. }     => op_multiplier * 5,
                     TxBody::UnbondValidator          => op_multiplier * 5,
+                    // Verifying a proof-of-possession signature is real
+                    // crypto work, comparable to the other key/identity ops.
+                    TxBody::RegisterValidatorKey { .. } => op_multiplier * 5,
                     TxBody::Custom  { .. }           => op_multiplier * 10,
                     TxBody::SponsorAgent { .. }      => op_multiplier * 4,
                     TxBody::RevokeAgent  { .. }      => op_multiplier * 2,
@@ -225,6 +228,36 @@ pub enum TxBody {
     /// `validator_bond::ValidatorBondStore::start_unbond()` /
     /// `sweep_matured()`.
     UnbondValidator,
+    /// CF-VAL-KEY-002: register (or rotate) the sender's authenticated
+    /// consensus public key -- the key that signs block proposals and
+    /// votes, as distinct from the account key used to sign ordinary
+    /// transactions (which may be the same key, but isn't required to be).
+    ///
+    /// `BondValidator` moves funds but has never carried any key material;
+    /// this is the transaction that actually establishes the authenticated
+    /// binding `consensus key -> validator identity` that mandatory
+    /// signature verification depends on. Reusable across any Chain Forge
+    /// chain -- there is nothing Qattice-specific here.
+    ///
+    /// Authentication (enforced unconditionally in the executor,
+    /// independent of this chain's general `require_signatures` setting --
+    /// see `verify_authorization_for`): the transaction's own signature
+    /// must authenticate `sender` (so only the address that controls this
+    /// validator's account can call this for itself), AND
+    /// `proof_of_possession` must be a valid signature, made with the
+    /// private key corresponding to `consensus_pubkey`, over
+    /// `validator_key_registration_signing_bytes(chain_id, sender)` -- so
+    /// the registrant has actually proven they hold the new key's private
+    /// half, not merely asserted its public bytes. Both conditions must
+    /// hold for every registration, including a later key rotation, which
+    /// is what makes an unauthorized replacement impossible: nobody else's
+    /// transaction can authenticate as `sender`, and nobody who doesn't
+    /// hold the target private key can produce a valid proof of possession
+    /// for it.
+    RegisterValidatorKey {
+        consensus_pubkey:     Vec<u8>,
+        proof_of_possession:  Vec<u8>,
+    },
     /// Custom operation -- opaque payload for module-specific logic.
     /// Used by Charm Confinement, Intrinsic Charm, Charmed Agents.
     /// QRC operations now use typed variants below.
@@ -955,6 +988,7 @@ impl TxBody {
             TxBody::Stake { .. }                  => "Stake",
             TxBody::BondValidator { .. }          => "BondValidator",
             TxBody::UnbondValidator               => "UnbondValidator",
+            TxBody::RegisterValidatorKey { .. }   => "RegisterValidatorKey",
             TxBody::Custom { .. }                 => "Custom",
             TxBody::SponsorAgent { .. }           => "SponsorAgent",
             TxBody::RevokeAgent { .. }            => "RevokeAgent",
@@ -1126,6 +1160,8 @@ impl Transaction {
             TxBody::Stake    { validator, .. }        => validator.len() + 16,
             TxBody::BondValidator { .. }               => 16,
             TxBody::UnbondValidator                    => 8,
+            TxBody::RegisterValidatorKey { consensus_pubkey, proof_of_possession } =>
+                consensus_pubkey.len() + proof_of_possession.len(),
             TxBody::Custom   { module, payload }      => module.len() + payload.len(),
             TxBody::RegisterIdentity                  => 8,
             TxBody::Attest   { claimant_id }          => claimant_id.len() + 8,
@@ -1859,6 +1895,28 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
     if !config.require_signatures {
         return Ok(());
     }
+    verify_authorization_signed(config, tx, state)
+}
+
+/// CF-VAL-KEY-002: like `verify_authorization`, but used for transaction
+/// types whose authentication must never be relaxed by this chain's general
+/// `require_signatures` setting. `require_signatures = false` exists for
+/// devnet/faucet convenience on ordinary transfers; it must never be read
+/// as permission to bind an unauthenticated consensus key to a validator
+/// identity. Callers pick this over `verify_authorization` for exactly
+/// those tx types (currently: `RegisterValidatorKey`).
+fn verify_authorization_for(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
+    if matches!(tx.body, TxBody::RegisterValidatorKey { .. }) {
+        return verify_authorization_signed(config, tx, state);
+    }
+    verify_authorization(config, tx, state)
+}
+
+/// The actual signature/key-binding check, unconditionally (no
+/// `require_signatures` escape hatch). Factored out of `verify_authorization`
+/// so `verify_authorization_for` can force it for specific tx types
+/// regardless of chain config.
+fn verify_authorization_signed(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
 
     // -- ML-DSA path -----------------------------------------------------------
     // If the transaction carries an mldsa65: signature tag, verify it before
@@ -1897,6 +1955,25 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
             }
         }
     }
+}
+
+/// CF-VAL-KEY-002: domain-separated signing bytes for a validator
+/// consensus-key registration proof-of-possession. Binds the registration
+/// to a specific chain and a specific sender address, so a
+/// proof-of-possession signature cannot be replayed against a different
+/// chain, nor reused to register the same key under a different sender's
+/// name. Reusable across any Chain Forge chain -- not Qattice-specific.
+pub fn validator_key_registration_signing_bytes(chain_id: &str, sender: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFVK|"); // Chain Forge Validator Key registration
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(sender.as_bytes());
+    b
+}
+
+fn hex_encode_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Verify an ML-DSA-65 signature on a transaction.
@@ -1986,6 +2063,9 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Validator Onboarding (ROADMAP.md) reuses the "staking" module --
         // bonding/unbonding is the same economic gate as TxBody::Stake.
         TxBody::BondValidator { .. } | TxBody::UnbondValidator => Some("staking"),
+        // Key registration is the authentication half of validator
+        // onboarding, same module gate as bonding (the economic half).
+        TxBody::RegisterValidatorKey { .. } => Some("staking"),
         TxBody::RegisterIdentity
         | TxBody::Attest { .. }
         | TxBody::RevokeAttestation { .. }
@@ -2160,7 +2240,7 @@ impl Executor {
         if let Err(e) = module_check(tx, &self.config.modules) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
-        if let Err(e) = verify_authorization(&self.config, tx, state) {
+        if let Err(e) = verify_authorization_for(&self.config, tx, state) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
@@ -2311,6 +2391,51 @@ impl Executor {
                                 tx.sender, unbonding_amount, self.config.native_denom
                             ));
                         })
+                }
+            }
+
+            // CF-VAL-KEY-002: authenticate and register the sender's
+            // consensus public key. Sender-authentication for this specific
+            // transaction was already forced to run unconditionally (see
+            // `verify_authorization_for`, called above instead of the
+            // general `require_signatures`-gated `verify_authorization` --
+            // a chain running devnet-permissive for ordinary transactions
+            // must never extend that leniency to binding a validator's
+            // consensus identity). What remains to check here is
+            // proof-of-possession: that the sender actually holds the
+            // *private* half of `consensus_pubkey`, not just its bytes.
+            //
+            // This only validates and emits an event; chain-forge-execution
+            // has no dependency on chain-forge-validators (and must not
+            // gain one -- ValidatorRegistry is a node-level concern, this
+            // crate is the reusable, chain-agnostic execution engine). The
+            // caller (`chain-forge-node`, after a successful commit) reads
+            // this event back and mirrors the now-authenticated key into
+            // `ValidatorRegistry::register_consensus_key()`.
+            TxBody::RegisterValidatorKey { consensus_pubkey, proof_of_possession } => {
+                if consensus_pubkey.is_empty() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        "consensus_pubkey must not be empty".to_string(),
+                    );
+                }
+                let msg = validator_key_registration_signing_bytes(&self.config.chain_id, &tx.sender);
+                let sig = Signature { scheme: SchemeId::Classical, bytes: proof_of_possession.clone() };
+                match ClassicalScheme.verify(&msg, &sig, consensus_pubkey) {
+                    Ok(()) => {
+                        events.push(format!(
+                            "register_validator_key: {} registered consensus key {}",
+                            tx.sender, hex_encode_bytes(consensus_pubkey),
+                        ));
+                        identity.record_activity_by_address(&tx.sender);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!(
+                        "proof-of-possession verification failed for {}: {e} -- the \
+                         sender does not appear to hold the private key corresponding \
+                         to the consensus_pubkey it is trying to register",
+                        tx.sender
+                    )),
                 }
             }
 
@@ -4689,7 +4814,7 @@ impl Executor {
         if let Err(e) = module_check(tx, &self.config.modules) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
-        if let Err(e) = verify_authorization(&self.config, tx, state) {
+        if let Err(e) = verify_authorization_for(&self.config, tx, state) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
@@ -4767,7 +4892,8 @@ impl Executor {
             // Validator Onboarding (ROADMAP.md): the unbonding cooldown is
             // tracked in epochs, so this needs identity.clock.current_epoch
             // -- execute_tx_with_identity() only.
-            TxBody::BondValidator { .. } | TxBody::UnbondValidator => {
+            TxBody::BondValidator { .. } | TxBody::UnbondValidator
+            | TxBody::RegisterValidatorKey { .. } => {
                 Err("validator bonding transaction requires identity-aware executor".to_string())
             }
             // QRC typed tx types require the QRC engine (execute_tx_with_identity).
@@ -5817,6 +5943,121 @@ mod tests {
         let r = exec.execute_tx(&tx, &mut state);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("invalid signature"));
+    }
+
+    // -- CF-VAL-KEY-002: RegisterValidatorKey authentication ----------------
+
+    fn register_key_tx(
+        sender: &str, nonce: u64, consensus_kp: &KeyPair, pop_signer: &KeyPair, chain_id: &str,
+    ) -> Transaction {
+        let pop_msg = validator_key_registration_signing_bytes(chain_id, sender);
+        let pop_sig = ClassicalScheme.sign(&pop_msg, pop_signer).unwrap();
+        Transaction {
+            id:        format!("regkey-{sender}-{nonce}"),
+            sender:    sender.to_string(),
+            nonce,
+            body:      TxBody::RegisterValidatorKey {
+                consensus_pubkey:    consensus_kp.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+            },
+            gas_limit: 10_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        }
+    }
+
+    #[test]
+    fn register_validator_key_succeeds_with_valid_proof_of_possession() {
+        let (exec, mut state, alice) = signed_setup();
+        let consensus_kp = key("alice-consensus-key");
+        let mut tx = register_key_tx("qcb1alice", 0, &consensus_kp, &consensus_kp, "qcb-testnet-1");
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(r.success, "{:?}", r.error);
+        assert!(r.events.iter().any(|e| e.starts_with("register_validator_key:")));
+    }
+
+    #[test]
+    fn register_validator_key_rejects_forged_proof_of_possession() {
+        // CF-VAL-KEY-002 Phase 4 test #3: "A forged key registration is
+        // rejected." The sender authenticates itself correctly, but signs
+        // the proof-of-possession with a DIFFERENT key than the one it is
+        // trying to register as `consensus_pubkey` -- i.e. it does not
+        // actually hold the private half of the key being registered.
+        let (exec, mut state, alice) = signed_setup();
+        let real_consensus_kp = key("alice-consensus-key");
+        let attacker_kp       = key("not-alices-key-at-all");
+        let mut tx = register_key_tx("qcb1alice", 0, &real_consensus_kp, &attacker_kp, "qcb-testnet-1");
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("proof-of-possession"));
+    }
+
+    #[test]
+    fn register_validator_key_requires_authentication_even_when_chain_allows_unsigned_txs() {
+        // The general `require_signatures = false` devnet convenience must
+        // never extend to binding an unauthenticated consensus key. Using
+        // the permissive `setup()` fixture (require_signatures: false in
+        // genesis) and submitting a completely unsigned RegisterValidatorKey
+        // tx must still fail -- unlike an ordinary unsigned Transfer, which
+        // `setup()`'s chain would accept.
+        let (exec, mut state) = setup();
+        let consensus_kp = key("some-consensus-key");
+        // Unsigned: tx.signature and tx.public_key both left empty.
+        let tx = register_key_tx("qcb1val", 0, &consensus_kp, &consensus_kp, "qcb-testnet-1");
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(
+            !r.success,
+            "a RegisterValidatorKey tx must require real sender authentication \
+             even on a chain configured with require_signatures = false"
+        );
+
+        // Sanity: the SAME chain really does accept an unsigned ordinary
+        // transfer, confirming the rejection above is specific to
+        // RegisterValidatorKey's unconditional check, not an accidental
+        // side effect of some other change.
+        let transfer = Transaction::transfer("t1", "qcb1val", "qcb1alice", "uqcb", 10, 0);
+        let r2 = exec.execute_tx(&transfer, &mut state);
+        assert!(r2.success, "{:?}", r2.error);
+    }
+
+    #[test]
+    fn register_validator_key_rejects_empty_consensus_pubkey() {
+        let (exec, mut state, alice) = signed_setup();
+        let consensus_kp = key("alice-consensus-key");
+        let mut tx = register_key_tx("qcb1alice", 0, &consensus_kp, &consensus_kp, "qcb-testnet-1");
+        tx.body = TxBody::RegisterValidatorKey { consensus_pubkey: vec![], proof_of_possession: vec![1,2,3] };
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+
+        let r = exec.execute_tx_with_identity(
+            &tx, &mut state,
+            &mut chain_forge_identity::IdentityStore::new(0),
+            &mut QrcEngine::new(chain_forge_qrc::D),
+            &mut AgentStore::new(),
+        );
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("must not be empty"));
     }
 
     #[test]

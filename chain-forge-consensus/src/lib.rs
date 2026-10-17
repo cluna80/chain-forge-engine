@@ -2140,6 +2140,20 @@ impl ConsensusEngine for TendermintEngine {
         // voting at `height + 1` rather than re-running already-committed
         // heights.  Per-round state (votes, proposals, locks) is for the old
         // height and is no longer valid, so clear it.
+        // CF-VAL-KEY-002 hardening: `update_validator_set()` always runs
+        // every incoming set through `gate_voting_power()` before installing
+        // it, so nothing upstream can hand real voting power back to a
+        // validator missing a registered consensus key or verified
+        // personhood (see that function's doc comment). `reset_to_height()`
+        // is a second, separate place the live validator_set gets written
+        // -- restart recovery -- and it did not go through that same gate.
+        // In practice the set handed in here should already be clean (the
+        // caller is expected to pass a correctly key-backfilled set), but
+        // defense-in-depth means this write path enforces the identical
+        // invariant rather than trusting every future caller to remember
+        // to pre-gate it themselves.
+        let validator_set = gate_voting_power(validator_set);
+
         self.height           = height;
         self.round            = 0;
         self.validator_set    = Some(validator_set);
@@ -2891,6 +2905,73 @@ mod tests {
             personhood:          None,
             vca:                 None,
         }
+    }
+
+    /// CF-VAL-KEY-002 Phase 4 test #10: "All three consensus engines reject
+    /// ineligible validators." `update_validator_set()` on every engine
+    /// (FbaEngine, TendermintEngine, HotStuffEngine) must run
+    /// `gate_voting_power()` unconditionally before installing a set it is
+    /// handed -- a validator missing a registered consensus key, or
+    /// missing verified personhood, must come out with zero voting power
+    /// on EVERY engine, not just the one this chain happens to be
+    /// configured with. This is what actually makes "no voting power
+    /// without a key" true chain-wide, rather than true only for whichever
+    /// engine someone remembered to add the check to.
+    #[tokio::test]
+    async fn all_three_engines_zero_voting_power_for_ineligible_validators() {
+        let mixed = ValidatorSet {
+            height: 0,
+            validators: vec![
+                // Eligible: verified personhood AND a registered key.
+                ValidatorInfo {
+                    id: ValidatorId("eligible".into()), voting_power: 10,
+                    pop_verified: true, public_key: vec![1, 2, 3],
+                },
+                // Ineligible: no registered consensus key (CF-VAL-KEY-002's
+                // exact scenario -- a bonded validator who hasn't
+                // registered a key yet).
+                ValidatorInfo {
+                    id: ValidatorId("no-key".into()), voting_power: 10,
+                    pop_verified: true, public_key: vec![],
+                },
+                // Ineligible: has a key but no verified personhood.
+                ValidatorInfo {
+                    id: ValidatorId("no-personhood".into()), voting_power: 10,
+                    pop_verified: false, public_key: vec![4, 5, 6],
+                },
+            ],
+        };
+
+        // -- TendermintEngine ---------------------------------------------
+        let mut tendermint = TendermintEngine::new();
+        tendermint.init(default_config(), mixed.clone()).await.unwrap();
+        tendermint.update_validator_set(mixed.clone()).unwrap();
+        let vs = tendermint.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("eligible".into())), 10);
+        assert_eq!(vs.power_of(&ValidatorId("no-key".into())), 0);
+        assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
+
+        // -- HotStuffEngine ------------------------------------------------
+        let mut hotstuff = HotStuffEngine::new();
+        let mut hs_config = default_config();
+        hs_config.variant = ConsensusVariant::HotStuffStyle;
+        hotstuff.init(hs_config, mixed.clone()).await.unwrap();
+        hotstuff.update_validator_set(mixed.clone()).unwrap();
+        let vs = hotstuff.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("eligible".into())), 10);
+        assert_eq!(vs.power_of(&ValidatorId("no-key".into())), 0);
+        assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
+
+        // -- FbaEngine ------------------------------------------------------
+        let mut fba = FbaEngine::new();
+        let mut fba_config = default_config();
+        fba_config.variant = ConsensusVariant::XrplInspired;
+        fba.init(fba_config, mixed.clone()).await.unwrap();
+        fba.update_validator_set(mixed.clone()).unwrap();
+        let vs = fba.validator_set();
+        assert_eq!(vs.power_of(&ValidatorId("eligible".into())), 10);
+        assert_eq!(vs.power_of(&ValidatorId("no-key".into())), 0);
+        assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
     }
 
     #[tokio::test]
