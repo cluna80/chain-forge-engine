@@ -1618,7 +1618,53 @@ impl Node {
 
             // Rebuild the consensus engine's view of the current height and
             // validator set so it does not re-propose already-committed blocks.
-            let vs = self.validator_registry.build_validator_set(height);
+            let mut vs = self.validator_registry.build_validator_set(height);
+
+            // CF-DEVNET-VAL-001 fix: ValidatorRegistry::build_validator_set()
+            // unconditionally returns public_key: vec![] for every validator
+            // -- ValidatorRegistry's own records never carry a real
+            // registered key (register_genesis_validator stores an empty
+            // "genesis-stub" KeyBundle; genesis is the sole key authority,
+            // not ValidatorRegistry). Before this fix, installing that
+            // keyless set via reset_to_height() below wiped every
+            // validator's public key from the live consensus view on every
+            // restart. That broke two things for the validator actually
+            // restarting: load_signing_key() (called right after this, with
+            // a correct --key-file) refused to load a key because the
+            // registered entry had none to match against, and with no key
+            // on file, both this node's own verify_vote_signature() and
+            // chain_forge_consensus::TendermintEngine::receive_vote() fell
+            // back to their Phase-0 "no key on file -> tolerate empty
+            // signature" allowance -- meant for the era before validator
+            // keys were mandatory, not for a restarted node. So a restarted
+            // node could locally accept and commit its own unsigned
+            // precommit into a CommitCertificate, which every peer that
+            // never restarted (and still has the real key) then correctly
+            // rejected as a forgery, stalling the chain.
+            //
+            // Minimal fix: genesis's real, already-verified public keys are
+            // still intact in this node's current (pre-restore) in-memory
+            // consensus validator set -- restoring from disk only replaces
+            // *this* node's own view, it never touched that key data.
+            // Backfill each validator's real public key from there before
+            // installing the freshly rebuilt set, leaving
+            // build_validator_set()'s own voting_power/pop_verified
+            // computation completely untouched. If a validator somehow has
+            // no live key to backfill from, its public_key stays empty here
+            // (same as before this fix) -- this only restores keys that
+            // already exist and are already verified; it does not grant,
+            // invent, or trust an unverified one.
+            let live_keys = self.consensus.validator_set();
+            for v in &mut vs.validators {
+                if v.public_key.is_empty() {
+                    if let Some(found) = live_keys.validators.iter()
+                        .find(|lv| lv.id == v.id && !lv.public_key.is_empty())
+                    {
+                        v.public_key = found.public_key.clone();
+                    }
+                }
+            }
+
             if let Err(e) = self.consensus.reset_to_height(height, vs) {
                 tracing::warn!(
                     height,
@@ -3839,6 +3885,231 @@ mod tests {
         let node = Node::new(&json, None).await.unwrap();
         assert_eq!(node.validator_epoch_blocks, 42);
         assert_eq!(node.min_bond_uqcb, 7_000_000);
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_registered_validator_public_keys() {
+        // CF-DEVNET-VAL-001 regression (found live via
+        // tests/devnet/test7-restart-recovery-local.sh on a real 4-node
+        // devnet): after a node restarts with --data-dir, the first new
+        // block it helps commit can carry an empty signature for its own
+        // precommit -- despite the validator having a registered genesis
+        // key and a real --key-file -- which every peer that never
+        // restarted then correctly rejects as a forgery:
+        //   "validator qcb1alice has a registered key but precommit in
+        //    commit certificate carries an empty signature (possible
+        //    forgery)"
+        //
+        // Root cause: `Node::load_persisted_state()` rebuilds the live
+        // consensus ValidatorSet after restoring from disk by calling
+        // `ValidatorRegistry::build_validator_set()`, which unconditionally
+        // emits `public_key: vec![]` for every validator (ValidatorRegistry
+        // was never wired to carry the real genesis-registered key --
+        // `register_genesis_validator` stores an empty "genesis-stub"
+        // KeyBundle). This wipes every validator's real public key from the
+        // live set on restart, which does two things: (1) load_signing_key
+        // (called right after, from main.rs) looks up the now-keyless entry
+        // and refuses to load a real signing key at all, even with a
+        // correct --key-file; (2) with no key on file, both
+        // node.rs::verify_vote_signature and
+        // chain_forge_consensus::TendermintEngine::receive_vote fall back
+        // to their Phase-0 "no key on file -> tolerate empty signature"
+        // path -- meant for the pre-mandatory-keys era, not a restarted
+        // node -- so the restarted node locally accepts and commits an
+        // empty-signature "vote" from itself. Any peer that never
+        // restarted still has the correct, non-wiped key and rejects the
+        // resulting certificate. A local-quorum / remote-verification
+        // divergence, not a cosmetic bug.
+        //
+        // This test reproduces the defect without any real OS process
+        // restart or networking: it exercises the exact same
+        // set_data_dir -> commit -> drop -> set_data_dir -> load_persisted_state
+        // sequence main.rs uses, in-process.
+        let dir = std::env::temp_dir()
+            .join(format!("cf-restart-regression-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Phase 1: a node with a data dir commits a couple of blocks.
+        {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.propose_block(cert0.block_hash).await.unwrap();
+            // propose_block()'s devnet/single-node auto-commit path does not
+            // itself call persist_state() (only the real multi-node
+            // commit_block() path does, right after committing each block).
+            // Call it explicitly here so this test persists to disk exactly
+            // what a real node's commit_block() would have persisted after
+            // these same two blocks.
+            node.persist_state();
+
+            // Sanity: before any restart, every genesis validator's real
+            // public key is present in the live set (as seeded from
+            // genesis at construction).
+            for v in &node.consensus.validator_set().validators {
+                assert!(
+                    !v.public_key.is_empty(),
+                    "sanity check failed: {} should have a public key \
+                     before any restart ever happens",
+                    v.id
+                );
+            }
+        } // node dropped -- simulates process exit.
+
+        // Phase 2: a fresh node instance ("restart") resumes from the same
+        // data dir, exactly as main.rs does: set_data_dir then
+        // load_persisted_state.
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(
+            restarted.load_persisted_state(),
+            "persisted state from phase 1 must be found and loaded"
+        );
+
+        // The actual defect: every validator's public key must survive the
+        // restart. Before the fix, this fails -- build_validator_set()
+        // replaces the whole set with public_key: vec![] for everyone.
+        for v in &restarted.consensus.validator_set().validators {
+            assert!(
+                !v.public_key.is_empty(),
+                "validator {} lost its registered public key across restart \
+                 -- this is what lets a restarted node locally accept and \
+                 commit an empty-signature vote that peers who never \
+                 restarted will correctly reject as a forgery",
+                v.id
+            );
+        }
+
+        // Closing the loop on the actual observed symptom: load_signing_key
+        // (called right after load_persisted_state in main.rs, with a real
+        // key file on disk) must still succeed post-restart.
+        let key_dir = dir.join("test-keys");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("alice.key.json");
+        // Same deterministic devnet keypair the GENESIS fixture's
+        // registered public key for qcb1alice comes from (see the comment
+        // above the GENESIS constant).
+        let kp = chain_forge_crypto::ClassicalScheme
+            .generate_keypair("qcb1alice")
+            .unwrap();
+        fn hex_encode(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        std::fs::write(
+            &key_path,
+            serde_json::json!({
+                "address": "qcb1alice",
+                "public_key": hex_encode(&kp.public_key),
+                "private_key": hex_encode(&kp.private_key),
+                "scheme": "classical-ed25519",
+            }).to_string(),
+        ).unwrap();
+
+        restarted.load_signing_key(&key_path).unwrap_or_else(|e| {
+            panic!("load_signing_key must succeed post-restart with a correct \
+                    key file, matching the genesis-registered key: {e}")
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restart_still_rejects_forged_or_unsigned_precommit_after_fix() {
+        // Adversarial counterpart to
+        // `restart_preserves_registered_validator_public_keys`: the fix for
+        // CF-DEVNET-VAL-001 only backfills a validator's REAL, already
+        // genesis-verified public key across restart -- it must not
+        // loosen signature verification itself. Prove that, post-restart,
+        // a validator whose key WAS correctly preserved still has every
+        // vote checked against it: an empty signature and a tampered
+        // signature are both still rejected, exactly as they would be for
+        // a node that never restarted at all.
+        let dir = std::env::temp_dir()
+            .join(format!("cf-restart-adversarial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.propose_block(cert0.block_hash).await.unwrap();
+            node.persist_state();
+        }
+
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+
+        let alice = chain_forge_consensus::ValidatorId("qcb1alice".into());
+        let height = restarted.consensus.current_height();
+        let round = restarted.consensus.current_round();
+        let block_hash = chain_forge_consensus::BlockHash("deadbeefdeadbeef".into());
+
+        // 1. Genuinely unsigned (empty-signature) precommit for a validator
+        //    the fix just restored a real key for -- must still be
+        //    rejected, not silently tolerated by the Phase-0 no-key
+        //    allowance (that allowance only applies when public_key really
+        //    is empty, which it no longer is for alice post-fix).
+        let unsigned = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  alice.clone(),
+            block_hash: Some(block_hash.clone()),
+            signature:  vec![],
+        };
+        assert!(
+            restarted.verify_vote_signature(&unsigned).is_err(),
+            "an empty-signature precommit for a validator with a (now correctly \
+             restored) registered key must still be rejected after the fix"
+        );
+
+        // 2. A forged precommit: signed with a key that is NOT alice's real
+        //    genesis key, claiming to be alice. Must still be rejected.
+        let forger_kp = ClassicalScheme.generate_keypair("not-the-real-alice-key")
+            .unwrap();
+        let bytes = chain_forge_consensus::vote_signing_bytes(
+            &restarted.genesis.chain_id, &VoteType::Precommit, height, round,
+            Some(&block_hash),
+        );
+        let forged_sig = ClassicalScheme.sign(&bytes, &forger_kp).unwrap();
+        let forged = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  alice.clone(),
+            block_hash: Some(block_hash.clone()),
+            signature:  forged_sig.bytes,
+        };
+        assert!(
+            restarted.verify_vote_signature(&forged).is_err(),
+            "a precommit for alice signed with any key other than alice's real \
+             registered key must still be rejected after the fix"
+        );
+
+        // 3. Sanity: a precommit genuinely signed with alice's real
+        //    genesis-registered key (same key the fix preserved) must
+        //    still verify successfully -- the fix did not also break the
+        //    honest path.
+        let real_kp = ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+        let real_sig = ClassicalScheme.sign(&bytes, &real_kp).unwrap();
+        let honest = Vote {
+            vote_type:  VoteType::Precommit,
+            height,
+            round,
+            validator:  alice,
+            block_hash: Some(block_hash),
+            signature:  real_sig.bytes,
+        };
+        assert!(
+            restarted.verify_vote_signature(&honest).is_ok(),
+            "a precommit genuinely signed with alice's real registered key \
+             must still verify successfully after the fix"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
