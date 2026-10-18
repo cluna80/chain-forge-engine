@@ -4442,8 +4442,10 @@ mod tests {
         let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
 
         // Block 0: fund the new address (it holds nothing at genesis, so
-        // it cannot bond before it has uqcb to bond).
-        node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_000_000, 0));
+        // it cannot bond before it has uqcb to bond). Fund with headroom
+        // above the bond amount to cover gas on this Transfer tx itself;
+        // without headroom the bond tx fails ("insufficient balance").
+        node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_010_000, 0));
         let cert0 = node.propose_block(genesis_hash).await.unwrap();
 
         // Block 1: bond the min threshold and above.
@@ -4486,7 +4488,9 @@ mod tests {
         async fn fund_and_bond_erin(node: &mut Node) -> chain_forge_consensus::ValidatorSet {
             node.validator_epoch_blocks = 2;
             let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
-            node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_000_000, 0));
+            // Fund with headroom above the bond amount to cover gas on the
+            // Transfer tx; without it the bond tx fails ("insufficient balance").
+            node.submit_tx(Transaction::transfer("fund-erin", "qcb1alice", "qcb1erin", "uqcb", 2_010_000, 0));
             let cert0 = node.propose_block(genesis_hash).await.unwrap();
             node.submit_tx(Transaction::bond_validator("bond-erin", "qcb1erin", 2_000_000, 0));
             let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
@@ -4583,7 +4587,16 @@ mod tests {
         node: &mut Node, addr: &str, amount: u128, parent_hash: chain_forge_consensus::BlockHash,
     ) -> chain_forge_consensus::CommitCertificate {
         node.validator_epoch_blocks = 2;
-        node.submit_tx(Transaction::transfer("fund", "qcb1alice", addr, "uqcb", amount, 0));
+        // Fund with enough headroom to cover gas on the Transfer tx itself
+        // (~82 uqcb for a typical devnet transfer) AND the subsequent
+        // BondValidator tx, so the candidate can bond exactly `amount`.
+        // Without this buffer the fund tx deducts gas first, leaving the
+        // candidate short of `amount` when the bond tx runs, causing it to
+        // fail with "insufficient balance" -- the root cause of all 7
+        // CF-DEVNET-VAL-001 failures (diagnosed via diagnostic eprintlns,
+        // now removed). 10_000 is conservative headroom; actual gas is ~200.
+        const GAS_BUFFER: u128 = 10_000;
+        node.submit_tx(Transaction::transfer("fund", "qcb1alice", addr, "uqcb", amount + GAS_BUFFER, 0));
         let cert0 = node.propose_block(parent_hash).await.unwrap();
 
         node.submit_tx(Transaction::bond_validator("bond", addr, amount, 0));
