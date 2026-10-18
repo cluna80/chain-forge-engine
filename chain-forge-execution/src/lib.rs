@@ -485,6 +485,12 @@ pub enum TxBody {
         /// Optional reference to a NIST/IETF advisory, vulnerability report,
         /// or internal security finding (e.g. "NIST-2026-CRQC-ALERT-001").
         advisory_ref: Option<String>,
+        /// Which signature layer(s) this deprecation covers.
+        ///
+        /// Must be `DeprecationScope::TxSignatures` — consensus-signature
+        /// migration is not yet implemented and is explicitly rejected at
+        /// execution time to prevent an accidental network halt.
+        scope: DeprecationScope,
     },
 
     /// Settle a verified PoCD research result as a uqcb reward payment.
@@ -809,12 +815,12 @@ impl Transaction {
                 child_agent_id, child_agent_address, parent_agent_id, description, ..
             } => child_agent_id.len() + child_agent_address.len()
                 + parent_agent_id.len() + description.len() + 64,
-            // EmergencyDeprecateAlgorithm: two scheme names + rationale + optional advisory.
+            // EmergencyDeprecateAlgorithm: two scheme names + rationale + optional advisory + scope.
             TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme, replacement_scheme, rationale, advisory_ref, ..
             } => {
                 deprecated_scheme.len() + replacement_scheme.len() + rationale.len()
-                    + advisory_ref.as_deref().map_or(0, str::len) + 16
+                    + advisory_ref.as_deref().map_or(0, str::len) + 32
             }
             // ClaimResearchReward: all string fields + 16 for amount/overhead.
             TxBody::ClaimResearchReward {
@@ -1154,8 +1160,56 @@ pub const MIN_CRYPTO_GRACE_EPOCHS: u64 = 10;
 /// longer than this is operationally untenable.
 pub const MAX_CRYPTO_GRACE_EPOCHS: u64 = 200;
 
+/// Canonical scheme identifiers that the Chain Forge execution layer recognises.
+///
+/// These are the stable lowercase ids returned by `SchemeId::canonical_id()`.
+/// Both `deprecated_scheme` and `replacement_scheme` in an
+/// `EmergencyDeprecateAlgorithm` tx must resolve to one of these values
+/// (case-insensitive) or the tx is rejected.
+pub const KNOWN_CANONICAL_SCHEME_IDS: &[&str] = &[
+    "ed25519",
+    "ml-dsa",
+    "ml-dsa-65",   // NIST alternate designation for the same scheme
+    "slh-dsa",
+    "fn-dsa",
+    "hybrid-ed25519-ml-dsa",
+];
+
 /// State key used in the StateStore to persist the active migration window.
 pub const CRYPTO_MIGRATION_STATE_KEY: &str = "crypto_migration:active";
+
+/// Scope of an emergency cryptographic algorithm deprecation.
+///
+/// Transaction-signature migration and consensus-signature migration are
+/// deliberately separate because an unsafe consensus migration can halt the
+/// entire network.  `ConsensusSignatures` and `Both` are reserved for a
+/// future release that includes a verified validator-key rotation procedure.
+///
+/// # Safety contract
+/// `TxSignatures` is the only scope that the current executor implements.
+/// Any attempt to deprecate `ConsensusSignatures` (directly or via `Both`) is
+/// rejected at execution time with an unambiguous error, preventing an
+/// accidental consensus-quorum failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeprecationScope {
+    /// Deprecate the scheme only for wallet / transaction signatures.
+    ///
+    /// Safe to use today: the consensus layer hardcodes `SchemeId::Classical`
+    /// and is entirely isolated from `CryptoMigrationState`.
+    TxSignatures,
+    /// Deprecate the scheme for consensus votes only.
+    ///
+    /// **NOT YET IMPLEMENTED** — rejected at execution time.
+    /// Requires a verified validator-key rotation procedure and a replacement
+    /// consensus signing path before it can be enabled.
+    ConsensusSignatures,
+    /// Deprecate the scheme for both transaction and consensus signatures.
+    ///
+    /// **NOT YET IMPLEMENTED** — rejected at execution time.
+    /// Requires all pre-conditions of `ConsensusSignatures` to be met.
+    Both,
+}
 
 /// On-chain record of an in-progress cryptographic algorithm migration.
 ///
@@ -1181,6 +1235,20 @@ pub struct CryptoMigrationState {
     pub initiated_by: String,
     /// Transaction ID of the `EmergencyDeprecateAlgorithm` tx.
     pub tx_id: String,
+    /// Scope of this deprecation — which signature layers are covered.
+    ///
+    /// Defaults to `TxSignatures` when deserializing older records that
+    /// pre-date the scope field, preserving backward compatibility.
+    #[serde(default = "DeprecationScope::default_tx_signatures")]
+    pub scope: DeprecationScope,
+}
+
+impl DeprecationScope {
+    /// Serde default: deserialize old `CryptoMigrationState` records (before
+    /// the scope field existed) as `TxSignatures`, preserving safe semantics.
+    fn default_tx_signatures() -> Self {
+        DeprecationScope::TxSignatures
+    }
 }
 
 impl CryptoMigrationState {
@@ -2317,7 +2385,28 @@ impl Executor {
                 grace_epochs,
                 rationale,
                 advisory_ref,
+                scope,
             } => {
+                // ── Guard 0: Scope must be TxSignatures ───────────────────────
+                // Consensus-signature migration requires a verified validator-key
+                // rotation path that does not yet exist.  Reject ConsensusSignatures
+                // and Both unconditionally to prevent an accidental network halt.
+                match scope {
+                    DeprecationScope::TxSignatures => { /* allowed */ }
+                    DeprecationScope::ConsensusSignatures | DeprecationScope::Both => {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "EmergencyDeprecateAlgorithm: scope {:?} is not yet \
+                                 supported — consensus-signature migration requires a \
+                                 verified validator-key rotation path; use \
+                                 TxSignatures scope only",
+                                scope,
+                            ),
+                        );
+                    }
+                }
+
                 // ── Guard 1: Sender must be a crypto governor ─────────────────
                 // Fail-closed: empty crypto_governors denies all deprecation txs.
                 if self.config.crypto_governors.is_empty() {
@@ -2344,6 +2433,35 @@ impl Executor {
                         "EmergencyDeprecateAlgorithm: deprecated_scheme and \
                          replacement_scheme must be different".to_string(),
                     );
+                }
+
+                // ── Guard 2b: Both schemes must be known canonical scheme ids ─
+                // Do not pretend that a replacement algorithm is operational merely
+                // because it appears as a string — it must be a scheme this
+                // executor knows about.
+                {
+                    let dep_lower  = deprecated_scheme.to_lowercase();
+                    let rep_lower  = replacement_scheme.to_lowercase();
+                    if !KNOWN_CANONICAL_SCHEME_IDS.contains(&dep_lower.as_str()) {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "EmergencyDeprecateAlgorithm: deprecated_scheme {:?} is \
+                                 not a known scheme id; accepted values: {:?}",
+                                deprecated_scheme, KNOWN_CANONICAL_SCHEME_IDS,
+                            ),
+                        );
+                    }
+                    if !KNOWN_CANONICAL_SCHEME_IDS.contains(&rep_lower.as_str()) {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "EmergencyDeprecateAlgorithm: replacement_scheme {:?} is \
+                                 not a known scheme id; accepted values: {:?}",
+                                replacement_scheme, KNOWN_CANONICAL_SCHEME_IDS,
+                            ),
+                        );
+                    }
                 }
 
                 // ── Guard 3: Grace period must be in valid range ──────────────
@@ -2389,6 +2507,7 @@ impl Executor {
                     advisory_ref: advisory_ref.clone(),
                     initiated_by: tx.sender.clone(),
                     tx_id: tx.id.clone(),
+                    scope: scope.clone(),
                 };
 
                 // Persist migration state as a JSON sentinel in state store.
@@ -4374,6 +4493,7 @@ mod tests {
                 grace_epochs: grace,
                 rationale: rationale.to_string(),
                 advisory_ref: None,
+                scope: DeprecationScope::TxSignatures,
             },
             gas_limit: 5_000_000,
             signature: vec![],
@@ -4537,6 +4657,7 @@ mod tests {
                 rationale: "Simulated CRQC attack: Ed25519 private keys exposed by \
                             adversary with quantum oracle access".to_string(),
                 advisory_ref: Some("SIMULATED-CRQC-2026-001".to_string()),
+                scope: DeprecationScope::TxSignatures,
             },
             gas_limit: 5_000_000,
             signature: vec![], public_key: vec![], pq_signatures: vec![],
@@ -4688,5 +4809,303 @@ mod tests {
             assert!(!err.contains("was deprecated"),
                 "Untagged tx must not be blocked by cutoff check; got: {err}");
         }
+    }
+
+    /// CS-001 P5 — Guard 0: consensus-scope deprecations are explicitly rejected.
+    ///
+    /// `ConsensusSignatures` and `Both` scopes must be refused because
+    /// consensus-signature migration has no verified replacement signing path.
+    /// Only `TxSignatures` is permitted.
+    #[test]
+    fn cs001_p5_consensus_scope_rejected() {
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // ConsensusSignatures scope must be rejected.
+        let consensus_tx = Transaction {
+            id: "scope-cons".to_string(),
+            sender: gov.to_string(),
+            nonce: 0,
+            body: TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme: "ed25519".to_string(),
+                replacement_scheme: "ml-dsa".to_string(),
+                grace_epochs: MIN_CRYPTO_GRACE_EPOCHS,
+                rationale: "scope test".to_string(),
+                advisory_ref: None,
+                scope: DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 5_000_000,
+            signature: vec![],
+            sig_scheme: None,
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &consensus_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success, "ConsensusSignatures scope must be rejected");
+        let err = r.error.clone().unwrap_or_default();
+        assert!(err.contains("not yet supported"),
+            "error must say scope is not yet supported; got: {err}");
+        assert!(err.contains("TxSignatures"),
+            "error must hint at TxSignatures; got: {err}");
+
+        // Both scope must also be rejected.
+        let both_tx = Transaction {
+            id: "scope-both".to_string(),
+            sender: gov.to_string(),
+            nonce: 0,
+            body: TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme: "ed25519".to_string(),
+                replacement_scheme: "ml-dsa".to_string(),
+                grace_epochs: MIN_CRYPTO_GRACE_EPOCHS,
+                rationale: "scope test both".to_string(),
+                advisory_ref: None,
+                scope: DeprecationScope::Both,
+            },
+            gas_limit: 5_000_000,
+            signature: vec![],
+            sig_scheme: None,
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &both_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success, "Both scope must be rejected");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("not yet supported"),
+            "error for Both scope must say not yet supported; got: {err}");
+
+        // TxSignatures scope must succeed (sanity check the guard is scoped).
+        let good_tx = emergency_deprecate_tx(
+            "scope-ok", gov, 0, "ed25519", "ml-dsa",
+            MIN_CRYPTO_GRACE_EPOCHS, "scope guard sanity",
+        );
+        let r = exec.execute_tx_with_identity(
+            &good_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(r.success, "TxSignatures scope must succeed: {:?}", r.error);
+        // Verify scope is persisted in migration state.
+        let raw = state.get_raw(CRYPTO_MIGRATION_STATE_KEY)
+            .expect("migration state must be written");
+        let migration: CryptoMigrationState = serde_json::from_str(raw).unwrap();
+        assert_eq!(migration.scope, DeprecationScope::TxSignatures,
+            "persisted scope must be TxSignatures");
+    }
+
+    /// CS-001 P5 — Test 10: Restart cannot reactivate a deprecated algorithm.
+    ///
+    /// After deprecation is committed, a snapshot roundtrip (simulating restart)
+    /// must preserve the migration state.  There is no code path that resets
+    /// `CRYPTO_MIGRATION_STATE_KEY` — the test verifies this by confirming the
+    /// key is present and identical after restore, and that the hard cutoff still
+    /// fires post-restore.
+    #[test]
+    fn cs001_p5_restart_cannot_reactivate_deprecated_algorithm() {
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // 1. Submit deprecation tx.
+        let dep_tx = emergency_deprecate_tx(
+            "restart-dep", gov, 0, "ed25519", "ml-dsa",
+            MIN_CRYPTO_GRACE_EPOCHS, "Restart survival test",
+        );
+        let r = exec.execute_tx_with_identity(
+            &dep_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(r.success, "deprecation must succeed: {:?}", r.error);
+
+        // 2. Record state root and migration JSON before snapshot.
+        let pre_root   = state.commit(0, 0, false).root_hash;
+        let pre_json   = state.get_raw(CRYPTO_MIGRATION_STATE_KEY)
+            .expect("migration state must exist pre-snapshot")
+            .to_string();
+        let pre_migration: CryptoMigrationState =
+            serde_json::from_str(&pre_json).unwrap();
+
+        // 3. Export snapshot (simulates node shutdown / persistence).
+        let snapshot = state.export_snapshot();
+        assert!(snapshot.metadata.contains_key(CRYPTO_MIGRATION_STATE_KEY),
+            "snapshot metadata must carry migration state");
+
+        // 4. Restore snapshot (simulates node restart from disk).
+        state.restore_snapshot(snapshot);
+
+        // 5. Migration state must be identical post-restore.
+        let post_json = state.get_raw(CRYPTO_MIGRATION_STATE_KEY)
+            .expect("migration state must survive restart");
+        let post_migration: CryptoMigrationState =
+            serde_json::from_str(post_json).unwrap();
+        assert_eq!(pre_migration, post_migration,
+            "migration state must be bit-identical after restart");
+
+        // 6. State root must be identical post-restore.
+        let post_root = state.commit(0, 0, false).root_hash;
+        assert_eq!(pre_root, post_root,
+            "state root must be identical after restart — deterministic JMT");
+
+        // 7. Hard cutoff still fires post-restore: advance past cutoff.
+        use chain_forge_crypto::SchemeId;
+        identity.clock.current_epoch = post_migration.hard_cutoff_epoch + 1;
+        let mut cutoff_tx = Transaction::transfer(
+            "restart-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, 1,
+        );
+        cutoff_tx.sig_scheme = Some(SchemeId::Classical);
+        let r = exec.execute_tx_with_identity(
+            &cutoff_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success,
+            "deprecated scheme must still be rejected post-restart");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("was deprecated"),
+            "post-restart cutoff error must mention deprecation; got: {err}");
+    }
+
+    /// CS-001 P5 — Test 11: Invalid / unsupported replacement scheme is rejected.
+    ///
+    /// An `EmergencyDeprecateAlgorithm` tx with a `replacement_scheme` that is
+    /// not in the executor's `KNOWN_CANONICAL_SCHEME_IDS` list must be rejected.
+    /// This prevents governance from accidentally migrating to a non-existent or
+    /// unsupported algorithm.
+    #[test]
+    fn cs001_p5_invalid_replacement_scheme_rejected() {
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // Completely unknown replacement scheme.
+        let bad_rep_tx = Transaction {
+            id: "bad-rep-1".to_string(),
+            sender: gov.to_string(),
+            nonce: 0,
+            body: TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:  "ed25519".to_string(),
+                replacement_scheme: "rsa-4096".to_string(), // not in registry
+                grace_epochs: MIN_CRYPTO_GRACE_EPOCHS,
+                rationale: "invalid replacement test".to_string(),
+                advisory_ref: None,
+                scope: DeprecationScope::TxSignatures,
+            },
+            gas_limit: 5_000_000,
+            signature: vec![],
+            sig_scheme: None,
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &bad_rep_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success,
+            "unknown replacement scheme must be rejected");
+        let err = r.error.clone().unwrap_or_default();
+        assert!(err.contains("not a known scheme id"),
+            "error must name the guard; got: {err}");
+        assert!(err.contains("rsa-4096"),
+            "error must name the offending scheme; got: {err}");
+
+        // Completely unknown deprecated scheme.
+        let bad_dep_tx = Transaction {
+            id: "bad-dep-1".to_string(),
+            sender: gov.to_string(),
+            nonce: 0,
+            body: TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:  "secp256k1".to_string(), // not in registry
+                replacement_scheme: "ml-dsa".to_string(),
+                grace_epochs: MIN_CRYPTO_GRACE_EPOCHS,
+                rationale: "invalid deprecated test".to_string(),
+                advisory_ref: None,
+                scope: DeprecationScope::TxSignatures,
+            },
+            gas_limit: 5_000_000,
+            signature: vec![],
+            sig_scheme: None,
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &bad_dep_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success,
+            "unknown deprecated scheme must be rejected");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("not a known scheme id"),
+            "error must name the guard; got: {err}");
+
+        // Valid tx must still succeed after the rejects.
+        let good_tx = emergency_deprecate_tx(
+            "good-scheme", gov, 0, "ed25519", "ml-dsa",
+            MIN_CRYPTO_GRACE_EPOCHS, "valid schemes",
+        );
+        let r = exec.execute_tx_with_identity(
+            &good_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(r.success, "valid scheme tx must succeed: {:?}", r.error);
+    }
+
+    /// CS-001 P5 — Test 12: Overlapping / conflicting migrations are rejected.
+    ///
+    /// Only one active migration is permitted at a time.  Submitting a second
+    /// `EmergencyDeprecateAlgorithm` while one is in progress must be rejected,
+    /// even if the deprecated scheme is different.
+    #[test]
+    fn cs001_p5_overlapping_migrations_rejected() {
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // 1. First migration: ed25519 → ml-dsa.
+        let first_tx = emergency_deprecate_tx(
+            "first-mig", gov, 0, "ed25519", "ml-dsa",
+            MIN_CRYPTO_GRACE_EPOCHS, "First migration",
+        );
+        let r = exec.execute_tx_with_identity(
+            &first_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(r.success, "first migration must succeed: {:?}", r.error);
+
+        // 2. Duplicate — same scheme, same governor: must be rejected.
+        let dup_tx = emergency_deprecate_tx(
+            "dup-mig", gov, 1, "ed25519", "ml-dsa",
+            MIN_CRYPTO_GRACE_EPOCHS, "Duplicate migration",
+        );
+        let r = exec.execute_tx_with_identity(
+            &dup_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success, "duplicate migration must be rejected");
+        let err = r.error.clone().unwrap_or_default();
+        assert!(err.contains("already in progress"),
+            "error must say a migration is already in progress; got: {err}");
+
+        // 3. Conflicting — different scheme but migration still active: must be rejected.
+        // Nonce 1 (same as dup_tx) since dup_tx failed and didn't advance the account nonce.
+        let conflict_tx = Transaction {
+            id: "conflict-mig".to_string(),
+            sender: gov.to_string(),
+            nonce: 1,
+            body: TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:  "slh-dsa".to_string(),
+                replacement_scheme: "ml-dsa".to_string(),
+                grace_epochs: MIN_CRYPTO_GRACE_EPOCHS,
+                rationale: "Conflicting migration".to_string(),
+                advisory_ref: None,
+                scope: DeprecationScope::TxSignatures,
+            },
+            gas_limit: 5_000_000,
+            signature: vec![],
+            sig_scheme: None,
+            public_key: vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &conflict_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success, "conflicting migration must be rejected");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("already in progress"),
+            "error must say migration already in progress; got: {err}");
     }
 }
