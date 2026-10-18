@@ -1699,32 +1699,61 @@ impl Executor {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
-        // CS-001 P4 hard-cutoff enforcement: once the grace window expires,
-        // any transaction whose sig_scheme names the deprecated algorithm is
-        // rejected by consensus.  Checked here — after auth, before nonce /
-        // fee — so it fires unconditionally for every scheme-tagged tx type.
-        if let Some(tx_scheme) = &tx.sig_scheme {
-            if let Some(migration_json) = state.get_raw(CRYPTO_MIGRATION_STATE_KEY) {
-                if let Ok(migration) = serde_json::from_str::<CryptoMigrationState>(migration_json) {
-                    let current_epoch = identity.clock.current_epoch;
-                    if migration.hard_cutoff_passed(current_epoch) {
-                        // Use the stable canonical_id() so the comparison is
-                        // independent of Debug / Display formatting.
-                        if tx_scheme.canonical_id() == migration.deprecated_scheme.to_lowercase() {
-                            return TransactionResult::err(
-                                tx.id.clone(), gas_required, tx.gas_limit,
-                                format!(
-                                    "sig_scheme {:?} was deprecated at epoch {} \
-                                     (hard cutoff passed at epoch {}); \
-                                     rotate to {} before submitting",
-                                    tx_scheme,
-                                    migration.initiated_epoch,
-                                    migration.hard_cutoff_epoch,
-                                    migration.replacement_scheme,
-                                ),
-                            );
-                        }
-                    }
+        // CS-001 P6 hard-cutoff enforcement (hardened).
+        //
+        // Boundary semantics: `hard_cutoff_passed` uses `current_epoch > hard_cutoff_epoch`,
+        // so the deprecated scheme is still accepted *at* hard_cutoff_epoch itself.
+        // This is intentional: it gives the entire epoch in which the cutoff epoch begins
+        // as a final grace period, protecting against block-timing races between the
+        // EmergencyDeprecateAlgorithm tx inclusion and epoch advancement on other nodes.
+        // The first epoch where classical is *refused* is hard_cutoff_epoch + 1.
+        //
+        // Fail-closed design (CS-001-P6-G1): if the migration key exists in state but
+        // cannot be deserialized, the transaction is rejected rather than silently passing.
+        // Malformed migration metadata is treated as an active (unknown) restriction
+        // because allowing execution would bypass the migration intent.
+        //
+        // sig_scheme = None bypass closed (CS-001-P6-G2): the legacy path (sig_scheme
+        // not set) falls through to classical Ed25519 verification.  A classical signer
+        // could strip the sig_scheme tag to avoid this gate.  We close that gap by
+        // treating None as SchemeId::Classical for cutoff purposes: any tx that reaches
+        // this point via the classical Ed25519 verifier is subject to the same cutoff
+        // as an explicitly-tagged Classical tx.
+        if let Some(migration_json) = state.get_raw(CRYPTO_MIGRATION_STATE_KEY) {
+            // Fail-closed: propagate deserialization failure as a hard rejection.
+            let migration = match serde_json::from_str::<CryptoMigrationState>(&migration_json) {
+                Ok(m) => m,
+                Err(e) => {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "crypto migration state is present but could not be read \
+                             (corrupt or schema mismatch); transaction rejected to \
+                             protect migration integrity: {e}",
+                        ),
+                    );
+                }
+            };
+            let current_epoch = identity.clock.current_epoch;
+            if migration.hard_cutoff_passed(current_epoch) {
+                // Resolve the effective scheme: tagged value if present, else Classical
+                // (the only scheme that reaches this code path untagged).
+                let effective_canonical = tx.sig_scheme.as_ref()
+                    .map(|s| s.canonical_id())
+                    .unwrap_or("ed25519");
+                if effective_canonical == migration.deprecated_scheme.to_lowercase() {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "sig_scheme {:?} was deprecated at epoch {} \
+                             (hard cutoff passed at epoch {}); \
+                             rotate to {} before submitting",
+                            tx.sig_scheme,
+                            migration.initiated_epoch,
+                            migration.hard_cutoff_epoch,
+                            migration.replacement_scheme,
+                        ),
+                    );
                 }
             }
         }
@@ -4797,18 +4826,19 @@ mod tests {
                 "MlDsa scheme must not be blocked by Classical cutoff; got: {err}");
         }
 
-        // A transaction with no sig_scheme (None) must also not be blocked —
-        // the cutoff only applies to explicitly tagged schemes.
+        // CS-001-P6-G2: A transaction with sig_scheme = None (legacy classical path)
+        // MUST be blocked by the cutoff after P6.  The untagged path reaches classical
+        // Ed25519 verification, so it is treated as "ed25519" for cutoff purposes.
+        // (This assertion was updated in P6; previously the gate did not cover None.)
         let untagged = Transaction::transfer(
             "t-untagged", "qcb1alice", "qcb1bob", "uqcb", 1, 2
         );
         assert!(untagged.sig_scheme.is_none());
         let r = exec.execute_tx_with_identity(&untagged, &mut state, &mut identity, &mut agents);
-        if !r.success {
-            let err = r.error.unwrap_or_default();
-            assert!(!err.contains("was deprecated"),
-                "Untagged tx must not be blocked by cutoff check; got: {err}");
-        }
+        assert!(!r.success, "Untagged classical tx must be blocked by cutoff after P6 (gap G2 closed)");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("was deprecated") || err.contains("deprecated"),
+            "Untagged classical tx must fail with deprecation error; got: {err}");
     }
 
     /// CS-001 P5 — Guard 0: consensus-scope deprecations are explicitly rejected.
@@ -5107,5 +5137,222 @@ mod tests {
         let err = r.error.unwrap_or_default();
         assert!(err.contains("already in progress"),
             "error must say migration already in progress; got: {err}");
+    }
+
+    // ── CS-001 Phase 6 tests ────────────────────────────────────────────────
+
+    /// CS-001-P6-G1: Malformed migration state in StateStore produces a hard
+    /// rejection rather than silently passing through the cutoff gate.
+    ///
+    /// If `crypto_migration:active` exists but cannot be deserialised, the gate
+    /// must reject the tx with a message indicating corrupt migration state.
+    /// This closes the fail-open deserialization gap identified in the Phase 5
+    /// security review.
+    #[test]
+    fn cs001_p6_corrupt_migration_state_rejected() {
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // Write deliberately malformed JSON into the migration key — simulates
+        // a state corruption event or a schema mismatch after a partial upgrade.
+        state.set_raw(CRYPTO_MIGRATION_STATE_KEY, "{ this is not valid json !!! }");
+
+        // A routine transfer from any sender should now be hard-rejected because
+        // the migration state cannot be read.
+        let transfer_tx = Transaction {
+            id:            "p6-corrupt-1".to_string(),
+            sender:        gov.to_string(),
+            nonce:         0,
+            body:          TxBody::Transfer {
+                to:     "qcb1recv".to_string(),
+                denom:  "uqcb".to_string(),
+                amount: 1,
+            },
+            gas_limit:     500_000,
+            signature:     vec![],
+            sig_scheme:    None,
+            public_key:    vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &transfer_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success, "tx must be rejected when migration state is corrupt");
+        let err = r.error.unwrap_or_default();
+        assert!(
+            err.contains("corrupt") || err.contains("could not be read"),
+            "error must indicate migration state is unreadable; got: {err}",
+        );
+    }
+
+    /// CS-001-P6-G2: A classical transaction with `sig_scheme = None` (legacy
+    /// path) is subject to the same cutoff gate as an explicitly-tagged Classical
+    /// tx after the hard cutoff passes.
+    ///
+    /// This closes the bypass gap: a signer who strips the `sig_scheme` field
+    /// from a classical tx cannot circumvent the deprecation cutoff.
+    #[test]
+    fn cs001_p6_untagged_classical_tx_rejected_after_cutoff() {
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // Deprecate ed25519 with grace = 10 epochs (minimum allowed).
+        // identity.clock.current_epoch = 42, so hard_cutoff_epoch = 52; rejected at 53.
+        let eda = emergency_deprecate_tx(
+            "eda-p6g2", gov, 0, "ed25519", "ml-dsa", 10,
+            "P6 gate2 test — untagged classical bypass",
+        );
+        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "EDA must succeed: {:?}", r.error);
+
+        // Advance to epoch 53 — one past the hard cutoff (cutoff = 52, rejected at 53).
+        identity.clock.current_epoch = 53;
+
+        // Submit a tx with sig_scheme = None.  This is the legacy path that used to
+        // bypass the cutoff gate; it should now be treated as Classical = ed25519.
+        let untagged_tx = Transaction {
+            id:            "p6-untagged-1".to_string(),
+            sender:        gov.to_string(),
+            nonce:         1,
+            body:          TxBody::Transfer {
+                to:     "qcb1recv".to_string(),
+                denom:  "uqcb".to_string(),
+                amount: 1,
+            },
+            gas_limit:     500_000,
+            signature:     vec![],
+            sig_scheme:    None,   // no explicit tag — legacy classical path
+            public_key:    vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &untagged_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success, "untagged classical tx must be rejected after cutoff");
+        let err = r.error.unwrap_or_default();
+        assert!(
+            err.contains("was deprecated") || err.contains("deprecated"),
+            "error must indicate scheme was deprecated; got: {err}",
+        );
+    }
+
+    /// CS-001-P6-BOUND: Documents and tests the exact cutoff boundary semantics.
+    ///
+    /// `hard_cutoff_passed(epoch)` returns `current_epoch > hard_cutoff_epoch`,
+    /// which means:
+    /// - At epoch == hard_cutoff_epoch: classical is still ACCEPTED (last grace epoch)
+    /// - At epoch == hard_cutoff_epoch + 1: classical is REJECTED (first cutoff epoch)
+    ///
+    /// This is intentional: it prevents a scenario where the EDA tx is included at
+    /// epoch N and the cutoff activates partway through the same epoch on another node,
+    /// which could split consensus if block timing is tight.
+    #[test]
+    fn cs001_p6_cutoff_boundary_semantics() {
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // epoch=42, grace=10 (minimum) → hard_cutoff_epoch = 52.
+        // Last accepted epoch: 52. First rejected epoch: 53.
+        let eda = emergency_deprecate_tx(
+            "eda-bound", gov, 0, "ed25519", "ml-dsa", 10,
+            "P6 boundary test",
+        );
+        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "EDA must succeed: {:?}", r.error);
+
+        // hard_cutoff_epoch = initiated_epoch + grace_epochs - 1 = 42 + 10 - 1 = 51.
+        // Last accepted epoch: 51. First rejected epoch: 52.
+        let raw = state.get_raw(CRYPTO_MIGRATION_STATE_KEY).expect("migration state");
+        let migration: CryptoMigrationState = serde_json::from_str(raw).expect("deserialise");
+        assert_eq!(migration.hard_cutoff_epoch, 51,
+            "initiated_epoch=42, grace=10 → cutoff must be 51 (= 42 + 10 - 1)");
+
+        // Make a minimal valid tx to test through the executor.
+        let make_transfer = |id: &str, nonce: u64| Transaction {
+            id:            id.to_string(),
+            sender:        gov.to_string(),
+            nonce,
+            body:          TxBody::Transfer {
+                to:     "qcb1recv".to_string(),
+                denom:  "uqcb".to_string(),
+                amount: 1,
+            },
+            gas_limit:     500_000,
+            signature:     vec![],
+            sig_scheme:    Some(SchemeId::Classical),
+            public_key:    vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+
+        // At epoch 51 (== hard_cutoff_epoch): classical still accepted.
+        identity.clock.current_epoch = 51;
+        let r51 = exec.execute_tx_with_identity(
+            &make_transfer("p6-bound-51", 1), &mut state, &mut identity, &mut agents,
+        );
+        assert!(r51.success,
+            "classical tx must be accepted AT hard_cutoff_epoch (51); got: {:?}", r51.error);
+
+        // At epoch 52 (== hard_cutoff_epoch + 1): classical rejected.
+        identity.clock.current_epoch = 52;
+        let r52 = exec.execute_tx_with_identity(
+            &make_transfer("p6-bound-52", 2), &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r52.success,
+            "classical tx must be REJECTED at hard_cutoff_epoch + 1 (52)");
+        let err = r52.error.unwrap_or_default();
+        assert!(err.contains("was deprecated") || err.contains("deprecated"),
+            "error must indicate scheme deprecated; got: {err}");
+    }
+
+    /// CS-001-P6-MLDSA: A real ML-DSA-65 keypair can create, sign, and finalize
+    /// a transaction after the classical cutoff has passed.
+    ///
+    /// This is the end-to-end proof that the replacement scheme is functional:
+    /// the cutoff blocks classical but does not block the replacement.
+    #[test]
+    fn cs001_p6_mldsa_tx_accepted_after_classical_cutoff() {
+        // Use the signed executor setup (require_signatures = true, funded sender).
+        let sender = "qcb1senderabcdef";
+        let chain_id = "b4-chain";
+        let (exec, mut state) = setup_signed(chain_id, sender);
+        let mut identity = IdentityStore::new(0);
+        let mut agents   = chain_forge_agents::AgentStore::new();
+
+        // Epoch 42; initiate ed25519 → ml-dsa with grace = 3 (cutoff at 45).
+        identity.clock.current_epoch = 42;
+
+        // We need a governor-enabled executor for the EDA tx.
+        // For simplicity: use require_signatures = false for the governance tx,
+        // then re-enable via the state directly by writing the migration record.
+        let migration = CryptoMigrationState {
+            deprecated_scheme:   "ed25519".to_string(),
+            replacement_scheme:  "ml-dsa".to_string(),
+            initiated_epoch:     42,
+            hard_cutoff_epoch:   45,
+            rationale:           "P6 end-to-end ML-DSA test".to_string(),
+            advisory_ref:        None,
+            initiated_by:        "qcb1gov".to_string(),
+            tx_id:               "eda-p6mldsa".to_string(),
+            scope:               DeprecationScope::TxSignatures,
+        };
+        let migration_json = serde_json::to_string(&migration).expect("serialize migration");
+        state.set_raw(CRYPTO_MIGRATION_STATE_KEY, &migration_json);
+
+        // Advance to epoch 46 — past the hard cutoff (45).
+        identity.clock.current_epoch = 46;
+
+        // Build a real ML-DSA-65 signed tx.
+        let (mldsa_tx, _pk) = make_pq_tx_with_chain(chain_id, sender, 0, "p6-seed-unique");
+
+        // Verify the tx is accepted — the deprecated classical scheme is blocked,
+        // but ML-DSA is the replacement and must succeed.
+        let r = exec.execute_tx_with_identity(
+            &mldsa_tx, &mut state, &mut identity, &mut agents,
+        );
+        assert!(r.success,
+            "ML-DSA-65 tx must be accepted after classical cutoff; got: {:?}", r.error);
     }
 }
