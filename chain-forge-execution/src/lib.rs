@@ -1519,6 +1519,46 @@ pub fn validator_key_registration_signing_bytes_v2(
     b
 }
 
+/// PQ-VAL-002 R2: Domain-separated signing bytes for consensus precommit votes.
+///
+/// Format (spec §Precommit-signing-bytes):
+///   `b"QATTICE-PRECOMMIT|" || chain_id || b"|" || height_le8 || b"|" || round_le4 || b"|" || hex(block_hash)`
+///
+/// Properties:
+///   - Domain prefix prevents cross-protocol replay.
+///   - `chain_id` prevents cross-chain replay.
+///   - Little-endian fixed-width integers prevent length-extension ambiguity.
+///   - `block_hash` hex-encoded to stay printable / loggable.
+///
+/// Used by both the classical (Ed25519) and ML-DSA-65 vote-signing paths;
+/// the scheme tag lives in `Vote.scheme`, not in these bytes.
+pub fn consensus_precommit_signing_bytes(
+    chain_id:   &str,
+    height:     u64,
+    round:      u32,
+    block_hash: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(
+        b"QATTICE-PRECOMMIT|".len()
+            + chain_id.len()
+            + 1  // '|'
+            + 8  // height LE8
+            + 1  // '|'
+            + 4  // round LE4
+            + 1  // '|'
+            + block_hash.len() * 2, // hex
+    );
+    b.extend_from_slice(b"QATTICE-PRECOMMIT|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(&height.to_le_bytes());
+    b.push(b'|');
+    b.extend_from_slice(&round.to_le_bytes());
+    b.push(b'|');
+    b.extend_from_slice(hex_encode_bytes(block_hash).as_bytes());
+    b
+}
+
 fn hex_encode_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
