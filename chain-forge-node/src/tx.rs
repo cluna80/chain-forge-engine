@@ -19,9 +19,6 @@
 ///   transfer          <to> <amount> [--denom <d>]
 ///   burn              <amount> [--denom <d>]
 ///   stake             <validator> <amount>
-///   qrc-purchase      <qcb-amount> [--min-out <n>]
-///   qrc-spend         <resource-kind> <units> <amount>
-///     resource-kind: Compute|Storage|ZkProving|Bandwidth|OracleData|AiInference
 ///   register-identity
 ///   attest            <claimant-address>
 ///   revoke-attestation <attested-address>
@@ -50,9 +47,6 @@
 ///   # Report a suspected sybil
 ///   chain-forge-tx --from qcb1alice report-suspected-sybil qcb1eve
 ///
-///   # Purchase QRC credits by burning 100 QCB, accepting any rate
-///   chain-forge-tx --from qcb1alice qrc-purchase 100
-///
 ///   # Dry-run: inspect tx JSON without submitting
 ///   chain-forge-tx --from qcb1alice --dry-run transfer qcb1bob 100
 ///
@@ -68,7 +62,6 @@
 
 use chain_forge_crypto::{KeyPair, SchemeId};
 use chain_forge_execution::{Transaction, TxBody};
-use chain_forge_qrc::ResourceKind;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -186,24 +179,6 @@ fn submit_tx(node: &str, tx_json: &str) -> Result<String, String> {
 }
 
 // ──────────────────────────────────────────────
-// ResourceKind parsing
-// ──────────────────────────────────────────────
-
-fn parse_resource(s: &str) -> Result<ResourceKind, String> {
-    match s {
-        "Compute"     | "compute"      => Ok(ResourceKind::Compute),
-        "Storage"     | "storage"      => Ok(ResourceKind::Storage),
-        "ZkProving"   | "zk-proving"   => Ok(ResourceKind::ZkProving),
-        "Bandwidth"   | "bandwidth"    => Ok(ResourceKind::Bandwidth),
-        "OracleData"  | "oracle-data"  => Ok(ResourceKind::OracleData),
-        "AiInference" | "ai-inference" => Ok(ResourceKind::AiInference),
-        other => Err(format!(
-            "unknown resource kind '{other}'. \
-             Valid: Compute, Storage, ZkProving, Bandwidth, OracleData, AiInference"
-        )),
-    }
-}
-
 // ──────────────────────────────────────────────
 // Tx ID generation (no external deps)
 // ──────────────────────────────────────────────
@@ -257,8 +232,6 @@ SUBCOMMANDS
   transfer <to> <amount> [--denom <d>]
   burn <amount> [--denom <d>]
   stake <validator> <amount>
-  qrc-purchase <qcb-amount> [--min-out <n>]
-  qrc-spend <resource-kind> <units> <qrc-amount>
   register-identity
   attest <claimant-address>
   revoke-attestation <attested-address>
@@ -347,27 +320,6 @@ fn parse_args() -> (GlobalArgs, TxBody) {
             TxBody::Stake {
                 validator: rest[0].clone(),
                 amount:    parse_u128(&rest[1], "amount"),
-            }
-        }
-
-        // ── QRC operations ─────────────────────────────────────────────────
-        "qrc-purchase" => {
-            if rest.is_empty() { die("qrc-purchase requires <qcb-amount>"); }
-            let min_out = flag("--min-out")
-                .map(|s| parse_u128(&s, "--min-out"))
-                .unwrap_or(0);
-            TxBody::QrcPurchase {
-                qcb_amount:  parse_u128(&rest[0], "qcb-amount"),
-                min_qrc_out: min_out,
-            }
-        }
-        "qrc-spend" => {
-            if rest.len() < 3 { die("qrc-spend requires <resource-kind> <units> <qrc-amount>"); }
-            let resource = parse_resource(&rest[0]).unwrap_or_else(|e| die(&e));
-            TxBody::QrcSpend {
-                resource,
-                units:  parse_u128(&rest[1], "units"),
-                amount: parse_u128(&rest[2], "qrc-amount"),
             }
         }
 

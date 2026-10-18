@@ -54,6 +54,7 @@ pub mod api;
 pub mod beacon;
 pub mod error;
 pub mod miner;
+pub mod research_reward;
 pub mod scheduler;
 pub mod settlement;
 pub mod verification;

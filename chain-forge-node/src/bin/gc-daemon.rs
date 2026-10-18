@@ -7,14 +7,14 @@
 //! * Executes the assigned computation in a subprocess sandbox
 //! * Runs the SHA256 seal-nonce search loop (same hardware as BTC mining,
 //!   but sealing a scientific result rather than an empty block header)
-//! * Submits a signed `UsefulWorkReceipt` to the chain via `/api/tx`
+//! * Submits a signed receipt to the chain via `/api/gc-receipt`
 //!
 //! ## Phase 0 target
 //!
 //! Replicate GC-DEVNET-001 as a daemon invocation:
 //! * Challenge: find a SHA256 hash of "QCB:<nonce>" with prefix "0000"
 //! * Seal: wrap the output hash in another SHA256 with a difficulty target
-//! * Receipt: submit a JSON UsefulWorkReceipt to the node API
+//! * Receipt: submit a JSON receipt to the node API
 //!
 //! ## Usage
 //!
@@ -32,19 +32,100 @@
 use std::time::{Duration, Instant};
 use std::io::Write as _;
 
-use chain_forge_resource::{
-    UsefulWorkReceipt, WorkType, MachineId,
-    find_seal_nonce, verify_seal,
-};
 use serde_json::json;
+
+// ── Inlined types (previously in chain-forge-resource, now retired) ────────
+
+/// Work type for the useful-work receipt.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum WorkType {
+    ResearchContribution,
+    GrandChallenge,
+}
+
+/// A useful-work receipt submitted by a gc-daemon after completing a challenge.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UsefulWorkReceipt {
+    pub receipt_id:           String,
+    pub work_type:            WorkType,
+    pub challenge_id:         String,
+    pub machine_id:           String,
+    pub input_hash:           String,
+    pub output_hash:          String,
+    pub methodology_ref:      String,
+    pub nonce:                u64,
+    pub checks_performed:     u64,
+    pub elapsed_seconds:      f64,
+    pub timestamp_utc:        String,
+    pub machine_signature:    String,
+    pub verified:             bool,
+    pub verifier_id:          Option<String>,
+    pub verifier_signature:   Option<String>,
+    pub seal_nonce:           u64,
+    pub seal_hash:            String,
+    pub seal_difficulty_bits: u32,
+}
+
+/// Find a seal nonce such that SHA256(seal_nonce || output_hash || challenge_id)
+/// has `difficulty` leading zero bits. Returns (nonce, hex_hash) or None if
+/// exhausted.
+pub fn find_seal_nonce(
+    output_hash:  &str,
+    challenge_id: &str,
+    difficulty:   u32,
+    start_nonce:  u64,
+    max_attempts: u64,
+) -> Option<(u64, String)> {
+    use sha2::{Sha256, Digest};
+
+    let required_bytes  = (difficulty / 8) as usize;
+    let required_bits   = difficulty % 8;
+
+    for nonce in start_nonce..start_nonce.saturating_add(max_attempts) {
+        let mut h = Sha256::new();
+        h.update(nonce.to_le_bytes());
+        h.update(output_hash.as_bytes());
+        h.update(challenge_id.as_bytes());
+        let hash = h.finalize();
+
+        let ok = hash[..required_bytes].iter().all(|&b| b == 0)
+            && (required_bits == 0 || (hash[required_bytes] >> (8 - required_bits)) == 0);
+        if ok {
+            return Some((nonce, hex::encode(hash)));
+        }
+    }
+    None
+}
+
+/// Verify that a receipt's seal_hash meets its stated difficulty.
+pub fn verify_seal(receipt: &UsefulWorkReceipt) -> bool {
+    use sha2::{Sha256, Digest};
+
+    let mut h = Sha256::new();
+    h.update(receipt.seal_nonce.to_le_bytes());
+    h.update(receipt.output_hash.as_bytes());
+    h.update(receipt.challenge_id.as_bytes());
+    let hash = h.finalize();
+    let computed = hex::encode(&hash);
+
+    if computed != receipt.seal_hash {
+        return false;
+    }
+
+    let difficulty    = receipt.seal_difficulty_bits;
+    let req_bytes     = (difficulty / 8) as usize;
+    let req_bits      = difficulty % 8;
+    hash[..req_bytes].iter().all(|&b| b == 0)
+        && (req_bits == 0 || (hash[req_bytes] >> (8 - req_bits)) == 0)
+}
 
 // ── Config ────────────────────────────────────────────────────────────────
 
-const DEFAULT_NODE_URL:      &str = "http://127.0.0.1:8080";
-const DEFAULT_MACHINE_ID:    &str = "MACH-GC-DAEMON-001";
-const DEFAULT_SEAL_DIFFICULTY: u32 = 16;     // bits — matches GC-DEVNET-001 simulation
-const DEFAULT_CHALLENGE_ID:  &str = "GC-DEVNET-002";
-const DEFAULT_POLL_SECS:     u64  = 30;
+const DEFAULT_NODE_URL:        &str = "http://127.0.0.1:8080";
+const DEFAULT_MACHINE_ID:      &str = "MACH-GC-DAEMON-001";
+const DEFAULT_SEAL_DIFFICULTY: u32  = 16;     // bits — matches GC-DEVNET-001 simulation
+const DEFAULT_CHALLENGE_ID:    &str = "GC-DEVNET-002";
+const DEFAULT_POLL_SECS:       u64  = 30;
 
 // ── CLI args (minimal, no clap dep) ───────────────────────────────────────
 
@@ -102,14 +183,11 @@ OPTIONS:
   --dry-run             Run computation but don't submit receipt
   --help                Print this help
 
-EXAMPLE:
-  cargo run --bin gc-daemon -- --node http://127.0.0.1:8080 --machine MACH-CAROL-003
-
 WHAT IT DOES:
   1. Polls the node for active challenge tracks
   2. Runs the GC-DEVNET-002 hash preimage search (same SHA256 as BTC mining)
   3. Seals the result with SHA256(nonce || output_hash || challenge_id)
-  4. Submits a signed UsefulWorkReceipt to the chain
+  4. Submits a signed receipt to the chain via /api/gc-receipt
 "#
     );
 }
@@ -181,7 +259,7 @@ fn assemble_receipt(
         receipt_id,
         work_type:           WorkType::ResearchContribution,
         challenge_id:        challenge_id.to_string(),
-        machine_id:          MachineId(machine_id.to_string()),
+        machine_id:          machine_id.to_string(),
         input_hash:          sha256_hex(format!("challenge-input:{}", challenge_id).as_bytes()),
         output_hash:         result.output_hash.clone(),
         methodology_ref:     "ipfs://QmGCDEVNET002-hash-preimage-v1".to_string(),
@@ -231,8 +309,6 @@ fn chrono_now() -> String {
 
 fn submit_receipt(node_url: &str, receipt: &UsefulWorkReceipt) -> Result<String, String> {
     // Wrap receipt in a minimal tx envelope the node API expects.
-    // Phase 0: POST to /api/gc-receipt (new endpoint) OR log to stdout.
-    // For now we submit to /api/gc-receipt and print what we'd send.
     let tx_body = json!({
         "tx_type": "UsefulWorkReceipt",
         "payload": receipt,
@@ -272,7 +348,7 @@ fn submit_receipt(node_url: &str, receipt: &UsefulWorkReceipt) -> Result<String,
         Ok(status_line)
     } else if status_line.contains("404") {
         // /api/gc-receipt not yet wired — expected in Phase 0
-        Ok(format!("(Phase 0: /api/gc-receipt not yet wired — receipt logged locally)"))
+        Ok("(Phase 0: /api/gc-receipt not yet wired — receipt logged locally)".to_string())
     } else {
         Err(format!("node returned: {}", status_line))
     }
@@ -312,8 +388,8 @@ fn main() {
             &result.output_hash,
             &cfg.challenge_id,
             cfg.seal_difficulty,
-            0,                    // start_nonce
-            u64::MAX,             // no limit — we'll find it
+            0,         // start_nonce
+            u64::MAX,  // no limit — we'll find it
         ) {
             Some((seal_nonce, seal_hash_str)) => {
                 let seal_elapsed = t_seal.elapsed();

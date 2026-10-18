@@ -13,7 +13,6 @@ use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest
                   verify_challenge_signature};
 use chain_forge_p2p::PeerInfo;
 use chain_forge_execution::Transaction;
-use chain_forge_resource::UsefulWorkReceipt;
 use chain_forge_pocd::{DiscoveryProof, DiscoveryRegistry};
 
 /// Serve the HTTP API on the given port.
@@ -349,9 +348,9 @@ pub async fn serve(
                         let p = peers.lock().unwrap();
                         http_200_json(&serde_json::to_string(&*p).unwrap_or_default())
                     } else if first_line.starts_with("POST /api/gc-receipt") {
-                        // POST /api/gc-receipt — receive a UsefulWorkReceipt from gc-daemon.
-                        // Validates with verify_seal(), stores in ExplorerState (newest-first,
-                        // capped at MAX_GC_RECEIPTS), and exposes via GET /api/gc-receipts.
+                        // POST /api/gc-receipt — receive a useful-work receipt from gc-daemon.
+                        // chain-forge-resource (QRC) has been retired; receipts are now stored
+                        // as raw JSON values (no seal verification). Exposes via GET /api/gc-receipts.
                         //
                         // The gc-daemon wraps the receipt in:
                         //   { "tx_type": "UsefulWorkReceipt", "payload": <receipt> }
@@ -361,60 +360,56 @@ pub async fn serve(
                             .unwrap_or(request.len());
                         let body = &request[body_start..];
 
-                        // Try both shapes: bare receipt or envelope with "payload" field.
-                        let receipt_result: Result<UsefulWorkReceipt, _> =
-                            serde_json::from_str(body)
-                            .or_else(|_| {
-                                serde_json::from_str::<serde_json::Value>(body)
-                                    .ok()
-                                    .and_then(|v| v.get("payload").cloned())
-                                    .ok_or_else(|| serde_json::from_str::<UsefulWorkReceipt>("").unwrap_err())
-                                    .and_then(|p| serde_json::from_value(p))
+                        // Parse as generic JSON; extract "payload" if wrapped.
+                        let receipt_result: Result<serde_json::Value, _> =
+                            serde_json::from_str::<serde_json::Value>(body)
+                            .map(|v| {
+                                if let Some(payload) = v.get("payload").cloned() {
+                                    payload
+                                } else {
+                                    v
+                                }
                             });
 
                         match receipt_result {
                             Ok(receipt) => {
-                                if !chain_forge_resource::verify_seal(&receipt) {
-                                    let resp = serde_json::json!({
-                                        "status": "rejected",
-                                        "receipt_id": receipt.receipt_id,
-                                        "reason": "verify_seal failed — seal_hash does not meet difficulty target"
-                                    });
-                                    tracing::warn!(
-                                        receipt_id = %receipt.receipt_id,
-                                        "gc-receipt rejected: verify_seal failed"
-                                    );
-                                    http_400_json(&resp.to_string())
-                                } else {
-                                    let receipt_id = receipt.receipt_id.clone();
-                                    let challenge_id = receipt.challenge_id.clone();
-                                    let machine_id = receipt.machine_id.0.clone();
-                                    {
-                                        let mut ex = explorer.lock().unwrap();
-                                        ex.gc_receipts.push_front(receipt);
-                                        if ex.gc_receipts.len() > MAX_GC_RECEIPTS {
-                                            ex.gc_receipts.pop_back();
-                                        }
+                                let receipt_id = receipt.get("receipt_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_owned();
+                                let challenge_id = receipt.get("challenge_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_owned();
+                                let machine_id = receipt.get("machine_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_owned();
+                                {
+                                    let mut ex = explorer.lock().unwrap();
+                                    ex.gc_receipts.push_front(receipt);
+                                    if ex.gc_receipts.len() > MAX_GC_RECEIPTS {
+                                        ex.gc_receipts.pop_back();
                                     }
-                                    tracing::info!(
-                                        receipt_id,
-                                        challenge_id,
-                                        machine_id,
-                                        "gc-receipt accepted and stored"
-                                    );
-                                    let resp = serde_json::json!({
-                                        "status": "accepted",
-                                        "receipt_id": receipt_id,
-                                        "challenge_id": challenge_id,
-                                        "machine_id": machine_id
-                                    });
-                                    http_200_json(&resp.to_string())
                                 }
+                                tracing::info!(
+                                    receipt_id,
+                                    challenge_id,
+                                    machine_id,
+                                    "gc-receipt accepted and stored"
+                                );
+                                let resp = serde_json::json!({
+                                    "status": "accepted",
+                                    "receipt_id": receipt_id,
+                                    "challenge_id": challenge_id,
+                                    "machine_id": machine_id
+                                });
+                                http_200_json(&resp.to_string())
                             }
                             Err(e) => {
                                 let resp = serde_json::json!({
                                     "status": "error",
-                                    "message": format!("invalid UsefulWorkReceipt JSON: {e}")
+                                    "message": format!("invalid receipt JSON: {e}")
                                 });
                                 http_400_json(&resp.to_string())
                             }

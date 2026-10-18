@@ -23,8 +23,6 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
-pub mod matchmaking;
-
 // -- Error --------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]

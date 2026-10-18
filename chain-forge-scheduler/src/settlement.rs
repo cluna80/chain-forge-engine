@@ -38,7 +38,7 @@ use tracing::{info, warn};
 
 use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme};
 use chain_forge_execution::{Transaction, TxBody};
-use chain_forge_qrc::{QcbResearchRewardPolicy, ResearchRewardError};
+use crate::research_reward::{QcbResearchRewardPolicy, ResearchRewardError};
 use chain_forge_research_db::{
     models::{ClaimStatus, RewardKind},
     ResearchDb, ResearchDbError,

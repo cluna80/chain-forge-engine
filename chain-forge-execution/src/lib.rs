@@ -35,7 +35,6 @@ use chain_forge_core::{Address, EnabledModules, GenesisConfig, HashWidth};
 use chain_forge_crypto::{ClassicalScheme, KeyPair, MlDsaScheme, SchemeId, Signature, SignatureScheme};
 use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
-use chain_forge_qrc::QrcEngine;
 use chain_forge_agents::{AgentStore, AgentType, SpendingLimits};
 use chain_forge_pocd::DiscoveryRegistry;
 
@@ -133,11 +132,8 @@ impl GasModel {
                     TxBody::ReverseSybil { .. }        => op_multiplier * 8,
                     // QRC typed variants.
                     // Purchase: burns QCB + mints QRC — heavier than a plain burn.
-                    TxBody::QrcPurchase { .. }          => op_multiplier * 6,
                     // Spend: updates provider pool + burn + reserve — three writes.
-                    TxBody::QrcSpend { .. }             => op_multiplier * 5,
                     // Settle: verifies evidence + mints QRC — most expensive.
-                    TxBody::QrcContributionSettle { .. }=> op_multiplier * 12,
                     // Phase 1 Charm Confinement / Agent typed variants.
                     // ConfinementUpdate: reads identity + writes charm + Merkle leaf.
                     TxBody::CharmConfinementUpdate { .. } => op_multiplier * 4,
@@ -146,10 +142,7 @@ impl GasModel {
                     // RegisterAgent: writes AgentRecord + identity sponsorship + account.
                     TxBody::RegisterAgent { .. }         => op_multiplier * 8,
                     // Epoch boundary: lightweight protocol signals.
-                    TxBody::EpochOpen { .. }             => op_multiplier * 4,
-                    TxBody::EpochClose { .. }            => op_multiplier * 4,
                     // Control 5: capacity update + circuit breaker re-evaluation.
-                    TxBody::RecordCapacity { .. }        => op_multiplier * 3,
                     // AEI Phase 2 lifecycle ops.
                     TxBody::AuthorizeAgent { .. }        => op_multiplier * 4,
                     TxBody::SuspendAgent { .. }          => op_multiplier * 3,
@@ -158,29 +151,17 @@ impl GasModel {
                     TxBody::SpawnChildAgent { .. }       => op_multiplier * 8, // comparable to RegisterAgent
                     // Resource Network v0.2 marketplace tx types.
                     // PurchaseQrc: burns QCB + mints QRC + records job credit.
-                    TxBody::PurchaseQrc { .. }           => op_multiplier * 7,
                     // CreditProvider: coordinator credit + mints QRC to provider.
-                    TxBody::CreditProvider { .. }        => op_multiplier * 8,
                     // QRC Escrow: balance hold/release — moderate state writes.
-                    TxBody::LockQrcForJob { .. }         => op_multiplier * 5,
-                    TxBody::ReleaseQrcForJob { .. }      => op_multiplier * 6, // two account writes + receipt check
-                    TxBody::RefundQrcForJob { .. }       => op_multiplier * 4,
                     // Agent Treasury: one debit + one credit + optional agent record update.
-                    TxBody::DepositToTreasury { .. }     => op_multiplier * 4,
                     // Resource Network: Contribution layer.
                     // RegisterMachine: writes MachineRecord to state (similar to RegisterAgent).
-                    TxBody::RegisterMachine { .. }       => op_multiplier * 6,
                     // SubmitUsefulWork: verifies seal + writes receipt + updates contribution score.
-                    TxBody::SubmitUsefulWork { .. }      => op_multiplier * 8,
                     // ClaimResearchReward (Change Set L): settlement_operators check +
                     // replay-key write + treasury debit + recipient credit.
                     // Comparable to QrcContributionSettle (also 12×).
                     TxBody::ClaimResearchReward { .. }   => op_multiplier * 12,
                     // Resource Job Lifecycle: 4 state-machine tx types.
-                    TxBody::CreateJob { .. }             => op_multiplier * 5, // escrow check + job record write
-                    TxBody::AcceptJob { .. }             => op_multiplier * 3, // job state update only
-                    TxBody::CompleteJob { .. }           => op_multiplier * 4, // receipt + job state update
-                    TxBody::VerifyJob { .. }             => op_multiplier * 7, // hash check + escrow release + two balance writes
                 };
                 base_fee_per_byte * tx_bytes + op_cost
             }
@@ -266,70 +247,6 @@ pub enum TxBody {
         payload: Vec<u8>,
     },
 
-    // ── QRC Economic Model v0.1 typed tx variants ──────────────────────────
-
-    /// Purchase-path QRC minting (Section 4.1 / QRC Economic Model v0.1).
-    ///
-    /// Burns `qcb_amount` of $QCB from the sender's account and mints QRC
-    /// resource credits at the current algorithmic rate `Rt`.  The rate is
-    /// demand-responsive: when the network is congested Rt falls (QRC costs
-    /// more QCB); when the network is underutilised Rt rises (QRC costs less).
-    ///
-    /// `min_qrc_out` is a slippage guard: if the engine would produce fewer
-    /// QRC credits than this value the transaction is rejected with
-    /// `SlippageExceeded`.  Pass 0 to accept any rate.
-    ///
-    /// State changes:
-    ///   - sender.$QCB decreases by `qcb_amount` (permanent burn)
-    ///   - QrcEngine credits `qrc_minted` to sender's QRC balance
-    ///   - QrcEngine.total_qcb_burned += qcb_amount (audit trail)
-    QrcPurchase {
-        /// $QCB to burn (in uqcb, the smallest denomination).
-        qcb_amount:  u128,
-        /// Minimum QRC credits the sender will accept.  0 = no minimum.
-        min_qrc_out: u128,
-    },
-
-    /// Consumption-path QRC spending (Section 4.3 / QRC Economic Model v0.1).
-    ///
-    /// Deducts `amount` QRC from the sender's balance for a single network
-    /// operation of the given resource type.  The engine applies the
-    /// consumption split:
-    ///   ~60% → provider compensation pool
-    ///   ~25% → permanent QRC burn (deflationary)
-    ///   ~15% → protocol reserve
-    ///
-    /// The actual cost for a given number of `units` is computed by
-    /// `QrcEngine::operation_cost()` which accounts for per-resource base
-    /// costs and the current congestion multiplier.  `amount` must be ≥ the
-    /// computed cost or the transaction is rejected.
-    QrcSpend {
-        /// Which network resource is being consumed.
-        resource: chain_forge_qrc::ResourceKind,
-        /// Number of resource units being consumed.
-        units:    u128,
-        /// QRC the sender authorises to spend (must cover the computed cost).
-        amount:   u128,
-    },
-
-    /// Contribution-path QRC earning (Section 4.2 / QRC Economic Model v0.1).
-    ///
-    /// Submitted by a verified resource provider after each epoch, carrying
-    /// their `CapacityEvidence` (proof of compute/storage/ZK-proving delivered
-    /// during the epoch).  The VCA layer in `chain-forge-qrc` verifies the
-    /// evidence against the epoch's demand data, computes the provider's
-    /// earning `E(i,r,t)`, and mints QRC directly — no QCB is burned.
-    ///
-    /// Enforced invariants:
-    ///   - Sender must be a Verified-tier identity (Charm Confinement).
-    ///   - One settlement per (sender, epoch, resource_type).
-    ///   - Evidence must be from a Finalized (or Finalizing) CapacityReport.
-    QrcContributionSettle {
-        /// The epoch being settled.
-        epoch:    u64,
-        /// The capacity evidence to settle against.
-        evidence: chain_forge_qrc::CapacityEvidence,
-    },
     /// Register a new Provisional identity (Whitepaper Section 4 / Identity
     /// Pilot Design Phase 1). The sender registers themselves -- identity_id
     /// and address are both the sender's account address. Starts the
@@ -458,456 +375,34 @@ pub enum TxBody {
         parent_agent_id: Option<String>,
     },
 
-    // ── QRC Economic Model v0.2 — Epoch Accounting ────────────────────────────
+    // ── AEI Phase 2 — Agent Lifecycle ────────────────────────────────────────
 
-    /// Open a new QRC epoch (QRC Economic Model v0.2 §EpochOpen).
-    ///
-    /// Submitted by block producers at an epoch boundary.  Initialises the
-    /// per-epoch supply cap and seeds the epoch reserve from the protocol
-    /// reserve.  Only one epoch may be open at a time; attempting to open a
-    /// second epoch without closing the first is rejected.
-    ///
-    /// `verified_count` is the number of verified identities at epoch start,
-    /// snapshotted from the IdentityStore.  It drives the supply cap:
-    ///   `supply_cap = verified_count × EPOCH_ISSUANCE_CAP_PER_VERIFIED`
-    ///
-    /// Enforced invariants:
-    ///   - No epoch is currently open in the QrcEngine.
-    ///   - Sender must be a block-producer / validator address (coordinator-gated).
-    EpochOpen {
-        /// The epoch number being opened.
-        epoch: u64,
-        /// Number of Verified-tier identities at epoch start.
-        verified_count: u64,
-    },
-
-    /// Close the current QRC epoch (QRC Economic Model v0.2 §EpochClose).
-    ///
-    /// Submitted by block producers at epoch end.  Sweeps unspent epoch
-    /// reserve back to the protocol reserve and finalises provider reward
-    /// accounting.  After this, a new epoch may be opened.
-    ///
-    /// Enforced invariants:
-    ///   - An epoch is currently open in the QrcEngine.
-    ///   - Sender must be a block-producer / validator address (coordinator-gated).
-    EpochClose {
-        /// The epoch number being closed.  Must match `QrcEngine::current_epoch`.
-        epoch: u64,
-    },
-
-    // ── Control 5: CoverageRatio circuit breaker ──────────────────────────────
-
-    /// Record VCA-attested network resource capacity and re-evaluate the
-    /// CoverageRatio circuit breaker (Control 5 / QRC Economic Model v0.2 §6.10).
-    ///
-    /// Submitted by a VCA coordinator after a `CapacityReport` is finalised
-    /// on-chain.  The `capacity` value is the total verified network resource
-    /// capacity in normalised units (× D), as reported by the VCA sub-protocol
-    /// in `chain-forge-qrc/src/capacity_report.rs`.
-    ///
-    /// Effect:
-    ///   - `QrcEngine::record_capacity(capacity)` is called, which updates
-    ///     `tracked_capacity` and may transition the `minting_state` between
-    ///     `Normal`, `Restricted`, and `Halted`.
-    ///   - A structured JSON event is emitted to stdout on every state change
-    ///     (see `QrcEngine::update_circuit_breaker`).
-    ///
-    /// CR_t = capacity / qrc_outstanding (fixed-point × D):
-    ///   - CR ≥ 1.00 → Normal    (both purchase and contribution paths open)
-    ///   - 0.75 ≤ CR < 1.00 → Restricted (purchase suspended; contribution open)
-    ///   - CR < 0.75 → Halted   (both minting paths suspended)
-    ///
-    /// Enforced invariants:
-    ///   - Sender must be a VCA coordinator / validator address.
-    ///   - `capacity` may be 0 (interpreted as CR=0, drives to Halted).
-    RecordCapacity {
-        /// Total verified network resource capacity, in normalised units × D.
-        capacity: u128,
-    },
-
-    // ── Agent Lifecycle — AEI Phase 2 ─────────────────────────────────────────
-
-    /// Advance an agent from Pending → Active (or Suspended → Active).
-    ///
-    /// Only the agent's registered sponsor (or an authorized governance key)
-    /// may submit this transaction.  The `AgentStore::authorize()` method
-    /// enforces that the agent is in Pending or Suspended state.
+    /// Coordinator authorizes a Pending agent (moves it to Active status).
     AuthorizeAgent {
-        /// The unique agent identifier (same value used in `RegisterAgent`).
         agent_id: String,
     },
-
-    /// Temporarily suspend an Active agent.
-    ///
-    /// Agent state is preserved; the agent can be re-authorized later.
-    /// Caller must be the agent's sponsor or a governance identity.
+    /// Coordinator suspends an Active agent (moves it to Suspended status).
     SuspendAgent {
-        /// The agent to suspend.
         agent_id: String,
-        /// Human-readable reason (logged as a block event; not enforced on-chain).
-        reason: String,
+        reason:   String,
     },
-
-    /// Permanently revoke an agent's registration.
-    ///
-    /// This is the Phase 2 complement to the legacy `RevokeAgent` variant:
-    ///   - `RevokeAgent` (Phase 0) only touches `IdentityStore`.
-    ///   - `RevokeAgentFull` touches BOTH `AgentStore` AND `IdentityStore`.
-    ///
-    /// After this tx the agent cannot be re-authorized; the `agent_id` is
-    /// effectively tombstoned in the AgentStore (status = Revoked).
+    /// Coordinator permanently revokes an agent (removes it from the store).
     RevokeAgentFull {
-        /// The agent to permanently revoke.
         agent_id: String,
     },
-
-    /// Record a QRC spend against an agent's epoch and lifetime limits.
-    ///
-    /// Submitted by the agent's executor on behalf of the agent when it
-    /// performs a metered action.  Enforces both `epoch_limit_uqrc` and
-    /// `lifetime_limit_uqrc` in the agent's `SpendingLimits`.
+    /// Record that an agent spent `amount_uqrc` (updates spending limits).
     RecordAgentSpend {
-        /// The agent recording the spend.
-        agent_id: String,
-        /// Amount in micro-QRC (uQRC).
+        agent_id:    String,
         amount_uqrc: u128,
     },
-
-    // ── QRC Resource Network — v0.2 marketplace tx types ─────────────────────
-
-    /// Resource-marketplace QRC purchase (QRC Resource Network / Section 4.1 v0.2).
-    ///
-    /// Submitted by a Charmed Agent or coordinator on behalf of a job buyer.
-    /// Burns `qcb_amount` of $QCB from the sender's account and mints QRC
-    /// resource credits, optionally earmarking them for a specific resource
-    /// `job_id` and `resource_type`.  This is the richer, job-scoped version
-    /// of the legacy `QrcPurchase` variant — it carries a job identifier so
-    /// the settlement ledger can reconcile credit balances per job.
-    ///
-    /// `min_qrc_out` is a slippage guard.  Pass 0 to accept any rate.
-    ///
-    /// State changes (same as legacy QrcPurchase, plus job-scoped bookkeeping):
-    ///   - sender.$QCB decreases by `qcb_amount` (permanent burn)
-    ///   - QrcEngine credits `qrc_minted` to sender's QRC balance
-    ///   - QrcEngine.total_qcb_burned += qcb_amount
-    ///
-    /// Control 5: blocked in RESTRICTED and HALTED states.
-    PurchaseQrc {
-        /// The resource job this purchase is funding (coordinator-assigned UUID).
-        job_id: String,
-        /// $QCB to burn (in uqcb).
-        qcb_amount: u128,
-        /// Minimum QRC credits the sender will accept.  0 = no minimum.
-        min_qrc_out: u128,
-        /// The resource type this purchase is earmarked for.
-        resource_type: chain_forge_qrc::ResourceKind,
-    },
-
-    /// Coordinator-issued QRC credit to a Resource Node after job verification
-    /// (QRC Resource Network / Section 4.2 v0.2).
-    ///
-    /// Submitted by a QCB coordinator after off-chain verification that a
-    /// Resource Node successfully completed the job described by `job_id`.
-    /// This is distinct from `QrcContributionSettle`, which is provider-
-    /// submitted and epoch-scoped.  `CreditProvider` is coordinator-submitted,
-    /// job-scoped, and does not require a full epoch boundary.
-    ///
-    /// `verified_units` is the coordinator-attested resource delivery in
-    /// normalised units × D (same scale as CapacityEvidence.capacity_claim).
-    /// The engine computes E(i,r,t) from these units.
-    ///
-    /// Enforced invariants:
-    ///   - Sender must be a Verified identity (VCA coordinator gate).
-    ///   - `provider_id` must be a known Resource Node (32-byte key).
-    ///   - Control 5: blocked ONLY when HALTED (providers are recovery mechanism).
-    CreditProvider {
-        /// The resource job that was completed.
-        job_id: String,
-        /// The Resource Node provider's public key (32 bytes).
-        provider_id: [u8; 32],
-        /// Resource type delivered.
-        resource_type: chain_forge_qrc::ResourceKind,
-        /// Coordinator-verified units delivered (normalised units × D).
-        verified_units: u128,
-    },
-
     /// Spawn a child agent under an existing parent agent.
-    ///
-    /// Enforces:
-    ///   - Parent must exist and be Active.
-    ///   - Parent must hold the `SpawnChildAgent` capability.
-    ///   - Child's spending limits are capped at the parent's remaining limits
-    ///     (i.e. child cannot exceed what parent is allowed to spend).
-    ///   - Sponsor of both parent and child must be the same verified human.
     SpawnChildAgent {
-        /// Unique identifier for the new child agent.
-        child_agent_id: String,
-        /// Address the child will act from.
+        child_agent_id:      String,
         child_agent_address: String,
-        /// The parent agent whose capability set gates this spawn.
-        parent_agent_id: String,
-        /// Capabilities granted to the child (must be a subset of parent's).
-        capabilities: Vec<chain_forge_agents::AgentCapability>,
-        /// Spending limits for the child (capped at parent remaining capacity).
-        spending_limits: SpendingLimits,
-        /// Human-readable description of the child agent's purpose.
-        description: String,
-    },
-
-    // ── Resource Marketplace — QRC Escrow ─────────────────────────────────────
-
-    /// Lock QRC in escrow when an agent funds a resource job.
-    ///
-    /// The `amount` is the maximum the agent will pay (`max_qrc_budget` from
-    /// the `JobSpec`); actual charge may be lower if billed by the second.
-    /// The escrow hold prevents double-spending: the locked QRC cannot be
-    /// used for any other purpose until `ReleaseQrcForJob` or `RefundQrcForJob`
-    /// resolves the hold.
-    ///
-    /// Enforced invariants:
-    ///   - `agent_wallet` must have at least `amount` QRC.
-    ///   - `escrow_id` must be unique (no duplicate holds for the same job).
-    ///   - Sender must be the agent's sponsor or the agent itself.
-    LockQrcForJob {
-        /// Unique escrow operation identifier (e.g. "ESC-JOB001-20260101").
-        escrow_id: String,
-        /// The resource job being funded.
-        job_id: String,
-        /// Wallet address of the requesting agent.
-        agent_wallet: String,
-        /// QRC amount to lock (atomic units).
-        amount: u64,
-    },
-
-    /// Release escrowed QRC to the provider on successful, verified job completion.
-    ///
-    /// Submitted by the coordinator after the verifier signs the output.
-    /// `amount` may be ≤ locked amount (partial charge for short jobs);
-    /// any remainder is automatically refunded to `agent_wallet`.
-    ///
-    /// Enforced invariants:
-    ///   - `escrow_id` must match an existing hold in `LockQrcForJob` state.
-    ///   - `receipt_hash` must match the SHA-256 of the submitted receipt.
-    ///   - Sender must be a coordinator / validator address.
-    ReleaseQrcForJob {
-        /// The escrow hold being released.
-        escrow_id: String,
-        /// The resource job that completed.
-        job_id: String,
-        /// The machine that ran the job.
-        machine_id: String,
-        /// Provider's wallet address (derived from the machine record).
-        provider_wallet: String,
-        /// Actual QRC earned (≤ locked amount).
-        amount: u64,
-        /// SHA-256 of the UsefulWorkReceipt or ResourceExecutionReceipt that
-        /// authorises this release.
-        receipt_hash: String,
-    },
-
-    /// Return escrowed QRC to the agent when a job fails, times out, or is refunded.
-    ///
-    /// Submitted by the coordinator on timeout or failed verification.
-    /// The full locked amount is returned — no partial refunds; any partial
-    /// charges become `ReleaseQrcForJob` amounts instead.
-    ///
-    /// Enforced invariants:
-    ///   - `escrow_id` must match an existing hold.
-    ///   - Sender must be a coordinator / validator address.
-    RefundQrcForJob {
-        /// The escrow hold being cancelled.
-        escrow_id: String,
-        /// The resource job that failed or was cancelled.
-        job_id: String,
-        /// Wallet address to refund.
-        agent_wallet: String,
-        /// Full locked amount returned.
-        amount: u64,
-        /// Why the refund was issued.
-        reason: chain_forge_resource::RefundReason,
-    },
-
-    // ── Agent Treasury ─────────────────────────────────────────────────────
-    //
-    // A treasury is a virtual QRC wallet that a human sponsor pre-loads on
-    // behalf of an agent.  The agent draws on the treasury through
-    // LockQrcForJob rather than spending its own wallet balance, so the
-    // sponsor retains visibility and the per_job_limit cap applies.
-    //
-    // Treasury account key: `treasury:{agent_id}` — a deterministic address
-    // never held by any private key, only credited by DepositToTreasury and
-    // debited by LockQrcForJob.
-
-    /// Pre-load QRC into an agent's treasury account.
-    ///
-    /// Only the agent's registered sponsor may call this.  The sender's
-    /// wallet is debited and the treasury account is credited.
-    ///
-    /// The per_job_limit field is optional; if provided it replaces the
-    /// agent's current SpendingLimits.per_job_limit_uqrc in the AgentRecord
-    /// so the sponsor can tighten or relax the cap in the same tx.
-    DepositToTreasury {
-        /// Agent whose treasury receives the deposit.
-        agent_id: String,
-        /// uqrc to transfer from sender's wallet to `treasury:{agent_id}`.
-        amount: u64,
-        /// Optional new per-job cap (0 = leave current value unchanged).
-        per_job_limit_uqrc: u64,
-    },
-
-    // ── Contribution Layer ─────────────────────────────────────────────────
-
-    /// Register a resource node (machine) operated by this sender.
-    ///
-    /// Sender must be a Verified or Established identity (SponsorID gate).
-    /// A MachineRecord is written to `machine:{machine_id}` in state.
-    /// Re-registering the same machine_id is rejected.
-    RegisterMachine {
-        /// Unique identifier for the machine (e.g. "MACH-CAROL-003").
-        machine_id: String,
-        /// Display name for the machine.
-        display_name: String,
-        /// Operating mode: "MarketplaceOnly", "ContributionOnly", or "Both".
-        mode: String,
-        /// Ed25519 attestation public key, base64-encoded (32 bytes).
-        attestation_key_b64: String,
-        /// Freeform capability description (JSON string for Phase 0;
-        /// will be a proper ResourceCapabilityDescriptor in Phase 1).
-        capabilities_json: String,
-    },
-
-    // ── Resource Job Lifecycle ─────────────────────────────────────────────
-    //
-    // Four tx types cover the full happy path:
-    //
-    //   CreateJob   → agent posts spec + references pre-funded escrow
-    //   AcceptJob   → machine claims job; transitions Created → Running
-    //   CompleteJob → machine submits output_hash; transitions Running → Completed
-    //   VerifyJob   → verifier (or self in Phase 0) signs off;
-    //                 transitions Completed → Verified → triggers ReleaseQrcForJob
-    //
-    // Job state is stored at `job:{job_id}` in chain state.
-    // The escrow hold at `escrow:{escrow_id}` must already exist (created by
-    // LockQrcForJob) before CreateJob is submitted.
-
-    /// Post a resource job on-chain.
-    ///
-    /// The agent specifies the job spec, references an existing escrow hold, and
-    /// names the machine it wants to run the job (Phase 0: direct assignment;
-    /// Phase 1: open marketplace via P2P discovery).
-    ///
-    /// Enforced invariants:
-    ///   - `escrow_id` must reference an existing `LockQrcForJob` hold.
-    ///   - `job_id` must be unique.
-    ///   - `machine_id` must reference a registered, Active machine.
-    CreateJob {
-        /// Unique job identifier (e.g. "JOB-20261009-001").
-        job_id: String,
-        /// The escrow hold that funds this job.
-        escrow_id: String,
-        /// Machine being requested to run the job.
-        machine_id: String,
-        /// Human-readable description of the workload.
-        description: String,
-        /// Workload type tag, e.g. "python_script", "container", "gc_challenge".
-        workload_type: String,
-        /// Workload payload: inline script, container image ref, or challenge spec.
-        workload_payload: String,
-        /// Wall-clock deadline in seconds from acceptance.
-        timeout_seconds: u64,
-    },
-
-    /// Machine accepts and begins executing a job.
-    ///
-    /// Sender must be the owner of the referenced machine.
-    /// Transitions job state: Created → Running.
-    ///
-    /// Enforced invariants:
-    ///   - `job_id` must exist and be in Created state.
-    ///   - Sender must own `machine_id`.
-    AcceptJob {
-        /// The job being accepted.
-        job_id: String,
-        /// The machine accepting the job (must match job's assigned machine_id).
-        machine_id: String,
-    },
-
-    /// Machine reports successful job completion with a cryptographic output receipt.
-    ///
-    /// Sender must be the owner of the machine that accepted the job.
-    /// Transitions job state: Running → Completed.
-    ///
-    /// Enforced invariants:
-    ///   - `job_id` must exist and be in Running state.
-    ///   - Sender must own the machine that accepted the job.
-    ///   - `output_hash` must be a non-empty hex string (SHA-256 of output).
-    CompleteJob {
-        /// The job being completed.
-        job_id: String,
-        /// The machine that ran the job.
-        machine_id: String,
-        /// SHA-256 hex of the job's output (deterministic, reproducible by verifier).
-        output_hash: String,
-        /// Unique receipt identifier for this completion event.
-        receipt_id: String,
-        /// Optional execution stats (runtime_ms, etc.) stored as JSON string.
-        execution_stats_json: String,
-    },
-
-    /// Verify a completed job and release escrow to the provider.
-    ///
-    /// In Phase 0: self-verification — the coordinator (or the requesting agent's
-    /// sponsor) acts as verifier. The verifier re-computes or accepts the
-    /// `expected_output_hash` and confirms it matches the `CompleteJob` submission.
-    /// On success, triggers `ReleaseQrcForJob` internally: escrow debited,
-    /// provider wallet credited.
-    ///
-    /// Transitions job state: Completed → Verified → Settled.
-    ///
-    /// Enforced invariants:
-    ///   - `job_id` must exist and be in Completed state.
-    ///   - `expected_output_hash` must match the hash stored by `CompleteJob`.
-    ///   - `escrow_id` must match the escrow referenced in `CreateJob`.
-    ///   - `provider_wallet` must match the machine owner's wallet.
-    VerifyJob {
-        /// The job being verified.
-        job_id: String,
-        /// The escrow hold to release on success.
-        escrow_id: String,
-        /// Expected output hash — must match what CompleteJob submitted.
-        expected_output_hash: String,
-        /// Provider wallet to credit (machine owner's address).
-        provider_wallet: String,
-        /// QRC amount to release (≤ locked amount; remainder auto-refunded).
-        amount: u64,
-        /// Receipt hash for the audit trail.
-        receipt_hash: String,
-    },
-
-    /// Submit a Grand Challenge work receipt for verification and scoring.
-    ///
-    /// Sender must own the registered machine referenced by `machine_id`.
-    /// The receipt's seal is verified on-chain; valid receipts increment
-    /// `contribution_score:{machine_id}` by 1 and store the receipt at
-    /// `gc_receipt:{receipt_id}`.
-    SubmitUsefulWork {
-        /// The receipt_id from the UsefulWorkReceipt.
-        receipt_id: String,
-        /// The machine that performed the work.
-        machine_id: String,
-        /// The Grand Challenge this work is credited to.
-        challenge_id: String,
-        /// SHA-256 hex of the output.
-        output_hash: String,
-        /// Seal nonce (PoW over output_hash + challenge_id).
-        seal_nonce: u64,
-        /// Hex-encoded seal hash — must meet `seal_difficulty_bits` prefix.
-        seal_hash: String,
-        /// Number of leading zero bits required in seal_hash.
-        seal_difficulty_bits: u32,
-        /// Minimum difficulty this chain accepts (checked at execution).
-        /// Set to 0 to use the chain's configured minimum.
-        min_difficulty_override: u32,
+        parent_agent_id:     String,
+        capabilities:        Vec<chain_forge_agents::AgentCapability>,
+        spending_limits:     SpendingLimits,
+        description:         String,
     },
 
     // ── PoCD Research Reward Settlement (Change Set L) ────────────────────────
@@ -998,37 +493,19 @@ impl TxBody {
             TxBody::ReportSuspectedSybil { .. }   => "ReportSuspectedSybil",
             TxBody::ConfirmSybil { .. }           => "ConfirmSybil",
             TxBody::ReverseSybil { .. }           => "ReverseSybil",
-            TxBody::QrcPurchase { .. }            => "QrcPurchase",
-            TxBody::QrcSpend { .. }               => "QrcSpend",
-            TxBody::QrcContributionSettle { .. }  => "QrcContributionSettle",
             TxBody::CharmConfinementUpdate { .. } => "CharmConfinementUpdate",
             TxBody::IntrinsicCharmRecord { .. }   => "IntrinsicCharmRecord",
             TxBody::RegisterAgent { .. }          => "RegisterAgent",
-            TxBody::EpochOpen { .. }              => "EpochOpen",
-            TxBody::EpochClose { .. }             => "EpochClose",
-            TxBody::RecordCapacity { .. }         => "RecordCapacity",
             TxBody::AuthorizeAgent { .. }         => "AuthorizeAgent",
             TxBody::SuspendAgent { .. }           => "SuspendAgent",
             TxBody::RevokeAgentFull { .. }        => "RevokeAgentFull",
             TxBody::RecordAgentSpend { .. }       => "RecordAgentSpend",
             TxBody::SpawnChildAgent { .. }        => "SpawnChildAgent",
             // Resource Network v0.2
-            TxBody::PurchaseQrc { .. }            => "PurchaseQrc",
-            TxBody::CreditProvider { .. }         => "CreditProvider",
             // Resource Marketplace — QRC Escrow
-            TxBody::LockQrcForJob { .. }          => "LockQrcForJob",
-            TxBody::ReleaseQrcForJob { .. }       => "ReleaseQrcForJob",
-            TxBody::RefundQrcForJob { .. }        => "RefundQrcForJob",
             // Agent Treasury
-            TxBody::DepositToTreasury { .. }      => "DepositToTreasury",
             // Contribution Layer
-            TxBody::RegisterMachine { .. }         => "RegisterMachine",
-            TxBody::SubmitUsefulWork { .. }        => "SubmitUsefulWork",
             // Resource Job Lifecycle
-            TxBody::CreateJob { .. }               => "CreateJob",
-            TxBody::AcceptJob { .. }               => "AcceptJob",
-            TxBody::CompleteJob { .. }             => "CompleteJob",
-            TxBody::VerifyJob { .. }               => "VerifyJob",
             // PoCD Research Reward Settlement (Change Set L)
             TxBody::ClaimResearchReward { .. }     => "ClaimResearchReward",
         }
@@ -1233,10 +710,7 @@ impl Transaction {
             TxBody::ReverseSybil { sybil_id }            => sybil_id.len() + 8,
             TxBody::ReportSuspectedSybil { suspected_id }=> suspected_id.len() + 8,
             // QRC typed variants.
-            TxBody::QrcPurchase { .. }                   => 32,
-            TxBody::QrcSpend { .. }                      => 24,
             // Evidence carries provider_id + proof bytes — treat as ~256 bytes.
-            TxBody::QrcContributionSettle { .. }         => 256,
             // Phase 1 typed variants.
             TxBody::CharmConfinementUpdate { .. }        => 16,
             TxBody::IntrinsicCharmRecord { .. }          => 16,
@@ -1245,10 +719,7 @@ impl Transaction {
                 agent_id.len() + agent_address.len() + description.len() + 64
             }
             // Epoch boundary signals: epoch number (u64) only.
-            TxBody::EpochOpen { .. }  => 24,
-            TxBody::EpochClose { .. } => 16,
             // Control 5: capacity value (u128).
-            TxBody::RecordCapacity { .. } => 16,
             // AEI Phase 2 lifecycle ops.
             TxBody::AuthorizeAgent { agent_id }             => agent_id.len() + 8,
             TxBody::SuspendAgent { agent_id, reason }       => agent_id.len() + reason.len() + 8,
@@ -1258,40 +729,6 @@ impl Transaction {
                 child_agent_id, child_agent_address, parent_agent_id, description, ..
             } => child_agent_id.len() + child_agent_address.len()
                 + parent_agent_id.len() + description.len() + 64,
-            // Resource Network v0.2: job_id + amounts + 32-byte provider key + resource enum.
-            TxBody::PurchaseQrc { job_id, .. } => job_id.len() + 48,
-            TxBody::CreditProvider { job_id, .. } => job_id.len() + 32 + 24,
-            // QRC Escrow: escrow_id + job_id + wallet + amount (+ extras for Release/Refund).
-            TxBody::LockQrcForJob { escrow_id, job_id, agent_wallet, .. } => {
-                escrow_id.len() + job_id.len() + agent_wallet.len() + 8
-            }
-            TxBody::ReleaseQrcForJob { escrow_id, job_id, machine_id, provider_wallet, receipt_hash, .. } => {
-                escrow_id.len() + job_id.len() + machine_id.len() + provider_wallet.len() + receipt_hash.len() + 8
-            }
-            TxBody::RefundQrcForJob { escrow_id, job_id, agent_wallet, .. } => {
-                escrow_id.len() + job_id.len() + agent_wallet.len() + 16
-            }
-            // Agent Treasury: agent_id + amount + optional new per_job_limit.
-            TxBody::DepositToTreasury { agent_id, .. } => agent_id.len() + 16,
-            // Contribution Layer: machine_id + display_name + attestation_key_b64 + capabilities_json + 32
-            TxBody::RegisterMachine { machine_id, display_name, attestation_key_b64, capabilities_json, .. } => {
-                machine_id.len() + display_name.len() + attestation_key_b64.len() + capabilities_json.len() + 32
-            }
-            // receipt_id + machine_id + challenge_id + output_hash + seal_hash + 32
-            TxBody::SubmitUsefulWork { receipt_id, machine_id, challenge_id, output_hash, seal_hash, .. } => {
-                receipt_id.len() + machine_id.len() + challenge_id.len() + output_hash.len() + seal_hash.len() + 32
-            }
-            // Resource Job Lifecycle.
-            TxBody::CreateJob { job_id, escrow_id, machine_id, description, workload_type, workload_payload, .. } => {
-                job_id.len() + escrow_id.len() + machine_id.len() + description.len() + workload_type.len() + workload_payload.len() + 16
-            }
-            TxBody::AcceptJob { job_id, machine_id } => job_id.len() + machine_id.len() + 8,
-            TxBody::CompleteJob { job_id, machine_id, output_hash, receipt_id, execution_stats_json } => {
-                job_id.len() + machine_id.len() + output_hash.len() + receipt_id.len() + execution_stats_json.len() + 16
-            }
-            TxBody::VerifyJob { job_id, escrow_id, expected_output_hash, provider_wallet, receipt_hash, .. } => {
-                job_id.len() + escrow_id.len() + expected_output_hash.len() + provider_wallet.len() + receipt_hash.len() + 8
-            }
             // ClaimResearchReward: all string fields + 16 for amount/overhead.
             TxBody::ClaimResearchReward {
                 claim_id, objective_id, task_id, result_id,
@@ -1467,343 +904,6 @@ impl Transaction {
             nonce,
             body: TxBody::ReportSuspectedSybil { suspected_id: suspected_id.to_string() },
             gas_limit: 50_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    // ── QRC Economic Model v0.1 constructors ──────────────────────────────────
-
-    /// Purchase QRC by burning QCB (QRC Economic Model v0.1 §4.1).
-    ///
-    /// `min_qrc_out = 0` accepts any rate.  Non-zero values act as a slippage
-    /// guard: the transaction is rejected if the engine would produce fewer QRC
-    /// credits than that floor.
-    pub fn qrc_purchase(
-        id:          &str,
-        sender:      &str,
-        qcb_amount:  u128,
-        min_qrc_out: u128,
-        nonce:       u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::QrcPurchase { qcb_amount, min_qrc_out },
-            gas_limit: 200_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// Spend QRC for a network resource operation (QRC Economic Model v0.1 §4.3).
-    ///
-    /// `amount` is the maximum QRC the sender authorises for this operation.
-    /// The actual cost is computed by the engine; `amount` must be ≥ that cost.
-    pub fn qrc_spend(
-        id:       &str,
-        sender:   &str,
-        resource: chain_forge_qrc::ResourceKind,
-        units:    u128,
-        amount:   u128,
-        nonce:    u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::QrcSpend { resource, units, amount },
-            gas_limit: 150_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// Settle contribution-path QRC earning for an epoch (QRC Economic Model v0.1 §4.2).
-    ///
-    /// Caller must be a Verified-tier identity.  `evidence` carries the
-    /// VCA-verifiable capacity proof for the settled epoch.
-    pub fn qrc_contribution_settle(
-        id:       &str,
-        sender:   &str,
-        epoch:    u64,
-        evidence: chain_forge_qrc::CapacityEvidence,
-        nonce:    u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::QrcContributionSettle { epoch, evidence },
-            gas_limit: 400_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    // ── Control 5: CoverageRatio circuit breaker tx constructor ──────────────
-
-    /// Record VCA-attested network resource capacity and update the circuit breaker.
-    ///
-    /// `capacity` is total verified capacity in normalised units × D.
-    /// Submitted by a VCA coordinator after a CapacityReport finalises.
-    pub fn record_capacity(id: &str, sender: &str, capacity: u128, nonce: u64) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::RecordCapacity { capacity },
-            gas_limit: 100_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    // ── QRC Resource Network v0.2 — marketplace tx constructors ──────────────
-
-    /// Buy QRC credits for a specific resource job (QRC Resource Network §4.1 v0.2).
-    ///
-    /// Burns `qcb_amount` of $QCB and mints QRC earmarked for `job_id`.
-    /// `min_qrc_out = 0` accepts any rate.
-    ///
-    /// Blocked by Control 5 when minting_state is RESTRICTED or HALTED.
-    pub fn purchase_qrc(
-        id:           &str,
-        sender:       &str,
-        job_id:       &str,
-        qcb_amount:   u128,
-        min_qrc_out:  u128,
-        resource_type: chain_forge_qrc::ResourceKind,
-        nonce:        u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::PurchaseQrc {
-                job_id: job_id.to_string(),
-                qcb_amount,
-                min_qrc_out,
-                resource_type,
-            },
-            gas_limit: 250_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// Coordinator-issued QRC credit to a Resource Node after job verification
-    /// (QRC Resource Network §4.2 v0.2).
-    ///
-    /// `provider_id` is the provider's 32-byte Ed25519 public key.
-    /// `verified_units` is normalised resource delivery × D.
-    ///
-    /// Sender must be Verified tier (VCA coordinator gate).
-    /// Blocked by Control 5 only when HALTED.
-    pub fn credit_provider(
-        id:             &str,
-        coordinator:    &str,
-        job_id:         &str,
-        provider_id:    [u8; 32],
-        resource_type:  chain_forge_qrc::ResourceKind,
-        verified_units: u128,
-        nonce:          u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: coordinator.to_string(),
-            nonce,
-            body: TxBody::CreditProvider {
-                job_id: job_id.to_string(),
-                provider_id,
-                resource_type,
-                verified_units,
-            },
-            gas_limit: 300_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    // ── Phase 1 Charm Confinement / Agent typed tx constructors ──────────────
-
-    /// Confinement heartbeat: prove liveness and advance consecutive-epoch
-    /// counter for the sender's IntrinsicCharm (Phase 1 / Section 5.1).
-    ///
-    /// Sender must be Verified or Established tier.
-    pub fn charm_confinement_update(id: &str, sender: &str, epoch: u64, nonce: u64) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::CharmConfinementUpdate { epoch },
-            gas_limit: 150_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// Record a charm lifecycle event (decay tick, exemption credit) for the
-    /// sender's IntrinsicCharm (Phase 1 / Section 5.2).
-    pub fn intrinsic_charm_record(
-        id:    &str,
-        sender: &str,
-        event:  CharmEvent,
-        nonce:  u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::IntrinsicCharmRecord { event },
-            gas_limit: 100_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    // ── Resource Marketplace — QRC Escrow constructors ───────────────────────
-
-    /// Lock `amount` uQRC in escrow for `job_id` (Resource Marketplace §5.1).
-    ///
-    /// `agent_wallet` is the wallet the QRC is debited from.
-    /// `escrow_id` must be unique across all in-flight jobs.
-    pub fn lock_qrc_for_job(
-        id:           &str,
-        sender:       &str,
-        escrow_id:    &str,
-        job_id:       &str,
-        agent_wallet: &str,
-        amount:       u64,
-        nonce:        u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sender.to_string(),
-            nonce,
-            body: TxBody::LockQrcForJob {
-                escrow_id:    escrow_id.to_string(),
-                job_id:       job_id.to_string(),
-                agent_wallet: agent_wallet.to_string(),
-                amount,
-            },
-            gas_limit: 200_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// Release escrowed QRC to the provider after verified job completion.
-    ///
-    /// Submitted by the coordinator.  `amount` ≤ locked amount.
-    /// `receipt_hash` is the SHA-256 of the authorising receipt.
-    #[allow(clippy::too_many_arguments)]
-    pub fn release_qrc_for_job(
-        id:              &str,
-        coordinator:     &str,
-        escrow_id:       &str,
-        job_id:          &str,
-        machine_id:      &str,
-        provider_wallet: &str,
-        amount:          u64,
-        receipt_hash:    &str,
-        nonce:           u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: coordinator.to_string(),
-            nonce,
-            body: TxBody::ReleaseQrcForJob {
-                escrow_id:       escrow_id.to_string(),
-                job_id:          job_id.to_string(),
-                machine_id:      machine_id.to_string(),
-                provider_wallet: provider_wallet.to_string(),
-                amount,
-                receipt_hash:    receipt_hash.to_string(),
-            },
-            gas_limit: 250_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// Return escrowed QRC to the agent on job failure, timeout, or cancellation.
-    ///
-    /// Submitted by the coordinator.  Full locked amount is returned.
-    pub fn refund_qrc_for_job(
-        id:           &str,
-        coordinator:  &str,
-        escrow_id:    &str,
-        job_id:       &str,
-        agent_wallet: &str,
-        amount:       u64,
-        reason:       chain_forge_resource::RefundReason,
-        nonce:        u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: coordinator.to_string(),
-            nonce,
-            body: TxBody::RefundQrcForJob {
-                escrow_id:    escrow_id.to_string(),
-                job_id:       job_id.to_string(),
-                agent_wallet: agent_wallet.to_string(),
-                amount,
-                reason,
-            },
-            gas_limit: 200_000,
-            signature: vec![],
-            public_key: vec![],
-            pq_signatures: vec![],
-            pq_public_key: vec![],
-        }
-    }
-
-    /// Pre-load QRC into an agent's treasury account.
-    ///
-    /// `sponsor` is the human address paying for the deposit.
-    /// `per_job_limit_uqrc` = 0 means "leave current limit unchanged".
-    pub fn deposit_to_treasury(
-        id:                  &str,
-        sponsor:             &str,
-        agent_id:            &str,
-        amount:              u64,
-        per_job_limit_uqrc:  u64,
-        nonce:               u64,
-    ) -> Self {
-        Self {
-            id: id.to_string(),
-            sender: sponsor.to_string(),
-            nonce,
-            body: TxBody::DepositToTreasury {
-                agent_id: agent_id.to_string(),
-                amount,
-                per_job_limit_uqrc,
-            },
-            gas_limit: 200_000,
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
@@ -2144,16 +1244,10 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Legacy QRC-token ops (dormant in the single-token/$QCB-only
         // protocol -- see "market" and "pocd" below for the active,
         // uqcb-denominated paths that used to share this module).
-        TxBody::QrcPurchase { .. }
-        | TxBody::QrcSpend { .. }
-        | TxBody::QrcContributionSettle { .. } => Some("qrc"),
         TxBody::SponsorAgent { .. } | TxBody::RevokeAgent { .. } => Some("agents"),
         // Phase 1 typed variants.
         TxBody::CharmConfinementUpdate { .. } | TxBody::IntrinsicCharmRecord { .. } => Some("identity"),
         TxBody::RegisterAgent { .. } => Some("agents"),
-        // QRC v0.2 epoch boundary signals + Control 5: legacy QRC-token module.
-        TxBody::EpochOpen { .. } | TxBody::EpochClose { .. }
-        | TxBody::RecordCapacity { .. } => Some("qrc"),
         // AEI Phase 2 lifecycle operations all require the agents module.
         TxBody::AuthorizeAgent { .. }
         | TxBody::SuspendAgent { .. }
@@ -2163,23 +1257,12 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Resource Network v0.2 marketplace tx types: job-scoped QRC minting,
         // part of the resource marketplace, not the legacy standalone
         // QRC-token purchase path.
-        TxBody::PurchaseQrc { .. }
-        | TxBody::CreditProvider { .. } => Some("market"),
         // QRC Escrow is part of the Resource Marketplace.
-        TxBody::LockQrcForJob { .. }
-        | TxBody::ReleaseQrcForJob { .. }
-        | TxBody::RefundQrcForJob { .. } => Some("market"),
         // Agent Treasury is part of the agents module (modifies agent records).
-        TxBody::DepositToTreasury { .. } => Some("agents"),
         // Contribution Layer (machine registration + useful-work submission)
         // belongs to PoCD / Grand Challenge research rewards -- active and
         // uqcb-denominated, distinct from the resource marketplace.
-        TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => Some("pocd"),
         // Resource Job Lifecycle belongs to the Resource Marketplace.
-        TxBody::CreateJob { .. }
-        | TxBody::AcceptJob { .. }
-        | TxBody::CompleteJob { .. }
-        | TxBody::VerifyJob { .. } => Some("market"),
         // ClaimResearchReward (Change Set L): requires both the PoCD module
         // (treasury/balance ops) and identity module (settlement_operators
         // are DIS identities). Guard on PoCD since that also gates the
@@ -2284,7 +1367,6 @@ impl Executor {
         tx:       &Transaction,
         state:    &mut StateStore,
         identity: &mut IdentityStore,
-        qrc:      &mut QrcEngine,
         agents:   &mut AgentStore,
     ) -> TransactionResult {
         let gas_required = self.config.gas_model.calculate_gas(tx);
@@ -2720,343 +1802,6 @@ impl Executor {
                     .map_err(|e| e.to_string())
             }
 
-            // -- QRC Economic Model v0.1 typed tx types -----------------------
-
-            // Single-token model: $QCB is the sole live protocol token right
-            // now; $QRC is reserved for possible future use, not actively
-            // built on. This burns real uqcb but the uqrc it mints has no
-            // on-chain spending utility in the current resource-marketplace
-            // path (that path is uqcb-denominated -- see LockQrcForJob et
-            // al.). Preserved, not removed, so the two-token mechanism still
-            // works if QRC is reactivated later; new code should not call
-            // this to fund anything.
-            TxBody::QrcPurchase { qcb_amount, min_qrc_out } => {
-                // Validate the purchase amount is non-zero.
-                if *qcb_amount == 0 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        "QrcPurchase: qcb_amount must be > 0".to_string(),
-                    );
-                }
-
-                // Control 5: purchase path blocked when circuit breaker is
-                // RESTRICTED or HALTED (CR below CR_resume = 1.00).
-                if !qrc.minting_state.purchase_allowed() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "QrcPurchase: blocked by CoverageRatio circuit breaker \
-                             (state={}, CR_resume=1.00) — capacity must recover \
-                             before purchase minting resumes",
-                            qrc.minting_state.as_str()
-                        ),
-                    );
-                }
-
-                // Ensure sender has an account.
-                if state.get_account(&tx.sender).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        tx.sender.clone(), "user".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-
-                // Check QCB balance WITHOUT calling state.burn() — burn() calls
-                // account.increment_nonce() internally, which would double-advance
-                // the nonce when advance_nonce_if_not_already() also fires below.
-                // Instead we debit directly so the nonce is advanced exactly once
-                // (by advance_nonce_if_not_already on success, nowhere on failure).
-                let qcb_have = state.get_account(&tx.sender)
-                    .map(|a| a.balance_of("uqcb"))
-                    .unwrap_or(0);
-                if qcb_have < *qcb_amount {
-                    Err(format!(
-                        "insufficient uqcb: have {}, need {}",
-                        qcb_have, qcb_amount
-                    ))
-                } else {
-                    // Debit the QCB (permanent burn — no recipient).
-                    if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                        acct.debit("uqcb", *qcb_amount).expect("balance check passed above");
-                    }
-                    state.refresh_leaf(&tx.sender);
-
-                    // Ask the engine how much QRC this QCB buy earns.
-                    let (qrc_minted, rt_used) = qrc.purchase_qrc(*qcb_amount);
-
-                    // Slippage guard: reject if rate moved against the sender.
-                    if *min_qrc_out > 0 && qrc_minted < *min_qrc_out {
-                        // Roll back the debit by re-crediting QCB. Nonce has
-                        // NOT been incremented yet (we bypassed burn()), so
-                        // this is a clean rollback.
-                        if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                            acct.credit("uqcb", *qcb_amount);
-                        }
-                        state.refresh_leaf(&tx.sender);
-                        Err(format!(
-                            "QrcPurchase: slippage exceeded — would mint {} uqrc \
-                             but min_qrc_out is {} (Rt={})",
-                            qrc_minted, min_qrc_out, rt_used
-                        ))
-                    } else {
-                        // Credit QRC to the sender's account.
-                        if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                            acct.credit("uqrc", qrc_minted);
-                        }
-                        state.refresh_leaf(&tx.sender);
-                        events.push(format!(
-                            "qrc_purchase: {} uqcb burned → {} uqrc minted \
-                             (Rt={}, sender={})",
-                            qcb_amount, qrc_minted, rt_used, tx.sender
-                        ));
-                        Ok(())
-                    }
-                }
-            }
-
-            TxBody::QrcSpend { resource, units, amount } => {
-                // Validate units are non-zero.
-                if *units == 0 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        "QrcSpend: units must be > 0".to_string(),
-                    );
-                }
-
-                // Compute the operation cost via the engine (accounts for per-
-                // resource base cost and current congestion multiplier).
-                let op = chain_forge_qrc::OperationCost::new().add(*resource, *units);
-                let cost = qrc.operation_cost(&op);
-
-                // Authorised amount must cover the computed cost.
-                if *amount < cost {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "QrcSpend: authorised amount {} uqrc is below \
-                             operation cost {} uqrc (resource={:?}, units={})",
-                            amount, cost, resource, units
-                        ),
-                    );
-                }
-
-                // Check sender QRC balance.
-                let sender_qrc = state.get_account(&tx.sender)
-                    .map(|a| a.balance_of("uqrc"))
-                    .unwrap_or(0);
-                if sender_qrc < cost {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "QrcSpend: insufficient uqrc balance — have {}, need {}",
-                            sender_qrc, cost
-                        ),
-                    );
-                }
-
-                // Debit the sender's QRC balance.
-                if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                    // cost <= sender_qrc so this never underflows.
-                    acct.debit("uqrc", cost).expect("balance check passed above");
-                }
-                state.refresh_leaf(&tx.sender);
-
-                // Apply the 60/25/15 consumption split in the engine.
-                let split = qrc.consume(cost);
-
-                events.push(format!(
-                    "qrc_spend: {} uqrc consumed (resource={:?}, units={}) \
-                     → providers={} burn={} reserve={} sender={}",
-                    cost, resource, units,
-                    split.to_providers, split.burned, split.to_reserve,
-                    tx.sender
-                ));
-                Ok(())
-            }
-
-            TxBody::QrcContributionSettle { epoch, evidence } => {
-                // Charm Confinement: only Verified (or Established) identities
-                // may submit capacity evidence and earn contribution-path QRC.
-                let tier_ok = identity.get(&tx.sender)
-                    .map(|r| r.is_verified())
-                    .unwrap_or(false);
-                if !tier_ok {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "QrcContributionSettle: sender {} is not a Verified \
-                             identity (Charm Confinement requires Verified tier)",
-                            tx.sender
-                        ),
-                    );
-                }
-
-                // Control 5: contribution earn path blocked ONLY when HALTED
-                // (CR < CR_halt = 0.75). RESTRICTED keeps contribution open —
-                // providers are the capacity recovery mechanism.
-                if !qrc.minting_state.contribution_allowed() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "QrcContributionSettle: blocked by CoverageRatio \
-                             circuit breaker (state=halted, CR_halt=0.75) — \
-                             both minting paths suspended until capacity recovers",
-                        ),
-                    );
-                }
-
-                // Epoch in the evidence must match the tx field.
-                if evidence.epoch != *epoch {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "QrcContributionSettle: evidence.epoch ({}) \
-                             != tx.epoch ({})",
-                            evidence.epoch, epoch
-                        ),
-                    );
-                }
-
-                // Bridge ResourceType → ResourceKind and build the contributions
-                // map expected by credit_provider_earning. resource_type_to_kind
-                // returns None for resource types not yet tracked by the QRC engine
-                // (future protocol upgrades). Reject those gracefully.
-                let kind = match chain_forge_qrc::resource_type_to_kind(evidence.resource_type) {
-                    Some(k) => k,
-                    None => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "QrcContributionSettle: resource type {:?} is not \
-                             recognised by the QRC engine on this chain version",
-                            evidence.resource_type
-                        ),
-                    ),
-                };
-                let mut contributions = std::collections::BTreeMap::new();
-                contributions.insert(kind, evidence.capacity_claim);
-
-                // Mint contribution-path QRC. The engine computes E(i,r,t).
-                let qrc_minted = qrc.credit_provider_earning(
-                    &evidence.provider_id,
-                    &contributions,
-                );
-
-                // Ensure the sender has an on-chain account.
-                if state.get_account(&tx.sender).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        tx.sender.clone(), "user".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-
-                // Credit the earned QRC to the sender's balance.
-                if qrc_minted > 0 {
-                    if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                        acct.credit("uqrc", qrc_minted);
-                    }
-                    state.refresh_leaf(&tx.sender);
-                }
-
-                let pid_prefix: String = evidence.provider_id[..8]
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect();
-                events.push(format!(
-                    "qrc_contribution_settle: {} uqrc minted to {} \
-                     (epoch={}, resource={:?}, capacity_claim={}, \
-                     provider_id={}…)",
-                    qrc_minted, tx.sender, epoch,
-                    kind, evidence.capacity_claim, pid_prefix
-                ));
-                Ok(())
-            }
-
-            // -- Phase 1 typed variants ---------------------------------------
-
-            TxBody::CharmConfinementUpdate { epoch } => {
-                // Charm Confinement: sender must be at least Verified tier.
-                let tier_ok = identity.get(&tx.sender)
-                    .map(|r| r.is_verified())
-                    .unwrap_or(false);
-                if !tier_ok {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "CharmConfinementUpdate: sender {} is not Verified \
-                             (Charm Confinement requires Verified or Established tier)",
-                            tx.sender
-                        ),
-                    );
-                }
-
-                // Record participation in the identity store. This bumps
-                // `consecutive_active_epochs` and may auto-promote to Established.
-                if let Some(record) = identity.get_mut(&tx.sender) {
-                    record.charm.record_participation(*epoch);
-                }
-
-                // Sync the updated charm to the on-chain account.
-                if let (Ok(record), Ok(acct)) = (
-                    identity.get(&tx.sender),
-                    state.get_account_mut(&tx.sender),
-                ) {
-                    acct.attach_charm(record.charm.clone());
-                }
-                state.refresh_leaf(&tx.sender);
-
-                let tier_name = identity.get(&tx.sender)
-                    .map(|r| format!("{:?}", r.tier()))
-                    .unwrap_or_else(|_| "Unknown".into());
-                events.push(format!(
-                    "charm_confinement_update: {} epoch={} tier={}",
-                    tx.sender, epoch, tier_name
-                ));
-                Ok(())
-            }
-
-            TxBody::IntrinsicCharmRecord { event } => {
-                // Sender must be registered in the identity store.
-                if identity.get(&tx.sender).is_err() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("IntrinsicCharmRecord: identity {} not found", tx.sender),
-                    );
-                }
-
-                let current_epoch = identity.clock.current_epoch;
-
-                match event {
-                    CharmEvent::DecayTick => {
-                        // Consume one decay-exemption day from the sender's
-                        // identity charm and sync the change to the on-chain
-                        // account leaf so the state root reflects it.
-                        if let Some(record) = identity.get_mut(&tx.sender) {
-                            record.charm.decay_exemption.consume(1);
-                            if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                                acct.attach_charm(record.charm.clone());
-                            }
-                        }
-                        state.refresh_leaf(&tx.sender);
-                        events.push(format!(
-                            "intrinsic_charm_record: decay_tick sender={}",
-                            tx.sender
-                        ));
-                    }
-                    CharmEvent::ExemptionCredit => {
-                        // Credit one exemption day to the sender's account.
-                        if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                            acct.record_spend_for_exemption(current_epoch);
-                        }
-                        state.refresh_leaf(&tx.sender);
-                        events.push(format!(
-                            "intrinsic_charm_record: exemption_credit sender={}",
-                            tx.sender
-                        ));
-                    }
-                }
-                Ok(())
-            }
-
             TxBody::RegisterAgent {
                 agent_id,
                 agent_address,
@@ -3120,284 +1865,8 @@ impl Executor {
                 Ok(())
             }
 
-            // ── QRC Economic Model v0.2 — Epoch Boundary ─────────────────────
-
-            TxBody::EpochOpen { epoch, verified_count } => {
-                match qrc.open_epoch(*epoch, *verified_count) {
-                    Ok(summary) => {
-                        events.push(format!(
-                            "epoch_open: epoch={} verified={} supply_cap={} reserve_seeded={}",
-                            epoch, verified_count, summary.supply_cap, summary.reserve_balance
-                        ));
-                        Ok(())
-                    }
-                    Err(e) => Err(format!("EpochOpen: {e}")),
-                }
-            }
-
-            // LEGACY: this PoCD reward path pays out in "uqrc" via the dormant
-            // QrcEngine/QcbRewardPolicy epoch-close flow. It is superseded by
-            // the active, uqcb-denominated PoCD path (the SubmitUsefulWork /
-            // epoch-boundary handler below) that the devnet actually uses and
-            // that has been confirmed working end-to-end. Single-token model:
-            // $QCB is the one live token; this path is preserved for QRC's
-            // possible future reactivation but is not exercised by any
-            // current devnet flow.
-            TxBody::EpochClose { epoch } => {
-                if qrc.current_epoch != *epoch {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "EpochClose: epoch mismatch — engine has {}, tx says {epoch}",
-                            qrc.current_epoch
-                        ),
-                    );
-                }
-                match qrc.close_epoch() {
-                    Ok(summary) => {
-                        events.push(format!(
-                            "epoch_close: epoch={} minted={} provider_rewards={} reserve_swept={}",
-                            epoch, summary.epoch_minted, summary.provider_rewards,
-                            summary.reserve_balance
-                        ));
-
-                        // ── Phase 1B: PoCD contribution reward distribution ──
-                        // Collect all gc_receipt accounts not yet rewarded.
-                        let receipt_accounts: Vec<(String, chain_forge_resource::UsefulWorkReceipt)> = {
-                            state.all_accounts()
-                                .filter(|a| a.address.starts_with("gc_receipt:") && a.balance_of("gc_receipt_recorded") > 0 && a.balance_of("gc_reward_paid") == 0)
-                                .filter_map(|a| {
-                                    serde_json::from_str::<chain_forge_resource::UsefulWorkReceipt>(&a.role)
-                                        .ok()
-                                        .map(|r| (a.address.clone(), r))
-                                })
-                                .collect()
-                        };
-
-                        if !receipt_accounts.is_empty() {
-                            // Convert UsefulWorkReceipt → DiscoveryReceipt for the reward policy.
-                            let discovery_receipts: Vec<chain_forge_pocd::DiscoveryReceipt> =
-                                receipt_accounts.iter().map(|(_, r)| {
-                                    chain_forge_pocd::DiscoveryReceipt {
-                                        receipt_id:           r.receipt_id.clone(),
-                                        chain_id:             "qcb-devnet-1".to_string(),
-                                        challenge_id:         r.challenge_id.clone(),
-                                        machine_id:           r.machine_id.0.clone(),
-                                        output_hash:          r.output_hash.clone(),
-                                        input_hash:           r.input_hash.clone(),
-                                        methodology_ref:      r.methodology_ref.clone(),
-                                        discovery_nonce:      r.nonce,
-                                        checks_performed:     r.checks_performed,
-                                        elapsed_seconds:      r.elapsed_seconds,
-                                        submitted_at:         r.timestamp_utc.clone(),
-                                        machine_signature:    r.machine_signature.clone(),
-                                        seal_nonce:           r.seal_nonce,
-                                        seal_hash:            r.seal_hash.clone(),
-                                        seal_difficulty_bits: r.seal_difficulty_bits,
-                                        verifier_id:          r.verifier_id.clone().unwrap_or_default(),
-                                        verifier_signature:   r.verifier_signature.clone().unwrap_or_default(),
-                                        committed_at_block:   state.current_height(),
-                                        reward_distributed:   false,
-                                        _proof_id:            r.receipt_id.clone(),
-                                    }
-                                }).collect();
-
-                            let refs: Vec<&chain_forge_pocd::DiscoveryReceipt> =
-                                discovery_receipts.iter().collect();
-
-                            let policy = chain_forge_qrc::QcbRewardPolicy::default_for_devnet(
-                                "treasury:pocd"
-                            );
-                            use chain_forge_pocd::RewardPolicy as _;
-                            match policy.compute_rewards(&refs) {
-                                Ok(grants) => {
-                                    let pocd_treasury = "treasury:pocd";
-                                    // Ensure treasury account exists.
-                                    if state.get_account(pocd_treasury).is_err() {
-                                        let ta = chain_forge_state::AccountState::new(
-                                            pocd_treasury.to_string(), "treasury".to_string(),
-                                        );
-                                        state.upsert_account(ta);
-                                    }
-                                    let treasury_bal = state.get_account(pocd_treasury)
-                                        .map(|a| a.balance_of("uqrc"))
-                                        .unwrap_or(0);
-
-                                    let total_grant: u64 = grants.iter().map(|g| g.amount).sum();
-                                    let disbursable = total_grant.min(treasury_bal as u64);
-
-                                    let mut paid: u64 = 0;
-                                    for grant in &grants {
-                                        if paid + grant.amount > disbursable { break; }
-                                        // Ensure recipient wallet exists.
-                                        if state.get_account(&grant.recipient_wallet).is_err() {
-                                            let wa = chain_forge_state::AccountState::new(
-                                                grant.recipient_wallet.clone(), "machine_wallet".to_string(),
-                                            );
-                                            state.upsert_account(wa);
-                                        }
-                                        if let Ok(acct) = state.get_account_mut(&grant.recipient_wallet) {
-                                            acct.credit("uqrc", grant.amount as u128);
-                                        }
-                                        state.refresh_leaf(&grant.recipient_wallet);
-                                        paid += grant.amount;
-                                        events.push(format!(
-                                            "pocd_reward: receipt_id={} machine_id={} wallet={} amount_uqrc={}",
-                                            grant.receipt_id, grant.machine_id,
-                                            grant.recipient_wallet, grant.amount
-                                        ));
-                                    }
-                                    // Debit PoCD treasury.
-                                    if paid > 0 {
-                                        if let Ok(ta) = state.get_account_mut(pocd_treasury) {
-                                            let _ = ta.debit("uqrc", paid as u128);
-                                        }
-                                        state.refresh_leaf(pocd_treasury);
-                                    }
-                                    // Mark receipts as rewarded.
-                                    for (addr, _) in &receipt_accounts {
-                                        if let Ok(ra) = state.get_account_mut(addr) {
-                                            ra.credit("gc_reward_paid", 1);
-                                        }
-                                        state.refresh_leaf(addr);
-                                    }
-                                    events.push(format!(
-                                        "pocd_epoch_distribution: epoch={} receipts={} total_granted_uqrc={} disbursed_uqrc={}",
-                                        epoch,
-                                        receipt_accounts.len(),
-                                        total_grant,
-                                        paid
-                                    ));
-                                }
-                                Err(e) => {
-                                    // Non-fatal: log and continue. Receipts stay un-rewarded
-                                    // until the next epoch close.
-                                    tracing::warn!(epoch=%epoch, error=%e,
-                                        "PoCD reward computation failed; receipts will retry next epoch");
-                                    events.push(format!(
-                                        "pocd_reward_error: epoch={} error={}",
-                                        epoch, e
-                                    ));
-                                }
-                            }
-                        }
-
-                        Ok(())
-                    }
-                    Err(e) => Err(format!("EpochClose: {e}")),
-                }
-            }
-
-            // ── Control 5: CoverageRatio circuit breaker ──────────────────────
-
-            TxBody::RecordCapacity { capacity } => {
-                let prev_state = qrc.minting_state;
-                qrc.record_capacity(*capacity);
-                let new_state = qrc.minting_state;
-
-                let cr_display = qrc.coverage_ratio()
-                    .map(|cr| format!("{:.4}", cr as f64 / chain_forge_qrc::D as f64))
-                    .unwrap_or_else(|| "∞ (no supply)".to_string());
-
-                events.push(format!(
-                    "record_capacity: capacity={} CR={} state={}->{} sender={}",
-                    capacity, cr_display,
-                    prev_state.as_str(), new_state.as_str(),
-                    tx.sender
-                ));
-                Ok(())
-            }
-
-            // ── QRC Resource Network v0.2 — Marketplace tx types ─────────────
-
-            TxBody::PurchaseQrc { job_id, qcb_amount, min_qrc_out, resource_type } => {
-                // Validate purchase amount is non-zero.
-                if *qcb_amount == 0 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        "PurchaseQrc: qcb_amount must be > 0".to_string(),
-                    );
-                }
-
-                // Control 5: purchase path blocked when RESTRICTED or HALTED.
-                if !qrc.minting_state.purchase_allowed() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "PurchaseQrc: blocked by CoverageRatio circuit breaker \
-                             (state={}, CR_resume=1.00) — capacity must recover \
-                             before purchase minting resumes (job_id={})",
-                            qrc.minting_state.as_str(), job_id
-                        ),
-                    );
-                }
-
-                // Ensure sender has an account.
-                if state.get_account(&tx.sender).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        tx.sender.clone(), "user".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-
-                // Check QCB balance without calling state.burn() to avoid
-                // double-advancing the nonce (same pattern as QrcPurchase).
-                let qcb_have = state.get_account(&tx.sender)
-                    .map(|a| a.balance_of("uqcb"))
-                    .unwrap_or(0);
-                if qcb_have < *qcb_amount {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "PurchaseQrc: insufficient uqcb — have {}, need {} (job_id={})",
-                            qcb_have, qcb_amount, job_id
-                        ),
-                    );
-                }
-
-                // Debit QCB (permanent burn).
-                if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                    acct.debit("uqcb", *qcb_amount).expect("balance check passed above");
-                }
-                state.refresh_leaf(&tx.sender);
-
-                // Mint QRC via the purchase-path engine.
-                let (qrc_minted, rt_used) = qrc.purchase_qrc(*qcb_amount);
-
-                // Slippage guard.
-                if *min_qrc_out > 0 && qrc_minted < *min_qrc_out {
-                    // Roll back the QCB debit.
-                    if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                        acct.credit("uqcb", *qcb_amount);
-                    }
-                    state.refresh_leaf(&tx.sender);
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "PurchaseQrc: slippage exceeded — would mint {} uqrc but \
-                             min_qrc_out is {} (Rt={}, job_id={})",
-                            qrc_minted, min_qrc_out, rt_used, job_id
-                        ),
-                    );
-                }
-
-                // Credit QRC to sender.
-                if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                    acct.credit("uqrc", qrc_minted);
-                }
-                state.refresh_leaf(&tx.sender);
-
-                events.push(format!(
-                    "purchase_qrc: {} uqcb burned → {} uqrc minted \
-                     (Rt={}, resource={:?}, job_id={}, sender={})",
-                    qcb_amount, qrc_minted, rt_used, resource_type, job_id, tx.sender
-                ));
-                Ok(())
-            }
-
-            TxBody::CreditProvider { job_id, provider_id, resource_type, verified_units } => {
-                // Coordinator gate: sender must be Verified or Established tier.
-                // The VCA coordinator is trusted to verify off-chain job completion.
+            // ── Phase 1: Charm Confinement ────────────────────────────────────
+            TxBody::CharmConfinementUpdate { epoch } => {
                 let tier_ok = identity.get(&tx.sender)
                     .map(|r| r.is_verified())
                     .unwrap_or(false);
@@ -3405,108 +1874,71 @@ impl Executor {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
                         format!(
-                            "CreditProvider: sender {} is not a Verified identity \
-                             (VCA coordinator must be Verified or Established tier)",
+                            "CharmConfinementUpdate: sender {} is not Verified tier",
                             tx.sender
                         ),
                     );
                 }
-
-                // Validate verified_units are non-zero.
-                if *verified_units == 0 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "CreditProvider: verified_units must be > 0 (job_id={})",
-                            job_id
-                        ),
-                    );
-                }
-
-                // Control 5: contribution earn path blocked ONLY when HALTED.
-                // RESTRICTED allows providers to earn — they are the recovery mechanism.
-                if !qrc.minting_state.contribution_allowed() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "CreditProvider: blocked by CoverageRatio circuit breaker \
-                             (state=halted, CR_halt=0.75) — both minting paths suspended \
-                             until capacity recovers (job_id={})",
-                            job_id
-                        ),
-                    );
-                }
-
-                // Build contributions map for credit_provider_earning.
-                let mut contributions = std::collections::BTreeMap::new();
-                contributions.insert(*resource_type, *verified_units);
-
-                // Derive the provider's on-chain address from their 32-byte key.
-                // We use the hex encoding as the account address so the credit
-                // lands in a deterministic, key-derived account without requiring
-                // a separate registration step.
-                let provider_addr: String = provider_id.iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect();
-
-                // Mint contribution-path QRC via the engine. E(i,r,t) is computed
-                // from verified_units and current resource utilization weights.
-                let qrc_minted = qrc.credit_provider_earning(provider_id, &contributions);
-
-                // Ensure provider has an on-chain account.
-                if state.get_account(&provider_addr).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        provider_addr.clone(), "provider".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-
-                // Credit the earned QRC to the provider's account.
-                if qrc_minted > 0 {
-                    if let Ok(acct) = state.get_account_mut(&provider_addr) {
-                        acct.credit("uqrc", qrc_minted);
+                if let Some(rec) = identity.get_mut(&tx.sender) {
+                    rec.charm.record_participation(*epoch);
+                    // Sync updated charm to on-chain account state.
+                    if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                        acct.attach_charm(rec.charm.clone());
                     }
-                    state.refresh_leaf(&provider_addr);
                 }
-
-                let pid_prefix: String = provider_id[..8]
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect();
+                state.refresh_leaf(&tx.sender);
                 events.push(format!(
-                    "credit_provider: {} uqrc minted to provider {}… \
-                     (resource={:?}, verified_units={}, job_id={}, coordinator={})",
-                    qrc_minted, pid_prefix, resource_type, verified_units, job_id, tx.sender
+                    "charm_confinement_update: sender={} epoch={}",
+                    tx.sender, epoch
                 ));
                 Ok(())
             }
 
-            // ── AEI Phase 2 — Agent Lifecycle ────────────────────────────────
-
-            TxBody::AuthorizeAgent { agent_id } => {
-                // Caller must be the agent's registered sponsor.
-                let agent = match agents.get(agent_id) {
-                    Ok(a) => a,
-                    Err(e) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("AuthorizeAgent: {e}"),
-                    ),
-                };
-                if agent.sponsor_id != tx.sender {
+            TxBody::IntrinsicCharmRecord { event } => {
+                if identity.get(&tx.sender).is_err() {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
                         format!(
-                            "AuthorizeAgent: sender {} is not the registered sponsor of agent {}",
-                            tx.sender, agent_id
+                            "IntrinsicCharmRecord: sender {} not registered in identity store",
+                            tx.sender
                         ),
                     );
                 }
+                if let Some(rec) = identity.get_mut(&tx.sender) {
+                    match event {
+                        CharmEvent::DecayTick => {
+                            // Consume one exemption day; lapse if exhausted.
+                            if rec.charm.decay_exemption.consume(1) == 0 {
+                                rec.charm.lapse();
+                            }
+                        }
+                        CharmEvent::ExemptionCredit => {
+                            // Credit one exemption day (spend activity reward).
+                            rec.charm.decay_exemption.record_spend(
+                                rec.charm.last_attested_epoch,
+                            );
+                        }
+                    }
+                    if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                        acct.attach_charm(rec.charm.clone());
+                    }
+                }
+                state.refresh_leaf(&tx.sender);
+                events.push(format!(
+                    "intrinsic_charm_record: sender={} event={:?}",
+                    tx.sender, event
+                ));
+                Ok(())
+            }
+
+            // ── AEI Phase 2 — Agent Lifecycle ─────────────────────────────────
+            TxBody::AuthorizeAgent { agent_id } => {
                 let current_epoch = identity.clock.current_epoch;
                 match agents.authorize(agent_id, current_epoch) {
-                    Ok(()) => {
+                    Ok(_) => {
                         events.push(format!(
-                            "authorize_agent: sponsor={} agent_id={} epoch={}",
-                            tx.sender, agent_id, current_epoch
+                            "authorize_agent: agent_id={} authorized_by={}",
+                            agent_id, tx.sender
                         ));
                         Ok(())
                     }
@@ -3515,29 +1947,12 @@ impl Executor {
             }
 
             TxBody::SuspendAgent { agent_id, reason } => {
-                // Caller must be the agent's registered sponsor.
-                let agent = match agents.get(agent_id) {
-                    Ok(a) => a,
-                    Err(e) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("SuspendAgent: {e}"),
-                    ),
-                };
-                if agent.sponsor_id != tx.sender {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SuspendAgent: sender {} is not the registered sponsor of agent {}",
-                            tx.sender, agent_id
-                        ),
-                    );
-                }
                 let current_epoch = identity.clock.current_epoch;
                 match agents.suspend(agent_id, current_epoch) {
-                    Ok(()) => {
+                    Ok(_) => {
                         events.push(format!(
-                            "suspend_agent: sponsor={} agent_id={} reason={:?} epoch={}",
-                            tx.sender, agent_id, reason, current_epoch
+                            "suspend_agent: agent_id={} reason={} suspended_by={}",
+                            agent_id, reason, tx.sender
                         ));
                         Ok(())
                     }
@@ -3546,67 +1961,34 @@ impl Executor {
             }
 
             TxBody::RevokeAgentFull { agent_id } => {
-                // Caller must be the agent's registered sponsor.
-                let agent = match agents.get(agent_id) {
-                    Ok(a) => a,
-                    Err(e) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("RevokeAgentFull: {e}"),
-                    ),
-                };
-                let agent_address = agent.address.clone();
-                if agent.sponsor_id != tx.sender {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "RevokeAgentFull: sender {} is not the registered sponsor of agent {}",
-                            tx.sender, agent_id
-                        ),
-                    );
-                }
                 let current_epoch = identity.clock.current_epoch;
-                // Step 1: revoke in AgentStore (tombstones the AEI record).
+                // Capture agent address before revoking (for identity store cleanup).
+                let agent_addr = agents.get(agent_id)
+                    .map(|a| a.address.clone())
+                    .unwrap_or_default();
+                // Revoke from agent store.
                 if let Err(e) = agents.revoke(agent_id, current_epoch) {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("RevokeAgentFull: AgentStore.revoke failed: {e}"),
+                        format!("RevokeAgentFull: {e}"),
                     );
                 }
-                // Step 2: remove the sponsorship link from IdentityStore so
-                //         the slot is freed and cannot be re-registered.
-                if let Some(record) = identity.get_mut(&tx.sender) {
-                    record.revoke_agent(&agent_address);
+                // Also remove from identity store.
+                if !agent_addr.is_empty() {
+                    if let Some(rec) = identity.get_mut(&tx.sender) {
+                        rec.revoke_agent(&agent_addr);
+                    }
                 }
                 events.push(format!(
-                    "revoke_agent_full: sponsor={} agent_id={} address={} epoch={}",
-                    tx.sender, agent_id, agent_address, current_epoch
+                    "revoke_agent_full: agent_id={} revoked_by={}",
+                    agent_id, tx.sender
                 ));
                 Ok(())
             }
 
             TxBody::RecordAgentSpend { agent_id, amount_uqrc } => {
-                // Caller must be the agent's registered sponsor (or the agent
-                // address itself — sponsors gate agent actions in Phase 2).
-                let agent = match agents.get(agent_id) {
-                    Ok(a) => a,
-                    Err(e) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("RecordAgentSpend: {e}"),
-                    ),
-                };
-                let is_sponsor  = agent.sponsor_id   == tx.sender;
-                let is_agent    = agent.address       == tx.sender;
-                if !is_sponsor && !is_agent {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "RecordAgentSpend: sender {} is neither sponsor nor agent address for {}",
-                            tx.sender, agent_id
-                        ),
-                    );
-                }
                 match agents.record_spend(agent_id, *amount_uqrc) {
-                    Ok(()) => {
+                    Ok(_) => {
                         events.push(format!(
                             "record_agent_spend: agent_id={} amount_uqrc={} sender={}",
                             agent_id, amount_uqrc, tx.sender
@@ -3625,67 +2007,21 @@ impl Executor {
                 spending_limits,
                 description,
             } => {
-                // 1. Parent must exist and be Active.
-                let parent = match agents.get(parent_agent_id) {
-                    Ok(p) => p,
-                    Err(e) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("SpawnChildAgent: parent lookup failed: {e}"),
-                    ),
-                };
-                if !parent.is_active() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("SpawnChildAgent: parent agent {} is not Active", parent_agent_id),
-                    );
-                }
-                // 2. Parent must hold SpawnChildAgent capability.
-                use chain_forge_agents::AgentCapability;
-                if let Err(e) = agents.check_capability(
-                    parent_agent_id,
-                    &AgentCapability::SpawnChildAgent,
-                ) {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("SpawnChildAgent: parent lacks SpawnChildAgent capability: {e}"),
-                    );
-                }
-                // 3. Caller must be the parent's sponsor (same verified human
-                //    must own both parent and child).
-                let sponsor_id = {
-                    let parent = agents.get(parent_agent_id).unwrap(); // already confirmed Ok
-                    parent.sponsor_id.clone()
-                };
-                if sponsor_id != tx.sender {
+                // Parent must exist and be Active.
+                let parent_ok = agents.get(parent_agent_id)
+                    .map(|r| r.status == chain_forge_agents::AgentStatus::Active)
+                    .unwrap_or(false);
+                if !parent_ok {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
                         format!(
-                            "SpawnChildAgent: sender {} is not the sponsor of parent agent {}",
-                            tx.sender, parent_agent_id
+                            "SpawnChildAgent: parent agent '{}' does not exist or is not Active",
+                            parent_agent_id
                         ),
                     );
                 }
-                // 4. Sponsor must be Verified (same gate as RegisterAgent).
-                if !identity.get(&tx.sender).map(|r| r.is_verified()).unwrap_or(false) {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SpawnChildAgent: sponsor {} is not Verified (Charm Confinement requires Verified or Established tier)",
-                            tx.sender
-                        ),
-                    );
-                }
-                // 5. Register the child with parent_agent_id set.
-                //    AgentStore::register checks parent is Active internally.
                 let current_epoch = identity.clock.current_epoch;
-                // Also record the sponsorship in IdentityStore.
-                if let Err(e) = identity.sponsor_agent(&tx.sender, child_agent_address) {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("SpawnChildAgent: identity sponsor_agent failed: {e}"),
-                    );
-                }
-                match agents.register(
+                if let Err(e) = agents.register(
                     child_agent_id.clone(),
                     child_agent_address.clone(),
                     tx.sender.clone(),
@@ -3696,1004 +2032,14 @@ impl Executor {
                     chain_forge_agents::AgentType::Native,
                     current_epoch,
                 ) {
-                    Ok(()) => {
-                        events.push(format!(
-                            "spawn_child_agent: sponsor={} parent={} child_id={} address={} status=Pending epoch={}",
-                            tx.sender, parent_agent_id, child_agent_id, child_agent_address, current_epoch
-                        ));
-                        Ok(())
-                    }
-                    Err(e) => {
-                        // Roll back the IdentityStore sponsorship.
-                        if let Some(record) = identity.get_mut(&tx.sender) {
-                            record.revoke_agent(child_agent_address);
-                        }
-                        Err(format!("SpawnChildAgent: AgentStore.register failed: {e}"))
-                    }
-                }
-            }
-
-            // ── Resource Marketplace — QRC Escrow ─────────────────────────────
-
-            TxBody::LockQrcForJob { escrow_id, job_id, agent_wallet, amount } => {
-                // ── resolve agent address → agent record ──────────────────────
-                // `agent_wallet` is the agent's registered on-chain ADDRESS (the
-                // `agent_address` field from RegisterAgent).  We look up the
-                // AgentRecord by address to get the canonical agent_id, which is
-                // what DepositToTreasury uses as the treasury key.  If no record
-                // exists we treat agent_wallet as a plain wallet (no treasury,
-                // no cap).
-                let agent_rec = agents.get_by_address(agent_wallet).ok().cloned();
-                let canonical_agent_id = agent_rec.as_ref().map(|r| r.agent_id.as_str());
-
-                // ── per-job spending limit check ──────────────────────────────
-                // If the agent has a registered record with a per_job_limit, enforce it.
-                // We look up by agent_wallet address (the agent's on-chain address).
-                let per_job_limit = agents
-                    .get_by_address(agent_wallet).ok()
-                    .map(|r| r.spending_limits.per_job_limit_uqrc)
-                    .unwrap_or(0);
-                if per_job_limit > 0 && (*amount as u128) > per_job_limit {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "LockQrcForJob: amount {} exceeds per-job limit {} for agent wallet {} \
-                             (escrow_id={}, job_id={})",
-                            amount, per_job_limit, agent_wallet, escrow_id, job_id
-                        ),
+                        format!("SpawnChildAgent: AgentStore.register failed: {e}"),
                     );
                 }
-
-                // ── duplicate escrow guard ───────────────────────────────────
-                // Each escrow_id must be globally unique.  If an entry for this
-                // escrow_id already exists in state the tx is rejected so that a
-                // replayed or reused escrow_id can never double-debit a treasury.
-                let escrow_key = format!("escrow:{}", escrow_id);
-                if state.get_account(&escrow_key).is_ok() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "LockQrcForJob: escrow_id '{}' already exists \
-                             (job_id={}, agent_wallet={})",
-                            escrow_id, job_id, agent_wallet
-                        ),
-                    );
-                }
-
-                // ── treasury-first funding ────────────────────────────────────
-                // Treasury key is `treasury:{agent_id}` — the canonical agent ID,
-                // matching exactly what DepositToTreasury writes.  Falls back to
-                // `treasury:{agent_wallet}` when no AgentRecord was found (plain
-                // wallet mode), and ultimately to the agent's own wallet.
-                let treasury_key = match canonical_agent_id {
-                    Some(id) => format!("treasury:{}", id),
-                    None     => format!("treasury:{}", agent_wallet),
-                };
-                let treasury_balance = state.get_account(&treasury_key)
-                    .map(|a| a.balance_of("uqcb"))
-                    .unwrap_or(0);
-
-                let (debit_from, source_label) = if treasury_balance >= *amount as u128 {
-                    (treasury_key.clone(), "treasury")
-                } else {
-                    (agent_wallet.clone(), "wallet")
-                };
-
-                let source_balance = state.get_account(&debit_from)
-                    .map(|a| a.balance_of("uqcb"))
-                    .unwrap_or(0);
-
-                if source_balance < *amount as u128 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "LockQrcForJob: insufficient uqcb — treasury={} wallet={} need={} \
-                             (escrow_id={}, job_id={})",
-                            treasury_balance,
-                            state.get_account(agent_wallet).map(|a| a.balance_of("uqcb")).unwrap_or(0),
-                            amount, escrow_id, job_id
-                        ),
-                    );
-                }
-
-                // Debit from the chosen source (held in escrow until Release/Refund).
-                if let Ok(acct) = state.get_account_mut(&debit_from) {
-                    acct.debit("uqcb", *amount as u128).expect("balance check passed above");
-                }
-                state.refresh_leaf(&debit_from);
-
-                // Credit the escrow account (create it — this is what makes
-                // the escrow_id queryable and what the duplicate-guard above
-                // detects on a second attempt with the same escrow_id).
-                //
-                // The escrow account's `role` encodes the authorized releaser
-                // (the coordinator who submitted LockQrcForJob).  ReleaseQrcForJob
-                // and RefundQrcForJob verify `tx.sender` matches this value, so
-                // a different coordinator cannot release or refund another party's escrow.
-                {
-                    let escrow_role = format!("escrow:authorized={}", tx.sender);
-                    let mut new_escrow = chain_forge_state::AccountState::new(
-                        escrow_key.clone(), escrow_role
-                    );
-                    new_escrow.escrow = Some(chain_forge_state::EscrowBinding {
-                        job_id: job_id.clone(),
-                        agent_wallet: agent_wallet.clone(),
-                        funding_source: debit_from.clone(),
-                    });
-                    state.upsert_account(new_escrow);
-                }
-                if let Ok(acct) = state.get_account_mut(&escrow_key) {
-                    acct.credit("locked_uqcb", *amount as u128);
-                    acct.credit("uqcb", *amount as u128);
-                }
-                state.refresh_leaf(&escrow_key);
-
                 events.push(format!(
-                    "lock_qrc_for_job: escrow_id={} job_id={} agent_wallet={} amount={} source={} locked",
-                    escrow_id, job_id, agent_wallet, amount, source_label
-                ));
-                Ok(())
-            }
-
-            TxBody::ReleaseQrcForJob {
-                escrow_id, job_id, machine_id, provider_wallet, amount, receipt_hash
-            } => {
-                // Coordinator gate: sender must be Verified or Established tier.
-                let tier_ok = identity.get(&tx.sender)
-                    .map(|r| r.is_verified())
-                    .unwrap_or(false);
-                if !tier_ok {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "ReleaseQrcForJob: sender {} is not a Verified identity \
-                             (coordinator gate, escrow_id={})",
-                            tx.sender, escrow_id
-                        ),
-                    );
-                }
-
-                let escrow_key = format!("escrow:{}", escrow_id);
-
-                // N5 guard — escrow must exist.
-                let escrow_acct = match state.get_account(&escrow_key) {
-                    Ok(a) => a.clone(),
-                    Err(_) => {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!(
-                                "ReleaseQrcForJob: escrow_id '{}' does not exist \
-                                 (job_id={}, sender={})",
-                                escrow_id, job_id, tx.sender
-                            ),
-                        );
-                    }
-                };
-
-                // N3 guard — only the coordinator who locked the escrow may release it.
-                // The authorized address is encoded in the escrow account's role field
-                // as "escrow:authorized={address}" at LockQrcForJob time.
-                let authorized_sender = escrow_acct.role
-                    .strip_prefix("escrow:authorized=")
-                    .unwrap_or("");
-                if authorized_sender != tx.sender.as_str() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "ReleaseQrcForJob: sender {} is not the authorized releaser \
-                             for escrow '{}' (authorized={}, job_id={})",
-                            tx.sender, escrow_id, authorized_sender, job_id
-                        ),
-                    );
-                }
-
-                // N6 guard — job_id must match the binding stored at lock time.
-                if let Some(ref binding) = escrow_acct.escrow {
-                    if binding.job_id != *job_id {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!(
-                                "ReleaseQrcForJob: job_id mismatch — escrow '{}' is bound to \
-                                 job '{}', not '{}'",
-                                escrow_id, binding.job_id, job_id
-                            ),
-                        );
-                    }
-                }
-
-                // N4 guard — release amount must be positive and not exceed escrow balance.
-                let escrow_balance = escrow_acct.balance_of("uqcb");
-                if *amount == 0 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "ReleaseQrcForJob: release amount must be > 0 \
-                             (escrow_id={}, job_id={})",
-                            escrow_id, job_id
-                        ),
-                    );
-                }
-                if (*amount as u128) > escrow_balance {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "ReleaseQrcForJob: release amount {} exceeds escrow balance {} \
-                             (escrow_id={}, job_id={})",
-                            amount, escrow_balance, escrow_id, job_id
-                        ),
-                    );
-                }
-
-                // N7 guard — provider_wallet must not be the escrow account itself.
-                if provider_wallet == &escrow_key {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "ReleaseQrcForJob: provider_wallet must not be the escrow account \
-                             itself (escrow_id={}, job_id={})",
-                            escrow_id, job_id
-                        ),
-                    );
-                }
-
-                // Debit the escrow account.
-                if let Ok(acct) = state.get_account_mut(&escrow_key) {
-                    acct.debit("uqcb", *amount as u128).expect("balance verified above");
-                }
-                state.refresh_leaf(&escrow_key);
-
-                // Ensure provider wallet account exists.
-                if state.get_account(provider_wallet).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        provider_wallet.clone(), "provider".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-                // Credit the settled amount to the provider.
-                if let Ok(acct) = state.get_account_mut(provider_wallet) {
-                    acct.credit("uqcb", *amount as u128);
-                }
-                state.refresh_leaf(provider_wallet);
-                events.push(format!(
-                    "release_qrc_for_job: escrow_id={} job_id={} machine_id={} \
-                     provider_wallet={} amount={} receipt_hash={} coordinator={}",
-                    escrow_id, job_id, machine_id, provider_wallet, amount, receipt_hash, tx.sender
-                ));
-                Ok(())
-            }
-
-            TxBody::RefundQrcForJob { escrow_id, job_id, agent_wallet, amount, reason } => {
-                // Coordinator gate: sender must be Verified or Established tier.
-                let tier_ok = identity.get(&tx.sender)
-                    .map(|r| r.is_verified())
-                    .unwrap_or(false);
-                if !tier_ok {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "RefundQrcForJob: sender {} is not a Verified identity \
-                             (coordinator gate, escrow_id={})",
-                            tx.sender, escrow_id
-                        ),
-                    );
-                }
-                let escrow_key = format!("escrow:{}", escrow_id);
-                let escrow = match state.get_account(&escrow_key) {
-                    Ok(account) => account,
-                    Err(_) => return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
-                        "resource settlement: escrow does not exist".to_string()),
-                };
-                let binding = match escrow.escrow.as_ref() {
-                    Some(binding) if binding.job_id == *job_id => binding.clone(),
-                    _ => return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
-                        "resource settlement: missing or mismatched job binding".to_string()),
-                };
-                if *amount == 0 || escrow.balance_of("uqcb") < *amount as u128 {
-                    return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
-                        "resource settlement: zero amount or insufficient escrow balance".to_string());
-                }
-                if binding.agent_wallet != *agent_wallet || escrow.balance_of("uqcb") != *amount as u128 {
-                    return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
-                        "resource refund: wallet mismatch or refund must equal remaining escrow".to_string());
-                }
-                let destination = binding.funding_source;
-                if state.get_account(&destination).is_err() {
-                    return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit,
-                        "resource refund: original funding account missing".to_string());
-                }
-                state.get_account_mut(&escrow_key).unwrap().debit("uqcb", *amount as u128).unwrap();
-                state.get_account_mut(&destination).unwrap().credit("uqcb", *amount as u128);
-                state.refresh_leaf(&escrow_key);
-                state.refresh_leaf(&destination);
-                events.push(format!(
-                    "refund_qrc_for_job: escrow_id={} job_id={} agent_wallet={} \
-                     amount={} reason={:?} coordinator={}",
-                    escrow_id, job_id, agent_wallet, amount, reason, tx.sender
-                ));
-                Ok(())
-            }
-
-            // ── Agent Treasury ─────────────────────────────────────────────────
-            TxBody::DepositToTreasury { agent_id, amount, per_job_limit_uqrc } => {
-                // Sender is the sponsor; verify they are the registered sponsor
-                // for this agent (or Verified if acting as a coordinator deposit).
-                let agent_rec = agents.get(agent_id).ok().cloned();
-                if let Some(ref rec) = agent_rec {
-                    if rec.sponsor_id != tx.sender {
-                        let tier_ok = identity.get(&tx.sender)
-                            .map(|r| r.is_verified())
-                            .unwrap_or(false);
-                        if !tier_ok {
-                            return TransactionResult::err(
-                                tx.id.clone(), gas_required, tx.gas_limit,
-                                format!(
-                                    "DepositToTreasury: sender {} is neither the registered \
-                                     sponsor {} nor a Verified coordinator for agent {}",
-                                    tx.sender, rec.sponsor_id, agent_id
-                                ),
-                            );
-                        }
-                    }
-                }
-                // Verify sender has enough uqcb.
-                let sender_balance = state.get_account(&tx.sender)
-                    .map(|a| a.balance_of("uqcb"))
-                    .unwrap_or(0);
-                if sender_balance < *amount as u128 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "DepositToTreasury: sender {} has {} uqcb but tried to deposit {} \
-                             into treasury for agent {}",
-                            tx.sender, sender_balance, amount, agent_id
-                        ),
-                    );
-                }
-                // Debit sender.
-                if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                    acct.debit("uqcb", *amount as u128).expect("sender balance verified above");
-                }
-                state.refresh_leaf(&tx.sender);
-                // Credit treasury account (create if new).
-                let treasury_key = format!("treasury:{}", agent_id);
-                if state.get_account(&treasury_key).is_err() {
-                    let new_acct = chain_forge_state::AccountState::new(
-                        treasury_key.clone(), "treasury".to_string()
-                    );
-                    state.upsert_account(new_acct);
-                }
-                if let Ok(acct) = state.get_account_mut(&treasury_key) {
-                    acct.credit("uqcb", *amount as u128);
-                }
-                state.refresh_leaf(&treasury_key);
-                // Optionally update per_job_limit on the agent record.
-                let new_limit = *per_job_limit_uqrc as u128;
-                if new_limit > 0 {
-                    if let Some(rec) = agents.get_mut_by_id(agent_id.as_str()) {
-                        rec.spending_limits.per_job_limit_uqrc = new_limit;
-                    }
-                }
-                let treasury_new_bal = state.get_account(&treasury_key)
-                    .map(|a| a.balance_of("uqcb"))
-                    .unwrap_or(0);
-                events.push(format!(
-                    "deposit_to_treasury: agent_id={} sponsor={} amount={} \
-                     treasury_balance={} per_job_limit={}",
-                    agent_id, tx.sender, amount, treasury_new_bal, per_job_limit_uqrc
-                ));
-                Ok(())
-            }
-
-            // ── Contribution Layer ─────────────────────────────────────────
-            TxBody::RegisterMachine {
-                machine_id,
-                display_name,
-                mode,
-                attestation_key_b64,
-                capabilities_json: _,
-            } => {
-                // Sender must be Verified or Established tier.
-                let tier_ok = identity.get(&tx.sender)
-                    .map(|r| r.is_verified())
-                    .unwrap_or(false);
-                if !tier_ok {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "RegisterMachine: sender {} must be Verified or Established tier",
-                            tx.sender
-                        ),
-                    );
-                }
-                // Machine must not already exist.
-                let machine_key = format!("machine:{}", machine_id);
-                if state.get_account(&machine_key).is_ok() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("RegisterMachine: machine {} already registered", machine_id),
-                    );
-                }
-                // Parse mode string.
-                let machine_mode = match mode.as_str() {
-                    "MarketplaceOnly"  => chain_forge_resource::MachineMode::MarketplaceOnly,
-                    "ContributionOnly" => chain_forge_resource::MachineMode::ContributionOnly,
-                    "Both"             => chain_forge_resource::MachineMode::Both,
-                    other => {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!(
-                                "RegisterMachine: unknown mode '{}'; \
-                                 expected MarketplaceOnly | ContributionOnly | Both",
-                                other
-                            ),
-                        );
-                    }
-                };
-                // Build a MachineRecord with a placeholder capability descriptor
-                // (full descriptor arrives via capabilities_json in Phase 1B).
-                let capability_descriptor = chain_forge_resource::ResourceCapabilityDescriptor {
-                    compute_class:  chain_forge_resource::ComputeClass::Cpu,
-                    compute_units:  1,
-                    memory_tier:    chain_forge_resource::MemoryTier::Small,
-                    storage_tier:   chain_forge_resource::StorageTier::Ssd,
-                    isa_tags:       vec![],
-                    price_model:    chain_forge_resource::PriceModel::PerJob { qrc_flat: 0 },
-                    daemon_version: "0.1.0".to_string(),
-                    extra:          std::collections::HashMap::new(),
-                };
-                let record = chain_forge_resource::MachineRecord {
-                    machine_id: chain_forge_resource::MachineId(machine_id.clone()),
-                    owner: chain_forge_resource::ProviderOwner::Individual(
-                        chain_forge_resource::SponsorId(tx.sender.clone()),
-                    ),
-                    attestation_key: chain_forge_resource::MachineAttestationKey {
-                        public_key_b64: attestation_key_b64.clone(),
-                    },
-                    capability_descriptor,
-                    mode: machine_mode,
-                    status: chain_forge_resource::MachineStatus::Active,
-                };
-                // Serialize and store in a virtual state account.
-                // The JSON record is stored in the account's `role` field.
-                let record_json = serde_json::to_string(&record)
-                    .unwrap_or_else(|_| "{}".to_string());
-                let mut acct = chain_forge_state::AccountState::new(
-                    machine_key.clone(), record_json,
-                );
-                // Credit a sentinel balance so the account is non-empty.
-                acct.credit("machine_registered", 1);
-                state.upsert_account(acct);
-                state.refresh_leaf(&machine_key);
-                events.push(format!(
-                    "register_machine: machine_id={} owner={} mode={:?} display_name={}",
-                    machine_id, tx.sender, machine_mode, display_name
-                ));
-                Ok(())
-            }
-
-            // ── Resource Job Lifecycle ─────────────────────────────────────
-            TxBody::CreateJob {
-                job_id,
-                escrow_id,
-                machine_id,
-                description,
-                workload_type,
-                workload_payload,
-                timeout_seconds,
-            } => {
-                // Guard 1: job_id must be unique.
-                let job_key = format!("job:{}", job_id);
-                if state.get_account(&job_key).is_ok() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("CreateJob: job_id '{}' already exists", job_id),
-                    );
-                }
-                // Guard 2: escrow must exist.
-                let escrow_key = format!("escrow:{}", escrow_id);
-                if state.get_account(&escrow_key).is_err() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("CreateJob: escrow '{}' not found — submit LockQrcForJob first", escrow_id),
-                    );
-                }
-                // Guard 3: machine must be registered and Active.
-                let machine_key = format!("machine:{}", machine_id);
-                if state.get_account(&machine_key).is_err() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("CreateJob: machine '{}' is not registered", machine_id),
-                    );
-                }
-                // Write job record in Created state.
-                let job_json = serde_json::json!({
-                    "job_id": job_id,
-                    "requester": tx.sender,
-                    "escrow_id": escrow_id,
-                    "machine_id": machine_id,
-                    "description": description,
-                    "workload_type": workload_type,
-                    "workload_payload": workload_payload,
-                    "timeout_seconds": timeout_seconds,
-                    "state": "Created",
-                    "output_hash": null,
-                    "receipt_id": null,
-                    "execution_stats_json": null,
-                    "created_at": "",
-                }).to_string();
-                let mut acct = chain_forge_state::AccountState::new(job_key.clone(), job_json);
-                acct.credit("job_created", 1);
-                state.upsert_account(acct);
-                state.refresh_leaf(&job_key);
-                events.push(format!(
-                    "create_job: job_id={} escrow_id={} machine_id={} requester={} workload_type={}",
-                    job_id, escrow_id, machine_id, tx.sender, workload_type
-                ));
-                Ok(())
-            }
-
-            TxBody::AcceptJob { job_id, machine_id } => {
-                // Guard 1: job must exist and be in Created state.
-                let job_key = format!("job:{}", job_id);
-                let job_acct = match state.get_account(&job_key) {
-                    Ok(a) => a,
-                    Err(_) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("AcceptJob: job '{}' not found", job_id),
-                    ),
-                };
-                let mut job_data: serde_json::Value =
-                    serde_json::from_str(&job_acct.role).unwrap_or_default();
-                let current_state = job_data.get("state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if current_state != "Created" {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("AcceptJob: job '{}' is in state '{}', expected Created", job_id, current_state),
-                    );
-                }
-                // Guard 2: sender must own the machine.
-                let machine_key = format!("machine:{}", machine_id);
-                let machine_acct = match state.get_account(&machine_key) {
-                    Ok(a) => a,
-                    Err(_) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("AcceptJob: machine '{}' not registered", machine_id),
-                    ),
-                };
-                if let Ok(record) = serde_json::from_str::<chain_forge_resource::MachineRecord>(&machine_acct.role) {
-                    let owner_id = match &record.owner {
-                        chain_forge_resource::ProviderOwner::Individual(s) => s.0.clone(),
-                        chain_forge_resource::ProviderOwner::Enterprise(e) => e.0.clone(),
-                    };
-                    if owner_id != tx.sender {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!("AcceptJob: sender {} is not the owner of machine {}", tx.sender, machine_id),
-                        );
-                    }
-                }
-                // Guard 3: machine_id must match what CreateJob specified.
-                let assigned_machine = job_data.get("machine_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if assigned_machine != machine_id.as_str() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("AcceptJob: job '{}' was assigned to machine '{}', not '{}'",
-                            job_id, assigned_machine, machine_id),
-                    );
-                }
-                // Transition: Created → Running.
-                job_data["state"] = serde_json::Value::String("Running".to_string());
-                job_data["accepted_at"] = serde_json::Value::String(String::new());
-                let updated_json = job_data.to_string();
-                let mut updated_acct = chain_forge_state::AccountState::new(job_key.clone(), updated_json);
-                updated_acct.credit("job_created", job_acct.balance_of("job_created"));
-                updated_acct.credit("job_running", 1);
-                state.upsert_account(updated_acct);
-                state.refresh_leaf(&job_key);
-                events.push(format!(
-                    "accept_job: job_id={} machine_id={} acceptor={}",
-                    job_id, machine_id, tx.sender
-                ));
-                Ok(())
-            }
-
-            TxBody::CompleteJob {
-                job_id,
-                machine_id,
-                output_hash,
-                receipt_id,
-                execution_stats_json,
-            } => {
-                // Guard 1: job must exist and be in Running state.
-                let job_key = format!("job:{}", job_id);
-                let job_acct = match state.get_account(&job_key) {
-                    Ok(a) => a,
-                    Err(_) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("CompleteJob: job '{}' not found", job_id),
-                    ),
-                };
-                let mut job_data: serde_json::Value =
-                    serde_json::from_str(&job_acct.role).unwrap_or_default();
-                let current_state = job_data.get("state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if current_state != "Running" {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("CompleteJob: job '{}' is in state '{}', expected Running", job_id, current_state),
-                    );
-                }
-                // Guard 2: sender must own the machine.
-                let machine_key = format!("machine:{}", machine_id);
-                let machine_acct = match state.get_account(&machine_key) {
-                    Ok(a) => a,
-                    Err(_) => return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("CompleteJob: machine '{}' not registered", machine_id),
-                    ),
-                };
-                if let Ok(record) = serde_json::from_str::<chain_forge_resource::MachineRecord>(&machine_acct.role) {
-                    let owner_id = match &record.owner {
-                        chain_forge_resource::ProviderOwner::Individual(s) => s.0.clone(),
-                        chain_forge_resource::ProviderOwner::Enterprise(e) => e.0.clone(),
-                    };
-                    if owner_id != tx.sender {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!("CompleteJob: sender {} is not the owner of machine {}", tx.sender, machine_id),
-                        );
-                    }
-                }
-                // Guard 3: output_hash must be non-empty.
-                if output_hash.is_empty() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        "CompleteJob: output_hash must not be empty".to_string(),
-                    );
-                }
-                // Guard 4: receipt_id must be unique.
-                let receipt_key = format!("job_receipt:{}", receipt_id);
-                if state.get_account(&receipt_key).is_ok() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!("CompleteJob: receipt_id '{}' already exists (duplicate)", receipt_id),
-                    );
-                }
-                // Transition: Running → Completed.
-                job_data["state"] = serde_json::Value::String("Completed".to_string());
-                job_data["output_hash"] = serde_json::Value::String(output_hash.clone());
-                job_data["receipt_id"] = serde_json::Value::String(receipt_id.clone());
-                job_data["execution_stats_json"] = serde_json::Value::String(execution_stats_json.clone());
-                job_data["completed_at"] = serde_json::Value::String(String::new());
-                let updated_json = job_data.to_string();
-                let mut updated_acct = chain_forge_state::AccountState::new(job_key.clone(), updated_json);
-                updated_acct.credit("job_created",   job_acct.balance_of("job_created"));
-                updated_acct.credit("job_running",   job_acct.balance_of("job_running"));
-                updated_acct.credit("job_completed", 1);
-                state.upsert_account(updated_acct);
-                state.refresh_leaf(&job_key);
-                // Write receipt record.
-                let receipt_json = serde_json::json!({
-                    "receipt_id": receipt_id,
-                    "job_id": job_id,
-                    "machine_id": machine_id,
-                    "output_hash": output_hash,
-                    "submitted_by": tx.sender,
-                    "submitted_at": "",
-                }).to_string();
-                let mut receipt_acct = chain_forge_state::AccountState::new(receipt_key.clone(), receipt_json);
-                receipt_acct.credit("receipt_recorded", 1);
-                state.upsert_account(receipt_acct);
-                state.refresh_leaf(&receipt_key);
-                events.push(format!(
-                    "complete_job: job_id={} machine_id={} output_hash={} receipt_id={}",
-                    job_id, machine_id, output_hash, receipt_id
-                ));
-                Ok(())
-            }
-
-            TxBody::VerifyJob {
-                job_id,
-                escrow_id,
-                expected_output_hash,
-                provider_wallet,
-                amount,
-                receipt_hash,
-            } => {
-                // Guard 1: job must exist and be in Completed state.
-                let job_key = format!("job:{}", job_id);
-                // Clone all needed data upfront to release the immutable borrow on state
-                // before we start mutating it.
-                let (mut job_data, job_bal_created, job_bal_running, job_bal_completed, requester_wallet) = {
-                    let job_acct = match state.get_account(&job_key) {
-                        Ok(a) => a,
-                        Err(_) => return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!("VerifyJob: job '{}' not found", job_id),
-                        ),
-                    };
-                    let jd: serde_json::Value =
-                        serde_json::from_str(&job_acct.role).unwrap_or_default();
-                    let current_state = jd.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let stored_hash   = jd.get("output_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let requester     = jd.get("requester").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let bc = job_acct.balance_of("job_created");
-                    let br = job_acct.balance_of("job_running");
-                    let bco = job_acct.balance_of("job_completed");
-                    if current_state != "Completed" {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!("VerifyJob: job '{}' is in state '{}', expected Completed", job_id, current_state),
-                        );
-                    }
-                    // Guard 2: output_hash must match what CompleteJob stored.
-                    if stored_hash != *expected_output_hash {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!(
-                                "VerifyJob: output_hash mismatch — stored='{}' expected='{}'",
-                                stored_hash, expected_output_hash
-                            ),
-                        );
-                    }
-                    (jd, bc, br, bco, requester)
-                };
-                // Guard 3: escrow must exist and match this job.
-                let escrow_key = format!("escrow:{}", escrow_id);
-                let (mut updated_escrow, locked_amount) = {
-                    let escrow_acct = match state.get_account(&escrow_key) {
-                        Ok(a) => a,
-                        Err(_) => return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!("VerifyJob: escrow '{}' not found", escrow_id),
-                        ),
-                    };
-                    let locked = escrow_acct.balance_of("locked_uqcb");
-                    (escrow_acct.clone(), locked)
-                };
-                // Guard 4: amount must not exceed locked amount.
-                if *amount > locked_amount as u64 {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "VerifyJob: release amount {} exceeds locked amount {}",
-                            amount, locked_amount
-                        ),
-                    );
-                }
-                // Guard 5: provider_wallet must not be empty.
-                if provider_wallet.is_empty() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        "VerifyJob: provider_wallet must not be empty".to_string(),
-                    );
-                }
-                // --- All guards passed. Execute settlement. ---
-                // 1. Debit escrow account.
-                // locked_uqcb tracks the logical lock; uqcb is the shadow balance
-                // credited by LockQrcForJob — both must be drained on settlement.
-                let _ = updated_escrow.debit("locked_uqcb", locked_amount);
-                let _ = updated_escrow.debit("uqcb", locked_amount);
-                // UED-001 (QCB-ECON-001): any escrow residual (locked_amount - amount)
-                // flows to the provider rather than the requester for Phase 1 devnet.
-                // Rationale: simplest deterministic policy; revisit when revenue-split
-                // escrow redesign is complete.
-                let residual_amount = locked_amount.saturating_sub(*amount as u128);
-                updated_escrow.credit("escrow_settled", 1);
-                state.upsert_account(updated_escrow);
-                state.refresh_leaf(&escrow_key);
-                // 2. Credit provider wallet (settled amount + any residual per UED-001).
-                if state.get_account(provider_wallet).is_err() {
-                    state.upsert_account(chain_forge_state::AccountState::new(
-                        provider_wallet.clone(), String::new()
-                    ));
-                }
-                let total_to_provider = (*amount as u128).saturating_add(residual_amount);
-                if let Ok(acct) = state.get_account_mut(provider_wallet) {
-                    acct.credit("uqcb", total_to_provider);
-                }
-                state.refresh_leaf(provider_wallet);
-                // 3. Transition job: Completed → Verified → Settled.
-                job_data["state"] = serde_json::Value::String("Settled".to_string());
-                job_data["verified_at"] = serde_json::Value::String(String::new());
-                job_data["verifier"] = serde_json::Value::String(tx.sender.clone());
-                job_data["receipt_hash"] = serde_json::Value::String(receipt_hash.clone());
-                job_data["settled_amount"] = serde_json::Value::Number(serde_json::Number::from(*amount));
-                let updated_json = job_data.to_string();
-                let mut updated_acct = chain_forge_state::AccountState::new(job_key.clone(), updated_json);
-                updated_acct.credit("job_created",   job_bal_created);
-                updated_acct.credit("job_running",   job_bal_running);
-                updated_acct.credit("job_completed", job_bal_completed);
-                updated_acct.credit("job_settled",   1);
-                state.upsert_account(updated_acct);
-                state.refresh_leaf(&job_key);
-                events.push(format!(
-                    "verify_job: job_id={} escrow_id={} provider={} amount={} receipt_hash={}",
-                    job_id, escrow_id, provider_wallet, amount, receipt_hash
-                ));
-                Ok(())
-            }
-
-            TxBody::SubmitUsefulWork {
-                receipt_id,
-                machine_id,
-                challenge_id,
-                output_hash,
-                seal_nonce,
-                seal_hash,
-                seal_difficulty_bits,
-                min_difficulty_override,
-            } => {
-                // ── Anti-farming guard 1: Machine must be registered ──────────
-                let machine_key = format!("machine:{}", machine_id);
-                let machine_role_json = match state.get_account(&machine_key) {
-                    Ok(a) => a.role.clone(),
-                    Err(_) => {
-                        return TransactionResult::err(
-                            tx.id.clone(), gas_required, tx.gas_limit,
-                            format!(
-                                "SubmitUsefulWork: machine {} is not registered",
-                                machine_id
-                            ),
-                        );
-                    }
-                };
-                // ── Anti-farming guard 2: Sender must be the machine's owner ─
-                // Parse the stored MachineRecord to verify ownership.
-                if let Ok(record) = serde_json::from_str::<chain_forge_resource::MachineRecord>(&machine_role_json) {
-                    let owner_id = match &record.owner {
-                        chain_forge_resource::ProviderOwner::Individual(s) => s.0.as_str(),
-                        chain_forge_resource::ProviderOwner::Enterprise(e) => e.0.as_str(),
-                    };
-                    if owner_id != tx.sender.as_str() {
-                        // Allow Verified coordinators as well.
-                        let tier_ok = identity.get(&tx.sender)
-                            .map(|r| r.is_verified())
-                            .unwrap_or(false);
-                        if !tier_ok {
-                            return TransactionResult::err(
-                                tx.id.clone(), gas_required, tx.gas_limit,
-                                format!(
-                                    "SubmitUsefulWork: sender {} is not the registered owner \
-                                     ({}) of machine {}",
-                                    tx.sender, owner_id, machine_id
-                                ),
-                            );
-                        }
-                    }
-                }
-                // ── Anti-farming guard 3: Reject duplicate receipts ───────────
-                let receipt_key = format!("gc_receipt:{}", receipt_id);
-                if state.get_account(&receipt_key).is_ok() {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SubmitUsefulWork: receipt {} already recorded (duplicate)",
-                            receipt_id
-                        ),
-                    );
-                }
-                // ── Anti-farming guard 4: Absolute minimum difficulty (8 bits) ─
-                // This is always enforced; the tx-level override can only raise it.
-                const ABSOLUTE_MIN_DIFFICULTY: u32 = 8;
-                if *seal_difficulty_bits < ABSOLUTE_MIN_DIFFICULTY {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SubmitUsefulWork: seal_difficulty_bits {} is below the \
-                             absolute minimum {} — trivial seals cannot earn rewards",
-                            seal_difficulty_bits, ABSOLUTE_MIN_DIFFICULTY
-                        ),
-                    );
-                }
-                // ── Anti-farming guard 5: Per-tx override minimum difficulty ──
-                if *min_difficulty_override > 0 && seal_difficulty_bits < min_difficulty_override {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SubmitUsefulWork: seal_difficulty_bits {} is below \
-                             required minimum {}",
-                            seal_difficulty_bits, min_difficulty_override
-                        ),
-                    );
-                }
-                // ── Anti-farming guard 6: Per-machine epoch receipt rate limit ─
-                // Max 100 receipts per machine per epoch prevents seal-spam.
-                const MAX_RECEIPTS_PER_MACHINE_PER_EPOCH: u128 = 100;
-                let epoch_rate_key = format!(
-                    "epoch_receipts:{}:{}",
-                    qrc.current_epoch, machine_id
-                );
-                let epoch_receipt_count = state.get_account(&epoch_rate_key)
-                    .map(|a| a.balance_of("count"))
-                    .unwrap_or(0);
-                if epoch_receipt_count >= MAX_RECEIPTS_PER_MACHINE_PER_EPOCH {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SubmitUsefulWork: machine {} has reached the epoch receipt \
-                             limit ({} receipts in epoch {}); wait for next epoch",
-                            machine_id, MAX_RECEIPTS_PER_MACHINE_PER_EPOCH, qrc.current_epoch
-                        ),
-                    );
-                }
-                // Verify the seal (single SHA-256 call).
-                let dummy_receipt = chain_forge_resource::UsefulWorkReceipt {
-                    receipt_id:          receipt_id.clone(),
-                    work_type:           chain_forge_resource::WorkType::ResearchContribution,
-                    challenge_id:        challenge_id.clone(),
-                    machine_id:          chain_forge_resource::MachineId(machine_id.clone()),
-                    input_hash:          "0".repeat(64),
-                    output_hash:         output_hash.clone(),
-                    methodology_ref:     String::new(),
-                    nonce:               0,
-                    checks_performed:    0,
-                    elapsed_seconds:     0.0,
-                    timestamp_utc:       String::new(),
-                    machine_signature:   String::new(),
-                    verified:            false,
-                    verifier_id:         None,
-                    verifier_signature:  None,
-                    seal_nonce:          *seal_nonce,
-                    seal_hash:           seal_hash.clone(),
-                    seal_difficulty_bits: *seal_difficulty_bits,
-                };
-                if !chain_forge_resource::verify_seal(&dummy_receipt) {
-                    return TransactionResult::err(
-                        tx.id.clone(), gas_required, tx.gas_limit,
-                        format!(
-                            "SubmitUsefulWork: seal verification failed for receipt {} \
-                             (challenge={}, difficulty={})",
-                            receipt_id, challenge_id, seal_difficulty_bits
-                        ),
-                    );
-                }
-                // Store the receipt in state.
-                // The JSON receipt is stored in the account's `role` field.
-                let receipt_json = serde_json::to_string(&dummy_receipt)
-                    .unwrap_or_else(|_| "{}".to_string());
-                let mut receipt_acct = chain_forge_state::AccountState::new(
-                    receipt_key.clone(), receipt_json,
-                );
-                // Credit a sentinel balance so the account is non-empty.
-                receipt_acct.credit("gc_receipt_recorded", 1);
-                state.upsert_account(receipt_acct);
-                state.refresh_leaf(&receipt_key);
-                // Increment per-machine epoch receipt counter (rate-limit guard).
-                if state.get_account(&epoch_rate_key).is_err() {
-                    let rc = chain_forge_state::AccountState::new(
-                        epoch_rate_key.clone(), "epoch_rate".to_string(),
-                    );
-                    state.upsert_account(rc);
-                }
-                if let Ok(acct) = state.get_account_mut(&epoch_rate_key) {
-                    acct.credit("count", 1);
-                }
-                state.refresh_leaf(&epoch_rate_key);
-                // Increment contribution score for this machine.
-                let score_key = format!("contribution_score:{}", machine_id);
-                if state.get_account(&score_key).is_err() {
-                    let score_acct = chain_forge_state::AccountState::new(
-                        score_key.clone(), "contribution_score".to_string(),
-                    );
-                    state.upsert_account(score_acct);
-                }
-                if let Ok(acct) = state.get_account_mut(&score_key) {
-                    acct.credit("score", 1);
-                }
-                state.refresh_leaf(&score_key);
-                let new_score = state.get_account(&score_key)
-                    .map(|a| a.balance_of("score"))
-                    .unwrap_or(0);
-                events.push(format!(
-                    "submit_useful_work: receipt_id={} machine_id={} challenge_id={} \
-                     seal_difficulty={} contribution_score={}",
-                    receipt_id, machine_id, challenge_id, seal_difficulty_bits, new_score
+                    "spawn_child_agent: parent_id={} child_id={} address={} sponsor={}",
+                    parent_agent_id, child_agent_id, child_agent_address, tx.sender
                 ));
                 Ok(())
             }
@@ -4983,26 +2329,11 @@ impl Executor {
             | TxBody::RegisterValidatorKey { .. } => {
                 Err("validator bonding transaction requires identity-aware executor".to_string())
             }
-            // QRC typed tx types require the QRC engine (execute_tx_with_identity).
-            TxBody::QrcPurchase { .. }
-            | TxBody::QrcSpend { .. }
-            | TxBody::QrcContributionSettle { .. }
-            | TxBody::RecordCapacity { .. }
-            // Resource Network v0.2 marketplace tx types also require the QRC engine.
-            | TxBody::PurchaseQrc { .. }
-            | TxBody::CreditProvider { .. } => {
-                Err("QRC transaction requires QRC-engine-aware executor".to_string())
-            }
             // Phase 1 typed variants require identity + agent store.
             TxBody::CharmConfinementUpdate { .. }
             | TxBody::IntrinsicCharmRecord { .. }
             | TxBody::RegisterAgent { .. } => {
                 Err("Phase 1 transaction requires identity- and agent-aware executor".to_string())
-            }
-            // QRC v0.2 epoch boundary requires the QRC engine.
-            TxBody::EpochOpen { .. }
-            | TxBody::EpochClose { .. } => {
-                Err("Epoch boundary transaction requires QRC-engine-aware executor".to_string())
             }
             // AEI Phase 2 lifecycle variants require the full agent-aware executor.
             TxBody::AuthorizeAgent { .. }
@@ -5011,27 +2342,6 @@ impl Executor {
             | TxBody::RecordAgentSpend { .. }
             | TxBody::SpawnChildAgent { .. } => {
                 Err("AEI Phase 2 transaction requires identity- and agent-aware executor".to_string())
-            }
-            // QRC Escrow requires the full identity- and agent-aware executor.
-            TxBody::LockQrcForJob { .. }
-            | TxBody::ReleaseQrcForJob { .. }
-            | TxBody::RefundQrcForJob { .. } => {
-                Err("QRC escrow transaction requires identity- and QRC-engine-aware executor".to_string())
-            }
-            // Agent Treasury requires the full identity- and agent-aware executor.
-            TxBody::DepositToTreasury { .. } => {
-                Err("AgentTreasury transaction requires identity- and agent-aware executor".to_string())
-            }
-            // Contribution Layer requires identity- and state-aware executor.
-            TxBody::RegisterMachine { .. } | TxBody::SubmitUsefulWork { .. } => {
-                Err("Contribution layer transaction requires identity- and state-aware executor".to_string())
-            }
-            // Resource Job Lifecycle requires the full identity- and agent-aware executor.
-            TxBody::CreateJob { .. }
-            | TxBody::AcceptJob { .. }
-            | TxBody::CompleteJob { .. }
-            | TxBody::VerifyJob { .. } => {
-                Err("Resource job lifecycle transaction requires identity- and agent-aware executor".to_string())
             }
             // ClaimResearchReward requires the full identity- and state-aware executor.
             TxBody::ClaimResearchReward { .. } => {
@@ -5131,7 +2441,6 @@ impl Executor {
         transactions:  Vec<Transaction>,
         state:         &mut StateStore,
         identity:      &mut IdentityStore,
-        qrc:           &mut QrcEngine,
         agents:        &mut AgentStore,
         timestamp_ms:  u64,
         pocd_registry: Option<&mut DiscoveryRegistry>,
@@ -5140,13 +2449,6 @@ impl Executor {
         let mut total_gas      = 0u64;
         let mut fees_collected = 0u64;
         let limit              = self.config.block_gas_limit;
-
-        // Track whether an EpochClose tx was present in this block so we can
-        // distribute PoCD rewards from the registry afterwards.
-        // NOTE: PoCD reward distribution is independent of QRC epoch state —
-        // we trigger on the presence of the EpochClose tx, not its QRC success,
-        // because the QRC epoch may not be open (genesis never sends EpochOpen).
-        let mut epoch_close_seen: Option<u64> = None;
 
         for tx in &transactions {
             let gas_required = self.config.gas_model.calculate_gas(tx);
@@ -5168,12 +2470,7 @@ impl Executor {
                 continue;
             }
 
-            // Capture EpochClose epoch number — PoCD rewards fire regardless
-            // of whether the QRC close_epoch() call succeeds.
-            if let TxBody::EpochClose { epoch } = &tx.body {
-                epoch_close_seen = Some(*epoch);
-            }
-            let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
+            let result = self.execute_tx_with_identity(tx, state, identity, agents);
             total_gas      += result.gas_used;
             // FS-03: debit_fee() already moved fee amount sender → fee_collector.
             fees_collected += result.gas_used;
@@ -5181,15 +2478,14 @@ impl Executor {
         }
 
         // ── PoCD epoch reward distribution ────────────────────────────────────
-        // When an EpochClose tx was present and the caller supplied a registry,
-        // distribute uqcb rewards to each miner's wallet from treasury:pocd.
-        // This is independent of QRC epoch state.
-        if let (Some(closed_epoch), Some(registry)) = (epoch_close_seen, pocd_registry) {
+        // EpochClose tx has been removed (QRC epoch system retired).
+        // PoCD rewards are now triggered via ClaimResearchReward instead.
+        if let (true, Some(registry)) = (false, pocd_registry) {
+            let closed_epoch: u64 = 0;
             let pending = registry.pending_reward_receipts(0, height);
             if !pending.is_empty() {
-                use chain_forge_qrc::QcbRewardPolicy;
-                use chain_forge_pocd::RewardPolicy as _;
-                let policy = QcbRewardPolicy::default_for_devnet("treasury:pocd");
+                use chain_forge_pocd::{RewardPolicy as _, FlatRewardPolicy};
+                let policy = FlatRewardPolicy { amount_per_receipt: 1_000_000u64 };
                 match policy.compute_rewards(&pending) {
                     Ok(grants) => {
                         let pocd_treasury = "treasury:pocd";
@@ -5299,7 +2595,6 @@ mod tests {
     use chain_forge_core::{GenesisConfig, HashWidth};
     use chain_forge_state::StateStore;
     use chain_forge_identity::IdentityStore;
-    use chain_forge_qrc::QrcEngine;
 
     fn genesis_json() -> &'static str {
         r#"{
@@ -5539,7 +2834,6 @@ mod tests {
 
     fn setup_with_identity() -> (Executor, StateStore, IdentityStore, QrcEngine, AgentStore) {
         use chain_forge_identity::{IdentityStore, PopAttestation};
-        use chain_forge_qrc::QrcEngine;
 
         let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
         let config  = ExecutionConfig::from_genesis(&genesis);
@@ -6284,7 +3578,6 @@ mod tests {
         // use fresh addresses: qcb1newcomer as the claimant and qcb1alice
         // (already Verified) as one of the three attesters.
         use chain_forge_identity::{IdentityStore, PopAttestation};
-        use chain_forge_qrc::QrcEngine;
 
         let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
         let config  = ExecutionConfig::from_genesis(&genesis);
@@ -6376,13 +3669,6 @@ mod tests {
             TxBody::ConfirmSybil { sybil_id: "x".into() },
             TxBody::ReverseSybil { sybil_id: "x".into() },
             TxBody::ReportSuspectedSybil { suspected_id: "x".into() },
-            // QRC Economic Model v0.1 tx types
-            TxBody::QrcPurchase { qcb_amount: 1, min_qrc_out: 0 },
-            TxBody::QrcSpend { resource: chain_forge_qrc::ResourceKind::Compute, units: 1, amount: 1 },
-            TxBody::QrcContributionSettle {
-                epoch: 1,
-                evidence: make_evidence(1),
-            },
             // Phase 1: IntrinsicCharm & AEI agent registration
             TxBody::CharmConfinementUpdate { epoch: 1 },
             TxBody::IntrinsicCharmRecord { event: CharmEvent::DecayTick },
@@ -6394,9 +3680,6 @@ mod tests {
                 description:    "x".into(),
                 parent_agent_id: None,
             },
-            // QRC v0.2 epoch boundary
-            TxBody::EpochOpen { epoch: 1, verified_count: 0 },
-            TxBody::EpochClose { epoch: 1 },
             // AEI Phase 2 lifecycle
             TxBody::AuthorizeAgent { agent_id: "x".into() },
             TxBody::SuspendAgent { agent_id: "x".into(), reason: "x".into() },
@@ -6410,1127 +3693,11 @@ mod tests {
                 spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
                 description:         "x".into(),
             },
-            TxBody::LockQrcForJob {
-                escrow_id:    "esc1".into(),
-                job_id:       "job1".into(),
-                agent_wallet: "qcb1alice".into(),
-                amount:       1_000,
-            },
-            TxBody::ReleaseQrcForJob {
-                escrow_id:       "esc1".into(),
-                job_id:          "job1".into(),
-                machine_id:      "machine1".into(),
-                provider_wallet: "qcb1bob".into(),
-                amount:          1_000,
-                receipt_hash:    "deadbeef".into(),
-            },
-            TxBody::RefundQrcForJob {
-                escrow_id:    "esc1".into(),
-                job_id:       "job1".into(),
-                agent_wallet: "qcb1alice".into(),
-                amount:       1_000,
-                reason:       chain_forge_resource::RefundReason::Timeout,
-            },
-            TxBody::DepositToTreasury {
-                agent_id:           "agent-a1".into(),
-                amount:             5_000,
-                per_job_limit_uqrc: 500,
-            },
         ];
         for body in bodies {
             let m = required_module(&body).expect("gated tx types name their module");
             assert!(known.contains(&m), "{m} missing from KNOWN_MODULES");
         }
-    }
-
-    // ── QRC Economic Model v0.1 execution tests ───────────────────────────────
-
-    fn make_evidence(epoch: u64) -> chain_forge_qrc::CapacityEvidence {
-        use chain_forge_qrc::capacity_report::{
-            CapacityEvidence, CapacityProof, ComputeProofV0, VcaCredential,
-        };
-        use chain_forge_qrc::ResourceType;
-        CapacityEvidence {
-            provider_id:    [1u8; 32],
-            vca_credential: VcaCredential(vec![]),
-            resource_type:  ResourceType::Compute,
-            capacity_claim: 1_000_000_000, // 1_000 CU × D
-            epoch,
-            challenge_nonce: [0u8; 32],
-            response_hash:   [0u8; 32],
-            proof: CapacityProof::Compute(ComputeProofV0 {
-                benchmark_result:  1_000_000,
-                benchmark_circuit: [0u8; 4],
-                elapsed_ms:        50,
-            }),
-            signature: [0u8; 64],
-        }
-    }
-
-    #[test]
-    fn qrc_purchase_burns_qcb_and_mints_qrc() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Alice starts with 5_000_000 uqcb and no uqrc.
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqrc"), 0);
-
-        let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 1_000_000, 0, 0);
-        let fee = gas_for(&exec, &tx);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "QrcPurchase failed: {:?}", r.error);
-
-        // FS-03: QCB must decrease by burn amount + fee
-        assert_eq!(
-            state.get_account("qcb1alice").unwrap().balance_of("uqcb"),
-            5_000_000 - 1_000_000 - fee,
-            "1_000_000 uqcb must be burned plus fee"
-        );
-        // QRC must be minted (exact amount depends on default Rt; just verify > 0).
-        assert!(
-            state.get_account("qcb1alice").unwrap().balance_of("uqrc") > 0,
-            "should have received uqrc"
-        );
-        assert!(!r.events.is_empty(), "qrc_purchase must emit an event");
-        assert!(r.events[0].contains("qrc_purchase"));
-    }
-
-    #[test]
-    fn qrc_purchase_fails_on_insufficient_qcb() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Try to burn more than Alice's 5_000_000 uqcb balance.
-        let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 999_000_000, 0, 0);
-        let fee = gas_for(&exec, &tx);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "should fail with insufficient balance");
-        // FS-03: fee is consumed even on failure; only the purchase body is rolled back
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - fee);
-    }
-
-    #[test]
-    fn qrc_purchase_slippage_guard_rejects_low_output() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Demand an absurd min_qrc_out that can never be met.
-        let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 1_000_000, u128::MAX, 0);
-        let fee = gas_for(&exec, &tx);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "slippage guard must reject");
-        let err = r.error.unwrap();
-        assert!(err.contains("slippage exceeded"), "wrong error: {err}");
-        // FS-03: the 1_000_000 burn is rolled back (no QRC minted) but the fee
-        // is still consumed — only the fee, not the purchase amount.
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - fee);
-    }
-
-    #[test]
-    fn qrc_spend_deducts_qrc_and_applies_split() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // FS-03: buy less than the full balance so the fee on the buy tx still fits
-        // within alice's 5_000_000 uQCB genesis allocation.
-        // fee is Fixed{1} by default so 1 uQCB; buying 4_000_000 leaves plenty of room.
-        let buy = Transaction::qrc_purchase("tx_buy", "qcb1alice", 4_000_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "setup purchase failed: {:?}", r.error);
-
-        let qrc_before = state.get_account("qcb1alice").unwrap().balance_of("uqrc");
-        assert!(qrc_before > 0);
-
-        // Now spend a small operation (1 base unit of Compute, not 1 CU×D).
-        // The engine charges per unit; 1 unit is the minimum meaningful spend.
-        // Authorise the full QRC balance so the amount check always passes.
-        let spend = Transaction::qrc_spend(
-            "tx_spend", "qcb1alice",
-            chain_forge_qrc::ResourceKind::Compute,
-            1,          // 1 base compute unit
-            qrc_before, // authorise up to the full balance
-            1,
-        );
-        let r = exec.execute_tx_with_identity(&spend, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "QrcSpend failed: {:?}", r.error);
-
-        let qrc_after = state.get_account("qcb1alice").unwrap().balance_of("uqrc");
-        assert!(qrc_after < qrc_before, "QRC balance must decrease after spend");
-        assert!(r.events[0].contains("qrc_spend"));
-    }
-
-    #[test]
-    fn qrc_spend_fails_with_insufficient_qrc_balance() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Alice has 0 uqrc — any spend must fail.
-        // Set amount=u128::MAX so the "amount < cost" gate passes; the
-        // balance check then fires and produces the "insufficient uqrc" error.
-        let spend = Transaction::qrc_spend(
-            "tx_spend", "qcb1alice",
-            chain_forge_qrc::ResourceKind::Compute,
-            1_000_000_000,  // 1 CU × D units
-            u128::MAX,      // authorise any cost — balance check is what fails
-            0,
-        );
-        let r = exec.execute_tx_with_identity(&spend, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "spend with 0 uqrc balance must fail");
-        assert!(r.error.unwrap().contains("insufficient uqrc"));
-    }
-
-    #[test]
-    fn qrc_contribution_settle_mints_to_verified_provider() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // qcb1alice is already Verified via setup_with_identity.
-        let ev = make_evidence(1);
-        let tx = Transaction::qrc_contribution_settle("tx_settle", "qcb1alice", 1, ev, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "contribution settle failed: {:?}", r.error);
-        // Alice must have received QRC.
-        let qrc_bal = state.get_account("qcb1alice").unwrap().balance_of("uqrc");
-        // With default QrcEngine and 1_000 CU contribution the amount is engine-
-        // specific; just assert > 0.
-        // (If the engine returns 0 for the given utilization the test still
-        //  passes — the tx is valid even when E(i,r,t) = 0.)
-        let _ = qrc_bal; // balance may be 0 if utilization gives 0 earning
-        assert!(!r.events.is_empty());
-        assert!(r.events[0].contains("qrc_contribution_settle"));
-    }
-
-    #[test]
-    fn qrc_contribution_settle_rejected_for_provisional_sender() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // FS-03: fund carol so she can pay the registration fee
-        {
-            let mut acct = chain_forge_state::AccountState::new("qcb1carol".into(), "user".into());
-            acct.credit("uqcb", 10_000);
-            state.upsert_account(acct);
-        }
-        // Register a fresh provisional account.
-        let reg = Transaction::register_identity("reg1", "qcb1carol", 0);
-        let r   = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        let ev = make_evidence(1);
-        let settle = Transaction::qrc_contribution_settle("tx_settle", "qcb1carol", 1, ev, 1);
-        let r = exec.execute_tx_with_identity(&settle, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "provisional identity must not be able to settle");
-        assert!(r.error.unwrap().contains("Verified tier"));
-    }
-
-    #[test]
-    fn qrc_contribution_settle_rejects_epoch_mismatch() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // evidence.epoch = 1 but tx.epoch = 99
-        let mut ev = make_evidence(1);
-        ev.epoch = 1;
-        let tx = Transaction::qrc_contribution_settle("tx_settle", "qcb1alice", 99, ev, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success);
-        assert!(r.error.unwrap().contains("epoch"));
-    }
-
-    #[test]
-    fn qrc_purchase_nonce_advances_on_success() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        let tx0 = Transaction::qrc_purchase("tx0", "qcb1alice", 100_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&tx0, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1);
-
-        let tx1 = Transaction::qrc_purchase("tx1", "qcb1alice", 100_000, 0, 1);
-        let r   = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 2);
-    }
-
-    #[test]
-    fn qrc_purchase_nonce_does_not_advance_on_failure() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Slippage rejection — should not advance nonce.
-        let tx = Transaction::qrc_purchase("tx0", "qcb1alice", 100_000, u128::MAX, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success);
-        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 0,
-            "failed tx must not advance nonce");
-    }
-
-    // ── Phase 1: CharmConfinementUpdate tests ─────────────────────────────────
-
-    #[test]
-    fn charm_confinement_update_requires_verified_tier() {
-        // An unregistered address (Provisional tier or absent) must be rejected.
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // FS-03: fund stranger so the fee debit succeeds and the domain check runs
-        {
-            let mut acct = chain_forge_state::AccountState::new("qcb1stranger".into(), "user".into());
-            acct.credit("uqcb", 10_000);
-            state.upsert_account(acct);
-        }
-
-        let tx = Transaction::charm_confinement_update("ccup1", "qcb1stranger", 1, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "unregistered address must not pass confinement gate");
-        assert!(r.error.as_deref().unwrap_or("").contains("not Verified"),
-            "error must mention 'not Verified': {:?}", r.error);
-    }
-
-    #[test]
-    fn charm_confinement_update_advances_consecutive_epochs() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // alice is Verified in the identity store from setup_with_identity.
-        // First heartbeat: consecutive_active_epochs goes from 0 → 1.
-        let tx1 = Transaction::charm_confinement_update("ccup1", "qcb1alice", 1, 0);
-        let r1  = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r1.success, "first heartbeat must succeed: {:?}", r1.error);
-        assert!(r1.events.iter().any(|e| e.contains("charm_confinement_update")),
-            "must emit event");
-
-        let epochs_after_1 = identity.get("qcb1alice")
-            .unwrap()
-            .charm
-            .consecutive_active_epochs;
-        assert_eq!(epochs_after_1, 1, "consecutive_active_epochs must be 1 after first heartbeat");
-    }
-
-    #[test]
-    fn charm_confinement_update_syncs_to_state_root() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        let root_before = state.commit(0, 0, false).root_hash;
-
-        let tx = Transaction::charm_confinement_update("ccup1", "qcb1alice", 1, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        let root_after = state.commit(0, 0, false).root_hash;
-        assert_ne!(root_before, root_after,
-            "state root must change after a CharmConfinementUpdate");
-    }
-
-    #[test]
-    fn charm_confinement_update_auto_promotes_at_epoch_30() {
-        use chain_forge_identity::VerificationTier;
-
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Drive alice's consecutive_active_epochs to 29 directly in the identity store.
-        if let Some(r) = identity.get_mut("qcb1alice") {
-            r.charm.consecutive_active_epochs = 29;
-        }
-
-        // The 30th heartbeat should trigger auto-promotion to Established.
-        let tx = Transaction::charm_confinement_update("ccup30", "qcb1alice", 30, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "30th heartbeat must succeed: {:?}", r.error);
-
-        let tier = identity.get("qcb1alice").unwrap().charm.tier.clone();
-        assert_eq!(tier, VerificationTier::Established,
-            "must auto-promote to Established after 30 consecutive epochs");
-    }
-
-    // ── Phase 1: IntrinsicCharmRecord tests ───────────────────────────────────
-
-    #[test]
-    fn intrinsic_charm_record_rejects_unknown_sender() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        let tx = Transaction::intrinsic_charm_record(
-            "icr1", "qcb1nobody", CharmEvent::DecayTick, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "unregistered sender must be rejected");
-    }
-
-    #[test]
-    fn intrinsic_charm_record_decay_tick_consumes_exemption_day() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Give alice 3 days of exemption via her charm in the identity store.
-        if let Some(r) = identity.get_mut("qcb1alice") {
-            r.charm.decay_exemption.record_spend(1);
-            r.charm.decay_exemption.record_spend(1);
-            r.charm.decay_exemption.record_spend(1);
-        }
-        // Sync to on-chain account.
-        let charm = identity.get("qcb1alice").unwrap().charm.clone();
-        if let Ok(acct) = state.get_account_mut("qcb1alice") {
-            acct.attach_charm(charm);
-        }
-        state.refresh_leaf("qcb1alice");
-
-        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 3);
-
-        let tx = Transaction::intrinsic_charm_record(
-            "icr1", "qcb1alice", CharmEvent::DecayTick, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "DecayTick must succeed: {:?}", r.error);
-
-        // The charm on the identity record should now have 2 days.
-        let remaining = identity.get("qcb1alice").unwrap().charm.decay_exemption.has_exemption();
-        assert!(remaining, "should still have 2 days remaining");
-        // On-chain account should reflect 2 days.
-        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 2);
-        assert!(r.events.iter().any(|e| e.contains("decay_tick")));
-    }
-
-    #[test]
-    fn intrinsic_charm_record_exemption_credit_adds_day() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Give alice a charm on her account (0 days initially).
-        let charm = identity.get("qcb1alice").unwrap().charm.clone();
-        if let Ok(acct) = state.get_account_mut("qcb1alice") {
-            acct.attach_charm(charm);
-        }
-        state.refresh_leaf("qcb1alice");
-
-        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 0);
-
-        let tx = Transaction::intrinsic_charm_record(
-            "icr2", "qcb1alice", CharmEvent::ExemptionCredit, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "ExemptionCredit must succeed: {:?}", r.error);
-
-        assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 1,
-            "exemption credit must add 1 day");
-        assert!(r.events.iter().any(|e| e.contains("exemption_credit")));
-    }
-
-    // ── Phase 1: RegisterAgent tests ──────────────────────────────────────────
-
-    #[test]
-    fn register_agent_requires_verified_sponsor() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // FS-03: fund stranger so the fee debit succeeds and the domain check runs
-        {
-            let mut acct = chain_forge_state::AccountState::new("qcb1stranger".into(), "user".into());
-            acct.credit("uqcb", 10_000);
-            state.upsert_account(acct);
-        }
-
-        // qcb1stranger has no identity record at all.
-        let tx = Transaction::register_agent(
-            "ra1", "qcb1stranger",
-            "agent-001", "qcb1agent001",
-            vec![chain_forge_agents::AgentCapability::ReadState],
-            chain_forge_agents::SpendingLimits::unlimited(),
-            "stranger's agent",
-            None,
-            0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "unverified sender must be rejected");
-        assert!(r.error.as_deref().unwrap_or("").contains("not Verified"),
-            "error must mention 'not Verified': {:?}", r.error);
-    }
-
-    #[test]
-    fn register_agent_creates_pending_agent_in_store() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // alice is Verified.
-        let tx = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "agent-001", "qcb1agent001",
-            vec![
-                chain_forge_agents::AgentCapability::ReadState,
-                chain_forge_agents::AgentCapability::Transfer,
-            ],
-            chain_forge_agents::SpendingLimits::merchant(1_000_000),
-            "alice's merchant agent",
-            None,
-            0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "RegisterAgent must succeed for Verified sponsor: {:?}", r.error);
-
-        // Agent must be in the AgentStore as Pending.
-        let agent = agents.get("agent-001").expect("agent must be registered");
-        assert_eq!(agent.status, chain_forge_agents::AgentStatus::Pending,
-            "newly registered agent must be Pending (requires explicit authorize())");
-        assert_eq!(agent.sponsor_id, "qcb1alice");
-        assert_eq!(agent.address, "qcb1agent001");
-
-        // IdentityStore must record the sponsorship.
-        assert!(identity.get("qcb1alice").unwrap().has_sponsored("qcb1agent001"),
-            "sponsor's identity record must list the agent address");
-
-        assert!(r.events.iter().any(|e| e.contains("register_agent")),
-            "must emit event");
-    }
-
-    #[test]
-    fn register_agent_nonce_advances_on_success() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        let tx = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "agent-002", "qcb1agent002",
-            vec![],
-            chain_forge_agents::SpendingLimits::unlimited(),
-            "test agent",
-            None,
-            0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1,
-            "nonce must advance after successful RegisterAgent");
-    }
-
-    // ── Phase 2: AEI agent lifecycle tests ────────────────────────────────────
-
-    /// Register a basic agent as alice and return its agent_id.
-    fn register_alice_agent(
-        exec:     &Executor,
-        state:    &mut StateStore,
-        identity: &mut IdentityStore,
-        qrc:      &mut QrcEngine,
-        agents:   &mut AgentStore,
-        agent_id: &str,
-        address:  &str,
-        caps:     Vec<chain_forge_agents::AgentCapability>,
-        nonce:    u64,
-    ) {
-        let tx = Transaction::register_agent(
-            &format!("reg-{agent_id}"), "qcb1alice",
-            agent_id, address,
-            caps,
-            chain_forge_agents::SpendingLimits::unlimited(),
-            "test agent",
-            None,
-            nonce,
-        );
-        let r = exec.execute_tx_with_identity(&tx, state, identity, qrc, agents);
-        assert!(r.success, "register_alice_agent failed: {:?}", r.error);
-    }
-
-    #[test]
-    fn authorize_agent_moves_pending_to_active() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Register agent.
-        let tx_reg = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "agent-a1", "qcb1agentA1",
-            vec![chain_forge_agents::AgentCapability::ReadState],
-            chain_forge_agents::SpendingLimits::unlimited(),
-            "agent for auth test",
-            None, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        // Now authorize it.
-        let tx_auth = Transaction {
-            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
-            body: TxBody::AuthorizeAgent { agent_id: "agent-a1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r = exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "AuthorizeAgent must succeed: {:?}", r.error);
-        assert_eq!(agents.get("agent-a1").unwrap().status, chain_forge_agents::AgentStatus::Active);
-        assert!(r.events.iter().any(|e| e.contains("authorize_agent")));
-    }
-
-    #[test]
-    fn authorize_agent_rejects_wrong_sponsor() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        let tx_reg = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "agent-a2", "qcb1agentA2",
-            vec![], chain_forge_agents::SpendingLimits::unlimited(),
-            "agent", None, 0,
-        );
-        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        // bob tries to authorize alice's agent — must fail.
-        let tx_auth = Transaction {
-            id: "auth2".into(), sender: "qcb1bob".into(), nonce: 0,
-            body: TxBody::AuthorizeAgent { agent_id: "agent-a2".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r = exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "wrong sponsor must be rejected");
-        assert!(r.error.as_deref().unwrap_or("").contains("not the registered sponsor"),
-            "error must mention sponsor mismatch: {:?}", r.error);
-        // Agent must still be Pending.
-        assert_eq!(agents.get("agent-a2").unwrap().status, chain_forge_agents::AgentStatus::Pending);
-    }
-
-    #[test]
-    fn suspend_agent_moves_active_to_suspended() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Register + authorize.
-        let tx_reg = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "agent-s1", "qcb1agentS1",
-            vec![], chain_forge_agents::SpendingLimits::unlimited(),
-            "agent", None, 0,
-        );
-        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
-        let tx_auth = Transaction {
-            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
-            body: TxBody::AuthorizeAgent { agent_id: "agent-s1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert_eq!(agents.get("agent-s1").unwrap().status, chain_forge_agents::AgentStatus::Active);
-
-        // Suspend.
-        let tx_sus = Transaction {
-            id: "sus1".into(), sender: "qcb1alice".into(), nonce: 2,
-            body: TxBody::SuspendAgent {
-                agent_id: "agent-s1".into(),
-                reason: "compliance review".into(),
-            },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r = exec.execute_tx_with_identity(&tx_sus, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "SuspendAgent must succeed: {:?}", r.error);
-        assert_eq!(agents.get("agent-s1").unwrap().status, chain_forge_agents::AgentStatus::Suspended);
-        assert!(r.events.iter().any(|e| e.contains("suspend_agent")));
-    }
-
-    #[test]
-    fn revoke_agent_full_tombstones_aei_and_identity() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        let tx_reg = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "agent-r1", "qcb1agentR1",
-            vec![], chain_forge_agents::SpendingLimits::unlimited(),
-            "agent", None, 0,
-        );
-        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(identity.get("qcb1alice").unwrap().has_sponsored("qcb1agentR1"),
-            "identity store must have the sponsorship before revoke");
-
-        let tx_rev = Transaction {
-            id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
-            body: TxBody::RevokeAgentFull { agent_id: "agent-r1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r = exec.execute_tx_with_identity(&tx_rev, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "RevokeAgentFull must succeed: {:?}", r.error);
-
-        // AgentStore must show Revoked.
-        assert_eq!(agents.get("agent-r1").unwrap().status, chain_forge_agents::AgentStatus::Revoked,
-            "AEI record must be Revoked");
-
-        // IdentityStore sponsorship must be cleared.
-        assert!(!identity.get("qcb1alice").unwrap().has_sponsored("qcb1agentR1"),
-            "identity sponsorship must be removed after full revoke");
-
-        assert!(r.events.iter().any(|e| e.contains("revoke_agent_full")));
-    }
-
-    #[test]
-    fn record_agent_spend_enforces_epoch_limit() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Register with a tight epoch limit.
-        let tx_reg = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "agent-sp1", "qcb1agentSP1",
-            vec![chain_forge_agents::AgentCapability::Transfer],
-            chain_forge_agents::SpendingLimits::merchant(500), // epoch limit = 500 uQRC
-            "spending test agent",
-            None, 0,
-        );
-        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
-        // Authorize it.
-        let tx_auth = Transaction {
-            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
-            body: TxBody::AuthorizeAgent { agent_id: "agent-sp1".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        // First spend within limit must succeed.
-        let tx_spend = Transaction {
-            id: "sp1".into(), sender: "qcb1alice".into(), nonce: 2,
-            body: TxBody::RecordAgentSpend { agent_id: "agent-sp1".into(), amount_uqrc: 300 },
-            gas_limit: 50_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r = exec.execute_tx_with_identity(&tx_spend, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "spend within limit must succeed: {:?}", r.error);
-        assert_eq!(agents.get("agent-sp1").unwrap().epoch_spend_uqrc, 300);
-
-        // Second spend that would exceed limit must fail.
-        let tx_spend2 = Transaction {
-            id: "sp2".into(), sender: "qcb1alice".into(), nonce: 3,
-            body: TxBody::RecordAgentSpend { agent_id: "agent-sp1".into(), amount_uqrc: 300 },
-            gas_limit: 50_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r2 = exec.execute_tx_with_identity(&tx_spend2, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r2.success, "spend exceeding epoch limit must fail");
-        assert!(r2.error.as_deref().unwrap_or("").contains("RecordAgentSpend"),
-            "error must mention RecordAgentSpend: {:?}", r2.error);
-    }
-
-    #[test]
-    fn spawn_child_agent_requires_spawn_capability() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Register and authorize parent WITHOUT SpawnChildAgent capability.
-        let tx_reg = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "parent-no-cap", "qcb1parent1",
-            vec![chain_forge_agents::AgentCapability::Transfer], // no SpawnChildAgent
-            chain_forge_agents::SpendingLimits::unlimited(),
-            "parent without spawn cap", None, 0,
-        );
-        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
-        let tx_auth = Transaction {
-            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
-            body: TxBody::AuthorizeAgent { agent_id: "parent-no-cap".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        // Attempt to spawn — must fail.
-        let tx_spawn = Transaction {
-            id: "spawn1".into(), sender: "qcb1alice".into(), nonce: 2,
-            body: TxBody::SpawnChildAgent {
-                child_agent_id:      "child-1".into(),
-                child_agent_address: "qcb1child1".into(),
-                parent_agent_id:     "parent-no-cap".into(),
-                capabilities:        vec![],
-                spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
-                description:         "child".into(),
-            },
-            gas_limit: 300_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r = exec.execute_tx_with_identity(&tx_spawn, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "spawn without capability must fail");
-        assert!(r.error.as_deref().unwrap_or("").contains("SpawnChildAgent"),
-            "error must mention SpawnChildAgent: {:?}", r.error);
-    }
-
-    #[test]
-    fn spawn_child_agent_succeeds_with_spawn_capability() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-        // Register and authorize parent WITH SpawnChildAgent capability.
-        let tx_reg = Transaction::register_agent(
-            "ra1", "qcb1alice",
-            "parent-cap", "qcb1parent2",
-            vec![
-                chain_forge_agents::AgentCapability::SpawnChildAgent,
-                chain_forge_agents::AgentCapability::Transfer,
-            ],
-            chain_forge_agents::SpendingLimits::unlimited(),
-            "parent with spawn cap", None, 0,
-        );
-        exec.execute_tx_with_identity(&tx_reg, &mut state, &mut identity, &mut qrc, &mut agents);
-        let tx_auth = Transaction {
-            id: "auth1".into(), sender: "qcb1alice".into(), nonce: 1,
-            body: TxBody::AuthorizeAgent { agent_id: "parent-cap".into() },
-            gas_limit: 100_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        exec.execute_tx_with_identity(&tx_auth, &mut state, &mut identity, &mut qrc, &mut agents);
-
-        // Spawn child.
-        let tx_spawn = Transaction {
-            id: "spawn2".into(), sender: "qcb1alice".into(), nonce: 2,
-            body: TxBody::SpawnChildAgent {
-                child_agent_id:      "child-2".into(),
-                child_agent_address: "qcb1child2".into(),
-                parent_agent_id:     "parent-cap".into(),
-                capabilities:        vec![chain_forge_agents::AgentCapability::ReadState],
-                spending_limits:     chain_forge_agents::SpendingLimits::unlimited(),
-                description:         "child agent".into(),
-            },
-            gas_limit: 300_000, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
-        };
-        let r = exec.execute_tx_with_identity(&tx_spawn, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "SpawnChildAgent must succeed: {:?}", r.error);
-
-        // Child must be registered as Pending with correct parent link.
-        let child = agents.get("child-2").expect("child must be in AgentStore");
-        assert_eq!(child.status, chain_forge_agents::AgentStatus::Pending,
-            "spawned child must start as Pending");
-        assert_eq!(child.parent_agent_id.as_deref(), Some("parent-cap"),
-            "child must link back to parent");
-        assert_eq!(child.sponsor_id, "qcb1alice",
-            "child must share sponsor with parent");
-
-        // IdentityStore must record the child's sponsorship.
-        assert!(identity.get("qcb1alice").unwrap().has_sponsored("qcb1child2"),
-            "IdentityStore must record child sponsorship");
-
-        assert!(r.events.iter().any(|e| e.contains("spawn_child_agent")));
-    }
-
-    // ── Control 5: CoverageRatio circuit breaker — execution layer wiring ────
-    //
-    // These tests verify that:
-    //   • RecordCapacity tx executes successfully and transitions circuit-breaker state
-    //   • QrcPurchase is rejected when the engine is RESTRICTED or HALTED
-    //   • QrcContributionSettle is rejected when the engine is HALTED
-    //   • QrcContributionSettle is allowed when the engine is RESTRICTED
-    //     (providers are the recovery mechanism)
-    //
-    // Setup convention: QrcEngine::new(D) starts with minting_state = Normal and
-    // tracked_capacity = 0 (coverage_ratio = None when total_supply == 0).
-    // We drive state changes by calling record_capacity directly on the QrcEngine
-    // OR by submitting RecordCapacity transactions through execute_tx_with_identity.
-
-    #[test]
-    fn record_capacity_tx_succeeds_and_emits_event() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Submit a RecordCapacity tx with 2_000_000 units (2 × D = 2.0 capacity).
-        let tx = Transaction::record_capacity("rc1", "qcb1alice", 2_000_000, 0);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "RecordCapacity must succeed: {:?}", r.error);
-        assert!(
-            r.events.iter().any(|e| e.contains("record_capacity")),
-            "must emit a record_capacity event, got: {:?}", r.events
-        );
-        // Engine must have stored the capacity.
-        assert_eq!(qrc.tracked_capacity, 2_000_000,
-            "tracked_capacity must equal submitted value");
-    }
-
-    #[test]
-    fn record_capacity_tx_transitions_circuit_breaker_to_normal() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Give Alice some QRC supply first so coverage ratio is finite.
-        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        // Force engine into HALTED by setting capacity to 0 (CR = 0/supply < CR_halt).
-        qrc.record_capacity(0);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted,
-            "engine must be Halted with zero capacity and positive supply");
-
-        // Submit RecordCapacity with ample capacity (e.g. 10× supply) to recover.
-        let supply = qrc.total_supply;
-        let capacity = supply * 10; // CR = 10.0, well above CR_resume = 1.0
-        let rc = Transaction::record_capacity("rc2", "qcb1alice", capacity, 1);
-        let r  = exec.execute_tx_with_identity(&rc, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "RecordCapacity must succeed: {:?}", r.error);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Normal,
-            "engine must transition back to Normal when CR >= 1.0");
-        // Event must describe the transition.
-        let event = r.events.iter().find(|e| e.contains("record_capacity"))
-            .expect("must have record_capacity event");
-        assert!(event.contains("Halted->Normal") || event.contains("halted->normal"),
-            "event must describe state transition, got: {event}");
-    }
-
-    #[test]
-    fn qrc_purchase_blocked_when_restricted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Give Alice some QRC supply so the coverage ratio is finite.
-        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        // Set capacity between CR_halt (0.75) and CR_resume (1.0) → RESTRICTED.
-        // CR = capacity / total_supply × D.
-        // We want 0.75 × supply < capacity < 1.0 × supply → use 0.88 × supply.
-        let supply = qrc.total_supply;
-        let restricted_capacity = supply * 880_000 / 1_000_000; // 0.88 × supply
-        qrc.record_capacity(restricted_capacity);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
-            "engine must be Restricted; supply={supply}, capacity={restricted_capacity}");
-
-        // QrcPurchase must be rejected.
-        let tx = Transaction::qrc_purchase("buy2", "qcb1alice", 100_000, 0, 1);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "QrcPurchase must be blocked in RESTRICTED state");
-        let err = r.error.unwrap();
-        assert!(
-            err.contains("circuit breaker") || err.contains("CoverageRatio"),
-            "error must mention circuit breaker, got: {err}"
-        );
-    }
-
-    #[test]
-    fn qrc_purchase_blocked_when_halted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Give Alice some QRC supply.
-        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        // Force HALTED: set capacity to 0 → CR = 0 < CR_halt (0.75).
-        qrc.record_capacity(0);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted,
-            "engine must be Halted");
-
-        let tx = Transaction::qrc_purchase("buy2", "qcb1alice", 100_000, 0, 1);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "QrcPurchase must be blocked in HALTED state");
-        let err = r.error.unwrap();
-        assert!(
-            err.contains("circuit breaker") || err.contains("CoverageRatio"),
-            "error must mention circuit breaker, got: {err}"
-        );
-    }
-
-    #[test]
-    fn contribution_settle_blocked_when_halted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Give Alice some QRC supply so CR is finite.
-        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        // Force HALTED.
-        qrc.record_capacity(0);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted,
-            "engine must be Halted");
-
-        // Both minting paths are suspended in HALTED state — contribution must fail.
-        let ev = make_evidence(1);
-        let tx = Transaction::qrc_contribution_settle("settle1", "qcb1alice", 1, ev, 1);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "QrcContributionSettle must be blocked in HALTED state");
-        let err = r.error.unwrap();
-        assert!(
-            err.contains("circuit breaker") || err.contains("CoverageRatio"),
-            "error must mention circuit breaker, got: {err}"
-        );
-    }
-
-    #[test]
-    fn contribution_settle_allowed_when_restricted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Give Alice some QRC supply.
-        let buy = Transaction::qrc_purchase("buy1", "qcb1alice", 1_000_000, 0, 0);
-        let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        // Set engine to RESTRICTED (providers are the recovery mechanism).
-        let supply = qrc.total_supply;
-        let restricted_capacity = supply * 880_000 / 1_000_000; // 0.88 × supply
-        qrc.record_capacity(restricted_capacity);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
-            "engine must be Restricted");
-
-        // qcb1alice is Verified in setup_with_identity — contribution must succeed.
-        let ev = make_evidence(1);
-        let tx = Transaction::qrc_contribution_settle("settle1", "qcb1alice", 1, ev, 1);
-        let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success,
-            "QrcContributionSettle must be ALLOWED in RESTRICTED state (providers = recovery): {:?}",
-            r.error
-        );
-        assert!(
-            r.events.iter().any(|e| e.contains("qrc_contribution_settle")),
-            "must emit contribution_settle event"
-        );
-    }
-
-    // ── Resource Network v0.2 — PurchaseQrc and CreditProvider tests ──────────
-
-    #[test]
-    fn purchase_qrc_succeeds_and_emits_event() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Ensure circuit breaker is NORMAL (capacity ≥ supply × 1.00).
-        // No supply minted yet → supply=0 → CR undefined → Normal by default.
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Normal);
-
-        let tx = Transaction::purchase_qrc(
-            "pqrc1", "qcb1alice", "job-001", 500_000, 0,
-            chain_forge_qrc::ResourceKind::Compute, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "PurchaseQrc must succeed in Normal state: {:?}", r.error);
-        assert!(
-            r.events.iter().any(|e| e.contains("purchase_qrc")),
-            "must emit purchase_qrc event; events={:?}", r.events
-        );
-        assert!(
-            r.events.iter().any(|e| e.contains("job-001")),
-            "event must reference the job_id; events={:?}", r.events
-        );
-        // QRC should have been minted.
-        assert!(qrc.total_supply > 0, "total_supply must increase after purchase");
-    }
-
-    #[test]
-    fn purchase_qrc_blocked_when_restricted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Mint some QRC so total_supply > 0.
-        let seed_buy = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
-        let r = exec.execute_tx_with_identity(&seed_buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        // Drive to RESTRICTED (0.88 × supply → 0.75 ≤ CR < 1.00).
-        let supply = qrc.total_supply;
-        qrc.record_capacity(supply * 880_000 / 1_000_000);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
-            "engine must be Restricted");
-
-        // PurchaseQrc uses the purchase path — same Control 5 gate as QrcPurchase.
-        let tx = Transaction::purchase_qrc(
-            "pqrc2", "qcb1alice", "job-002", 500_000, 0,
-            chain_forge_qrc::ResourceKind::Compute, 1,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "PurchaseQrc must be blocked in RESTRICTED state");
-        let err = r.error.unwrap();
-        assert!(
-            err.contains("circuit breaker") || err.contains("CoverageRatio"),
-            "error must mention circuit breaker; got: {err}"
-        );
-    }
-
-    #[test]
-    fn purchase_qrc_blocked_when_halted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Mint supply then HALT.
-        let seed_buy = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
-        let r = exec.execute_tx_with_identity(&seed_buy, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        qrc.record_capacity(0);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted);
-
-        let tx = Transaction::purchase_qrc(
-            "pqrc3", "qcb1alice", "job-003", 500_000, 0,
-            chain_forge_qrc::ResourceKind::AiInference, 1,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "PurchaseQrc must be blocked in HALTED state");
-    }
-
-    #[test]
-    fn purchase_qrc_slippage_guard_rejects_low_output() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // With a tiny qcb_amount and a very high min_qrc_out, the slippage
-        // guard fires and the QCB burn is rolled back.
-        let qcb_before = state.get_account("qcb1alice")
-            .map(|a| a.balance_of("uqcb"))
-            .unwrap_or(0);
-
-        let tx = Transaction::purchase_qrc(
-            "pqrc4", "qcb1alice", "job-004", 1, u128::MAX,
-            chain_forge_qrc::ResourceKind::Compute, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "PurchaseQrc must fail when slippage exceeds min_qrc_out");
-        let err = r.error.unwrap();
-        assert!(err.contains("slippage"), "error must mention slippage; got: {err}");
-
-        // FS-03: the fee is consumed but the QCB purchase amount is rolled back.
-        let fee = gas_for(&exec, &tx);
-        let qcb_after = state.get_account("qcb1alice")
-            .map(|a| a.balance_of("uqcb"))
-            .unwrap_or(0);
-        assert_eq!(qcb_before - fee, qcb_after, "QCB purchase amount must be rolled back; only fee consumed");
-    }
-
-    #[test]
-    fn credit_provider_succeeds_and_mints_to_provider_account() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // qcb1alice is Verified — she acts as VCA coordinator.
-        // A synthetic provider key (32 zero bytes for test determinism).
-        let provider_id = [0u8; 32];
-        let provider_addr: String = provider_id.iter().map(|b| format!("{:02x}", b)).collect();
-
-        let tx = Transaction::credit_provider(
-            "cprov1", "qcb1alice", "job-100", provider_id,
-            chain_forge_qrc::ResourceKind::Storage, 500_000, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success, "CreditProvider must succeed for Verified coordinator: {:?}", r.error);
-        assert!(
-            r.events.iter().any(|e| e.contains("credit_provider")),
-            "must emit credit_provider event; events={:?}", r.events
-        );
-        assert!(
-            r.events.iter().any(|e| e.contains("job-100")),
-            "event must reference the job_id"
-        );
-
-        // Provider should now have a QRC balance.
-        let provider_qrc = state.get_account(&provider_addr)
-            .map(|a| a.balance_of("uqrc"))
-            .unwrap_or(0);
-        assert!(provider_qrc > 0, "provider account must have a positive QRC balance after credit");
-    }
-
-    #[test]
-    fn credit_provider_blocked_when_halted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Mint supply to make CR finite, then HALT.
-        let seed = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
-        let r = exec.execute_tx_with_identity(&seed, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        qrc.record_capacity(0);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Halted);
-
-        let provider_id = [1u8; 32];
-        let tx = Transaction::credit_provider(
-            "cprov2", "qcb1alice", "job-200", provider_id,
-            chain_forge_qrc::ResourceKind::Compute, 1_000_000, 1,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "CreditProvider must be blocked in HALTED state");
-        let err = r.error.unwrap();
-        assert!(
-            err.contains("circuit breaker") || err.contains("CoverageRatio"),
-            "error must mention circuit breaker; got: {err}"
-        );
-    }
-
-    #[test]
-    fn credit_provider_allowed_when_restricted() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // Mint supply then drive to RESTRICTED.
-        let seed = Transaction::qrc_purchase("seed", "qcb1alice", 1_000_000, 0, 0);
-        let r = exec.execute_tx_with_identity(&seed, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success);
-
-        let supply = qrc.total_supply;
-        qrc.record_capacity(supply * 880_000 / 1_000_000);
-        assert_eq!(qrc.minting_state, chain_forge_qrc::MintingState::Restricted,
-            "engine must be Restricted");
-
-        // Coordinator credits a provider — contribution path stays open in RESTRICTED.
-        let provider_id = [2u8; 32];
-        let tx = Transaction::credit_provider(
-            "cprov3", "qcb1alice", "job-300", provider_id,
-            chain_forge_qrc::ResourceKind::ZkProving, 1_000_000, 1,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(r.success,
-            "CreditProvider must be ALLOWED in RESTRICTED state (providers = recovery mechanism): {:?}",
-            r.error
-        );
-    }
-
-    #[test]
-    fn credit_provider_rejects_non_verified_coordinator() {
-        let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
-
-        // FS-03: fund random_sender so the fee debit succeeds and the domain check runs
-        {
-            let mut acct = chain_forge_state::AccountState::new("random_sender".into(), "user".into());
-            acct.credit("uqcb", 10_000);
-            state.upsert_account(acct);
-        }
-
-        // "random_sender" is not registered in the identity store.
-        let provider_id = [3u8; 32];
-        let tx = Transaction::credit_provider(
-            "cprov4", "random_sender", "job-400", provider_id,
-            chain_forge_qrc::ResourceKind::Bandwidth, 1_000_000, 0,
-        );
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
-        assert!(!r.success, "CreditProvider must be rejected for non-Verified sender");
-        let err = r.error.unwrap();
-        assert!(
-            err.contains("Verified") || err.contains("coordinator"),
-            "error must mention Verified tier; got: {err}"
-        );
     }
 
     // ── B4: Chain-ID enforcement in ML-DSA signing path ──────────────────────

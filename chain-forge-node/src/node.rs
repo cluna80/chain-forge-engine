@@ -19,7 +19,6 @@ use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
 use chain_forge_slashing::{SlashingModule, EquivocationEvidence};
 use chain_forge_validators::ValidatorRegistry;
 use chain_forge_identity::IdentityStore;
-use chain_forge_qrc::QrcEngine;
 use chain_forge_pocd::DiscoveryRegistry;
 use chain_forge_agents::AgentStore;
 use chain_forge_p2p::{
@@ -117,7 +116,9 @@ pub struct ExplorerState {
     pub validator_powers: Vec<ValidatorPowerSummary>,
     /// Grand Challenge receipts received via POST /api/gc-receipt.
     /// Newest first, capped at MAX_GC_RECEIPTS.
-    pub gc_receipts: std::collections::VecDeque<chain_forge_resource::UsefulWorkReceipt>,
+    /// NOTE: UsefulWorkReceipt (chain-forge-resource) has been retired.
+    /// This field is kept as a placeholder to avoid breaking API shape.
+    pub gc_receipts: std::collections::VecDeque<serde_json::Value>,
 }
 
 pub const MAX_GC_RECEIPTS: usize = 500;
@@ -281,11 +282,6 @@ pub struct Node {
     /// execute_block_with_identity()
     /// on every commit so identity state actually persists across blocks.
     identity: IdentityStore,
-    /// QRC resource economy engine — tracks conversion rate Rt, per-resource
-    /// utilization EMAs, supply/burn/reserve accounting, and epoch minting caps.
-    /// Threaded through execute_block_with_identity() so economy state persists
-    /// across blocks (purchase path, contribution path, consumption splits).
-    qrc: QrcEngine,
     /// AEI agent registry -- tracks registered agents, their capabilities,
     /// spending limits, and lifecycle status. Threaded through
     /// execute_block_with_identity() so agent state persists across blocks.
@@ -440,42 +436,16 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::ConfirmSybil { .. }             => "confirm_sybil",
         TxBody::ReverseSybil { .. }             => "reverse_sybil",
         TxBody::ReportSuspectedSybil { .. }     => "report_suspected_sybil",
-        // QRC Economic Model v0.1
-        TxBody::QrcPurchase { .. }              => "qrc_purchase",
-        TxBody::QrcSpend { .. }                 => "qrc_spend",
-        TxBody::QrcContributionSettle { .. }    => "qrc_contribution_settle",
         // Phase 1: IntrinsicCharm & AEI agent registration
         TxBody::CharmConfinementUpdate { .. }   => "charm_confinement_update",
         TxBody::IntrinsicCharmRecord { .. }     => "intrinsic_charm_record",
         TxBody::RegisterAgent { .. }            => "register_agent",
-        // QRC Economic Model v0.2 epoch boundary signals
-        TxBody::EpochOpen { .. }                => "epoch_open",
-        TxBody::EpochClose { .. }               => "epoch_close",
         // AEI Phase 2 agent lifecycle
         TxBody::AuthorizeAgent { .. }           => "authorize_agent",
         TxBody::SuspendAgent { .. }             => "suspend_agent",
         TxBody::RevokeAgentFull { .. }          => "revoke_agent_full",
         TxBody::RecordAgentSpend { .. }         => "record_agent_spend",
         TxBody::SpawnChildAgent { .. }          => "spawn_child_agent",
-        // Control 5: network capacity reporting
-        TxBody::RecordCapacity { .. }           => "record_capacity",
-        // Resource Network v0.2 marketplace tx types
-        TxBody::PurchaseQrc { .. }              => "purchase_qrc",
-        TxBody::CreditProvider { .. }           => "credit_provider",
-        // Resource Marketplace — QRC Escrow
-        TxBody::LockQrcForJob { .. }            => "lock_qrc_for_job",
-        TxBody::ReleaseQrcForJob { .. }         => "release_qrc_for_job",
-        TxBody::RefundQrcForJob { .. }          => "refund_qrc_for_job",
-        // Agent Treasury
-        TxBody::DepositToTreasury { .. }        => "deposit_to_treasury",
-        // Contribution Layer
-        TxBody::RegisterMachine { .. }          => "register_machine",
-        TxBody::SubmitUsefulWork { .. }         => "submit_useful_work",
-        // Resource Job Lifecycle
-        TxBody::CreateJob { .. }                => "create_job",
-        TxBody::AcceptJob { .. }                => "accept_job",
-        TxBody::CompleteJob { .. }              => "complete_job",
-        TxBody::VerifyJob { .. }                => "verify_job",
         // PoCD Research Reward Settlement (Change Set L)
         TxBody::ClaimResearchReward { .. }      => "claim_research_reward",
         // Validator Onboarding (ROADMAP.md)
@@ -568,7 +538,7 @@ impl Node {
         let modules = genesis.enabled_modules().map_err(NodeError::Genesis)?;
         info!(
             staking = modules.staking, identity = modules.identity,
-            qrc = modules.qrc, agents = modules.agents,
+            agents = modules.agents,
             market = modules.market, pocd = modules.pocd,
             personhood_weighted = genesis.consensus.personhood_weighted,
             "modules enabled"
@@ -897,7 +867,6 @@ impl Node {
             );
         }
 
-        let qrc   = QrcEngine::new(chain_forge_qrc::D);
         let slasher = SlashingModule::with_qcb_defaults();
 
         // Seed the ValidatorRegistry with genesis validators, gated on
@@ -1071,7 +1040,6 @@ impl Node {
             round_watch_started: None,
             chain_store: std::collections::BTreeMap::new(),
             identity,
-            qrc,
             agents: AgentStore::new(),
             slasher,
             validator_registry,
@@ -1501,7 +1469,6 @@ impl Node {
         for (name, value) in [
             ("state.json",      serde_json::to_string_pretty(&snap)                  .ok()),
             ("identity.json",   serde_json::to_string_pretty(&self.identity)         .ok()),
-            ("qrc.json",        serde_json::to_string_pretty(&self.qrc)              .ok()),
             ("validators.json", serde_json::to_string_pretty(&self.validator_registry).ok()),
             ("agents.json",     serde_json::to_string_pretty(&self.agents)           .ok()),
             ("slashing.json",   serde_json::to_string_pretty(&self.slasher)          .ok()),
@@ -1540,7 +1507,6 @@ impl Node {
         let persist = dir.join("persist");
         let snap_path        = persist.join("state.json");
         let id_path          = persist.join("identity.json");
-        let qrc_path         = persist.join("qrc.json");
         let validators_path  = persist.join("validators.json");
         let agents_path      = persist.join("agents.json");
         let slashing_path    = persist.join("slashing.json");
@@ -1558,9 +1524,6 @@ impl Node {
 
             if id_path.exists() {
                 self.identity = serde_json::from_str(&std::fs::read_to_string(&id_path)?)?;
-            }
-            if qrc_path.exists() {
-                self.qrc = serde_json::from_str(&std::fs::read_to_string(&qrc_path)?)?;
             }
             if validators_path.exists() {
                 self.validator_registry =
@@ -3113,12 +3076,12 @@ impl Node {
             let mut reg = reg_arc.lock().unwrap();
             self.executor.execute_block_with_identity(
                 cert.height, txs, &mut self.state, &mut self.identity,
-                &mut self.qrc, &mut self.agents, now_ms, Some(&mut *reg),
+                &mut self.agents, now_ms, Some(&mut *reg),
             )
         } else {
             self.executor.execute_block_with_identity(
                 cert.height, txs, &mut self.state, &mut self.identity,
-                &mut self.qrc, &mut self.agents, now_ms, None,
+                &mut self.agents, now_ms, None,
             )
         };
 
@@ -3649,57 +3612,6 @@ impl Node {
         let mut txs = std::mem::take(&mut self.mempool);
 
         // ── Epoch boundary: auto-inject EpochClose + EpochOpen ──────────────
-        // When PoCD is enabled and this block lands exactly on an epoch
-        // boundary, prepend a synthetic EpochClose for the epoch that just
-        // ended followed by an EpochOpen for the new epoch.  Both carry a
-        // zero gas_limit so they're fee-free system transactions.
-        if let Some(ref cfg) = self.pocd_config {
-            let epoch_len = cfg.reward_epoch_blocks;
-            if epoch_len > 0 && height > 0 && height % epoch_len == 0 {
-                use chain_forge_execution::{Transaction, TxBody};
-                let closing_epoch = height / epoch_len - 1;
-                let opening_epoch = height / epoch_len;
-
-                let close_tx = Transaction {
-                    id:           format!("sys-epoch-close-{}", closing_epoch),
-                    sender:       "system".to_string(),
-                    body:         TxBody::EpochClose { epoch: closing_epoch },
-                    gas_limit:    0,
-                    nonce:        0,
-                    signature:    vec![],
-                    public_key:   vec![],
-                    pq_signatures: vec![],
-                    pq_public_key: vec![],
-                };
-                let open_tx = Transaction {
-                    id:           format!("sys-epoch-open-{}", opening_epoch),
-                    sender:       "system".to_string(),
-                    body:         TxBody::EpochOpen {
-                        epoch:          opening_epoch,
-                        verified_count: 0,
-                    },
-                    gas_limit:    0,
-                    nonce:        0,
-                    signature:    vec![],
-                    public_key:   vec![],
-                    pq_signatures: vec![],
-                    pq_public_key: vec![],
-                };
-
-                // Prepend: close first, then open — so rewards are settled
-                // before the new epoch begins.
-                txs.insert(0, open_tx);
-                txs.insert(0, close_tx);
-
-                info!(
-                    height,
-                    closing_epoch,
-                    opening_epoch,
-                    "epoch boundary: injecting EpochClose + EpochOpen"
-                );
-            }
-        }
-
         let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
 
         // Produce a proposal
@@ -3866,12 +3778,12 @@ impl Node {
             let mut reg = reg_arc.lock().unwrap();
             self.executor.execute_block_with_identity(
                 height, txs, &mut self.state, &mut self.identity,
-                &mut self.qrc, &mut self.agents, now_ms, Some(&mut *reg),
+                &mut self.agents, now_ms, Some(&mut *reg),
             )
         } else {
             self.executor.execute_block_with_identity(
                 height, txs, &mut self.state, &mut self.identity,
-                &mut self.qrc, &mut self.agents, now_ms, None,
+                &mut self.agents, now_ms, None,
             )
         };
 
@@ -4072,24 +3984,7 @@ impl Node {
             }
         }
 
-        // Update QRC resource economy metrics snapshot (Section 9.1 / 5.4 / 5.5)
-        // Mirror live QrcEngine state directly into the shared metrics struct
-        // so the /api/qrc endpoint always reflects the committed engine state.
-        {
-            let mut cm = self.qrc_metrics.lock().unwrap();
-            cm.last_updated_epoch               = exec_result.height;
-            cm.total_supply_uqrc                = self.qrc.total_supply;
-            cm.total_burned_uqrc                = self.qrc.total_burned;
-            cm.total_purchase_minted_uqrc       = self.qrc.total_purchase_minted;
-            cm.total_contribution_minted_uqrc   = self.qrc.total_contribution_minted;
-            cm.total_qcb_burned_uqcb            = self.qrc.total_qcb_burned;
-            cm.conversion_rate_rt               = self.qrc.conversion_rate.rt;
-            cm.protocol_reserve_uqrc            = self.qrc.protocol_reserve;
-            // Control 5: circuit-breaker state and coverage ratio
-            cm.minting_state                    = self.qrc.minting_state.as_str().to_string();
-            cm.tracked_capacity_fp              = self.qrc.tracked_capacity;
-            cm.coverage_ratio_fp                = self.qrc.coverage_ratio();
-        }
+        // QrcMetrics update removed: QRC engine retired; /api/qrc returns empty metrics.
 
         Ok(cert)
     }
