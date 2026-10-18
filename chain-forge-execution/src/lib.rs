@@ -5355,4 +5355,61 @@ mod tests {
         assert!(r.success,
             "ML-DSA-65 tx must be accepted after classical cutoff; got: {:?}", r.error);
     }
+
+    /// CS-001-P6-CFG: The hard-cutoff gate is independent of the `require_signatures`
+    /// chain configuration.  A chain with `require_signatures = false` (devnet mode)
+    /// still enforces the migration cutoff — auth and cutoff are separate checks.
+    ///
+    /// This confirms the gate cannot be bypassed by node configuration.
+    #[test]
+    fn cs001_p6_cutoff_enforced_regardless_of_require_signatures() {
+        let gov = "qcb1gov";
+        // cs001_p4_setup builds a chain with require_signatures = false.
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // Sanity: confirm require_signatures is false on this executor.
+        assert!(!exec.config.require_signatures,
+            "cs001_p4_setup must produce require_signatures = false");
+
+        // Initiate deprecation (grace=10, cutoff at epoch 51).
+        let eda = emergency_deprecate_tx(
+            "eda-cfg", gov, 0, "ed25519", "ml-dsa", 10,
+            "P6 config-independence test",
+        );
+        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "EDA must succeed: {:?}", r.error);
+
+        // Advance past hard cutoff (epoch 52 > cutoff 51).
+        identity.clock.current_epoch = 52;
+
+        // A tx with no signature and no sig_scheme — the kind that would pass
+        // auth on a require_signatures=false chain.  After cutoff it should
+        // still be rejected by the cutoff gate (which is after auth, not inside it).
+        let unsigned_classical = Transaction {
+            id:            "p6-cfg-unsigned".to_string(),
+            sender:        gov.to_string(),
+            nonce:         1,
+            body:          TxBody::Transfer {
+                to:     "qcb1recv".to_string(),
+                denom:  "uqcb".to_string(),
+                amount: 1,
+            },
+            gas_limit:     500_000,
+            signature:     vec![],
+            sig_scheme:    None,   // no tag — treated as classical by G2 fix
+            public_key:    vec![],
+            pq_signatures: vec![],
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(
+            &unsigned_classical, &mut state, &mut identity, &mut agents,
+        );
+        assert!(!r.success,
+            "unsigned classical tx must be rejected by cutoff gate even with require_signatures=false");
+        let err = r.error.unwrap_or_default();
+        assert!(
+            err.contains("was deprecated") || err.contains("deprecated"),
+            "cutoff gate must fire despite require_signatures=false; got: {err}",
+        );
+    }
 }
