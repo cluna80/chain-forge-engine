@@ -322,6 +322,10 @@ pub struct StateStore {
     /// Snapshots keyed by height. Kept for the last N blocks.
     snapshots: BTreeMap<u64, StateSnapshot>,
     max_snapshots: usize,
+    /// Generic key→value metadata store for protocol-level state that doesn't
+    /// map cleanly to the account model (e.g. CryptoMigrationState, CS-001 P4).
+    /// Values are serialized JSON strings.
+    metadata: HashMap<String, String>,
 }
 
 impl StateStore {
@@ -334,7 +338,24 @@ impl StateStore {
             width,
             snapshots:     BTreeMap::new(),
             max_snapshots: 128,
+            metadata:      HashMap::new(),
         }
+    }
+
+    /// Store an arbitrary string value under `key` in the metadata store.
+    /// Used for protocol-level state (e.g. CryptoMigrationState).
+    pub fn set_raw(&mut self, key: &str, value: &str) {
+        self.metadata.insert(key.to_string(), value.to_string());
+    }
+
+    /// Retrieve a metadata value by key.
+    pub fn get_raw(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+
+    /// Remove a metadata value (e.g. after a migration completes).
+    pub fn remove_raw(&mut self, key: &str) {
+        self.metadata.remove(key);
     }
 
     /// Seed the state from a genesis config.

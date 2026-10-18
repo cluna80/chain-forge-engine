@@ -446,6 +446,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RevokeAgentFull { .. }          => "revoke_agent_full",
         TxBody::RecordAgentSpend { .. }         => "record_agent_spend",
         TxBody::SpawnChildAgent { .. }          => "spawn_child_agent",
+        // CS-001 P4: Emergency Cryptographic Deprecation (constitutional governance)
+        TxBody::EmergencyDeprecateAlgorithm { .. } => "emergency_deprecate_algorithm",
         // PoCD Research Reward Settlement (Change Set L)
         TxBody::ClaimResearchReward { .. }      => "claim_research_reward",
         // Validator Onboarding (ROADMAP.md)

@@ -302,9 +302,9 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Route non-signing hash sites through `ChainHash` (CS-001-L1) | ✅ | `pocd_reward.rs` claim_id now uses SHA-3-256 via `ChainHash` |
 | BLS12-381 / Groth16 ZK migration (CS-001-L2) | 🔲 | Superseded by QCB-ZKP-001 (hash-based STARKs preferred); long-horizon (10–15 yr) |
 | libp2p PQ transport (CS-001-L3) | 🔲 | Follow upstream libp2p NIST PQC adoption; ephemeral key, not on-chain |
-| Safe cryptographic migration procedures | ⬜ | Documented + tested path: old algorithm → new without disrupting in-flight txs |
-| Emergency algorithm-deprecation governance tx | ⬜ | Flag an algorithm deprecated; grace period for key rotation; hard cutoff in consensus |
-| Simulated cryptographic compromise tests | ⬜ | Treat one scheme as "broken"; verify network migrates cleanly under adversarial conditions |
+| Safe cryptographic migration procedures | ✅ | `CryptoMigrationState` persisted in `StateStore::metadata`; grace window + hard cutoff enforced by consensus |
+| Emergency algorithm-deprecation governance tx | ✅ | `EmergencyDeprecateAlgorithm` TxBody variant; `crypto_governors` constitutional keyholder set; fail-closed semantics |
+| Simulated cryptographic compromise tests | ✅ | 9 CS-001 P4 tests including full adversarial CRQC-emergency migration sequence |
 | Independent security review | 🔲 | Prerequisite: migration procedures + adversarial tests pass; external review before mainnet |
 
 ---

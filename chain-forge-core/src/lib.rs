@@ -354,6 +354,13 @@ pub struct GenesisConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settlement_operators: Vec<String>,
 
+    /// Addresses authorized to submit `EmergencyDeprecateAlgorithm` transactions
+    /// (CS-001 P4). Constitutional keyholders — kept separate from ordinary
+    /// governance and from `settlement_operators`. An empty list means no
+    /// `EmergencyDeprecateAlgorithm` tx can be submitted (fail-closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crypto_governors: Vec<String>,
+
     /// Optional overrides for the permissionless stake-bond validator-
     /// onboarding module (`chain-forge-execution::validator_bond`) and the
     /// deterministic block-height validator-set epoch length
