@@ -1085,6 +1085,67 @@ fn advance_nonce_if_not_already(tx: &Transaction, state: &mut StateStore) {
     state.refresh_leaf(&tx.sender);
 }
 
+/// Debit the fee for a transaction from the sender's account and credit it
+/// to the fee-collector account.
+///
+/// Called in `execute_tx` and `execute_tx_with_identity` after the gas-limit
+/// and balance checks, before executing the tx body.  On failure the tx is
+/// rejected with an insufficient-balance error (FS-03).
+///
+/// The fee-collector account is auto-created if it does not yet exist —
+/// this handles the genesis case where `treasury:fees` is not pre-funded.
+/// Both the sender and fee-collector state leaves are refreshed so the
+/// Merkle tree stays consistent.
+fn debit_fee(
+    tx:        &Transaction,
+    fee:       u64,
+    denom:     &str,
+    collector: &str,
+    state:     &mut StateStore,
+) -> Result<(), String> {
+    let fee_u128 = fee as u128;
+
+    // Verify sender has enough to cover the fee.
+    let sender_bal = state.get_account(&tx.sender)
+        .map(|a| a.balance_of(denom))
+        .unwrap_or(0);
+    if sender_bal < fee_u128 {
+        return Err(format!(
+            "insufficient balance for fee: sender {} has {} {denom}, need {fee}",
+            tx.sender, sender_bal,
+        ));
+    }
+
+    // Debit sender.
+    if let Ok(acct) = state.get_account_mut(&tx.sender) {
+        let _ = acct.debit(denom, fee_u128); // balance check above guarantees this succeeds
+    }
+    state.refresh_leaf(&tx.sender);
+
+    // Credit fee collector (auto-create if absent).
+    if state.get_account(collector).is_err() {
+        let ca = chain_forge_state::AccountState::new(
+            collector.to_string(),
+            "treasury".to_string(),
+        );
+        state.upsert_account(ca);
+    }
+    if let Ok(ca) = state.get_account_mut(collector) {
+        ca.credit(denom, fee_u128);
+    }
+    state.refresh_leaf(collector);
+
+    tracing::debug!(
+        tx_id     = %tx.id,
+        sender    = %tx.sender,
+        fee,
+        denom,
+        collector,
+        "fee_debit"
+    );
+    Ok(())
+}
+
 /// A fully-formed transaction ready for execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -1860,6 +1921,11 @@ pub struct ExecutionConfig {
     /// Addresses authorized to submit `ClaimResearchReward` (Change Set L).
     /// Derived from `GenesisConfig::settlement_operators`.
     pub settlement_operators: Vec<String>,
+
+    /// Address of the fee-collector account. All per-tx fees (in `native_denom`)
+    /// are credited here after each transaction executes. Defaults to
+    /// `"treasury:fees"` when not specified in genesis.
+    pub fee_collector: String,
 }
 
 impl ExecutionConfig {
@@ -1877,6 +1943,9 @@ impl ExecutionConfig {
             // optional modules. (The node refuses to start on one anyway.)
             modules: genesis.enabled_modules().unwrap_or_default(),
             settlement_operators: genesis.settlement_operators.clone(),
+            fee_collector: genesis.execution.fee_collector
+                .clone()
+                .unwrap_or_else(|| "treasury:fees".to_string()),
         }
     }
 }
@@ -2251,6 +2320,15 @@ impl Executor {
                 tx.id.clone(), gas_required, tx.gas_limit,
                 format!("nonce mismatch: expected {expected_nonce}, got {}", tx.nonce),
             );
+        }
+
+        // FS-03: Debit per-tx fee from sender before executing the body.
+        // Failed txs still consume the fee (matching established EVM semantics).
+        if let Err(e) = debit_fee(
+            tx, gas_required, &self.config.native_denom,
+            &self.config.fee_collector, state,
+        ) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
         let mut events = Vec::new();
@@ -4832,6 +4910,15 @@ impl Executor {
             );
         }
 
+        // FS-03: Debit per-tx fee from sender before executing the body.
+        // Failed txs still consume the fee (matching established EVM semantics).
+        if let Err(e) = debit_fee(
+            tx, gas_required, &self.config.native_denom,
+            &self.config.fee_collector, state,
+        ) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
+        }
+
         // Execute the operation
         let mut events = Vec::new();
         let result = match &tx.body {
@@ -5000,7 +5087,11 @@ impl Executor {
 
             let result = self.execute_tx(tx, state);
             total_gas     += result.gas_used;
-            fees_collected += result.gas_used; // simplified: all gas = fees
+            // FS-03: fee in uQCB == gas_used (GasModel returns uQCB directly).
+            // debit_fee() already moved this amount sender → fee_collector.
+            // Failed txs still consume the fee (EVM semantics); both success
+            // and failure cases are counted in fees_collected.
+            fees_collected += result.gas_used;
             results.push(result);
         }
 
@@ -5084,6 +5175,7 @@ impl Executor {
             }
             let result = self.execute_tx_with_identity(tx, state, identity, qrc, agents);
             total_gas      += result.gas_used;
+            // FS-03: debit_fee() already moved fee amount sender → fee_collector.
             fees_collected += result.gas_used;
             results.push(result);
         }
@@ -5241,14 +5333,23 @@ mod tests {
         (Executor::new(config), state)
     }
 
+    /// Compute the gas cost for a tx under the test executor's gas model.
+    /// Used to write balance assertions that stay correct after FS-03
+    /// fee debit: `expected_balance = start - amount - gas_for(&exec, &tx)`.
+    fn gas_for(exec: &Executor, tx: &Transaction) -> u128 {
+        exec.config.gas_model.calculate_gas(tx) as u128
+    }
+
     #[test]
     fn transfer_tx_succeeds() {
         let (exec, mut state) = setup();
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100_000, 0);
+        let fee = gas_for(&exec, &tx);
         let result = exec.execute_tx(&tx, &mut state);
 
         assert!(result.success, "transfer should succeed: {:?}", result.error);
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 4_900_000);
+        // FS-03: alice pays transfer amount + fee; bob receives transfer amount only
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - 100_000 - fee);
         assert_eq!(state.get_account("qcb1bob").unwrap().balance_of("uqcb"),   5_100_000);
     }
 
@@ -5265,10 +5366,12 @@ mod tests {
     fn burn_tx_reduces_supply() {
         let (exec, mut state) = setup();
         let tx = Transaction::burn("tx1", "qcb1alice", "uqcb", 500_000, 0);
+        let fee = gas_for(&exec, &tx);
         let result = exec.execute_tx(&tx, &mut state);
 
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 4_500_000);
+        // FS-03: alice pays burn amount + fee
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - 500_000 - fee);
     }
 
     #[test]
@@ -5356,6 +5459,7 @@ mod tests {
             require_signatures: false,
             modules:         EnabledModules::all(),
             settlement_operators: vec![],
+            fee_collector:   "treasury:fees".into(),
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -5458,9 +5562,11 @@ mod tests {
     fn bond_validator_moves_funds_into_bond_account() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let tx = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        let fee = gas_for(&exec, &tx);
         let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "{:?}", r.error);
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+        // FS-03: alice pays bond amount + fee; bond account receives bond amount only
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - 2_000_000 - fee);
         assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
     }
 
@@ -5481,10 +5587,12 @@ mod tests {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Alice only has 5_000_000 at genesis.
         let tx = Transaction::bond_validator("bond1", "qcb1alice", 50_000_000, 0);
+        let fee = gas_for(&exec, &tx);
         let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success);
-        // No partial debit: balance and bond account both untouched.
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        // FS-03: the fee is consumed even on failure (EVM semantics).
+        // The bond body is not executed, so no partial debit to the bond account.
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - fee);
         assert!(state.get_account("validator-bond:qcb1alice").is_err());
     }
 
@@ -5501,35 +5609,44 @@ mod tests {
     fn unbond_starts_cooldown_and_removes_from_bond_account() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        let fee_bond = gas_for(&exec, &bond);
         exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
 
         let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        let fee_unbond = gas_for(&exec, &unbond);
         let r = exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "{:?}", r.error);
         // No longer counted as bonded -- stops counting toward the active set immediately.
         assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 0);
         // Funds are locked in the unbonding account, not back in Alice's spendable balance yet.
         assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+        // FS-03: alice paid fees for both bond and unbond txs
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"),
+            5_000_000 - 2_000_000 - fee_bond - fee_unbond);
     }
 
     #[test]
     fn claiming_unbonded_stake_before_cooldown_elapses_is_rejected() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
+        let fee_bond = gas_for(&exec, &bond);
         exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut qrc, &mut agents);
         let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
+        let fee_unbond = gas_for(&exec, &unbond);
         exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut qrc, &mut agents);
 
         // Still epoch 0 -- cooldown (21 epochs) has not elapsed. A second
         // UnbondValidator call (the only way to attempt a sweep) must be
         // rejected, and must NOT move any funds.
         let sweep_attempt = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let fee_sweep = gas_for(&exec, &sweep_attempt);
         let r = exec.execute_tx_with_identity(&sweep_attempt, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("cooldown not complete"));
         assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 3_000_000);
+        // FS-03: alice paid fees for bond + unbond + failed sweep attempt
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"),
+            5_000_000 - 2_000_000 - fee_bond - fee_unbond - fee_sweep);
     }
 
     #[test]
@@ -5544,18 +5661,26 @@ mod tests {
         identity.clock.current_epoch = 21;
 
         let sweep = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
+        let fee_bond   = gas_for(&exec, &Transaction::bond_validator("x", "qcb1alice", 2_000_000, 0));
+        let fee_unbond = gas_for(&exec, &Transaction::unbond_validator("x", "qcb1alice", 0));
+        let fee_sweep  = gas_for(&exec, &sweep);
         let r = exec.execute_tx_with_identity(&sweep, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "{:?}", r.error);
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        // FS-03: bond, unbond, and sweep all pay fees; but full principal returns via sweep
+        let expected_after_sweep = 5_000_000 - fee_bond - fee_unbond - fee_sweep;
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), expected_after_sweep);
         assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 0);
 
         // Calling UnbondValidator again finds nothing bonded and nothing
         // matured left to sweep -- it must not double-release funds.
         let double_sweep = Transaction::unbond_validator("unbond3", "qcb1alice", 3);
+        let fee_double = gas_for(&exec, &double_sweep);
         let r2 = exec.execute_tx_with_identity(&double_sweep, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r2.success);
         assert!(r2.error.unwrap().contains("no bonded stake"));
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        // FS-03: failed double-sweep still consumes fee
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"),
+            expected_after_sweep - fee_double);
     }
 
     #[test]
@@ -5773,6 +5898,13 @@ mod tests {
     fn register_identity_tx_creates_provisional_account_with_charm() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
+        // FS-03: fund newbie so they can pay the registration fee
+        {
+            let mut acct = chain_forge_state::AccountState::new("qcb1newbie".into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
+
         let tx = Transaction::register_identity("tx1", "qcb1newbie", 0);
         let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
 
@@ -5800,6 +5932,13 @@ mod tests {
             let att = PopAttestation::genesis(name, 0);
             identity.register(name.into(), name.into(), att.clone()).unwrap();
             identity.verify_identity(name, att, None).unwrap();
+        }
+
+        // FS-03: fund newbie, bob, and carol so they can pay transaction fees
+        for name in ["qcb1newbie", "qcb1bob", "qcb1carol"] {
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
         }
 
         // Register the real claimant via the actual transaction path.
@@ -5856,6 +5995,13 @@ mod tests {
             let att = PopAttestation::genesis(name, 0);
             identity.register(name.into(), name.into(), att.clone()).unwrap();
             identity.verify_identity(name, att, None).unwrap();
+        }
+
+        // FS-03: fund new accounts so they can pay registration fees
+        for name in ["qcb1newbie", "qcb1other"] {
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
         }
 
         // Registration advances the new account's nonce 0 -> 1.
@@ -6093,6 +6239,14 @@ mod tests {
 
         let user = key("new-user");
         let addr = Address::from_public_key(&user.public_key, "qcb", HashWidth::Bits256);
+
+        // FS-03: fund the new address so it can pay the registration fee
+        {
+            let mut acct = chain_forge_state::AccountState::new(addr.as_str().into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
+
         let mut reg = Transaction::register_identity("r0", addr.as_str(), 0);
         reg.sign(&user, "qcb-testnet-1").unwrap();
         let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents);
@@ -6147,6 +6301,13 @@ mod tests {
         }
         let mut qrc = QrcEngine::new(chain_forge_qrc::D);
         let mut agents = chain_forge_agents::AgentStore::new();
+
+        // FS-03: fund newcomer, bob, and carol so they can pay transaction fees
+        for name in ["qcb1newcomer", "qcb1bob", "qcb1carol"] {
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
 
         let root_before = state.commit(0, 0, false).root_hash;
 
@@ -6313,14 +6474,15 @@ mod tests {
         assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqrc"), 0);
 
         let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 1_000_000, 0, 0);
+        let fee = gas_for(&exec, &tx);
         let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "QrcPurchase failed: {:?}", r.error);
 
-        // QCB must decrease.
+        // FS-03: QCB must decrease by burn amount + fee
         assert_eq!(
             state.get_account("qcb1alice").unwrap().balance_of("uqcb"),
-            4_000_000,
-            "1_000_000 uqcb must be burned"
+            5_000_000 - 1_000_000 - fee,
+            "1_000_000 uqcb must be burned plus fee"
         );
         // QRC must be minted (exact amount depends on default Rt; just verify > 0).
         assert!(
@@ -6336,10 +6498,11 @@ mod tests {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Try to burn more than Alice's 5_000_000 uqcb balance.
         let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 999_000_000, 0, 0);
+        let fee = gas_for(&exec, &tx);
         let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "should fail with insufficient balance");
-        // Balance unchanged.
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        // FS-03: fee is consumed even on failure; only the purchase body is rolled back
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - fee);
     }
 
     #[test]
@@ -6347,20 +6510,24 @@ mod tests {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
         // Demand an absurd min_qrc_out that can never be met.
         let tx = Transaction::qrc_purchase("tx_buy", "qcb1alice", 1_000_000, u128::MAX, 0);
+        let fee = gas_for(&exec, &tx);
         let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "slippage guard must reject");
         let err = r.error.unwrap();
         assert!(err.contains("slippage exceeded"), "wrong error: {err}");
-        // QCB must be refunded (not permanently burned).
-        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000);
+        // FS-03: the 1_000_000 burn is rolled back (no QRC minted) but the fee
+        // is still consumed — only the fee, not the purchase amount.
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - fee);
     }
 
     #[test]
     fn qrc_spend_deducts_qrc_and_applies_split() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
 
-        // First give Alice some QRC via purchase.
-        let buy = Transaction::qrc_purchase("tx_buy", "qcb1alice", 5_000_000, 0, 0);
+        // FS-03: buy less than the full balance so the fee on the buy tx still fits
+        // within alice's 5_000_000 uQCB genesis allocation.
+        // fee is Fixed{1} by default so 1 uQCB; buying 4_000_000 leaves plenty of room.
+        let buy = Transaction::qrc_purchase("tx_buy", "qcb1alice", 4_000_000, 0, 0);
         let r   = exec.execute_tx_with_identity(&buy, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(r.success, "setup purchase failed: {:?}", r.error);
 
@@ -6425,6 +6592,12 @@ mod tests {
     #[test]
     fn qrc_contribution_settle_rejected_for_provisional_sender() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+        // FS-03: fund carol so she can pay the registration fee
+        {
+            let mut acct = chain_forge_state::AccountState::new("qcb1carol".into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
         // Register a fresh provisional account.
         let reg = Transaction::register_identity("reg1", "qcb1carol", 0);
         let r   = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut qrc, &mut agents);
@@ -6480,6 +6653,14 @@ mod tests {
     fn charm_confinement_update_requires_verified_tier() {
         // An unregistered address (Provisional tier or absent) must be rejected.
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // FS-03: fund stranger so the fee debit succeeds and the domain check runs
+        {
+            let mut acct = chain_forge_state::AccountState::new("qcb1stranger".into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
+
         let tx = Transaction::charm_confinement_update("ccup1", "qcb1stranger", 1, 0);
         let r  = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut qrc, &mut agents);
         assert!(!r.success, "unregistered address must not pass confinement gate");
@@ -6613,6 +6794,14 @@ mod tests {
     #[test]
     fn register_agent_requires_verified_sponsor() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // FS-03: fund stranger so the fee debit succeeds and the domain check runs
+        {
+            let mut acct = chain_forge_state::AccountState::new("qcb1stranger".into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
+
         // qcb1stranger has no identity record at all.
         let tx = Transaction::register_agent(
             "ra1", "qcb1stranger",
@@ -7226,11 +7415,12 @@ mod tests {
         let err = r.error.unwrap();
         assert!(err.contains("slippage"), "error must mention slippage; got: {err}");
 
-        // QCB balance must be unchanged (rollback happened).
+        // FS-03: the fee is consumed but the QCB purchase amount is rolled back.
+        let fee = gas_for(&exec, &tx);
         let qcb_after = state.get_account("qcb1alice")
             .map(|a| a.balance_of("uqcb"))
             .unwrap_or(0);
-        assert_eq!(qcb_before, qcb_after, "QCB must be rolled back on slippage rejection");
+        assert_eq!(qcb_before - fee, qcb_after, "QCB purchase amount must be rolled back; only fee consumed");
     }
 
     #[test]
@@ -7320,6 +7510,13 @@ mod tests {
     #[test]
     fn credit_provider_rejects_non_verified_coordinator() {
         let (exec, mut state, mut identity, mut qrc, mut agents) = setup_with_identity();
+
+        // FS-03: fund random_sender so the fee debit succeeds and the domain check runs
+        {
+            let mut acct = chain_forge_state::AccountState::new("random_sender".into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
 
         // "random_sender" is not registered in the identity store.
         let provider_id = [3u8; 32];

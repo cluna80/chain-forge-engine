@@ -428,6 +428,11 @@ pub struct GenesisExecution {
     /// file has to opt OUT of signature checks explicitly, never opt in.
     #[serde(default = "default_require_signatures")]
     pub require_signatures: bool,
+
+    /// Address that collects all per-transaction fees (in the native denom).
+    /// Defaults to `"treasury:fees"` when absent in genesis.
+    #[serde(default)]
+    pub fee_collector: Option<String>,
 }
 
 fn default_require_signatures() -> bool { true }
