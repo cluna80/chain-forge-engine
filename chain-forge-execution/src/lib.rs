@@ -1701,6 +1701,13 @@ impl Executor {
 
         // CS-001 P6 hard-cutoff enforcement (hardened).
         //
+        // TODO(mempool): Chain Forge currently has no pre-execution mempool.
+        // When a mempool is added, audit that any transaction admitted to the
+        // mempool *before* the hard cutoff activates is re-checked against the
+        // cutoff gate at execution time, not only at admission time.  The gate
+        // here is the authoritative enforcement point; a mempool admission check
+        // must not be treated as a substitute for it.
+        //
         // Boundary semantics: `hard_cutoff_passed` uses `current_epoch > hard_cutoff_epoch`,
         // so the deprecated scheme is still accepted *at* hard_cutoff_epoch itself.
         // This is intentional: it gives the entire epoch in which the cutoff epoch begins

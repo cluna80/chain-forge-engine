@@ -1260,6 +1260,10 @@ pub mod tendermint {
 ///
 /// What is NOT here yet (will be added as the engine matures):
 ///   - Real signature verification (crypto layer not wired up)
+///     NOTE: this comment is stale. `verify_commit` does per-vote Ed25519
+///     verification under `#[cfg(feature = "real-crypto")]`, which is enabled
+///     in chain-forge-node. Plain `cargo test -p chain-forge-consensus` runs
+///     without the feature; use `--features real-crypto` to exercise the crypto path.
 ///   - Network I/O (P2P crate handles that)
 ///   - Persistent state / WAL (needed before mainnet)
 ///   - Evidence handling for equivocation (Open Question 13)
