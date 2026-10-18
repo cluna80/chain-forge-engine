@@ -46,7 +46,7 @@
 **Goal**: A working, partition-tolerant BFT consensus engine plus one complete, adversarially-verified, cross-machine resource purchase and a live PoCD research pipeline — Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios. Separately, external miners submit SHA-256 cryptographic discovery proofs that are independently verified and rewarded in uQCB from `treasury:pocd-research`.
 
 **Token model (current — single token)**:
-- **QCB / uQCB** — the one and only token on QCB Chain. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, escrow, job payments, PoCD rewards, staking, and governance use uQCB. There is no second token.
+- **QCB / uQCB** — the one and only token on Qattice. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, escrow, job payments, PoCD rewards, staking, and governance use uQCB. There is no second token.
 - **PoCD research rewards** — paid from `treasury:pocd-research` in uQCB.
 - **Job escrow** — `LockQrcForJob` / `ReleaseQrcForJob` tx types operate in uQCB despite the legacy "Qrc" name; no `PurchaseQrc` step is needed or used.
 
@@ -92,7 +92,7 @@
 
 ### QRC Layer (`chain-forge-qrc`) — Retired
 
-> **QRC is a retired concept.** QCB Chain is a single-token chain. All balances, escrow, job payments, PoCD rewards, staking, and governance use **uQCB** only. The `chain-forge-qrc` crate remains compiled into the workspace as a vestigial artifact but none of its logic runs in any active devnet flow.
+> **QRC is a retired concept.** Qattice is a single-token chain. All balances, escrow, job payments, PoCD rewards, staking, and governance use **uQCB** only. The `chain-forge-qrc` crate remains compiled into the workspace as a vestigial artifact but none of its logic runs in any active devnet flow.
 
 | Component | Status | Direction |
 |-----------|--------|-----------|
@@ -101,7 +101,7 @@
 | Epoch conversion cap (Control 2) | ⬜ | **Retired** — no conversion path exists |
 | CoverageRatio circuit breaker (Control 5) | ⬜ | **Retired** — designed for a contribution-minting model that was abandoned |
 | Per-resource congestion pricing in QRC | ⬜ | **Retired** — resource pricing now expressed in uQCB |
-| `PurchaseQrc` tx type | ⬜ | **Retired** — no QCB→QRC on-ramp needed; single token only |
+| `PurchaseQrc` tx type | ⬜ | **Retired** — no Qattice→QRC on-ramp needed; single token only |
 | `CapacityReport` / `CapacityEvidence_v0` | ⬜ | **Superseded** → `ResourceExecutionReceipt` in `chain-forge-resource` |
 | `CreditProvider` tx type | ⬜ | **Retired** — minting-era primitive; never used in uQCB flows |
 | `QrcContributionSettle` | ⬜ | **Retired** — contribution-minting model artifact |
@@ -177,7 +177,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | All QRC tx types wired (`QrcPurchase`, `QrcContributionSettle`, `PurchaseQrc`, `CreditProvider`) | ✅ | Gas model, `variant_name`, `payload_size_bytes`, `required_module`, `execute_tx` |
 | `tx_kind_label()` exhaustive match in `node.rs` | ✅ | Compiler-enforced; updated with every new variant |
 | Attestation guard tx types (Phases A–D) | ✅ | `AttestEntity`, `RevokeAttestation`, `ConfirmSybil`, `ReportSuspectedSybil`, `ReverseSybil` |
-| QCB native tx types (Transfer, Stake, Unstake, etc.) | ✅ | |
+| Qattice native tx types (Transfer, Stake, Unstake, etc.) | ✅ | |
 | Governance tx types | ✅ | `ProposeChange`, `VoteOnProposal`, `ActivateChange` |
 | **EVM precompile / permissioned EVM layer** | 🔲 | Phase 5+ — identity layer must be proven at scale first |
 
@@ -213,7 +213,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 ### Validator Onboarding — Permissionless Entry via Stake Bond
 
-> **Design decision (October 2026)**: QCB mainnet should attract validators, not gatekeep them. The onboarding model is stake-based and permissionless — anyone who bonds the minimum uQCB can join the active validator set. No whitelist, no committee approval. Existing slashing (liveness + equivocation) is the Sybil defense.
+> **Design decision (October 2026)**: Qattice mainnet should attract validators, not gatekeep them. The onboarding model is stake-based and permissionless — anyone who bonds the minimum uQCB can join the active validator set. No whitelist, no committee approval. Existing slashing (liveness + equivocation) is the Sybil defense.
 
 | Item | Status | Notes |
 |------|--------|-------|
@@ -255,7 +255,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 ### Cryptographic Security Hardening
 
-> These are **Chain Forge modules** first — reusable by any sovereign chain built on Chain Forge. QCB is the first chain to enable and adversarially test them, exactly as with PoCD. Future chains can adopt cryptographic-agility and key-lifecycle capabilities independently of QCB's QRC economy or personhood rules.
+> These are **Chain Forge modules** first — reusable by any sovereign chain built on Chain Forge. Qattice is the first chain to enable and adversarially test them, exactly as with PoCD. Future chains can adopt cryptographic-agility and key-lifecycle capabilities independently of Qattice's QRC economy or personhood rules.
 >
 > **Implementation order:** QCB-CS-001 first (defines the migration architecture); QCB-DIS-001 Phase A builds the wallet on top of that architecture; QCB-KR-001 implements account-level and multisig key management; QCB-PM-001 adds zero-knowledge identity privacy as a separate research layer.  
 > **Completion rule:** No milestone is ✅ until implementation **and** adversarial tests pass.
@@ -339,21 +339,21 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 #### QCB-DIS-001 — Digital Identity Stone (QCB Native Wallet)
 
-*Goal: A scannable, post-quantum authentication protocol that lets users access QCB services without exposing private keys. The QR code is the doorway, not the key.*
+*Goal: A scannable, post-quantum authentication protocol that lets users access Qattice services without exposing private keys. The QR code is the doorway, not the key.*
 
 **Core architectural principles:**
 1. Private keys never leave the wallet — transactions are signed locally using ML-DSA.
 2. Scannable authentication — temporary QR challenges provide secure access without exposing signing secrets.
 3. Privacy-preserving identity — applications receive only the authorization or identity information they require.
 4. Post-quantum multisig — multiple owners can securely authorize treasury operations.
-5. Cryptographic adaptability — QCB can migrate to new algorithms if existing cryptography becomes vulnerable.
+5. Cryptographic adaptability — Qattice can migrate to new algorithms if existing cryptography becomes vulnerable.
 6. Network-wide security — post-quantum protections extend beyond wallets to validators and other critical authorization paths.
 7. Open-standard ambitions — QSWIP can eventually provide reusable security specifications for other Chain Forge chains.
 
 **Authentication flow:**
 ```
-User opens QCB app → QR challenge displayed
-  → User scans with QCB wallet on phone
+User opens Qattice app → QR challenge displayed
+  → User scans with Qattice wallet on phone
   → Wallet signs challenge using ML-DSA
   → Service verifies signature → grants access
   (Private key never leaves device; QR expires after use)
@@ -367,7 +367,7 @@ User opens QCB app → QR challenge displayed
 | B — Security hardening (DIS-001 Phase B) | Chain-ID binding in ML-DSA sigs, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality | ✅ Complete |
 | B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
-| D — Integration | Connect to QCB wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
+| D — Integration | Connect to Qattice wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
 | E — Security testing | QR replay, phishing, session hijacking, key compromise, identity correlation, account recovery | 🔲 |
 
 **DIS-001 Phase B — ✅ COMPLETE (2026-10-09):**
@@ -397,11 +397,11 @@ User opens QCB app → QR challenge displayed
 
 **Prerequisite:** QCB-CS-001 complete (defines the underlying migration architecture that the wallet must be built on).
 
-> **QSWIP-001 — Open Post-Quantum Wallet Identity Protocol**: Long-term open standard so other Chain Forge blockchains can reuse QCB's wallet identity and authentication infrastructure. Proposed; timing deferred until Phase B–D of QCB-DIS-001 is battle-tested.
+> **QSWIP-001 — Open Post-Quantum Wallet Identity Protocol**: Long-term open standard so other Chain Forge blockchains can reuse Qattice's wallet identity and authentication infrastructure. Proposed; timing deferred until Phase B–D of QCB-DIS-001 is battle-tested.
 
 #### QCB-PM-001 — Private Post-Quantum Threshold Authorization
 
-*Goal: Allow QCB identity holders to prove they are authorized — without revealing which identity they hold — using zero-knowledge or threshold credential mechanisms.*
+*Goal: Allow Qattice identity holders to prove they are authorized — without revealing which identity they hold — using zero-knowledge or threshold credential mechanisms.*
 
 | Item | Status | Notes |
 |---|---|---|
@@ -412,7 +412,7 @@ User opens QCB app → QR challenge displayed
 
 #### QCB-KR-001 — Post-Quantum Multisig Key Lifecycle
 
-*Goal: Protect QCB accounts, multisig treasuries, and authorized signers with secure key rotation, revocation, and recovery — without ever accidentally locking legitimate owners out of their assets.*
+*Goal: Protect Qattice accounts, multisig treasuries, and authorized signers with secure key rotation, revocation, and recovery — without ever accidentally locking legitimate owners out of their assets.*
 
 Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise Authorization Tree.
 
@@ -485,7 +485,7 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 
 ### Dual Resource Participation — Machine Modes
 
-> **What this is**: A machine running a QCB Resource Node is not required to sell capacity to commercial customers. It can contribute capacity directly to QCB network infrastructure instead — or do both simultaneously, subject to the owner's policy.
+> **What this is**: A machine running a Qattice Resource Node is not required to sell capacity to commercial customers. It can contribute capacity directly to Qattice network infrastructure instead — or do both simultaneously, subject to the owner's policy.
 
 ```
                          MACHINE
@@ -514,7 +514,7 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 | `MachineMode` flag on `MachineRecord` | ⬜ | `enum MachineMode { MarketplaceOnly, ContributionOnly, Both }`; persisted in machine registration |
 | Machine owner resource policy | ⬜ | Owner declares: GPU%, storage TB, bandwidth Mbps, hours window, allowed modes; respected by resource node at runtime |
 | `NetworkContributionJob` type | ⬜ | QCB-assigned workload submitted to a machine in Contribution Mode; structured as a well-defined task with verifiable output (storage proof, compute proof, etc.) — not open-ended execution |
-| `UsefulWorkReceipt` | ⬜ | Receipt for a completed `NetworkContributionJob`; shares shape with `ResourceExecutionReceipt` (job_id, machine_id, work_type, proof, verification_status) but payer is the QCB network contribution pool, not a customer agent; a `receipt_type` field distinguishes the two — avoid two entirely separate receipt types |
+| `UsefulWorkReceipt` | ⬜ | Receipt for a completed `NetworkContributionJob`; shares shape with `ResourceExecutionReceipt` (job_id, machine_id, work_type, proof, verification_status) but payer is the Qattice network contribution pool, not a customer agent; a `receipt_type` field distinguishes the two — avoid two entirely separate receipt types |
 | Network Contribution Pool coordinator | ⬜ | Assigns `NetworkContributionJob`s to available machines in Contribution Mode; defines what work is legitimately available; must be decentralized in Phase 2+ |
 
 ### Useful Contribution / uQCB — Verified Network Work
@@ -586,13 +586,13 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 
 ---
 
-## QCB Grand Challenge — Long-Term Distributed Research Compute
+## Qattice Grand Challenge — Long-Term Distributed Research Compute
 
-> **What this is**: When commercial demand is absent, voluntarily contributed QCB resources can be directed toward objectively verifiable computational challenges intended to advance cryptography, mathematics, computational efficiency, and machine-assisted discovery. This is not consensus. Personhood-anchored BFT remains solely responsible for block production and finality. The Grand Challenge and network contribution sit above consensus as productive economic and research layers.
+> **What this is**: When commercial demand is absent, voluntarily contributed Qattice resources can be directed toward objectively verifiable computational challenges intended to advance cryptography, mathematics, computational efficiency, and machine-assisted discovery. This is not consensus. Personhood-anchored BFT remains solely responsible for block production and finality. The Grand Challenge and network contribution sit above consensus as productive economic and research layers.
 >
-> **Long-term research principle**: QCB does not ask machines to compute meaningless hashes. When machines contribute capacity to the network, that capacity is directed toward useful, objectively verifiable work — including research challenges with real scientific or cryptographic value.
+> **Long-term research principle**: Qattice does not ask machines to compute meaningless hashes. When machines contribute capacity to the network, that capacity is directed toward useful, objectively verifiable work — including research challenges with real scientific or cryptographic value.
 >
-> **Safety boundary** (hard constraint): Discoveries never automatically change QCB protocol behavior. Any finding that could affect protocol cryptography must pass independent expert review, formal security analysis, adversarial testing, and explicit QCB governance approval before it influences any protocol parameter. Research and governance are entirely separate.
+> **Safety boundary** (hard constraint): Discoveries never automatically change Qattice protocol behavior. Any finding that could affect protocol cryptography must pass independent expert review, formal security analysis, adversarial testing, and explicit Qattice governance approval before it influences any protocol parameter. Research and governance are entirely separate.
 
 ### Grand Challenge Tracks
 
@@ -615,7 +615,7 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 | Research `UsefulWorkReceipt` variant | ✅ | `work_type: ResearchContribution`; includes output hash, methodology reference, verifier ID; same anti-farming defenses as other contribution jobs. **Simulation proven 2026-10-06 — see `grand-challenge/simulations/GC-DEVNET-001`** |
 | Discovery reward schedule | 🔲 | Predetermined pool per track; governance-approved before any track goes live; rewards are fixed/predefined, not minted on discovery |
 | Independent verifier registry | 🔲 | Track-specific domain experts registered on-chain; discovery claims require independent verification before reward release |
-| Formal safety review gate | 🔲 | Any cryptographic finding that could affect QCB protocol must pass: independent expert review → formal/security analysis → adversarial testing → governance vote; no automatic protocol changes |
+| Formal safety review gate | 🔲 | Any cryptographic finding that could affect Qattice protocol must pass: independent expert review → formal/security analysis → adversarial testing → governance vote; no automatic protocol changes |
 
 ### Useful Hash Commitments — BTC Ecosystem Integration
 
@@ -671,9 +671,9 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 
 ---
 
-## QCB Equilibrium State — When the Network Becomes Alive
+## Qattice Equilibrium State — When the Network Becomes Alive
 
-> Equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. Below equilibrium, QCB is a blockchain with a research layer. Above equilibrium, it is a trustworthy distributed supercomputer: self-sustaining, self-healing, and capable of scientific work no individual machine or centralized facility could reach.
+> Equilibrium is not a launch event. It is a threshold the network crosses — gradually, over years — as machines join, attestations accumulate, and the resource market deepens. Below equilibrium, Qattice is a blockchain with a research layer. Above equilibrium, it is a trustworthy distributed supercomputer: self-sustaining, self-healing, and capable of scientific work no individual machine or centralized facility could reach.
 
 ### Equilibrium Criteria
 
@@ -699,9 +699,9 @@ All five conditions must hold simultaneously and sustain for a meaningful period
 
 ### Timeline Honesty
 
-Reaching Equilibrium State will take years. Bitcoin took years to harden its consensus under real adversarial conditions. Ethereum took years to reach the validator depth where its consensus felt genuinely robust. QCB accepts the same timeline — and names it here rather than implying otherwise.
+Reaching Equilibrium State will take years. Bitcoin took years to harden its consensus under real adversarial conditions. Ethereum took years to reach the validator depth where its consensus felt genuinely robust. Qattice accepts the same timeline — and names it here rather than implying otherwise.
 
-The architectural commitment is different from the timeline: QCB is designed for equilibrium from the first block. The MachineID registry, ResourceExecutionReceipt accountability layer, Grand Challenge tracks, and hard safety boundary are not retrofits. They are load-bearing from day one, so that when the network reaches scale, the capability is already there waiting.
+The architectural commitment is different from the timeline: Qattice is designed for equilibrium from the first block. The MachineID registry, ResourceExecutionReceipt accountability layer, Grand Challenge tracks, and hard safety boundary are not retrofits. They are load-bearing from day one, so that when the network reaches scale, the capability is already there waiting.
 
 > No specific machine count is required for Equilibrium State. Scale is a means, not the definition. The five criteria above — not any headcount target — determine when equilibrium is reached.
 
@@ -709,7 +709,7 @@ The architectural commitment is different from the timeline: QCB is designed for
 
 ## Phase 3 — Merchant API + BME Activation
 
-**Goal**: Stripe-compatible payment API live; first real QCB buyback-and-burn.
+**Goal**: Stripe-compatible payment API live; first real Qattice buyback-and-burn.
 
 **Prerequisite**: Phase 2 identity pilot hitting targets.
 
@@ -752,7 +752,7 @@ The architectural commitment is different from the timeline: QCB is designed for
 |------|--------|-------|
 | Permissioned EVM (`chain-forge-evm`) | 🔲 | Every contract needs SponsorID; see whitepaper §7.2 and Open Q23 |
 | Sponsored Contracts (Solidity + identity constraints) | 🔲 | Subclass of Charmed Agent; EVM opcode subset TBD (Open Q23e) |
-| RWA issuance layer | 🔲 | Tokenized assets via permissioned EVM; QCB compliance-at-protocol-layer |
+| RWA issuance layer | 🔲 | Tokenized assets via permissioned EVM; Qattice compliance-at-protocol-layer |
 | Governance succession (post-founder) | ❓ | Open Q10 |
 | Interoperability (PoP-preserving bridge only) | 🔲 | Forbidden until chain stable and identity proven; Open Q per §7.1 |
 | Post-quantum verification services — external verification API | 🔲 | `POST /api/verify/credential`, `GET /api/attestation/{subject}`, `POST /api/verify/signature`; public key for verifying Qattice's own attestation signatures. Whitepaper §10.4. Contingent on the identity pilot succeeding — see §4 |
@@ -842,9 +842,9 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 ## Phase 0d — Proof of Cryptographic Discovery (PoCD) Scaffold
 
-**Goal**: Build the reusable `chain-forge-pocd` crate so any blockchain created with Chain Forge can opt into PoCD mining.  QCB Chain will be the first integrator.
+**Goal**: Build the reusable `chain-forge-pocd` crate so any blockchain created with Chain Forge can opt into PoCD mining.  Qattice will be the first integrator.
 
-**Design principle**: The crate is fully chain-agnostic — no QRC, uQRC, or QCB hardcoding.  Chains wire in their own `RewardPolicy` implementation and `PoCDConfig`.
+**Design principle**: The crate is fully chain-agnostic — no QRC, uQRC, or Qattice hardcoding.  Chains wire in their own `RewardPolicy` implementation and `PoCDConfig`.
 
 ### PoCD Crate (`chain-forge-pocd`)
 
@@ -863,12 +863,12 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 | `DiscoveryVerifier` trait | ✅ **DONE** | `verify_result` (domain-specific) + `verify_identity` (optional); `build_receipt` helper |
 | `cargo build -p chain-forge-pocd` passes | ✅ **DONE (2026-10-08)** | Clean compile, zero warnings |
 
-### QCB PoCD Integration (next phase)
+### Qattice PoCD Integration (next phase)
 
 | Item | Status | Notes |
 |------|--------|-------|
 | `QcbRewardPolicy` in `chain-forge-qrc` | ✅ | Pays rewards in uQRC; implements `RewardPolicy` trait; difficulty + track multipliers; pro-rata epoch pool cap; full test suite |
-| Wire `PoCDConfig` into QCB genesis | ✅ | `genesis.pocd: Option<serde_json::Value>` in `chain-forge-core`; node parses at startup into `PoCDConfig`; `pocd_registry` Arc<Mutex> wired through to API |
+| Wire `PoCDConfig` into Qattice genesis | ✅ | `genesis.pocd: Option<serde_json::Value>` in `chain-forge-core`; node parses at startup into `PoCDConfig`; `pocd_registry` Arc<Mutex> wired through to API |
 | PoCD API endpoints | ✅ | `GET /api/pocd/challenges`, `GET /api/pocd/receipts`, `POST /api/pocd/submit`; self-verifies seal in Phase 0; no external verifier sig required |
 | First live PoCD mining round on devnet | ✅ | `scripts/phase0_pocd_test.py` — mines 4-bit seal, submits proof, verifies receipt; runs against live devnet |
 | `QcbVerifier` adapter | ⬜ | Wraps identity layer + `chain-forge-resource` scientific receipt; Phase 1 |
@@ -1027,7 +1027,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 | # | Topic | Urgency |
 |---|-------|---------|
 | Q1 | Final identity layer design; pilot cost/sybil targets | 🔴 High — gates everything |
-| Q2 | BFT variant selection for QCB | 🟡 Medium — all three variants shipped; selection decision now unblocked |
+| Q2 | BFT variant selection for Qattice | 🟡 Medium — all three variants shipped; selection decision now unblocked |
 | Q5 | Jurisdiction / legal entity | 🔴 High — needed before mainnet |
 | Q9 | Identity replacement constitutional mechanism | 🟡 Medium |
 | Q10 | Governance succession past founder control | 🟡 Medium |
