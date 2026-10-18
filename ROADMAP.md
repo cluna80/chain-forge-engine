@@ -264,7 +264,8 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 | Milestone | Technology | Status |
 |---|---|---|
-| **QCB-CS-001** | Cryptographic Survivability and Migration | ⬜ Phase 1 |
+| **QCB-CS-001** | Cryptographic Survivability and Migration | 🔄 P1+P2+P3 complete; P4 tracked |
+| **QCB-ZKP-001** | ZK Block Proving — Hash-Based STARKs | 🔲 Research / long-horizon |
 | **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B complete |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
@@ -272,18 +273,69 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 
 #### QCB-CS-001 — Cryptographic Survivability and Migration
 
-*Goal: Ensure QCB can safely migrate to different cryptographic algorithms if an existing algorithm becomes vulnerable to AI-assisted cryptanalysis, quantum computing, or other attacks.*
+*Goal: Ensure Qattice can safely migrate to different cryptographic algorithms if an existing algorithm becomes vulnerable to AI-assisted cryptanalysis, quantum computing, or other attacks.*
+
+**Branch:** `security/cs-001-crypto-hardening` | **Full inventory:** `docs/security/QCB-CS-001-crypto-inventory.md`
+
+**Completed (2026-10-17) — branch `security/cs-001-crypto-hardening`:**
+- ✅ **CS-001-H1** — Scheme-versioned address derivation: `AddressScheme` enum; `qcb1pq{hex}` namespace for PQ keys; classical addresses remain `qcb1{hex}`. All derivation sites delegate to `Address::from_public_key_schemed()`.
+- ✅ **CS-001-H2** — `sig_scheme: Option<SchemeId>` on `Transaction`; signer stamps it, verifier dispatches explicitly; legacy `None` falls back to prefix scan. Enables live algorithm migration without hard fork.
+- ✅ **CS-001-M1** — `MLDSA_TX_DOMAIN_V1` and `ED25519_TX_DOMAIN_V1` as `pub const` in `chain-forge-crypto`. Single authoritative source for signing domain separation.
+- ✅ **CS-001-M2** — `mldsa_tx_prehash(chain_id, body_json) -> [u8; 32]` helper. Replaced 5 independent inline SHA-256 signing blocks across execution, wallet, scheduler.
+- ✅ **CS-001-L1** — `chain-forge-qrc/pocd_reward.rs` claim_id derivation routes through `ChainHash` (SHA-3-256); raw `sha2` dep removed from that crate.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| Complete cryptographic dependency inventory | ⬜ | Audit every hash function, signature scheme, and KDF used across all Chain Forge / QCB crates |
-| Public-key exposure audit across QCB | ⬜ | Identify every place a public key is stored on-chain or transmitted; classify exposure risk |
-| Post-quantum authentication for critical operations | ⬜ | Validator signing, treasury multisig, governance votes — must tolerate PQ threat model |
-| Pluggable signature algorithms (`chain-forge-crypto`) | ⬜ | `SignatureScheme` trait with versioned algorithm identifiers; builds on existing `chain-forge-consensus` pluggability work |
-| Safe cryptographic migration procedures | ⬜ | Documented + tested path: old algorithm → new algorithm without disrupting in-flight transactions or active multisig sets |
-| Emergency algorithm-deprecation mechanism | ⬜ | Governance tx to flag an algorithm as deprecated; grace period for key rotation; hard cutoff enforcement in consensus |
-| Simulated cryptographic compromise tests | ⬜ | Deliberately treat one scheme as "broken"; verify network migrates cleanly under simulated adversarial conditions |
-| Independent security review | 🔲 | Prerequisite: all above items pass; external review before mainnet |
+| Complete cryptographic dependency inventory | ✅ | `docs/security/QCB-CS-001-crypto-inventory.md` — 14 crates audited |
+| Scheme-versioned address derivation (CS-001-H1) | ✅ | `qcb1pq` namespace for PQ; `qcb1` for classical |
+| Versioned signature scheme tag on all transactions (CS-001-H2) | ✅ | Live migration path exists without hard fork |
+| Canonical domain constants + pre-hash helper (CS-001-M1/M2) | ✅ | `MLDSA_TX_DOMAIN_V1`, `mldsa_tx_prehash()` in `chain-forge-crypto` |
+| Route non-signing hash sites through `ChainHash` (CS-001-L1) | ✅ | `pocd_reward.rs` claim_id now uses SHA-3-256 |
+| BLS12-381 / Groth16 ZK migration (CS-001-L2) | 🔲 | Superseded by QCB-ZKP-001 (hash-based STARKs preferred over pairing-based ZK) |
+| libp2p PQ transport (CS-001-L3) | 🔲 | Follow upstream libp2p NIST PQC adoption |
+| Safe cryptographic migration procedures | ⬜ | Documented + tested path: old algorithm → new without disrupting in-flight txs |
+| Emergency algorithm-deprecation governance tx | ⬜ | Flag an algorithm deprecated; grace period for key rotation; hard cutoff in consensus |
+| Simulated cryptographic compromise tests | ⬜ | Treat one scheme as "broken"; verify network migrates cleanly under adversarial conditions |
+| Independent security review | 🔲 | Prerequisite: migration procedures + adversarial tests pass; external review before mainnet |
+
+---
+
+#### QCB-ZKP-001 — ZK Block Proving (Hash-Based STARKs)
+
+*Goal: Every Qattice block carries a cryptographic proof that its execution was correct — independently verifiable by any party without re-executing the block. Proof system must be post-quantum safe by construction.*
+
+**Motivation:** zkSync's Airbender Prime (2026) demonstrated real-time ZK block proving on a single GPU using hash-based STARKs (WHIR polynomial commitments + BLAKE2s/Keccak-256 + GKR sumcheck), achieving sub-10s proof generation for 99% of Ethereum mainnet blocks. This approach:
+- Is **inherently post-quantum** — no elliptic curve pairings; security reduces to hash collision resistance
+- **Supersedes the BLS12-381/Groth16 path** (CS-001-L2) — hash-based STARKs provide stronger long-term security without the quantum vulnerability of pairing-based systems
+- Enables **independent verification** — a standalone verifier checks block validity without running a full node; directly supports the RedTeam suite and external auditors
+- Makes **compromised execution servers unable to forge valid state transitions** — even a fully compromised node cannot produce a proof for an invalid block
+
+**Proof system primitives (target):**
+
+| Primitive | Role | PQ-safe? |
+|---|---|---|
+| Hash-based STARKs | Proof system backbone | ✅ (hash security only) |
+| WHIR polynomial commitments | Fast polynomial IOP | ✅ |
+| BLAKE2s / SHA-3 | Hash primitive | ✅ |
+| GKR sumcheck | Efficient circuit evaluation | ✅ |
+| No BN254 / BLS12-381 pairings | Eliminated | N/A — removed |
+
+**Rust ecosystem to track:**
+- [`stwo`](https://github.com/starkware-libs/stwo) — StarkWare's next-gen STARK prover (Circle STARKs, Rust)
+- [`plonky3`](https://github.com/Plonky3/Plonky3) — modular STARK framework (Polygon/external, Rust)
+- [`whir`](https://github.com/WizardOfMenlo/whir) — WHIR polynomial commitment reference implementation
+
+**Implementation phases:**
+
+| Phase | Scope | Status |
+|---|---|---|
+| Research | Track `stwo` / `plonky3` maturity; define Qattice execution circuit formally | 🔲 Ongoing |
+| Circuit design | Formalize what "valid Qattice block" means as an arithmetic circuit over `chain-forge-execution` output | 🔲 After execution stabilizes |
+| Prover integration | Wire STARK prover to block production in `chain-forge-scheduler` | 🔲 12–24 months |
+| Verifier | Standalone block verifier; integrate into `chain-forge-consensus` and RedTeam suite | 🔲 |
+| Real-time proving | Single-GPU target (RTX class); benchmark against Airbender Prime baseline | 🔲 Long-horizon |
+
+**Prerequisites:** `chain-forge-execution` state model stable; CS-001-H1/H2 merged to main (execution circuit must reflect versioned signature scheme).
 
 #### QCB-DIS-001 — Digital Identity Stone (QCB Native Wallet)
 
