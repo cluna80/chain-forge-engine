@@ -3073,10 +3073,13 @@ impl Node {
         // `execute_block_with_identity`) rather than a separately-filtered
         // zip that could silently misalign if two such txs land in one
         // block.
-        let register_key_attempts: Vec<(usize, String, Vec<u8>)> = txs.iter().enumerate()
+        // Tuple: (tx_index, sender, consensus_pubkey, scheme)
+        let register_key_attempts: Vec<(usize, String, Vec<u8>, String)> = txs.iter().enumerate()
             .filter_map(|(i, t)| {
-                if let chain_forge_execution::TxBody::RegisterValidatorKey { consensus_pubkey, .. } = &t.body {
-                    Some((i, t.sender.clone(), consensus_pubkey.clone()))
+                if let chain_forge_execution::TxBody::RegisterValidatorKey {
+                    consensus_pubkey, scheme, ..
+                } = &t.body {
+                    Some((i, t.sender.clone(), consensus_pubkey.clone(), scheme.clone()))
                 } else {
                     None
                 }
@@ -3162,12 +3165,22 @@ impl Node {
         // and the live ValidatorSet refresh.
         {
             let epoch = self.identity.clock.current_epoch;
-            for (idx, sender, pubkey) in &register_key_attempts {
+            for (idx, sender, pubkey, scheme) in &register_key_attempts {
                 let Some(result) = exec_result.tx_results.get(*idx) else { continue };
                 if !result.success {
                     continue;
                 }
-                if let Err(e) = self.validator_registry.register_consensus_key(sender, pubkey, epoch) {
+                // PQ-VAL-001: store scheme alongside key so gate_voting_power
+                // (R3) can distinguish ML-DSA-only validators.
+                let effective_scheme = if scheme.is_empty() { "classical" } else { scheme.as_str() };
+                let reg_result = if effective_scheme != "classical" {
+                    self.validator_registry.register_consensus_key_with_scheme(
+                        sender, pubkey, epoch, effective_scheme,
+                    )
+                } else {
+                    self.validator_registry.register_consensus_key(sender, pubkey, epoch)
+                };
+                if let Err(e) = reg_result {
                     warn!(
                         validator = %sender,
                         error     = %e,
@@ -3359,16 +3372,33 @@ impl Node {
                 // unaffected), look up the actual bonded amount from
                 // state and restore it.
                 if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
-                    let bond_addr = format!(
-                        "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
-                    );
-                    let bonded = self.state.get_account(&bond_addr)
-                        .map(|a| a.balance_of(self.executor.native_denom()))
-                        .unwrap_or(0);
-                    if bonded > 0 {
-                        v.voting_power = bonded.min(u64::MAX as u128) as u64;
-                        any_changed = true;
-                        info!(validator = %v.id, voting_power = v.voting_power, "consensus key gate: voting power restored from bonded stake");
+                    // PQ-VAL-001 / R3: ML-DSA-only validators must NOT receive
+                    // voting power in this milestone.  The consensus vote verifier
+                    // in commit_block is still classical-only; admitting an
+                    // ML-DSA-only validator would permanently stall liveness because
+                    // its precommits can never be verified.  Gate removed by PQ-VAL-002
+                    // once the consensus verifier is updated.
+                    let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
+                        .unwrap_or("classical");
+                    if scheme == "ml-dsa-65" {
+                        warn!(
+                            validator = %v.id,
+                            "R3 consensus gate: ML-DSA-only validator kept at voting_power=0 \
+                             until PQ-VAL-002 activates the ML-DSA consensus verifier"
+                        );
+                        // Leave voting_power at 0 — do not restore.
+                    } else {
+                        let bond_addr = format!(
+                            "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
+                        );
+                        let bonded = self.state.get_account(&bond_addr)
+                            .map(|a| a.balance_of(self.executor.native_denom()))
+                            .unwrap_or(0);
+                        if bonded > 0 {
+                            v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                            any_changed = true;
+                            info!(validator = %v.id, voting_power = v.voting_power, "consensus key gate: voting power restored from bonded stake");
+                        }
                     }
                 }
             }
@@ -3733,10 +3763,13 @@ impl Node {
 
         // CF-VAL-KEY-002: same snapshot-before-consume as the multi-node
         // commit_block path -- see that path's full comment.
-        let register_key_attempts: Vec<(usize, String, Vec<u8>)> = txs.iter().enumerate()
+        // Tuple: (tx_index, sender, consensus_pubkey, scheme)
+        let register_key_attempts: Vec<(usize, String, Vec<u8>, String)> = txs.iter().enumerate()
             .filter_map(|(i, t)| {
-                if let chain_forge_execution::TxBody::RegisterValidatorKey { consensus_pubkey, .. } = &t.body {
-                    Some((i, t.sender.clone(), consensus_pubkey.clone()))
+                if let chain_forge_execution::TxBody::RegisterValidatorKey {
+                    consensus_pubkey, scheme, ..
+                } = &t.body {
+                    Some((i, t.sender.clone(), consensus_pubkey.clone(), scheme.clone()))
                 } else {
                     None
                 }
@@ -3812,12 +3845,20 @@ impl Node {
         // verified before this tx could succeed at all.
         {
             let epoch = self.identity.clock.current_epoch;
-            for (idx, sender, pubkey) in &register_key_attempts {
+            for (idx, sender, pubkey, scheme) in &register_key_attempts {
                 let Some(result) = exec_result.tx_results.get(*idx) else { continue };
                 if !result.success {
                     continue;
                 }
-                if let Err(e) = self.validator_registry.register_consensus_key(sender, pubkey, epoch) {
+                let effective_scheme = if scheme.is_empty() { "classical" } else { scheme.as_str() };
+                let reg_result = if effective_scheme != "classical" {
+                    self.validator_registry.register_consensus_key_with_scheme(
+                        sender, pubkey, epoch, effective_scheme,
+                    )
+                } else {
+                    self.validator_registry.register_consensus_key(sender, pubkey, epoch)
+                };
+                if let Err(e) = reg_result {
                     warn!(validator = %sender, error = %e, "consensus key registration mirror failed");
                 }
             }
@@ -3905,15 +3946,20 @@ impl Node {
                 // CF-VAL-KEY-002: same voting-power restoration as the
                 // multi-node commit_block path -- see that path's comment.
                 if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
-                    let bond_addr = format!(
-                        "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
-                    );
-                    let bonded = self.state.get_account(&bond_addr)
-                        .map(|a| a.balance_of(self.executor.native_denom()))
-                        .unwrap_or(0);
-                    if bonded > 0 {
-                        v.voting_power = bonded.min(u64::MAX as u128) as u64;
-                        any_changed = true;
+                    // PQ-VAL-001 / R3: ML-DSA-only validators stay at 0 power.
+                    let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
+                        .unwrap_or("classical");
+                    if scheme != "ml-dsa-65" {
+                        let bond_addr = format!(
+                            "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
+                        );
+                        let bonded = self.state.get_account(&bond_addr)
+                            .map(|a| a.balance_of(self.executor.native_denom()))
+                            .unwrap_or(0);
+                        if bonded > 0 {
+                            v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                            any_changed = true;
+                        }
                     }
                 }
             }
@@ -4566,6 +4612,11 @@ mod tests {
             body:      chain_forge_execution::TxBody::RegisterValidatorKey {
                 consensus_pubkey:    consensus_kp.public_key.clone(),
                 proof_of_possession: pop_sig.bytes,
+                // V1 classical legacy path: empty scheme triggers the
+                // backward-compat branch (treated as "classical"), and
+                // pop_version = 1 uses the V1 message (no pubkey binding).
+                scheme:              String::new(),
+                pop_version:         1,
             },
             gas_limit: 10_000,
             signature: vec![],
@@ -6689,5 +6740,645 @@ mod tests {
             node.explorer.lock().unwrap().blocks.len(), 4,
             "explorer must record four blocks with no gaps"
         );
+    }
+
+    // =========================================================================
+    // PQ-VAL-001 — ML-DSA Validator-Key Registration and Proof of Possession
+    //
+    // Spec: docs/pq-val-001-spec.md  Baseline: bda89a5
+    // Branch: feat/pq-val-001-mldsa-key-registration
+    //
+    // These 14 tests express the desired behaviour of the ML-DSA key
+    // registration pipeline.  On the baseline commit they WILL NOT COMPILE
+    // (tests 01–07, 09–14) because `TxBody::RegisterValidatorKey` has no
+    // `scheme` or `pop_version` fields and `validator_key_registration_signing_bytes_v2`
+    // does not yet exist.  The compile errors ARE the failure matrix.
+    //
+    // Test 08 (`classical_validator_path_unaffected`) runs against existing
+    // classical helpers and should pass on the baseline, serving as the
+    // regression anchor for the whole suite.
+    // =========================================================================
+
+    // ----- helpers for PQ-VAL-001 tests -------------------------------------
+
+    /// Generate an ML-DSA-65 keypair and derive the validator address from
+    /// the Ed25519-compatible first 32 bytes of the public key.
+    fn mldsa_keyed_candidate(seed: &str) -> (chain_forge_crypto::KeyPair, String) {
+        use chain_forge_crypto::MlDsaScheme;
+        let kp = MlDsaScheme.generate_keypair(seed).unwrap();
+        // ML-DSA public keys are 1952 bytes; Address derivation uses the full
+        // bytes (HashWidth::Bits256 hashes them down to 20 bytes for the bech32).
+        let addr = chain_forge_core::Address::from_public_key(
+            &kp.public_key, "qcb", chain_forge_core::HashWidth::Bits256,
+        ).to_string();
+        (kp, addr)
+    }
+
+    /// Build a `RegisterValidatorKey` transaction using the ML-DSA scheme and
+    /// V2 PoP format.  Requires the new `scheme` and `pop_version` fields.
+    fn mldsa_register_key_tx(
+        sender:       &str,
+        nonce:        u64,
+        consensus_kp: &chain_forge_crypto::KeyPair,
+        chain_id:     &str,
+        // account_kp is the Ed25519 key that signs the outer transaction envelope
+        account_kp:   &chain_forge_crypto::KeyPair,
+    ) -> Transaction {
+        use chain_forge_crypto::MlDsaScheme;
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            chain_id, sender, &consensus_kp.public_key,
+        );
+        let pop_sig = MlDsaScheme.sign(&pop_msg, consensus_kp).unwrap();
+        let mut tx = Transaction {
+            id:        format!("regkey-mldsa-{sender}-{nonce}"),
+            sender:    sender.to_string(),
+            nonce,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    consensus_kp.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(account_kp, chain_id).unwrap();
+        tx
+    }
+
+    /// Build a classical `RegisterValidatorKey` tx with explicit V2 PoP and
+    /// `scheme = "classical"`.  Used for test 12 (legacy compat).
+    fn classical_register_key_tx_v2(
+        sender:       &str,
+        nonce:        u64,
+        consensus_kp: &chain_forge_crypto::KeyPair,
+        chain_id:     &str,
+    ) -> Transaction {
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            chain_id, sender, &consensus_kp.public_key,
+        );
+        let pop_sig = ClassicalScheme.sign(&pop_msg, consensus_kp).unwrap();
+        let mut tx = Transaction {
+            id:        format!("regkey-classical-v2-{sender}-{nonce}"),
+            sender:    sender.to_string(),
+            nonce,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    consensus_kp.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+                scheme:              "classical".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 10_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(consensus_kp, chain_id).unwrap();
+        tx
+    }
+
+    // ----- PQ-VAL-001 tests --------------------------------------------------
+
+    /// PQ-VAL-001 / Test 01
+    /// A validator with a bond, personhood, and a valid ML-DSA-65 + V2 PoP
+    /// can register their consensus key.  The key is stored in the registry.
+    #[tokio::test]
+    async fn mldsa_validator_key_registers_with_valid_pop() {
+        let (account_kp, addr) = keyed_candidate("pq001-t01-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t01-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr)
+            .expect("validator must appear in the active set after ML-DSA key registration");
+        assert!(!v.public_key.is_empty(), "registered ML-DSA key must be non-empty");
+        assert_eq!(v.public_key, mldsa_kp.public_key,
+            "stored key must match the submitted ML-DSA public key");
+        assert!(v.pop_verified, "personhood gate must still be satisfied");
+    }
+
+    /// PQ-VAL-001 / Test 02
+    /// A PoP signed by a *different* ML-DSA private key (attacker key) must
+    /// be rejected.  The public key field carries the legitimate key but the
+    /// signature was produced by a different private key.
+    #[tokio::test]
+    async fn mldsa_pop_with_wrong_private_key_is_rejected() {
+        use chain_forge_crypto::MlDsaScheme;
+        let (account_kp, addr) = keyed_candidate("pq001-t02-account");
+        let (legit_kp, _)      = mldsa_keyed_candidate("pq001-t02-legit");
+        let (attacker_kp, _)   = mldsa_keyed_candidate("pq001-t02-attacker");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // Sign the V2 PoP with the attacker's private key but submit the
+        // legitimate public key — should fail PoP verification.
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            node.chain_id(), &addr, &legit_kp.public_key,
+        );
+        let bad_sig = MlDsaScheme.sign(&pop_msg, &attacker_kp).unwrap();
+        let mut tx = Transaction {
+            id:        "regkey-mldsa-t02".to_string(),
+            sender:    addr.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    legit_kp.public_key.clone(),
+                proof_of_possession: bad_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // The tx must have failed: no key stored, validator absent or keyless.
+        node.propose_block(cert2.block_hash).await.unwrap();
+        let vs = node.consensus.validator_set();
+        let has_key = vs.validators.iter()
+            .any(|v| v.id.0 == addr && !v.public_key.is_empty());
+        assert!(!has_key, "validator must NOT have a key after wrong-key PoP");
+    }
+
+    /// PQ-VAL-001 / Test 03
+    /// A PoP built over the wrong chain_id (cross-chain replay attempt) must
+    /// be rejected even though the signature is valid for that wrong message.
+    #[tokio::test]
+    async fn mldsa_pop_with_wrong_chain_id_is_rejected() {
+        use chain_forge_crypto::MlDsaScheme;
+        let (account_kp, addr) = keyed_candidate("pq001-t03-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t03-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // Build a valid PoP but over a foreign chain_id.
+        let wrong_chain_id = "qcb-foreign-chain";
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            wrong_chain_id, &addr, &mldsa_kp.public_key,
+        );
+        let pop_sig = MlDsaScheme.sign(&pop_msg, &mldsa_kp).unwrap();
+        let mut tx = Transaction {
+            id:        "regkey-mldsa-t03".to_string(),
+            sender:    addr.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        node.propose_block(cert2.block_hash).await.unwrap();
+        let vs = node.consensus.validator_set();
+        let has_key = vs.validators.iter()
+            .any(|v| v.id.0 == addr && !v.public_key.is_empty());
+        assert!(!has_key, "cross-chain PoP replay must be rejected");
+    }
+
+    /// PQ-VAL-001 / Test 04
+    /// Submitting a valid ML-DSA registration without first bonding must be
+    /// rejected (bond gate precedes key registration in the admission pipeline).
+    #[tokio::test]
+    async fn mldsa_pop_without_bond_is_rejected() {
+        let (account_kp, addr) = keyed_candidate("pq001-t04-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t04-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Fund but do NOT bond.
+        const GAS_BUFFER: u128 = 10_000;
+        node.submit_tx(Transaction::transfer(
+            "fund-t04", "qcb1alice", &addr, "uqcb", 2_000_000 + GAS_BUFFER, 0,
+        ));
+        let cert = node.propose_block(genesis_hash).await.unwrap();
+
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let in_active = vs.validators.iter().any(|v| v.id.0 == addr);
+        assert!(!in_active,
+            "unbonded validator must not appear in the active set after key registration");
+    }
+
+    /// PQ-VAL-001 / Test 05
+    /// A bonded validator who registers an ML-DSA key but has NOT obtained
+    /// verified personhood must have `voting_power == 0` (personhood gate).
+    #[tokio::test]
+    async fn mldsa_pop_without_personhood_has_zero_power() {
+        let (account_kp, addr) = keyed_candidate("pq001-t05-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t05-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Fund + bond, but skip personhood.
+        const GAS_BUFFER: u128 = 10_000;
+        node.submit_tx(Transaction::transfer(
+            "fund-t05", "qcb1alice", &addr, "uqcb", 2_000_000 + GAS_BUFFER, 0,
+        ));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        node.submit_tx(Transaction::bond_validator("bond-t05", &addr, 2_000_000, 0));
+        let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
+
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        node.propose_block(cert1.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        if let Some(v) = vs.validators.iter().find(|v| v.id.0 == addr) {
+            assert_eq!(v.voting_power, 0,
+                "bonded-but-unverified ML-DSA validator must have zero voting_power");
+        }
+        // If absent from set, that also satisfies zero-power requirement.
+    }
+
+    /// PQ-VAL-001 / Test 06
+    /// Submitting a classical (Ed25519) PoP signature for an ML-DSA public key
+    /// must be rejected: scheme declared is "ml-dsa-65" but the verifier would
+    /// need an ML-DSA signature, not a classical one.
+    #[tokio::test]
+    async fn classical_pop_on_mldsa_key_is_rejected() {
+        let (account_kp, addr) = keyed_candidate("pq001-t06-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t06-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // Build a PoP but sign it with classical Ed25519.
+        // The tx claims scheme = "ml-dsa-65" so the executor must use the
+        // ML-DSA verifier, which will reject this Ed25519 signature.
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            node.chain_id(), &addr, &mldsa_kp.public_key,
+        );
+        let classical_sig = ClassicalScheme.sign(&pop_msg, &account_kp).unwrap();
+        let mut tx = Transaction {
+            id:        "regkey-classical-on-mldsa-t06".to_string(),
+            sender:    addr.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp.public_key.clone(),
+                proof_of_possession: classical_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        node.propose_block(cert2.block_hash).await.unwrap();
+        let vs = node.consensus.validator_set();
+        let has_mldsa_key = vs.validators.iter()
+            .any(|v| v.id.0 == addr && !v.public_key.is_empty());
+        assert!(!has_mldsa_key,
+            "classical PoP on ML-DSA key must be rejected by scheme-aware executor");
+    }
+
+    /// PQ-VAL-001 / Test 07
+    /// An ML-DSA consensus key persists across a node restart (serialised to
+    /// disk and reloaded correctly).
+    #[tokio::test]
+    async fn mldsa_validator_key_survives_restart() {
+        let (account_kp, addr) = keyed_candidate("pq001-t07-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t07-mldsa");
+        let dir = std::env::temp_dir()
+            .join(format!("pq-val-001-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // --- Phase 1: register key, persist state ---
+        let height_before = {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert = fund_bond_and_verify_personhood(
+                &mut node, &addr, 2_000_000, genesis_hash,
+            ).await;
+            node.submit_tx(mldsa_register_key_tx(
+                &addr, 1, &mldsa_kp, node.chain_id(), &account_kp,
+            ));
+            node.propose_block(cert.block_hash).await.unwrap();
+            node.persist_state();
+            node.state.current_height()
+        };
+
+        // --- Phase 2: reload from disk, verify key is still there ---
+        let mut restarted = Node::new(GENESIS, None).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state(), "state must reload from disk");
+        assert_eq!(restarted.consensus.current_height(), height_before,
+            "height must be restored after restart");
+
+        let vs = restarted.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr)
+            .expect("validator must be present after restart");
+        assert_eq!(v.public_key, mldsa_kp.public_key,
+            "ML-DSA key must be identical after node restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PQ-VAL-001 / Test 08 — REGRESSION ANCHOR
+    /// All CF-DEVNET-VAL-001 classical key registration tests must still pass
+    /// after PQ-VAL-001 changes.  This test re-runs the primary happy path
+    /// (`bonded_validator_with_key_and_personhood_becomes_eligible`) to
+    /// confirm zero regression on the classical path.
+    #[tokio::test]
+    async fn classical_validator_path_unaffected() {
+        // Replicate the classical happy-path from CF-DEVNET-VAL-001.
+        // Uses the OLD `register_key_tx` helper (V1 PoP, no scheme field).
+        let (kp, addr) = keyed_candidate("pq001-t08-classical");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr)
+            .expect("classical validator must still be seated");
+        assert!(!v.public_key.is_empty(), "classical validator must have a real key");
+        assert_eq!(v.public_key, kp.public_key);
+        assert!(v.pop_verified);
+    }
+
+    /// PQ-VAL-001 / Test 09
+    /// V2 PoP binds the public key bytes.  Registering with key-A's PoP but
+    /// submitting key-B's bytes must be rejected (key substitution attack).
+    #[tokio::test]
+    async fn mldsa_pop_key_substitution_rejected() {
+        use chain_forge_crypto::MlDsaScheme;
+        let (account_kp, addr) = keyed_candidate("pq001-t09-account");
+        let (key_a, _)         = mldsa_keyed_candidate("pq001-t09-key-a");
+        let (key_b, _)         = mldsa_keyed_candidate("pq001-t09-key-b");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // Build a valid PoP for key-A…
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            node.chain_id(), &addr, &key_a.public_key,
+        );
+        let pop_sig = MlDsaScheme.sign(&pop_msg, &key_a).unwrap();
+        // …but submit key-B's public bytes.  V2 binds pubkey → verification fails.
+        let mut tx = Transaction {
+            id:        "regkey-mldsa-t09-substitution".to_string(),
+            sender:    addr.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    key_b.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        node.propose_block(cert2.block_hash).await.unwrap();
+        let vs = node.consensus.validator_set();
+        let has_key = vs.validators.iter()
+            .any(|v| v.id.0 == addr && !v.public_key.is_empty());
+        assert!(!has_key, "key substitution attack must be rejected by V2 PoP binding");
+    }
+
+    /// PQ-VAL-001 / Test 10
+    /// A `RegisterValidatorKey` tx with an unknown/unauthorised scheme must be
+    /// rejected with an "not authorized for validator registration" error.
+    #[tokio::test]
+    async fn unknown_scheme_is_rejected() {
+        let (account_kp, addr) = keyed_candidate("pq001-t10-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t10-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // Submit an ML-DSA key but claim an unauthorized scheme.
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            node.chain_id(), &addr, &mldsa_kp.public_key,
+        );
+        // Note: signing with ClassicalScheme since MlDsaScheme can't produce
+        // an "ed448" signature; the point is that the scheme string is rejected
+        // before verification even runs (fail-closed, R2).
+        let fake_sig = ClassicalScheme.sign(&pop_msg, &account_kp).unwrap();
+        let mut tx = Transaction {
+            id:        "regkey-unknown-scheme-t10".to_string(),
+            sender:    addr.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp.public_key.clone(),
+                proof_of_possession: fake_sig.bytes,
+                scheme:              "ed448".to_string(), // not in VALIDATOR_AUTHORIZED_SCHEMES
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        node.propose_block(cert2.block_hash).await.unwrap();
+        let vs = node.consensus.validator_set();
+        let has_key = vs.validators.iter()
+            .any(|v| v.id.0 == addr && !v.public_key.is_empty());
+        assert!(!has_key, "unknown scheme must be rejected fail-closed");
+    }
+
+    /// PQ-VAL-001 / Test 11
+    /// A tx that declares `scheme = "ml-dsa-65"` but supplies the wrong number
+    /// of key bytes must be rejected by the length guard before PoP verification.
+    #[tokio::test]
+    async fn malformed_mldsa_key_fails_closed() {
+        let (account_kp, addr) = keyed_candidate("pq001-t11-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // 32 bytes — correct for Ed25519, wrong for ML-DSA-65 (needs 1952 bytes).
+        let short_key = vec![0xdeu8; 32];
+        let dummy_sig  = vec![0u8; 64];
+        let mut tx = Transaction {
+            id:        "regkey-malformed-t11".to_string(),
+            sender:    addr.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    short_key,
+                proof_of_possession: dummy_sig,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        node.propose_block(cert2.block_hash).await.unwrap();
+        let vs = node.consensus.validator_set();
+        let has_key = vs.validators.iter()
+            .any(|v| v.id.0 == addr && !v.public_key.is_empty());
+        assert!(!has_key, "malformed ML-DSA key (wrong length) must be rejected fail-closed");
+    }
+
+    /// PQ-VAL-001 / Test 12
+    /// Classical validators that were registered with the V1 PoP format
+    /// (legacy, no pubkey binding) must still be accepted so existing devnet
+    /// state is not broken.  This is the R1 backward-compat requirement.
+    #[tokio::test]
+    async fn classical_v1_pop_compat_preserved() {
+        let (kp, addr) = keyed_candidate("pq001-t12-classical-v1");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // Use the pre-PQ-VAL-001 classical helper which uses V1 PoP (no pubkey
+        // binding, no scheme/pop_version fields in the old struct).
+        // After PQ-VAL-001 implementation this tx must use the new struct with
+        // scheme = "classical", pop_version = 1.
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr)
+            .expect("classical V1 PoP validator must still be admitted");
+        assert!(!v.public_key.is_empty(), "classical V1 key must be stored");
+        assert_eq!(v.public_key, kp.public_key, "stored key must match");
+    }
+
+    /// PQ-VAL-001 / Test 13
+    /// A validator that has ONLY an ML-DSA key (no classical key) must have
+    /// `voting_power == 0` in this milestone (R3 — consensus verifier not yet
+    /// updated for ML-DSA, so admitting such a validator would harm liveness).
+    #[tokio::test]
+    async fn mldsa_only_validator_has_zero_voting_power() {
+        let (account_kp, addr) = keyed_candidate("pq001-t13-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq001-t13-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Full happy path for an ML-DSA-only validator (bond + personhood + key).
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v_power = vs.validators.iter()
+            .find(|v| v.id.0 == addr)
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert_eq!(v_power, 0,
+            "ML-DSA-only validator must have voting_power == 0 until PQ-VAL-002 (R3)");
+    }
+
+    /// PQ-VAL-001 / Test 14
+    /// A valid V2 PoP for alice must not be replayable by bob.  The sender
+    /// address is bound in the V2 message, so bob's registration tx (sender=bob)
+    /// will fail PoP verification even if the signature is over alice's address.
+    #[tokio::test]
+    async fn mldsa_pop_cross_validator_replay_rejected() {
+        use chain_forge_crypto::MlDsaScheme;
+        let (account_kp_alice, alice) = keyed_candidate("pq001-t14-alice-account");
+        let (account_kp_bob,   bob)   = keyed_candidate("pq001-t14-bob-account");
+        let (mldsa_kp, _)             = mldsa_keyed_candidate("pq001-t14-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Both alice and bob have bonds and personhood.
+        let cert = fund_bond_and_verify_personhood(&mut node, &alice, 2_000_000, genesis_hash).await;
+        let cert = fund_bond_and_verify_personhood(&mut node, &bob, 2_000_000, cert.block_hash).await;
+
+        // Alice produces a valid V2 PoP for her address…
+        let alice_pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            node.chain_id(), &alice, &mldsa_kp.public_key,
+        );
+        let alice_pop_sig = MlDsaScheme.sign(&alice_pop_msg, &mldsa_kp).unwrap();
+
+        // …but Bob submits it as if it were his own (sender=bob, sig over alice's msg).
+        let mut tx = Transaction {
+            id:        "regkey-mldsa-t14-replay".to_string(),
+            sender:    bob.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp.public_key.clone(),
+                proof_of_possession: alice_pop_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp_bob, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        node.propose_block(cert2.block_hash).await.unwrap();
+        let vs = node.consensus.validator_set();
+        let bob_has_key = vs.validators.iter()
+            .any(|v| v.id.0 == bob && !v.public_key.is_empty());
+        assert!(!bob_has_key,
+            "cross-validator PoP replay (alice's sig submitted by bob) must be rejected");
     }
 }

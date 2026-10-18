@@ -452,6 +452,8 @@ fn build_register_key_tx(
         body:        TxBody::RegisterValidatorKey {
             consensus_pubkey:    consensus_kp.public_key.clone(),
             proof_of_possession: pop_sig.bytes,
+            scheme:              String::new(),
+            pop_version:         1,
         },
         gas_limit:   10_000,
         signature:   vec![],
@@ -1049,6 +1051,8 @@ fn invalid_proof_of_possession_rejected() {
         body:        TxBody::RegisterValidatorKey {
             consensus_pubkey:    consensus_kp.public_key.clone(),
             proof_of_possession: vec![0xde, 0xad, 0xbe, 0xef].into_iter().cycle().take(64).collect(),  // 64 bytes of garbage
+            scheme:              String::new(),
+            pop_version:         1,
         },
         gas_limit:   10_000,
         signature:   vec![],
@@ -1125,6 +1129,8 @@ fn forged_outer_signature_rejected() {
         body:        TxBody::RegisterValidatorKey {
             consensus_pubkey:    consensus_kp.public_key.clone(),
             proof_of_possession: pop_sig.bytes,
+            scheme:              String::new(),
+            pop_version:         1,
         },
         gas_limit:   10_000,
         signature:   vec![],
@@ -1212,6 +1218,8 @@ fn wrong_chain_id_in_pop_rejected() {
         body:        TxBody::RegisterValidatorKey {
             consensus_pubkey:    consensus_kp.public_key.clone(),
             proof_of_possession: pop_sig.bytes,
+            scheme:              String::new(),
+            pop_version:         1,
         },
         gas_limit:   10_000,
         signature:   vec![],

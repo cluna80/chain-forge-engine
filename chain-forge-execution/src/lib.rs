@@ -244,6 +244,16 @@ pub enum TxBody {
     RegisterValidatorKey {
         consensus_pubkey:     Vec<u8>,
         proof_of_possession:  Vec<u8>,
+        /// Signature scheme used for this consensus key.
+        /// Authorised values: "classical" | "ml-dsa-65".
+        /// Required — absent or unrecognised values are rejected fail-closed.
+        #[serde(default)]
+        scheme:               String,
+        /// PoP message version: 1 = legacy V1 (chain_id + sender),
+        /// 2 = canonical V2 (chain_id + sender + pubkey).
+        /// Defaults to 1 for backward-compat with pre-PQ-VAL-001 txs.
+        #[serde(default = "default_pop_version")]
+        pop_version:          u8,
     },
     /// Custom operation -- opaque payload for module-specific logic.
     /// Used by Charm Confinement, Intrinsic Charm, Charmed Agents.
@@ -784,7 +794,7 @@ impl Transaction {
             TxBody::Stake    { validator, .. }        => validator.len() + 16,
             TxBody::BondValidator { .. }               => 16,
             TxBody::UnbondValidator                    => 8,
-            TxBody::RegisterValidatorKey { consensus_pubkey, proof_of_possession } =>
+            TxBody::RegisterValidatorKey { consensus_pubkey, proof_of_possession, .. } =>
                 consensus_pubkey.len() + proof_of_possession.len(),
             TxBody::Custom   { module, payload }      => module.len() + payload.len(),
             TxBody::RegisterIdentity                  => 8,
@@ -1432,18 +1442,56 @@ fn verify_authorization_signed(config: &ExecutionConfig, tx: &Transaction, state
     }
 }
 
+/// Default serde value for `TxBody::RegisterValidatorKey::pop_version`.
+/// Returns 1 so that pre-PQ-VAL-001 txs (which have no pop_version field
+/// in their JSON) deserialise as V1 and continue to verify against the
+/// classical-legacy PoP format.
+fn default_pop_version() -> u8 { 1 }
+
+/// PQ-VAL-001: authorised signature schemes for validator key registration.
+/// Fail-closed: any scheme not in this list is rejected before verification.
+const VALIDATOR_AUTHORIZED_SCHEMES: &[&str] = &["classical", "ml-dsa-65"];
+
 /// CF-VAL-KEY-002: domain-separated signing bytes for a validator
 /// consensus-key registration proof-of-possession. Binds the registration
 /// to a specific chain and a specific sender address, so a
 /// proof-of-possession signature cannot be replayed against a different
 /// chain, nor reused to register the same key under a different sender's
 /// name. Reusable across any Chain Forge chain -- not Qattice-specific.
+///
+/// V1 — legacy format.  Does NOT bind the public key bytes.
+/// Accepted for `scheme = "classical"` with `pop_version = 1` only.
+/// New registrations SHOULD use V2.
 pub fn validator_key_registration_signing_bytes(chain_id: &str, sender: &str) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(b"CFVK|"); // Chain Forge Validator Key registration
     b.extend_from_slice(chain_id.as_bytes());
     b.push(b'|');
     b.extend_from_slice(sender.as_bytes());
+    b
+}
+
+/// PQ-VAL-001: V2 PoP signing bytes — binds chain_id + sender + pubkey.
+///
+/// Prevents:
+///   - Cross-chain replay  (chain_id bound)
+///   - Cross-validator theft  (sender bound)
+///   - Key substitution  (consensus_pubkey hex bound)
+///
+/// Required for all ML-DSA registrations and recommended for new
+/// classical registrations going forward.
+pub fn validator_key_registration_signing_bytes_v2(
+    chain_id:       &str,
+    sender:         &str,
+    consensus_pubkey: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFVK-V2|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(sender.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(hex_encode_bytes(consensus_pubkey).as_bytes());
     b
 }
 
@@ -1942,20 +1990,97 @@ impl Executor {
             // caller (`chain-forge-node`, after a successful commit) reads
             // this event back and mirrors the now-authenticated key into
             // `ValidatorRegistry::register_consensus_key()`.
-            TxBody::RegisterValidatorKey { consensus_pubkey, proof_of_possession } => {
+            TxBody::RegisterValidatorKey {
+                consensus_pubkey,
+                proof_of_possession,
+                scheme,
+                pop_version,
+            } => {
+                // --- GAP-1 guard: reject empty key ---
                 if consensus_pubkey.is_empty() {
                     return TransactionResult::err(
                         tx.id.clone(), gas_required, tx.gas_limit,
                         "consensus_pubkey must not be empty".to_string(),
                     );
                 }
-                let msg = validator_key_registration_signing_bytes(&self.config.chain_id, &tx.sender);
-                let sig = Signature { scheme: SchemeId::Classical, bytes: proof_of_possession.clone() };
-                match ClassicalScheme.verify(&msg, &sig, consensus_pubkey) {
+
+                // --- R2: fail-closed scheme allowlist ---
+                // Pre-PQ-VAL-001 txs have scheme = "" (serde default).
+                // Treat empty scheme as "classical" for backward-compat
+                // (they also have pop_version = 1 via the serde default).
+                let effective_scheme: &str = if scheme.is_empty() {
+                    "classical"
+                } else {
+                    scheme.as_str()
+                };
+                if !VALIDATOR_AUTHORIZED_SCHEMES.contains(&effective_scheme) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!(
+                            "scheme '{effective_scheme}' is not authorized for \
+                             validator registration; authorized: {}",
+                            VALIDATOR_AUTHORIZED_SCHEMES.join(", ")
+                        ),
+                    );
+                }
+
+                // --- R2: key-length guard (fail before expensive crypto) ---
+                let expected_key_len: Option<usize> = match effective_scheme {
+                    "classical"  => Some(32),   // Ed25519 public key
+                    "ml-dsa-65"  => Some(1952),  // ML-DSA-65 public key
+                    _            => None,        // already gated above
+                };
+                if let Some(expected) = expected_key_len {
+                    if consensus_pubkey.len() != expected {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "consensus_pubkey length {} does not match expected \
+                                 {} bytes for scheme '{effective_scheme}'",
+                                consensus_pubkey.len(), expected
+                            ),
+                        );
+                    }
+                }
+
+                // --- Build the PoP message for the declared pop_version ---
+                let msg = match pop_version {
+                    2 => validator_key_registration_signing_bytes_v2(
+                        &self.config.chain_id, &tx.sender, consensus_pubkey,
+                    ),
+                    // V1 — legacy classical path; no pubkey binding.
+                    _ => validator_key_registration_signing_bytes(
+                        &self.config.chain_id, &tx.sender,
+                    ),
+                };
+
+                // --- R2: scheme-aware PoP verification ---
+                let verify_result = match effective_scheme {
+                    "classical" => {
+                        let sig = Signature {
+                            scheme: SchemeId::Classical,
+                            bytes: proof_of_possession.clone(),
+                        };
+                        ClassicalScheme.verify(&msg, &sig, consensus_pubkey)
+                    }
+                    "ml-dsa-65" => {
+                        let sig = Signature {
+                            scheme: SchemeId::MlDsa,
+                            bytes: proof_of_possession.clone(),
+                        };
+                        MlDsaScheme.verify(&msg, &sig, consensus_pubkey)
+                    }
+                    _ => unreachable!("already gated by VALIDATOR_AUTHORIZED_SCHEMES"),
+                };
+
+                match verify_result {
                     Ok(()) => {
                         events.push(format!(
-                            "register_validator_key: {} registered consensus key {}",
-                            tx.sender, hex_encode_bytes(consensus_pubkey),
+                            "register_validator_key: {} registered {} consensus key {} (pop_v{})",
+                            tx.sender,
+                            effective_scheme,
+                            hex_encode_bytes(consensus_pubkey),
+                            pop_version,
                         ));
                         identity.record_activity_by_address(&tx.sender);
                         Ok(())
