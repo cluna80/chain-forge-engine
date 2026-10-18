@@ -791,6 +791,35 @@ impl ValidatorRegistry {
         Ok(())
     }
 
+    /// PQ-VAL-001: Register a consensus key with an explicit scheme string.
+    /// Updates `KeyBundle.scheme` so callers can later query it for R3 gating.
+    /// Falls through to `register_consensus_key` for all other logic.
+    pub fn register_consensus_key_with_scheme(
+        &mut self,
+        validator_id:     &str,
+        consensus_pubkey: &[u8],
+        epoch:            u64,
+        scheme:           &str,
+    ) -> ValResult<()> {
+        self.register_consensus_key(validator_id, consensus_pubkey, epoch)?;
+        // register_consensus_key succeeded; now update the scheme field.
+        if let Some(rec) = self.validators.get_mut(validator_id) {
+            rec.keys.scheme = scheme.to_string();
+        }
+        Ok(())
+    }
+
+    /// PQ-VAL-001 / R3: Return the registered consensus key scheme for a
+    /// validator, or `None` if the validator is unknown or has no key.
+    /// Used by node.rs to gate voting_power for ML-DSA-only validators.
+    pub fn consensus_key_scheme(&self, validator_id: &str) -> Option<&str> {
+        let rec = self.validators.get(validator_id)?;
+        if rec.keys.consensus_pubkey.is_empty() {
+            return None;
+        }
+        Some(rec.keys.scheme.as_str())
+    }
+
     /// Look up a validator's registered consensus public key, hex-decoded
     /// back to raw bytes. `None` if the validator is unknown or has no key
     /// registered yet.

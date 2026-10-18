@@ -3073,10 +3073,13 @@ impl Node {
         // `execute_block_with_identity`) rather than a separately-filtered
         // zip that could silently misalign if two such txs land in one
         // block.
-        let register_key_attempts: Vec<(usize, String, Vec<u8>)> = txs.iter().enumerate()
+        // Tuple: (tx_index, sender, consensus_pubkey, scheme)
+        let register_key_attempts: Vec<(usize, String, Vec<u8>, String)> = txs.iter().enumerate()
             .filter_map(|(i, t)| {
-                if let chain_forge_execution::TxBody::RegisterValidatorKey { consensus_pubkey, .. } = &t.body {
-                    Some((i, t.sender.clone(), consensus_pubkey.clone()))
+                if let chain_forge_execution::TxBody::RegisterValidatorKey {
+                    consensus_pubkey, scheme, ..
+                } = &t.body {
+                    Some((i, t.sender.clone(), consensus_pubkey.clone(), scheme.clone()))
                 } else {
                     None
                 }
@@ -3162,12 +3165,22 @@ impl Node {
         // and the live ValidatorSet refresh.
         {
             let epoch = self.identity.clock.current_epoch;
-            for (idx, sender, pubkey) in &register_key_attempts {
+            for (idx, sender, pubkey, scheme) in &register_key_attempts {
                 let Some(result) = exec_result.tx_results.get(*idx) else { continue };
                 if !result.success {
                     continue;
                 }
-                if let Err(e) = self.validator_registry.register_consensus_key(sender, pubkey, epoch) {
+                // PQ-VAL-001: store scheme alongside key so gate_voting_power
+                // (R3) can distinguish ML-DSA-only validators.
+                let effective_scheme = if scheme.is_empty() { "classical" } else { scheme.as_str() };
+                let reg_result = if effective_scheme != "classical" {
+                    self.validator_registry.register_consensus_key_with_scheme(
+                        sender, pubkey, epoch, effective_scheme,
+                    )
+                } else {
+                    self.validator_registry.register_consensus_key(sender, pubkey, epoch)
+                };
+                if let Err(e) = reg_result {
                     warn!(
                         validator = %sender,
                         error     = %e,
@@ -3359,16 +3372,33 @@ impl Node {
                 // unaffected), look up the actual bonded amount from
                 // state and restore it.
                 if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
-                    let bond_addr = format!(
-                        "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
-                    );
-                    let bonded = self.state.get_account(&bond_addr)
-                        .map(|a| a.balance_of(self.executor.native_denom()))
-                        .unwrap_or(0);
-                    if bonded > 0 {
-                        v.voting_power = bonded.min(u64::MAX as u128) as u64;
-                        any_changed = true;
-                        info!(validator = %v.id, voting_power = v.voting_power, "consensus key gate: voting power restored from bonded stake");
+                    // PQ-VAL-001 / R3: ML-DSA-only validators must NOT receive
+                    // voting power in this milestone.  The consensus vote verifier
+                    // in commit_block is still classical-only; admitting an
+                    // ML-DSA-only validator would permanently stall liveness because
+                    // its precommits can never be verified.  Gate removed by PQ-VAL-002
+                    // once the consensus verifier is updated.
+                    let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
+                        .unwrap_or("classical");
+                    if scheme == "ml-dsa-65" {
+                        warn!(
+                            validator = %v.id,
+                            "R3 consensus gate: ML-DSA-only validator kept at voting_power=0 \
+                             until PQ-VAL-002 activates the ML-DSA consensus verifier"
+                        );
+                        // Leave voting_power at 0 — do not restore.
+                    } else {
+                        let bond_addr = format!(
+                            "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
+                        );
+                        let bonded = self.state.get_account(&bond_addr)
+                            .map(|a| a.balance_of(self.executor.native_denom()))
+                            .unwrap_or(0);
+                        if bonded > 0 {
+                            v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                            any_changed = true;
+                            info!(validator = %v.id, voting_power = v.voting_power, "consensus key gate: voting power restored from bonded stake");
+                        }
                     }
                 }
             }
@@ -3733,10 +3763,13 @@ impl Node {
 
         // CF-VAL-KEY-002: same snapshot-before-consume as the multi-node
         // commit_block path -- see that path's full comment.
-        let register_key_attempts: Vec<(usize, String, Vec<u8>)> = txs.iter().enumerate()
+        // Tuple: (tx_index, sender, consensus_pubkey, scheme)
+        let register_key_attempts: Vec<(usize, String, Vec<u8>, String)> = txs.iter().enumerate()
             .filter_map(|(i, t)| {
-                if let chain_forge_execution::TxBody::RegisterValidatorKey { consensus_pubkey, .. } = &t.body {
-                    Some((i, t.sender.clone(), consensus_pubkey.clone()))
+                if let chain_forge_execution::TxBody::RegisterValidatorKey {
+                    consensus_pubkey, scheme, ..
+                } = &t.body {
+                    Some((i, t.sender.clone(), consensus_pubkey.clone(), scheme.clone()))
                 } else {
                     None
                 }
@@ -3812,12 +3845,20 @@ impl Node {
         // verified before this tx could succeed at all.
         {
             let epoch = self.identity.clock.current_epoch;
-            for (idx, sender, pubkey) in &register_key_attempts {
+            for (idx, sender, pubkey, scheme) in &register_key_attempts {
                 let Some(result) = exec_result.tx_results.get(*idx) else { continue };
                 if !result.success {
                     continue;
                 }
-                if let Err(e) = self.validator_registry.register_consensus_key(sender, pubkey, epoch) {
+                let effective_scheme = if scheme.is_empty() { "classical" } else { scheme.as_str() };
+                let reg_result = if effective_scheme != "classical" {
+                    self.validator_registry.register_consensus_key_with_scheme(
+                        sender, pubkey, epoch, effective_scheme,
+                    )
+                } else {
+                    self.validator_registry.register_consensus_key(sender, pubkey, epoch)
+                };
+                if let Err(e) = reg_result {
                     warn!(validator = %sender, error = %e, "consensus key registration mirror failed");
                 }
             }
@@ -3905,15 +3946,20 @@ impl Node {
                 // CF-VAL-KEY-002: same voting-power restoration as the
                 // multi-node commit_block path -- see that path's comment.
                 if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
-                    let bond_addr = format!(
-                        "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
-                    );
-                    let bonded = self.state.get_account(&bond_addr)
-                        .map(|a| a.balance_of(self.executor.native_denom()))
-                        .unwrap_or(0);
-                    if bonded > 0 {
-                        v.voting_power = bonded.min(u64::MAX as u128) as u64;
-                        any_changed = true;
+                    // PQ-VAL-001 / R3: ML-DSA-only validators stay at 0 power.
+                    let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
+                        .unwrap_or("classical");
+                    if scheme != "ml-dsa-65" {
+                        let bond_addr = format!(
+                            "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
+                        );
+                        let bonded = self.state.get_account(&bond_addr)
+                            .map(|a| a.balance_of(self.executor.native_denom()))
+                            .unwrap_or(0);
+                        if bonded > 0 {
+                            v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                            any_changed = true;
+                        }
                     }
                 }
             }
@@ -4566,6 +4612,11 @@ mod tests {
             body:      chain_forge_execution::TxBody::RegisterValidatorKey {
                 consensus_pubkey:    consensus_kp.public_key.clone(),
                 proof_of_possession: pop_sig.bytes,
+                // V1 classical legacy path: empty scheme triggers the
+                // backward-compat branch (treated as "classical"), and
+                // pop_version = 1 uses the V1 message (no pubkey binding).
+                scheme:              String::new(),
+                pop_version:         1,
             },
             gas_limit: 10_000,
             signature: vec![],
