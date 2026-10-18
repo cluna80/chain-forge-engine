@@ -3611,7 +3611,6 @@ impl Node {
         // Drain mempool into the block
         let mut txs = std::mem::take(&mut self.mempool);
 
-        // ── Epoch boundary: auto-inject EpochClose + EpochOpen ──────────────
         let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
 
         // Produce a proposal
@@ -4557,6 +4556,7 @@ mod tests {
             signature: vec![],
             public_key: vec![],
             pq_signatures: vec![],
+            sig_scheme:    None,
             pq_public_key: vec![],
         };
         tx.sign(consensus_kp, chain_id).unwrap();

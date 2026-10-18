@@ -1,0 +1,337 @@
+# QCB-CS-001 — Cryptographic Dependency Inventory
+**Branch:** `security/cs-001-crypto-hardening`  
+**Date:** 2026-10-17  
+**Status:** ACTIVE — P1 and P2 remediation complete; P3 complete; P4 tracked
+
+---
+
+## 1. Executive Summary
+
+Chain Forge uses cryptographic primitives across 17+ crates. A post-quantum migration
+requires knowing exactly where each primitive lives, what it protects, and whether it
+needs to be algorithm-agile. This document is the canonical audit.
+
+**Finding categories:**
+
+| Category | Count | Risk |
+|---|---|---|
+| SHA-256 hardcoded (non-security-critical) | 7 crates | LOW — collision-resistance only, preimage attacks infeasible classically |
+| SHA-256 hardcoded in auth/signing paths | 2 files | MEDIUM — domain-separates ML-DSA signatures; must be auditable/replaceable |
+| SHA-256 hardcoded address derivation | 1 site | HIGH — double-SHA-256 public-key → address; locked to classical scheme |
+| SHA3-256/384 hardcoded (block/tx hashes) | 2 crates | LOW — SHA-3 is quantum-resistant to Grover with 256-bit output; no near-term threat |
+| BLAKE3 (personhood nullifiers) | 1 crate | LOW — quantum-resistant; keyed-hash construction sound |
+| Ed25519 (P2P transport only) | 1 site | LOW — libp2p ephemeral transport key, not on-chain |
+| Ed25519 (validator consensus key) | many | NOTE — already behind `SignatureScheme` trait in node/consensus/execution |
+| ML-DSA-65 (transaction signing) | wallet + execution | NOTE — already real PQC via `pqcrypto-dilithium`; wired correctly |
+| Argon2id + AES-256-GCM (wallet KDF+enc) | 1 crate | NOTE — appropriate; Argon2id is memory-hard and PQ-safe |
+| BLS12-381 (Groth16 ZK proofs) | personhood | NOTE — quantum-vulnerable in the long term; tracked separately |
+| No versioned scheme tag on chain signatures | all tx | HIGH — cannot migrate algorithm without a hard fork |
+
+---
+
+## 2. Crate-by-Crate Inventory
+
+### 2.1 `chain-forge-crypto` — CANONICAL ABSTRACTION
+
+**File:** `src/lib.rs`
+
+| Primitive | Use | PQ-safe? | Abstracted? |
+|---|---|---|---|
+| Ed25519 (`ed25519-dalek`) | Validator consensus signing/verification | No | ✅ behind `ClassicalScheme` + `SignatureScheme` trait |
+| ML-DSA-65 (`pqcrypto-dilithium`) | PQ transaction/validator signing | Yes (NIST FIPS 204) | ✅ behind `MlDsaScheme` |
+| SHA-256 (`sha2`) | ML-DSA signing message digest | No (Grover: 128-bit security) | ⚠️ hardcoded in scheme impl |
+| `SchemeRegistry` + `MigrationTrigger` | Algorithm switchover tracking | N/A | ✅ designed |
+
+**Features required:** `real-crypto` (Ed25519) + `real-pqc` (ML-DSA). Both enabled in `chain-forge-node` and `chain-forge-execution`.
+
+**Gap:** No versioned algorithm identifier is stored alongside signatures. Signatures are
+raw bytes with no scheme tag — the verifier must be told which scheme to use out-of-band.
+This makes live migration impossible without a hard fork.
+
+---
+
+### 2.2 `chain-forge-node` — CRITICAL PATHS
+
+#### `src/auth.rs`
+
+| Line(s) | Primitive | What it hashes | Risk |
+|---|---|---|---|
+| 179–180 | SHA-256 | Challenge ID input (nonce generation) | LOW — entropy only |
+| 222–223 | SHA-256 | Auth payload body | MEDIUM — used to produce signing message for validator ops |
+| 244–246 | SHA-256 | **Public key → address derivation** (double-SHA-256) | HIGH — locked to classical; must be auditable |
+| 359–360 | SHA-256 | Tx payload signing message | MEDIUM — domain-separates signatures |
+
+**Key finding:** Lines 244–246 derive the on-chain address from a public key using
+double-SHA-256 (Bitcoin-style). If the key scheme migrates to ML-DSA, the address
+derivation function must also be versioned — otherwise an ML-DSA pubkey produces
+an address indistinguishable from a classical one, breaking replay protection.
+
+#### `src/bin/gc-daemon.rs`
+
+| Line(s) | Primitive | What it hashes | Risk |
+|---|---|---|---|
+| 131, 143, 202–204 | SHA-256 | GC challenge ID / challenge candidate | LOW — PoW puzzle, collision resistance sufficient |
+| 185 | SHA-256 | `challenge-input:{id}` for challenge record | LOW — audit trail only |
+
+---
+
+### 2.3 `chain-forge-core` — BLOCK AND TX HASHING
+
+**File:** `src/lib.rs`
+
+| Primitive | Use | PQ-safe? | Notes |
+|---|---|---|---|
+| SHA3-256 | Block hashes, tx hashes (256-bit mode) | ✅ Yes | Grover halves security to 128-bit; remains safe |
+| SHA3-384 | Block hashes, tx hashes (384-bit mode) | ✅ Yes | Grover: 192-bit security; conservative choice |
+
+`ChainHash::digest()` is **already abstracted** behind a `HashWidth` enum driven by
+genesis config. This is the correct pattern — hash algorithm is configurable at genesis.
+No immediate remediation required; SHA-3 family is considered PQ-resistant for hashing.
+
+**`ChainAddress::from_public_key()`** at line 180 delegates to `ChainHash` (SHA-3), which
+is safer than the double-SHA-256 in `auth.rs`. However it lacks a scheme-version prefix,
+so ML-DSA addresses and Ed25519 addresses would collide in the same namespace.
+
+---
+
+### 2.4 `chain-forge-state` — JELLYFISH MERKLE TREE
+
+**File:** `src/jmt.rs`
+
+| Primitive | Use | PQ-safe? |
+|---|---|---|
+| SHA3-256 | Leaf, internal node, and root hashes | ✅ Yes |
+
+Domain separators (tag bytes) are applied correctly. No action required.
+
+---
+
+### 2.5 `chain-forge-execution` — TX VERIFICATION
+
+**File:** `src/lib.rs` (lines ~1998, ~7361)
+
+| Primitive | Use | Risk |
+|---|---|---|
+| SHA-256 | Domain-separated ML-DSA signing message: `SHA-256("chain-forge/pq-tx/v1\n" \|\| chain_id \|\| "\n" \|\| body_json)` | MEDIUM |
+
+This is the canonical message format for ML-DSA transactions. SHA-256 is used only to
+produce a 32-byte message digest that ML-DSA then signs. The ML-DSA signature itself is
+PQ-safe; SHA-256 here is a pre-hash step (common in hybrid constructions). Risk is that
+SHA-256 collision attacks (128-bit quantum security) could theoretically allow forged
+messages — but ML-DSA provides 128-bit PQ security anyway, so this doesn't weaken the
+overall construction meaningfully.
+
+**Recommendation:** Document the domain separator as a versioned protocol constant
+(`MLDSA_TX_HASH_DOMAIN_V1`) and make it easy to swap to SHA3-256 if needed.
+
+---
+
+### 2.6 `chain-forge-miner` + `chain-forge-seed` + `chain-forge-verifier` — PoW PUZZLES
+
+**Files:** `chain-forge-miner/src/challenge.rs`, `chain-forge-seed/src/challenge.rs`,
+`chain-forge-verifier/src/engine.rs`
+
+| Primitive | Use | Risk |
+|---|---|---|
+| SHA-256 (all three crates) | `sha256-preimage-v1` and `sha256-avalanche-v1` PoW puzzles | NONE |
+
+SHA-256 PoW is **intentionally hardcoded** — the puzzle type is part of the protocol
+(identified by `algorithm_version: "sha256-preimage-v1"`). Quantum speedup via Grover
+halves the effective difficulty but does not break the scheme — miners can adjust
+difficulty targets. This is a known and accepted trade-off.
+
+**No remediation required.** The algorithm string in puzzle records makes these versioned.
+
+---
+
+### 2.7 `chain-forge-scheduler` — BEACON / SETTLEMENT
+
+**Files:** `src/beacon.rs`, `src/settlement.rs`
+
+| Primitive | Use | Risk |
+|---|---|---|
+| SHA-256 | Randomness beacon computation | LOW |
+| SHA-256 | Settlement hash integrity | LOW |
+
+Randomness beacon uses SHA-256 of combined validator inputs. Grover does not help
+an adversary here — the beacon is collision-resistant, not a signature. Low priority.
+
+---
+
+### 2.8 `chain-forge-analyzer` — RESEARCH TASK HASHING
+
+**File:** `src/compute.rs`
+
+| Primitive | Use | Risk |
+|---|---|---|
+| SHA-256 | Research task content fingerprinting | LOW — integrity only |
+
+---
+
+### 2.9 `chain-forge-resource` — RECEIPT HASHING
+
+**File:** `src/types/receipt.rs`
+
+| Primitive | Use | Risk |
+|---|---|---|
+| SHA-256 | Resource receipt content hash | LOW |
+
+---
+
+### 2.10 `chain-forge-qrc` — CAPACITY / PoCD
+
+**File:** `src/pocd_reward.rs`
+
+| Primitive | Use | Risk |
+|---|---|---|
+| SHA-256 | PoCD reward computation | LOW — uses `ChainHash` correctly in `capacity_report.rs` |
+
+`capacity_report.rs` routes through `ChainHash::digest(, HashWidth::Bits256)` which
+goes through the SHA-3 abstraction — correct. `pocd_reward.rs` uses raw `sha2` — inconsistent.
+
+---
+
+### 2.11 `chain-forge-personhood` — NULLIFIERS AND ZK PROOFS
+
+**Files:** `src/eligibility.rs`, `src/lib.rs`, circuits
+
+| Primitive | Use | PQ-safe? | Notes |
+|---|---|---|---|
+| BLAKE3 (keyed) | Epoch nullifier: `N = BLAKE3-keyed-hash(K, domain \|\| epoch_be)` | ✅ Yes | BLAKE3 is quantum-resistant; keyed construction is sound |
+| BLAKE3 (unkeyed) | Credential commitment: `BLAKE3(secret)` | ✅ Yes | |
+| BLS12-381 (Groth16) | ZK proof generation/verification for personhood | ⚠️ Vulnerable long-term | BLS12-381 discrete log is broken by Shor's algorithm |
+| ark-groth16 `VerifyingKey` | Stored verifying key for ZK circuits | ⚠️ Vulnerable long-term | |
+
+**BLS12-381 note:** Shor's algorithm breaks elliptic curve discrete log, which would
+break both BLS12-381 signatures AND Groth16 proofs that use this pairing. This is a
+**long-term** concern (10–15 year horizon with fault-tolerant quantum computers).
+Tracked as a future item; near-term priority is signature schemes.
+
+---
+
+### 2.12 `chain-forge-wallet` — KEY STORAGE
+
+**File:** `src/lib.rs`
+
+| Primitive | Use | PQ-safe? | Notes |
+|---|---|---|---|
+| ML-DSA-65 | Signing key storage and tx signing | ✅ Yes | Via `chain-forge-crypto` |
+| Argon2id | KDF: passphrase → 32-byte AES key | ✅ Yes | Memory-hard; quantum-safe |
+| AES-256-GCM | Key file encryption | ✅ Yes (symmetric 256-bit) | Grover halves to 128-bit; secure |
+| SHA-256 | Signing message pre-hash | MEDIUM | Same domain separator as execution |
+
+**Wallet KDF and encryption are correctly implemented.** Argon2id parameters (128 MB /
+3 iterations / 4 threads) are appropriate for 2026 hardware.
+
+---
+
+### 2.13 `chain-forge-p2p` — TRANSPORT
+
+**File:** `src/lib.rs:572`
+
+```rust
+let local_key = libp2p::identity::Keypair::generate_ed25519();
+```
+
+| Primitive | Use | Risk |
+|---|---|---|
+| Ed25519 (libp2p) | Ephemeral P2P transport identity | LOW |
+
+This key is generated fresh each time the node starts — it is **not persisted**, not
+stored on-chain, and not used for consensus. It identifies the node to peers for
+transport-layer security only. Low priority; libp2p will adopt PQ transport
+independently via Noise protocol evolution.
+
+---
+
+### 2.14 `chain-forge-vca-pq` — VCA / QUORUM
+
+SHA-3 reference found only in test string literals (not actual hash calls).
+No raw crypto usage in production code.
+
+---
+
+## 3. Risk Register
+
+| ID | Location | Primitive | Risk | Priority | Status |
+|---|---|---|---|---|---|
+| CS-001-H1 | `auth.rs:244-246` | SHA-256 address derivation | **HIGH** | P1 | ✅ DONE — `AddressScheme` enum + `from_public_key_schemed()` in core; `qcb1pq{hex}` namespace for PQ keys; wallet + auth.rs delegate to it. Commit `7479f99`. |
+| CS-001-H2 | All tx signatures | No scheme version tag | **HIGH** | P1 | ✅ DONE — `sig_scheme: Option<SchemeId>` field on `Transaction`; signer stamps it, verifier dispatches explicitly; legacy `None` falls back to prefix scan. Commit `24b6...`. |
+| CS-001-M1 | `chain-forge-crypto` | SHA-256 signing message domain string | **MEDIUM** | P2 | ✅ DONE — `pub const MLDSA_TX_DOMAIN_V1` + `ED25519_TX_DOMAIN_V1` in `chain-forge-crypto`; `sha2` promoted to non-optional dep. Commit `db9b632`. |
+| CS-001-M2 | `execution`, `wallet`, `scheduler` | 5 inline SHA-256 ML-DSA pre-hash blocks | **MEDIUM** | P2 | ✅ DONE — `mldsa_tx_prehash(chain_id, body_json)` helper; all 5 sites replaced. Commit `db9b632`. |
+| CS-001-L1 | `qrc/pocd_reward.rs` | Raw sha2 (inconsistent with ChainHash pattern) | **LOW** | P3 | ✅ DONE — claim_id derivation routes through `ChainHash::digest` (SHA-3-256); `sha2` dep removed from `chain-forge-qrc`. Commit `4afd169`. |
+| CS-001-L2 | personhood circuits | BLS12-381 (long-term quantum threat) | **LOW** | P4 | 🔲 TRACKED — requires new ZK proof system (Plonky3/Nova/STARK). 10–15 year horizon. |
+| CS-001-L3 | `p2p/src/lib.rs:572` | Ed25519 ephemeral transport | **LOW** | P4 | 🔲 TRACKED — follow upstream libp2p NIST PQC adoption. |
+
+---
+
+## 4. What Is Already PQ-Safe
+
+- **ML-DSA-65 transaction signing** — real Dilithium3, NIST FIPS 204. ✅
+- **SHA-3 block/tx hashing** in `chain-forge-core` and `chain-forge-state`. ✅
+- **BLAKE3 personhood nullifiers** — quantum-resistant hash. ✅
+- **Argon2id + AES-256-GCM wallet encryption** — memory-hard KDF, 256-bit symmetric. ✅
+- **`SignatureScheme` trait** — pluggable abstraction exists; Ed25519 and ML-DSA already behind it. ✅
+
+---
+
+## 5. Remediation Plan
+
+### P1 — High priority ✅ COMPLETE
+
+**CS-001-H1 ✅** — `AddressScheme` enum (`Classical` / `PostQuantum`) in `chain-forge-core`.
+`Address::from_public_key_schemed()` produces `qcb1{hex}` for Ed25519 and `qcb1pq{hex}` for ML-DSA.
+Both `chain-forge-wallet` and `chain-forge-node/auth.rs` delegate to this — no independent
+implementations. 4 new tests in `chain-forge-core`. Committed `7479f99`.
+
+**CS-001-H2 ✅** — `sig_scheme: Option<SchemeId>` field on `Transaction`. Signer stamps it
+(`Some(SchemeId::MlDsa)` for PQ txs); verifier dispatches explicitly by scheme tag;
+legacy `None` falls back to prefix scan for backward compat with pre-H2 devnet state.
+Wired in `node.rs`, `tx.rs`, `validator_key_live.rs`, `settlement.rs`. Committed `24b6...`.
+
+### P2 — Medium priority ✅ COMPLETE
+
+**CS-001-M1 ✅** — `pub const MLDSA_TX_DOMAIN_V1: &[u8] = b"chain-forge/pq-tx/v1\n"` and
+`ED25519_TX_DOMAIN_V1: &[u8] = b"chain-forge/tx/v1\n"` added to `chain-forge-crypto`.
+`sha2` promoted from optional feature dep to mandatory dep (helper always callable).
+6 new tests. Committed `db9b632`.
+
+**CS-001-M2 ✅** — `mldsa_tx_prehash(chain_id, body_json) -> [u8; 32]` helper in
+`chain-forge-crypto`. All 5 independent inline SHA-256 signing blocks replaced:
+`execution` (3 sites), `wallet` (2 sites), `scheduler/settlement` (1 site).
+Upgrade path to SHA3-256 is a one-line change in this function + domain version bump.
+Committed `db9b632`. Tests: crypto 30/30, execution 110/110, wallet 12/12.
+
+### P3 — Low priority ✅ COMPLETE
+
+**CS-001-L1 ✅** — `chain-forge-qrc/pocd_reward.rs` claim_id derivation routes through
+`ChainHash::digest` (SHA-3-256). `sha2` dep removed from `chain-forge-qrc` Cargo.toml.
+Devnet note: claim_id hash changed from SHA-256 to SHA-3-256 — safe on devnet; a mainnet
+deployment would need a claim_id migration (documented in comment). Committed `4afd169`.
+Tests: chain-forge-qrc 92/92.
+
+### P4 — Future (tracked, not blocking)
+
+**CS-001-L2** — BLS12-381 / Groth16 quantum migration — requires new ZK proof system
+(Plonky3, Nova, or STARK-based). Long-horizon item (10–15 year quantum threat).
+
+**CS-001-L3** — libp2p PQ transport — follow upstream libp2p NIST PQC adoption.
+Ephemeral transport key; not stored on-chain; not blocking.
+
+---
+
+## 6. Non-Findings (Intentional Hardcoding)
+
+These SHA-256 usages are **protocol-versioned** and do not need abstraction:
+
+- `chain-forge-seed` / `chain-forge-miner` / `chain-forge-verifier`: SHA-256 PoW puzzles
+  (`sha256-preimage-v1`, `sha256-avalanche-v1`) — algorithm name is embedded in the
+  challenge record; upgrading means issuing new challenge types, not changing the code.
+- `chain-forge-node/src/bin/gc-daemon.rs`: GC challenge PoW — same reasoning.
+- `chain-forge-analyzer`: Research task fingerprinting — content addressing only.
+- `chain-forge-resource/receipt.rs`: Receipt content hash — integrity, not authentication.
+- `chain-forge-scheduler/beacon.rs`: Randomness beacon — not a signature scheme.
+
+---
+
+*Audit performed: 2026-10-17 | Branch: security/cs-001-crypto-hardening*

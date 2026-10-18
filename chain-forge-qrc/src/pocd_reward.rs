@@ -224,8 +224,8 @@ fn track_from_challenge_id(challenge_id: &str) -> Option<ChallengeTrack> {
 //   "Do not introduce AI inference, new token economics, or automatic scientific
 //    discovery claims."
 
+use chain_forge_core::{ChainHash, HashWidth};
 use chain_forge_research_db::models::{NewResearchRewardClaim, RewardKind};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Policy version string for `QcbResearchRewardPolicy`.
@@ -379,21 +379,28 @@ impl QcbResearchRewardPolicy {
             });
         }
 
-        // 3. Derive deterministic claim_id.
-        //    Format: hex( SHA-256( "qcb-claim-v1\x00" || chain_id || "\x00"
-        //                          || objective_id || "\x00" || task_id || "\x00"
-        //                          || reward_kind_str ) )
+        // 3. Derive deterministic claim_id via ChainHash (SHA-3-256).
+        //    CS-001-L1: routes through ChainHash instead of raw sha2 so the
+        //    hash algorithm is upgraded in one place.
+        //    Format: hex( SHA3-256( "qcb-claim-v1\x00" || chain_id || "\x00"
+        //                           || objective_id || "\x00" || task_id || "\x00"
+        //                           || reward_kind_str ) )
+        //    NOTE: devnet only — a mainnet deployment would need a claim_id
+        //    migration if switching from the prior SHA-256 derivation.
         let reward_kind_str = reward_kind.as_str();
-        let mut hasher = Sha256::new();
-        hasher.update(b"qcb-claim-v1\x00");
-        hasher.update(chain_id.as_bytes());
-        hasher.update(b"\x00");
-        hasher.update(objective_id.as_bytes());
-        hasher.update(b"\x00");
-        hasher.update(task_id.as_bytes());
-        hasher.update(b"\x00");
-        hasher.update(reward_kind_str.as_bytes());
-        let claim_id = hex::encode(hasher.finalize());
+        let mut preimage = Vec::with_capacity(
+            13 + chain_id.len() + 1 + objective_id.len() + 1
+               + task_id.len() + 1 + reward_kind_str.len(),
+        );
+        preimage.extend_from_slice(b"qcb-claim-v1\x00");
+        preimage.extend_from_slice(chain_id.as_bytes());
+        preimage.push(b'\x00');
+        preimage.extend_from_slice(objective_id.as_bytes());
+        preimage.push(b'\x00');
+        preimage.extend_from_slice(task_id.as_bytes());
+        preimage.push(b'\x00');
+        preimage.extend_from_slice(reward_kind_str.as_bytes());
+        let claim_id = ChainHash::digest(&preimage, HashWidth::Bits256).to_hex();
 
         tracing::info!(
             claim_id       = %claim_id,

@@ -18,6 +18,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme};
+use chain_forge_crypto::mldsa_tx_prehash;  // CS-001-M2: canonical PQ pre-hash helper
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -275,19 +276,10 @@ pub fn load_wallet(path: &str, passphrase: &str) -> WalletResult<(WalletKeyFile,
 /// # Returns
 /// Hex-encoded ML-DSA-65 detached signature (3293 bytes).
 pub fn sign_transaction(tx_body_json: &str, chain_id: &str, kp: &KeyPair) -> WalletResult<String> {
-    use sha2::{Sha256, Digest};
-
-    // Message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || tx_body_json)
-    let mut hasher = Sha256::new();
-    hasher.update(b"chain-forge/pq-tx/v1\n");
-    hasher.update(chain_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(tx_body_json.as_bytes());
-    let message: [u8; 32] = hasher.finalize().into();
-
+    // CS-001-M2: canonical pre-hash — MLDSA_TX_DOMAIN_V1 || chain_id || "\n" || body_json
+    let message = mldsa_tx_prehash(chain_id, tx_body_json.as_bytes());
     let scheme = MlDsaScheme;
     let sig = scheme.sign(&message, kp)?;
-
     Ok(hex_encode(&sig.bytes))
 }
 
@@ -335,16 +327,10 @@ pub fn verify_transaction(
     sig_hex:      &str,
     public_key:   &[u8],
 ) -> WalletResult<()> {
-    use sha2::{Sha256, Digest};
     use chain_forge_crypto::Signature;
 
-    // Message = SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || tx_body_json)
-    let mut hasher = Sha256::new();
-    hasher.update(b"chain-forge/pq-tx/v1\n");
-    hasher.update(chain_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(tx_body_json.as_bytes());
-    let message: [u8; 32] = hasher.finalize().into();
+    // CS-001-M2: canonical pre-hash — MLDSA_TX_DOMAIN_V1 || chain_id || "\n" || body_json
+    let message = mldsa_tx_prehash(chain_id, tx_body_json.as_bytes());
 
     let sig_bytes = hex_decode(sig_hex)?;
     let sig = Signature { scheme: SchemeId::MlDsa, bytes: sig_bytes };
@@ -430,18 +416,27 @@ pub fn submit_tx(host: &str, port: u16, tx: &SignedTxEnvelope) -> WalletResult<s
 
 // ── Address derivation ────────────────────────────────────────────────────────
 
-/// Derive a QCB bech32-style address from an ML-DSA public key.
+/// Derive a QCB bech32-style address from an ML-DSA (or other PQ) public key.
 ///
-/// Address = "qcb1" + lowercase_hex(SHA-256(SHA-256(public_key))[..20])
-/// This matches the `chain-forge-core` Address::from_public_key convention
-/// adapted for the larger ML-DSA-65 public key (1952 bytes → 20-byte hash).
+/// **CS-001-H1**: Delegates to `chain_forge_core::Address::from_public_key_schemed`
+/// with `AddressScheme::PostQuantum`, which produces:
+///   `qcb1pq{hex(SHA3-256(public_key)[..20])}`
+///
+/// Using SHA-3 (consistent with block/tx hashing) instead of the earlier
+/// double-SHA-256 construction.  The `pq` infix is the permanent namespace
+/// discriminant — Ed25519 addresses (`qcb1…`) can never collide with ML-DSA
+/// addresses (`qcb1pq…`) even if the hash output happened to match.
+///
+/// **Breaking change from pre-CS-001-H1 devnet**: old addresses used
+/// double-SHA-256; new addresses use SHA3-256.  Devnet state is not migrated —
+/// regenerate keys and re-derive addresses after this commit.
 pub fn derive_address_from_pq_key(public_key: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
-
-    let round1 = Sha256::digest(public_key);
-    let round2 = Sha256::digest(&round1);
-    let payload: String = round2[..20].iter().map(|b| format!("{b:02x}")).collect();
-    format!("qcb1pq{payload}") // "pq" infix distinguishes ML-DSA from Ed25519 addresses
+    chain_forge_core::Address::from_public_key_schemed(
+        public_key,
+        "qcb",
+        chain_forge_core::HashWidth::Bits256,
+        chain_forge_core::AddressScheme::PostQuantum,
+    ).as_str().to_string()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
