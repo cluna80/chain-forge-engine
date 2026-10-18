@@ -1631,6 +1631,36 @@ impl Executor {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
+        // CS-001 P4 hard-cutoff enforcement: once the grace window expires,
+        // any transaction whose sig_scheme names the deprecated algorithm is
+        // rejected by consensus.  Checked here — after auth, before nonce /
+        // fee — so it fires unconditionally for every scheme-tagged tx type.
+        if let Some(tx_scheme) = &tx.sig_scheme {
+            if let Some(migration_json) = state.get_raw(CRYPTO_MIGRATION_STATE_KEY) {
+                if let Ok(migration) = serde_json::from_str::<CryptoMigrationState>(migration_json) {
+                    let current_epoch = identity.clock.current_epoch;
+                    if migration.hard_cutoff_passed(current_epoch) {
+                        // Use the stable canonical_id() so the comparison is
+                        // independent of Debug / Display formatting.
+                        if tx_scheme.canonical_id() == migration.deprecated_scheme.to_lowercase() {
+                            return TransactionResult::err(
+                                tx.id.clone(), gas_required, tx.gas_limit,
+                                format!(
+                                    "sig_scheme {:?} was deprecated at epoch {} \
+                                     (hard cutoff passed at epoch {}); \
+                                     rotate to {} before submitting",
+                                    tx_scheme,
+                                    migration.initiated_epoch,
+                                    migration.hard_cutoff_epoch,
+                                    migration.replacement_scheme,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let expected_nonce = state.get_account(&tx.sender)
             .map(|a| a.nonce).unwrap_or(0);
         if tx.nonce != expected_nonce {
@@ -4580,5 +4610,83 @@ mod tests {
         assert!(!r.success, "no crypto_governors must deny all deprecation txs");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("no crypto_governors configured"), "error: {err}");
+    }
+
+    /// CS-001-P4-T10: After the hard cutoff epoch passes, any transaction
+    /// whose `sig_scheme` matches the deprecated algorithm is rejected by
+    /// consensus.  Transactions using the replacement scheme are still accepted.
+    ///
+    /// This is the consensus-enforcement half of the migration: the governance
+    /// tx (EmergencyDeprecateAlgorithm) sets the timeline; the executor enforces
+    /// it here once `current_epoch > hard_cutoff_epoch`.
+    #[test]
+    fn cs001_p4_cutoff_rejects_deprecated_scheme_tx() {
+        use chain_forge_crypto::SchemeId;
+
+        let gov = "qcb1gov";
+        let (exec, mut state, mut identity, mut agents) = cs001_p4_setup(gov);
+
+        // Epoch 42: initiate deprecation of "ed25519" with grace = 10 epochs.
+        // hard_cutoff_epoch = 42 + 10 - 1 = 51.
+        let dep_tx = emergency_deprecate_tx("cutoff-dep", gov, 0,
+            "ed25519", "ml-dsa", 10, "Simulated CRQC break");
+        let r = exec.execute_tx_with_identity(&dep_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "deprecation tx must succeed: {:?}", r.error);
+
+        // Sanity: epoch 51 is the last grace epoch — transfer with Classical
+        // sig_scheme should still be accepted.
+        identity.clock.current_epoch = 51;
+        let mut in_grace = Transaction::transfer(
+            "t-grace", "qcb1alice", "qcb1bob", "uqcb", 1, 1
+        );
+        in_grace.sig_scheme = Some(SchemeId::Classical);
+        let r = exec.execute_tx_with_identity(&in_grace, &mut state, &mut identity, &mut agents);
+        // May fail for other reasons (balance, nonce) but must NOT fail with the
+        // cutoff message while still in the grace window.
+        if !r.success {
+            let err = r.error.unwrap_or_default();
+            assert!(!err.contains("was deprecated"),
+                "Classical scheme must still be accepted at epoch 51 (in grace window); got: {err}");
+        }
+
+        // Epoch 52 = one past the hard cutoff — Classical scheme must be rejected.
+        identity.clock.current_epoch = 52;
+        let mut post_cutoff = Transaction::transfer(
+            "t-post-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, 2
+        );
+        post_cutoff.sig_scheme = Some(SchemeId::Classical);
+        let r = exec.execute_tx_with_identity(&post_cutoff, &mut state, &mut identity, &mut agents);
+        assert!(!r.success, "Classical scheme must be rejected after hard cutoff");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("was deprecated"),
+            "error must mention deprecation; got: {err}");
+        assert!(err.contains("rotate to"),
+            "error must hint at replacement scheme; got: {err}");
+
+        // A transaction using the replacement scheme (ml-dsa) must NOT be
+        // blocked by the cutoff check — the cutoff is scheme-specific.
+        let mut pq_tx = Transaction::transfer(
+            "t-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, 2
+        );
+        pq_tx.sig_scheme = Some(SchemeId::MlDsa);
+        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
+        if !r.success {
+            let err = r.error.unwrap_or_default();
+            assert!(!err.contains("was deprecated"),
+                "MlDsa scheme must not be blocked by Classical cutoff; got: {err}");
+        }
+
+        // A transaction with no sig_scheme (None) must also not be blocked —
+        // the cutoff only applies to explicitly tagged schemes.
+        let untagged = Transaction::transfer(
+            "t-untagged", "qcb1alice", "qcb1bob", "uqcb", 1, 2
+        );
+        assert!(untagged.sig_scheme.is_none());
+        let r = exec.execute_tx_with_identity(&untagged, &mut state, &mut identity, &mut agents);
+        if !r.success {
+            let err = r.error.unwrap_or_default();
+            assert!(!err.contains("was deprecated"),
+                "Untagged tx must not be blocked by cutoff check; got: {err}");
+        }
     }
 }

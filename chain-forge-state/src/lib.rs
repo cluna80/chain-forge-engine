@@ -304,6 +304,11 @@ pub struct StateSnapshot {
     pub height:    u64,
     pub root_hash: String,
     pub accounts:  HashMap<String, AccountState>,
+    /// Protocol-level metadata (e.g. CryptoMigrationState) persisted
+    /// alongside account state so the snapshot is self-contained and
+    /// survives node restart without losing migration progress.
+    #[serde(default)]
+    pub metadata:  HashMap<String, String>,
 }
 
 // -- State store --------------------------------------------------------------
@@ -342,10 +347,18 @@ impl StateStore {
         }
     }
 
-    /// Store an arbitrary string value under `key` in the metadata store.
-    /// Used for protocol-level state (e.g. CryptoMigrationState).
+    /// The Merkle-tree leaf key for a metadata entry.
+    /// Prefixed with `"meta:"` to namespace it away from account addresses.
+    fn metadata_leaf_key(key: &str) -> String {
+        format!("meta:{key}")
+    }
+
+    /// Store an arbitrary string value under `key` in the metadata store
+    /// and insert the corresponding leaf into the Merkle tree so that the
+    /// entry participates in the state root.
     pub fn set_raw(&mut self, key: &str, value: &str) {
         self.metadata.insert(key.to_string(), value.to_string());
+        self.tree.upsert(Self::metadata_leaf_key(key), value.as_bytes());
     }
 
     /// Retrieve a metadata value by key.
@@ -353,9 +366,11 @@ impl StateStore {
         self.metadata.get(key).map(String::as_str)
     }
 
-    /// Remove a metadata value (e.g. after a migration completes).
+    /// Remove a metadata value (e.g. after a migration completes or is
+    /// cleared) and prune the corresponding Merkle leaf.
     pub fn remove_raw(&mut self, key: &str) {
         self.metadata.remove(key);
+        self.tree.remove(&Self::metadata_leaf_key(key));
     }
 
     /// Seed the state from a genesis config.
@@ -495,6 +510,7 @@ impl StateStore {
                 height,
                 root_hash,
                 accounts: self.accounts.clone(),
+                metadata: self.metadata.clone(),
             };
             self.snapshots.insert(height, snap);
 
@@ -524,12 +540,18 @@ impl StateStore {
     /// Restore state from a snapshot (used during fast-sync).
     pub fn restore_snapshot(&mut self, snapshot: StateSnapshot) {
         self.accounts = snapshot.accounts.clone();
-        // Rebuild the JMT from restored accounts in a single batch.
+        self.metadata = snapshot.metadata.clone();
+        // Rebuild the JMT from restored accounts and metadata in a single batch.
         let mut new_tree = MerkleTree::new(self.width);
         {
             let mut w = JmtWriter::new(&mut new_tree.store);
             for account in self.accounts.values() {
                 w.upsert(&account.address, &account.to_leaf_bytes());
+            }
+            // Re-insert metadata leaves so the restored root matches the
+            // root that was committed when the snapshot was taken.
+            for (key, value) in &self.metadata {
+                w.upsert(&Self::metadata_leaf_key(key), value.as_bytes());
             }
             let h = w.flush();
             new_tree.root = if h.is_zero() { None } else { Some(h.to_hex()) };
@@ -555,6 +577,7 @@ impl StateStore {
                 .map(|r| r.root_hash.clone())
                 .unwrap_or_default(),
             accounts: self.accounts.clone(),
+            metadata: self.metadata.clone(),
         }
     }
 
@@ -954,5 +977,90 @@ mod tests {
 
         assert_ne!(root1, root2,
             "state root must change when identity tier changes");
+    }
+
+    // ── CS-001 P4: metadata Merkle inclusion and snapshot survival ────────────
+
+    /// set_raw must change the state root (metadata enters the Merkle tree).
+    #[test]
+    fn cs001_p4_metadata_participates_in_merkle_root() {
+        let mut store = make_store();
+        let root_before = store.commit(1, 1_000, false).root_hash;
+
+        store.set_raw("crypto_migration:active", r#"{"deprecated":"classical"}"#);
+        let root_after_set = store.commit(2, 2_000, false).root_hash;
+        assert_ne!(root_before, root_after_set,
+            "set_raw must change the state root");
+
+        // Updating the value must produce yet another distinct root.
+        store.set_raw("crypto_migration:active", r#"{"deprecated":"ml-dsa"}"#);
+        let root_after_update = store.commit(3, 3_000, false).root_hash;
+        assert_ne!(root_after_set, root_after_update,
+            "updating a metadata value must change the state root");
+
+        // Removing the key must revert to the pre-set root.
+        store.remove_raw("crypto_migration:active");
+        let root_after_remove = store.commit(4, 4_000, false).root_hash;
+        assert_eq!(root_before, root_after_remove,
+            "remove_raw must restore the root to what it was before set_raw");
+    }
+
+    /// Two independent StateStores that apply identical metadata entries must
+    /// produce identical state roots (determinism).
+    #[test]
+    fn cs001_p4_metadata_root_is_deterministic() {
+        let make = || {
+            let mut store = make_store();
+            store.set_raw("crypto_migration:active", r#"{"scheme":"classical"}"#);
+            store.commit(1, 1_000, false).root_hash
+        };
+        assert_eq!(make(), make(),
+            "metadata-inclusive state root must be deterministic");
+    }
+
+    /// export_snapshot / restore_snapshot must round-trip metadata so that a
+    /// node restarting from the snapshot sees the same migration state and
+    /// produces the same state root.
+    #[test]
+    fn cs001_p4_metadata_survives_snapshot_roundtrip() {
+        let mut store = make_store();
+        store.set_raw("crypto_migration:active", r#"{"scheme":"classical","cutoff":71}"#);
+        let committed_root = store.commit(1, 1_000, false).root_hash;
+
+        // Export and restore into a fresh StateStore.
+        let snap = store.export_snapshot();
+        assert_eq!(snap.metadata.get("crypto_migration:active").map(String::as_str),
+            Some(r#"{"scheme":"classical","cutoff":71}"#),
+            "export_snapshot must carry metadata");
+
+        let mut restored = StateStore::new(HashWidth::Bits256);
+        restored.restore_snapshot(snap);
+
+        // The restored store must surface the metadata value.
+        assert_eq!(
+            restored.get_raw("crypto_migration:active"),
+            Some(r#"{"scheme":"classical","cutoff":71}"#),
+            "restore_snapshot must make metadata readable via get_raw"
+        );
+
+        // And produce the same root as the original after a commit.
+        let restored_root = restored.commit(1, 1_000, false).root_hash;
+        assert_eq!(committed_root, restored_root,
+            "restored state root must match the original committed root");
+    }
+
+    /// A take_snapshot commit must also capture metadata so the in-process
+    /// snapshot (used for rollback) is self-consistent.
+    #[test]
+    fn cs001_p4_metadata_captured_in_commit_snapshot() {
+        let mut store = make_store();
+        store.set_raw("crypto_migration:active", r#"{"cutoff":100}"#);
+        let root = store.commit(1, 1_000, true /* take_snapshot */).root_hash;
+
+        let snap = store.snapshot_at(1).expect("snapshot must exist");
+        assert_eq!(snap.root_hash, root);
+        assert_eq!(snap.metadata.get("crypto_migration:active").map(String::as_str),
+            Some(r#"{"cutoff":100}"#),
+            "commit snapshot must carry metadata");
     }
 }

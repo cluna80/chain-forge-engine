@@ -103,6 +103,20 @@ impl SchemeId {
         }
     }
 
+    /// Stable lowercase short identifier used in protocol state
+    /// (e.g. `CryptoMigrationState::deprecated_scheme`).
+    /// This is what operators write in `EmergencyDeprecateAlgorithm` and what
+    /// the consensus hard-cutoff check compares against `tx.sig_scheme`.
+    pub fn canonical_id(&self) -> &str {
+        match self {
+            Self::Classical          => "ed25519",
+            Self::MlDsa              => "ml-dsa",
+            Self::SlhDsa             => "slh-dsa",
+            Self::FnDsa              => "fn-dsa",
+            Self::HybridEd25519MlDsa => "hybrid-ed25519-ml-dsa",
+        }
+    }
+
     /// Approximate signature size in bytes (Section 10.3).
     /// These are the real sizes that inform the PQC tradeoff discussion.
     pub fn signature_size_bytes(&self) -> usize {
