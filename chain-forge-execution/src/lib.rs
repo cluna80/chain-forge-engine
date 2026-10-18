@@ -160,6 +160,9 @@ impl GasModel {
                     // Resource Network: Contribution layer.
                     // RegisterMachine: writes MachineRecord to state (similar to RegisterAgent).
                     // SubmitUsefulWork: verifies seal + writes receipt + updates contribution score.
+                    // PQ-VAL-002 R1: ActivatePqConsensus governance tx — low gas,
+                    // single epoch write.
+                    TxBody::ActivatePqConsensus { .. } => op_multiplier * 4,
                     // EmergencyDeprecateAlgorithm (CS-001 P4): constitutional governance
                     // operation; high gas to deter frivolous calls.
                     TxBody::EmergencyDeprecateAlgorithm { .. } => op_multiplier * 20,
@@ -482,6 +485,23 @@ pub enum TxBody {
     ///
     /// Authorization: sender must be in `config.crypto_governors` (a small set of
     /// constitutional keyholders, distinct from ordinary governance).
+    /// Governance transaction that sets the epoch at which ML-DSA-65 consensus
+    /// signature verification is activated (PQ-VAL-002 R1).
+    ///
+    /// - `activation_epoch` must be strictly greater than the current epoch.
+    /// - A second `ActivatePqConsensus` tx before the first epoch is reached
+    ///   replaces the stored epoch (last-writer-wins within the constraint).
+    /// - After `EmergencyDeprecateAlgorithm("ml-dsa-65")`, a new tx is required
+    ///   to re-enable; the deprecation clears the stored epoch.
+    ///
+    /// Authorization: initially open (any funded sender); a future change-set
+    /// can narrow this to `crypto_governors` if needed.
+    ActivatePqConsensus {
+        /// Epoch at which ML-DSA-65 consensus signatures become accepted and
+        /// the R3 power gate lifts for qualifying validators.
+        activation_epoch: u64,
+    },
+
     EmergencyDeprecateAlgorithm {
         /// Algorithm being deprecated (must be the current `active_scheme`).
         deprecated_scheme: String,
@@ -573,6 +593,8 @@ impl TxBody {
             TxBody::RevokeAgentFull { .. }        => "RevokeAgentFull",
             TxBody::RecordAgentSpend { .. }       => "RecordAgentSpend",
             TxBody::SpawnChildAgent { .. }        => "SpawnChildAgent",
+            // PQ-VAL-002 R1: PQ consensus activation
+            TxBody::ActivatePqConsensus { .. } => "ActivatePqConsensus",
             // CS-001 P4: Emergency Crypto Deprecation
             TxBody::EmergencyDeprecateAlgorithm { .. } => "EmergencyDeprecateAlgorithm",
             // Resource Network v0.2
@@ -825,6 +847,8 @@ impl Transaction {
                 child_agent_id, child_agent_address, parent_agent_id, description, ..
             } => child_agent_id.len() + child_agent_address.len()
                 + parent_agent_id.len() + description.len() + 64,
+            // ActivatePqConsensus: single u64 field.
+            TxBody::ActivatePqConsensus { .. } => 8,
             // EmergencyDeprecateAlgorithm: two scheme names + rationale + optional advisory + scope.
             TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme, replacement_scheme, rationale, advisory_ref, ..
@@ -1616,6 +1640,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // are DIS identities). Guard on PoCD since that also gates the
         // treasury and balance transfers for this reward path.
         TxBody::ClaimResearchReward { .. } => Some("pocd"),
+        // PQ-VAL-002 R1: ActivatePqConsensus — no module gate.
+        TxBody::ActivatePqConsensus { .. } => None,
         // CS-001 P4: EmergencyDeprecateAlgorithm is a core constitutional tx;
         // no optional module gate — governed exclusively by crypto_governors list.
         TxBody::EmergencyDeprecateAlgorithm { .. } => None,
@@ -2539,6 +2565,29 @@ impl Executor {
                 Ok(())
             }
 
+            // ── PQ-VAL-002 R1: Activate PQ Consensus ─────────────────────────
+            TxBody::ActivatePqConsensus { activation_epoch } => {
+                let current_epoch = identity.clock.current_epoch;
+                if *activation_epoch <= current_epoch {
+                    Err(format!(
+                        "ActivatePqConsensus: activation_epoch {} must be strictly \
+                         greater than current epoch {}",
+                        activation_epoch, current_epoch
+                    ))
+                } else {
+                    state.set_raw(
+                        "pq_consensus_activation_epoch",
+                        &activation_epoch.to_string(),
+                    );
+                    events.push(format!(
+                        "activate_pq_consensus: activation_epoch={activation_epoch} \
+                         set_by={} at_epoch={current_epoch}",
+                        tx.sender
+                    ));
+                    Ok(())
+                }
+            }
+
             // ── CS-001 P4: Emergency Algorithm Deprecation ────────────────────
             TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme,
@@ -2996,6 +3045,11 @@ impl Executor {
             | TxBody::RecordAgentSpend { .. }
             | TxBody::SpawnChildAgent { .. } => {
                 Err("AEI Phase 2 transaction requires identity- and agent-aware executor".to_string())
+            }
+            // ActivatePqConsensus requires the identity-aware executor
+            // (needs current_epoch from identity.clock).
+            TxBody::ActivatePqConsensus { .. } => {
+                Err("ActivatePqConsensus requires the full identity- and state-aware executor".to_string())
             }
             // EmergencyDeprecateAlgorithm requires the identity-aware executor
             // (needs current_epoch from identity.clock).
