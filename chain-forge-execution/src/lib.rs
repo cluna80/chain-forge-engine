@@ -488,7 +488,8 @@ pub enum TxBody {
     /// Governance transaction that sets the epoch at which ML-DSA-65 consensus
     /// signature verification is activated (PQ-VAL-002 R1).
     ///
-    /// - `activation_epoch` must be strictly greater than the current epoch.
+    /// - `activation_epoch` must be ≥ 1 (epoch 0 is the genesis sentinel and is rejected).
+    ///   Any epoch ≥ 1, including epochs already passed, is valid (immediate activation).
     /// - A second `ActivatePqConsensus` tx before the first epoch is reached
     ///   replaces the stored epoch (last-writer-wins within the constraint).
     /// - After `EmergencyDeprecateAlgorithm("ml-dsa-65")`, a new tx is required
@@ -2608,11 +2609,15 @@ impl Executor {
             // ── PQ-VAL-002 R1: Activate PQ Consensus ─────────────────────────
             TxBody::ActivatePqConsensus { activation_epoch } => {
                 let current_epoch = identity.clock.current_epoch;
-                if *activation_epoch <= current_epoch {
+                // Epoch 0 is the genesis sentinel and is always rejected —
+                // activation must refer to a named, post-genesis epoch.
+                // Any epoch ≥ 1 is valid: if it has already passed, ML-DSA
+                // consensus signatures are effective immediately.
+                if *activation_epoch == 0 {
                     Err(format!(
-                        "ActivatePqConsensus: activation_epoch {} must be strictly \
-                         greater than current epoch {}",
-                        activation_epoch, current_epoch
+                        "ActivatePqConsensus: activation_epoch must be ≥ 1 \
+                         (epoch 0 is the genesis sentinel; current epoch is {})",
+                        current_epoch
                     ))
                 } else {
                     state.set_raw(
@@ -2637,22 +2642,35 @@ impl Executor {
                 advisory_ref,
                 scope,
             } => {
-                // ── Guard 0: Scope must be TxSignatures ───────────────────────
-                // Consensus-signature migration requires a verified validator-key
-                // rotation path that does not yet exist.  Reject ConsensusSignatures
-                // and Both unconditionally to prevent an accidental network halt.
+                // ── Guard 0: Scope check ───────────────────────────────────────
+                // ConsensusSignatures scope is allowed only for "ml-dsa-65"
+                // (PQ-VAL-002 R4 emergency rollback path).  All other schemes
+                // and the Both scope still require the full validator-key
+                // rotation path that does not yet exist.
                 match scope {
-                    DeprecationScope::TxSignatures => { /* allowed */ }
-                    DeprecationScope::ConsensusSignatures | DeprecationScope::Both => {
+                    DeprecationScope::TxSignatures => { /* always allowed */ }
+                    DeprecationScope::ConsensusSignatures => {
+                        // Allowed only for the PQ-VAL-002 ML-DSA rollback.
+                        if deprecated_scheme != "ml-dsa-65" {
+                            return TransactionResult::err(
+                                tx.id.clone(), gas_required, tx.gas_limit,
+                                format!(
+                                    "EmergencyDeprecateAlgorithm: ConsensusSignatures \
+                                     scope is only supported for deprecated_scheme \
+                                     \"ml-dsa-65\"; got {:?}",
+                                    deprecated_scheme,
+                                ),
+                            );
+                        }
+                        // Guard 5 (no in-progress migration) is checked below
+                        // as usual; nothing else to gate here.
+                    }
+                    DeprecationScope::Both => {
                         return TransactionResult::err(
                             tx.id.clone(), gas_required, tx.gas_limit,
-                            format!(
-                                "EmergencyDeprecateAlgorithm: scope {:?} is not yet \
-                                 supported — consensus-signature migration requires a \
-                                 verified validator-key rotation path; use \
-                                 TxSignatures scope only",
-                                scope,
-                            ),
+                            "EmergencyDeprecateAlgorithm: scope Both is not yet \
+                             supported — use TxSignatures or ConsensusSignatures \
+                             (ml-dsa-65 only) separately".to_string(),
                         );
                     }
                 }
@@ -2766,6 +2784,16 @@ impl Executor {
                 let migration_json = serde_json::to_string(&migration)
                     .unwrap_or_else(|_| "{}".to_string());
                 state.set_raw(CRYPTO_MIGRATION_STATE_KEY, &migration_json);
+
+                // PQ-VAL-002 R4: When deprecating ML-DSA consensus signatures,
+                // clear the activation epoch so verify_consensus_vote() in
+                // chain-forge-node immediately rejects ML-DSA precommits.
+                // A new ActivatePqConsensus tx is required to re-enable.
+                if matches!(scope, DeprecationScope::ConsensusSignatures)
+                    && deprecated_scheme == "ml-dsa-65"
+                {
+                    state.remove_raw("pq_consensus_activation_epoch");
+                }
 
                 tracing::warn!(
                     deprecated = %deprecated_scheme,
