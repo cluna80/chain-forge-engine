@@ -56,11 +56,17 @@ default = ["real-network"]
 tokio             = { workspace = true }
 serde_json        = { workspace = true }
 hex               = { workspace = true }
+criterion         = { version = "0.5", features = ["html_reports"] }
+rayon             = { version = "1" }
 chain-forge-consensus = { path = "../chain-forge-consensus", features = ["real-crypto"] }
 chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network"] }
 chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto", "real-pqc"] }
 chain-forge-execution = { path = "../chain-forge-execution" }
 chain-forge-vca-pq    = { path = "../chain-forge-vca-pq" }
+
+[[bench]]
+name    = "bft_round_mldsa"
+harness = false
 
 [[test]]
 name = "devnet_4node"

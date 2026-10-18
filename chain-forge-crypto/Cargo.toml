@@ -61,4 +61,11 @@ path = "src/bin/gen_devnet_keys.rs"
 required-features = ["real-crypto"]
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio     = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+rayon     = { version = "1" }
+
+[[bench]]
+name              = "mldsa_validator"
+harness           = false
+required-features = ["real-pqc"]
