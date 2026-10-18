@@ -2708,6 +2708,7 @@ impl Node {
             validator:  my_id.clone(),
             block_hash: Some(proposal.block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         self.sign_vote(&mut prevote);
         if let Err(e) = self.consensus.receive_vote(prevote.clone()).await {
@@ -2725,6 +2726,7 @@ impl Node {
             validator:  my_id,
             block_hash: Some(proposal.block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         self.sign_vote(&mut precommit);
         let cert = self.consensus.receive_vote(precommit.clone()).await
@@ -3723,6 +3725,7 @@ impl Node {
                     validator:  validator.id.clone(),
                     block_hash: Some(proposal.block_hash.clone()),
                     signature:  vec![],
+                    scheme:     Vote::default_scheme(),
                 };
                 if let Some(ref kp) = devnet_sim_key {
                     let bytes = vote_signing_bytes(
@@ -4295,6 +4298,7 @@ mod tests {
             validator:  alice.clone(),
             block_hash: Some(block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         assert!(
             restarted.verify_vote_signature(&unsigned).is_err(),
@@ -4318,6 +4322,7 @@ mod tests {
             validator:  alice.clone(),
             block_hash: Some(block_hash.clone()),
             signature:  forged_sig.bytes,
+            scheme:     Vote::default_scheme(),
         };
         assert!(
             restarted.verify_vote_signature(&forged).is_err(),
@@ -4338,6 +4343,7 @@ mod tests {
             validator:  alice,
             block_hash: Some(block_hash),
             signature:  real_sig.bytes,
+            scheme:     Vote::default_scheme(),
         };
         assert!(
             restarted.verify_vote_signature(&honest).is_ok(),
@@ -4747,6 +4753,7 @@ mod tests {
             validator:  chain_forge_consensus::ValidatorId(addr.clone()),
             block_hash: Some(cert.block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         let result = node.consensus.receive_vote(unsigned).await;
         assert!(
@@ -4781,6 +4788,7 @@ mod tests {
             validator:  chain_forge_consensus::ValidatorId(addr.clone()),
             block_hash: Some(cert.block_hash.clone()),
             signature:  forged_sig.bytes,
+            scheme:     Vote::default_scheme(),
         };
         let result = node.consensus.receive_vote(forged).await;
         assert!(
@@ -4946,6 +4954,7 @@ mod tests {
                 validator: ValidatorId(addr.to_string()),
                 block_hash: Some(BlockHash("block7".to_string())),
                 signature: vec![],
+                scheme:     Vote::default_scheme(),
             };
             let kp = ClassicalScheme.generate_keypair(addr).unwrap();
             let bytes = vote_signing_bytes("qcb-testnet-1", &vote.vote_type, vote.height, vote.round, vote.block_hash.as_ref());
@@ -5173,6 +5182,7 @@ mod tests {
             validator:  ValidatorId(validator.to_string()),
             block_hash: Some(block_hash),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         let kp = ClassicalScheme.generate_keypair(validator)
             .expect("deterministic devnet keypair generation must not fail");
