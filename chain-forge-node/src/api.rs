@@ -700,31 +700,32 @@ pub async fn serve(
                     } else if first_line.starts_with("POST /api/auth/challenge") {
                         // POST /api/auth/challenge — issue a time-bounded challenge.
                         //
-                        // Body (optional JSON): { "scope": "qcb-auth" }
-                        // Response: AuthChallenge JSON including challenge_id + expires_at.
+                        // Body (optional JSON): { "scope": "wallet:authenticate" }
+                        // Response: AuthChallenge JSON including challenge_id + expires_at + chain_id.
                         //
-                        // The wallet signs the full challenge JSON (SHA-256 pre-hashed),
-                        // not just the challenge_id, so the signature covers temporal and
-                        // node context. The QR code encodes the challenge JSON for the
-                        // user's wallet app to scan.
+                        // The wallet builds the DIS-AUTH-V1 canonical binary payload from the
+                        // challenge JSON fields, SHA-256 pre-hashes it, and signs with ML-DSA-65.
+                        // The chain_id field binds the signature to this specific chain — a replay
+                        // from another Qattice instance will fail audience/chain binding.
                         let body_start = request.find("\r\n\r\n")
                             .map(|i| i + 4)
                             .unwrap_or(request.len());
                         let body = &request[body_start..];
 
                         let scope = if body.trim().is_empty() {
-                            "qcb-auth".to_string()
+                            "wallet:authenticate".to_string()
                         } else {
                             serde_json::from_str::<ChallengeRequest>(body)
                                 .map(|r| r.scope)
-                                .unwrap_or_else(|_| "qcb-auth".to_string())
+                                .unwrap_or_else(|_| "wallet:authenticate".to_string())
                         };
 
-                        let challenge = AuthChallenge::new(&node_id, &scope);
+                        let challenge = AuthChallenge::new(&node_id, &scope, &precheck.chain_id);
                         let ch_json = serde_json::to_string(&challenge).unwrap_or_default();
                         tracing::info!(
                             challenge_id = %challenge.challenge_id,
                             expires_at   = challenge.expires_at,
+                            chain_id     = %challenge.chain_id,
                             scope        = %scope,
                             "auth challenge issued"
                         );
@@ -735,7 +736,7 @@ pub async fn serve(
                         http_200_json(&ch_json)
 
                     } else if first_line.starts_with("POST /api/auth/verify") {
-                        // POST /api/auth/verify — verify a wallet-signed challenge.
+                        // POST /api/auth/verify — verify a wallet-signed DIS-AUTH-V1 challenge.
                         //
                         // Body JSON: {
                         //   "challenge_id": "<32-char hex>",
@@ -744,12 +745,18 @@ pub async fn serve(
                         // }
                         //
                         // On success:
-                        //   { "status": "verified", "address": "qcb1pq…", … }
+                        //   { "status": "verified", "address": "qcb1pq…", "chain_id": "…", … }
                         // On failure:
                         //   HTTP 400  { "status": "rejected", "reason": "…" }
                         //
-                        // Anti-replay: challenge_id is consumed on first success.
-                        // Expired challenges are rejected automatically.
+                        // Ordering: cryptographic verification happens BEFORE challenge consumption.
+                        // A failed signature attempt leaves the legitimate challenge intact —
+                        // an attacker who learns a challenge_id cannot burn it without a valid
+                        // signature. The challenge is consumed only on successful verification.
+                        // See ChallengeStore::consume() for the threat-model trade-off note.
+                        //
+                        // Anti-replay: challenge_id is consumed on first successful verification.
+                        // Expired challenges are rejected at consume time.
                         let body_start = request.find("\r\n\r\n")
                             .map(|i| i + 4)
                             .unwrap_or(request.len());
@@ -764,10 +771,11 @@ pub async fn serve(
                                 http_400_json(&resp.to_string())
                             }
                             Ok(verify_req) => {
-                                // Consume the challenge (anti-replay + expiry in one step)
+                                // Step 1: Peek at the challenge WITHOUT consuming it.
+                                // This allows failed verification to leave the challenge intact.
                                 let maybe_challenge = {
-                                    let mut store = challenge_store.lock().unwrap();
-                                    store.consume(&verify_req.challenge_id)
+                                    let store = challenge_store.lock().unwrap();
+                                    store.get(&verify_req.challenge_id).cloned()
                                 };
                                 match maybe_challenge {
                                     None => {
@@ -784,13 +792,32 @@ pub async fn serve(
                                         });
                                         http_400_json(&resp.to_string())
                                     }
+                                    Some(challenge) if challenge.is_expired() => {
+                                        // Evict the expired entry.
+                                        {
+                                            let mut store = challenge_store.lock().unwrap();
+                                            store.challenges.remove(&verify_req.challenge_id);
+                                        }
+                                        let resp = serde_json::json!({
+                                            "status": "rejected",
+                                            "reason": "challenge expired"
+                                        });
+                                        http_400_json(&resp.to_string())
+                                    }
                                     Some(challenge) => {
+                                        // Step 2: Cryptographic verification (before consume).
                                         match verify_challenge_signature(&challenge, &verify_req) {
                                             Ok(address) => {
+                                                // Step 3: Consume only on success (anti-replay).
+                                                {
+                                                    let mut store = challenge_store.lock().unwrap();
+                                                    store.consume(&verify_req.challenge_id);
+                                                }
                                                 tracing::info!(
                                                     challenge_id = %challenge.challenge_id,
                                                     address      = %address,
                                                     scope        = %challenge.scope,
+                                                    chain_id     = %challenge.chain_id,
                                                     "DIS-001: auth challenge verified"
                                                 );
                                                 let resp = serde_json::json!({
@@ -799,14 +826,17 @@ pub async fn serve(
                                                     "address":      address,
                                                     "scope":        challenge.scope,
                                                     "issued_at":    challenge.issued_at,
+                                                    "chain_id":     challenge.chain_id,
                                                 });
                                                 http_200_json(&resp.to_string())
                                             }
                                             Err(reason) => {
+                                                // Verification failed — challenge NOT consumed.
+                                                // The legitimate user can retry.
                                                 tracing::warn!(
                                                     challenge_id = %challenge.challenge_id,
                                                     %reason,
-                                                    "DIS-001: auth challenge verification failed"
+                                                    "DIS-001: auth challenge verification failed (challenge preserved)"
                                                 );
                                                 let resp = serde_json::json!({
                                                     "status": "rejected",

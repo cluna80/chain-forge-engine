@@ -53,6 +53,9 @@ pub enum WalletError {
 
     #[error("transaction rejected by node: {0}")]
     TxRejected(String),
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 pub type WalletResult<T> = Result<T, WalletError>;
@@ -283,31 +286,142 @@ pub fn sign_transaction(tx_body_json: &str, chain_id: &str, kp: &KeyPair) -> Wal
     Ok(hex_encode(&sig.bytes))
 }
 
+// ─── DIS-AUTH-V1 canonical payload ──────────────────────────────────────────
+//
+// These constants and the builder function must stay byte-for-byte identical
+// with the implementation in chain-forge-node::auth.  Both crates implement
+// the same algorithm independently to avoid a dependency cycle.
+//
+// Layout (all integers big-endian):
+//   [10]  b"DIS-AUTH-V1"          domain separator (fixed, not length-prefixed)
+//   [2]   protocol_version: u16   = 1
+//   [2+N] chain_id                u16-length-prefixed UTF-8
+//   [2+N] audience (node_id)      u16-length-prefixed UTF-8
+//   [2+N] scope                   u16-length-prefixed UTF-8
+//   [16]  challenge_id            16 raw bytes (from 32-char hex API field)
+//   [8]   issued_at: u64          Unix seconds
+//   [8]   expires_at: u64         Unix seconds
+
+const DIS_DOMAIN_SEPARATOR: &[u8] = b"DIS-AUTH-V1";
+const DIS_PROTOCOL_VERSION: u16    = 1;
+const DIS_MAX_FIELD_LEN: usize     = 255;
+
+/// Build the DIS-AUTH-V1 canonical binary payload from challenge JSON fields.
+///
+/// Call this with the parsed fields from the QR-code `AuthChallenge` JSON
+/// before passing to `sign_challenge_canonical`.
+pub fn dis_canonical_payload(
+    chain_id:         &str,
+    audience:         &str,   // == challenge.node_id
+    scope:            &str,
+    challenge_id_hex: &str,   // 32 hex chars = 16 bytes
+    issued_at:        u64,
+    expires_at:       u64,
+) -> WalletResult<Vec<u8>> {
+    let chain_id_bytes = chain_id.as_bytes();
+    let audience_bytes = audience.as_bytes();
+    let scope_bytes    = scope.as_bytes();
+
+    if chain_id_bytes.len() > DIS_MAX_FIELD_LEN {
+        return Err(WalletError::InvalidInput(
+            format!("DIS chain_id too long: {} bytes (max {DIS_MAX_FIELD_LEN})", chain_id_bytes.len())
+        ));
+    }
+    if audience_bytes.len() > DIS_MAX_FIELD_LEN {
+        return Err(WalletError::InvalidInput(
+            format!("DIS audience too long: {} bytes (max {DIS_MAX_FIELD_LEN})", audience_bytes.len())
+        ));
+    }
+    if scope_bytes.len() > DIS_MAX_FIELD_LEN {
+        return Err(WalletError::InvalidInput(
+            format!("DIS scope too long: {} bytes (max {DIS_MAX_FIELD_LEN})", scope_bytes.len())
+        ));
+    }
+    if challenge_id_hex.len() != 32 {
+        return Err(WalletError::InvalidInput(
+            format!("DIS challenge_id must be 32 hex chars, got {}", challenge_id_hex.len())
+        ));
+    }
+    let id_bytes = hex_decode(challenge_id_hex)
+        .map_err(|_| WalletError::InvalidInput("DIS challenge_id is not valid hex".into()))?;
+
+    let mut buf = Vec::with_capacity(
+        DIS_DOMAIN_SEPARATOR.len() + 2
+        + 2 + chain_id_bytes.len()
+        + 2 + audience_bytes.len()
+        + 2 + scope_bytes.len()
+        + 16 + 8 + 8
+    );
+    buf.extend_from_slice(DIS_DOMAIN_SEPARATOR);
+    buf.extend_from_slice(&DIS_PROTOCOL_VERSION.to_be_bytes());
+    buf.extend_from_slice(&(chain_id_bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(chain_id_bytes);
+    buf.extend_from_slice(&(audience_bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(audience_bytes);
+    buf.extend_from_slice(&(scope_bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(scope_bytes);
+    buf.extend_from_slice(&id_bytes);
+    buf.extend_from_slice(&issued_at.to_be_bytes());
+    buf.extend_from_slice(&expires_at.to_be_bytes());
+    Ok(buf)
+}
+
 /// Sign a DIS-001 authentication challenge with an ML-DSA key pair.
 ///
 /// The wallet receives the `challenge_json` string from the QR code (the full
-/// `AuthChallenge` JSON issued by `POST /api/auth/challenge`).  It SHA-256
-/// pre-hashes the JSON (same convention as `sign_transaction`) then signs with
-/// ML-DSA-65, and returns the tagged signature `"mldsa65:<hex>"`.
+/// `AuthChallenge` JSON issued by `POST /api/auth/challenge`).  It parses the
+/// JSON, builds the DIS-AUTH-V1 canonical binary payload, SHA-256 pre-hashes it
+/// (same convention as `sign_transaction`), signs with ML-DSA-65, and returns
+/// the tagged signature `"mldsa65:<hex>"`.
 ///
 /// # Authentication flow
 /// 1. Node issues `AuthChallenge` via `POST /api/auth/challenge`
 /// 2. Node encodes the challenge JSON as a QR code
 /// 3. User scans QR code; wallet calls `sign_challenge(challenge_json, &kp)`
 /// 4. Wallet POSTs `{ challenge_id, public_key, signature }` to `POST /api/auth/verify`
-/// 5. Node verifies signature and returns `{ status: "verified", address }`
+/// 5. Node verifies signature using the SAME DIS-AUTH-V1 canonical payload and returns
+///    `{ status: "verified", address, chain_id }`
+///
+/// # Signing construction (DIS-specific, documented explicitly)
+/// ```text
+/// payload  = DIS-AUTH-V1 canonical binary (see dis_canonical_payload)
+/// message  = SHA-256(payload)            // explicit SHA-256 pre-hash
+/// sig      = ML-DSA-65.sign(message, sk) // standard ML-DSA on the hash
+/// output   = "mldsa65:" || hex(sig)
+/// ```
+///
+/// This is NOT standard ML-DSA-65 message signing.  The SHA-256 pre-hash is
+/// a DIS-specific construction identical to how transaction bodies are signed.
 ///
 /// # Returns
 /// Tagged hex signature: `"mldsa65:<hex_signature_bytes>"`
 pub fn sign_challenge(challenge_json: &str, kp: &KeyPair) -> WalletResult<String> {
     use sha2::{Sha256, Digest};
 
-    // Message = SHA-256(challenge_json bytes)
-    // Same pre-hash convention as sign_transaction so the crypto path is uniform.
-    let mut hasher = Sha256::new();
-    hasher.update(challenge_json.as_bytes());
-    let message: [u8; 32] = hasher.finalize().into();
+    // Parse the challenge JSON to extract the fields needed for canonical payload.
+    let ch: serde_json::Value = serde_json::from_str(challenge_json)
+        .map_err(|e| WalletError::InvalidInput(format!("invalid challenge JSON: {e}")))?;
 
+    let challenge_id = ch["challenge_id"].as_str()
+        .ok_or_else(|| WalletError::InvalidInput("challenge_id missing".into()))?;
+    let issued_at = ch["issued_at"].as_u64()
+        .ok_or_else(|| WalletError::InvalidInput("issued_at missing".into()))?;
+    let expires_at = ch["expires_at"].as_u64()
+        .ok_or_else(|| WalletError::InvalidInput("expires_at missing".into()))?;
+    let node_id = ch["node_id"].as_str()
+        .ok_or_else(|| WalletError::InvalidInput("node_id missing".into()))?;
+    let scope = ch["scope"].as_str()
+        .ok_or_else(|| WalletError::InvalidInput("scope missing".into()))?;
+    let chain_id = ch["chain_id"].as_str()
+        .ok_or_else(|| WalletError::InvalidInput("chain_id missing in challenge — node may be running an older version".into()))?;
+
+    // Build the DIS-AUTH-V1 canonical binary payload.
+    // This is the single source of truth for the signed bytes — the node's
+    // verify_challenge_signature() builds the same bytes from the stored AuthChallenge.
+    let payload = dis_canonical_payload(chain_id, node_id, scope, challenge_id, issued_at, expires_at)?;
+
+    // SHA-256 pre-hash then ML-DSA sign (DIS-specific construction).
+    let message: [u8; 32] = Sha256::digest(&payload).into();
     let scheme = MlDsaScheme;
     let sig = scheme.sign(&message, kp)?;
 
@@ -696,8 +810,8 @@ mod tests {
         let _kf = generate_wallet(&path, "auth-test", "passphrase").unwrap();
         let (_kf, kp) = load_wallet(&path, "passphrase").unwrap();
 
-        // Minimal challenge JSON (same shape as AuthChallenge::signing_payload)
-        let challenge_json = r#"{"challenge_id":"abcdef1234567890abcdef1234567890","issued_at":1700000000,"expires_at":1700000060,"node_id":"testchain:8080","scope":"qcb-auth"}"#;
+        // DIS-AUTH-V1 challenge JSON — must include chain_id (added in DIS-001-11).
+        let challenge_json = r#"{"challenge_id":"abcdef1234567890abcdef1234567890","issued_at":1700000000,"expires_at":1700000060,"node_id":"qcb1alice","scope":"wallet:authenticate","chain_id":"qattice-devnet-1"}"#;
 
         let sig = sign_challenge(challenge_json, &kp).unwrap();
         assert!(sig.starts_with("mldsa65:"),
@@ -715,11 +829,9 @@ mod tests {
 
     // ── Test 12: sign_challenge integration with verify_challenge_signature ───
     //
-    // This test verifies the full DIS-001 Phase A round-trip:
-    //   wallet::sign_challenge → node::auth::verify_challenge_signature
-    //
-    // We import auth directly (same workspace) to avoid a crate-level
-    // dependency — the #[cfg(test)] guard keeps this test-only.
+    // Full DIS-001-11 round-trip: wallet::sign_challenge (DIS-AUTH-V1 canonical payload)
+    // must produce a signature that passes the same canonical-payload verification.
+    // We replicate the verifier logic here (can't import chain-forge-node — cycle).
 
     #[test]
     fn sign_challenge_integrates_with_node_verify() {
@@ -732,26 +844,62 @@ mod tests {
         let kf = generate_wallet(&path, "alice-auth", "passphrase").unwrap();
         let (_kf, kp) = load_wallet(&path, "passphrase").unwrap();
 
-        let challenge_json = r#"{"challenge_id":"deadbeef1234567890abcdef12345678","issued_at":1700000000,"expires_at":1700000060,"node_id":"testchain:8080","scope":"qcb-auth"}"#;
+        // DIS-AUTH-V1 challenge JSON with chain_id (required since DIS-001-11).
+        let challenge_json = r#"{"challenge_id":"deadbeef1234567890abcdef12345678","issued_at":1700000000,"expires_at":1700000060,"node_id":"qcb1alice","scope":"wallet:authenticate","chain_id":"qattice-devnet-1"}"#;
 
-        // Sign with wallet
+        // Sign with wallet (uses DIS-AUTH-V1 canonical payload internally)
         let sig_tagged = sign_challenge(challenge_json, &kp).unwrap();
         assert!(sig_tagged.starts_with("mldsa65:"));
 
-        // Manually verify (mirrors auth::verify_challenge_signature logic)
+        // Replicate the verifier path: build the same canonical payload and SHA-256 pre-hash.
+        let payload = dis_canonical_payload(
+            "qattice-devnet-1",
+            "qcb1alice",
+            "wallet:authenticate",
+            "deadbeef1234567890abcdef12345678",
+            1700000000,
+            1700000060,
+        ).expect("canonical_payload must succeed");
+
+        let message: [u8; 32] = Sha256::digest(&payload).into();
+
+        // Verify using the ML-DSA-65 public key from the wallet
         let pk_bytes = hex_decode(&kf.public_key).unwrap();
         assert_eq!(pk_bytes.len(), 1952, "ML-DSA-65 pk must be 1952 bytes");
 
         let sig_hex = sig_tagged.strip_prefix("mldsa65:").unwrap();
         let sig_bytes = hex_decode(sig_hex).unwrap();
 
-        // SHA-256 pre-hash (same as auth.rs)
-        let message: [u8; 32] = Sha256::digest(challenge_json.as_bytes()).into();
-
-        let sig = chain_forge_crypto::Signature { scheme: chain_forge_crypto::SchemeId::MlDsa, bytes: sig_bytes };
+        let sig = chain_forge_crypto::Signature {
+            scheme: chain_forge_crypto::SchemeId::MlDsa,
+            bytes:  sig_bytes,
+        };
         let result = MlDsaScheme.verify(&message, &sig, &pk_bytes);
         assert!(result.is_ok(),
-            "wallet sign_challenge output must pass ML-DSA-65 verification: {:?}", result.err());
+            "wallet sign_challenge (DIS-AUTH-V1) must pass canonical-payload verification: {:?}", result.err());
+
+        cleanup(&path);
+    }
+
+    // ── Test 13: sign_challenge requires chain_id field ───────────────────────
+
+    #[test]
+    fn sign_challenge_rejects_missing_chain_id() {
+        let path = tmp_path("sign_challenge_no_chain");
+        cleanup(&path);
+
+        let _kf = generate_wallet(&path, "dis-test", "passphrase").unwrap();
+        let (_kf, kp) = load_wallet(&path, "passphrase").unwrap();
+
+        // Old-format challenge JSON without chain_id — must be rejected
+        let old_challenge_json = r#"{"challenge_id":"abcdef1234567890abcdef1234567890","issued_at":1700000000,"expires_at":1700000060,"node_id":"qcb1alice","scope":"wallet:authenticate"}"#;
+
+        let result = sign_challenge(old_challenge_json, &kp);
+        assert!(result.is_err(),
+            "sign_challenge must reject a challenge JSON missing chain_id (version isolation)");
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(err_str.contains("chain_id"),
+            "error message must mention chain_id; got: {err_str}");
 
         cleanup(&path);
     }
