@@ -3279,6 +3279,15 @@ impl Node {
             )
         };
 
+        // Diagnostic: log each failed tx so tests can see the root cause.
+        for r in exec_result.tx_results.iter().filter(|r| !r.success) {
+            warn!(
+                tx_id  = %r.tx_id,
+                error  = ?r.error,
+                "tx failed during block execution"
+            );
+        }
+
         info!(
             height     = cert.height,
             block_hash = %cert.block_hash,
@@ -4141,6 +4150,15 @@ impl Node {
                 &mut self.agents, now_ms, None,
             )
         };
+
+        // Diagnostic: log each failed tx so tests can see the root cause.
+        for r in exec_result.tx_results.iter().filter(|r| !r.success) {
+            warn!(
+                tx_id  = %r.tx_id,
+                error  = ?r.error,
+                "tx failed during block execution"
+            );
+        }
 
         info!(
             height,
