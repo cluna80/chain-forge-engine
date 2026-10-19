@@ -279,10 +279,13 @@ pub async fn serve(
                             Some(a) => {
                                 let is_registered = a.tier.is_some();
                                 let resp = serde_json::json!({
-                                    "address":       address,
-                                    "registered":    is_registered,
-                                    "tier":          a.tier,
+                                    "address":        address,
+                                    "registered":     is_registered,
+                                    "tier":           a.tier,
                                     "exemption_days": a.exemption_days,
+                                    // INV-13 fields: set by ConfirmSybil, cleared by ReverseSybil.
+                                    "frozen":         a.frozen,
+                                    "sybil_confirmed": a.sybil_confirmed,
                                     // attestation_count and attester_list are
                                     // available via the identity crate's IdentityStore
                                     // directly; ExplorerState carries tier/charm only.
@@ -294,10 +297,12 @@ pub async fn serve(
                                 // Address not found in explorer — either never registered
                                 // or node hasn't committed a block since registration.
                                 let resp = serde_json::json!({
-                                    "address":    address,
-                                    "registered": false,
-                                    "tier":       serde_json::Value::Null,
+                                    "address":        address,
+                                    "registered":     false,
+                                    "tier":           serde_json::Value::Null,
                                     "exemption_days": 0,
+                                    "frozen":         false,
+                                    "sybil_confirmed": false,
                                     "note": "address not found in explorer state"
                                 });
                                 http_200_json(&resp.to_string())

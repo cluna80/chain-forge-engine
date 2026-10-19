@@ -738,6 +738,15 @@ pub struct IdentityRecord {
     /// How many distinct claimants this identity has vouched for so far
     /// in attestations_given_epoch. Reset to 0 whenever the epoch advances.
     pub attestations_given_count: u32,
+    /// INV-13: set true atomically when the coordinator calls confirm_sybil().
+    /// A frozen identity cannot receive rewards, cast votes, or be attested.
+    /// Cleared by reverse_sybil() after a successful appeal.
+    #[serde(default)]
+    pub frozen: bool,
+    /// INV-13: mirrors confirm_sybil log presence for fast O(1) lookup.
+    /// Set true by confirm_sybil(); cleared by reverse_sybil().
+    #[serde(default)]
+    pub sybil_confirmed: bool,
 }
 
 impl IdentityRecord {
@@ -757,7 +766,15 @@ impl IdentityRecord {
             attestation_ledger: AttestationLedger::default(),
             attestations_given_epoch: 0,
             attestations_given_count: 0,
+            frozen: false,
+            sybil_confirmed: false,
         }
+    }
+
+    /// True if this identity is frozen by a ConfirmSybil (INV-13).
+    /// Frozen identities cannot vote, receive rewards, or be attested.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
     }
 
     /// Verify this identity (upgrade Provisional -> Verified).
@@ -1530,12 +1547,19 @@ impl IdentityStore {
             },
         );
 
+        // INV-13: atomically freeze the entity so it cannot receive rewards,
+        // cast consensus votes, or be attested to again until reversed.
+        if let Some(record) = self.records.get_mut(sybil_id) {
+            record.frozen = true;
+            record.sybil_confirmed = true;
+        }
+
         tracing::info!(
             sybil_id,
             coordinator = caller_id,
             epoch,
             penalized_count = penalized_ids.len(),
-            "sybil confirmed; attesters penalized"
+            "sybil confirmed; entity frozen; attesters penalized"
         );
 
         Ok(penalized_ids)
@@ -1655,12 +1679,18 @@ impl IdentityStore {
             }
         }
 
+        // INV-13: unfreeze the entity now that the appeal succeeded.
+        if let Some(record) = self.records.get_mut(sybil_id) {
+            record.frozen = false;
+            record.sybil_confirmed = false;
+        }
+
         tracing::info!(
             sybil_id,
             coordinator = caller_id,
             epoch,
             restored_count = attester_ids.len(),
-            "sybil confirmation reversed; attester penalties cleared"
+            "sybil confirmation reversed; entity unfrozen; attester penalties cleared"
         );
 
         Ok(attester_ids)

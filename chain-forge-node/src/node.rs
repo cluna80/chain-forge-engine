@@ -89,6 +89,14 @@ pub struct AccountSummary {
     /// IntrinsicCharm surface: verification tier, or null for non-human.
     pub tier:     Option<String>,
     pub exemption_days: u32,
+    /// INV-13: true when this identity is frozen by a ConfirmSybil tx.
+    /// Frozen identities cannot earn rewards, cast votes, or be attested.
+    #[serde(default)]
+    pub frozen: bool,
+    /// INV-13: true once a ConfirmSybil has been confirmed on-chain.
+    /// Cleared by ReverseSybil after a successful appeal.
+    #[serde(default)]
+    pub sybil_confirmed: bool,
 }
 
 /// Voting-power snapshot for one validator.
@@ -1717,6 +1725,9 @@ impl Node {
                 // Accounts: derive from the restored StateStore snapshot.
                 ex.accounts.clear();
                 for a in self.state.all_accounts() {
+                    let (frozen, sybil_confirmed) = self.identity.get(&a.address)
+                        .map(|r| (r.frozen, r.sybil_confirmed))
+                        .unwrap_or((false, false));
                     ex.accounts.insert(a.address.clone(), AccountSummary {
                         address:        a.address.clone(),
                         role:           a.role.clone(),
@@ -1724,6 +1735,8 @@ impl Node {
                         balances:       a.balances.clone(),
                         tier:           a.verification_tier().map(|t| t.to_string()),
                         exemption_days: a.exemption_days(),
+                        frozen,
+                        sybil_confirmed,
                     });
                 }
 
@@ -3543,14 +3556,21 @@ impl Node {
             let mut updated_vs = current_vs;
             let mut any_changed = false;
             for v in &mut updated_vs.validators {
+                // INV-13: a frozen (ConfirmSybil) identity loses consensus power
+                // immediately, regardless of its VerificationTier.
                 let now_verified = self.identity.get(&v.id.0)
-                    .map(|r| r.charm.tier.grants_consensus())
+                    .map(|r| !r.frozen && r.charm.tier.grants_consensus())
                     .unwrap_or(false);
                 if v.pop_verified != now_verified {
                     if now_verified {
                         info!(validator = %v.id, "PoP gate: identity Verified — granting consensus power");
                     } else {
-                        warn!(validator = %v.id, "PoP gate: identity not Verified — revoking consensus power");
+                        let frozen = self.identity.get(&v.id.0).map(|r| r.frozen).unwrap_or(false);
+                        if frozen {
+                            warn!(validator = %v.id, "PoP gate: identity frozen (ConfirmSybil) — revoking consensus power");
+                        } else {
+                            warn!(validator = %v.id, "PoP gate: identity not Verified — revoking consensus power");
+                        }
                     }
                     v.pop_verified = now_verified;
                     any_changed = true;
@@ -3719,6 +3739,9 @@ impl Node {
             }
             ex.accounts.clear();
             for a in self.state.all_accounts() {
+                let (frozen, sybil_confirmed) = self.identity.get(&a.address)
+                    .map(|r| (r.frozen, r.sybil_confirmed))
+                    .unwrap_or((false, false));
                 ex.accounts.insert(a.address.clone(), AccountSummary {
                     address:        a.address.clone(),
                     role:           a.role.clone(),
@@ -3726,6 +3749,8 @@ impl Node {
                     balances:       a.balances.clone(),
                     tier:           a.verification_tier().map(|t| t.to_string()),
                     exemption_days: a.exemption_days(),
+                    frozen,
+                    sybil_confirmed,
                 });
             }
 
@@ -4394,6 +4419,9 @@ impl Node {
             // Refresh account snapshots (includes IntrinsicCharm surface)
             ex.accounts.clear();
             for a in self.state.all_accounts() {
+                let (frozen, sybil_confirmed) = self.identity.get(&a.address)
+                    .map(|r| (r.frozen, r.sybil_confirmed))
+                    .unwrap_or((false, false));
                 ex.accounts.insert(a.address.clone(), AccountSummary {
                     address:        a.address.clone(),
                     role:           a.role.clone(),
@@ -4401,6 +4429,8 @@ impl Node {
                     balances:       a.balances.clone(),
                     tier:           a.verification_tier().map(|t| t.to_string()),
                     exemption_days: a.exemption_days(),
+                    frozen,
+                    sybil_confirmed,
                 });
             }
 
