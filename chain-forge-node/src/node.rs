@@ -446,6 +446,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RevokeAgentFull { .. }          => "revoke_agent_full",
         TxBody::RecordAgentSpend { .. }         => "record_agent_spend",
         TxBody::SpawnChildAgent { .. }          => "spawn_child_agent",
+        // PQ-VAL-002 R1: PQ Consensus Activation governance tx
+        TxBody::ActivatePqConsensus { .. } => "activate_pq_consensus",
         // CS-001 P4: Emergency Cryptographic Deprecation (constitutional governance)
         TxBody::EmergencyDeprecateAlgorithm { .. } => "emergency_deprecate_algorithm",
         // PoCD Research Reward Settlement (Change Set L)
@@ -1459,6 +1461,122 @@ impl Node {
         self.data_dir = Some(dir);
         Ok(())
     }
+
+    // ── PQ-VAL-002 public API ────────────────────────────────────────────────
+
+    /// Returns the current consensus epoch from the node's identity clock.
+    pub fn current_epoch(&self) -> u64 {
+        self.identity.clock.current_epoch
+    }
+
+    /// Returns the stored ML-DSA consensus activation epoch, or `None` if no
+    /// `ActivatePqConsensus` governance tx has been processed (or if the
+    /// activation epoch was cleared by an `EmergencyDeprecateAlgorithm` tx).
+    pub fn pq_activation_epoch(&self) -> Option<u64> {
+        self.state
+            .get_raw("pq_consensus_activation_epoch")
+            .and_then(|s| s.parse::<u64>().ok())
+    }
+
+    /// Verify a scheme-tagged consensus precommit vote (PQ-VAL-002 R2).
+    ///
+    /// - `"classical"` votes are verified with Ed25519 against the validator's
+    ///   registered classical key; accepted at any epoch.
+    /// - `"ml-dsa-65"` votes are accepted only at or after the activation
+    ///   epoch stored by an `ActivatePqConsensus` governance tx.  If no
+    ///   activation epoch is set, or the current epoch is before it, the vote
+    ///   is rejected.
+    /// - Any other scheme tag is rejected fail-closed.
+    ///
+    /// The signing message is produced by
+    /// `chain_forge_execution::consensus_precommit_signing_bytes()`.
+    pub fn verify_consensus_vote(
+        &self,
+        vote: &chain_forge_consensus::Vote,
+    ) -> Result<(), String> {
+        use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme};
+
+        let validator_id = &vote.validator.0;
+        let current_epoch = self.identity.clock.current_epoch;
+
+        match vote.scheme.as_str() {
+            "classical" => {
+                // Classical path — accepted at any epoch.
+                let pub_key = self.validator_registry
+                    .consensus_pubkey_bytes(validator_id)
+                    .ok_or_else(|| format!(
+                        "verify_consensus_vote: validator {validator_id} has no \
+                         registered classical consensus key"
+                    ))?;
+                let block_hash_bytes = vote.block_hash
+                    .as_ref()
+                    .map(|h| h.0.as_bytes())
+                    .unwrap_or(&[]);
+                let msg = chain_forge_execution::consensus_precommit_signing_bytes(
+                    &self.genesis.chain_id,
+                    vote.height,
+                    vote.round,
+                    block_hash_bytes,
+                );
+                let sig = chain_forge_crypto::Signature {
+                    scheme: SchemeId::Classical,
+                    bytes:  vote.signature.clone(),
+                };
+                ClassicalScheme.verify(&msg, &sig, &pub_key).map_err(|e| format!(
+                    "verify_consensus_vote: classical signature verification \
+                     failed for validator {validator_id}: {e}"
+                ))
+            }
+
+            "ml-dsa-65" => {
+                // ML-DSA path — epoch-gated by ActivatePqConsensus.
+                let activation_epoch = self.pq_activation_epoch().ok_or_else(|| {
+                    "verify_consensus_vote: ML-DSA consensus not yet activated \
+                     (no ActivatePqConsensus tx has been executed)"
+                        .to_string()
+                })?;
+                if current_epoch < activation_epoch {
+                    return Err(format!(
+                        "verify_consensus_vote: ML-DSA vote rejected — current \
+                         epoch {current_epoch} is before activation epoch \
+                         {activation_epoch}"
+                    ));
+                }
+                let pub_key = self.validator_registry
+                    .consensus_pubkey_bytes(validator_id)
+                    .ok_or_else(|| format!(
+                        "verify_consensus_vote: validator {validator_id} has no \
+                         registered ML-DSA consensus key"
+                    ))?;
+                let block_hash_bytes = vote.block_hash
+                    .as_ref()
+                    .map(|h| h.0.as_bytes())
+                    .unwrap_or(&[]);
+                let msg = chain_forge_execution::consensus_precommit_signing_bytes(
+                    &self.genesis.chain_id,
+                    vote.height,
+                    vote.round,
+                    block_hash_bytes,
+                );
+                let sig = chain_forge_crypto::Signature {
+                    scheme: SchemeId::MlDsa,
+                    bytes:  vote.signature.clone(),
+                };
+                MlDsaScheme.verify(&msg, &sig, &pub_key).map_err(|e| format!(
+                    "verify_consensus_vote: ML-DSA signature verification \
+                     failed for validator {validator_id}: {e}"
+                ))
+            }
+
+            other => Err(format!(
+                "verify_consensus_vote: unknown scheme tag {:?} — fail-closed; \
+                 accepted: \"classical\", \"ml-dsa-65\"",
+                other
+            )),
+        }
+    }
+
+    // ── end PQ-VAL-002 public API ────────────────────────────────────────────
 
     /// Write chain state to disk. Called after every committed block.
     /// Writes JSON files for all stateful subsystems so a restarted node
@@ -2706,6 +2824,7 @@ impl Node {
             validator:  my_id.clone(),
             block_hash: Some(proposal.block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         self.sign_vote(&mut prevote);
         if let Err(e) = self.consensus.receive_vote(prevote.clone()).await {
@@ -2723,6 +2842,7 @@ impl Node {
             validator:  my_id,
             block_hash: Some(proposal.block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         self.sign_vote(&mut precommit);
         let cert = self.consensus.receive_vote(precommit.clone()).await
@@ -3086,6 +3206,23 @@ impl Node {
             })
             .collect();
 
+        // PQ-VAL-002 R4: capture indices of any EDA txs that target
+        // ml-dsa-65 consensus signatures — if one succeeds we re-zero
+        // all ML-DSA-only validators' voting power in this block.
+        let eda_mldsa_consensus_attempts: Vec<usize> = txs.iter().enumerate()
+            .filter_map(|(i, t)| {
+                if let chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                    deprecated_scheme,
+                    scope: chain_forge_execution::DeprecationScope::ConsensusSignatures,
+                    ..
+                } = &t.body {
+                    if deprecated_scheme == "ml-dsa-65" { Some(i) } else { None }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let exec_result = if let Some(ref reg_arc) = self.pocd_registry {
             let mut reg = reg_arc.lock().unwrap();
             self.executor.execute_block_with_identity(
@@ -3188,6 +3325,38 @@ impl Node {
                          executor already authenticated -- this should only happen on a \
                          genuine duplicate-key conflict"
                     );
+                }
+            }
+        }
+
+        // PQ-VAL-002 R4: if an EDA targeting ml-dsa-65 ConsensusSignatures
+        // succeeded in this block, re-zero all ML-DSA-only validators'
+        // voting power in the live ValidatorSet immediately.  The state key
+        // `pq_consensus_activation_epoch` was already cleared by the executor,
+        // so subsequent verify_consensus_vote() calls will also reject ML-DSA.
+        {
+            let eda_activated = eda_mldsa_consensus_attempts.iter().any(|&idx| {
+                exec_result.tx_results.get(idx).map_or(false, |r| r.success)
+            });
+            if eda_activated {
+                let mut updated_vs = self.consensus.validator_set().clone();
+                let mut any_changed = false;
+                for v in &mut updated_vs.validators {
+                    let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
+                        .unwrap_or("classical");
+                    if scheme == "ml-dsa-65" && v.voting_power > 0 {
+                        warn!(
+                            validator = %v.id,
+                            "PQ-VAL-002 R4: re-zeroing ML-DSA validator power after \
+                             EmergencyDeprecateAlgorithm(ml-dsa-65)"
+                        );
+                        v.voting_power = 0;
+                        any_changed = true;
+                    }
+                }
+                if any_changed {
+                    updated_vs.height = cert.height;
+                    let _ = self.consensus.update_validator_set(updated_vs);
                 }
             }
         }
@@ -3372,22 +3541,49 @@ impl Node {
                 // unaffected), look up the actual bonded amount from
                 // state and restore it.
                 if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
-                    // PQ-VAL-001 / R3: ML-DSA-only validators must NOT receive
-                    // voting power in this milestone.  The consensus vote verifier
-                    // in commit_block is still classical-only; admitting an
-                    // ML-DSA-only validator would permanently stall liveness because
-                    // its precommits can never be verified.  Gate removed by PQ-VAL-002
-                    // once the consensus verifier is updated.
+                    // PQ-VAL-001/002 / R3: ML-DSA-only validators are gated
+                    // until PQ-VAL-002 activates the ML-DSA consensus verifier.
+                    // At or after the activation epoch (stored in state by an
+                    // ActivatePqConsensus tx), the gate lifts and ML-DSA
+                    // validators receive their bonded voting power.
                     let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
                         .unwrap_or("classical");
-                    if scheme == "ml-dsa-65" {
-                        warn!(
-                            validator = %v.id,
-                            "R3 consensus gate: ML-DSA-only validator kept at voting_power=0 \
-                             until PQ-VAL-002 activates the ML-DSA consensus verifier"
-                        );
-                        // Leave voting_power at 0 — do not restore.
+                    let pq_active = if scheme == "ml-dsa-65" {
+                        let current_epoch = self.identity.clock.current_epoch;
+                        match self.pq_activation_epoch() {
+                            Some(activation_epoch) if current_epoch >= activation_epoch => {
+                                info!(
+                                    validator = %v.id,
+                                    current_epoch,
+                                    activation_epoch,
+                                    "R3 gate lift: ML-DSA consensus verifier is active"
+                                );
+                                true
+                            }
+                            Some(activation_epoch) => {
+                                warn!(
+                                    validator = %v.id,
+                                    current_epoch,
+                                    activation_epoch,
+                                    "R3 consensus gate: ML-DSA validator kept at \
+                                     voting_power=0 until activation epoch"
+                                );
+                                false
+                            }
+                            None => {
+                                warn!(
+                                    validator = %v.id,
+                                    "R3 consensus gate: ML-DSA validator kept at \
+                                     voting_power=0 — no ActivatePqConsensus tx yet"
+                                );
+                                false
+                            }
+                        }
                     } else {
+                        true // classical validators always allowed
+                    };
+
+                    if pq_active {
                         let bond_addr = format!(
                             "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
                         );
@@ -3721,6 +3917,7 @@ impl Node {
                     validator:  validator.id.clone(),
                     block_hash: Some(proposal.block_hash.clone()),
                     signature:  vec![],
+                    scheme:     Vote::default_scheme(),
                 };
                 if let Some(ref kp) = devnet_sim_key {
                     let bytes = vote_signing_bytes(
@@ -3770,6 +3967,21 @@ impl Node {
                     consensus_pubkey, scheme, ..
                 } = &t.body {
                     Some((i, t.sender.clone(), consensus_pubkey.clone(), scheme.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // PQ-VAL-002 R4: same EDA capture as the multi-node commit_block path.
+        let eda_mldsa_consensus_attempts: Vec<usize> = txs.iter().enumerate()
+            .filter_map(|(i, t)| {
+                if let chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                    deprecated_scheme,
+                    scope: chain_forge_execution::DeprecationScope::ConsensusSignatures,
+                    ..
+                } = &t.body {
+                    if deprecated_scheme == "ml-dsa-65" { Some(i) } else { None }
                 } else {
                     None
                 }
@@ -3864,6 +4076,34 @@ impl Node {
             }
         }
 
+        // PQ-VAL-002 R4: same EDA ML-DSA re-zero as the multi-node path.
+        {
+            let eda_activated = eda_mldsa_consensus_attempts.iter().any(|&idx| {
+                exec_result.tx_results.get(idx).map_or(false, |r| r.success)
+            });
+            if eda_activated {
+                let mut updated_vs = self.consensus.validator_set().clone();
+                let mut any_changed = false;
+                for v in &mut updated_vs.validators {
+                    let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
+                        .unwrap_or("classical");
+                    if scheme == "ml-dsa-65" && v.voting_power > 0 {
+                        warn!(
+                            validator = %v.id,
+                            "PQ-VAL-002 R4: re-zeroing ML-DSA validator power after \
+                             EmergencyDeprecateAlgorithm(ml-dsa-65)"
+                        );
+                        v.voting_power = 0;
+                        any_changed = true;
+                    }
+                }
+                if any_changed {
+                    updated_vs.height = height;
+                    let _ = self.consensus.update_validator_set(updated_vs);
+                }
+            }
+        }
+
         // Integration Point 4 (Push) — same stake-bond admission as the
         // multi-node commit path (see the full design comment there). This
         // is the devnet/single-node auto-commit path, so it needs its own
@@ -3946,10 +4186,18 @@ impl Node {
                 // CF-VAL-KEY-002: same voting-power restoration as the
                 // multi-node commit_block path -- see that path's comment.
                 if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
-                    // PQ-VAL-001 / R3: ML-DSA-only validators stay at 0 power.
+                    // PQ-VAL-001/002 / R3: ML-DSA-only validators gated until
+                    // PQ-VAL-002 activation epoch (same logic as multi-node path).
                     let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
                         .unwrap_or("classical");
-                    if scheme != "ml-dsa-65" {
+                    let pq_active = if scheme == "ml-dsa-65" {
+                        let current_epoch = self.identity.clock.current_epoch;
+                        matches!(self.pq_activation_epoch(),
+                            Some(ae) if current_epoch >= ae)
+                    } else {
+                        true
+                    };
+                    if pq_active {
                         let bond_addr = format!(
                             "{}{}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX, v.id.0,
                         );
@@ -4067,6 +4315,7 @@ mod tests {
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
         "modules": ["bank", "staking", "identity", "agents", "pocd"],
         "custom_modules": [],
+        "crypto_governors": ["qcb1alice"],
         "genesis_accounts": [
             { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator", "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8" },
             { "label": "Bob",   "address": "qcb1bob",   "balance": "5000000", "role": "validator", "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0" },
@@ -4293,6 +4542,7 @@ mod tests {
             validator:  alice.clone(),
             block_hash: Some(block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         assert!(
             restarted.verify_vote_signature(&unsigned).is_err(),
@@ -4316,6 +4566,7 @@ mod tests {
             validator:  alice.clone(),
             block_hash: Some(block_hash.clone()),
             signature:  forged_sig.bytes,
+            scheme:     Vote::default_scheme(),
         };
         assert!(
             restarted.verify_vote_signature(&forged).is_err(),
@@ -4336,6 +4587,7 @@ mod tests {
             validator:  alice,
             block_hash: Some(block_hash),
             signature:  real_sig.bytes,
+            scheme:     Vote::default_scheme(),
         };
         assert!(
             restarted.verify_vote_signature(&honest).is_ok(),
@@ -4745,6 +4997,7 @@ mod tests {
             validator:  chain_forge_consensus::ValidatorId(addr.clone()),
             block_hash: Some(cert.block_hash.clone()),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         let result = node.consensus.receive_vote(unsigned).await;
         assert!(
@@ -4779,6 +5032,7 @@ mod tests {
             validator:  chain_forge_consensus::ValidatorId(addr.clone()),
             block_hash: Some(cert.block_hash.clone()),
             signature:  forged_sig.bytes,
+            scheme:     Vote::default_scheme(),
         };
         let result = node.consensus.receive_vote(forged).await;
         assert!(
@@ -4944,6 +5198,7 @@ mod tests {
                 validator: ValidatorId(addr.to_string()),
                 block_hash: Some(BlockHash("block7".to_string())),
                 signature: vec![],
+                scheme:     Vote::default_scheme(),
             };
             let kp = ClassicalScheme.generate_keypair(addr).unwrap();
             let bytes = vote_signing_bytes("qcb-testnet-1", &vote.vote_type, vote.height, vote.round, vote.block_hash.as_ref());
@@ -5171,6 +5426,7 @@ mod tests {
             validator:  ValidatorId(validator.to_string()),
             block_hash: Some(block_hash),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         let kp = ClassicalScheme.generate_keypair(validator)
             .expect("deterministic devnet keypair generation must not fail");
@@ -7327,6 +7583,641 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(v_power, 0,
             "ML-DSA-only validator must have voting_power == 0 until PQ-VAL-002 (R3)");
+    }
+
+    // =========================================================================
+    // PQ-VAL-002 — ML-DSA-65 Consensus Signature Verification and Activation
+    //
+    // Spec: docs/pq-val-002-spec.md  Baseline: cefc8a0
+    // Branch: feat/pq-val-002-mldsa-consensus-activation
+    //
+    // These 14 tests express the desired behaviour of the PQ-VAL-002 activation
+    // pipeline. On the baseline commit they WILL NOT COMPILE because:
+    //   GAP-1: TxBody::ActivatePqConsensus does not exist
+    //   GAP-2: consensus_precommit_signing_bytes() does not exist
+    //   GAP-3: Vote has no `scheme` field
+    //   GAP-4: Node has no activation_epoch state, R3 lift logic, or deprecation handler
+    //
+    // The compile errors are the failure matrix.
+    // =========================================================================
+
+    // ----- helpers for PQ-VAL-002 tests -------------------------------------
+
+    /// Build an `ActivatePqConsensus` governance tx setting the given epoch.
+    fn activate_pq_consensus_tx(
+        sender:           &str,
+        nonce:            u64,
+        activation_epoch: u64,
+        account_kp:       &chain_forge_crypto::KeyPair,
+        chain_id:         &str,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            id:        format!("activate-pq-{sender}-{nonce}"),
+            sender:    sender.to_string(),
+            nonce,
+            body:      chain_forge_execution::TxBody::ActivatePqConsensus {
+                activation_epoch,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(account_kp, chain_id).unwrap();
+        tx
+    }
+
+    /// Build a scheme-tagged ML-DSA precommit vote for the given block.
+    fn mldsa_precommit_vote(
+        validator_id: &str,
+        height:       u64,
+        round:        u32,
+        block_hash:   &chain_forge_consensus::BlockHash,
+        consensus_kp: &chain_forge_crypto::KeyPair,
+        chain_id:     &str,
+    ) -> chain_forge_consensus::Vote {
+        use chain_forge_crypto::MlDsaScheme;
+        let msg = chain_forge_execution::consensus_precommit_signing_bytes(
+            chain_id, height, round, block_hash.0.as_bytes(),
+        );
+        let sig = MlDsaScheme.sign(&msg, consensus_kp).unwrap();
+        chain_forge_consensus::Vote {
+            vote_type:  chain_forge_consensus::VoteType::Precommit,
+            height,
+            round,
+            validator:  chain_forge_consensus::ValidatorId(validator_id.to_string()),
+            block_hash: Some(block_hash.clone()),
+            signature:  sig.bytes,
+            scheme:     "ml-dsa-65".to_string(),
+        }
+    }
+
+    /// Build a classical (Ed25519) precommit vote.
+    fn classical_precommit_vote(
+        validator_id: &str,
+        height:       u64,
+        round:        u32,
+        block_hash:   &chain_forge_consensus::BlockHash,
+        consensus_kp: &chain_forge_crypto::KeyPair,
+        chain_id:     &str,
+    ) -> chain_forge_consensus::Vote {
+        let msg = chain_forge_execution::consensus_precommit_signing_bytes(
+            chain_id, height, round, block_hash.0.as_bytes(),
+        );
+        let sig = ClassicalScheme.sign(&msg, consensus_kp).unwrap();
+        chain_forge_consensus::Vote {
+            vote_type:  chain_forge_consensus::VoteType::Precommit,
+            height,
+            round,
+            validator:  chain_forge_consensus::ValidatorId(validator_id.to_string()),
+            block_hash: Some(block_hash.clone()),
+            signature:  sig.bytes,
+            scheme:     "classical".to_string(),
+        }
+    }
+
+    // ----- PQ-VAL-002 tests -------------------------------------------------
+
+    /// PQ-VAL-002 / Test 01
+    /// `ActivatePqConsensus` governance tx stores the activation epoch in
+    /// node state and can be queried back.
+    #[tokio::test]
+    async fn activation_epoch_set_by_governance_tx() {
+        let (account_kp, _) = keyed_candidate("pq002-t01-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let tx = activate_pq_consensus_tx(
+            "qcb1alice", 0, 10, &account_kp, node.chain_id(),
+        );
+        node.submit_tx(tx);
+        node.propose_block(genesis_hash).await.unwrap();
+
+        assert_eq!(
+            node.pq_activation_epoch(),
+            Some(10),
+            "activation epoch must be stored and queryable after governance tx"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 02
+    /// `ActivatePqConsensus` with an epoch ≤ the current epoch must be
+    /// rejected (activation must be strictly in the future).
+    #[tokio::test]
+    async fn activation_epoch_must_be_future() {
+        let (account_kp, _) = keyed_candidate("pq002-t02-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Current epoch is 0 at genesis; submitting epoch=0 must fail.
+        let tx = activate_pq_consensus_tx(
+            "qcb1alice", 0, 0, &account_kp, node.chain_id(),
+        );
+        node.submit_tx(tx);
+        node.propose_block(genesis_hash).await.unwrap();
+
+        assert_eq!(
+            node.pq_activation_epoch(),
+            None,
+            "past/current activation epoch must be rejected; state must remain unset"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 03
+    /// An ML-DSA precommit vote submitted before the activation epoch must
+    /// be rejected by the consensus verifier.
+    #[tokio::test]
+    async fn mldsa_vote_rejected_before_activation_epoch() {
+        let (account_kp, addr) = keyed_candidate("pq002-t03-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq002-t03-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Register ML-DSA key (PQ-VAL-001 prerequisite)
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // No ActivatePqConsensus tx — activation epoch is unset.
+        // An ML-DSA precommit should be rejected.
+        let vote = mldsa_precommit_vote(
+            &addr, cert2.height + 1, 0, &cert2.block_hash, &mldsa_kp, node.chain_id(),
+        );
+        let result = node.verify_consensus_vote(&vote);
+        assert!(
+            result.is_err(),
+            "ML-DSA precommit must be rejected before activation epoch is reached"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 04
+    /// A classical (Ed25519) precommit vote is accepted before the activation
+    /// epoch — regression anchor for the classical path.
+    #[tokio::test]
+    async fn classical_vote_accepted_before_activation_epoch() {
+        let (account_kp, addr) = keyed_candidate("pq002-t04-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &account_kp, node.chain_id()));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        let vote = classical_precommit_vote(
+            &addr, cert2.height + 1, 0, &cert2.block_hash, &account_kp, node.chain_id(),
+        );
+        let result = node.verify_consensus_vote(&vote);
+        assert!(
+            result.is_ok(),
+            "classical precommit must be accepted before activation epoch"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 05
+    /// An ML-DSA precommit vote is accepted at or after the activation epoch.
+    #[tokio::test]
+    async fn mldsa_vote_accepted_after_activation_epoch() {
+        let (account_kp, addr) = keyed_candidate("pq002-t05-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq002-t05-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Register ML-DSA key
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        // Set activation epoch = current epoch (immediate activation).
+        // fund_bond_and_verify_personhood used qcb1alice nonce 0, so nonce 1 here.
+        let activation_epoch = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 1, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        let vote = mldsa_precommit_vote(
+            &addr, cert2.height + 1, 0, &cert2.block_hash, &mldsa_kp, node.chain_id(),
+        );
+        let result = node.verify_consensus_vote(&vote);
+        assert!(
+            result.is_ok(),
+            "ML-DSA precommit must be accepted at/after the activation epoch"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 06
+    /// Classical (Ed25519) precommit is still accepted after the activation
+    /// epoch — dual-scheme must hold.
+    #[tokio::test]
+    async fn classical_vote_accepted_after_activation_epoch() {
+        let (account_kp, addr) = keyed_candidate("pq002-t06-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &account_kp, node.chain_id()));
+        let activation_epoch = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 0, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        let vote = classical_precommit_vote(
+            &addr, cert2.height + 1, 0, &cert2.block_hash, &account_kp, node.chain_id(),
+        );
+        let result = node.verify_consensus_vote(&vote);
+        assert!(
+            result.is_ok(),
+            "classical precommit must still be accepted after activation (dual-scheme)"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 07
+    /// At the activation epoch, the R3 power gate lifts for ML-DSA-only
+    /// validators that have bond and personhood — voting_power becomes > 0.
+    #[tokio::test]
+    async fn r3_gate_lifts_at_activation_epoch() {
+        let (account_kp, addr) = keyed_candidate("pq002-t07-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq002-t07-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Bond, personhood, ML-DSA key registration
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // Before activation: voting_power must be 0 (R3 gate active)
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert_eq!(v.voting_power, 0, "R3 gate must hold voting_power at 0 before activation");
+        }
+
+        // Set activation epoch and trigger epoch transition.
+        // fund_bond_and_verify_personhood used qcb1alice nonce 0, so nonce 1 here.
+        let next_epoch = node.current_epoch() + 1;
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 1, next_epoch, &account_kp, node.chain_id(),
+        ));
+        node.propose_block(cert2.block_hash.clone()).await.unwrap();
+        // Advance epoch
+        node.identity.clock.current_epoch = next_epoch;
+        node.propose_block(cert2.block_hash.clone()).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+        assert!(
+            v.voting_power > 0,
+            "R3 gate must lift at activation epoch for ML-DSA validator with bond and personhood"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 08
+    /// After activation, an ML-DSA validator without bond or personhood stays
+    /// at voting_power = 0 — other gates still apply.
+    #[tokio::test]
+    async fn r3_gate_requires_bond_and_personhood() {
+        let (account_kp, addr) = keyed_candidate("pq002-t08-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq002-t08-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Fund but do NOT bond — no personhood either
+        node.submit_tx(Transaction::transfer("fund", "qcb1alice", &addr, "uqcb", 5_000_000, 0));
+        let cert = node.propose_block(genesis_hash).await.unwrap();
+
+        // Activate PQ consensus immediately
+        let activation_epoch = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 0, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        // Try to register an ML-DSA key without bond — should be rejected
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let in_set = vs.validators.iter().any(|v| v.id.0 == addr && v.voting_power > 0);
+        assert!(
+            !in_set,
+            "ML-DSA validator without bond/personhood must stay at voting_power=0 after activation"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 09
+    /// An unknown scheme tag on a vote is rejected even after the activation
+    /// epoch — fail-closed.
+    #[tokio::test]
+    async fn unknown_scheme_vote_rejected_after_activation() {
+        let (account_kp, addr) = keyed_candidate("pq002-t09-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &account_kp, node.chain_id()));
+        let activation_epoch = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 0, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // Forge a vote with an unknown scheme tag
+        let msg = chain_forge_execution::consensus_precommit_signing_bytes(
+            node.chain_id(), cert2.height + 1, 0, cert2.block_hash.0.as_bytes(),
+        );
+        let sig = ClassicalScheme.sign(&msg, &account_kp).unwrap();
+        let vote = chain_forge_consensus::Vote {
+            vote_type:  chain_forge_consensus::VoteType::Precommit,
+            height:     cert2.height + 1,
+            round:      0,
+            validator:  chain_forge_consensus::ValidatorId(addr.clone()),
+            block_hash: Some(cert2.block_hash.clone()),
+            signature:  sig.bytes,
+            scheme:     "falcon-512".to_string(), // unknown scheme
+        };
+        let result = node.verify_consensus_vote(&vote);
+        assert!(
+            result.is_err(),
+            "unknown scheme tag must be rejected fail-closed after activation"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 10
+    /// `EmergencyDeprecateAlgorithm("ml-dsa-65")` re-zeros voting power for
+    /// all ML-DSA-only validators.
+    #[tokio::test]
+    async fn emergency_deprecate_zeros_mldsa_power() {
+        let (account_kp, addr) = keyed_candidate("pq002-t10-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq002-t10-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Full setup: bond + personhood + ML-DSA key + activate.
+        // fund_bond_and_verify_personhood uses qcb1alice nonce 0 → activate uses nonce 1.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let next_epoch = node.current_epoch() + 1;
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 1, next_epoch, &account_kp, node.chain_id(),
+        ));
+        node.propose_block(cert.block_hash.clone()).await.unwrap();
+        node.identity.clock.current_epoch = next_epoch;
+        let cert2 = node.propose_block(cert.block_hash.clone()).await.unwrap();
+
+        // Confirm power was lifted
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert!(v.voting_power > 0, "setup: ML-DSA validator must have power before deprecation");
+        }
+
+        // Emergency deprecation tx — qcb1alice nonce is now 2 (nonce 0: fund, 1: activate).
+        // replacement_scheme must be a known canonical id (ed25519); grace_epochs
+        // must be >= MIN_CRYPTO_GRACE_EPOCHS (10). "classical" and 1 both fail
+        // Guards 2b/3 and cause the EDA tx to be silently rejected.
+        let mut eda_tx = Transaction {
+            id:        "eda-mldsa".to_string(),
+            sender:    "qcb1alice".to_string(),
+            nonce:     2,
+            body:      chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:   "ml-dsa-65".to_string(),
+                replacement_scheme:  "ed25519".to_string(),
+                rationale:           "PQ-VAL-002 emergency rollback test".to_string(),
+                advisory_ref:        None,
+                grace_epochs:        chain_forge_execution::MIN_CRYPTO_GRACE_EPOCHS,
+                scope:               chain_forge_execution::DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        eda_tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(eda_tx);
+        node.propose_block(cert2.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+        assert_eq!(
+            v.voting_power, 0,
+            "EmergencyDeprecateAlgorithm must re-zero ML-DSA validator power"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 11
+    /// After `EmergencyDeprecateAlgorithm("ml-dsa-65")`, ML-DSA precommit
+    /// votes are rejected by the consensus verifier.
+    #[tokio::test]
+    async fn emergency_deprecate_rejects_mldsa_votes() {
+        let (account_kp, addr) = keyed_candidate("pq002-t11-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq002-t11-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: bond + personhood + ML-DSA key + activate
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let activation_epoch = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 0, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // Emergency deprecation
+        let mut eda_tx = Transaction {
+            id:        "eda-mldsa-t11".to_string(),
+            sender:    "qcb1alice".to_string(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:   "ml-dsa-65".to_string(),
+                replacement_scheme:  "classical".to_string(),
+                rationale:           "PQ-VAL-002 vote rejection test".to_string(),
+                advisory_ref:        None,
+                grace_epochs:        1,
+                scope:               chain_forge_execution::DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        eda_tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(eda_tx);
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // ML-DSA vote must now be rejected
+        let vote = mldsa_precommit_vote(
+            &addr, cert3.height + 1, 0, &cert3.block_hash, &mldsa_kp, node.chain_id(),
+        );
+        let result = node.verify_consensus_vote(&vote);
+        assert!(
+            result.is_err(),
+            "ML-DSA votes must be rejected after EmergencyDeprecateAlgorithm"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 12
+    /// Classical validators are unaffected by `EmergencyDeprecateAlgorithm("ml-dsa-65")` —
+    /// they keep their voting power.
+    #[tokio::test]
+    async fn classical_unaffected_by_emergency_deprecate() {
+        let (account_kp, addr) = keyed_candidate("pq002-t12-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &account_kp, node.chain_id()));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // Confirm power
+        let power_before = {
+            let vs = node.consensus.validator_set();
+            vs.validators.iter().find(|v| v.id.0 == addr).map(|v| v.voting_power).unwrap_or(0)
+        };
+        assert!(power_before > 0, "setup: classical validator must have power");
+
+        // Emergency deprecate ML-DSA (classical validator uninvolved)
+        let mut eda_tx = Transaction {
+            id:        "eda-mldsa-t12".to_string(),
+            sender:    "qcb1alice".to_string(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:   "ml-dsa-65".to_string(),
+                replacement_scheme:  "classical".to_string(),
+                rationale:           "PQ-VAL-002 classical unaffected test".to_string(),
+                advisory_ref:        None,
+                grace_epochs:        1,
+                scope:               chain_forge_execution::DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        eda_tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(eda_tx);
+        node.propose_block(cert2.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+        assert_eq!(
+            v.voting_power, power_before,
+            "classical validator voting_power must be unchanged after ML-DSA deprecation"
+        );
+    }
+
+    /// PQ-VAL-002 / Test 13
+    /// The activation epoch survives a node restart.
+    #[tokio::test]
+    async fn activation_epoch_survives_restart() {
+        let (account_kp, _) = keyed_candidate("pq002-t13-account");
+        let dir = std::env::temp_dir().join("pq002-t13-restart");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        node.set_data_dir(dir.clone());
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 0, 42, &account_kp, node.chain_id(),
+        ));
+        node.propose_block(genesis_hash).await.unwrap();
+        assert_eq!(node.pq_activation_epoch(), Some(42), "activation epoch must be set before persist");
+
+        node.persist_state();
+
+        let mut restarted = Node::new(GENESIS, None).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        restarted.load_persisted_state();
+
+        assert_eq!(
+            restarted.pq_activation_epoch(),
+            Some(42),
+            "activation epoch must survive node restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PQ-VAL-002 / Test 14
+    /// After `EmergencyDeprecateAlgorithm("ml-dsa-65")`, a new
+    /// `ActivatePqConsensus` tx is required to re-enable ML-DSA consensus;
+    /// ML-DSA votes remain rejected until one is processed.
+    #[tokio::test]
+    async fn reactivation_requires_new_governance_tx() {
+        let (account_kp, addr) = keyed_candidate("pq002-t14-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq002-t14-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: activate, then deprecate.
+        // fund_bond_and_verify_personhood uses qcb1alice nonce 0 → activate uses nonce 1.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let activation_epoch = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 1, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // EDA tx — qcb1alice nonce is now 2 (nonce 0: fund, 1: activate).
+        // replacement_scheme must be a known canonical id (ed25519); grace_epochs
+        // must be >= MIN_CRYPTO_GRACE_EPOCHS (10). "classical" and 1 both fail
+        // Guards 2b/3 and cause the EDA tx to be silently rejected.
+        let mut eda_tx = Transaction {
+            id:        "eda-mldsa-t14".to_string(),
+            sender:    "qcb1alice".to_string(),
+            nonce:     2,
+            body:      chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:   "ml-dsa-65".to_string(),
+                replacement_scheme:  "ed25519".to_string(),
+                rationale:           "PQ-VAL-002 reactivation test".to_string(),
+                advisory_ref:        None,
+                grace_epochs:        chain_forge_execution::MIN_CRYPTO_GRACE_EPOCHS,
+                scope:               chain_forge_execution::DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        eda_tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(eda_tx);
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Without a new ActivatePqConsensus tx, ML-DSA votes must still be rejected
+        let vote = mldsa_precommit_vote(
+            &addr, cert3.height + 1, 0, &cert3.block_hash, &mldsa_kp, node.chain_id(),
+        );
+        assert!(
+            node.verify_consensus_vote(&vote).is_err(),
+            "ML-DSA votes must remain rejected after deprecation without re-activation"
+        );
+
+        // Now submit a new ActivatePqConsensus tx.
+        // qcb1alice nonce sequence: 0 (fund), 1 (activate), 2 (EDA) → reactivation is nonce 3.
+        let new_activation = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 3, new_activation, &account_kp, node.chain_id(),
+        ));
+        let cert4 = node.propose_block(cert3.block_hash).await.unwrap();
+
+        // ML-DSA votes must now be accepted again
+        let vote2 = mldsa_precommit_vote(
+            &addr, cert4.height + 1, 0, &cert4.block_hash, &mldsa_kp, node.chain_id(),
+        );
+        assert!(
+            node.verify_consensus_vote(&vote2).is_ok(),
+            "ML-DSA votes must be accepted again after new ActivatePqConsensus tx"
+        );
     }
 
     /// PQ-VAL-001 / Test 14

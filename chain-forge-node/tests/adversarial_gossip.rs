@@ -392,6 +392,7 @@ async fn adversarial_unknown_validator() {
         validator:  ValidatorId("qcb1evil".to_string()),
         block_hash: Some(BlockHash("fake_block_hash_000000000000000".to_string())),
         signature:  vec![0xde, 0xad, 0xbe, 0xef],
+        scheme:     Vote::default_scheme(),
     };
 
     eprintln!("   [attacker] sending vote from unknown validator qcb1evil...");
@@ -486,6 +487,7 @@ async fn adversarial_equivocation_over_gossip() {
             validator:  ValidatorId("qcb1alice".to_string()),
             block_hash: Some(BlockHash(block_hash.to_string())),
             signature:  vec![],
+            scheme:     Vote::default_scheme(),
         };
         let bytes = vote_signing_bytes(
             "qcb-devnet-4node", &vote.vote_type, vote.height, vote.round,
@@ -649,6 +651,7 @@ async fn adversarial_garbage_signature() {
         validator:  ValidatorId("qcb1bob".to_string()),
         block_hash: Some(BlockHash("block_h_r0_garbage_sig_00000000".to_string())),
         signature:  garbage,
+        scheme:     Vote::default_scheme(),
     };
 
     eprintln!("   [attacker] sending forged vote from qcb1bob (garbage sig) at height={attack_height}...");

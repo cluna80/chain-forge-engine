@@ -160,6 +160,9 @@ impl GasModel {
                     // Resource Network: Contribution layer.
                     // RegisterMachine: writes MachineRecord to state (similar to RegisterAgent).
                     // SubmitUsefulWork: verifies seal + writes receipt + updates contribution score.
+                    // PQ-VAL-002 R1: ActivatePqConsensus governance tx — low gas,
+                    // single epoch write.
+                    TxBody::ActivatePqConsensus { .. } => op_multiplier * 4,
                     // EmergencyDeprecateAlgorithm (CS-001 P4): constitutional governance
                     // operation; high gas to deter frivolous calls.
                     TxBody::EmergencyDeprecateAlgorithm { .. } => op_multiplier * 20,
@@ -482,6 +485,24 @@ pub enum TxBody {
     ///
     /// Authorization: sender must be in `config.crypto_governors` (a small set of
     /// constitutional keyholders, distinct from ordinary governance).
+    /// Governance transaction that sets the epoch at which ML-DSA-65 consensus
+    /// signature verification is activated (PQ-VAL-002 R1).
+    ///
+    /// - `activation_epoch` must be ≥ 1 (epoch 0 is the genesis sentinel and is rejected).
+    ///   Any epoch ≥ 1, including epochs already passed, is valid (immediate activation).
+    /// - A second `ActivatePqConsensus` tx before the first epoch is reached
+    ///   replaces the stored epoch (last-writer-wins within the constraint).
+    /// - After `EmergencyDeprecateAlgorithm("ml-dsa-65")`, a new tx is required
+    ///   to re-enable; the deprecation clears the stored epoch.
+    ///
+    /// Authorization: initially open (any funded sender); a future change-set
+    /// can narrow this to `crypto_governors` if needed.
+    ActivatePqConsensus {
+        /// Epoch at which ML-DSA-65 consensus signatures become accepted and
+        /// the R3 power gate lifts for qualifying validators.
+        activation_epoch: u64,
+    },
+
     EmergencyDeprecateAlgorithm {
         /// Algorithm being deprecated (must be the current `active_scheme`).
         deprecated_scheme: String,
@@ -573,6 +594,8 @@ impl TxBody {
             TxBody::RevokeAgentFull { .. }        => "RevokeAgentFull",
             TxBody::RecordAgentSpend { .. }       => "RecordAgentSpend",
             TxBody::SpawnChildAgent { .. }        => "SpawnChildAgent",
+            // PQ-VAL-002 R1: PQ consensus activation
+            TxBody::ActivatePqConsensus { .. } => "ActivatePqConsensus",
             // CS-001 P4: Emergency Crypto Deprecation
             TxBody::EmergencyDeprecateAlgorithm { .. } => "EmergencyDeprecateAlgorithm",
             // Resource Network v0.2
@@ -825,6 +848,8 @@ impl Transaction {
                 child_agent_id, child_agent_address, parent_agent_id, description, ..
             } => child_agent_id.len() + child_agent_address.len()
                 + parent_agent_id.len() + description.len() + 64,
+            // ActivatePqConsensus: single u64 field.
+            TxBody::ActivatePqConsensus { .. } => 8,
             // EmergencyDeprecateAlgorithm: two scheme names + rationale + optional advisory + scope.
             TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme, replacement_scheme, rationale, advisory_ref, ..
@@ -1495,6 +1520,46 @@ pub fn validator_key_registration_signing_bytes_v2(
     b
 }
 
+/// PQ-VAL-002 R2: Domain-separated signing bytes for consensus precommit votes.
+///
+/// Format (spec §Precommit-signing-bytes):
+///   `b"QATTICE-PRECOMMIT|" || chain_id || b"|" || height_le8 || b"|" || round_le4 || b"|" || hex(block_hash)`
+///
+/// Properties:
+///   - Domain prefix prevents cross-protocol replay.
+///   - `chain_id` prevents cross-chain replay.
+///   - Little-endian fixed-width integers prevent length-extension ambiguity.
+///   - `block_hash` hex-encoded to stay printable / loggable.
+///
+/// Used by both the classical (Ed25519) and ML-DSA-65 vote-signing paths;
+/// the scheme tag lives in `Vote.scheme`, not in these bytes.
+pub fn consensus_precommit_signing_bytes(
+    chain_id:   &str,
+    height:     u64,
+    round:      u32,
+    block_hash: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(
+        b"QATTICE-PRECOMMIT|".len()
+            + chain_id.len()
+            + 1  // '|'
+            + 8  // height LE8
+            + 1  // '|'
+            + 4  // round LE4
+            + 1  // '|'
+            + block_hash.len() * 2, // hex
+    );
+    b.extend_from_slice(b"QATTICE-PRECOMMIT|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(&height.to_le_bytes());
+    b.push(b'|');
+    b.extend_from_slice(&round.to_le_bytes());
+    b.push(b'|');
+    b.extend_from_slice(hex_encode_bytes(block_hash).as_bytes());
+    b
+}
+
 fn hex_encode_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -1616,6 +1681,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // are DIS identities). Guard on PoCD since that also gates the
         // treasury and balance transfers for this reward path.
         TxBody::ClaimResearchReward { .. } => Some("pocd"),
+        // PQ-VAL-002 R1: ActivatePqConsensus — no module gate.
+        TxBody::ActivatePqConsensus { .. } => None,
         // CS-001 P4: EmergencyDeprecateAlgorithm is a core constitutional tx;
         // no optional module gate — governed exclusively by crypto_governors list.
         TxBody::EmergencyDeprecateAlgorithm { .. } => None,
@@ -2539,6 +2606,33 @@ impl Executor {
                 Ok(())
             }
 
+            // ── PQ-VAL-002 R1: Activate PQ Consensus ─────────────────────────
+            TxBody::ActivatePqConsensus { activation_epoch } => {
+                let current_epoch = identity.clock.current_epoch;
+                // Epoch 0 is the genesis sentinel and is always rejected —
+                // activation must refer to a named, post-genesis epoch.
+                // Any epoch ≥ 1 is valid: if it has already passed, ML-DSA
+                // consensus signatures are effective immediately.
+                if *activation_epoch == 0 {
+                    Err(format!(
+                        "ActivatePqConsensus: activation_epoch must be ≥ 1 \
+                         (epoch 0 is the genesis sentinel; current epoch is {})",
+                        current_epoch
+                    ))
+                } else {
+                    state.set_raw(
+                        "pq_consensus_activation_epoch",
+                        &activation_epoch.to_string(),
+                    );
+                    events.push(format!(
+                        "activate_pq_consensus: activation_epoch={activation_epoch} \
+                         set_by={} at_epoch={current_epoch}",
+                        tx.sender
+                    ));
+                    Ok(())
+                }
+            }
+
             // ── CS-001 P4: Emergency Algorithm Deprecation ────────────────────
             TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme,
@@ -2548,22 +2642,35 @@ impl Executor {
                 advisory_ref,
                 scope,
             } => {
-                // ── Guard 0: Scope must be TxSignatures ───────────────────────
-                // Consensus-signature migration requires a verified validator-key
-                // rotation path that does not yet exist.  Reject ConsensusSignatures
-                // and Both unconditionally to prevent an accidental network halt.
+                // ── Guard 0: Scope check ───────────────────────────────────────
+                // ConsensusSignatures scope is allowed only for "ml-dsa-65"
+                // (PQ-VAL-002 R4 emergency rollback path).  All other schemes
+                // and the Both scope still require the full validator-key
+                // rotation path that does not yet exist.
                 match scope {
-                    DeprecationScope::TxSignatures => { /* allowed */ }
-                    DeprecationScope::ConsensusSignatures | DeprecationScope::Both => {
+                    DeprecationScope::TxSignatures => { /* always allowed */ }
+                    DeprecationScope::ConsensusSignatures => {
+                        // Allowed only for the PQ-VAL-002 ML-DSA rollback.
+                        if deprecated_scheme != "ml-dsa-65" {
+                            return TransactionResult::err(
+                                tx.id.clone(), gas_required, tx.gas_limit,
+                                format!(
+                                    "EmergencyDeprecateAlgorithm: ConsensusSignatures \
+                                     scope is only supported for deprecated_scheme \
+                                     \"ml-dsa-65\"; got {:?}",
+                                    deprecated_scheme,
+                                ),
+                            );
+                        }
+                        // Guard 5 (no in-progress migration) is checked below
+                        // as usual; nothing else to gate here.
+                    }
+                    DeprecationScope::Both => {
                         return TransactionResult::err(
                             tx.id.clone(), gas_required, tx.gas_limit,
-                            format!(
-                                "EmergencyDeprecateAlgorithm: scope {:?} is not yet \
-                                 supported — consensus-signature migration requires a \
-                                 verified validator-key rotation path; use \
-                                 TxSignatures scope only",
-                                scope,
-                            ),
+                            "EmergencyDeprecateAlgorithm: scope Both is not yet \
+                             supported — use TxSignatures or ConsensusSignatures \
+                             (ml-dsa-65 only) separately".to_string(),
                         );
                     }
                 }
@@ -2677,6 +2784,16 @@ impl Executor {
                 let migration_json = serde_json::to_string(&migration)
                     .unwrap_or_else(|_| "{}".to_string());
                 state.set_raw(CRYPTO_MIGRATION_STATE_KEY, &migration_json);
+
+                // PQ-VAL-002 R4: When deprecating ML-DSA consensus signatures,
+                // clear the activation epoch so verify_consensus_vote() in
+                // chain-forge-node immediately rejects ML-DSA precommits.
+                // A new ActivatePqConsensus tx is required to re-enable.
+                if matches!(scope, DeprecationScope::ConsensusSignatures)
+                    && deprecated_scheme == "ml-dsa-65"
+                {
+                    state.remove_raw("pq_consensus_activation_epoch");
+                }
 
                 tracing::warn!(
                     deprecated = %deprecated_scheme,
@@ -2996,6 +3113,11 @@ impl Executor {
             | TxBody::RecordAgentSpend { .. }
             | TxBody::SpawnChildAgent { .. } => {
                 Err("AEI Phase 2 transaction requires identity- and agent-aware executor".to_string())
+            }
+            // ActivatePqConsensus requires the identity-aware executor
+            // (needs current_epoch from identity.clock).
+            TxBody::ActivatePqConsensus { .. } => {
+                Err("ActivatePqConsensus requires the full identity- and state-aware executor".to_string())
             }
             // EmergencyDeprecateAlgorithm requires the identity-aware executor
             // (needs current_epoch from identity.clock).
