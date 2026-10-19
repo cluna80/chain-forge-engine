@@ -2912,4 +2912,123 @@ mod tests {
             "pending reports must be cleared after sybil confirmation"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // INV-8 persistence: epoch_reg_count survives a serde round-trip
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn inv8_epoch_cap_survives_serde_round_trip() {
+        // Register identities up to the cap in epoch 0.
+        let mut store = IdentityStore::with_epoch_ms(0, 1);
+
+        for i in 0..EPOCH_REG_CAP {
+            let id = format!("id_{i}");
+            store.register(
+                id.clone(),
+                format!("qcb1{id}"),
+                PopAttestation::genesis(&id, 0),
+            ).unwrap();
+        }
+
+        // One more must fail (cap reached).
+        let extra = "id_extra".to_string();
+        assert!(
+            matches!(
+                store.register(extra.clone(), "qcb1extra".to_string(), PopAttestation::genesis(&extra, 0)),
+                Err(IdentityError::EpochCapExceeded(_, _))
+            ),
+            "cap must be enforced before serde round-trip"
+        );
+
+        // Serialize → deserialize (simulates node restart).
+        let json = serde_json::to_string(&store).expect("serialize failed");
+        let mut restored: IdentityStore = serde_json::from_str(&json).expect("deserialize failed");
+
+        // The cap must still be enforced in the restored store for the same epoch.
+        let extra2 = "id_extra2".to_string();
+        assert!(
+            matches!(
+                restored.register(extra2.clone(), "qcb1extra2".to_string(), PopAttestation::genesis(&extra2, 0)),
+                Err(IdentityError::EpochCapExceeded(_, _))
+            ),
+            "epoch cap must remain enforced after serde round-trip (disk restart)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // IP-2: duplicate attestation (same active attester, same claimant)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ip2_duplicate_active_attestation_rejected() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        // First attestation succeeds.
+        store.attest("bob", "alice").unwrap();
+
+        // Second attestation from the same attester for the same claimant must fail.
+        let result = store.attest("bob", "alice");
+        assert!(
+            matches!(result, Err(IdentityError::AlreadyAttested(_))),
+            "duplicate active attestation must be rejected with AlreadyAttested, got {:?}", result
+        );
+
+        // The ledger must still show exactly one attester (no double-count).
+        assert_eq!(
+            store.get("bob").unwrap().attestation_ledger.count(), 1,
+            "ledger count must not be inflated by a rejected duplicate attest"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // S3 boundary: cooldown boundary (reject in window, accept at first epoch
+    // after window closes)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn s3_revocation_cooldown_boundary() {
+        let mut store = make_store();
+        register_and_verify(&mut store, "alice", "qcb1alice");
+        register_provisional(&mut store, "bob", "qcb1bob");
+
+        // Attest in epoch 0 (store starts at epoch 0).
+        store.attest("bob", "alice").unwrap();
+
+        // Revoke in epoch 0.
+        store.revoke_attestation("alice", "bob").unwrap();
+
+        // Immediate re-attest (still epoch 0) must fail with RevocationCooldown.
+        assert!(
+            matches!(store.attest("bob", "alice"), Err(IdentityError::RevocationCooldown(..))),
+            "re-attest in same epoch must be rejected (cooldown window not yet elapsed)"
+        );
+
+        // Advance to the first epoch where cooldown has elapsed.
+        // revoked_at=0, REVOCATION_COOLDOWN_EPOCHS=1 → valid at epoch >= 1.
+        let first_valid_epoch = REVOCATION_COOLDOWN_EPOCHS; // == 1
+        stay_lively_verified(&mut store, "alice", first_valid_epoch);
+        store.advance_epoch_to(first_valid_epoch);
+
+        // Re-attest at the first valid epoch must succeed.
+        let result = store.attest("bob", "alice");
+        assert!(
+            result.is_ok(),
+            "re-attest at first epoch after cooldown must succeed, got {:?}", result
+        );
+
+        // No double-count: ledger must show exactly 1 attester.
+        assert_eq!(
+            store.get("bob").unwrap().attestation_ledger.count(), 1,
+            "ledger count must be 1 after successful re-attest (no double-count)"
+        );
+    }
+
+    /// Keep a Verified identity lively through an epoch jump so liveness
+    /// enforcement in advance_epoch_to doesn't lapse it before the test check.
+    fn stay_lively_verified(store: &mut IdentityStore, id: &str, target_epoch: u64) {
+        store.stay_lively(id, target_epoch);
+    }
 }
