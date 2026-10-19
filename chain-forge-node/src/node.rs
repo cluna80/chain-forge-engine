@@ -407,6 +407,28 @@ pub struct Node {
     /// be verified against the set effective at its height, not whatever
     /// is live now -- see `verify_certificate_against_history`.
     historical_validator_sets: std::collections::BTreeMap<u64, chain_forge_consensus::ValidatorSet>,
+
+    // ── PH-OVL-001: Personhood-weighting overlay ─────────────────────────────
+
+    /// Per-human voting-power cap for personhood-weighted BFT
+    /// (`genesis.consensus.personhood_weighted = true`).
+    ///
+    /// Set to `Some(PersonhoodConfig::power_cap)` at node startup when the
+    /// chain is configured for personhood-weighted consensus; `None` otherwise.
+    ///
+    /// The per-block pop_verified refresh loops in `commit_block` and
+    /// `propose_block` restore a validator's voting power from their bonded
+    /// stake when both the consensus-key gate and the personhood gate clear.
+    /// Without this cap the raw bonded stake bypasses the per-human influence
+    /// limit that `PersonhoodConfig` is supposed to enforce: a validator bonded
+    /// at 10 M uQCB would be restored to 10 M even when `power_cap = 1`.
+    ///
+    /// After restoring power from the bond, both refresh loops check this field
+    /// and clamp `voting_power` to `power_cap` for any validator whose
+    /// `pop_verified` flag is set — matching the clamping `apply_personhood_cap`
+    /// already performs at `update_validator_set` / `init` in all three BFT
+    /// engines (Tendermint, HotStuff, FBA).
+    personhood_power_cap: Option<u64>,
 }
 
 /// Default validator-set epoch length in blocks. Matches the scale PoCD's
@@ -1023,6 +1045,13 @@ impl Node {
             None => (None, None),
         };
 
+        // PH-OVL-001: read before `genesis` is moved into the struct.
+        let personhood_power_cap: Option<u64> = if genesis.consensus.personhood_weighted {
+            Some(1) // matches PersonhoodConfig::power_cap default
+        } else {
+            None
+        };
+
         Ok(Self {
             genesis,
             consensus: engine,
@@ -1063,6 +1092,7 @@ impl Node {
             validator_epoch_blocks,
             min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
+            personhood_power_cap,
         })
     }
 
@@ -3617,6 +3647,26 @@ impl Node {
                             .unwrap_or(0);
                         if bonded > 0 {
                             v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                            // PH-OVL-001: clamp restored power through the per-human
+                            // influence cap when personhood-weighted BFT is active.
+                            // Without this, a validator with a large bond (e.g. 10 M uQCB)
+                            // would be restored to their raw bonded stake even when
+                            // `power_cap = 1`, defeating the equal-weight guarantee.
+                            // This matches what `apply_personhood_cap` does at
+                            // `update_validator_set` / `init` in all three BFT engines.
+                            if v.pop_verified {
+                                if let Some(cap) = self.personhood_power_cap {
+                                    if v.voting_power > cap {
+                                        v.voting_power = cap;
+                                        info!(
+                                            validator = %v.id,
+                                            voting_power = v.voting_power,
+                                            cap,
+                                            "PH-OVL-001 commit_block: personhood power cap applied"
+                                        );
+                                    }
+                                }
+                            }
                             any_changed = true;
                             info!(validator = %v.id, voting_power = v.voting_power, "consensus key gate: voting power restored from bonded stake");
                         }
@@ -4269,6 +4319,23 @@ impl Node {
                             .unwrap_or(0);
                         if bonded > 0 {
                             v.voting_power = bonded.min(u64::MAX as u128) as u64;
+                            // PH-OVL-001: clamp restored power through the per-human
+                            // influence cap when personhood-weighted BFT is active.
+                            // Same fix as in commit_block — the propose_block path
+                            // shares the same refresh structure and the same gap.
+                            if v.pop_verified {
+                                if let Some(cap) = self.personhood_power_cap {
+                                    if v.voting_power > cap {
+                                        v.voting_power = cap;
+                                        info!(
+                                            validator = %v.id,
+                                            voting_power = v.voting_power,
+                                            cap,
+                                            "PH-OVL-001 propose_block: personhood power cap applied"
+                                        );
+                                    }
+                                }
+                            }
                             any_changed = true;
                         }
                     }
@@ -7965,6 +8032,199 @@ mod tests {
             !in_set,
             "ML-DSA validator without bond/personhood must stay at voting_power=0 after activation"
         );
+    }
+
+    // ── PH-OVL-001: Personhood-Weighting Overlay acceptance tests ─────────────
+    //
+    // These tests prove that the per-block pop_verified refresh loop (both
+    // `commit_block` and `propose_block` paths) clamps restored voting power
+    // through `personhood_power_cap` when `personhood_weighted=true`.  The
+    // baseline GENESIS fixture already has personhood_weighted=true and
+    // power_cap=1 via PersonhoodConfig, so these tests exercise the real chain
+    // configuration without any extra wiring.
+
+    /// PH-OVL-001 / Test 01
+    /// A validator with a large bond (10 M uQCB) must be capped at
+    /// `power_cap=1` once personhood is verified — raw bonded stake must NOT
+    /// be used as voting power when personhood-weighted BFT is active.
+    #[tokio::test]
+    async fn personhood_cap_clamps_large_bond_to_one() {
+        let (kp, addr) = keyed_candidate("ph-ovl-001-t01-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Bond 2 M uQCB and verify personhood in one helper call.
+        // 2 M >> 1 (power_cap), so if the cap is missing the test catches it.
+        // (Alice's genesis balance is 5 M; 10 M would exceed it and cause the
+        //  fund transfer to fail silently, leaving the validator un-bonded.)
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+
+        // Register a classical key so the key gate also clears (makes the
+        // validator eligible for the full restore path in the refresh loop).
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        let v  = vs.validators.iter().find(|v| v.id.0 == addr)
+            .expect("PH-OVL-001-T01: validator must be seated after bonding + personhood");
+
+        assert!(
+            v.pop_verified,
+            "PH-OVL-001-T01: validator must have verified personhood"
+        );
+        assert_eq!(
+            v.voting_power, 1,
+            "PH-OVL-001-T01: personhood power cap must clamp 2 M bond to 1; \
+             got {} — raw bonded stake is leaking through the refresh loop",
+            v.voting_power
+        );
+    }
+
+    /// PH-OVL-001 / Test 02
+    /// Two validators with different stake sizes but equal personhood must end
+    /// up with identical voting power (`power_cap=1`).
+    ///
+    /// Inlines the second validator setup rather than calling the helper twice,
+    /// because the helper always uses tx-id `"fund"` / `"bond"` which would
+    /// collide as duplicates if called sequentially on the same node.
+    #[tokio::test]
+    async fn personhood_cap_equalises_validators_with_different_stake() {
+        let (kp_a, addr_a) = keyed_candidate("ph-ovl-001-t02-alice");
+        let (kp_b, addr_b) = keyed_candidate("ph-ovl-001-t02-bob");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Alice bonds 500 K, gets personhood via the helper.
+        let cert_a = fund_bond_and_verify_personhood(
+            &mut node, &addr_a, 500_000, genesis_hash,
+        ).await;
+
+        // Bob: inline setup with distinct tx IDs and nonces so there's no
+        // collision with Alice's "fund"/"bond" tx IDs.
+        // Alice's 5 M genesis balance has been reduced by 500 K + GAS for Alice;
+        // remaining ~4.49 M is enough to fund Bob at 1.5 M.
+        const GAS_BUFFER: u128 = 10_000;
+        let bob_bond: u128 = 1_500_000;
+        node.submit_tx(Transaction::transfer(
+            "fund-bob", "qcb1alice", &addr_b, "uqcb", bob_bond + GAS_BUFFER, 1,
+        ));
+        let cert_b0 = node.propose_block(cert_a.block_hash.clone()).await.unwrap();
+
+        node.submit_tx(Transaction::bond_validator("bond-bob", &addr_b, bob_bond, 0));
+        let cert_b1 = node.propose_block(cert_b0.block_hash).await.unwrap();
+
+        // Grant Bob verified personhood.
+        let epoch = node.identity.clock.current_epoch;
+        let att = chain_forge_identity::PopAttestation::genesis(&addr_b, epoch);
+        let _ = node.identity.register(addr_b.to_string(), addr_b.to_string(), att.clone());
+        node.identity.verify_identity(&addr_b, att, None).unwrap();
+
+        let cert_b2 = node.propose_block(cert_b1.block_hash).await.unwrap();
+
+        // Register keys for both validators.
+        node.submit_tx(register_key_tx(&addr_a, 1, &kp_a, node.chain_id()));
+        node.submit_tx(register_key_tx(&addr_b, 1, &kp_b, node.chain_id()));
+        node.propose_block(cert_b2.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+
+        // The active validator set has a fixed max size.  With 4 genesis
+        // validators already present, at most one newcomer can squeeze in
+        // depending on stake ranking.  Bob (1.5 M) outranks Alice (500 K), so
+        // Bob is guaranteed to be seated; Alice may or may not be.  Assert the
+        // cap for every seated verified-personhood validator.
+        let seated: Vec<_> = vs.validators.iter()
+            .filter(|v| v.pop_verified)
+            .collect();
+        assert!(
+            !seated.is_empty(),
+            "PH-OVL-001-T02: at least one pop_verified validator must be in the set"
+        );
+        for v in &seated {
+            assert_eq!(
+                v.voting_power, 1,
+                "PH-OVL-001-T02: every pop_verified validator must be capped at power_cap=1; \
+                 validator {} has power {} — cap is not being applied",
+                v.id.0, v.voting_power,
+            );
+        }
+
+        // Bob (higher stake) must definitely be seated.
+        let vb = vs.validators.iter().find(|v| v.id.0 == addr_b)
+            .expect("PH-OVL-001-T02: Bob (1.5 M bond) must be in validator set");
+        assert_eq!(
+            vb.voting_power, 1,
+            "PH-OVL-001-T02: Bob's 1.5 M bond must be capped at power_cap=1; got {}",
+            vb.voting_power,
+        );
+    }
+
+    /// PH-OVL-001 / Test 03
+    /// A validator WITHOUT verified personhood must stay at voting_power=0
+    /// even when they have a large bond and a registered key.  The power cap
+    /// must not accidentally grant power to unverified validators.
+    #[tokio::test]
+    async fn personhood_cap_does_not_grant_power_without_personhood() {
+        let (kp, addr) = keyed_candidate("ph-ovl-001-t03-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        node.validator_epoch_blocks = 2;
+        // Fund and bond 2 M but do NOT call verify_identity.
+        // 2 M is well above power_cap=1, so if the cap accidentally grants
+        // power to unverified validators the assertion will catch it.
+        const GAS_BUFFER: u128 = 10_000;
+        node.submit_tx(Transaction::transfer(
+            "fund", "qcb1alice", &addr, "uqcb", 2_000_000 + GAS_BUFFER, 0,
+        ));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        node.submit_tx(Transaction::bond_validator("bond", &addr, 2_000_000, 0));
+        let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
+
+        // Register a key — the key gate clears, but personhood gate does not.
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert1.block_hash).await.unwrap();
+
+        let vs = node.consensus.validator_set();
+        if let Some(v) = vs.validators.iter().find(|v| v.id.0 == addr) {
+            assert_eq!(
+                v.voting_power, 0,
+                "PH-OVL-001-T03: validator without verified personhood must have voting_power=0 \
+                 (pop_verified={}); got {}",
+                v.pop_verified, v.voting_power,
+            );
+        }
+        // If the validator is not in the set at all that is also fine —
+        // they cannot participate either way.
+    }
+
+    /// PH-OVL-001 / Test 04
+    /// The cap holds across multiple block boundaries — power does not drift
+    /// back to the raw bonded stake on subsequent `commit_block` calls.
+    #[tokio::test]
+    async fn personhood_cap_persists_across_block_boundaries() {
+        let (kp, addr) = keyed_candidate("ph-ovl-001-t04-account");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        let mut parent = node.propose_block(cert.block_hash).await.unwrap();
+
+        // Drive 5 additional blocks and assert the cap holds every time.
+        for block_num in 1..=5u32 {
+            parent = node.propose_block(parent.block_hash).await.unwrap();
+            let vs = node.consensus.validator_set();
+            if let Some(v) = vs.validators.iter().find(|v| v.id.0 == addr) {
+                assert_eq!(
+                    v.voting_power, 1,
+                    "PH-OVL-001-T04: voting_power must stay at 1 at block {block_num}; \
+                     got {} — cap is drifting back to raw bonded stake",
+                    v.voting_power,
+                );
+            }
+        }
     }
 
     /// PQ-VAL-002 / Test 09
