@@ -99,6 +99,9 @@ pub enum IdentityError {
     #[error("epoch registration cap exceeded: at most {1} identities may register in epoch {0}")]
     EpochCapExceeded(u64, u32),
 
+    #[error("attester {0} cannot re-attest {1} for {2} more epoch(s): revocation cooldown is {3} epochs")]
+    RevocationCooldown(String, String, u64, u64),
+
     #[error("internal identity error: {0}")]
     Internal(String),
 }
@@ -370,6 +373,18 @@ pub const ATTEST_PENALTY_RATE_BPS: u32 = 12_000;
 /// Governance-tunable. Applied by the execution layer using the
 /// `RevocationCost` value returned by `revoke_attestation()`.
 pub const REVOCATION_COST_BPS: u32 = 1_000;
+
+/// S3 / revocation-cooldown invariant.
+///
+/// After an attester revokes their attestation for a claimant, they must wait
+/// at least this many epochs before they can re-attest the same claimant.
+/// Prevents "revoke → immediately re-attest" cycles that would let an attester
+/// wash a tainted attestation (signal gaming) or bypass the revocation cost by
+/// instantly reinstating the attestation.
+///
+/// Set to 1 epoch so the cooldown is non-trivial even on fast devnet clocks
+/// while remaining testable.  Production chains may increase this.
+pub const REVOCATION_COOLDOWN_EPOCHS: u64 = 1;
 
 /// Penalty reduction for attesters who self-reported before coordinator
 /// confirmation, in basis points of the STANDARD penalty.
@@ -1105,6 +1120,28 @@ impl IdentityStore {
         }
 
         let epoch = self.clock.current_epoch;
+
+        // S3 / revocation-cooldown enforcement.
+        // If this attester previously revoked their attestation for this claimant,
+        // they must wait REVOCATION_COOLDOWN_EPOCHS epochs before re-attesting.
+        // The check uses the attestation_records map (keyed by attester\0claimant)
+        // which retains revoked records so we can inspect revocation_epoch.
+        let key = attestation_record_key(attester_id, claimant_id);
+        if let Some(prior) = self.attestation_records.get(&key) {
+            if prior.status == AttestationStatus::Revoked {
+                let revoked_at = prior.revocation_epoch.unwrap_or(prior.epoch);
+                let earliest_re_attest = revoked_at.saturating_add(REVOCATION_COOLDOWN_EPOCHS);
+                if epoch < earliest_re_attest {
+                    let remaining = earliest_re_attest - epoch;
+                    return Err(IdentityError::RevocationCooldown(
+                        attester_id.to_string(),
+                        claimant_id.to_string(),
+                        remaining,
+                        REVOCATION_COOLDOWN_EPOCHS,
+                    ));
+                }
+            }
+        }
 
         // Phase B: rolling-window cap enforcement.
         // Count active attestations from this attester in the last
