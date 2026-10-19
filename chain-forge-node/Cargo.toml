@@ -97,3 +97,7 @@ path = "tests/validator_key_live.rs"
 [[test]]
 name = "dis_parity"
 path = "tests/dis_parity.rs"
+
+[[test]]
+name = "dis_auth_live"
+path = "tests/dis_auth_live.rs"
