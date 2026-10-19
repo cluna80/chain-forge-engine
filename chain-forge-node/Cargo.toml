@@ -64,6 +64,7 @@ chain-forge-p2p       = { path = "../chain-forge-p2p", features = ["real-network
 chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto", "real-pqc"] }
 chain-forge-execution = { path = "../chain-forge-execution" }
 chain-forge-vca-pq    = { path = "../chain-forge-vca-pq" }
+chain-forge-wallet    = { path = "../chain-forge-wallet" }
 
 [[bench]]
 name    = "bft_round_mldsa"
@@ -92,3 +93,7 @@ path = "tests/vca_pq_live.rs"
 [[test]]
 name = "validator_key_live"
 path = "tests/validator_key_live.rs"
+
+[[test]]
+name = "dis_parity"
+path = "tests/dis_parity.rs"
