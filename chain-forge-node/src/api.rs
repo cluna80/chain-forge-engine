@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS};
 use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest,
                   verify_challenge_signature, identity_auth_status, authorize_scope,
-                  scope_policy};
+                  key_binding_from_explorer, scope_policy};
 use chain_forge_p2p::PeerInfo;
 use chain_forge_execution::Transaction;
 use chain_forge_pocd::{DiscoveryProof, DiscoveryRegistry};
@@ -858,30 +858,42 @@ pub async fn serve(
                                                     http_400_json(&resp.to_string())
                                                 } else {
 
-                                                // Step 5: Identity-state lookup (DIS-001-08).
+                                                // Steps 5 + 6: Identity-state lookup and key binding.
+                                                // Both fields are derived from the same ExplorerState
+                                                // snapshot in a single lock acquisition so they are
+                                                // always consistent with each other.
+                                                //
                                                 // Fail-closed: if the explorer lock is poisoned,
-                                                // restricted scopes are denied.
-                                                let id_status = {
+                                                // id_status = Unavailable and key_binding = false.
+                                                let (id_status, key_binding_verified) = {
                                                     match explorer.lock() {
                                                         Ok(ex) => match ex.accounts.get(&address) {
-                                                            Some(acc) => identity_auth_status(
-                                                                acc.tier.as_deref(),
-                                                                acc.frozen,
+                                                            Some(acc) => {
+                                                                let tier = acc.tier.as_deref();
+                                                                let frozen = acc.frozen;
+                                                                (
+                                                                    identity_auth_status(tier, frozen),
+                                                                    key_binding_from_explorer(tier, frozen),
+                                                                )
+                                                            }
+                                                            None => (
+                                                                super::auth::IdentityAuthStatus::Unknown,
+                                                                false,
                                                             ),
-                                                            None => super::auth::IdentityAuthStatus::Unknown,
                                                         },
-                                                        Err(_) => super::auth::IdentityAuthStatus::Unavailable,
+                                                        Err(_) => (
+                                                            super::auth::IdentityAuthStatus::Unavailable,
+                                                            false,
+                                                        ),
                                                     }
                                                 };
 
-                                                // Step 6: Scope authorization policy.
-                                                // DIS-001-12 note: key_binding_verified is always
-                                                // false until binding verification is implemented.
-                                                // Restricted scopes that pass policy still carry
-                                                // key_binding_verified: false as a mandatory signal.
-                                                let scope_result = authorize_scope(&challenge.scope, &id_status);
+                                                // Step 7: Scope authorization policy.
+                                                // RequiresVerified scopes now gate on BOTH
+                                                // key_binding_verified AND identity status,
+                                                // closing the DIS-001-08 interim gap.
+                                                let scope_result = authorize_scope(&challenge.scope, &id_status, key_binding_verified);
                                                 let scope_authorized = scope_result.is_ok();
-                                                let key_binding_verified = false; // DIS-001-12 pending
 
                                                 tracing::info!(
                                                     challenge_id    = %challenge.challenge_id,

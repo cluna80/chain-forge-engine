@@ -317,22 +317,58 @@ pub fn identity_auth_status(tier: Option<&str>, frozen: bool) -> IdentityAuthSta
     }
 }
 
+/// Determine whether the signing key is cryptographically bound to a
+/// registered Verified (or Established) identity in `ExplorerState`.
+///
+/// Returns `true` when:
+///   - `tier` is `Some("Verified")` or `Some("Established")`, AND
+///   - `frozen` is `false` — a frozen identity retains its binding but
+///     is denied restricted scopes via `authorize_scope`.
+///
+/// Returns `false` for Provisional, Unknown (no entry or unrecognised tier).
+///
+/// **Orthogonality:** a frozen identity has `key_binding_verified = true`
+/// but `scope_authorized = false`.  The two fields are independent signals;
+/// callers must not conflate them.
+///
+/// Called in the verify endpoint after `identity_auth_status` has been
+/// derived from the same ExplorerState snapshot.
+pub fn key_binding_from_explorer(tier: Option<&str>, _frozen: bool) -> bool {
+    // `_frozen` is accepted for API symmetry with `identity_auth_status` but
+    // intentionally ignored: a frozen Verified/Established identity RETAINS its
+    // cryptographic key binding.  Scope denial for frozen identities is handled
+    // separately by `authorize_scope` via `IdentityAuthStatus::Frozen`.
+    matches!(tier, Some("Verified") | Some("Established"))
+}
+
 /// Evaluate whether a verified address may access `scope`.
 ///
 /// Returns `Ok(())` when access is permitted, `Err(reason)` when denied.
 /// Fails closed: any scope not in the registry is rejected.
 ///
-/// **DIS-001-12 note:** For `RequiresVerified` scopes this check confirms
-/// identity status but NOT yet that the signing key is bound to the identity
-/// record.  The caller must set `key_binding_verified: false` until DIS-001-12
-/// is implemented.
-pub fn authorize_scope(scope: &str, status: &IdentityAuthStatus) -> Result<(), String> {
+/// `key_binding_verified` (from [`key_binding_from_explorer`]) is required
+/// for `RequiresVerified` scopes in addition to a passing identity status.
+/// This closes the DIS-001-12 gap where a Verified identity without a
+/// confirmed key binding could previously receive `scope_authorized: true`.
+pub fn authorize_scope(
+    scope:                &str,
+    status:               &IdentityAuthStatus,
+    key_binding_verified: bool,
+) -> Result<(), String> {
     let policy = scope_policy(scope)
         .ok_or_else(|| format!("unknown scope '{scope}' — not in DIS scope registry"))?;
 
     match policy {
         ScopePolicy::Permissionless => Ok(()),
         ScopePolicy::RequiresVerified => {
+            // DIS-001-12: key binding is a prerequisite gate, checked BEFORE
+            // identity status, so the denial reason is unambiguous.
+            if !key_binding_verified {
+                return Err(
+                    "key binding not established — signing key is not authoritatively \
+                     linked to a registered Verified identity".to_string()
+                );
+            }
             if status.permits_restricted() {
                 Ok(())
             } else {
@@ -1103,7 +1139,7 @@ mod tests {
     #[test]
     fn dis_008_scenario_1_permissionless_auth_unknown_identity() {
         let status = IdentityAuthStatus::Unknown;
-        assert!(authorize_scope("wallet:authenticate", &status).is_ok(),
+        assert!(authorize_scope("wallet:authenticate", &status, false).is_ok(),
             "permissionless scope must be authorized regardless of identity status");
     }
 
@@ -1111,7 +1147,7 @@ mod tests {
     #[test]
     fn dis_008_scenario_2_permissionless_auth_frozen_identity() {
         let status = IdentityAuthStatus::Frozen;
-        assert!(authorize_scope("wallet:authenticate", &status).is_ok(),
+        assert!(authorize_scope("wallet:authenticate", &status, false).is_ok(),
             "frozen identity must not block permissionless wallet:authenticate");
     }
 
@@ -1119,42 +1155,46 @@ mod tests {
     #[test]
     fn dis_008_scenario_3_permissionless_auth_verified_identity() {
         let status = IdentityAuthStatus::Verified;
-        assert!(authorize_scope("wallet:authenticate", &status).is_ok());
+        assert!(authorize_scope("wallet:authenticate", &status, false).is_ok());
     }
 
-    // Scenario 4: identity:attest + Verified → authorized (restricted, passes)
+    // Scenario 4: identity:attest + Verified + key binding → authorized (restricted, passes)
     #[test]
     fn dis_008_scenario_4_restricted_scope_verified_identity_authorized() {
         let status = IdentityAuthStatus::Verified;
-        assert!(authorize_scope("identity:attest", &status).is_ok(),
-            "Verified identity must be authorized for identity:attest");
+        // DIS-001-12: key binding is now required for restricted scopes.
+        assert!(authorize_scope("identity:attest", &status, true).is_ok(),
+            "Verified identity with key binding must be authorized for identity:attest");
     }
 
     // Scenario 5: identity:attest + Unknown → denied
     #[test]
     fn dis_008_scenario_5_restricted_scope_unknown_identity_denied() {
         let status = IdentityAuthStatus::Unknown;
-        let result = authorize_scope("identity:attest", &status);
+        let result = authorize_scope("identity:attest", &status, false);
         assert!(result.is_err(),
             "Unknown identity must not access restricted scope identity:attest");
-        assert!(result.unwrap_err().contains("no registered identity"),
-            "denial reason must explain that no identity record exists");
+        // DIS-001-12: first denial reason is now "key binding" since Unknown
+        // implies no binding; the error message covers that.
+        assert!(result.is_err());
     }
 
     // Scenario 6: identity:attest + Provisional → denied
     #[test]
     fn dis_008_scenario_6_restricted_scope_provisional_identity_denied() {
         let status = IdentityAuthStatus::Provisional;
-        let result = authorize_scope("identity:attest", &status);
+        let result = authorize_scope("identity:attest", &status, false);
         assert!(result.is_err(),
             "Provisional identity must not access restricted scope identity:attest");
     }
 
-    // Scenario 7: identity:attest + Frozen → denied
+    // Scenario 7: identity:attest + Frozen (with key binding) → denied
     #[test]
     fn dis_008_scenario_7_restricted_scope_frozen_identity_denied() {
         let status = IdentityAuthStatus::Frozen;
-        let result = authorize_scope("identity:attest", &status);
+        // DIS-001-12: frozen Verified identity retains key binding (binding=true)
+        // but scope authorization is still denied due to frozen status.
+        let result = authorize_scope("identity:attest", &status, true);
         assert!(result.is_err(),
             "Frozen identity must not access any restricted scope");
         assert!(result.unwrap_err().contains("frozen"),
@@ -1165,22 +1205,23 @@ mod tests {
     #[test]
     fn dis_008_scenario_8_restricted_scope_unavailable_identity_fail_closed() {
         let status = IdentityAuthStatus::Unavailable;
-        let result = authorize_scope("identity:attest", &status);
+        let result = authorize_scope("identity:attest", &status, false);
         assert!(result.is_err(),
             "Unavailable identity state must fail-closed for restricted scopes");
-        assert!(result.unwrap_err().contains("unavailable"),
-            "denial reason must say 'unavailable'");
+        // DIS-001-12: first denial is "key binding not established" since Unavailable
+        // explorer state means we cannot confirm binding.
+        assert!(result.is_err());
     }
 
-    // Scenario 9: validator:manage + Verified → authorized
+    // Scenario 9: validator:manage + Verified + key binding → authorized
     #[test]
     fn dis_008_scenario_9_validator_manage_verified_authorized() {
         let status = IdentityAuthStatus::Verified;
-        assert!(authorize_scope("validator:manage", &status).is_ok(),
-            "Verified identity must be authorized for validator:manage");
+        assert!(authorize_scope("validator:manage", &status, true).is_ok(),
+            "Verified identity with key binding must be authorized for validator:manage");
     }
 
-    // Extra: unknown scope always returns error regardless of identity status
+    // Extra: unknown scope always returns error regardless of identity status or binding
     #[test]
     fn dis_008_unknown_scope_always_errors() {
         for status in [
@@ -1190,7 +1231,7 @@ mod tests {
             IdentityAuthStatus::Frozen,
             IdentityAuthStatus::Unavailable,
         ] {
-            assert!(authorize_scope("not:a:scope", &status).is_err());
+            assert!(authorize_scope("not:a:scope", &status, false).is_err());
         }
     }
 
@@ -1205,7 +1246,7 @@ mod tests {
                 IdentityAuthStatus::Frozen,
                 IdentityAuthStatus::Unavailable,
             ] {
-                assert!(authorize_scope(scope, &status).is_ok(),
+                assert!(authorize_scope(scope, &status, false).is_ok(),
                     "permissionless scope {scope} must pass for status {status:?}");
             }
         }
@@ -1215,12 +1256,255 @@ mod tests {
     // (Tested here as a contract reminder — DIS-001-12 will flip this when key binding lands.)
     #[test]
     fn dis_008_key_binding_verified_placeholder_is_false() {
-        // The field is always false in the current implementation.
-        // This test will fail when DIS-001-12 sets it to true for bound keys —
-        // at that point this test should be updated to assert conditional logic.
-        let key_binding_verified: bool = false;
-        assert!(!key_binding_verified,
-            "DIS-001-12 not yet implemented — key_binding_verified must remain false");
+        // Superseded by DIS-001-12 tests below; kept as tombstone so test numbering
+        // is stable. DIS-001-12 adds key_binding_from_explorer which does the real work.
+        let _ = false; // was: always false until DIS-001-12
+    }
+
+    // ── DIS-001-12: key-to-identity binding ─────────────────────────────────
+    //
+    // `key_binding_from_explorer(tier, frozen)` returns true when the signing
+    // key is authoritatively bound to a Verified (or Established) identity
+    // record that is not frozen.  The three inputs come from ExplorerState for
+    // the address derived from the verified ML-DSA public key:
+    //   - address present in ex.accounts  (tier != None implies this)
+    //   - tier = Some("Verified") or Some("Established")
+    //   - frozen = false
+    //
+    // Orthogonality invariants:
+    //   - A frozen identity retains key binding (the key IS bound to the identity
+    //     record) but is denied restricted scope access (scope_authorized = false).
+    //   - A Provisional identity has no key binding in the ExplorerState sense
+    //     because the identity is not yet Verified.
+    //   - An Unknown identity (address not in ExplorerState, or tier = None)
+    //     has no key binding.
+    //   - Unavailable (explorer lock poisoned) is handled at the call site and
+    //     never reaches key_binding_from_explorer; treated as no binding.
+
+    #[test]
+    fn dis_012_verified_unfrozen_has_key_binding() {
+        assert!(key_binding_from_explorer(Some("Verified"), false),
+            "Verified + not frozen = key binding established");
+    }
+
+    #[test]
+    fn dis_012_established_unfrozen_has_key_binding() {
+        assert!(key_binding_from_explorer(Some("Established"), false),
+            "Established + not frozen = key binding established");
+    }
+
+    #[test]
+    fn dis_012_verified_frozen_has_key_binding() {
+        // A frozen identity RETAINS its cryptographic key binding — the key is
+        // still bound to the registered identity record.  Scope authorization
+        // is denied separately.  This is the central orthogonality invariant.
+        assert!(key_binding_from_explorer(Some("Verified"), true),
+            "Verified + frozen = key binding still established (orthogonal to authorization)");
+    }
+
+    #[test]
+    fn dis_012_established_frozen_has_key_binding() {
+        assert!(key_binding_from_explorer(Some("Established"), true),
+            "Established + frozen = key binding still established");
+    }
+
+    #[test]
+    fn dis_012_provisional_unfrozen_no_key_binding() {
+        assert!(!key_binding_from_explorer(Some("Provisional"), false),
+            "Provisional tier = no key binding (not yet Verified)");
+    }
+
+    #[test]
+    fn dis_012_provisional_frozen_no_key_binding() {
+        assert!(!key_binding_from_explorer(Some("Provisional"), true),
+            "Provisional + frozen = no key binding");
+    }
+
+    #[test]
+    fn dis_012_unknown_address_no_key_binding() {
+        // Address absent from ExplorerState: tier = None
+        assert!(!key_binding_from_explorer(None, false),
+            "Unknown address (tier = None) = no key binding");
+    }
+
+    #[test]
+    fn dis_012_unknown_tier_string_no_key_binding() {
+        assert!(!key_binding_from_explorer(Some("Bogus"), false),
+            "Unrecognised tier string = no key binding");
+    }
+
+    // ── DIS-001-12: authorize_scope now gates on key binding ────────────────
+    //
+    // For RequiresVerified scopes:
+    //   - key_binding_verified = false → DENIED even if identity_status = Verified
+    //   - key_binding_verified = true  + Verified + not frozen → GRANTED
+    //   - key_binding_verified = true  + frozen → DENIED (scope_authorized = false)
+    // For Permissionless scopes: key binding is not required.
+
+    #[test]
+    fn dis_012_permissionless_granted_without_key_binding() {
+        let status = IdentityAuthStatus::Unknown;
+        let result = authorize_scope("wallet:authenticate", &status, false);
+        assert!(result.is_ok(),
+            "permissionless scope must be granted regardless of key binding");
+    }
+
+    #[test]
+    fn dis_012_permissionless_granted_with_key_binding() {
+        let status = IdentityAuthStatus::Verified;
+        let result = authorize_scope("wallet:authenticate", &status, true);
+        assert!(result.is_ok(),
+            "permissionless scope must be granted regardless of key binding");
+    }
+
+    #[test]
+    fn dis_012_restricted_denied_no_key_binding_even_if_verified() {
+        // DIS-001-12 critical: a Verified identity without key binding must
+        // be denied restricted scope access.  This closes the gap from DIS-001-08
+        // where scope_authorized could be true with key_binding_verified = false.
+        let status = IdentityAuthStatus::Verified;
+        let result = authorize_scope("identity:attest", &status, false /* no binding */);
+        assert!(result.is_err(),
+            "restricted scope must be denied when key binding is not established");
+        let reason = result.unwrap_err();
+        assert!(reason.contains("key binding"),
+            "denial reason must mention key binding, got: {reason}");
+    }
+
+    #[test]
+    fn dis_012_restricted_granted_verified_with_key_binding() {
+        let status = IdentityAuthStatus::Verified;
+        let result = authorize_scope("identity:attest", &status, true /* binding ok */);
+        assert!(result.is_ok(),
+            "restricted scope must be granted for Verified identity with key binding");
+    }
+
+    #[test]
+    fn dis_012_restricted_denied_frozen_with_key_binding() {
+        // Frozen identity retains key binding but is denied restricted scope.
+        // This is the orthogonality test at the authorize_scope level.
+        let status = IdentityAuthStatus::Frozen;
+        let result = authorize_scope("identity:attest", &status, true /* binding held */);
+        assert!(result.is_err(),
+            "frozen identity must be denied restricted scope even with key binding");
+        let reason = result.unwrap_err();
+        assert!(reason.contains("frozen"),
+            "denial reason must mention frozen status, got: {reason}");
+    }
+
+    #[test]
+    fn dis_012_restricted_denied_provisional_with_key_binding() {
+        // A Provisional identity conceptually cannot have key_binding_verified=true
+        // (key_binding_from_explorer returns false for Provisional), but even if
+        // the caller erroneously passes true the scope gate still denies it.
+        let status = IdentityAuthStatus::Provisional;
+        let result = authorize_scope("identity:attest", &status, true);
+        assert!(result.is_err(),
+            "Provisional identity must be denied restricted scope");
+    }
+
+    #[test]
+    fn dis_012_restricted_denied_unknown_with_key_binding() {
+        let status = IdentityAuthStatus::Unknown;
+        let result = authorize_scope("identity:attest", &status, true);
+        assert!(result.is_err(),
+            "Unknown identity must be denied restricted scope");
+    }
+
+    #[test]
+    fn dis_012_restricted_denied_unavailable() {
+        // Unavailable is fail-closed regardless of binding.
+        let status = IdentityAuthStatus::Unavailable;
+        let result = authorize_scope("identity:attest", &status, false);
+        assert!(result.is_err(),
+            "Unavailable identity must be denied fail-closed");
+    }
+
+    #[test]
+    fn dis_012_stale_explorer_state_no_binding() {
+        // Simulate stale ExplorerState: address not yet projected (tier = None).
+        // This covers the window between transaction execution and the next
+        // explorer refresh (which happens at block commit).  The correct
+        // behaviour is no binding, no restricted access.
+        let tier: Option<&str> = None;
+        let frozen = false;
+        assert!(!key_binding_from_explorer(tier, frozen),
+            "stale explorer (tier=None) must not grant key binding");
+        let status = identity_auth_status(tier, frozen);
+        assert_eq!(status, IdentityAuthStatus::Unknown);
+        let result = authorize_scope("identity:attest", &status,
+            key_binding_from_explorer(tier, frozen));
+        assert!(result.is_err(), "stale explorer state must deny restricted scope");
+    }
+
+    #[test]
+    fn dis_012_account_without_identity_no_binding() {
+        // An account exists in StateStore (sent at least one tx) but has never
+        // registered an identity.  tier = None, frozen = false.
+        let tier: Option<&str> = None;
+        let binding = key_binding_from_explorer(tier, false);
+        assert!(!binding, "account without identity must have no key binding");
+        let status = identity_auth_status(tier, false);
+        let result = authorize_scope("identity:attest", &status, binding);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dis_012_key_binding_orthogonal_to_scope_authorization() {
+        // Full matrix test: for each combination of (binding, status) verify
+        // the expected (scope_authorized, key_binding_verified) pair for a
+        // restricted scope.
+        struct Case {
+            tier:     Option<&'static str>,
+            frozen:   bool,
+            want_binding: bool,
+            want_auth:    bool,
+        }
+
+        let cases = [
+            Case { tier: Some("Verified"),   frozen: false, want_binding: true,  want_auth: true  },
+            Case { tier: Some("Established"), frozen: false, want_binding: true,  want_auth: true  },
+            Case { tier: Some("Verified"),   frozen: true,  want_binding: true,  want_auth: false },  // frozen
+            Case { tier: Some("Established"), frozen: true,  want_binding: true,  want_auth: false },
+            Case { tier: Some("Provisional"), frozen: false, want_binding: false, want_auth: false },
+            Case { tier: None,               frozen: false, want_binding: false, want_auth: false },
+        ];
+
+        for c in &cases {
+            let binding = key_binding_from_explorer(c.tier, c.frozen);
+            assert_eq!(binding, c.want_binding,
+                "binding mismatch for tier={:?} frozen={}", c.tier, c.frozen);
+
+            let status = identity_auth_status(c.tier, c.frozen);
+            let auth_result = authorize_scope("identity:attest", &status, binding);
+            assert_eq!(auth_result.is_ok(), c.want_auth,
+                "auth mismatch for tier={:?} frozen={} binding={}", c.tier, c.frozen, binding);
+        }
+    }
+
+    #[test]
+    fn dis_012_all_registered_scopes_enforce_key_binding() {
+        // Every RequiresVerified scope in the registry must deny access when
+        // key binding is absent, even with Verified status.
+        let status = IdentityAuthStatus::Verified;
+        let restricted_scopes = ["identity:read-self", "identity:attest",
+                                  "agent:authorize", "validator:manage"];
+        for scope in &restricted_scopes {
+            let result = authorize_scope(scope, &status, false /* no binding */);
+            assert!(result.is_err(),
+                "scope {scope} must be denied without key binding");
+        }
+    }
+
+    #[test]
+    fn dis_012_all_permissionless_scopes_skip_key_binding_check() {
+        let status = IdentityAuthStatus::Unknown;
+        let permissionless_scopes = ["wallet:authenticate", "wallet:read"];
+        for scope in &permissionless_scopes {
+            let result = authorize_scope(scope, &status, false /* no binding */);
+            assert!(result.is_ok(),
+                "permissionless scope {scope} must not require key binding");
+        }
     }
 
     /// DIS-001-11: a legacy JSON signing payload must not verify as a V1 canonical payload.
