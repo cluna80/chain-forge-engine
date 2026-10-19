@@ -270,7 +270,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | **PQ-VAL-002** | ML-DSA-65 consensus activation + EDA | ✅ Merged to main (PR #4) |
 | **PQ-VAL-003** | ML-DSA-65 key rotation/revocation lifecycle | ✅ Merged to main (PR #5) |
 | **QCB-ZKP-001** | ZK Block Proving — Hash-Based STARKs | 🔲 Research / long-horizon |
-| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B complete |
+| **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B + DIS-001-13 live test complete |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | **QCB-PM-001** | Private Post-Quantum Threshold Authorization | ❓ Research |
 | **QSWIP-001** | Open Post-Quantum Wallet Identity Protocol | 🔲 Proposed standard |
@@ -399,10 +399,23 @@ User opens Qattice app → QR challenge displayed
 |-------|-------|--------|
 | A — Digital identity and authentication | ML-DSA wallet identity, temporary QR challenges, signature verification | ✅ Complete |
 | B — Security hardening (DIS-001 Phase B) | Chain-ID binding in ML-DSA sigs, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality | ✅ Complete |
+| B-Live — DIS-001-13 live authentication acceptance test | End-to-end proof of key-binding, scope-authorization, freeze semantics, and restart reconstruction on real 4-node devnet | ✅ Complete (2026-10-19) |
 | B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to Qattice wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
 | E — Security testing | QR replay, phishing, session hijacking, key compromise, identity correlation, account recovery | 🔲 |
+
+**DIS-001-13 — Live Authentication Acceptance Test — ✅ COMPLETE (2026-10-19):**
+- **Test:** `chain-forge-node/tests/dis_auth_live.rs` — 8-step end-to-end acceptance test against a real 4-node devnet; runtime ~30s; committed `c69eef3` + `6af728d`.
+- **Step 1 ✅** — Two fresh ML-DSA-65 keypairs registered as Provisional identities on all 4 nodes; ML-DSA-derived `qcb1pq…` addresses pre-funded (10,000 uqcb each) from `qcb1alice` genesis account to cover 92 uqcb gas cost.
+- **Step 2 ✅** — Three attestations (bob + carol + dave) satisfy `ATTESTATION_QUORUM=3`; Wallet A promoted to Verified across all nodes with BFT convergence within ~4s.
+- **Step 4 ✅** — Verified wallet: `key_binding_verified=true`, `scope_authorized=true` for restricted scope `identity:attest`.
+- **Step 5 ✅** — Provisional wallet (Wallet B): `key_binding_verified=false`, `scope_authorized=false` — restricted scope denied.
+- **Step 6 ✅** — `ConfirmSybil` freezes Wallet A; `key_binding_verified` stays `true` (orthogonality invariant), `scope_authorized` drops to `false`.
+- **Step 6.5 ✅** — `ReverseSybil` restores Wallet A; restricted auth re-enabled on all nodes.
+- **Step 7 ✅** — Alice node SIGKILL + restart; `ExplorerState` reconstructs from `IdentityStore`; Wallet A auth correct post-restart (`key_binding_verified=true`, `scope_authorized=true`).
+- **Step 8 ✅** — Permissionless scope (`wallet:authenticate`) authorized for both Wallet A (Verified) and Wallet B (Provisional).
+- **Key fixes proved by test:** zero-balance ML-DSA addresses must be pre-funded before any tx; nonce sequencing required between back-to-back txs from the same sender; `ATTESTATION_QUORUM=3` requires 3 distinct Verified/Established attesters.
 
 **DIS-001 Phase B — ✅ COMPLETE (2026-10-09):**
 - **B4 — Chain-ID binding in ML-DSA signatures:** `verify_mldsa_authorization()` now hashes `SHA-256("chain-forge/pq-tx/v1\n" + chain_id + "\n" + body_json)` — identical construction in both `chain-forge-execution` verifier and `chain-forge-wallet` signer. Cross-chain replay is cryptographically impossible: a valid sig for `qcb-chain-A` cannot be accepted by `qcb-chain-B`. Wallet CLI gains `--chain-id` flag on `sign-tx` and `submit` (default: `qcb-testnet-1`).
