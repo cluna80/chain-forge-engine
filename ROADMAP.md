@@ -265,6 +265,9 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Milestone | Technology | Status |
 |---|---|---|
 | **QCB-CS-001** | Cryptographic Survivability and Migration | 🔄 P1+P2+P3 complete; P4 tracked |
+| **PQ-VAL-001** | ML-DSA-65 validator-key registration + PoP | ✅ Merged to main (PR #2) |
+| **PQ-VAL-002** | ML-DSA-65 consensus activation + EDA | ✅ Merged to main (PR #4) |
+| **PQ-VAL-003** | ML-DSA-65 key rotation/revocation lifecycle | ✅ Merged to main (PR #5) |
 | **QCB-ZKP-001** | ZK Block Proving — Hash-Based STARKs | 🔲 Research / long-horizon |
 | **QCB-DIS-001** | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B complete |
 | **QCB-KR-001** | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
@@ -306,6 +309,27 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | Emergency algorithm-deprecation governance tx | ✅ | `EmergencyDeprecateAlgorithm` TxBody variant; `crypto_governors` constitutional keyholder set; fail-closed semantics |
 | Simulated cryptographic compromise tests | ✅ | 9 CS-001 P4 tests including full adversarial CRQC-emergency migration sequence |
 | Independent security review | 🔲 | Prerequisite: migration procedures + adversarial tests pass; external review before mainnet |
+
+---
+
+#### PQ-VAL Series — Post-Quantum Validator Key Lifecycle ✅ COMPLETE
+
+*Goal: Harden the validator set against quantum adversaries — mandatory ML-DSA-65 keys, post-quantum consensus signature verification, and a full key rotation/revocation lifecycle with proof-of-possession replay protection.*
+
+> All three milestones merged to `main` (2026-10-18). Specs in `docs/pq-val-00{1,2,3}-spec.md`.
+
+| Milestone | Branch | PR | Status | Requirements covered |
+|---|---|---|---|---|
+| **PQ-VAL-001** — ML-DSA-65 key registration + PoP | `feat/pq-val-001-mldsa-key-registration` | #2 | ✅ Merged | Mandatory validator-key enforcement; proof-of-possession binding; personhood gating; signature verification |
+| **PQ-VAL-001b** — BFT performance benchmark | `feat/pq-val-001b-benchmarks` | #3 | ✅ Merged | ML-DSA signing/verification throughput at BFT scale; all phases pass |
+| **PQ-VAL-002** — ML-DSA-65 consensus activation + EDA | `feat/pq-val-002-mldsa-consensus-activation` | #4 | ✅ Merged | `ActivatePqConsensus` tx type (R1); `Vote.scheme` field (R2); `consensus_precommit_signing_bytes()` (R2); 14/14 acceptance tests |
+| **PQ-VAL-003** — Key rotation/revocation lifecycle | `feat/pq-val-003-key-rotation-revocation` | #5 | ✅ Merged | R1 (ML-DSA→new ML-DSA); R2 (ML-DSA→classical downgrade with scheme update); R3 (duplicate-key blocked); R4 (PoP replay blocked); R5 (vote rejected after rotation); R6 (power zeroed at rotation block, restored next block); R7 (released key reusable by different validator); 10/10 tests |
+
+**Invariants upheld across all three milestones:**
+- Validator-key enforcement is mandatory and cannot be weakened — `gate_voting_power()` zeroes power for any validator missing a registered key or `pop_verified=true`
+- Personhood gating is unconditional across all three BFT engines (Tendermint, HotStuff, FBA)
+- Key rotation uses `register_consensus_key_with_scheme()` on both `commit_block` and `propose_block` paths; first-time registrations do NOT get the R6 one-block power gap — only rotations do
+- No post-quantum consensus cryptography modified (PQ migration is a separate governance tx, not an implicit side-effect of key rotation)
 
 ---
 
