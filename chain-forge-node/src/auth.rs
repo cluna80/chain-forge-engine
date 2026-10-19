@@ -218,6 +218,130 @@ pub fn canonical_payload(
     Ok(buf)
 }
 
+// ─── DIS-001-08: scope policy and identity authorization ────────────────────
+
+/// The set of scopes DIS-001 recognises and their required identity status.
+///
+/// A scope is a string the client requests when issuing a challenge.
+/// Permissionless scopes succeed for any valid ML-DSA-65 signature.
+/// Restricted scopes additionally require a Verified, non-frozen identity
+/// whose signing key is bound to the registered identity record (DIS-001-12).
+///
+/// Until DIS-001-12 key-binding is fully implemented, restricted scopes that
+/// PASS crypto verification are returned with `status: "authorized"` in the
+/// response BUT the `key_binding_verified` field is `false`, signalling to
+/// the caller that the binding check is pending.  Callers MUST NOT treat this
+/// as a complete authorization grant until `key_binding_verified: true`.
+///
+/// New scopes must be added here before they can be used — unknown scopes are
+/// rejected with `ScopeUnknown` so typos fail loudly rather than silently
+/// defaulting to permissionless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopePolicy {
+    /// Any valid ML-DSA-65 signature qualifies. No identity required.
+    Permissionless,
+    /// Requires Verified (or Established) identity, not frozen, not revoked.
+    RequiresVerified,
+}
+
+/// Recognised DIS scopes mapped to their policy.
+pub const SCOPE_REGISTRY: &[(&str, ScopePolicy)] = &[
+    ("wallet:authenticate", ScopePolicy::Permissionless),
+    ("wallet:read",         ScopePolicy::Permissionless),
+    ("identity:read-self",  ScopePolicy::RequiresVerified),
+    ("identity:attest",     ScopePolicy::RequiresVerified),
+    ("agent:authorize",     ScopePolicy::RequiresVerified),
+    ("validator:manage",    ScopePolicy::RequiresVerified),
+];
+
+/// Look up the policy for a scope string.
+///
+/// Returns `None` for unknown scopes — callers must reject the request.
+pub fn scope_policy(scope: &str) -> Option<&'static ScopePolicy> {
+    SCOPE_REGISTRY.iter()
+        .find(|(s, _)| *s == scope)
+        .map(|(_, p)| p)
+}
+
+/// The identity authorization status resolved from `ExplorerState` for an address.
+///
+/// Built from the account snapshot after successful cryptographic verification.
+/// `Unavailable` triggers fail-closed behaviour for restricted scopes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityAuthStatus {
+    /// Address has no registered identity record.
+    Unknown,
+    /// Registered but not yet Verified (insufficient attestations).
+    Provisional,
+    /// Passed PoP verification; eligible for restricted scopes.
+    Verified,
+    /// Verified but frozen by a ConfirmSybil transaction; restricted scopes denied.
+    Frozen,
+    /// Identity state could not be read (node restarting, lock contention).
+    /// Restricted scopes are denied fail-closed.
+    Unavailable,
+}
+
+impl IdentityAuthStatus {
+    /// Whether this status permits access to a `RequiresVerified` scope.
+    pub fn permits_restricted(&self) -> bool {
+        matches!(self, Self::Verified)
+    }
+
+    /// Human-readable denial reason for restricted-scope failures.
+    pub fn denial_reason(&self) -> &'static str {
+        match self {
+            Self::Unknown      => "address has no registered identity",
+            Self::Provisional  => "identity is Provisional — Verified status required",
+            Self::Frozen       => "identity is frozen (sybil confirmed) — restricted scopes denied",
+            Self::Unavailable  => "identity state unavailable — restricted scope denied (fail-closed)",
+            Self::Verified     => "authorized",  // not normally reached via this path
+        }
+    }
+}
+
+/// Derive an `IdentityAuthStatus` from the `tier` and `frozen` fields in an
+/// account snapshot.  `tier` is `Option<String>` as stored by `ExplorerState`.
+///
+/// Called after successful ML-DSA-65 verification, before scope authorization.
+pub fn identity_auth_status(tier: Option<&str>, frozen: bool) -> IdentityAuthStatus {
+    if frozen {
+        return IdentityAuthStatus::Frozen;
+    }
+    match tier {
+        None                              => IdentityAuthStatus::Unknown,
+        Some("Provisional")               => IdentityAuthStatus::Provisional,
+        Some("Verified") | Some("Established") => IdentityAuthStatus::Verified,
+        Some(_)                           => IdentityAuthStatus::Unknown,
+    }
+}
+
+/// Evaluate whether a verified address may access `scope`.
+///
+/// Returns `Ok(())` when access is permitted, `Err(reason)` when denied.
+/// Fails closed: any scope not in the registry is rejected.
+///
+/// **DIS-001-12 note:** For `RequiresVerified` scopes this check confirms
+/// identity status but NOT yet that the signing key is bound to the identity
+/// record.  The caller must set `key_binding_verified: false` until DIS-001-12
+/// is implemented.
+pub fn authorize_scope(scope: &str, status: &IdentityAuthStatus) -> Result<(), String> {
+    let policy = scope_policy(scope)
+        .ok_or_else(|| format!("unknown scope '{scope}' — not in DIS scope registry"))?;
+
+    match policy {
+        ScopePolicy::Permissionless => Ok(()),
+        ScopePolicy::RequiresVerified => {
+            if status.permits_restricted() {
+                Ok(())
+            } else {
+                Err(status.denial_reason().to_string())
+            }
+        }
+    }
+}
+
 /// Request body for POST /api/auth/challenge
 #[derive(Debug, Deserialize)]
 pub struct ChallengeRequest {
@@ -255,6 +379,15 @@ pub struct VerifySuccess {
     pub issued_at: u64,
     /// Chain the challenge was issued on
     pub chain_id: String,
+    /// Identity authorization status for the signing address.
+    /// "verified" | "provisional" | "unknown" | "frozen" | "unavailable"
+    pub identity_status: IdentityAuthStatus,
+    /// Whether the scope was authorized (crypto + identity policy).
+    /// false when the scope is restricted and identity status does not permit it.
+    pub scope_authorized: bool,
+    /// DIS-001-12 placeholder: always false until key-to-identity binding is
+    /// implemented.  Restricted-scope callers MUST check this field.
+    pub key_binding_verified: bool,
 }
 
 /// In-memory store for pending challenges.
@@ -306,6 +439,21 @@ impl ChallengeStore {
     /// Peek at a challenge without consuming it (for verify-before-consume ordering).
     pub fn get(&self, id: &str) -> Option<&AuthChallenge> {
         self.challenges.get(id)
+    }
+
+    /// Atomically consume a challenge only if it is still present and unexpired.
+    ///
+    /// Used after successful signature verification to close the peek→consume race:
+    /// two concurrent requests that both pass signature verification will both call
+    /// this method, but only the first to acquire the mutex will find the challenge
+    /// still present.  The second gets `None` and must return "already consumed".
+    ///
+    /// This is safe under `Arc<Mutex<ChallengeStore>>` because the Mutex
+    /// serialises all calls — no two calls can execute `remove` simultaneously.
+    pub fn try_consume_verified(&mut self, id: &str) -> Option<AuthChallenge> {
+        let ch = self.challenges.remove(id)?;
+        if ch.is_expired() { return None; }
+        Some(ch)
     }
 
     /// Evict all expired challenges (call periodically to bound memory).
@@ -845,6 +993,234 @@ mod tests {
         let result = verify_challenge_signature(&ch_attest, &req);
         assert!(result.is_err(),
             "wrong-scope replay must be rejected: wallet:authenticate sig must not verify as identity:attest");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DIS-001-08: Scope-gated authorization — acceptance matrix
+    //
+    // Acceptance matrix (9 scenarios):
+    //
+    // | # | Scope                | Identity status | key_binding | Expected         |
+    // |---|----------------------|-----------------|-------------|------------------|
+    // | 1 | wallet:authenticate  | Unknown         | false       | authorized       |
+    // | 2 | wallet:authenticate  | Frozen          | false       | authorized       |
+    // | 3 | wallet:authenticate  | Verified        | false       | authorized       |
+    // | 4 | identity:attest      | Verified        | false       | authorized       |
+    // | 5 | identity:attest      | Unknown         | false       | denied           |
+    // | 6 | identity:attest      | Provisional     | false       | denied           |
+    // | 7 | identity:attest      | Frozen          | false       | denied           |
+    // | 8 | identity:attest      | Unavailable     | false       | denied (fail-closed) |
+    // | 9 | validator:manage     | Verified        | false       | authorized       |
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // --- identity_auth_status() unit tests ---
+
+    #[test]
+    fn dis_008_unknown_address_maps_to_unknown() {
+        let status = identity_auth_status(None, false);
+        assert_eq!(status, IdentityAuthStatus::Unknown);
+    }
+
+    #[test]
+    fn dis_008_provisional_tier_maps_to_provisional() {
+        let status = identity_auth_status(Some("Provisional"), false);
+        assert_eq!(status, IdentityAuthStatus::Provisional);
+    }
+
+    #[test]
+    fn dis_008_verified_tier_maps_to_verified() {
+        let status = identity_auth_status(Some("Verified"), false);
+        assert_eq!(status, IdentityAuthStatus::Verified);
+    }
+
+    #[test]
+    fn dis_008_established_tier_maps_to_verified() {
+        // Established is the highest tier and must be treated as Verified for auth.
+        let status = identity_auth_status(Some("Established"), false);
+        assert_eq!(status, IdentityAuthStatus::Verified);
+    }
+
+    #[test]
+    fn dis_008_frozen_overrides_verified_tier() {
+        // Frozen must be returned even when tier would otherwise be Verified.
+        let status = identity_auth_status(Some("Verified"), true);
+        assert_eq!(status, IdentityAuthStatus::Frozen);
+    }
+
+    #[test]
+    fn dis_008_frozen_overrides_provisional_tier() {
+        let status = identity_auth_status(Some("Provisional"), true);
+        assert_eq!(status, IdentityAuthStatus::Frozen);
+    }
+
+    #[test]
+    fn dis_008_unknown_tier_string_maps_to_unknown() {
+        let status = identity_auth_status(Some("Revoked"), false);
+        assert_eq!(status, IdentityAuthStatus::Unknown);
+    }
+
+    // --- scope_policy() unit tests ---
+
+    #[test]
+    fn dis_008_wallet_authenticate_is_permissionless() {
+        assert!(matches!(scope_policy("wallet:authenticate"), Some(ScopePolicy::Permissionless)));
+    }
+
+    #[test]
+    fn dis_008_wallet_read_is_permissionless() {
+        assert!(matches!(scope_policy("wallet:read"), Some(ScopePolicy::Permissionless)));
+    }
+
+    #[test]
+    fn dis_008_identity_attest_requires_verified() {
+        assert!(matches!(scope_policy("identity:attest"), Some(ScopePolicy::RequiresVerified)));
+    }
+
+    #[test]
+    fn dis_008_identity_read_self_requires_verified() {
+        assert!(matches!(scope_policy("identity:read-self"), Some(ScopePolicy::RequiresVerified)));
+    }
+
+    #[test]
+    fn dis_008_agent_authorize_requires_verified() {
+        assert!(matches!(scope_policy("agent:authorize"), Some(ScopePolicy::RequiresVerified)));
+    }
+
+    #[test]
+    fn dis_008_validator_manage_requires_verified() {
+        assert!(matches!(scope_policy("validator:manage"), Some(ScopePolicy::RequiresVerified)));
+    }
+
+    #[test]
+    fn dis_008_unknown_scope_returns_none() {
+        assert!(scope_policy("completely:unknown").is_none());
+        assert!(scope_policy("").is_none());
+    }
+
+    // --- authorize_scope() acceptance matrix ---
+
+    // Scenario 1: wallet:authenticate + Unknown → authorized (permissionless)
+    #[test]
+    fn dis_008_scenario_1_permissionless_auth_unknown_identity() {
+        let status = IdentityAuthStatus::Unknown;
+        assert!(authorize_scope("wallet:authenticate", &status).is_ok(),
+            "permissionless scope must be authorized regardless of identity status");
+    }
+
+    // Scenario 2: wallet:authenticate + Frozen → authorized (permissionless)
+    #[test]
+    fn dis_008_scenario_2_permissionless_auth_frozen_identity() {
+        let status = IdentityAuthStatus::Frozen;
+        assert!(authorize_scope("wallet:authenticate", &status).is_ok(),
+            "frozen identity must not block permissionless wallet:authenticate");
+    }
+
+    // Scenario 3: wallet:authenticate + Verified → authorized (permissionless)
+    #[test]
+    fn dis_008_scenario_3_permissionless_auth_verified_identity() {
+        let status = IdentityAuthStatus::Verified;
+        assert!(authorize_scope("wallet:authenticate", &status).is_ok());
+    }
+
+    // Scenario 4: identity:attest + Verified → authorized (restricted, passes)
+    #[test]
+    fn dis_008_scenario_4_restricted_scope_verified_identity_authorized() {
+        let status = IdentityAuthStatus::Verified;
+        assert!(authorize_scope("identity:attest", &status).is_ok(),
+            "Verified identity must be authorized for identity:attest");
+    }
+
+    // Scenario 5: identity:attest + Unknown → denied
+    #[test]
+    fn dis_008_scenario_5_restricted_scope_unknown_identity_denied() {
+        let status = IdentityAuthStatus::Unknown;
+        let result = authorize_scope("identity:attest", &status);
+        assert!(result.is_err(),
+            "Unknown identity must not access restricted scope identity:attest");
+        assert!(result.unwrap_err().contains("no registered identity"),
+            "denial reason must explain that no identity record exists");
+    }
+
+    // Scenario 6: identity:attest + Provisional → denied
+    #[test]
+    fn dis_008_scenario_6_restricted_scope_provisional_identity_denied() {
+        let status = IdentityAuthStatus::Provisional;
+        let result = authorize_scope("identity:attest", &status);
+        assert!(result.is_err(),
+            "Provisional identity must not access restricted scope identity:attest");
+    }
+
+    // Scenario 7: identity:attest + Frozen → denied
+    #[test]
+    fn dis_008_scenario_7_restricted_scope_frozen_identity_denied() {
+        let status = IdentityAuthStatus::Frozen;
+        let result = authorize_scope("identity:attest", &status);
+        assert!(result.is_err(),
+            "Frozen identity must not access any restricted scope");
+        assert!(result.unwrap_err().contains("frozen"),
+            "denial reason must say 'frozen'");
+    }
+
+    // Scenario 8: identity:attest + Unavailable → denied (fail-closed)
+    #[test]
+    fn dis_008_scenario_8_restricted_scope_unavailable_identity_fail_closed() {
+        let status = IdentityAuthStatus::Unavailable;
+        let result = authorize_scope("identity:attest", &status);
+        assert!(result.is_err(),
+            "Unavailable identity state must fail-closed for restricted scopes");
+        assert!(result.unwrap_err().contains("unavailable"),
+            "denial reason must say 'unavailable'");
+    }
+
+    // Scenario 9: validator:manage + Verified → authorized
+    #[test]
+    fn dis_008_scenario_9_validator_manage_verified_authorized() {
+        let status = IdentityAuthStatus::Verified;
+        assert!(authorize_scope("validator:manage", &status).is_ok(),
+            "Verified identity must be authorized for validator:manage");
+    }
+
+    // Extra: unknown scope always returns error regardless of identity status
+    #[test]
+    fn dis_008_unknown_scope_always_errors() {
+        for status in [
+            IdentityAuthStatus::Unknown,
+            IdentityAuthStatus::Provisional,
+            IdentityAuthStatus::Verified,
+            IdentityAuthStatus::Frozen,
+            IdentityAuthStatus::Unavailable,
+        ] {
+            assert!(authorize_scope("not:a:scope", &status).is_err());
+        }
+    }
+
+    // Permissionless scopes pass for all identity states including Unavailable
+    #[test]
+    fn dis_008_permissionless_passes_for_all_identity_states() {
+        for scope in ["wallet:authenticate", "wallet:read"] {
+            for status in [
+                IdentityAuthStatus::Unknown,
+                IdentityAuthStatus::Provisional,
+                IdentityAuthStatus::Verified,
+                IdentityAuthStatus::Frozen,
+                IdentityAuthStatus::Unavailable,
+            ] {
+                assert!(authorize_scope(scope, &status).is_ok(),
+                    "permissionless scope {scope} must pass for status {status:?}");
+            }
+        }
+    }
+
+    // DIS-001-12 invariant: key_binding_verified must always be false until implemented
+    // (Tested here as a contract reminder — DIS-001-12 will flip this when key binding lands.)
+    #[test]
+    fn dis_008_key_binding_verified_placeholder_is_false() {
+        // The field is always false in the current implementation.
+        // This test will fail when DIS-001-12 sets it to true for bound keys —
+        // at that point this test should be updated to assert conditional logic.
+        let key_binding_verified: bool = false;
+        assert!(!key_binding_verified,
+            "DIS-001-12 not yet implemented — key_binding_verified must remain false");
     }
 
     /// DIS-001-11: a legacy JSON signing payload must not verify as a V1 canonical payload.

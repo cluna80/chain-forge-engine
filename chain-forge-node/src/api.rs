@@ -10,7 +10,8 @@
 use std::sync::{Arc, Mutex};
 use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS};
 use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest,
-                  verify_challenge_signature};
+                  verify_challenge_signature, identity_auth_status, authorize_scope,
+                  scope_policy};
 use chain_forge_p2p::PeerInfo;
 use chain_forge_execution::Transaction;
 use chain_forge_pocd::{DiscoveryProof, DiscoveryRegistry};
@@ -805,34 +806,25 @@ pub async fn serve(
                                         http_400_json(&resp.to_string())
                                     }
                                     Some(challenge) => {
-                                        // Step 2: Cryptographic verification (before consume).
-                                        match verify_challenge_signature(&challenge, &verify_req) {
-                                            Ok(address) => {
-                                                // Step 3: Consume only on success (anti-replay).
-                                                {
-                                                    let mut store = challenge_store.lock().unwrap();
-                                                    store.consume(&verify_req.challenge_id);
-                                                }
-                                                tracing::info!(
-                                                    challenge_id = %challenge.challenge_id,
-                                                    address      = %address,
-                                                    scope        = %challenge.scope,
-                                                    chain_id     = %challenge.chain_id,
-                                                    "DIS-001: auth challenge verified"
-                                                );
-                                                let resp = serde_json::json!({
-                                                    "status":       "verified",
-                                                    "challenge_id": challenge.challenge_id,
-                                                    "address":      address,
-                                                    "scope":        challenge.scope,
-                                                    "issued_at":    challenge.issued_at,
-                                                    "chain_id":     challenge.chain_id,
-                                                });
-                                                http_200_json(&resp.to_string())
-                                            }
+                                        // Step 2: Reject unknown scope before crypto work.
+                                        // Step 3: Cryptographic verification (before consume).
+                                        // A failed sig attempt leaves the challenge intact — the
+                                        // legitimate user can retry.
+                                        // Step 4: Atomically consume (only on success).
+                                        // Steps 5-6: Identity lookup + scope authorization.
+                                        //
+                                        // All steps are chained as match expressions so every
+                                        // arm produces the same `String` type (HTTP response).
+                                        // No `return` is used here — the enclosing `response`
+                                        // binding collects the final value.
+                                        if scope_policy(&challenge.scope).is_none() {
+                                            let resp = serde_json::json!({
+                                                "status": "rejected",
+                                                "reason": format!("unknown scope '{}'", challenge.scope)
+                                            });
+                                            http_400_json(&resp.to_string())
+                                        } else { match verify_challenge_signature(&challenge, &verify_req) {
                                             Err(reason) => {
-                                                // Verification failed — challenge NOT consumed.
-                                                // The legitimate user can retry.
                                                 tracing::warn!(
                                                     challenge_id = %challenge.challenge_id,
                                                     %reason,
@@ -844,10 +836,84 @@ pub async fn serve(
                                                 });
                                                 http_400_json(&resp.to_string())
                                             }
-                                        }
-                                    }
-                                }
-                            }
+                                            Ok(address) => {
+                                                // Step 4: Atomically consume the challenge.
+                                                // If another concurrent request already consumed it,
+                                                // treat this as "challenge not found" — the first
+                                                // request to consume wins; the second is rejected.
+                                                let consumed = {
+                                                    let mut store = challenge_store.lock().unwrap();
+                                                    store.try_consume_verified(&verify_req.challenge_id)
+                                                };
+                                                if consumed.is_none() {
+                                                    tracing::warn!(
+                                                        challenge_id = %verify_req.challenge_id,
+                                                        address      = %address,
+                                                        "DIS-001: challenge already consumed by concurrent request"
+                                                    );
+                                                    let resp = serde_json::json!({
+                                                        "status": "rejected",
+                                                        "reason": "challenge already consumed — concurrent replay attempt"
+                                                    });
+                                                    http_400_json(&resp.to_string())
+                                                } else {
+
+                                                // Step 5: Identity-state lookup (DIS-001-08).
+                                                // Fail-closed: if the explorer lock is poisoned,
+                                                // restricted scopes are denied.
+                                                let id_status = {
+                                                    match explorer.lock() {
+                                                        Ok(ex) => match ex.accounts.get(&address) {
+                                                            Some(acc) => identity_auth_status(
+                                                                acc.tier.as_deref(),
+                                                                acc.frozen,
+                                                            ),
+                                                            None => super::auth::IdentityAuthStatus::Unknown,
+                                                        },
+                                                        Err(_) => super::auth::IdentityAuthStatus::Unavailable,
+                                                    }
+                                                };
+
+                                                // Step 6: Scope authorization policy.
+                                                // DIS-001-12 note: key_binding_verified is always
+                                                // false until binding verification is implemented.
+                                                // Restricted scopes that pass policy still carry
+                                                // key_binding_verified: false as a mandatory signal.
+                                                let scope_result = authorize_scope(&challenge.scope, &id_status);
+                                                let scope_authorized = scope_result.is_ok();
+                                                let key_binding_verified = false; // DIS-001-12 pending
+
+                                                tracing::info!(
+                                                    challenge_id    = %challenge.challenge_id,
+                                                    address         = %address,
+                                                    scope           = %challenge.scope,
+                                                    chain_id        = %challenge.chain_id,
+                                                    identity_status = ?id_status,
+                                                    scope_authorized,
+                                                    "DIS-001: auth challenge verified"
+                                                );
+
+                                                let resp = serde_json::json!({
+                                                    "status":               "verified",
+                                                    "challenge_id":         challenge.challenge_id,
+                                                    "address":              address,
+                                                    "scope":                challenge.scope,
+                                                    "issued_at":            challenge.issued_at,
+                                                    "chain_id":             challenge.chain_id,
+                                                    "identity_status":      id_status,
+                                                    "scope_authorized":     scope_authorized,
+                                                    "key_binding_verified": key_binding_verified,
+                                                    // Include denial reason when scope is restricted
+                                                    // and not authorized, so clients get actionable errors.
+                                                    "authorization_detail": scope_result.err(),
+                                                });
+                                                http_200_json(&resp.to_string())
+                                                } // end else { consumed.is_some() }
+                                            }   // end Ok(address) arm
+                                        }}      // end match verify_challenge_signature + else { match
+                                    }           // end Some(challenge) arm
+                                }               // end match peek
+                            }                   // end POST /api/auth/verify
                         }
 
                     } else if first_line.starts_with("OPTIONS") {
