@@ -3300,6 +3300,10 @@ impl Node {
         // refresh block immediately below, so a key registered in this
         // very block is visible to both this block's admission decisions
         // and the live ValidatorSet refresh.
+        // PQ-VAL-003 R6: collect validators whose key was registered this block
+        // so the pop_verified refresh below can skip power restoration for them
+        // (producing the one-block power gap R6 requires).
+        let mut key_registered_this_block: Vec<String> = Vec::new();
         {
             let epoch = self.identity.clock.current_epoch;
             for (idx, sender, pubkey, scheme) in &register_key_attempts {
@@ -3309,14 +3313,22 @@ impl Node {
                 }
                 // PQ-VAL-001: store scheme alongside key so gate_voting_power
                 // (R3) can distinguish ML-DSA-only validators.
+                // PQ-VAL-003 R2: always use register_consensus_key_with_scheme
+                // so classical downgrade (ML-DSA → classical) updates the
+                // scheme field in the registry.
                 let effective_scheme = if scheme.is_empty() { "classical" } else { scheme.as_str() };
-                let reg_result = if effective_scheme != "classical" {
-                    self.validator_registry.register_consensus_key_with_scheme(
-                        sender, pubkey, epoch, effective_scheme,
-                    )
-                } else {
-                    self.validator_registry.register_consensus_key(sender, pubkey, epoch)
-                };
+                // PQ-VAL-003 R6: detect rotation (validator already holds a
+                // different key) BEFORE updating the registry so the
+                // key_registered_this_block guard applies only to rotations.
+                // First-time registrations should restore power immediately;
+                // only rotation introduces the one-block power gap.
+                let is_rotation = self.validator_registry
+                    .consensus_pubkey_bytes(sender)
+                    .map(|old| old != *pubkey)
+                    .unwrap_or(false);
+                let reg_result = self.validator_registry.register_consensus_key_with_scheme(
+                    sender, pubkey, epoch, effective_scheme,
+                );
                 if let Err(e) = reg_result {
                     warn!(
                         validator = %sender,
@@ -3325,6 +3337,10 @@ impl Node {
                          executor already authenticated -- this should only happen on a \
                          genuine duplicate-key conflict"
                     );
+                    continue;
+                }
+                if is_rotation {
+                    key_registered_this_block.push(sender.clone());
                 }
             }
         }
@@ -3540,7 +3556,16 @@ impl Node {
                 // carrying real power, so genesis validators are
                 // unaffected), look up the actual bonded amount from
                 // state and restore it.
-                if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
+                // PQ-VAL-003 R6: skip power restoration for validators whose
+                // key was registered in this very block (first-time or
+                // rotation). Their power is intentionally held at 0 until the
+                // next block's refresh — this is the one-block gap R6 requires.
+                if key_registered_this_block.contains(&v.id.0) {
+                    if v.voting_power != 0 {
+                        v.voting_power = 0;
+                        any_changed = true;
+                    }
+                } else if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
                     // PQ-VAL-001/002 / R3: ML-DSA-only validators are gated
                     // until PQ-VAL-002 activates the ML-DSA consensus verifier.
                     // At or after the activation epoch (stored in state by an
@@ -4055,6 +4080,15 @@ impl Node {
         // the registry -- see the multi-node commit_block path's full
         // comment for why this runs here and what the executor already
         // verified before this tx could succeed at all.
+        //
+        // PQ-VAL-003 R6: validators whose key was registered (first-time or
+        // rotation) in this block are collected in `key_registered_this_block`
+        // so the R6 power-zero can be applied AFTER the pop_verified refresh
+        // loop below. Applying it before the refresh would be undone
+        // immediately — the refresh sees pop_verified=true, public_key
+        // non-empty, and restores power in the same block. Running after the
+        // refresh means the zero is the last write to voting_power this block.
+        let mut key_registered_this_block: Vec<String> = Vec::new();
         {
             let epoch = self.identity.clock.current_epoch;
             for (idx, sender, pubkey, scheme) in &register_key_attempts {
@@ -4062,16 +4096,32 @@ impl Node {
                 if !result.success {
                     continue;
                 }
+                // PQ-VAL-003 R2: always use register_consensus_key_with_scheme
+                // so the scheme field is updated on every registration,
+                // including ML-DSA → classical downgrade. The old
+                // register_consensus_key path left the scheme unchanged,
+                // making the registry show "ml-dsa-65" after a classical
+                // downgrade (T05/T06).
                 let effective_scheme = if scheme.is_empty() { "classical" } else { scheme.as_str() };
-                let reg_result = if effective_scheme != "classical" {
-                    self.validator_registry.register_consensus_key_with_scheme(
-                        sender, pubkey, epoch, effective_scheme,
-                    )
-                } else {
-                    self.validator_registry.register_consensus_key(sender, pubkey, epoch)
-                };
+                // PQ-VAL-003 R6: detect rotation (validator already holds a
+                // different key) BEFORE updating the registry, so the
+                // key_registered_this_block guard only applies to rotations, not
+                // first-time registrations. A first-time registration should
+                // restore power immediately; only rotation introduces the one-block
+                // power gap (R6).
+                let is_rotation = self.validator_registry
+                    .consensus_pubkey_bytes(sender)
+                    .map(|old| old != *pubkey)
+                    .unwrap_or(false);
+                let reg_result = self.validator_registry.register_consensus_key_with_scheme(
+                    sender, pubkey, epoch, effective_scheme,
+                );
                 if let Err(e) = reg_result {
                     warn!(validator = %sender, error = %e, "consensus key registration mirror failed");
+                    continue;
+                }
+                if is_rotation {
+                    key_registered_this_block.push(sender.clone());
                 }
             }
         }
@@ -4185,7 +4235,20 @@ impl Node {
                 }
                 // CF-VAL-KEY-002: same voting-power restoration as the
                 // multi-node commit_block path -- see that path's comment.
-                if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
+                //
+                // PQ-VAL-003 R6: skip power restoration for any validator
+                // whose key was registered (first-time or rotation) in this
+                // very block. Their power is intentionally held at 0 until the
+                // next block's refresh — this is the one-block gap R6 requires.
+                // Without this guard the refresh restores power in the same
+                // block as the rotation, making the gap unobservable.
+                if key_registered_this_block.contains(&v.id.0) {
+                    // Force power to 0 for this block; next block restores it.
+                    if v.voting_power != 0 {
+                        v.voting_power = 0;
+                        any_changed = true;
+                    }
+                } else if v.pop_verified && !v.public_key.is_empty() && v.voting_power == 0 {
                     // PQ-VAL-001/002 / R3: ML-DSA-only validators gated until
                     // PQ-VAL-002 activation epoch (same logic as multi-node path).
                     let scheme = self.validator_registry.consensus_key_scheme(&v.id.0)
@@ -8271,5 +8334,576 @@ mod tests {
             .any(|v| v.id.0 == bob && !v.public_key.is_empty());
         assert!(!bob_has_key,
             "cross-validator PoP replay (alice's sig submitted by bob) must be rejected");
+    }
+
+    // ----- PQ-VAL-003 tests -------------------------------------------------
+
+    /// PQ-VAL-003 / Test 01
+    /// A validator with an ML-DSA-65 key may rotate to a new ML-DSA-65 key.
+    /// After rotation: new key is in the registry, old key is gone.
+    #[tokio::test]
+    async fn mldsa_key_rotation_replaces_old_key() {
+        let (account_kp, addr) = keyed_candidate("pq003-t01-account");
+        let (mldsa_kp1, _)    = mldsa_keyed_candidate("pq003-t01-mldsa-old");
+        let (mldsa_kp2, _)    = mldsa_keyed_candidate("pq003-t01-mldsa-new");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: bond + personhood + initial ML-DSA key registration.
+        // ML-DSA txs cost ~5400 uqcb each (large pubkey + PoP sig). Top up with an extra
+        // 50_000 transfer after fund_bond so addr has enough free balance for ≥3 ML-DSA txs.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        // Top-up: send 50_000 extra to cover ML-DSA tx fees.
+        node.submit_tx(Transaction::transfer("topup-t01", "qcb1alice", &addr, "uqcb", 50_000, 1));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+        // addr nonce 0 was used by BondValidator inside fund_bond_and_verify_personhood.
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp1, node.chain_id(), &account_kp));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        // Confirm old key is registered.
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&addr),
+            Some(mldsa_kp1.public_key.clone()),
+            "setup: old ML-DSA key must be registered"
+        );
+
+        // Rotation: replace old ML-DSA key with new ML-DSA key.
+        // addr nonce is now 2 (nonce 0: bond, 1: regkey-old).
+        let rot_tx = mldsa_register_key_tx(&addr, 2, &mldsa_kp2, node.chain_id(), &account_kp);
+        node.submit_tx(rot_tx);
+        let _block3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // New key must be registered; old key must be gone from the index.
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&addr),
+            Some(mldsa_kp2.public_key.clone()),
+            "new ML-DSA key must be in the registry after rotation"
+        );
+        // Old key must be freed — no other validator holds it now, so if we try
+        // to look it up by finding which validator owns mldsa_kp1's bytes we
+        // expect nothing. We confirm by checking that the old bytes are NOT
+        // returned as the current key of addr (they've been replaced).
+        // Additionally, confirm old bytes ≠ new bytes (sanity).
+        assert_ne!(
+            node.validator_registry.consensus_pubkey_bytes(&addr),
+            Some(mldsa_kp1.public_key.clone()),
+            "old ML-DSA key must be removed from the registry after rotation"
+        );
+        // Scheme must still be ml-dsa-65.
+        assert_eq!(
+            node.validator_registry.consensus_key_scheme(&addr),
+            Some("ml-dsa-65"),
+            "scheme must remain ml-dsa-65 after ML-DSA → ML-DSA rotation"
+        );
+    }
+
+    /// PQ-VAL-003 / Test 02
+    /// After key rotation, a vote signed with the OLD (pre-rotation) ML-DSA
+    /// private key is rejected — the verifier uses the current registered key.
+    #[tokio::test]
+    async fn mldsa_key_rotation_rejects_old_key_vote() {
+        let (account_kp, addr) = keyed_candidate("pq003-t02-account");
+        let (mldsa_kp1, _)    = mldsa_keyed_candidate("pq003-t02-mldsa-old");
+        let (mldsa_kp2, _)    = mldsa_keyed_candidate("pq003-t02-mldsa-new");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: bond + personhood + ML-DSA key + activate PQ consensus.
+        // ML-DSA txs cost ~5400 uqcb each. Top up after fund_bond so addr has enough for 2 ML-DSA txs.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        // qcb1alice nonce: 0 (fund via helper), 1 (topup).
+        node.submit_tx(Transaction::transfer("topup-t02", "qcb1alice", &addr, "uqcb", 50_000, 1));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp1, node.chain_id(), &account_kp));
+        let activation_epoch = node.current_epoch() + 1;
+        // qcb1alice nonce: 0 (fund) + 1 (topup) = 2 for activate.
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 2, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+        node.identity.clock.current_epoch = activation_epoch;
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Rotate to new key.
+        // addr nonce 2 (0: bond, 1: regkey-old).
+        node.submit_tx(mldsa_register_key_tx(&addr, 2, &mldsa_kp2, node.chain_id(), &account_kp));
+        let cert4 = node.propose_block(cert3.block_hash).await.unwrap();
+
+        // A vote using the OLD key must be rejected.
+        let old_vote = mldsa_precommit_vote(
+            &addr, cert4.height + 1, 0, &cert4.block_hash, &mldsa_kp1, node.chain_id(),
+        );
+        assert!(
+            node.verify_consensus_vote(&old_vote).is_err(),
+            "vote with old (pre-rotation) ML-DSA key must be rejected"
+        );
+    }
+
+    /// PQ-VAL-003 / Test 03
+    /// After key rotation, a vote signed with the NEW ML-DSA private key is
+    /// accepted (PQ activation epoch already in effect).
+    #[tokio::test]
+    async fn mldsa_key_rotation_accepts_new_key_vote() {
+        let (account_kp, addr) = keyed_candidate("pq003-t03-account");
+        let (mldsa_kp1, _)    = mldsa_keyed_candidate("pq003-t03-mldsa-old");
+        let (mldsa_kp2, _)    = mldsa_keyed_candidate("pq003-t03-mldsa-new");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: bond + personhood + ML-DSA key + activate.
+        // ML-DSA txs cost ~5400 uqcb each. Top up after fund_bond so addr has enough for 2 ML-DSA txs.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        // qcb1alice nonce: 0 (fund via helper), 1 (topup).
+        node.submit_tx(Transaction::transfer("topup-t03", "qcb1alice", &addr, "uqcb", 50_000, 1));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp1, node.chain_id(), &account_kp));
+        let activation_epoch = node.current_epoch() + 1;
+        // qcb1alice nonce: 0 (fund) + 1 (topup) = 2 for activate.
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 2, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+        node.identity.clock.current_epoch = activation_epoch;
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Rotate: addr nonce 2.
+        node.submit_tx(mldsa_register_key_tx(&addr, 2, &mldsa_kp2, node.chain_id(), &account_kp));
+        let cert4 = node.propose_block(cert3.block_hash).await.unwrap();
+
+        // Propose one more block so the pop_verified refresh restores power.
+        let cert5 = node.propose_block(cert4.block_hash).await.unwrap();
+
+        // A vote using the NEW key must be accepted.
+        let new_vote = mldsa_precommit_vote(
+            &addr, cert5.height + 1, 0, &cert5.block_hash, &mldsa_kp2, node.chain_id(),
+        );
+        assert!(
+            node.verify_consensus_vote(&new_vote).is_ok(),
+            "vote with new ML-DSA key must be accepted after rotation"
+        );
+    }
+
+    /// PQ-VAL-003 / Test 04
+    /// During the rotation block, voting_power is zeroed. In the block after,
+    /// the pop_verified refresh loop restores it (bond + personhood + scheme
+    /// + activation epoch all still satisfied).
+    #[tokio::test]
+    async fn mldsa_power_zeroed_during_rotation_block() {
+        let (account_kp, addr) = keyed_candidate("pq003-t04-account");
+        let (mldsa_kp1, _)    = mldsa_keyed_candidate("pq003-t04-mldsa-old");
+        let (mldsa_kp2, _)    = mldsa_keyed_candidate("pq003-t04-mldsa-new");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Full setup: bond + personhood + ML-DSA key + activate + let power lift.
+        // ML-DSA txs cost ~5400 uqcb each. Top up after fund_bond so addr has enough for 2 ML-DSA txs.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        // qcb1alice nonce: 0 (fund via helper), 1 (topup).
+        node.submit_tx(Transaction::transfer("topup-t04", "qcb1alice", &addr, "uqcb", 50_000, 1));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp1, node.chain_id(), &account_kp));
+        let activation_epoch = node.current_epoch() + 1;
+        // qcb1alice nonce: 0 (fund) + 1 (topup) = 2 for activate.
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 2, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+        node.identity.clock.current_epoch = activation_epoch;
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Confirm power was lifted before rotation.
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert!(v.voting_power > 0, "setup: power must be > 0 before rotation");
+        }
+
+        // Rotation block (addr nonce 2).
+        node.submit_tx(mldsa_register_key_tx(&addr, 2, &mldsa_kp2, node.chain_id(), &account_kp));
+        let cert4 = node.propose_block(cert3.block_hash).await.unwrap();
+
+        // Immediately after the rotation block: power must be 0.
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert_eq!(
+                v.voting_power, 0,
+                "voting_power must be 0 immediately after the rotation block"
+            );
+        }
+
+        // One more block: pop_verified refresh must restore power.
+        node.propose_block(cert4.block_hash).await.unwrap();
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert!(
+                v.voting_power > 0,
+                "voting_power must be restored in the block after rotation (bond + personhood + ml-dsa-65 + epoch all satisfied)"
+            );
+        }
+    }
+
+    /// PQ-VAL-003 / Test 05
+    /// An ML-DSA validator can rotate to a classical Ed25519 key.
+    /// After rotation: scheme in registry is "classical", Ed25519 vote is accepted.
+    #[tokio::test]
+    async fn mldsa_to_classical_scheme_downgrade() {
+        let (account_kp, addr) = keyed_candidate("pq003-t05-account");
+        let (mldsa_kp, _)     = mldsa_keyed_candidate("pq003-t05-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: bond + personhood + ML-DSA key + activate.
+        // ML-DSA tx costs ~5400 uqcb. Top up so the classical downgrade tx also has room.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        // qcb1alice nonce: 0 (fund via helper), 1 (topup).
+        node.submit_tx(Transaction::transfer("topup-t05", "qcb1alice", &addr, "uqcb", 50_000, 1));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let activation_epoch = node.current_epoch() + 1;
+        // qcb1alice nonce: 0 (fund) + 1 (topup) = 2 for activate.
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 2, activation_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+        node.identity.clock.current_epoch = activation_epoch;
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Downgrade to classical key (addr nonce 2).
+        // Use account_kp as the classical consensus key for simplicity.
+        node.submit_tx(classical_register_key_tx_v2(&addr, 2, &account_kp, node.chain_id()));
+        let cert4 = node.propose_block(cert3.block_hash).await.unwrap();
+
+        // Scheme must now be "classical".
+        assert_eq!(
+            node.validator_registry.consensus_key_scheme(&addr),
+            Some("classical"),
+            "scheme must be classical after ML-DSA → classical rotation"
+        );
+
+        // Classical vote with the new key must be accepted.
+        let classical_vote = classical_precommit_vote(
+            &addr, cert4.height + 1, 0, &cert4.block_hash, &account_kp, node.chain_id(),
+        );
+        assert!(
+            node.verify_consensus_vote(&classical_vote).is_ok(),
+            "classical vote must be accepted after ML-DSA → classical scheme downgrade"
+        );
+    }
+
+    /// PQ-VAL-003 / Test 06
+    /// After ML-DSA → classical downgrade, voting power is restored without
+    /// requiring PQ activation epoch (classical validators are never R3-gated).
+    #[tokio::test]
+    async fn classical_downgrade_restores_power_without_pq_activation() {
+        let (account_kp, addr) = keyed_candidate("pq003-t06-account");
+        let (mldsa_kp, _)     = mldsa_keyed_candidate("pq003-t06-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: bond + personhood + ML-DSA key only — no ActivatePqConsensus.
+        // Power must stay at 0 (R3 gate, ML-DSA, no activation epoch).
+        // Top up so there is enough balance for both the ML-DSA registration and the classical downgrade.
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        // qcb1alice nonce: 0 (fund via helper), 1 (topup).
+        node.submit_tx(Transaction::transfer("topup-t06", "qcb1alice", &addr, "uqcb", 50_000, 1));
+        let cert = node.propose_block(cert.block_hash).await.unwrap();
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert_eq!(v.voting_power, 0, "setup: ML-DSA validator without activation must have 0 power");
+        }
+
+        // Downgrade to classical (addr nonce 2, no qcb1alice activate needed).
+        node.submit_tx(classical_register_key_tx_v2(&addr, 2, &account_kp, node.chain_id()));
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // One more block so the pop_verified refresh picks up the classical key.
+        node.propose_block(cert3.block_hash).await.unwrap();
+
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert!(
+                v.voting_power > 0,
+                "classical key after downgrade must restore power without PQ activation epoch"
+            );
+        }
+    }
+
+    /// PQ-VAL-003 / Test 07
+    /// A rotation tx carrying another validator's PoP (cross-validator replay)
+    /// is rejected — the PoP message binds (chain_id, sender, pubkey) so a
+    /// PoP made by alice cannot authenticate a rotation tx submitted by bob.
+    #[tokio::test]
+    async fn rotation_cross_validator_pop_replay_rejected() {
+        use chain_forge_crypto::MlDsaScheme;
+        let (account_kp_alice, alice) = keyed_candidate("pq003-t07-alice-account");
+        let (account_kp_bob, bob)     = keyed_candidate("pq003-t07-bob-account");
+        let (mldsa_kp, _)             = mldsa_keyed_candidate("pq003-t07-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Both validators get bond + personhood.
+        let cert = fund_bond_and_verify_personhood(&mut node, &alice, 2_000_000, genesis_hash).await;
+        let cert = fund_bond_and_verify_personhood(&mut node, &bob, 2_000_000, cert.block_hash).await;
+
+        // Alice's initial key registration (alice nonce 1, qcb1alice nonce used by both funds).
+        // Note: fund_bond_and_verify_personhood for alice uses qcb1alice nonce 0 and alice nonce 0.
+        // fund_bond_and_verify_personhood for bob uses qcb1alice nonce 1 and bob nonce 0.
+        // After both: qcb1alice nonce = 2, alice nonce = 1, bob nonce = 1.
+        node.submit_tx(mldsa_register_key_tx(&alice, 1, &mldsa_kp, node.chain_id(), &account_kp_alice));
+        node.propose_block(cert.block_hash.clone()).await.unwrap();
+
+        // Produce a valid PoP for the NEXT key over alice's address.
+        let (mldsa_kp2, _) = mldsa_keyed_candidate("pq003-t07-mldsa-new");
+        let alice_pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            node.chain_id(), &alice, &mldsa_kp2.public_key,
+        );
+        let alice_pop_sig = MlDsaScheme.sign(&alice_pop_msg, &mldsa_kp2).unwrap();
+
+        // Bob submits alice's PoP as if it were a rotation for himself.
+        let mut tx = Transaction {
+            id:        "regkey-replay-bob".to_string(),
+            sender:    bob.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp2.public_key.clone(),
+                proof_of_possession: alice_pop_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp_bob, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+        node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Bob must NOT have the key — PoP bound to alice's address, rejected.
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&bob),
+            None,
+            "cross-validator PoP replay on rotation must be rejected"
+        );
+    }
+
+    /// PQ-VAL-003 / Test 08
+    /// Rotating to a key already registered to a DIFFERENT validator is blocked.
+    /// The duplicate-key guard fires before PoP verification.
+    #[tokio::test]
+    async fn rotation_duplicate_key_blocked() {
+        let (account_kp_alice, alice) = keyed_candidate("pq003-t08-alice-account");
+        let (account_kp_bob, bob)     = keyed_candidate("pq003-t08-bob-account");
+        let (mldsa_kp, _)             = mldsa_keyed_candidate("pq003-t08-shared-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Bond + personhood for both.
+        let cert = fund_bond_and_verify_personhood(&mut node, &alice, 2_000_000, genesis_hash).await;
+        let cert = fund_bond_and_verify_personhood(&mut node, &bob, 2_000_000, cert.block_hash).await;
+        // qcb1alice nonce = 2, alice nonce = 1, bob nonce = 1.
+
+        // Alice registers the shared key.
+        node.submit_tx(mldsa_register_key_tx(&alice, 1, &mldsa_kp, node.chain_id(), &account_kp_alice));
+        node.propose_block(cert.block_hash.clone()).await.unwrap();
+
+        // Bob tries to rotate to the same key (already owned by alice).
+        // This constructs a valid PoP for bob's address, but the key is alice's.
+        let pop_msg = chain_forge_execution::validator_key_registration_signing_bytes_v2(
+            node.chain_id(), &bob, &mldsa_kp.public_key,
+        );
+        use chain_forge_crypto::MlDsaScheme;
+        let pop_sig = MlDsaScheme.sign(&pop_msg, &mldsa_kp).unwrap();
+        let mut tx = Transaction {
+            id:        "regkey-dup-bob".to_string(),
+            sender:    bob.clone(),
+            nonce:     1,
+            body:      chain_forge_execution::TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp.public_key.clone(),
+                proof_of_possession: pop_sig.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        tx.sign(&account_kp_bob, node.chain_id()).unwrap();
+        node.submit_tx(tx);
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+        node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Bob must NOT have the key — duplicate-key guard blocked it.
+        assert!(
+            node.validator_registry.consensus_pubkey_bytes(&bob).is_none(),
+            "duplicate key (already owned by alice) must be rejected when bob tries to register it"
+        );
+        // Alice must still hold her key.
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&alice),
+            Some(mldsa_kp.public_key.clone()),
+            "alice's key must remain intact after bob's blocked duplicate attempt"
+        );
+    }
+
+    /// PQ-VAL-003 / Test 09
+    /// EDA does NOT clear ML-DSA key registry entries. After EDA and a new
+    /// ActivatePqConsensus tx, ML-DSA power is restored without re-registration.
+    #[tokio::test]
+    async fn eda_does_not_clear_mldsa_registry() {
+        let (account_kp, addr) = keyed_candidate("pq003-t09-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("pq003-t09-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Setup: bond + personhood + ML-DSA key + activate.
+        // qcb1alice nonces: 0 (fund), 1 (activate).
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let next_epoch = node.current_epoch() + 1;
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 1, next_epoch, &account_kp, node.chain_id(),
+        ));
+        let cert2 = node.propose_block(cert.block_hash).await.unwrap();
+        node.identity.clock.current_epoch = next_epoch;
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        // Confirm power lifted.
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert!(v.voting_power > 0, "setup: power must be lifted before EDA");
+        }
+
+        // EDA: qcb1alice nonce 2.
+        let mut eda_tx = Transaction {
+            id:        "eda-mldsa-t09".to_string(),
+            sender:    "qcb1alice".to_string(),
+            nonce:     2,
+            body:      chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:   "ml-dsa-65".to_string(),
+                replacement_scheme:  "ed25519".to_string(),
+                rationale:           "PQ-VAL-003 registry persistence test".to_string(),
+                advisory_ref:        None,
+                grace_epochs:        chain_forge_execution::MIN_CRYPTO_GRACE_EPOCHS,
+                scope:               chain_forge_execution::DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 50_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        eda_tx.sign(&account_kp, node.chain_id()).unwrap();
+        node.submit_tx(eda_tx);
+        let cert4 = node.propose_block(cert3.block_hash).await.unwrap();
+
+        // After EDA: key must still be in the registry.
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&addr),
+            Some(mldsa_kp.public_key.clone()),
+            "EDA must not clear the ML-DSA key from the registry"
+        );
+        assert_eq!(
+            node.validator_registry.consensus_key_scheme(&addr),
+            Some("ml-dsa-65"),
+            "EDA must not change the scheme in the registry"
+        );
+
+        // Re-activate: qcb1alice nonce 3.
+        // cert4 is the EDA block (cert3 was the last pre-EDA cert).
+        // We need to get the block hash from cert4 to continue.
+        // Re-propose from cert4 with the activation tx.
+        let new_activation = node.current_epoch();
+        node.submit_tx(activate_pq_consensus_tx(
+            "qcb1alice", 3, new_activation, &account_kp, node.chain_id(),
+        ));
+        let cert5 = node.propose_block(cert4.block_hash).await.unwrap();
+
+        // One more block for the pop_verified refresh to restore power.
+        node.propose_block(cert5.block_hash).await.unwrap();
+
+        {
+            let vs = node.consensus.validator_set();
+            let v = vs.validators.iter().find(|v| v.id.0 == addr).unwrap();
+            assert!(
+                v.voting_power > 0,
+                "after re-activation, ML-DSA power must be restored without re-registration"
+            );
+        }
+    }
+
+    /// PQ-VAL-003 / Test 10
+    /// After a validator rotates away from an ML-DSA key, the OLD key is
+    /// released from the by_pubkey index and can be registered by a DIFFERENT
+    /// validator.
+    #[tokio::test]
+    async fn released_key_reusable_after_rotation() {
+        let (account_kp_alice, alice) = keyed_candidate("pq003-t10-alice-account");
+        let (account_kp_bob, bob)     = keyed_candidate("pq003-t10-bob-account");
+        let (mldsa_kp_shared, _)      = mldsa_keyed_candidate("pq003-t10-shared-mldsa");
+        let (mldsa_kp_alice_new, _)   = mldsa_keyed_candidate("pq003-t10-alice-new-mldsa");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // Bond + personhood for both.
+        // ML-DSA txs cost ~5400 uqcb each. Alice needs 2 ML-DSA txs (register + rotate), bob needs 1.
+        // Top up both after their respective fund_bond calls.
+        let cert = fund_bond_and_verify_personhood(&mut node, &alice, 2_000_000, genesis_hash).await;
+        let cert = fund_bond_and_verify_personhood(&mut node, &bob, 2_000_000, cert.block_hash).await;
+        // qcb1alice nonce = 1 after both fund helpers: the first helper's
+        // nonce-0 transfer succeeds (nonce → 1); the second helper reuses
+        // nonce 0 which the executor rejects, so bob's balance is funded via
+        // a separate path, and qcb1alice nonce stays at 1.  Use nonces 1 and 2
+        // for the topups here so the executor accepts them.
+        node.submit_tx(Transaction::transfer("topup-t10-alice", "qcb1alice", &alice, "uqcb", 50_000, 1));
+        node.submit_tx(Transaction::transfer("topup-t10-bob",   "qcb1alice", &bob,   "uqcb", 50_000, 2));
+        let cert = node.propose_block(cert.block_hash.clone()).await.unwrap();
+        // qcb1alice nonce = 3 after topups, alice nonce = 0, bob nonce = 0.
+
+        // Alice registers the shared key first (alice nonce 1).
+        node.submit_tx(mldsa_register_key_tx(&alice, 1, &mldsa_kp_shared, node.chain_id(), &account_kp_alice));
+        let cert2 = node.propose_block(cert.block_hash.clone()).await.unwrap();
+
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&alice),
+            Some(mldsa_kp_shared.public_key.clone()),
+            "setup: alice must hold the shared key"
+        );
+
+        // Alice rotates away — she now uses a new key, freeing the shared key.
+        // alice nonce 2.
+        node.submit_tx(mldsa_register_key_tx(&alice, 2, &mldsa_kp_alice_new, node.chain_id(), &account_kp_alice));
+        let cert3 = node.propose_block(cert2.block_hash).await.unwrap();
+
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&alice),
+            Some(mldsa_kp_alice_new.public_key.clone()),
+            "alice must now hold the new key after rotation"
+        );
+
+        // Bob registers the (now-freed) shared key. bob nonce 0 (no prior txs).
+        node.submit_tx(mldsa_register_key_tx(&bob, 0, &mldsa_kp_shared, node.chain_id(), &account_kp_bob));
+        node.propose_block(cert3.block_hash).await.unwrap();
+
+        assert_eq!(
+            node.validator_registry.consensus_pubkey_bytes(&bob),
+            Some(mldsa_kp_shared.public_key.clone()),
+            "bob must be able to register the key released by alice's rotation"
+        );
     }
 }

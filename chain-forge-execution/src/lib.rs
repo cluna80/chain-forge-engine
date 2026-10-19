@@ -4120,6 +4120,8 @@ mod tests {
             body:      TxBody::RegisterValidatorKey {
                 consensus_pubkey:    consensus_kp.public_key.clone(),
                 proof_of_possession: pop_sig.bytes,
+                scheme:              String::new(),
+                pop_version:         1,
             },
             gas_limit: 10_000,
             signature: vec![],
@@ -4206,7 +4208,7 @@ mod tests {
         let (exec, mut state, alice) = signed_setup();
         let consensus_kp = key("alice-consensus-key");
         let mut tx = register_key_tx("qcb1alice", 0, &consensus_kp, &consensus_kp, "qcb-testnet-1");
-        tx.body = TxBody::RegisterValidatorKey { consensus_pubkey: vec![], proof_of_possession: vec![1,2,3] };
+        tx.body = TxBody::RegisterValidatorKey { consensus_pubkey: vec![], proof_of_possession: vec![1,2,3], scheme: String::new(), pop_version: 1 };
         tx.sign(&alice, "qcb-testnet-1").unwrap();
 
         let r = exec.execute_tx_with_identity(
@@ -5665,5 +5667,100 @@ mod tests {
             err.contains("was deprecated") || err.contains("deprecated"),
             "cutoff gate must fire despite require_signatures=false; got: {err}",
         );
+    }
+
+    /// PQ-VAL-003 diagnostic: confirm the executor accepts a second
+    /// RegisterValidatorKey tx (rotation) from the same sender.
+    #[test]
+    fn mldsa_key_rotation_executor_accepts_second_registration() {
+        use chain_forge_crypto::{ClassicalScheme, MlDsaScheme};
+        use chain_forge_identity::IdentityStore;
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let exec = Executor::new(config.clone());
+        let mut identity = IdentityStore::new(0);
+        let mut agents   = chain_forge_agents::AgentStore::default();
+
+        // Fund + bond the test validator via executor.
+        let account_kp = ClassicalScheme.generate_keypair("pq003-exec-diag").unwrap();
+        let addr = chain_forge_core::Address::from_public_key(
+            &account_kp.public_key, "qcb", HashWidth::Bits256,
+        ).to_string();
+
+        // Fund from alice (nonce 0) — alice genesis balance ~5M; fund 4M to stay under
+        let fund_tx = Transaction::transfer("fund-diag", "qcb1alice", &addr, "uqcb", 4_000_000, 0);
+        let r = exec.execute_tx_with_identity(&fund_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "fund: {:?}", r.error);
+
+        // Bond (addr nonce 0)
+        let bond_tx = Transaction::bond_validator("bond-diag", &addr, 2_000_000, 0);
+        let r = exec.execute_tx_with_identity(&bond_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "bond: {:?}", r.error);
+
+        // Grant personhood in identity store
+        let epoch = identity.clock.current_epoch;
+        let att = chain_forge_identity::PopAttestation::genesis(&addr, epoch);
+        let _ = identity.register(addr.clone(), addr.clone(), att.clone());
+        identity.verify_identity(&addr, att, None).unwrap();
+
+        // First ML-DSA key registration (addr nonce 1)
+        let mldsa_kp1 = MlDsaScheme.generate_keypair("pq003-exec-mldsa1").unwrap();
+        let pop_msg1 = validator_key_registration_signing_bytes_v2(
+            &config.chain_id, &addr, &mldsa_kp1.public_key,
+        );
+        let pop_sig1 = MlDsaScheme.sign(&pop_msg1, &mldsa_kp1).unwrap();
+        let mut reg1 = Transaction {
+            id:        "regkey1-diag".to_string(),
+            sender:    addr.clone(),
+            nonce:     1,
+            body:      TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp1.public_key.clone(),
+                proof_of_possession: pop_sig1.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        reg1.sign(&account_kp, &config.chain_id).unwrap();
+
+        let r1 = exec.execute_tx_with_identity(&reg1, &mut state, &mut identity, &mut agents);
+        assert!(r1.success, "first registration must succeed: {:?}", r1.error);
+
+        // Second ML-DSA key registration / rotation (addr nonce 2)
+        let mldsa_kp2 = MlDsaScheme.generate_keypair("pq003-exec-mldsa2").unwrap();
+        let pop_msg2 = validator_key_registration_signing_bytes_v2(
+            &config.chain_id, &addr, &mldsa_kp2.public_key,
+        );
+        let pop_sig2 = MlDsaScheme.sign(&pop_msg2, &mldsa_kp2).unwrap();
+        let mut reg2 = Transaction {
+            id:        "regkey2-diag".to_string(),
+            sender:    addr.clone(),
+            nonce:     2,
+            body:      TxBody::RegisterValidatorKey {
+                consensus_pubkey:    mldsa_kp2.public_key.clone(),
+                proof_of_possession: pop_sig2.bytes,
+                scheme:              "ml-dsa-65".to_string(),
+                pop_version:         2,
+            },
+            gas_limit: 20_000,
+            signature: vec![],
+            public_key: vec![],
+            pq_signatures: vec![],
+            sig_scheme:    None,
+            pq_public_key: vec![],
+        };
+        reg2.sign(&account_kp, &config.chain_id).unwrap();
+
+        let r2 = exec.execute_tx_with_identity(&reg2, &mut state, &mut identity, &mut agents);
+        assert!(r2.success,
+            "rotation (second RegisterValidatorKey) must be accepted by executor: {:?}", r2.error);
     }
 }
