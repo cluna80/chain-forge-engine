@@ -96,6 +96,9 @@ pub enum IdentityError {
     #[error("attester {0} has already reported identity {1} as a suspected sybil")]
     AlreadyReported(String, String),
 
+    #[error("epoch registration cap exceeded: at most {1} identities may register in epoch {0}")]
+    EpochCapExceeded(u64, u32),
+
     #[error("internal identity error: {0}")]
     Internal(String),
 }
@@ -871,6 +874,16 @@ impl EpochClock {
     }
 }
 
+// -- Epoch registration cap ---------------------------------------------------
+
+/// Maximum number of new identities that may be registered within a single
+/// epoch.  Invariant INV-8 / attack surface S2.
+///
+/// Rationale (Whitepaper Section 4.5): Sybil resistance requires that an
+/// attacker cannot flood the registry in a single epoch.  Ten is a
+/// conservative pilot-phase value; governance may raise it post-pilot.
+pub const EPOCH_REG_CAP: u32 = 10;
+
 // -- Identity store -----------------------------------------------------------
 
 /// The canonical registry of all identity records on QCB.
@@ -942,6 +955,18 @@ pub struct IdentityStore {
     /// are consumed into the confirmation log's `PenaltyRecord.self_reported` fields.
     /// Entries are also preserved if the coordinator reverses and re-confirms.
     pub(crate) pending_sybil_reports: HashMap<String, Vec<SybilReport>>,
+    /// INV-8: Per-epoch registration counter.
+    ///
+    /// Key: epoch number.  Value: count of successful RegisterIdentity
+    /// executions in that epoch.  Enforced atomically with insertion:
+    /// `register()` checks this counter and returns `EpochCapExceeded` if
+    /// it is at or above `EPOCH_REG_CAP` before inserting.
+    ///
+    /// Failed registrations (AlreadyExists, invalid proof, cap exceeded)
+    /// do NOT increment the counter, satisfying the invariant that only
+    /// successful registrations consume quota.
+    #[serde(default)]
+    epoch_reg_count: HashMap<u64, u32>,
 }
 
 impl IdentityStore {
@@ -954,6 +979,7 @@ impl IdentityStore {
             coordinator_id: None,
             sybil_confirmations: HashMap::new(),
             pending_sybil_reports: HashMap::new(),
+            epoch_reg_count: HashMap::new(),
         }
     }
 
@@ -967,6 +993,7 @@ impl IdentityStore {
             coordinator_id: None,
             sybil_confirmations: HashMap::new(),
             pending_sybil_reports: HashMap::new(),
+            epoch_reg_count: HashMap::new(),
         }
     }
 
@@ -982,13 +1009,22 @@ impl IdentityStore {
         if self.records.contains_key(&id) {
             return Err(IdentityError::AlreadyExists(id));
         }
+        // INV-8: Enforce per-epoch registration cap before any state changes.
+        // Failed registrations (AlreadyExists, proof error, cap exceeded) must
+        // NOT consume quota — the counter is only incremented on success below.
+        let epoch = self.clock.current_epoch;
+        let count = self.epoch_reg_count.get(&epoch).copied().unwrap_or(0);
+        if count >= EPOCH_REG_CAP {
+            return Err(IdentityError::EpochCapExceeded(epoch, EPOCH_REG_CAP));
+        }
         // Registration creates a Provisional identity; no ZK proof is
         // required at registration time (structural checks only).
         attestation.verify(None)?;
-        let epoch = self.clock.current_epoch;
         let record = IdentityRecord::new(id.clone(), address.clone(), attestation, epoch);
         self.by_address.insert(address, id.clone());
         self.records.insert(id, record);
+        // Increment quota only after all checks pass (atomic with insertion).
+        *self.epoch_reg_count.entry(epoch).or_insert(0) += 1;
         Ok(())
     }
 
