@@ -189,7 +189,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
 | ZK-VRC prototype (`chain-forge-personhood`) | ✅ | Groth16 / BLS12-381; 5 binaries; integrated into workspace |
 | `governance_authority.rs` — uses real `ValidatorSet` | ✅ | Quorum tied to `quorum_power()` / `revocation_quorum_power()` |
 | `/api/identity/{address}` REST endpoint | ✅ | Returns verification tier + CS score |
-| Personhood-weighting overlay on BFT | ⬜ | Overlay not yet built; consensus base ready |
+| Personhood-weighting overlay on BFT | ✅ | PH-OVL-001 merged (PR #6) — per-block refresh clamps power through `power_cap`; 132/132 tests |
 | Identity pilot — real-world sybil test | 🔲 | Requires Phase 1 (personhood-weighted BFT) complete |
 | Coordinator role decentralized | 🔲 | Currently a named temporary centralization (see `QCB-Attestation-Guard-Design.md §Coordinator`) |
 
@@ -829,7 +829,7 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 
 ### Phase 1 prep (after Phase 0 acceptance test passes)
 
-11. **Personhood-weighting overlay** — per-human validator influence cap on `TendermintEngine`, using `ValidatorInfo.pop_verified` already in the registry.
+11. **Personhood-weighting overlay** ✅ — per-human validator influence cap applied in the per-block `pop_verified` refresh loop on both `commit_block` and `propose_block` paths (`node.rs`). PH-OVL-001 merged to main (PR #6, commit `ccc8239`). All three BFT engines (Tendermint, HotStuff, FBA) already had the cap at `update_validator_set`/`init`; the refresh loop gap is now closed. 132/132 node tests, 67/67 consensus tests.
 
 12. **AI red-team Agent 1 (Phase A–D attestation guard bypass)** — strategy-search agent for adversarial attestation guard bypass attempts. Backlogged from prior session.
 
