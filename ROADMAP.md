@@ -433,6 +433,7 @@ User opens Qattice app → QR challenge displayed
 | B-Android-3 — Vendor server | Rust HTTP server issues challenges and verifies DIS proofs; full phone-to-server auth | ✅ Complete (2026-10-20) |
 | B-Android-4 — GitHub Actions APK builder | Auto-builds and publishes APK on every push to dis-wallet-android/ or dis-core/ | ✅ Complete (2026-10-20) |
 | B-Android-5 — Licensing | Apache 2.0 for dis-core; BSL 1.1 for Android SDK and vendor server; commercial licensing info | ✅ Complete (2026-10-20) |
+| B-Security — DIS-SEC-002 | Authenticated enrollment, protected sessions, vendor identity isolation, authorization hardening | ✅ Complete (2026-10-21) |
 | B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to Qattice wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
