@@ -119,6 +119,52 @@
             android:visibility="gone"
             android:layout_marginBottom="16dp"/>
 
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="VENDOR SERVER"
+            android:textColor="#58A6FF"
+            android:textSize="12sp"
+            android:letterSpacing="0.1"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="12dp"/>
+
+        <EditText
+            android:id="@+id/etServerUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Server URL"
+            android:text="https://sturdy-meme-575gpgxgwrj34vwr-3000.app.github.dev"
+            android:textColor="#E6EDF3"
+            android:textColorHint="#484F58"
+            android:background="@drawable/input_background"
+            android:padding="16dp"
+            android:layout_marginBottom="8dp"
+            android:inputType="textUri"/>
+
+        <EditText
+            android:id="@+id/etResourceId"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Resource ID (e.g. document:001)"
+            android:text="document:001"
+            android:textColor="#E6EDF3"
+            android:textColorHint="#484F58"
+            android:background="@drawable/input_background"
+            android:padding="16dp"
+            android:layout_marginBottom="8dp"
+            android:inputType="text"/>
+
+        <Button
+            android:id="@+id/btnServerAuth"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="🌐 Authenticate with Server"
+            android:backgroundTint="#B08800"
+            android:textColor="#FFFFFF"
+            android:layout_marginBottom="8dp"/>
+
         <TextView
             android:id="@+id/tvResult"
             android:layout_width="match_parent"

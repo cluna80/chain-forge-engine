@@ -80,6 +80,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        binding.btnServerAuth.setOnClickListener {
+            val serverUrl = binding.etServerUrl.text.toString().trim()
+            val vendorId = binding.etVendorId.text.toString().trim()
+            val resourceId = binding.etResourceId.text.toString().trim()
+            lifecycleScope.launch {
+                binding.progressBar.visibility = View.VISIBLE
+                binding.tvStatus.text = "Authenticating with server..."
+                val result = viewModel.serverAuth(serverUrl, vendorId, resourceId, "read")
+                binding.progressBar.visibility = View.GONE
+                binding.tvResult.text = result
+                binding.tvStatus.text = if (result.startsWith("✅")) "✅ Verified!" else "❌ Failed"
+            }
+        }
+
         binding.btnCopy.setOnClickListener {
             val text = binding.tvResult.text.toString()
             if (text.isNotEmpty()) {
