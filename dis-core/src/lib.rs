@@ -59,11 +59,15 @@ fn field(out: &mut Vec<u8>, value: &str) -> Result<(), Error> {
 /// The wallet MUST authenticate rp_origin independently; a string in a QR
 /// challenge is never sufficient to establish origin identity.
 pub fn canonical_request(r: &Request) -> Result<Vec<u8>, Error> {
-    if r.suite_id != SUITE_ML_DSA_65 { return Err(Error::UnsupportedSuite); }
+    if r.suite_id != SUITE_ML_DSA_65 {
+        return Err(Error::UnsupportedSuite);
+    }
     if r.expires_at <= r.issued_at || r.expires_at - r.issued_at > MAX_TTL {
         return Err(Error::InvalidTime);
     }
-    if r.scopes.len() > 64 { return Err(Error::InvalidField); }
+    if r.scopes.len() > 64 {
+        return Err(Error::InvalidField);
+    }
     if r.scopes.windows(2).any(|p| p[0] >= p[1]) {
         return Err(Error::NonCanonicalScopes);
     }
@@ -79,9 +83,14 @@ pub fn canonical_request(r: &Request) -> Result<Vec<u8>, Error> {
     field(&mut out, &r.resource_id)?;
     field(&mut out, &r.action)?;
     out.extend_from_slice(&(r.scopes.len() as u16).to_be_bytes());
-    for scope in &r.scopes { field(&mut out, scope)?; }
+    for scope in &r.scopes {
+        field(&mut out, scope)?;
+    }
     match r.operation_digest {
-        Some(d) => { out.push(1); out.extend_from_slice(&d); }
+        Some(d) => {
+            out.push(1);
+            out.extend_from_slice(&d);
+        }
         None => out.push(0),
     }
     field(&mut out, &r.policy_id)?;
@@ -102,8 +111,10 @@ mod tests {
             suite_id: SUITE_ML_DSA_65,
             rp_id: "vendor-a".into(),
             rp_origin: "https://vendor-a.example".into(),
-            challenge_id: [1; 16], nonce: [2; 16],
-            issued_at: 1000, expires_at: 1060,
+            challenge_id: [1; 16],
+            nonce: [2; 16],
+            issued_at: 1000,
+            expires_at: 1060,
             resource_id: "document:123".into(),
             action: "read".into(),
             scopes: vec!["document:read".into()],
@@ -114,7 +125,10 @@ mod tests {
     #[test]
     fn deterministic_and_domain_separated() {
         let r = example();
-        assert_eq!(canonical_request(&r).unwrap(), canonical_request(&r).unwrap());
+        assert_eq!(
+            canonical_request(&r).unwrap(),
+            canonical_request(&r).unwrap()
+        );
         assert!(canonical_request(&r).unwrap().starts_with(DOMAIN));
     }
     #[test]
