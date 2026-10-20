@@ -6,6 +6,7 @@
 //! Existing Qattice DIS-AUTH-V1 is intentionally unchanged.
 
 pub mod verifier;
+pub mod wallet;
 
 use sha2::{Digest, Sha256};
 
