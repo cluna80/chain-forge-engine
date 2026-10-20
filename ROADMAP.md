@@ -431,6 +431,8 @@ User opens Qattice app → QR challenge displayed
 | B-Android — DIS Android wallet (Galaxy A15) | Rust DIS Core cross-compiled to ARM64 via JNI; Kotlin wallet app; ML-DSA-65 signing on real device; QR scan-to-sign | ✅ Complete (2026-10-20) |
 | B-Android-2 — Persistent key storage | Android Keystore-backed key persistence; keys survive app restarts | ✅ Complete (2026-10-20) |
 | B-Android-3 — Vendor server | Rust HTTP server issues challenges and verifies DIS proofs; full phone-to-server auth | ✅ Complete (2026-10-20) |
+| B-Android-4 — GitHub Actions APK builder | Auto-builds and publishes APK on every push to dis-wallet-android/ or dis-core/ | ✅ Complete (2026-10-20) |
+| B-Android-5 — Licensing | Apache 2.0 for dis-core; BSL 1.1 for Android SDK and vendor server; commercial licensing info | ✅ Complete (2026-10-20) |
 | B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to Qattice wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
