@@ -6,7 +6,6 @@ on:
     paths:
       - 'dis-wallet-android/**'
       - 'dis-core/**'
-      - 'dis-vendor-server/**'
   workflow_dispatch:
 
 jobs:
@@ -31,42 +30,35 @@ jobs:
             ~/.cargo/git
             target/
           key: ${{ runner.os }}-cargo-apk-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-apk-
+          restore-keys: ${{ runner.os }}-cargo-apk-
 
-      - name: Install Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-      - name: Install Android NDK
+      - name: Install NDK
         run: |
-          sdkmanager "ndk;26.1.10909125"
+          echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" "platforms;android-34" "build-tools;34.0.0"
           echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
 
       - name: Configure Rust Android linker
         run: |
+          NDK_BIN=$ANDROID_SDK_ROOT/ndk/26.1.10909125/toolchains/llvm/prebuilt/linux-x86_64/bin
           mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'CARGO'
+          cat >> ~/.cargo/config.toml << CARGO
           [target.aarch64-linux-android]
-          linker = "${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
-          ar = "${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          linker = "$NDK_BIN/aarch64-linux-android34-clang"
+          ar = "$NDK_BIN/llvm-ar"
           CARGO
-
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'microsoft'
+          # Symlink for cc-rs
+          ln -sf $NDK_BIN/aarch64-linux-android34-clang $NDK_BIN/aarch64-linux-android-clang
 
       - name: Build Rust JNI for Android ARM64
         run: |
-          export ANDROID_NDK_HOME=${{ env.ANDROID_NDK_HOME }}
-          export PATH=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
-          
-          # Create symlink for cc-rs
-          ln -sf $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
-                 $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-clang
-          
+          export PATH=$ANDROID_SDK_ROOT/ndk/26.1.10909125/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           cargo build -p dis-wallet-jni --target aarch64-linux-android --release
 
       - name: Copy .so to Android project
@@ -81,16 +73,9 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: dis-wallet-debug-${{ github.sha }}
-          path: dis-wallet-android/app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
-
-      - name: Upload APK to release (on main push)
-        uses: actions/upload-artifact@v4
-        with:
-          name: dis-wallet-latest
+          name: dis-wallet-debug
           path: dis-wallet-android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 90
