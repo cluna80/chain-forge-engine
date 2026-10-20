@@ -429,7 +429,7 @@ User opens Qattice app → QR challenge displayed
 | B — Security hardening (DIS-001 Phase B) | Chain-ID binding in ML-DSA sigs, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality | ✅ Complete |
 | B-Live — DIS-001-13 live authentication acceptance test | End-to-end proof of key-binding, scope-authorization, freeze semantics, and restart reconstruction on real 4-node devnet | ✅ Complete (2026-10-19) |
 | B-Android — DIS Android wallet (Galaxy A15) | Rust DIS Core cross-compiled to ARM64 via JNI; Kotlin wallet app; ML-DSA-65 signing on real device; QR scan-to-sign | ✅ Complete (2026-10-20) |
-| B-Android-2 — Persistent key storage | Android Keystore-backed key persistence; keys survive app restarts | 🔧 In progress |
+| B-Android-2 — Persistent key storage | Android Keystore-backed key persistence; keys survive app restarts | ✅ Complete (2026-10-20) |
 | B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to Qattice wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |

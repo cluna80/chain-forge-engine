@@ -31,6 +31,10 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
         viewModel = ViewModelProvider(this)[WalletViewModel::class.java]
 
+        lifecycleScope.launch {
+            val restored = viewModel.restoreKeys()
+            if (restored.isNotEmpty()) binding.tvStatus.text = restored
+        }
         binding.etVendorId.setText("docs")
         binding.etVendorOrigin.setText("https://docs.example.com")
 

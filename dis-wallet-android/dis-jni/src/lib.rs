@@ -164,3 +164,55 @@ pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_listVendors(
     }
     arr.into_raw()
 }
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
+        .collect()
+}
+
+
+#[no_mangle]
+pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_exportKey(
+    mut env: JNIEnv,
+    _class: JClass,
+    vendor_id: JString,
+) -> jstring {
+    let id = get_string(&mut env, &vendor_id);
+    let w = wallet().lock().unwrap();
+    match w.get(&id) {
+        Some(k) => to_jstring(&mut env, &format!("{}:{}", hex_encode(&k.pk), hex_encode(&k.sk))),
+        None => to_jstring(&mut env, "ERROR: vendor not found"),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_importKey(
+    mut env: JNIEnv,
+    _class: JClass,
+    vendor_id: JString,
+    vendor_origin: JString,
+    policy_id: JString,
+    pk_hex: JString,
+    sk_hex: JString,
+) -> jstring {
+    let id = get_string(&mut env, &vendor_id);
+    let origin = get_string(&mut env, &vendor_origin);
+    let policy = get_string(&mut env, &policy_id);
+    let pk = get_string(&mut env, &pk_hex);
+    let sk = get_string(&mut env, &sk_hex);
+
+    let pk_bytes = match hex_decode(&pk) {
+        Some(b) => b,
+        None => return to_jstring(&mut env, "ERROR: invalid pk hex"),
+    };
+    let sk_bytes = match hex_decode(&sk) {
+        Some(b) => b,
+        None => return to_jstring(&mut env, "ERROR: invalid sk hex"),
+    };
+
+    let mut w = wallet().lock().unwrap();
+    w.insert(id, WalletKey { origin, policy, pk: pk_bytes, sk: sk_bytes });
+    to_jstring(&mut env, "OK")
+}
