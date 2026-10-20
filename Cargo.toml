@@ -28,6 +28,7 @@ members = [
     "chain-forge-keygen",
     "chain-forge-seed",
     "chain-forge-wallet",
+    "dis-core",
     "chain-forge-analyzer",
 ]
 
