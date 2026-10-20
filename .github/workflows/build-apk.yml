@@ -1,4 +1,5 @@
 name: Build DIS Wallet APK
+# v2 - no setup-android
 
 on:
   push:
