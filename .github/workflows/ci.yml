@@ -1,0 +1,50 @@
+name: DIS Core CI
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build & Test DIS Core
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --package dis-core -- --check
+
+      - name: Run Clippy (lint)
+        run: cargo clippy -p dis-core -- -D warnings
+
+      - name: Build DIS Core
+        run: cargo build -p dis-core --verbose
+
+      - name: Run DIS Core tests
+        run: cargo test -p dis-core --verbose
+
+      - name: Run DIS Core tests (release mode)
+        run: cargo test -p dis-core --release
