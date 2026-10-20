@@ -18,6 +18,34 @@
 ### The name is Qattice, changed from QCB but still uses $QCB as the token to the ecosystem.
 
 
+## DIS Standalone Product — Keystone Identity and Authorization (Planned)
+
+**Status:** 🔲 Research/design; no standalone DIS release or independent security audit claimed. **Scope:** Vendor-independent Digital Identity Stone (DIS) protocol; Qattice Android wallet is the first reference client, not a required dependency.
+
+**Product thesis:** One holder-controlled cryptographic identity can access multiple independent systems, each with its own issuer trust, resources, policies, and permissions. Authentication alone never grants access. DIS is not equivalent to QPC: QPC is an optional verified-human credential; DIS must also support organization, machine, and delegated agent identities without claiming personhood.
+
+**Security invariants:** No cross-vendor permission leakage; no universal access token; audience/resource/action/nonce/expiry binding; replay and confused-deputy resistance; local private-key custody; least-privilege delegated authorization; vendor-controlled revocation; privacy-preserving vendor-specific identifiers; secure recovery without resurrecting compromised keys; cryptographic agility with explicit algorithm migration; offline/local verification where practical. ML-DSA authentication alone does not make every credential, proof, transport, or recovery flow post-quantum secure.
+
+| Milestone | Status | Deliverable / acceptance criteria |
+|---|---|---|
+| **DIS-KS-001 — Competitive Security and Interoperability Specification** | 🔲 | Threat model and normative protocol spec; compare and document compatibility with OAuth 2.0/OIDC, FIDO2/passkeys, W3C Verifiable Credentials/DIDs, OpenID4VP, and capability authorization. Identify reused standards vs genuinely new DIS mechanisms; document issuer trust, privacy, and failure assumptions. |
+| **DIS-CORE-001 — Standalone Rust core** | 🔲 | Extract DIS identity, authentication, credential and authorization verification from Qattice-specific code; versioned wire formats and domain separation; no Qattice node, QCB token, or centralized DIS service required for core verification. |
+| **DIS-KS-002 — Keystone Continuity and Cross-Vendor Authorization** | 🔲 | One DIS wallet connects to **three independent test services** with distinct permissions; vendor-specific identifiers and scoped credentials; cross-service substitution and replay rejected; each service enforces its own policy and revocation; key rotation/recovery retains authorized relationships while invalidating old keys. |
+| **DIS-PQ-001 — End-to-end PQ security and migration** | 🔲 | ML-DSA-based challenge authentication and credential signatures where appropriate; inventory every classical dependency (including ZK, key agreement, recovery and transport); algorithm identifiers, downgrade resistance, key rollover, and migration test vectors; independent cryptographic review. |
+| **DIS-PRIV-001 — Unlinkable presentation and minimal disclosure** | 🔲 | Demonstrate no shared public correlator across unrelated vendors; verifier-specific identifiers or reviewed unlinkable proofs; disclosure policy and metadata-leakage analysis. Claims must match actual cryptographic properties. |
+| **DIS-AGENT-001 — Delegated agent/machine authorization** | 🔲 | Scoped, expiring, revocable capabilities with per-action and optional spending limits; delegation-chain validation; human approval for designated high-risk actions; machine/agent credentials never imply human uniqueness. |
+| **DIS-SDK-001 — Vendor SDKs and Android reference wallet** | 🔲 | Rust SDK and Android client with local key custody; documented server integration and sample applications; subsequent iOS/web bindings; reproducible builds and cross-platform conformance vectors. |
+| **DIS-SEC-001 — Assurance and adversarial validation** | 🔲 | Negative tests for forged credentials, replay, wrong audience, permission escalation, issuer compromise, stale revocation, stolen-device recovery, key substitution, rollback and downgrade; independent audit and remediation before production claims. |
+| **DIS-COM-001 — Commercialization readiness** | 🔲 | Licensing/open-core decision, vendor deployment model, support and hosted-service offerings, trademark/prior-art/IP review, developer documentation and pilot customers; pricing and novelty remain unvalidated. |
+
+**First demonstration (DIS-KS-002):** Install a DIS-enabled Qattice Android devnet wallet; connect to three separately operated mock vendors; assign different rights; authenticate with locally held ML-DSA keys; revoke one vendor without impacting the others; rotate/recover the key while preserving authorized continuity; reject old-key signatures, cross-vendor credential reuse, and replay. Measure integration time, latency, privacy leakage, and revocation propagation against reference standards.
+
+**Dependencies / gates:** Define precise security claims and trust boundaries before implementation. DIS identity binding does **not** prove one-human-one-credential; QPC uniqueness remains a separate research/pilot gate. Do not claim production readiness, novelty, post-quantum end-to-end security, or interoperability until demonstrated and independently assessed.
+
+---
+
+
+
 ## Planned Feature — FeeSponsor (Native Transaction Fee Sponsorship)
 
 **Status:** 🔄 In progress on branch `fs-01-feesponsor` (FS-01 + FS-02 landed; not yet merged to `main`, not yet wired into live execution). **Placement:** After core deterministic transaction-fee accounting and before broad application onboarding.
