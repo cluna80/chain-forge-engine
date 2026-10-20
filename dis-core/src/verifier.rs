@@ -53,7 +53,16 @@ pub struct RelyingParty {
 impl RelyingParty {
     pub fn new(policy: RpPolicy) -> Self { Self { policy, pending: HashMap::new(), enrolled_keys: HashSet::new() } }
 
-    /// Local demo enrollment. Production enrollment MUST authenticate the holder\n    /// through an RP-approved bootstrap/credential process; never accept arbitrary\n    /// keys from an unauthenticated public endpoint. Each RP stores its own keys.\n    pub fn enroll_test_key(&mut self, public_key: &[u8]) -> Result<(), VerifyError> {\n        dilithium3::PublicKey::from_bytes(public_key).map_err(|_| VerifyError::Signature)?;\n        self.enrolled_keys.insert(Sha256::digest(public_key).into());\n        Ok(())\n    }\n\n    /// The RP must obtain fresh challenge_id AND nonce from a CSPRNG.
+    /// Local demo enrollment. Production enrollment MUST authenticate the holder
+    /// through an RP-approved bootstrap/credential process; never accept arbitrary
+    /// keys from an unauthenticated public endpoint. Each RP stores its own keys.
+    pub fn enroll_test_key(&mut self, public_key: &[u8]) -> Result<(), VerifyError> {
+        dilithium3::PublicKey::from_bytes(public_key).map_err(|_| VerifyError::Signature)?;
+        self.enrolled_keys.insert(Sha256::digest(public_key).into());
+        Ok(())
+    }
+
+    /// The RP must obtain fresh challenge_id AND nonce from a CSPRNG.
     /// Only register requests issued by this RP, never wallet-supplied requests.
     pub fn issue(&mut self, mut request: Request) -> Result<Request, VerifyError> {
         self.check_audience(&request)?;
@@ -85,6 +94,9 @@ impl RelyingParty {
         let sig = dilithium3::DetachedSignature::from_bytes(&proof.signature).map_err(|_| VerifyError::Signature)?;
         dilithium3::verify_detached_signature(&sig, &transcript, &pk).map_err(|_| VerifyError::Signature)?;
         self.pending.remove(&request.challenge_id);
+        if !self.enrolled_keys.contains(&Sha256::digest(&proof.public_key).into()) {
+            return Err(VerifyError::Unauthorized);
+        }
         if request.scopes.is_empty() || request.scopes.iter().any(|scope| {
             !self.policy.grants.contains(&(request.resource_id.clone(), request.action.clone(), scope.clone()))
         }) { return Err(VerifyError::Unauthorized); }
@@ -124,7 +136,6 @@ mod tests {
     }
     #[test]
     fn three_independent_vendors_and_replay() {
-        let (pk, sk) = dilithium3::keypair();
         let mut a = rp("game", "game:1", "play", "game:play");
         let mut b = rp("docs", "doc:1", "read", "document:read");
         let mut c = rp("payments", "payment:1", "submit", "payment:submit");
@@ -133,6 +144,8 @@ mod tests {
             (&mut b, request("docs","doc:1","read","document:read")),
             (&mut c, request("payments","payment:1","submit","payment:submit"))
         ] {
+            let (pk, sk) = dilithium3::keypair();
+            rp.enroll_test_key(pk.as_bytes()).unwrap();
             let issued = rp.issue(req).unwrap();
             let proof = sign_for_test(&issued, sk.as_bytes(), pk.as_bytes()).unwrap();
             assert_eq!(rp.verify(&issued, &proof, 1010), Ok(()));
@@ -144,7 +157,8 @@ mod tests {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp("game","game:1","play","game:play");
         let mut b = rp("docs","doc:1","read","document:read");
-        a.enroll_test_key(pk.as_bytes()).unwrap();\n        let req = a.issue(request("game","game:1","play","game:play")).unwrap();
+        a.enroll_test_key(pk.as_bytes()).unwrap();
+        let req = a.issue(request("game","game:1","play","game:play")).unwrap();
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
         assert_eq!(b.verify(&req,&proof,1010),Err(VerifyError::Audience));
         let mut tampered = req.clone();
@@ -153,10 +167,20 @@ mod tests {
         assert_eq!(a.verify(&req,&proof,1010),Ok(()));
     }
     #[test]
+    fn unregistered_key_is_denied() {
+        let (pk, sk) = dilithium3::keypair();
+        let mut a = rp("docs","doc:1","read","document:read");
+        let req = a.issue(request("docs","doc:1","read","document:read")).unwrap();
+        let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
+        assert_eq!(a.verify(&req,&proof,1010),Err(VerifyError::Unauthorized));
+        assert_eq!(a.verify(&req,&proof,1010),Err(VerifyError::Replay));
+    }
+    #[test]
     fn signature_expiry_and_policy_denial() {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp("docs","doc:1","read","document:read");
-        a.enroll_test_key(pk.as_bytes()).unwrap();\n        let req = a.issue(request("docs","doc:1","delete","document:read")).unwrap();
+        a.enroll_test_key(pk.as_bytes()).unwrap();
+        let req = a.issue(request("docs","doc:1","delete","document:read")).unwrap();
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
         assert_eq!(a.verify(&req,&proof,1060),Err(VerifyError::Time));
         let mut forged = proof.clone();
