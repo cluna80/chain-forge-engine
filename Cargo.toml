@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "dis-wallet-android/dis-jni",
     "chain-forge-sim",
     "chain-forge-service",
     "chain-forge-core",

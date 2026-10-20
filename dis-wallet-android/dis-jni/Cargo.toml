@@ -1,0 +1,16 @@
+[package]
+name = "dis-wallet-jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dis_wallet"
+crate-type = ["cdylib"]
+
+[dependencies]
+dis-core = { path = "../../dis-core" }
+jni = { version = "0.21", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits = "0.3"

@@ -1,0 +1,16 @@
+R_DEF: Internal format may change without notice
+local
+drawable input_background
+id btnCopy
+id btnProvision
+id btnSign
+id btnTest
+id etChallenge
+id etVendorId
+id etVendorOrigin
+id progressBar
+id tvResult
+id tvStatus
+layout activity_main
+string app_name
+style Theme.DISWallet
