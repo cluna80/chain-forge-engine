@@ -1,25 +1,34 @@
 use axum::{
     extract::State,
-    http::{HeaderValue, Method},
+    http::{HeaderValue, Method, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
 };
+use axum_extra::{
+    headers::{Authorization, authorization::Bearer},
+    TypedHeader,
+};
 use dis_core::{
     canonical_request,
-    verifier::{RelyingParty, RpPolicy, VerifyError},
+    verifier::{HolderProof, RelyingParty, RpPolicy, VerifyError},
     Request, SUITE_ML_DSA_65,
 };
 use pqcrypto_dilithium::dilithium3;
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
-// ── State ────────────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const SESSIONS_API_KEY: &str = "dis-sessions-key-change-in-production";
+
+// ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
@@ -27,41 +36,63 @@ struct AppState {
 }
 
 struct VendorState {
-    rps: HashMap<String, RelyingParty>,      // wallet_id -> RP
-    enrolled_keys: HashMap<String, Vec<u8>>, // wallet_id -> public_key
+    rps: HashMap<String, RelyingParty>,
+    enrolled_keys: HashMap<String, Vec<u8>>,
+    enroll_nonces: HashMap<String, String>, // wallet_id -> nonce
     verified_sessions: Vec<VerifiedSession>,
+    vendor_registry: HashMap<String, VendorRegistration>,
 }
 
 #[derive(Clone, Serialize)]
 struct VerifiedSession {
     wallet_id: String,
+    vendor_id: String,
     resource_id: String,
     action: String,
     verified_at: String,
 }
 
-// ── Request / Response types ─────────────────────────────────────────────────
+#[derive(Clone, Serialize, Deserialize)]
+struct VendorRegistration {
+    vendor_id: String,
+    rp_origin: String,
+    allowed_resources: Vec<String>,
+    allowed_actions: Vec<String>,
+    api_key_hash: String, // SHA256 of vendor API key
+}
+
+// ── Request/Response types ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RegisterVendorRequest {
+    vendor_id: String,
+    rp_origin: String,
+    allowed_resources: Vec<String>,
+    allowed_actions: Vec<String>,
+    api_key: String,
+}
+
+#[derive(Deserialize)]
+struct EnrollChallengeRequest {
+    wallet_id: String,
+}
 
 #[derive(Deserialize)]
 struct EnrollRequest {
     wallet_id: String,
     public_key_hex: String,
-}
-
-#[derive(Serialize)]
-struct EnrollResponse {
-    status: String,
-    wallet_id: String,
+    nonce_signature_hex: String, // proves ownership of the key
 }
 
 #[derive(Deserialize)]
 struct ChallengeRequest {
     wallet_id: String,
+    vendor_id: String,
     resource_id: String,
     action: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ChallengeResponse {
     challenge_id: Vec<u8>,
     nonce: Vec<u8>,
@@ -79,27 +110,23 @@ struct ChallengeResponse {
 #[derive(Deserialize)]
 struct VerifyRequest {
     wallet_id: String,
+    vendor_id: String,
     challenge: ChallengeResponse,
     public_key_hex: String,
     signature_hex: String,
 }
 
-#[derive(Serialize)]
-struct VerifyResponse {
-    status: String,
-    message: String,
-    wallet_id: Option<String>,
-    resource_id: Option<String>,
-    action: Option<String>,
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 { return None; }
     (0..s.len()).step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
         .collect()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn now_secs() -> u64 {
@@ -109,38 +136,99 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn make_rp_for(rp_id: &str, rp_origin: &str) -> RelyingParty {
+fn sha256_hex(input: &str) -> String {
+    hex_encode(&Sha256::digest(input.as_bytes()))
+}
+
+fn random_nonce() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).unwrap();
+    hex_encode(&bytes)
+}
+
+fn make_rp_for(vendor_id: &str, rp_origin: &str, resources: &[String], actions: &[String]) -> RelyingParty {
     let mut grants = HashSet::new();
-    for resource in &["document:001", "payment:001", "profile:001"] {
-        for (action, scope) in &[
-            ("read", "document:read"),
-            ("write", "document:write"),
-            ("submit", "payment:submit"),
-            ("read", "profile:read"),
-        ] {
-            grants.insert((resource.to_string(), action.to_string(), scope.to_string()));
+    for resource in resources {
+        for action in actions {
+            let scope = match action.as_str() {
+                "read" => "document:read",
+                "write" => "document:write",
+                "submit" => "payment:submit",
+                _ => "document:read",
+            };
+            grants.insert((resource.clone(), action.clone(), scope.to_string()));
         }
     }
     RelyingParty::new(RpPolicy {
-        rp_id: rp_id.to_string(),
+        rp_id: vendor_id.to_string(),
         rp_origin: rp_origin.to_string(),
         policy_id: "v1".into(),
         grants,
     })
 }
 
-// ── Handlers ─────────────────────────────────────────────────────────────────
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "server": "DIS Vendor Server",
-        "version": "0.1.0",
-        "rp_id": "dis-vendor",
-        "rp_origin": "https://dis-vendor.example.com"
+        "version": "0.2.0",
+        "security": "DIS-SEC-002"
     }))
 }
 
+// Fix #3: Vendors register with their own identity
+async fn register_vendor(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterVendorRequest>,
+) -> Json<serde_json::Value> {
+    if req.vendor_id.is_empty() || req.rp_origin.is_empty() || req.api_key.is_empty() {
+        return Json(serde_json::json!({"status":"error","message":"missing required fields"}));
+    }
+
+    let mut s = state.inner.lock().unwrap();
+
+    if s.vendor_registry.contains_key(&req.vendor_id) {
+        return Json(serde_json::json!({"status":"error","message":"vendor already registered"}));
+    }
+
+    let rp = make_rp_for(&req.vendor_id, &req.rp_origin, &req.allowed_resources, &req.allowed_actions);
+    s.rps.insert(req.vendor_id.clone(), rp);
+
+    s.vendor_registry.insert(req.vendor_id.clone(), VendorRegistration {
+        vendor_id: req.vendor_id.clone(),
+        rp_origin: req.rp_origin.clone(),
+        allowed_resources: req.allowed_resources,
+        allowed_actions: req.allowed_actions,
+        api_key_hash: sha256_hex(&req.api_key),
+    });
+
+    Json(serde_json::json!({
+        "status": "registered",
+        "vendor_id": req.vendor_id,
+        "rp_origin": req.rp_origin,
+        "message": "Vendor registered. Wallets can now enroll and authenticate."
+    }))
+}
+
+// Fix #1a: Issue enroll challenge (nonce)
+async fn enroll_challenge(
+    State(state): State<AppState>,
+    Json(req): Json<EnrollChallengeRequest>,
+) -> Json<serde_json::Value> {
+    let nonce = random_nonce();
+    let mut s = state.inner.lock().unwrap();
+    s.enroll_nonces.insert(req.wallet_id.clone(), nonce.clone());
+    Json(serde_json::json!({
+        "status": "ok",
+        "wallet_id": req.wallet_id,
+        "nonce": nonce,
+        "message": "Sign this nonce with your ML-DSA key to prove ownership"
+    }))
+}
+
+// Fix #1b: Authenticated enrollment — verify key ownership
 async fn enroll(
     State(state): State<AppState>,
     Json(req): Json<EnrollRequest>,
@@ -149,29 +237,48 @@ async fn enroll(
         Some(b) => b,
         None => return Json(serde_json::json!({"status":"error","message":"invalid public key hex"})),
     };
+    let sig_bytes = match hex_decode(&req.nonce_signature_hex) {
+        Some(b) => b,
+        None => return Json(serde_json::json!({"status":"error","message":"invalid signature hex"})),
+    };
 
     let mut s = state.inner.lock().unwrap();
 
-    // Create per-wallet RP if not exists
-    let wallet_origin = format!("https://{}.example.com", req.wallet_id);
-    let wallet_id_clone = req.wallet_id.clone();
-    let rp = s.rps.entry(req.wallet_id.clone())
-        .or_insert_with(|| make_rp_for(&wallet_id_clone, &wallet_origin));
-
-    match rp.enroll_test_key(&pk_bytes) {
-        Ok(_) => {
-            s.enrolled_keys.insert(req.wallet_id.clone(), pk_bytes);
-            Json(serde_json::json!({
-                "status": "enrolled",
-                "wallet_id": req.wallet_id,
-                "message": "Public key enrolled. You can now request challenges."
-            }))
-        }
-        Err(e) => Json(serde_json::json!({
+    // Check nonce exists
+    let nonce = match s.enroll_nonces.get(&req.wallet_id) {
+        Some(n) => n.clone(),
+        None => return Json(serde_json::json!({
             "status": "error",
-            "message": format!("{:?}", e)
+            "message": "no enroll challenge found — call /enroll/challenge first"
         })),
+    };
+
+    // Verify signature over nonce proves key ownership
+    let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+        Ok(k) => k,
+        Err(_) => return Json(serde_json::json!({"status":"error","message":"invalid public key"})),
+    };
+    let sig = match dilithium3::DetachedSignature::from_bytes(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return Json(serde_json::json!({"status":"error","message":"invalid signature"})),
+    };
+
+    if dilithium3::verify_detached_signature(&sig, nonce.as_bytes(), &pk).is_err() {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "key ownership proof failed — signature does not match nonce"
+        }));
     }
+
+    // Ownership proven — remove nonce and enroll
+    s.enroll_nonces.remove(&req.wallet_id);
+    s.enrolled_keys.insert(req.wallet_id.clone(), pk_bytes);
+
+    Json(serde_json::json!({
+        "status": "enrolled",
+        "wallet_id": req.wallet_id,
+        "message": "Key ownership verified. Wallet enrolled."
+    }))
 }
 
 async fn challenge(
@@ -180,17 +287,28 @@ async fn challenge(
 ) -> Json<serde_json::Value> {
     let mut s = state.inner.lock().unwrap();
 
-    // Check wallet is enrolled
     if !s.enrolled_keys.contains_key(&req.wallet_id) {
         return Json(serde_json::json!({
             "status": "error",
-            "message": "wallet not enrolled — call /enroll first"
+            "message": "wallet not enrolled"
         }));
     }
-    let rp_id = req.wallet_id.clone();
-    let rp_origin = format!("https://{}.example.com", rp_id);
-    let rp_id_clone = rp_id.clone();
-    let rp_origin_clone = rp_origin.clone();
+
+    let vendor = match s.vendor_registry.get(&req.vendor_id) {
+        Some(v) => v.clone(),
+        None => return Json(serde_json::json!({
+            "status": "error",
+            "message": "vendor not registered — call /vendor/register first"
+        })),
+    };
+
+    // Fix #5: Check resource/action against vendor-specific grants
+    if !vendor.allowed_resources.iter().any(|r| r == &req.resource_id || r == "*") {
+        return Json(serde_json::json!({"status":"error","message":"resource not authorized for this vendor"}));
+    }
+    if !vendor.allowed_actions.contains(&req.action) {
+        return Json(serde_json::json!({"status":"error","message":"action not authorized for this vendor"}));
+    }
 
     let now = now_secs();
     let scope = match req.action.as_str() {
@@ -202,8 +320,8 @@ async fn challenge(
 
     let template = Request {
         suite_id: SUITE_ML_DSA_65,
-        rp_id: rp_id.clone(),
-        rp_origin: rp_origin.clone(),
+        rp_id: req.vendor_id.clone(),
+        rp_origin: vendor.rp_origin.clone(),
         challenge_id: [0; 16],
         nonce: [0; 16],
         issued_at: now,
@@ -215,8 +333,11 @@ async fn challenge(
         policy_id: "v1".into(),
     };
 
-    let rp = s.rps.entry(req.wallet_id.clone())
-        .or_insert_with(|| make_rp_for(&rp_id_clone, &rp_origin_clone));
+    let rp_id_clone = req.vendor_id.clone();
+    let rp_origin_clone = vendor.rp_origin.clone();
+    let rp = s.rps.entry(req.vendor_id.clone())
+        .or_insert_with(|| make_rp_for(&rp_id_clone, &rp_origin_clone, &vendor.allowed_resources, &vendor.allowed_actions));
+
     match rp.issue(template) {
         Ok(issued) => Json(serde_json::json!({
             "status": "ok",
@@ -234,10 +355,7 @@ async fn challenge(
                 "suite_id": issued.suite_id
             }
         })),
-        Err(e) => Json(serde_json::json!({
-            "status": "error",
-            "message": format!("{:?}", e)
-        })),
+        Err(e) => Json(serde_json::json!({"status":"error","message":format!("{:?}",e)})),
     }
 }
 
@@ -253,6 +371,20 @@ async fn verify(
         Some(b) => b,
         None => return Json(serde_json::json!({"status":"error","message":"invalid signature hex"})),
     };
+
+    // Verify enrolled key matches submitted key
+    let s_lock = state.inner.lock().unwrap();
+    match s_lock.enrolled_keys.get(&req.wallet_id) {
+        Some(enrolled_pk) if enrolled_pk != &pk_bytes => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": "public key does not match enrolled key"
+            }));
+        }
+        None => return Json(serde_json::json!({"status":"error","message":"wallet not enrolled"})),
+        _ => {}
+    }
+    drop(s_lock);
 
     let c = &req.challenge;
     let mut challenge_id = [0u8; 16];
@@ -275,52 +407,58 @@ async fn verify(
         policy_id: c.policy_id.clone(),
     };
 
-    let proof = dis_core::verifier::HolderProof {
-        public_key: pk_bytes,
-        signature: sig_bytes,
-    };
-
+    let proof = HolderProof { public_key: pk_bytes, signature: sig_bytes };
     let now = now_secs();
     let mut s = state.inner.lock().unwrap();
-    let wallet_id = req.wallet_id.clone();
-    let rp = match s.rps.get_mut(&wallet_id) {
+
+    let rp = match s.rps.get_mut(&req.vendor_id) {
         Some(r) => r,
-        None => return Json(serde_json::json!({"status":"error","message":"wallet not enrolled"})),
+        None => return Json(serde_json::json!({"status":"error","message":"vendor not registered"})),
     };
+
     match rp.verify(&request, &proof, now) {
         Ok(_) => {
-            let session = VerifiedSession {
+            s.verified_sessions.push(VerifiedSession {
                 wallet_id: req.wallet_id.clone(),
+                vendor_id: req.vendor_id.clone(),
                 resource_id: c.resource_id.clone(),
                 action: c.action.clone(),
                 verified_at: chrono::Utc::now().to_rfc3339(),
-            };
-            s.verified_sessions.push(session);
+            });
             Json(serde_json::json!({
                 "status": "verified",
                 "message": "DIS proof accepted — access granted",
                 "wallet_id": req.wallet_id,
+                "vendor_id": req.vendor_id,
                 "resource_id": c.resource_id,
                 "action": c.action,
             }))
         }
-        Err(e) => Json(serde_json::json!({
-            "status": "rejected",
-            "message": format!("{:?}", e)
-        })),
+        Err(e) => Json(serde_json::json!({"status":"rejected","message":format!("{:?}",e)})),
     }
 }
 
-async fn sessions(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let s = state.inner.lock().unwrap();
-    Json(serde_json::json!({
-        "verified_sessions": s.verified_sessions,
-        "count": s.verified_sessions.len(),
-        "enrolled_wallets": s.enrolled_keys.keys().collect::<Vec<_>>()
-    }))
+// Fix #2: Protected /sessions endpoint
+async fn sessions(
+    State(state): State<AppState>,
+    auth: Option<TypedHeader<Authorization<Bearer>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match auth {
+        Some(TypedHeader(Authorization(bearer))) if bearer.token() == SESSIONS_API_KEY => {
+            let s = state.inner.lock().unwrap();
+            (StatusCode::OK, Json(serde_json::json!({
+                "verified_sessions": s.verified_sessions,
+                "count": s.verified_sessions.len(),
+                "enrolled_wallets": s.enrolled_keys.keys().collect::<Vec<_>>(),
+                "registered_vendors": s.vendor_registry.keys().collect::<Vec<_>>()
+            })))
+        }
+        _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "status": "error",
+            "message": "Authorization: Bearer <api-key> required"
+        }))),
+    }
 }
-
-// ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
@@ -328,17 +466,26 @@ async fn main() {
         inner: Arc::new(Mutex::new(VendorState {
             rps: HashMap::new(),
             enrolled_keys: HashMap::new(),
+            enroll_nonces: HashMap::new(),
             verified_sessions: Vec::new(),
+            vendor_registry: HashMap::new(),
         })),
     };
 
+    // Fix #4: Tighter CORS
+    let allowed_origins = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let cors = CorsLayer::new()
-        .allow_origin("*".parse::<HeaderValue>().unwrap())
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+            allowed_origins.split(',').any(|o| o.trim() == origin.to_str().unwrap_or(""))
+        }))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers(tower_http::cors::Any);
 
-    let app = Router::new()
+    let app: Router = Router::new()
         .route("/health", get(health))
+        .route("/vendor/register", post(register_vendor))
+        .route("/enroll/challenge", post(enroll_challenge))
         .route("/enroll", post(enroll))
         .route("/challenge", post(challenge))
         .route("/verify", post(verify))
@@ -348,12 +495,14 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or("3000".into());
     let addr = format!("0.0.0.0:{port}");
-    println!("🚀 DIS Vendor Server running on {addr}");
-    println!("   POST /enroll    — register a wallet public key");
-    println!("   POST /challenge — issue a DIS challenge");
-    println!("   POST /verify    — verify a DIS proof");
-    println!("   GET  /sessions  — list verified sessions");
-    println!("   GET  /health    — server status");
+    println!("🚀 DIS Vendor Server v0.2.0 (DIS-SEC-002) running on {addr}");
+    println!("   POST /vendor/register   — register a vendor with its own identity");
+    println!("   POST /enroll/challenge  — get nonce to prove key ownership");
+    println!("   POST /enroll            — authenticated enrollment with ownership proof");
+    println!("   POST /challenge         — issue a DIS challenge");
+    println!("   POST /verify            — verify a DIS proof");
+    println!("   GET  /sessions          — list sessions (requires API key)");
+    println!("   GET  /health            — server status");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
