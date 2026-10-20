@@ -94,7 +94,8 @@ impl RelyingParty {
         let sig = dilithium3::DetachedSignature::from_bytes(&proof.signature).map_err(|_| VerifyError::Signature)?;
         dilithium3::verify_detached_signature(&sig, &transcript, &pk).map_err(|_| VerifyError::Signature)?;
         self.pending.remove(&request.challenge_id);
-        if !self.enrolled_keys.contains(&Sha256::digest(&proof.public_key).into()) {
+        let key_fingerprint: [u8; 32] = Sha256::digest(&proof.public_key).into();
+        if !self.enrolled_keys.contains(&key_fingerprint) {
             return Err(VerifyError::Unauthorized);
         }
         if request.scopes.is_empty() || request.scopes.iter().any(|scope| {
