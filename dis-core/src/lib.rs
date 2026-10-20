@@ -5,6 +5,8 @@
 //! an experimental versioned profile pending external review and golden vectors.
 //! Existing Qattice DIS-AUTH-V1 is intentionally unchanged.
 
+pub mod verifier;
+
 use sha2::{Digest, Sha256};
 
 pub const DOMAIN: &[u8] = b"DIS-KS-V1\0";
