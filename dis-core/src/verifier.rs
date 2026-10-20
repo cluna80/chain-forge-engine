@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use crate::{canonical_request, Request, Error as EncodingError};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum VerifyError {
@@ -46,12 +47,13 @@ pub struct HolderProof {
 pub struct RelyingParty {
     policy: RpPolicy,
     pending: HashMap<[u8; 16], Request>,
+    enrolled_keys: HashSet<[u8; 32]>,
 }
 
 impl RelyingParty {
-    pub fn new(policy: RpPolicy) -> Self { Self { policy, pending: HashMap::new() } }
+    pub fn new(policy: RpPolicy) -> Self { Self { policy, pending: HashMap::new(), enrolled_keys: HashSet::new() } }
 
-    /// The RP must obtain fresh challenge_id AND nonce from a CSPRNG.
+    /// Local demo enrollment. Production enrollment MUST authenticate the holder\n    /// through an RP-approved bootstrap/credential process; never accept arbitrary\n    /// keys from an unauthenticated public endpoint. Each RP stores its own keys.\n    pub fn enroll_test_key(&mut self, public_key: &[u8]) -> Result<(), VerifyError> {\n        dilithium3::PublicKey::from_bytes(public_key).map_err(|_| VerifyError::Signature)?;\n        self.enrolled_keys.insert(Sha256::digest(public_key).into());\n        Ok(())\n    }\n\n    /// The RP must obtain fresh challenge_id AND nonce from a CSPRNG.
     /// Only register requests issued by this RP, never wallet-supplied requests.
     pub fn issue(&mut self, mut request: Request) -> Result<Request, VerifyError> {
         self.check_audience(&request)?;
@@ -142,7 +144,7 @@ mod tests {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp("game","game:1","play","game:play");
         let mut b = rp("docs","doc:1","read","document:read");
-        let req = a.issue(request("game","game:1","play","game:play")).unwrap();
+        a.enroll_test_key(pk.as_bytes()).unwrap();\n        let req = a.issue(request("game","game:1","play","game:play")).unwrap();
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
         assert_eq!(b.verify(&req,&proof,1010),Err(VerifyError::Audience));
         let mut tampered = req.clone();
@@ -154,7 +156,7 @@ mod tests {
     fn signature_expiry_and_policy_denial() {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp("docs","doc:1","read","document:read");
-        let req = a.issue(request("docs","doc:1","delete","document:read")).unwrap();
+        a.enroll_test_key(pk.as_bytes()).unwrap();\n        let req = a.issue(request("docs","doc:1","delete","document:read")).unwrap();
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
         assert_eq!(a.verify(&req,&proof,1060),Err(VerifyError::Time));
         let mut forged = proof.clone();
