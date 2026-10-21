@@ -177,12 +177,14 @@ async fn main() {
     let tx_queue      = node.tx_queue();
     let api_port      = args.api_port;
     let precheck      = api::TxPrecheck {
-        chain_id:             node.chain_id().to_string(),
-        require_signatures:   node.require_signatures(),
-        modules:              node.enabled_modules(),
-        settlement_operators: node.settlement_operators(),
-        max_tx_bytes:         node.max_tx_bytes(),
-        block_gas_limit:      node.block_gas_limit(),
+        chain_id:               node.chain_id().to_string(),
+        require_signatures:     node.require_signatures(),
+        modules:                node.enabled_modules(),
+        settlement_operators:   node.settlement_operators(),
+        max_tx_bytes:           node.max_tx_bytes(),
+        block_gas_limit:        node.block_gas_limit(),
+        attestation_coordinator: node.attestation_coordinator(),
+        governance_authorities: node.governance_authorities(),
     };
     // Set the data directory for state persistence.
     if let Some(ref dir) = args.data_dir {

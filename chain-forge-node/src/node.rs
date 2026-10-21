@@ -1139,6 +1139,21 @@ impl Node {
         self.genesis.limits.block_gas_limit
     }
 
+    /// Address of the pilot-phase attestation coordinator (may be None if not configured).
+    /// Only this address may submit ConfirmSybil and ReverseSybil transactions.
+    pub fn attestation_coordinator(&self) -> Option<String> {
+        self.genesis.attestation_coordinator.clone()
+    }
+
+    /// Addresses authorised to submit governance transactions (ActivatePqConsensus).
+    /// Derived from genesis validator accounts. Returns empty Vec if none configured.
+    pub fn governance_authorities(&self) -> Vec<String> {
+        self.genesis.genesis_accounts.iter()
+            .filter(|a| a.role == "validator")
+            .map(|a| a.address.clone())
+            .collect()
+    }
+
     pub fn nonce_cache(&self) -> SharedNonceCache {
         self.nonce_cache.clone()
     }

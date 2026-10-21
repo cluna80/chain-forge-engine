@@ -39,6 +39,13 @@ pub struct TxPrecheck {
     /// `limits.block_gas_limit`. A tx asking for more than one full block's
     /// worth of gas can never be included and is rejected at ingress.
     pub block_gas_limit: u64,
+    /// Address of the pilot-phase attestation coordinator.
+    /// Only this address may submit ConfirmSybil and ReverseSybil.
+    /// None means coordinator is not configured — both tx types are rejected.
+    pub attestation_coordinator: Option<String>,
+    /// Addresses authorised to submit governance transactions (ActivatePqConsensus).
+    /// Populated from genesis validator accounts. Empty list = all senders blocked.
+    pub governance_authorities: Vec<String>,
 }
 
 pub async fn serve(
@@ -281,6 +288,80 @@ pub async fn serve(
                                     operators_configured = precheck.settlement_operators.len(),
                                     "ClaimResearchReward rejected at mempool ingress: unauthorized operator"
                                 );
+                                http_400_json(&resp.to_string())
+                            }
+                            // Coordinator-only: ConfirmSybil and ReverseSybil may only
+                            // be submitted by the attestation coordinator configured in
+                            // genesis. Reject at ingress (fail-closed) so the mempool
+                            // cannot be spammed with coordinator-impersonation attempts
+                            // that would all fail at execution time.
+                            Ok(tx)
+                                if matches!(
+                                    &tx.body,
+                                    chain_forge_execution::TxBody::ConfirmSybil { .. }
+                                    | chain_forge_execution::TxBody::ReverseSybil { .. }
+                                )
+                                && precheck.attestation_coordinator
+                                    .as_deref()
+                                    .map_or(true, |coord| coord != tx.sender.as_str()) =>
+                            {
+                                let reason = match &precheck.attestation_coordinator {
+                                    None => format!(
+                                        "{}: attestation coordinator not configured in genesis \
+                                         — coordinator-only txs disabled",
+                                        tx.body.variant_name()
+                                    ),
+                                    Some(_) => format!(
+                                        "{}: sender {} is not the attestation coordinator",
+                                        tx.body.variant_name(),
+                                        tx.sender
+                                    ),
+                                };
+                                tracing::warn!(
+                                    tx_id  = %tx.id,
+                                    sender = %tx.sender,
+                                    tx_type = tx.body.variant_name(),
+                                    "coordinator-only tx rejected at mempool ingress"
+                                );
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            // Governance-only: ActivatePqConsensus may only be submitted
+                            // by validator addresses listed in genesis. Rejects mempool
+                            // spam that would fill blocks with governance noise from
+                            // non-authorised senders.
+                            Ok(tx)
+                                if matches!(
+                                    &tx.body,
+                                    chain_forge_execution::TxBody::ActivatePqConsensus { .. }
+                                )
+                                && !precheck.governance_authorities.contains(&tx.sender) =>
+                            {
+                                let reason = if precheck.governance_authorities.is_empty() {
+                                    format!(
+                                        "ActivatePqConsensus: no governance_authorities configured \
+                                         (no validators in genesis) — governance txs blocked"
+                                    )
+                                } else {
+                                    format!(
+                                        "ActivatePqConsensus: sender {} is not a governance authority",
+                                        tx.sender
+                                    )
+                                };
+                                tracing::warn!(
+                                    tx_id  = %tx.id,
+                                    sender = %tx.sender,
+                                    "ActivatePqConsensus rejected at mempool ingress: unauthorized sender"
+                                );
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
                                 http_400_json(&resp.to_string())
                             }
                             Ok(tx) => {
@@ -864,6 +945,24 @@ pub async fn serve(
                                 http_400_json(&resp.to_string())
                             }
                             Ok(verify_req) => {
+                                // Step 0: Validate delegation chain structure before any
+                                // crypto work. Checks depth ≤ MAX_CHAIN_DEPTH, no scope
+                                // widening, and human-approval token present when required.
+                                // This is stateless and runs before challenge consumption.
+                                if let Err(reason) = super::auth::validate_delegation_chain_structure(
+                                    &verify_req.delegation_chain
+                                ) {
+                                    tracing::warn!(
+                                        challenge_id = %verify_req.challenge_id,
+                                        %reason,
+                                        "DIS delegation chain rejected at auth/verify ingress"
+                                    );
+                                    let resp = serde_json::json!({
+                                        "status": "rejected",
+                                        "reason": reason
+                                    });
+                                    http_400_json(&resp.to_string())
+                                } else {
                                 // Step 1: Peek at the challenge WITHOUT consuming it.
                                 // This allows failed verification to leave the challenge intact.
                                 let maybe_challenge = {
@@ -1017,6 +1116,7 @@ pub async fn serve(
                                         }}      // end match verify_challenge_signature + else { match
                                     }           // end Some(challenge) arm
                                 }               // end match peek
+                                }               // end else { (delegation chain ok)
                             }                   // end POST /api/auth/verify
                         }
 

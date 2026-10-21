@@ -390,6 +390,26 @@ pub struct ChallengeRequest {
 
 fn default_scope() -> String { "wallet:authenticate".to_string() }
 
+/// One link in a delegation chain, as submitted in a VerifyRequest.
+/// Mirrors `dis_core::delegation::Delegation` but uses JSON-friendly types.
+#[derive(Debug, Deserialize)]
+pub struct DelegationLinkReq {
+    pub rp_id:                  String,
+    pub delegator_public_key:   String,   // hex ML-DSA-65 pubkey
+    pub delegate_public_key:    String,   // hex ML-DSA-65 pubkey
+    pub scopes:                 Vec<String>,
+    pub resource_id:            String,
+    pub action:                 String,
+    pub issued_at:              u64,
+    pub expires_at:             u64,
+    pub max_uses:               Option<u32>,
+    pub requires_human_approval: bool,
+    pub signature:              String,   // hex ML-DSA-65 sig
+    /// Client-supplied approval signal. Required when `requires_human_approval = true`.
+    /// The server checks its presence; actual approval is validated out-of-band.
+    pub human_approval_token:   Option<String>,
+}
+
 /// Request body for POST /api/auth/verify
 #[derive(Debug, Deserialize)]
 pub struct VerifyRequest {
@@ -400,6 +420,60 @@ pub struct VerifyRequest {
     /// ML-DSA-65 signature over SHA-256(canonical_payload()),
     /// tagged "mldsa65:<hex>" (same convention as SignedTxEnvelope).
     pub signature: String,
+    /// Optional DIS delegation chain. When present the server validates:
+    ///   1. Chain depth ≤ MAX_CHAIN_DEPTH (4 links)
+    ///   2. Scopes narrow or stay equal at every link (no scope widening)
+    ///   3. `requires_human_approval` links must carry a `human_approval_token`
+    /// max_uses enforcement is stateful and happens at execution time.
+    #[serde(default)]
+    pub delegation_chain: Vec<DelegationLinkReq>,
+}
+
+/// Maximum delegation chain depth allowed at the API ingress.
+pub const MAX_DELEGATION_CHAIN_DEPTH: usize = 4;
+
+/// Stateless structural validation of a delegation chain submitted with a
+/// VerifyRequest. Checks depth, scope monotonicity, and human-approval signal.
+/// Does NOT verify cryptographic signatures (that is done by dis-core at execution)
+/// or check max_uses (stateful).
+pub fn validate_delegation_chain_structure(
+    chain: &[DelegationLinkReq],
+) -> Result<(), String> {
+    if chain.is_empty() {
+        return Ok(());
+    }
+    if chain.len() > MAX_DELEGATION_CHAIN_DEPTH {
+        return Err(format!(
+            "delegation chain depth {} exceeds maximum {}",
+            chain.len(),
+            MAX_DELEGATION_CHAIN_DEPTH
+        ));
+    }
+
+    let mut parent_scopes: Option<&[String]> = None;
+    for (i, link) in chain.iter().enumerate() {
+        // Scope narrowing: each link's scopes must be a subset of the parent's.
+        if let Some(parent) = parent_scopes {
+            for scope in &link.scopes {
+                if !parent.contains(scope) {
+                    return Err(format!(
+                        "delegation chain link {} widens scopes: '{}' not in parent grants",
+                        i, scope
+                    ));
+                }
+            }
+        }
+        // Human-approval gate: if the link requires it, an approval token must be present.
+        if link.requires_human_approval && link.human_approval_token.is_none() {
+            return Err(format!(
+                "delegation chain link {} requires human approval but no \
+                 human_approval_token was provided",
+                i
+            ));
+        }
+        parent_scopes = Some(&link.scopes);
+    }
+    Ok(())
 }
 
 /// Result of a successful verification
@@ -855,6 +929,7 @@ mod tests {
             challenge_id: ch.challenge_id.clone(),
             public_key:   "aa".repeat(1952),
             signature:    "deadbeef".to_string(),
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch, &req);
         assert!(result.is_err());
@@ -868,6 +943,7 @@ mod tests {
             challenge_id: ch.challenge_id.clone(),
             public_key:   "deadbeef".to_string(),
             signature:    "mldsa65:aabb".to_string(),
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch, &req);
         assert!(result.is_err());
@@ -890,6 +966,7 @@ mod tests {
             challenge_id: ch.challenge_id.clone(),
             public_key:   pk_hex,
             signature:    sig_tagged,
+            delegation_chain: vec![],
         };
 
         let result = verify_challenge_signature(&ch, &req);
@@ -915,6 +992,7 @@ mod tests {
             challenge_id: ch.challenge_id.clone(),
             public_key:   pk_hex,
             signature:    forged_sig,
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch, &req);
         assert!(result.is_err(), "forged signature must be rejected");
@@ -937,6 +1015,7 @@ mod tests {
             challenge_id: ch.challenge_id.clone(),
             public_key:   pk1_hex,
             signature:    sig_tagged,
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch, &req);
         assert!(result.is_err(), "wrong-key signature must be rejected");
@@ -966,6 +1045,7 @@ mod tests {
             challenge_id: ch_b.challenge_id.clone(),
             public_key:   pk_hex,
             signature:    sig,
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch_b, &req);
         assert!(result.is_err(),
@@ -996,6 +1076,7 @@ mod tests {
             challenge_id: ch_b.challenge_id.clone(),
             public_key:   pk_hex,
             signature:    sig,
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch_b, &req);
         assert!(result.is_err(),
@@ -1025,6 +1106,7 @@ mod tests {
             challenge_id: ch_attest.challenge_id.clone(),
             public_key:   pk_hex,
             signature:    sig,
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch_attest, &req);
         assert!(result.is_err(),
@@ -1529,6 +1611,7 @@ mod tests {
             challenge_id: ch.challenge_id.clone(),
             public_key:   pk_hex,
             signature:    legacy_tagged,
+            delegation_chain: vec![],
         };
         let result = verify_challenge_signature(&ch, &req);
         assert!(result.is_err(),
