@@ -828,13 +828,13 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 
 | Item | Status | Notes |
 |---|---|---|
-| BondValidator tx type | ⬜ | Lock QCB as validator stake; enter pending set |
-| UnbondValidator tx type | ⬜ | Start unbonding timer; stake released after cooldown |
-| Minimum bond threshold | ❓ | Low enough for individual participation; high enough to deter Sybil attacks |
-| Maximum active validator set size | ❓ | BFT doesn't scale to thousands; cap at ~100–200, ranked by stake |
-| Stake-ranked validator set at epoch boundary | ⬜ | Top-N stakers automatically enter/exit active set |
-| Unbonding cooldown enforcement | ⬜ | Stake locked for N epochs after UnbondValidator; slashable during cooldown |
-| Validator commission rate | ⬜ | Configurable % of PoCD research rewards |
+| BondValidator tx type | ✅ Complete v0.1 (2026-10-21) | `TxBody::BondValidator { amount }` — moves funds to `validator-bond:<addr>` in StateStore; incremental bonding supported |
+| UnbondValidator tx type | ✅ Complete v0.1 (2026-10-21) | `TxBody::UnbondValidator` — zeros bonded amount immediately (exits active set), sets 21-epoch cooldown lock; double-unbond rejected to prevent slash-and-run |
+| Minimum bond threshold | ✅ Complete v0.1 (2026-10-21) | `DEFAULT_MIN_BOND_UQCB = 1_000_000` uqcb (1 QCB floor); tiered system: Entry 1k QCB, Standard 10k QCB, Full 100k QCB — value is governance-tunable |
+| Maximum active validator set size | ✅ Complete v0.1 (2026-10-21) | `DEFAULT_MAX_ACTIVE_VALIDATORS = 150` — BFT cap; governance-tunable |
+| Stake-ranked validator set at epoch boundary | ✅ Complete v0.1 (2026-10-21) | `compute_stake_active_set()` — descending stake, address tiebreak, truncated to max; wired into node epoch boundary (Integration Point 4) |
+| Unbonding cooldown enforcement | ✅ Complete v0.1 (2026-10-21) | `DEFAULT_UNBONDING_COOLDOWN_EPOCHS = 21`; stake slashable during cooldown (slashing-crate wiring is a tracked follow-up) |
+| Validator commission rate | 🔄 Partial (2026-10-21) | `Commission` data model complete (rate_bps, max_rate_bps capped at 20%, 7-epoch change delay); `UpdateCommission` tx type not yet implemented |
 | Validator self-service docs | ⬜ | Operator guide: keygen → bond QCB → run node → monitor → unbond |
 
 ---
