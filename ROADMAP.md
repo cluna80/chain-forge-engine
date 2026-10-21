@@ -434,6 +434,8 @@ User opens Qattice app → QR challenge displayed
 | B-Android-4 — GitHub Actions APK builder | Auto-builds and publishes APK on every push to dis-wallet-android/ or dis-core/ | ✅ Complete (2026-10-20) |
 | B-Android-5 — Licensing | Apache 2.0 for dis-core; BSL 1.1 for Android SDK and vendor server; commercial licensing info | ✅ Complete (2026-10-20) |
 | B-Security — DIS-SEC-002 | Authenticated enrollment, protected sessions, vendor identity isolation, authorization hardening | ✅ Complete (2026-10-21) |
+| B-Security — DIS-SEC-003 | Adversarial testing — 8/8 attack scenarios rejected; enrollment replay, key replacement, cross-vendor substitution, concurrent replay | ✅ Complete (2026-10-21) |
+| C-State — DIS-STATE-001 | Persistent vendor registrations, enrolled keys, revocations, and consumed challenges across server restarts | ⏳ Next |
 | B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to Qattice wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
