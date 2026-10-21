@@ -2,6 +2,7 @@
 name = "dis-vendor-server"
 version = "0.6.0"
 edition = "2021"
+license = "BUSL-1.1"
 
 [[bin]]
 name = "dis-vendor-server"
