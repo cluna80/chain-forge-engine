@@ -271,11 +271,28 @@ DIS is the authentication layer that sits on top of the identity layer. The iden
 
 **Authentication flow:** User opens Qattice application → challenge presented → User signs the challenge locally using ML-DSA-65 → Service verifies the signature → Service grants access. The private key never leaves the device; the challenge expires after use.
 
-**What DIS guarantees:** key non-exposure; replay resistance (single-use, 60-second challenges); chain binding (cross-chain replay is cryptographically impossible); post-quantum authentication (ML-DSA-65 / NIST FIPS 204); nonce and balance enforcement.
+**What DIS guarantees:** key non-exposure; replay resistance (single-use challenges); audience binding (rp_id + rp_origin + policy_id — cross-RP replay is cryptographically impossible); post-quantum authentication (ML-DSA-65 / NIST FIPS 204); per-vendor unlinkable identifiers (cross-vendor correlation is impossible without holder cooperation); scope-minimality enforcement (RP rejects any scope not in its grant set); downgrade resistance (suite_id floor enforced at both issue and verify); delegated agent authorization (human → agent chains, scope-narrowing only, depth limit 4, human-approval gate for high-risk actions, max_uses counter).
 
-**What DIS does not guarantee on its own:** unlinkability across services (that requires a zero-knowledge credential layer — QCB-PM-001, a research milestone); transport-layer privacy; device compromise protection beyond encrypted-at-rest storage.
+**What DIS does not guarantee on its own:** transport-layer privacy; device compromise protection beyond encrypted-at-rest storage; ZK selective disclosure (that is QCB-PM-001, a research milestone); durable max_uses storage across RP restarts (in-memory only in v0.1).
 
-> **Implementation status:** Phase A (ML-DSA-65 challenge/response authentication) and Phase B (chain-ID binding, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality) are complete and adversarially tested. 25/25 Phase B regression checks pass. 5/5 adversarial Phase A scenarios pass on the live devnet. Phases B-Privacy, C, D, and E (unlinkable authorization, credential storage, integration, security testing) are pending.
+> **Implementation status (2026-10-21 — DIS-KS-V1 standalone stack, merged to main):**
+>
+> **Complete ✅**
+> - **DIS-KS-V1 core** (`dis-core`): versioned wire format, domain-separated canonical transcript (`DIS-KS-V1\0`), ML-DSA-65 sign/verify, `RelyingParty` with per-RP enrolled keys, revocation, key rotation, downgrade resistance (`min_suite_id`), replay protection. Frozen conformance vectors at `dis-core/conformance/vectors.json`.
+> - **Unlinkable presentation** (`dis-core::privacy`): `are_linkable()`, `disclosure_info()` — per-vendor keypairs, no shared public correlator across RPs. 6 tests.
+> - **Delegated agent/machine authorization** (`dis-core::delegation`): `Delegation` + `DelegatedProof`, chain validation (scopes narrow, sigs valid, expiry, depth ≤ 4), `requires_human_approval` flag, `max_uses` counter. 9 tests.
+> - **Vendor SDK** (`dis-sdk`): `VendorSdk` (enroll/revoke/rotate/issue/verify/verify_delegated) + `WalletSdk` (provision/sign/rotate/import/export). MIT licensed.
+> - **Android reference wallet** (`dis-wallet-android`): JNI bridge over `dis-core`, AES-256-GCM key storage (Android Keystore), key rotation, full server challenge→sign→verify flow.
+> - **Adversarial validation**: 33 labeled attack scenarios, all rejected — signature forgery, replay, cross-RP challenge, wrong audience, scope injection, revocation, downgrade, delegation chain abuse (depth overflow, scope widening, expired links, max_uses exhaustion, forged delegation sigs, human-approval bypass), stolen-device recovery. 104 tests total across DIS crates, 0 failures.
+> - **Licensing**: `dis-core` + `dis-sdk` MIT; `dis-vendor-server` BUSL-1.1 (→ Apache-2.0 on 2030-01-01). Copyright Luna Krizz 2026.
+>
+> **Pending / return gates before production ⚠️**
+> - Replace `enroll_test_key` / `DemoWallet` with HSM-backed key storage and authenticated enrollment ceremony
+> - Independent cryptographic audit of `canonical_request` encoding and domain separator
+> - Conformance test suite run against a non-Rust (Kotlin/Swift) implementation
+> - Durable `max_uses` and per-delegation revocation (currently in-memory only)
+> - PQ hybrid TLS on all `rp_origin` endpoints
+> - Phases C (PQ credential storage), D (integration), E (full security audit) remain pending
 
 ---
 
@@ -849,6 +866,7 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 |---|---|---|
 | QCB-CS-001 | Cryptographic Survivability and Migration | ⬜ Phase 1 |
 | QCB-DIS-001 | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B complete |
+| DIS-KS-V1 | DIS Standalone Stack (dis-core, dis-sdk, Android wallet, adversarial suite, licensing) | ✅ Complete v0.1 (2026-10-21) — return gates remain |
 | QCB-KR-001 | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
 | QCB-PM-001 | Private Post-Quantum Threshold Authorization | ❓ Research |
 | QSWIP-001 | Open Post-Quantum Wallet Identity Protocol | 🔲 Proposed standard |
@@ -872,10 +890,11 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 |---|---|---|
 | A — Identity and authentication | ML-DSA-65 wallet identity, QR challenges, signature verification, anti-replay | ✅ Complete |
 | B — Security hardening | Chain-ID binding, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality | ✅ Complete |
-| B-Privacy — Unlinkable authorization | Selective disclosure, service-specific pseudonyms, ZK authorization | 🔲 |
+| B-Privacy — Unlinkable authorization | Per-vendor keypairs (no shared public correlator), `are_linkable()` + `DisclosureInfo`, RP-enforced scope minimality | ✅ Complete v0.1 — ZK selective disclosure remains 🔲 (QCB-PM-001) |
+| B-Delegation — Agent/machine authorization | `Delegation` + `DelegatedProof`, chain depth ≤ 4, scopes narrow only, `requires_human_approval`, `max_uses` counter | ✅ Complete v0.1 — durable storage + per-delegation revocation 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment | 🔲 |
 | D — Integration | Wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
-| E — Security testing | QR replay, phishing, session hijacking, key compromise, identity correlation | 🔲 |
+| E — Security testing | 33 adversarial scenarios passed (DIS-SEC-001); full external audit, fuzz testing, timing analysis pending | 🔄 Partial |
 
 **DIS-001 Phase B — COMPLETE ✅ (2026-10-09):** 25/25 checks green. B1 nonce enforcement ✅, B2 balance enforcement ✅, B3 gas cap enforcement ✅ (gas_limit=0 rejected; gas_limit=10B rejected), B4 chain-ID enforcement ✅, B5 malformed tx rejection ✅, B6 Phase A regression ✅, B7 SIGKILL+restart+replay rejection ✅, B8 Carol finality confirmed across all 3 nodes ✅.
 
