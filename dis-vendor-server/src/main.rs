@@ -18,11 +18,14 @@
 //! is honoured; once a revocation has committed (i.e. before /admin/revoke
 //! responds) no verification on any instance can commit.
 //!
-//! SSRF protection (see `validate_origin_url` and `validate_origin_ips`):
-//! Production mode enforces HTTPS for rp_origin, validates URL structure
-//! (no path/query/fragment/userinfo), blocks internal/private/loopback IPs,
-//! disables HTTP redirects on the verification client, and checks DNS-resolved
-//! addresses before connecting. DIS_ALLOW_HTTP_ORIGINS=1 bypasses checks for tests.
+//! SSRF protection (see `validate_origin_url`, `validate_origin_ips`,
+//! `verify_origin_ownership`):
+//! Production mode enforces HTTPS, validates URL structure (no path/query/
+//! fragment/userinfo), blocks internal/private/loopback IPs, disables HTTP
+//! redirects, and closes the DNS rebinding window by pinning the pre-validated
+//! IP addresses into a per-request reqwest client (`resolve_to_addrs`).
+//! `DIS_ALLOW_HTTP_ORIGINS=1` (test-only) skips these checks; the server
+//! refuses to start if this flag is set and DATABASE_URL is not local.
 
 use axum::{
     extract::State,
@@ -42,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use std::{net::IpAddr, time::Duration};
+use std::{net::{IpAddr, SocketAddr}, time::Duration};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use url::Url;
 // reqwest is used only for origin verification; pulled in via dev-deps too.
@@ -171,9 +174,15 @@ fn is_internal_ip(addr: IpAddr) -> bool {
 }
 
 /// Resolve `hostname` and verify that none of the DNS answers are internal IPs.
-async fn validate_origin_ips(hostname: &str, port: u16) -> Result<(), &'static str> {
+///
+/// Returns the validated socket addresses so the caller can build a pinned
+/// reqwest client that connects directly to one of these addresses instead of
+/// re-resolving the hostname.  This closes the DNS rebinding window: an attacker
+/// who changes the DNS record after validation cannot redirect the actual HTTP
+/// connection to an internal destination.
+async fn validate_origin_ips(hostname: &str, port: u16) -> Result<Vec<SocketAddr>, &'static str> {
     let hostport = format!("{hostname}:{port}");
-    let addrs: Vec<_> = tokio::net::lookup_host(&hostport).await
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&hostport).await
         .map_err(|_| "could not resolve rp_origin hostname")?
         .collect();
     if addrs.is_empty() {
@@ -184,7 +193,7 @@ async fn validate_origin_ips(hostname: &str, port: u16) -> Result<(), &'static s
             return Err("rp_origin resolves to a non-public IP address");
         }
     }
-    Ok(())
+    Ok(addrs)
 }
 
 /// Verify that the caller controls `rp_origin` by fetching
@@ -204,7 +213,10 @@ async fn validate_origin_ips(hostname: &str, port: u16) -> Result<(), &'static s
 ///   - scheme must be https
 ///   - URL structure validated (no path/query/fragment/credentials)
 ///   - DNS-resolved addresses must all be public (no loopback/private/link-local/etc.)
-///   - HTTP redirects are disabled on the client (set at construction)
+///   - Validated IPs are pinned into a per-request client via `resolve_to_addrs`,
+///     so the actual connection uses the pre-checked addresses — not a fresh DNS
+///     lookup — closing the DNS rebinding window.
+///   - HTTP redirects are disabled on every client built here.
 async fn verify_origin_ownership(
     http: &HttpClient,
     rp_origin: &str,
@@ -214,25 +226,46 @@ async fn verify_origin_ownership(
 ) -> Result<(), &'static str> {
     // Validate URL structure before making any network request.
     let parsed = validate_origin_url(rp_origin, allow_http)?;
-    let hostname = parsed.host_str().unwrap_or("");
-    // In production mode, reject any origin whose hostname resolves to a
-    // non-public IP.  This check runs before the outbound request so a
-    // DNS rebinding attack during the request itself doesn't help: the
-    // attacker would need to change the answer between the pre-check and
-    // the GET, but the pre-check result is not cached — the OS resolver
-    // is called again for the actual connection, which is an acceptable
-    // known gap documented below.
+    let hostname = parsed.host_str().unwrap_or("").to_string();
+
+    // Determine which client to use for the outbound GET.
+    //
+    // Production path (allow_http == false):
+    //   IP literals → check directly, use the shared client.
+    //   Hostnames   → resolve, validate, build a per-request pinned client.
+    //                 The pinned client's `resolve_to_addrs` map means reqwest
+    //                 will connect to one of the pre-validated IPs instead of
+    //                 re-invoking the OS DNS resolver.  A rebinding attacker
+    //                 who changes the DNS record after `validate_origin_ips`
+    //                 returns cannot redirect the connection to a private address.
+    //
+    // Test path (allow_http == true):
+    //   Origins are IP literals (127.0.0.1:PORT); no DNS to rebind; shared client.
+    let pinned: Option<HttpClient>;
     if !allow_http {
-        // Reject numeric IP literals directly in the origin hostname.
         if let Ok(ip) = hostname.parse::<IpAddr>() {
+            // Numeric IP literal — validate directly, no DNS involved.
             if is_internal_ip(ip) {
                 return Err("rp_origin must not be a non-public IP address");
             }
+            pinned = None;
         } else {
             let port = parsed.port().unwrap_or(443);
-            validate_origin_ips(hostname, port).await?;
+            let validated_addrs = validate_origin_ips(&hostname, port).await?;
+            // Build a one-shot client pinned to the validated addresses.
+            pinned = Some(
+                HttpClient::builder()
+                    .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .resolve_to_addrs(&hostname, &validated_addrs)
+                    .build()
+                    .map_err(|_| "failed to build pinned HTTP client")?,
+            );
         }
+    } else {
+        pinned = None;
     }
+    let effective_client = pinned.as_ref().unwrap_or(http);
 
     // Compute what the well-known endpoint must return.
     let expected = sha256_hex(format!("{vendor_id}:{registration_token}").as_bytes());
@@ -243,7 +276,7 @@ async fn verify_origin_ownership(
         u.set_path(WELL_KNOWN_PATH);
         String::from(u)
     };
-    let resp = http
+    let resp = effective_client
         .get(&well_known_url)
         .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS))
         .send().await
@@ -262,6 +295,160 @@ async fn verify_origin_ownership(
         return Err("well-known token does not match expected value");
     }
     Ok(())
+}
+
+/// Unit tests for the SSRF protection layer.
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ── validate_origin_url ──────────────────────────────────────────────────
+
+    #[test]
+    fn origin_url_https_bare_accepted() {
+        assert!(validate_origin_url("https://example.com", false).is_ok());
+        assert!(validate_origin_url("https://example.com:8443", false).is_ok());
+    }
+
+    #[test]
+    fn origin_url_http_rejected_in_prod() {
+        assert!(validate_origin_url("http://example.com", false).is_err());
+    }
+
+    #[test]
+    fn origin_url_http_accepted_in_test_mode() {
+        assert!(validate_origin_url("http://127.0.0.1:8080", true).is_ok());
+    }
+
+    #[test]
+    fn origin_url_ftp_rejected() {
+        assert!(validate_origin_url("ftp://example.com", false).is_err());
+    }
+
+    #[test]
+    fn origin_url_credentials_rejected() {
+        assert!(validate_origin_url("https://user:pass@example.com", false).is_err());
+    }
+
+    #[test]
+    fn origin_url_path_rejected() {
+        assert!(validate_origin_url("https://example.com/path", false).is_err());
+    }
+
+    #[test]
+    fn origin_url_query_rejected() {
+        assert!(validate_origin_url("https://example.com?q=1", false).is_err());
+    }
+
+    #[test]
+    fn origin_url_fragment_rejected() {
+        assert!(validate_origin_url("https://example.com#f", false).is_err());
+    }
+
+    // ── is_internal_ip ───────────────────────────────────────────────────────
+
+    #[test]
+    fn loopback_ipv4_is_internal() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(127, 255, 255, 255))));
+    }
+
+    #[test]
+    fn private_rfc1918_is_internal() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+    }
+
+    #[test]
+    fn link_local_is_internal() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+    }
+
+    #[test]
+    fn cgnat_is_internal() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 255))));
+        // 100.128.0.0 is outside CGNAT.
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 0))));
+    }
+
+    #[test]
+    fn loopback_ipv6_is_internal() {
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn ipv4_mapped_private_is_internal() {
+        // ::ffff:192.168.1.1
+        let mapped: Ipv6Addr = "::ffff:192.168.1.1".parse().unwrap();
+        assert!(is_internal_ip(IpAddr::V6(mapped)));
+    }
+
+    #[test]
+    fn public_ipv4_is_not_internal() {
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+    }
+
+    // ── DNS pinning mechanism ─────────────────────────────────────────────────
+
+    /// Verifies that a reqwest client built with `resolve_to_addrs` connects
+    /// to the pinned address even when the URL hostname would not resolve via
+    /// the OS DNS resolver.  This is the same mechanism `verify_origin_ownership`
+    /// uses in production: after `validate_origin_ips` returns validated
+    /// `Vec<SocketAddr>`, a per-request client pins those addresses so that
+    /// any DNS change between validation and connection has no effect.
+    #[tokio::test]
+    async fn pinned_client_uses_pre_validated_address() {
+        use axum::{routing::get as aGet, Router as ARouter};
+        use tokio::net::TcpListener;
+
+        // Start a mock server that returns a known body.
+        const BODY: &str = "pinning-works";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let app = ARouter::new().route(
+                "/.well-known/dis-vendor-registration",
+                aGet(|| async { BODY }),
+            );
+            axum::serve(listener, app).await.ok();
+        });
+
+        let mock_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Build a client pinned to the mock's address under a fake hostname.
+        // "fake-dis-pin.invalid" is guaranteed to never exist in real DNS
+        // (IANA reserves the .invalid TLD for exactly this purpose).
+        let pinned = HttpClient::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs("fake-dis-pin.invalid", &[mock_addr])
+            .build()
+            .unwrap();
+
+        // Request via the fake hostname → reaches the mock through pinning.
+        let url = format!("http://fake-dis-pin.invalid:{port}/.well-known/dis-vendor-registration");
+        let resp = pinned.get(&url).send().await
+            .expect("pinned client must reach the mock server");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text().await.unwrap().trim(), BODY);
+
+        // An unpinned client fails because the hostname does not exist in DNS.
+        let unpinned = HttpClient::builder()
+            .timeout(Duration::from_millis(500))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let err = unpinned.get(&url).send().await;
+        assert!(err.is_err(), "unpinned client must fail for a .invalid hostname");
+
+        handle.abort();
+    }
 }
 
 #[derive(Deserialize)]
@@ -610,6 +797,20 @@ async fn main() {
     };
     let allow_http_origins = std::env::var("DIS_ALLOW_HTTP_ORIGINS").map(|v| v == "1").unwrap_or(false);
     if allow_http_origins {
+        // Guard against accidental production use.  If the DATABASE_URL does not
+        // contain a loopback/localhost address this environment looks like a
+        // production or staging database.  Refuse to start rather than silently
+        // disable SSRF protections.
+        let looks_local = database_url.contains("localhost")
+            || database_url.contains("127.0.0.1")
+            || database_url.contains("::1");
+        if !looks_local {
+            panic!(
+                "DIS_ALLOW_HTTP_ORIGINS=1 is a test-only flag. \
+                 DATABASE_URL does not point to a local/test database. \
+                 Remove DIS_ALLOW_HTTP_ORIGINS from production deployments."
+            );
+        }
         eprintln!("WARNING: DIS_ALLOW_HTTP_ORIGINS=1 — HTTP origins and internal IPs allowed (test mode only)");
     }
     let http = HttpClient::builder()

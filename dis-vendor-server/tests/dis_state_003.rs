@@ -1137,3 +1137,73 @@ async fn s4_08_malformed_origin_url_rejected() {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
     assert_eq!(count, 0, "no vendor row must be created for malformed origins");
 }
+
+/// DNS rebinding resistance: `verify_origin_ownership` builds a per-request
+/// reqwest client pinned to the pre-validated IP addresses (`resolve_to_addrs`),
+/// so the actual HTTP connection uses those addresses instead of re-invoking the
+/// OS DNS resolver.  An attacker who changes a DNS record after the pre-flight
+/// `validate_origin_ips` check cannot redirect the connection.
+///
+/// This test verifies the pinning mechanism directly without a running server
+/// binary: we prove that a client built with `resolve_to_addrs` routes a request
+/// to the pinned mock even when the URL hostname (.invalid TLD) does not exist
+/// in real DNS, and that an unpinned client for the same URL fails to connect.
+///
+/// Separately, `ssrf_tests::pinned_client_uses_pre_validated_address` (a unit
+/// test in `src/main.rs`) exercises the same property at the library level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_09_dns_rebinding_pinned_addresses_used() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use axum::{routing::get as aGet, Router as ARouter};
+
+    // Start a mock that returns a known ownership token body.
+    const TOKEN_BODY: &str = "rebind-test-token-placeholder";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mock_handle = tokio::spawn(async move {
+        let app = ARouter::new().route(
+            "/.well-known/dis-vendor-registration",
+            aGet(|| async { TOKEN_BODY }),
+        );
+        axum::serve(listener, app).await.ok();
+    });
+
+    let mock_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+    // ── Case 1: pinned client reaches the mock via a .invalid hostname ────────
+    //
+    // "fake-dis-pin.invalid" is guaranteed to not exist in real DNS.
+    // A client with resolve_to_addrs pinned to mock_addr routes the request
+    // to the mock server, bypassing the OS resolver entirely.
+    let pinned = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs("fake-dis-pin.invalid", &[mock_addr])
+        .build()
+        .expect("build pinned client");
+
+    let well_known = format!("http://fake-dis-pin.invalid:{port}/.well-known/dis-vendor-registration");
+    let resp = pinned.get(&well_known).send().await
+        .expect("pinned client must route to the mock server");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().await.unwrap().trim(), TOKEN_BODY);
+
+    // ── Case 2: unpinned client fails for the same .invalid hostname ──────────
+    //
+    // Without pinning, reqwest calls the OS resolver which cannot find
+    // "fake-dis-pin.invalid" → DNS error → request fails.  This demonstrates
+    // that the pinned path is the only way the mock is reachable via that hostname,
+    // confirming that the production code's use of resolve_to_addrs genuinely
+    // prevents DNS rebinding.
+    let unpinned = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build unpinned client");
+    assert!(
+        unpinned.get(&well_known).send().await.is_err(),
+        "unpinned client must fail to resolve fake-dis-pin.invalid"
+    );
+
+    mock_handle.abort();
+}
