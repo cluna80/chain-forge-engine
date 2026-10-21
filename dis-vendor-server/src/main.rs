@@ -17,6 +17,12 @@
 //! serialize on it. A verification that commits before the revocation commits
 //! is honoured; once a revocation has committed (i.e. before /admin/revoke
 //! responds) no verification on any instance can commit.
+//!
+//! SSRF protection (see `validate_origin_url` and `validate_origin_ips`):
+//! Production mode enforces HTTPS for rp_origin, validates URL structure
+//! (no path/query/fragment/userinfo), blocks internal/private/loopback IPs,
+//! disables HTTP redirects on the verification client, and checks DNS-resolved
+//! addresses before connecting. DIS_ALLOW_HTTP_ORIGINS=1 bypasses checks for tests.
 
 use axum::{
     extract::State,
@@ -36,8 +42,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use url::Url;
 // reqwest is used only for origin verification; pulled in via dev-deps too.
 use reqwest::Client as HttpClient;
 
@@ -59,6 +66,9 @@ struct AppState {
     registration_key_hash: Option<[u8; 32]>,
     /// HTTP client used to verify vendor RP origin ownership.
     http: HttpClient,
+    /// When true, HTTP origins are accepted and internal IPs are not blocked.
+    /// Set only via DIS_ALLOW_HTTP_ORIGINS=1 for integration tests.
+    allow_http_origins: bool,
 }
 
 type Resp = (StatusCode, Json<Value>);
@@ -100,6 +110,83 @@ const WELL_KNOWN_MAX_BYTES: usize = 4096;
 /// Timeout for the outbound origin-verification request.
 const ORIGIN_VERIFY_TIMEOUT_MS: u64 = 5000;
 
+/// Validate that `rp_origin` is a well-formed origin suitable for a production
+/// vendor registration.  A well-formed origin:
+///   - parses as a URL with scheme https (or http when `allow_http` is set)
+///   - has a non-empty host that is not an IP literal in production
+///   - has no path component beyond "/" (i.e. no path/query/fragment/userinfo)
+///   - has no embedded credentials (userinfo)
+fn validate_origin_url(rp_origin: &str, allow_http: bool) -> Result<Url, &'static str> {
+    let parsed = Url::parse(rp_origin).map_err(|_| "rp_origin is not a valid URL")?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_http => {}
+        "http" => return Err("rp_origin must use HTTPS in production"),
+        _ => return Err("rp_origin scheme must be https"),
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("rp_origin must not contain credentials");
+    }
+    if parsed.host_str().unwrap_or("").is_empty() {
+        return Err("rp_origin must have a non-empty host");
+    }
+    // No path beyond "/", no query, no fragment.
+    let path = parsed.path();
+    if path != "/" && !path.is_empty() {
+        return Err("rp_origin must not have a path component");
+    }
+    if parsed.query().is_some() {
+        return Err("rp_origin must not have a query component");
+    }
+    if parsed.fragment().is_some() {
+        return Err("rp_origin must not have a fragment component");
+    }
+    Ok(parsed)
+}
+
+/// Returns true if `addr` is a non-public address that should not be reachable
+/// from a vendor registration request.
+fn is_internal_ip(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()         // 127.0.0.0/8
+            || v4.is_private()       // 10/8, 172.16/12, 192.168/16
+            || v4.is_link_local()    // 169.254.0.0/16
+            || v4.is_multicast()     // 224.0.0.0/4
+            || v4.is_broadcast()     // 255.255.255.255
+            || v4.is_unspecified()   // 0.0.0.0
+            // CGNAT 100.64.0.0/10
+            || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+            // Reserved/documentation ranges
+            || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()         // ::1
+            || v6.is_multicast()
+            || v6.is_unspecified()   // ::
+            // IPv4-mapped: ::ffff:0:0/96 — check the embedded v4 address
+            || v6.to_ipv4_mapped().map(|v4| is_internal_ip(IpAddr::V4(v4))).unwrap_or(false)
+        }
+    }
+}
+
+/// Resolve `hostname` and verify that none of the DNS answers are internal IPs.
+async fn validate_origin_ips(hostname: &str, port: u16) -> Result<(), &'static str> {
+    let hostport = format!("{hostname}:{port}");
+    let addrs: Vec<_> = tokio::net::lookup_host(&hostport).await
+        .map_err(|_| "could not resolve rp_origin hostname")?
+        .collect();
+    if addrs.is_empty() {
+        return Err("rp_origin hostname resolved to no addresses");
+    }
+    for sa in &addrs {
+        if is_internal_ip(sa.ip()) {
+            return Err("rp_origin resolves to a non-public IP address");
+        }
+    }
+    Ok(())
+}
+
 /// Verify that the caller controls `rp_origin` by fetching
 /// `{rp_origin}/.well-known/dis-vendor-registration` and checking that
 /// the response body contains the expected ownership token.
@@ -112,17 +199,52 @@ const ORIGIN_VERIFY_TIMEOUT_MS: u64 = 5000;
 /// token for `vendor-a` cannot be used to register `vendor-b` at the
 /// same origin, and a token from a different origin cannot claim
 /// `vendor-a`'s identity.
+///
+/// SSRF protections applied before any outbound request (when `allow_http` is false):
+///   - scheme must be https
+///   - URL structure validated (no path/query/fragment/credentials)
+///   - DNS-resolved addresses must all be public (no loopback/private/link-local/etc.)
+///   - HTTP redirects are disabled on the client (set at construction)
 async fn verify_origin_ownership(
     http: &HttpClient,
     rp_origin: &str,
     vendor_id: &str,
     registration_token: &str,
+    allow_http: bool,
 ) -> Result<(), &'static str> {
+    // Validate URL structure before making any network request.
+    let parsed = validate_origin_url(rp_origin, allow_http)?;
+    let hostname = parsed.host_str().unwrap_or("");
+    // In production mode, reject any origin whose hostname resolves to a
+    // non-public IP.  This check runs before the outbound request so a
+    // DNS rebinding attack during the request itself doesn't help: the
+    // attacker would need to change the answer between the pre-check and
+    // the GET, but the pre-check result is not cached — the OS resolver
+    // is called again for the actual connection, which is an acceptable
+    // known gap documented below.
+    if !allow_http {
+        // Reject numeric IP literals directly in the origin hostname.
+        if let Ok(ip) = hostname.parse::<IpAddr>() {
+            if is_internal_ip(ip) {
+                return Err("rp_origin must not be a non-public IP address");
+            }
+        } else {
+            let port = parsed.port().unwrap_or(443);
+            validate_origin_ips(hostname, port).await?;
+        }
+    }
+
     // Compute what the well-known endpoint must return.
     let expected = sha256_hex(format!("{vendor_id}:{registration_token}").as_bytes());
-    let url = format!("{rp_origin}{WELL_KNOWN_PATH}");
+    // Construct the well-known URL from the validated parsed origin only, not
+    // from the raw rp_origin string, to avoid any parsing inconsistency.
+    let well_known_url = {
+        let mut u = parsed.clone();
+        u.set_path(WELL_KNOWN_PATH);
+        String::from(u)
+    };
     let resp = http
-        .get(&url)
+        .get(&well_known_url)
         .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS))
         .send().await
         .map_err(|_| "could not reach rp_origin well-known endpoint")?;
@@ -242,7 +364,7 @@ async fn register_vendor(
         return error("registration_token must be at least 32 characters");
     }
     // Verify the vendor controls its declared rp_origin before writing anything.
-    if let Err(msg) = verify_origin_ownership(&state.http, &req.rp_origin, &req.vendor_id, &req.registration_token).await {
+    if let Err(msg) = verify_origin_ownership(&state.http, &req.rp_origin, &req.vendor_id, &req.registration_token, state.allow_http_origins).await {
         return (StatusCode::FORBIDDEN, Json(json!({"status":"error","message":format!("origin ownership verification failed: {msg}")})));
     }
     finish(async {
@@ -486,10 +608,17 @@ async fn main() {
         Ok(_) => panic!("DIS_VENDOR_REGISTRATION_KEY must be at least 32 characters"),
         Err(_) => { eprintln!("DIS_VENDOR_REGISTRATION_KEY not set — /vendor/register disabled"); None }
     };
+    let allow_http_origins = std::env::var("DIS_ALLOW_HTTP_ORIGINS").map(|v| v == "1").unwrap_or(false);
+    if allow_http_origins {
+        eprintln!("WARNING: DIS_ALLOW_HTTP_ORIGINS=1 — HTTP origins and internal IPs allowed (test mode only)");
+    }
     let http = HttpClient::builder()
         .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS + 500))
+        // Disable redirects: a redirect could steer the verification request to
+        // an internal endpoint after the SSRF pre-checks have passed.
+        .redirect(reqwest::redirect::Policy::none())
         .build().expect("failed to build HTTP client");
-    let state = AppState { db: pool, admin_key_hash, registration_key_hash, http };
+    let state = AppState { db: pool, admin_key_hash, registration_key_hash, http, allow_http_origins };
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| "http://localhost:3000".into());
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {

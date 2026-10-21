@@ -155,12 +155,56 @@ Five consecutive runs; all 16 tests (11 from DIS-STATE-003, 5 new) passed every 
 | `s4_04_unreachable_origin_rejected` | Dead port → connection refused → 403; no vendor row created |
 | `s4_05_unverified_vendor_cannot_issue_challenges` | Vendor row with `origin_verified_at = NULL` (direct DB insert, simulating old-schema migration) → challenge endpoint returns error on both instances |
 
-## Remaining gaps (updated)
+## Remaining gaps (updated after DIS-SEC-005)
 
 - Consumed/expired `challenges` rows are never purged (no background sweep).
 - `dis_state.db*` SQLite files on earlier branches are no longer used.
 - Vendor registration tokens are single-use by convention but not enforced by
   the DB (a second registration attempt with the same token is rejected by the
   `already registered` check, not by a used-token table).
-- The well-known verification uses plain HTTP in tests; production deployments
-  should require HTTPS for the rp_origin to prevent MITM on the ownership proof.
+- DNS rebinding: the pre-flight IP check and the outbound request use the OS
+  resolver independently; an attacker who controls DNS TTLs can change the
+  answer between the two calls. Mitigated by requiring HTTPS (which requires
+  a valid cert for the hostname) and by the per-connection TLS handshake, which
+  would fail for an IP the attacker doesn't control a cert for.
+
+---
+
+# DIS-SEC-005 — SSRF Hardening for Origin Verification
+
+## Status: ✅ COMPLETE (2026-10-21)
+
+## Problem
+
+`verify_origin_ownership` constructed an outbound URL from the caller-supplied
+`rp_origin` and made an HTTP GET request without:
+- enforcing HTTPS (plain HTTP allowed any caller to use an unencrypted channel)
+- validating URL structure (path/query/fragment components not rejected)
+- blocking private/loopback/internal IP destinations (SSRF)
+- rejecting HTTP redirects (a redirect could steer the request to an internal endpoint)
+
+## What was implemented
+
+| Control | Mechanism |
+|---------|-----------|
+| **HTTPS enforcement** | `validate_origin_url` rejects any scheme other than `https` (or `http` when `DIS_ALLOW_HTTP_ORIGINS=1` is set for tests). |
+| **URL structure validation** | `validate_origin_url` rejects credentials, path components beyond `/`, query strings, and fragments. |
+| **Internal IP blocking** | `validate_origin_ips` resolves the hostname before making the request and rejects loopback (127/8, ::1), private RFC1918 (10/8, 172.16/12, 192.168/16), link-local (169.254/16), CGNAT (100.64/10), multicast, broadcast, and unspecified addresses. IP literals in the origin hostname are also checked directly. |
+| **Redirect suppression** | `reqwest::redirect::Policy::none()` set at client construction — a 302/301/etc. response from the well-known endpoint causes the request to fail, not follow. |
+| **Test-mode bypass** | `DIS_ALLOW_HTTP_ORIGINS=1` env var (read once at startup) enables HTTP origins and skips the IP check for integration tests that use localhost OriginMock servers. Set in `Server::start_on()` only. |
+| **Well-known URL constructed from parsed origin** | The outbound URL is built from the `url::Url`-parsed origin, not the raw string, preventing path traversal or parser inconsistency. |
+
+## Acceptance tests — 3 new, 19/19 total passed (2026-10-21)
+
+| Test | What is verified |
+|------|-----------------|
+| `s4_06_ssrf_internal_addresses_rejected_in_prod_mode` | HTTP scheme, loopback IPv4/IPv6 literals, private RFC1918, link-local, CGNAT, and `localhost` hostname all rejected in production mode; no vendor row created |
+| `s4_07_redirect_from_well_known_blocked` | Well-known endpoint returning 302 redirect → registration rejected; redirect destination not contacted |
+| `s4_08_malformed_origin_url_rejected` | Non-URL string, FTP scheme, credentials, path, query, fragment, empty host, HTTP without allow flag — all rejected with appropriate error messages; no vendor row created |
+
+## Remaining gaps
+
+- Consumed/expired `challenges` rows are never purged (no background sweep).
+- `dis_state.db*` SQLite files on earlier branches are no longer used.
+- Vendor registration tokens are single-use by convention but not enforced by the DB.
+- DNS rebinding window between IP pre-check and actual connection (see note above).

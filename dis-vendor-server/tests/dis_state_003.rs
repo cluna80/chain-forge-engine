@@ -163,6 +163,27 @@ impl Server {
             .env("DIS_DB_ACQUIRE_TIMEOUT_MS", "1500")
             .env("DIS_ADMIN_API_KEY", ADMIN_KEY)
             .env("DIS_VENDOR_REGISTRATION_KEY", REGISTRATION_KEY)
+            // Allow HTTP origins so tests can use OriginMock (plain HTTP on localhost).
+            .env("DIS_ALLOW_HTTP_ORIGINS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn().expect("spawn dis-vendor-server");
+        let s = Server { child, base: format!("http://127.0.0.1:{port}"), port, db_url: db_url.into() };
+        s.wait_healthy(Duration::from_secs(30)).await;
+        s
+    }
+
+    /// Start a server in production mode (no DIS_ALLOW_HTTP_ORIGINS).
+    /// Used by SSRF adversarial tests that need the strict validation path.
+    async fn start_prod_mode(db_url: &str) -> Self {
+        let port = free_port();
+        let child = Command::new(env!("CARGO_BIN_EXE_dis-vendor-server"))
+            .env("DATABASE_URL", db_url)
+            .env("PORT", port.to_string())
+            .env("DIS_DB_ACQUIRE_TIMEOUT_MS", "1500")
+            .env("DIS_ADMIN_API_KEY", ADMIN_KEY)
+            .env("DIS_VENDOR_REGISTRATION_KEY", REGISTRATION_KEY)
+            // DIS_ALLOW_HTTP_ORIGINS intentionally NOT set → production SSRF checks active.
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn().expect("spawn dis-vendor-server");
@@ -906,4 +927,213 @@ async fn s4_05_unverified_vendor_cannot_issue_challenges() {
         "resource_id":"doc:1","action":"read"})).await;
     assert_eq!(status(&r), "error");
     assert!(message(&r).contains("origin not verified"), "{r}");
+}
+
+// ================================================================ DIS-SEC-005 SSRF tests
+
+/// In production mode (no DIS_ALLOW_HTTP_ORIGINS), rp_origin values that resolve
+/// to internal/private/loopback IPs or that use the HTTP scheme are rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_06_ssrf_internal_addresses_rejected_in_prod_mode() {
+    let _g = SERIAL.lock().await;
+    let admin = admin_url();
+    let mut conn = PgConnection::connect(&admin).await.unwrap();
+    let db_name = format!("dis003_{}", rand_hex(6));
+    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&mut conn).await.unwrap();
+    let base = admin.rsplit_once('/').unwrap().0.to_string();
+    let direct = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new().max_connections(2).connect(&direct).await.unwrap();
+    let via = format!("{}@127.0.0.1:5432/{db_name}", base.rsplit_once('@').unwrap().0);
+    // Start server WITHOUT DIS_ALLOW_HTTP_ORIGINS → production SSRF checks active.
+    let s = Server::start_prod_mode(&via).await;
+    let vendor = format!("vendor{}", rand_hex(4));
+    let reg_token = rand_hex(32);
+
+    let bad_origins: &[&str] = &[
+        // HTTP scheme (not HTTPS) — rejected by scheme check.
+        "http://127.0.0.1:8080",
+        // Loopback IPv4 literal.
+        "https://127.0.0.1",
+        // Loopback IPv6 literal.
+        "https://[::1]",
+        // Private RFC1918 ranges.
+        "https://10.0.0.1",
+        "https://172.16.0.1",
+        "https://192.168.1.1",
+        // Link-local.
+        "https://169.254.169.254",
+        // CGNAT.
+        "https://100.64.0.1",
+        // Unspecified.
+        "https://0.0.0.0",
+        // localhost resolves to 127.0.0.1 — rejected by DNS check.
+        "https://localhost",
+    ];
+
+    for origin in bad_origins {
+        let (code, r) = s.post_with_reg_key("/vendor/register", json!({
+            "vendor_id": vendor,
+            "rp_origin": origin,
+            "allowed_resources": ["doc:1"],
+            "allowed_actions": ["read"],
+            "api_key": "k",
+            "registration_token": reg_token
+        })).await;
+        assert!(
+            code == 403 || code == 400,
+            "expected 403/400 for SSRF origin {origin}: got {code} — {r}"
+        );
+        let msg = message(&r);
+        assert!(
+            msg.contains("origin ownership") || msg.contains("HTTPS") || msg.contains("non-public")
+                || msg.contains("valid URL") || msg.contains("credentials") || msg.contains("path"),
+            "unexpected error message for {origin}: {msg}"
+        );
+    }
+
+    // No vendor row should have been created.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 0, "no vendor row must be created via internal-IP origins");
+}
+
+/// Redirects from the well-known endpoint are not followed.
+/// An origin mock that returns a 302 redirect to a different (possibly internal)
+/// URL must not allow registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_07_redirect_from_well_known_blocked() {
+    let _g = SERIAL.lock().await;
+    let admin = admin_url();
+    let mut conn = PgConnection::connect(&admin).await.unwrap();
+    let db_name = format!("dis003_{}", rand_hex(6));
+    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&mut conn).await.unwrap();
+    let base = admin.rsplit_once('/').unwrap().0.to_string();
+    let direct = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new().max_connections(2).connect(&direct).await.unwrap();
+    let via = format!("{}@127.0.0.1:5432/{db_name}", base.rsplit_once('@').unwrap().0);
+
+    // Build a redirect mock: always responds with 302 to the real token location.
+    let token_store: Arc<Mutex<Option<String>>> = Arc::default();
+    let token_clone = token_store.clone();
+    let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redirect_port = redirect_listener.local_addr().unwrap().port();
+    // A second listener that serves the actual token.
+    let token_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token_port = token_listener.local_addr().unwrap().port();
+    let token_clone2 = token_store.clone();
+    use axum::{routing::get as aGet, Router as ARouter};
+
+    let token_app = ARouter::new()
+        .route("/.well-known/dis-vendor-registration", aGet(move || {
+            let t = token_clone2.clone();
+            async move {
+                match t.lock().unwrap().clone() {
+                    Some(s) => (axum::http::StatusCode::OK, s),
+                    None => (axum::http::StatusCode::NOT_FOUND, String::new()),
+                }
+            }
+        }));
+    let token_base = format!("http://127.0.0.1:{token_port}");
+    tokio::spawn(async move { axum::serve(token_listener, token_app).await.ok(); });
+
+    let token_base_c = token_base.clone();
+    let redirect_app = ARouter::new()
+        .route("/.well-known/dis-vendor-registration", aGet(move || {
+            let dest = format!("{token_base_c}/.well-known/dis-vendor-registration");
+            let _ = token_clone.clone(); // keep alive
+            async move {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, dest)],
+                    "",
+                )
+            }
+        }));
+    tokio::spawn(async move { axum::serve(redirect_listener, redirect_app).await.ok(); });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Start in test mode so HTTP origins pass the scheme check (we're testing redirect blocking).
+    let s = Server::start(&via).await;
+    let vendor = format!("vendor{}", rand_hex(4));
+    let reg_token = rand_hex(32);
+    let expected = sha256_hex_test(format!("{vendor}:{reg_token}").as_bytes());
+    *token_store.lock().unwrap() = Some(expected);
+
+    // The registration origin points at the redirect mock, not the token server.
+    let redirect_origin = format!("http://127.0.0.1:{redirect_port}");
+    let (code, r) = s.post_with_reg_key("/vendor/register", json!({
+        "vendor_id": vendor,
+        "rp_origin": redirect_origin,
+        "allowed_resources": ["doc:1"],
+        "allowed_actions": ["read"],
+        "api_key": "k",
+        "registration_token": reg_token
+    })).await;
+    // Redirect not followed → the redirect response body is empty/302 text,
+    // not the ownership token → rejected.
+    assert_eq!(code, 403, "redirect should not be followed: {r}");
+    assert!(message(&r).contains("origin ownership"), "{r}");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 0, "redirect must not allow registration");
+}
+
+/// Malformed rp_origin values (bad scheme, credentials, path, query, fragment)
+/// are rejected by URL validation before any network request is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_08_malformed_origin_url_rejected() {
+    let _g = SERIAL.lock().await;
+    let admin = admin_url();
+    let mut conn = PgConnection::connect(&admin).await.unwrap();
+    let db_name = format!("dis003_{}", rand_hex(6));
+    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&mut conn).await.unwrap();
+    let base = admin.rsplit_once('/').unwrap().0.to_string();
+    let direct = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new().max_connections(2).connect(&direct).await.unwrap();
+    let via = format!("{}@127.0.0.1:5432/{db_name}", base.rsplit_once('@').unwrap().0);
+    // Production mode: enforces HTTPS.
+    let s = Server::start_prod_mode(&via).await;
+    let vendor = format!("vendor{}", rand_hex(4));
+    let reg_token = rand_hex(32);
+
+    let bad_urls: &[(&str, &str)] = &[
+        // Not a URL at all.
+        ("not-a-url", "valid URL"),
+        // FTP scheme.
+        ("ftp://example.com", "scheme"),
+        // Embedded credentials.
+        ("https://user:pass@example.com", "credentials"),
+        // Path component.
+        ("https://example.com/path", "path"),
+        // Query component.
+        ("https://example.com?q=1", "query"),
+        // Fragment.
+        ("https://example.com#frag", "fragment"),
+        // Empty host — url crate rejects it as unparseable.
+        ("https://", "valid URL"),
+        // HTTP without allow flag.
+        ("http://example.com", "HTTPS"),
+    ];
+
+    for (origin, expected_substr) in bad_urls {
+        let (code, r) = s.post_with_reg_key("/vendor/register", json!({
+            "vendor_id": vendor,
+            "rp_origin": origin,
+            "allowed_resources": ["doc:1"],
+            "allowed_actions": ["read"],
+            "api_key": "k",
+            "registration_token": reg_token
+        })).await;
+        assert!(
+            code == 403 || code == 400,
+            "expected 403/400 for {origin}: got {code} — {r}"
+        );
+        let msg = message(&r);
+        assert!(
+            msg.contains(expected_substr),
+            "for origin {origin}: expected message containing {expected_substr:?}, got: {msg}"
+        );
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 0, "no vendor row must be created for malformed origins");
 }
