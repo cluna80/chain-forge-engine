@@ -86,6 +86,10 @@ impl RelyingParty {
         }
     }
 
+    pub fn policy(&self) -> &RpPolicy {
+        &self.policy
+    }
+
     /// Local demo enrollment. Production enrollment MUST authenticate the holder
     /// through an RP-approved bootstrap/credential process; never accept arbitrary
     /// keys from an unauthenticated public endpoint. Each RP stores its own keys.

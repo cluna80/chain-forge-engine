@@ -54,6 +54,45 @@ impl DemoWallet {
         Ok((old_pk, new_pk.as_bytes().to_vec()))
     }
 
+    /// Restore a key from persistent storage (e.g. Android Keystore after restart).
+    /// Validates key bytes before inserting; overwrites if the vendor already exists.
+    /// Demo only — in production the secret key must never leave encrypted storage.
+    pub fn import_key(
+        &mut self,
+        id: &str,
+        origin: &str,
+        policy: &str,
+        pk: &[u8],
+        sk: &[u8],
+    ) -> Result<(), VerifyError> {
+        if id.is_empty() || origin.is_empty() || policy.is_empty() {
+            return Err(VerifyError::Challenge);
+        }
+        dilithium3::PublicKey::from_bytes(pk).map_err(|_| VerifyError::Signature)?;
+        dilithium3::SecretKey::from_bytes(sk).map_err(|_| VerifyError::Signature)?;
+        self.keys.insert(
+            id.into(),
+            Key { origin: origin.into(), policy: policy.into(), pk: pk.to_vec(), sk: sk.to_vec() },
+        );
+        Ok(())
+    }
+
+    /// List all provisioned vendor IDs.
+    pub fn list_vendors(&self) -> Vec<String> {
+        self.keys.keys().cloned().collect()
+    }
+
+    /// Return the enrolled public key for a vendor, or `None` if not provisioned.
+    pub fn get_public_key(&self, id: &str) -> Option<Vec<u8>> {
+        self.keys.get(id).map(|k| k.pk.clone())
+    }
+
+    /// Demo-only key export for persistent storage. The secret key must be stored
+    /// in hardware-backed encrypted storage (e.g. Android Keystore); never log it.
+    pub fn export_key(&self, id: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.keys.get(id).map(|k| (k.pk.clone(), k.sk.clone()))
+    }
+
     /// Production wallet must independently authenticate origin and obtain consent.
     pub fn sign(
         &self,

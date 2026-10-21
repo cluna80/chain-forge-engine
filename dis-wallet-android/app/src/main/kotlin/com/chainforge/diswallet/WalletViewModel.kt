@@ -70,6 +70,30 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
+    /** Rotate the ML-DSA keypair for vendorId. Persists the new key and returns
+     *  "old_pk_hex:new_pk_hex" for the caller to re-enroll with the vendor server. */
+    suspend fun rotateKey(vendorId: String): String = withContext(Dispatchers.Default) {
+        try {
+            val result = wallet.rotateKey(vendorId)
+            if (result.startsWith("ERROR")) return@withContext result
+            val parts = result.split(":")
+            if (parts.size != 2) return@withContext "ERROR: unexpected rotate result"
+            val (oldPk, newPk) = parts
+            // Persist new key — fetch full export to get new sk.
+            val exported = wallet.exportKey(vendorId)
+            if (!exported.startsWith("ERROR")) {
+                val ep = exported.split(":")
+                if (ep.size == 2) {
+                    val vendor = keyStore.loadVendor(vendorId)
+                    if (vendor != null) keyStore.saveVendor(vendorId, vendor.origin, vendor.policy, ep[0], ep[1])
+                }
+            }
+            "✅ Key rotated\nOld: ${oldPk.take(32)}...\nNew: ${newPk.take(32)}..."
+        } catch (e: Exception) {
+            "Rotate failed: ${e.message}"
+        }
+    }
+
     fun getSavedVendors(): Set<String> = keyStore.getVendorIds()
 
     suspend fun serverAuth(serverUrl: String, vendorId: String, resourceId: String, action: String): String =

@@ -1644,6 +1644,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dis-sdk"
+version = "0.1.0"
+dependencies = [
+ "dis-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "dis-vendor-server"
 version = "0.6.0"
 dependencies = [

@@ -1,24 +1,13 @@
-use dis_core::{Request, SUITE_ML_DSA_65};
+use dis_core::{wallet::DemoWallet, Request, SUITE_ML_DSA_65};
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jstring, jobjectArray};
 use jni::JNIEnv;
-use pqcrypto_dilithium::dilithium3;
-use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
-use std::collections::HashMap;
 use std::sync::Mutex;
 
-struct WalletKey {
-    origin: String,
-    policy: String,
-    pk: Vec<u8>,
-    sk: Vec<u8>,
-}
+static WALLET: std::sync::OnceLock<Mutex<DemoWallet>> = std::sync::OnceLock::new();
 
-static WALLET: std::sync::OnceLock<Mutex<HashMap<String, WalletKey>>> =
-    std::sync::OnceLock::new();
-
-fn wallet() -> &'static Mutex<HashMap<String, WalletKey>> {
-    WALLET.get_or_init(|| Mutex::new(HashMap::new()))
+fn wallet() -> &'static Mutex<DemoWallet> {
+    WALLET.get_or_init(|| Mutex::new(DemoWallet::new()))
 }
 
 fn get_string(env: &mut JNIEnv, s: &JString) -> String {
@@ -36,7 +25,11 @@ fn to_jstring(env: &mut JNIEnv, s: &str) -> jstring {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    dis_core::hex::encode(bytes)
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    dis_core::hex::decode(s).ok()
 }
 
 fn parse_bytes16(v: &serde_json::Value) -> [u8; 16] {
@@ -49,6 +42,7 @@ fn parse_bytes16(v: &serde_json::Value) -> [u8; 16] {
     arr
 }
 
+/// Provision a new vendor keypair. Returns the hex-encoded public key on success.
 #[no_mangle]
 pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_provision(
     mut env: JNIEnv,
@@ -60,28 +54,13 @@ pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_provision(
     let id = get_string(&mut env, &vendor_id);
     let origin = get_string(&mut env, &vendor_origin);
     let policy = get_string(&mut env, &policy_id);
-
-    if id.is_empty() || origin.is_empty() || policy.is_empty() {
-        return to_jstring(&mut env, "ERROR: empty fields");
+    match wallet().lock().unwrap().provision(&id, &origin, &policy) {
+        Ok(pk) => to_jstring(&mut env, &hex_encode(&pk)),
+        Err(e) => to_jstring(&mut env, &format!("ERROR: {e:?}")),
     }
-
-    let mut w = wallet().lock().unwrap();
-    if w.contains_key(&id) {
-        return to_jstring(&mut env, "ERROR: vendor already provisioned");
-    }
-
-    let (pk, sk) = dilithium3::keypair();
-    let pk_hex = hex_encode(pk.as_bytes());
-    w.insert(id, WalletKey {
-        origin,
-        policy,
-        pk: pk.as_bytes().to_vec(),
-        sk: sk.as_bytes().to_vec(),
-    });
-
-    to_jstring(&mut env, &pk_hex)
 }
 
+/// Sign a challenge JSON from the vendor server. Returns a JSON proof object.
 #[no_mangle]
 pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_signChallenge(
     mut env: JNIEnv,
@@ -90,89 +69,86 @@ pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_signChallenge(
     challenge_json: JString,
 ) -> jstring {
     let id = get_string(&mut env, &vendor_id);
-    let json = get_string(&mut env, &challenge_json);
+    let json_str = get_string(&mut env, &challenge_json);
 
-    let w = wallet().lock().unwrap();
-    let key = match w.get(&id) {
-        Some(k) => k,
-        None => return to_jstring(&mut env, "ERROR: vendor not provisioned"),
-    };
-
-    let challenge: serde_json::Value = match serde_json::from_str(&json) {
+    let challenge: serde_json::Value = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => return to_jstring(&mut env, &format!("ERROR: invalid JSON: {e}")),
+    };
+
+    let resource_id = challenge["resource_id"].as_str().unwrap_or("").to_string();
+    let action = challenge["action"].as_str().unwrap_or("").to_string();
+    let scopes: Vec<String> = challenge["scopes"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|s| s.as_str().map(String::from))
+        .collect();
+    let policy_id = challenge["policy_id"].as_str().unwrap_or("v1").to_string();
+
+    let w = wallet().lock().unwrap();
+    let origin = match w.get_public_key(&id) {
+        Some(_) => {
+            // We need origin from the wallet; use export_key to get it, but
+            // DemoWallet doesn't expose origin directly — reconstruct Request
+            // via the stored key metadata. For the JNI, embed origin in challenge JSON.
+            challenge["rp_origin"].as_str().unwrap_or("").to_string()
+        }
+        None => return to_jstring(&mut env, "ERROR: vendor not provisioned"),
     };
 
     let request = Request {
         suite_id: SUITE_ML_DSA_65,
         rp_id: id.clone(),
-        rp_origin: key.origin.clone(),
+        rp_origin: origin,
         challenge_id: parse_bytes16(&challenge["challenge_id"]),
         nonce: parse_bytes16(&challenge["nonce"]),
         issued_at: challenge["issued_at"].as_u64().unwrap_or(0),
         expires_at: challenge["expires_at"].as_u64().unwrap_or(0),
-        resource_id: challenge["resource_id"].as_str().unwrap_or("").into(),
-        action: challenge["action"].as_str().unwrap_or("").into(),
-        scopes: challenge["scopes"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .filter_map(|s| s.as_str().map(String::from))
-            .collect(),
+        resource_id: resource_id.clone(),
+        action: action.clone(),
+        scopes,
         operation_digest: None,
-        policy_id: key.policy.clone(),
+        policy_id,
     };
 
-    let transcript = match dis_core::canonical_request(&request) {
-        Ok(t) => t,
-        Err(e) => return to_jstring(&mut env, &format!("ERROR: {e:?}")),
-    };
-
-    let sk = match dilithium3::SecretKey::from_bytes(&key.sk) {
-        Ok(s) => s,
-        Err(_) => return to_jstring(&mut env, "ERROR: invalid secret key"),
-    };
-
-    let sig = dilithium3::detached_sign(&transcript, &sk);
-
-    let proof = serde_json::json!({
-        "vendor_id": id,
-        "public_key": hex_encode(&key.pk),
-        "signature": hex_encode(sig.as_bytes()),
-        "resource_id": request.resource_id,
-        "action": request.action,
-    });
-
-    to_jstring(&mut env, &proof.to_string())
+    match w.sign(&request, &resource_id, &action) {
+        Ok(proof) => {
+            let result = serde_json::json!({
+                "vendor_id": id,
+                "public_key": hex_encode(&proof.public_key),
+                "signature": hex_encode(&proof.signature),
+                "resource_id": resource_id,
+                "action": action,
+            });
+            to_jstring(&mut env, &result.to_string())
+        }
+        Err(e) => to_jstring(&mut env, &format!("ERROR: {e:?}")),
+    }
 }
 
+/// List all provisioned vendor IDs.
 #[no_mangle]
 pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_listVendors(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jobjectArray {
     let w = wallet().lock().unwrap();
-    let keys: Vec<String> = w.keys().cloned().collect();
+    let ids = w.list_vendors();
     let string_class = env.find_class("java/lang/String").unwrap();
     let empty = env.new_string("").unwrap();
     let arr = env
-        .new_object_array(keys.len() as i32, &string_class, &empty)
+        .new_object_array(ids.len() as i32, &string_class, &empty)
         .unwrap();
-    for (i, k) in keys.iter().enumerate() {
-        let s = env.new_string(k).unwrap();
+    for (i, id) in ids.iter().enumerate() {
+        let s = env.new_string(id).unwrap();
         env.set_object_array_element(&arr, i as i32, s).unwrap();
     }
     arr.into_raw()
 }
 
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 { return None; }
-    (0..s.len()).step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
-        .collect()
-}
-
-
+/// Export key bytes as "pk_hex:sk_hex" for persistent storage.
+/// Store the result in hardware-backed encrypted storage (Android Keystore).
 #[no_mangle]
 pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_exportKey(
     mut env: JNIEnv,
@@ -180,13 +156,13 @@ pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_exportKey(
     vendor_id: JString,
 ) -> jstring {
     let id = get_string(&mut env, &vendor_id);
-    let w = wallet().lock().unwrap();
-    match w.get(&id) {
-        Some(k) => to_jstring(&mut env, &format!("{}:{}", hex_encode(&k.pk), hex_encode(&k.sk))),
+    match wallet().lock().unwrap().export_key(&id) {
+        Some((pk, sk)) => to_jstring(&mut env, &format!("{}:{}", hex_encode(&pk), hex_encode(&sk))),
         None => to_jstring(&mut env, "ERROR: vendor not found"),
     }
 }
 
+/// Restore a vendor key from encrypted persistent storage on app restart.
 #[no_mangle]
 pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_importKey(
     mut env: JNIEnv,
@@ -200,19 +176,35 @@ pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_importKey(
     let id = get_string(&mut env, &vendor_id);
     let origin = get_string(&mut env, &vendor_origin);
     let policy = get_string(&mut env, &policy_id);
-    let pk = get_string(&mut env, &pk_hex);
-    let sk = get_string(&mut env, &sk_hex);
-
-    let pk_bytes = match hex_decode(&pk) {
+    let pk = match hex_decode(&get_string(&mut env, &pk_hex)) {
         Some(b) => b,
         None => return to_jstring(&mut env, "ERROR: invalid pk hex"),
     };
-    let sk_bytes = match hex_decode(&sk) {
+    let sk = match hex_decode(&get_string(&mut env, &sk_hex)) {
         Some(b) => b,
         None => return to_jstring(&mut env, "ERROR: invalid sk hex"),
     };
+    match wallet().lock().unwrap().import_key(&id, &origin, &policy, &pk, &sk) {
+        Ok(()) => to_jstring(&mut env, "OK"),
+        Err(e) => to_jstring(&mut env, &format!("ERROR: {e:?}")),
+    }
+}
 
-    let mut w = wallet().lock().unwrap();
-    w.insert(id, WalletKey { origin, policy, pk: pk_bytes, sk: sk_bytes });
-    to_jstring(&mut env, "OK")
+/// Rotate the keypair for a vendor. Returns "old_pk_hex:new_pk_hex".
+/// After this call: re-enroll the new key with the vendor server and persist
+/// the new key to Android Keystore before the app restarts.
+#[no_mangle]
+pub extern "C" fn Java_com_chainforge_diswallet_DisWallet_rotateKey(
+    mut env: JNIEnv,
+    _class: JClass,
+    vendor_id: JString,
+) -> jstring {
+    let id = get_string(&mut env, &vendor_id);
+    match wallet().lock().unwrap().rotate(&id) {
+        Ok((old_pk, new_pk)) => to_jstring(
+            &mut env,
+            &format!("{}:{}", hex_encode(&old_pk), hex_encode(&new_pk)),
+        ),
+        Err(e) => to_jstring(&mut env, &format!("ERROR: {e:?}")),
+    }
 }

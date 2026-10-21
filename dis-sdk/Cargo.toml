@@ -1,0 +1,14 @@
+[package]
+name = "dis-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Ergonomic Rust SDK for DIS-KS-V1 vendor (RP) and wallet integrations"
+
+[dependencies]
+dis-core = { path = "../dis-core" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = "0.4"
