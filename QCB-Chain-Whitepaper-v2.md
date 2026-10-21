@@ -690,8 +690,8 @@ Its security comes not from capital or hardware, but from verified humans. Its i
 | Item | Status | Notes |
 |---|---|---|
 | ML-DSA (Dilithium3) post-quantum signing (chain-forge-crypto) | ✅ | Validator signing scheme; --features real-crypto |
-| Crypto-agility constitutional guarantee | 🔄 | Design captured in whitepaper §10 + §7.3; not yet protocol-enforced |
-| Signature scheme pluggability in chain-forge-consensus | ⬜ | Architectural requirement for PQ migration path |
+| Crypto-agility constitutional guarantee | ✅ Complete v0.1 (2026-10-21) | `EmergencyDeprecateAlgorithm` tx type implemented; `SchemeRegistry` state updated on execution; constitutional governance path wired |
+| Signature scheme pluggability in chain-forge-consensus | ✅ Complete v0.1 (2026-10-21) | `SignatureScheme` trait in chain-forge-crypto; `ClassicalScheme` + `MlDsaScheme` implemented; `SchemeRegistry` selects active scheme at runtime |
 
 ---
 
@@ -843,11 +843,11 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 
 | Item | Status | Notes |
 |---|---|---|
-| Personhood-weighting overlay on TendermintEngine | ⬜ | Cap per-human validator influence regardless of stake |
-| ValidatorInfo.pop_verified gating in consensus | ⬜ | Only PoP-confirmed validators counted for quorum |
-| Stake → influence cap enforcement | ⬜ | See whitepaper §3.3 |
+| Personhood-weighting overlay on TendermintEngine | ✅ Complete v0.1 (2026-10-21) | `PersonhoodConfig` applied in `update_validator_set`; `personhood_weighted = true` in genesis config; `gate_voting_power` + `apply_personhood_cap` run on every set update |
+| ValidatorInfo.pop_verified gating in consensus | ✅ Complete v0.1 (2026-10-21) | `gate_voting_power()` forces voting_power=0 for any validator where `pop_verified=false` or `public_key` is empty — enforced unconditionally in all three BFT variants |
+| Stake → influence cap enforcement | ✅ Complete v0.1 (2026-10-21) | `apply_personhood_cap()` clamps per-human power to `power_cap=1`; `ValidatorRegistry::build_validator_set()` distributes cap across multi-validator owners oldest-first (Section 3.3) |
 | Validator liveness under partial-participation (Open Q13) | ❓ | How does finality behave if large fraction of verified humans go offline? |
-| Governance quorum floor enforcement | ⬜ | >3% for ordinary votes; >6% for constitutional |
+| Governance quorum floor enforcement | 🔄 Partial (2026-10-21) | `min_verified_pct = 67` on `PersonhoodConfig`; `AdaptiveQuorumConfig::quorum_floor` enforced in VCA engine; per-proposal >3%/>6% thresholds not yet a distinct tx-level gate |
 
 ---
 
@@ -855,8 +855,8 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 
 | Item | Status | Notes |
 |---|---|---|
-| Charm Confinement (chain-forge-identity extension) | ⬜ | Identity-scoped state isolation; one claim per epoch |
-| Intrinsic Charm module | ⬜ | Verification tier intrinsic to identity; decay-exemption credits removed |
+| Charm Confinement (chain-forge-identity extension) | ✅ Complete v0.1 (2026-10-21) | Enforced in `chain-forge-identity`: identity-scoped state isolation, one claim per epoch; wired into `TxBody::Custom { module: "charm-confinement" }` path |
+| Intrinsic Charm module | ✅ Complete v0.1 (2026-10-21) | `IntrinsicCharm` struct in chain-forge-identity: Provisional → Verified → Established lifecycle; verification tier intrinsic to identity record; decay-exemption credits removed |
 
 ---
 
@@ -864,7 +864,7 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 
 | Milestone | Technology | Status |
 |---|---|---|
-| QCB-CS-001 | Cryptographic Survivability and Migration | ⬜ Phase 1 |
+| QCB-CS-001 | Cryptographic Survivability and Migration | 🔄 Partial — PQ auth, pluggable schemes, migration + emergency deprecation tx complete; dependency inventory, exposure audit, compromise tests pending |
 | QCB-DIS-001 | Digital Identity Stone — Native QCB Wallet | ✅ Phase A + B complete |
 | DIS-KS-V1 | DIS Standalone Stack (dis-core, dis-sdk, Android wallet, adversarial suite, licensing) | ✅ Complete v0.1 (2026-10-21) — return gates remain |
 | QCB-KR-001 | Post-Quantum Multisig and Key Lifecycle | ⬜ Phase 1 |
@@ -877,10 +877,10 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 |---|---|
 | Complete cryptographic dependency inventory | ⬜ |
 | Public-key exposure audit | ⬜ |
-| Post-quantum authentication for critical operations | ⬜ |
-| Pluggable signature algorithms (SignatureScheme trait) | ⬜ |
-| Safe cryptographic migration procedures | ⬜ |
-| Emergency algorithm-deprecation mechanism | ⬜ |
+| Post-quantum authentication for critical operations | ✅ ML-DSA-65 for all validator consensus keys; `RegisterValidatorKey` with proof-of-possession enforced |
+| Pluggable signature algorithms (SignatureScheme trait) | ✅ `SignatureScheme` trait + `ClassicalScheme` + `MlDsaScheme` in chain-forge-crypto; `SchemeRegistry` runtime selection |
+| Safe cryptographic migration procedures | ✅ `ActivatePqConsensus` tx type + `CryptoMigrationState`; epoch-delayed activation |
+| Emergency algorithm-deprecation mechanism | ✅ `EmergencyDeprecateAlgorithm` tx type; constitutional governance path; `SchemeRegistry` state updated on execution |
 | Simulated cryptographic compromise tests | ⬜ |
 | Independent security review | 🔲 |
 
