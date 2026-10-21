@@ -10,3 +10,8 @@ __pycache__/
 
 # QCB-WALLET-001: encrypted wallet key files — never commit signing seeds
 *.wallet.json
+
+# SQLite state files — replaced by PostgreSQL (DIS-STATE-003)
+*.db
+*.db-shm
+*.db-wal

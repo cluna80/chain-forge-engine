@@ -1,4 +1,4 @@
-//! DIS vendor server — DIS-SEC-004 (vendor registration hardening).
+//! DIS vendor server — DIS-SEC-005 gap closures (challenge purge, token single-use, SQLite removal).
 //!
 //! All security state (vendors, enrolled keys, issued/consumed challenges,
 //! revocations, sessions) lives in one shared PostgreSQL database, so any
@@ -62,6 +62,11 @@ const CHALLENGE_TTL_SECS: i64 = 299;
 const ENROLL_NONCE_TTL_SECS: i64 = 300;
 const POLICY_ID: &str = "v1";
 const DB_NOW: &str = "EXTRACT(EPOCH FROM clock_timestamp())::BIGINT";
+/// How often the background purge task runs.
+const CHALLENGE_PURGE_INTERVAL_SECS: u64 = 600;
+/// Consumed challenges are kept for this many seconds after consumption before
+/// being purged (allows post-hoc audit of recent sessions).
+const CHALLENGE_PURGE_GRACE_SECS: i64 = 3600;
 
 #[derive(Clone)]
 struct AppState {
@@ -569,16 +574,34 @@ async fn register_vendor(
         return (StatusCode::FORBIDDEN, Json(json!({"status":"error","message":format!("origin ownership verification failed: {msg}")})));
     }
     finish(async {
+        let token_hash = sha256_hex(req.registration_token.as_bytes());
         let res_json = serde_json::to_string(&req.allowed_resources).unwrap();
         let act_json = serde_json::to_string(&req.allowed_actions).unwrap();
-        let inserted = sqlx::query(&format!(
+        // Atomically: mark the token used AND insert the vendor row.
+        // Either both succeed or neither does (transaction).
+        let mut tx = state.db.begin().await?;
+        // Claim the token. ON CONFLICT DO NOTHING; rows_affected == 0 means already used.
+        let token_inserted = sqlx::query(&format!(
+            "INSERT INTO used_registration_tokens (token_hash,vendor_id,used_at)
+             VALUES ($1,$2,{DB_NOW}) ON CONFLICT (token_hash) DO NOTHING"))
+            .bind(&token_hash).bind(&req.vendor_id)
+            .execute(&mut *tx).await?.rows_affected();
+        if token_inserted == 0 {
+            tx.rollback().await.ok();
+            return Ok(error("registration token already used"));
+        }
+        let vendor_inserted = sqlx::query(&format!(
             "INSERT INTO vendors (vendor_id,rp_origin,allowed_resources,allowed_actions,api_key_hash,registration_token_hash,origin_verified_at)
              VALUES ($1,$2,$3,$4,$5,$6,{DB_NOW}) ON CONFLICT (vendor_id) DO NOTHING"))
             .bind(&req.vendor_id).bind(&req.rp_origin).bind(res_json).bind(act_json)
             .bind(sha256_hex(req.api_key.as_bytes()))
-            .bind(sha256_hex(req.registration_token.as_bytes()))
-            .execute(&state.db).await?.rows_affected();
-        if inserted == 0 { return Ok(error("vendor already registered")); }
+            .bind(&token_hash)
+            .execute(&mut *tx).await?.rows_affected();
+        if vendor_inserted == 0 {
+            tx.rollback().await.ok();
+            return Ok(error("vendor already registered"));
+        }
+        tx.commit().await?;
         Ok(ok(json!({"status":"registered","vendor_id":req.vendor_id,"rp_origin":req.rp_origin,
             "message":"Vendor registered: origin ownership verified and identity persisted."})))
     }.await)
@@ -841,6 +864,39 @@ async fn main() {
         .no_proxy()
         .build().expect("failed to build HTTP client");
     let state = AppState { db: pool, admin_key_hash, registration_key_hash, http, allow_http_origins };
+
+    // Background task: purge expired/consumed challenge rows to keep the table
+    // bounded. Consumed rows are retained for CHALLENGE_PURGE_GRACE_SECS after
+    // consumption for audit purposes; purely expired (never-consumed) rows are
+    // removed immediately once past their TTL.
+    {
+        let purge_pool = state.db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                Duration::from_secs(CHALLENGE_PURGE_INTERVAL_SECS)
+            );
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                let result = sqlx::query(&format!(
+                    "DELETE FROM challenges WHERE
+                       (consumed_at IS NOT NULL
+                        AND consumed_at < {DB_NOW} - $1)
+                    OR (consumed_at IS NULL
+                        AND expires_at < {DB_NOW})"))
+                    .bind(CHALLENGE_PURGE_GRACE_SECS)
+                    .execute(&purge_pool).await;
+                match result {
+                    Ok(r) if r.rows_affected() > 0 =>
+                        eprintln!("challenge purge: removed {} row(s)", r.rows_affected()),
+                    Err(e) =>
+                        eprintln!("challenge purge error: {e}"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| "http://localhost:3000".into());
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
@@ -862,7 +918,7 @@ async fn main() {
         .layer(cors);
     let port = std::env::var("PORT").unwrap_or("3000".into());
     let addr = format!("0.0.0.0:{port}");
-    println!("DIS Vendor Server v0.5.0 (DIS-SEC-004) on {addr}");
+    println!("DIS Vendor Server v0.6.0 (DIS-SEC-005 gaps) on {addr}");
     println!("DB: PostgreSQL — {vendor_count} vendor(s), {key_count} key(s) in shared store");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

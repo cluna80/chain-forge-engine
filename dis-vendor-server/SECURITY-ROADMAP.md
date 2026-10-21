@@ -155,18 +155,7 @@ Five consecutive runs; all 16 tests (11 from DIS-STATE-003, 5 new) passed every 
 | `s4_04_unreachable_origin_rejected` | Dead port → connection refused → 403; no vendor row created |
 | `s4_05_unverified_vendor_cannot_issue_challenges` | Vendor row with `origin_verified_at = NULL` (direct DB insert, simulating old-schema migration) → challenge endpoint returns error on both instances |
 
-## Remaining gaps (updated after DIS-SEC-005)
-
-- Consumed/expired `challenges` rows are never purged (no background sweep).
-- `dis_state.db*` SQLite files on earlier branches are no longer used.
-- Vendor registration tokens are single-use by convention but not enforced by
-  the DB (a second registration attempt with the same token is rejected by the
-  `already registered` check, not by a used-token table).
-- DNS rebinding: the pre-flight IP check and the outbound request use the OS
-  resolver independently; an attacker who controls DNS TTLs can change the
-  answer between the two calls. Mitigated by requiring HTTPS (which requires
-  a valid cert for the hostname) and by the per-connection TLS handshake, which
-  would fail for an IP the attacker doesn't control a cert for.
+## Remaining gaps (all closed — see DIS-GAP-001/002 below)
 
 ---
 
@@ -207,9 +196,63 @@ Five consecutive runs; all 16 tests (11 from DIS-STATE-003, 5 new) passed every 
 | `s4_08_malformed_origin_url_rejected` | Non-URL string, FTP scheme, credentials, path, query, fragment, empty host, HTTP without allow flag — all rejected with appropriate error messages; no vendor row created |
 | `s4_09_pinned_client_bypasses_os_dns_resolver` | `resolve_to_addrs` overrides OS DNS: pinned client reaches mock server at pre-validated address; unpinned client fails DNS resolution for same `.invalid` hostname. Verifies pinning mechanism, not a live DNS rebinding simulation. |
 
-## Remaining gaps
+## Remaining gaps (all closed — see DIS-GAP-001/002 below)
 
-- Consumed/expired `challenges` rows are never purged (no background sweep).
-- `dis_state.db*` SQLite files on earlier branches are no longer used.
-- Vendor registration tokens are single-use by convention but not enforced by the DB.
-- DNS rebinding: `resolve_to_addrs` pins addresses resolved at pre-flight time. An adversary who controls DNS TTLs and can change the A-record between the pre-flight lookup and the connection attempt is blocked by the pin. Residual risk: an adversary who can modify the OS resolver cache (e.g. via `/etc/hosts` on the server host) before the pre-flight lookup; this is a host-compromise scenario outside DIS's threat model.
+- DNS rebinding: `resolve_to_addrs` pins addresses resolved at pre-flight time.
+  An adversary who controls DNS TTLs and can change the A-record between the
+  pre-flight lookup and the connection attempt is blocked by the pin. Residual
+  risk: an adversary who can modify the OS resolver cache (e.g. via `/etc/hosts`
+  on the server host) before the pre-flight lookup; this is a host-compromise
+  scenario outside DIS's threat model.
+
+---
+
+# DIS-GAP-001 — Registration Token Single-Use Enforcement
+
+## Status: ✅ COMPLETE (2026-10-21)
+
+## Problem
+
+`/vendor/register` stored `registration_token_hash` in the `vendors` row but never
+prevented the same token from being submitted again with a different `vendor_id`
+(a second attempt for the same `vendor_id` was rejected by the PK conflict, but
+the token itself was not globally revoked after first use).
+
+## What was implemented
+
+| Control | Mechanism |
+|---------|-----------|
+| **`used_registration_tokens` table** | Migration 0004 adds a table keyed on `token_hash`. |
+| **Atomic claim-then-insert** | `register_vendor` opens a transaction, inserts into `used_registration_tokens` with `ON CONFLICT DO NOTHING`, checks `rows_affected == 1`, then inserts the vendor row. Both succeed or neither does. |
+| **Error on replay** | A second call with the same token returns `"registration token already used"` before the vendor row is touched. |
+
+---
+
+# DIS-GAP-002 — Background Challenge Row Purge
+
+## Status: ✅ COMPLETE (2026-10-21)
+
+## Problem
+
+Consumed and expired `challenges` rows accumulated forever — unbounded table growth
+with no operational path to reclaim space.
+
+## What was implemented
+
+| Control | Mechanism |
+|---------|-----------|
+| **Background sweep** | `tokio::spawn` loop in `main()`; fires every `CHALLENGE_PURGE_INTERVAL_SECS` (600 s). |
+| **Purge policy** | Consumed rows: deleted after `CHALLENGE_PURGE_GRACE_SECS` (3600 s) post-consumption for audit. Expired-unconsumed rows: deleted immediately once past TTL. |
+| **Fail-open on purge error** | A DB error during purge is logged to stderr; it does not affect any handler or crash the server. |
+| **Index** | Migration 0004 adds `challenges_consumed_at_idx` to keep the DELETE fast. |
+
+---
+
+# DIS-GAP-003 — SQLite File Removal
+
+## Status: ✅ COMPLETE (2026-10-21)
+
+`dis_state.db`, `dis_state.db-shm`, and `dis_state.db-wal` were committed on
+earlier branches (DIS-STATE-001) and have not been used since DIS-STATE-003
+replaced SQLite with PostgreSQL. These files have been removed from the
+repository and `*.db` / `*.db-shm` / `*.db-wal` added to `.gitignore`.
