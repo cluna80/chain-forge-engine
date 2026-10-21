@@ -32,6 +32,9 @@ pub struct TxPrecheck {
     /// Populated from genesis `settlement_operators`. An empty list disables
     /// the ingress check (useful for chains that don't use the PoCD module).
     pub settlement_operators: Vec<String>,
+    /// Maximum accepted tx payload size in bytes (0 = unlimited).
+    /// Sourced from genesis `limits.max_tx_bytes`.
+    pub max_tx_bytes: usize,
 }
 
 pub async fn serve(
@@ -127,6 +130,17 @@ pub async fn serve(
                         let body = &request[body_start..];
 
                         match serde_json::from_str::<Transaction>(body) {
+                            Ok(tx) if chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes).is_err() => {
+                                let reason = chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes)
+                                    .unwrap_err();
+                                tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at mempool ingress (check_tx)");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
                             Ok(tx) if chain_forge_execution::module_check(&tx, &precheck.modules).is_err() => {
                                 let reason = chain_forge_execution::module_check(&tx, &precheck.modules)
                                     .unwrap_err();

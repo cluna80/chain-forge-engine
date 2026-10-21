@@ -1120,6 +1120,10 @@ impl Node {
         self.genesis.settlement_operators.clone()
     }
 
+    pub fn max_tx_bytes(&self) -> usize {
+        self.genesis.limits.max_tx_bytes as usize
+    }
+
     pub fn chain_id(&self) -> &str {
         &self.genesis.chain_id
     }

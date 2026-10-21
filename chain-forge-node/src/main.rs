@@ -181,6 +181,7 @@ async fn main() {
         require_signatures:   node.require_signatures(),
         modules:              node.enabled_modules(),
         settlement_operators: node.settlement_operators(),
+        max_tx_bytes:         node.max_tx_bytes(),
     };
     // Set the data directory for state persistence.
     if let Some(ref dir) = args.data_dir {
