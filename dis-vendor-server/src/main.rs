@@ -1,4 +1,4 @@
-//! DIS vendor server — DIS-STATE-003.
+//! DIS vendor server — DIS-SEC-004 (vendor registration hardening).
 //!
 //! All security state (vendors, enrolled keys, issued/consumed challenges,
 //! revocations, sessions) lives in one shared PostgreSQL database, so any
@@ -38,6 +38,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+// reqwest is used only for origin verification; pulled in via dev-deps too.
+use reqwest::Client as HttpClient;
 
 const SESSIONS_API_KEY: &str = "dis-sessions-key-change-in-production";
 /// Server-enforced challenge lifetime. Must match the `challenge_ttl` CHECK
@@ -53,16 +55,20 @@ struct AppState {
     db: PgPool,
     /// SHA-256 of DIS_ADMIN_API_KEY; None disables the admin endpoints.
     admin_key_hash: Option<[u8; 32]>,
+    /// SHA-256 of DIS_VENDOR_REGISTRATION_KEY; None disables /vendor/register.
+    registration_key_hash: Option<[u8; 32]>,
+    /// HTTP client used to verify vendor RP origin ownership.
+    http: HttpClient,
 }
 
 type Resp = (StatusCode, Json<Value>);
 type BearerAuth = Option<TypedHeader<Authorization<Bearer>>>;
 
-/// Admin endpoints require `Authorization: Bearer <DIS_ADMIN_API_KEY>`.
-/// Digests are compared in constant time.
-fn require_admin(state: &AppState, auth: &BearerAuth) -> Result<(), Resp> {
-    let Some(expected) = state.admin_key_hash else {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"status":"error","message":"admin API disabled — set DIS_ADMIN_API_KEY"}))));
+/// Compares a bearer token against a stored SHA-256 hash in constant time.
+/// Returns `Ok(())` only when the token is present and matches.
+fn require_key(expected: Option<[u8; 32]>, auth: &BearerAuth, disabled_msg: &str, required_msg: &str) -> Result<(), Resp> {
+    let Some(expected) = expected else {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"status":"error","message":disabled_msg}))));
     };
     let presented: [u8; 32] = match auth {
         Some(TypedHeader(Authorization(bearer))) => Sha256::digest(bearer.token().as_bytes()).into(),
@@ -70,15 +76,84 @@ fn require_admin(state: &AppState, auth: &BearerAuth) -> Result<(), Resp> {
     };
     let diff = expected.iter().zip(presented.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
     if auth.is_none() || diff != 0 {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"status":"error","message":"Authorization: Bearer <admin-key> required"}))));
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"status":"error","message":required_msg}))));
+    }
+    Ok(())
+}
+
+fn require_admin(state: &AppState, auth: &BearerAuth) -> Result<(), Resp> {
+    require_key(state.admin_key_hash, auth,
+        "admin API disabled — set DIS_ADMIN_API_KEY",
+        "Authorization: Bearer <admin-key> required")
+}
+
+fn require_registration_key(state: &AppState, auth: &BearerAuth) -> Result<(), Resp> {
+    require_key(state.registration_key_hash, auth,
+        "vendor registration disabled — set DIS_VENDOR_REGISTRATION_KEY",
+        "Authorization: Bearer <registration-key> required")
+}
+
+/// Well-known path where the vendor must publish its ownership token.
+const WELL_KNOWN_PATH: &str = "/.well-known/dis-vendor-registration";
+/// Maximum response body length accepted from the well-known endpoint.
+const WELL_KNOWN_MAX_BYTES: usize = 4096;
+/// Timeout for the outbound origin-verification request.
+const ORIGIN_VERIFY_TIMEOUT_MS: u64 = 5000;
+
+/// Verify that the caller controls `rp_origin` by fetching
+/// `{rp_origin}/.well-known/dis-vendor-registration` and checking that
+/// the response body contains the expected ownership token.
+///
+/// The ownership token is `SHA-256("{vendor_id}:{registration_token}")`,
+/// hex-encoded. The vendor pre-publishes it at the well-known URL before
+/// calling `/vendor/register`; the server verifies it here.
+///
+/// This binds the vendor identity to a specific origin: a registration
+/// token for `vendor-a` cannot be used to register `vendor-b` at the
+/// same origin, and a token from a different origin cannot claim
+/// `vendor-a`'s identity.
+async fn verify_origin_ownership(
+    http: &HttpClient,
+    rp_origin: &str,
+    vendor_id: &str,
+    registration_token: &str,
+) -> Result<(), &'static str> {
+    // Compute what the well-known endpoint must return.
+    let expected = sha256_hex(format!("{vendor_id}:{registration_token}").as_bytes());
+    let url = format!("{rp_origin}{WELL_KNOWN_PATH}");
+    let resp = http
+        .get(&url)
+        .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS))
+        .send().await
+        .map_err(|_| "could not reach rp_origin well-known endpoint")?;
+    if !resp.status().is_success() {
+        return Err("rp_origin well-known endpoint returned non-200");
+    }
+    let body = resp.bytes().await.map_err(|_| "could not read well-known response")?;
+    if body.len() > WELL_KNOWN_MAX_BYTES {
+        return Err("well-known response too large");
+    }
+    let body_str = std::str::from_utf8(&body)
+        .map_err(|_| "well-known response is not valid UTF-8")?
+        .trim();
+    if body_str != expected {
+        return Err("well-known token does not match expected value");
     }
     Ok(())
 }
 
 #[derive(Deserialize)]
 struct RegisterVendorRequest {
-    vendor_id: String, rp_origin: String,
-    allowed_resources: Vec<String>, allowed_actions: Vec<String>, api_key: String,
+    vendor_id: String,
+    rp_origin: String,
+    allowed_resources: Vec<String>,
+    allowed_actions: Vec<String>,
+    /// Per-vendor API key (stored as SHA-256; used for /sessions auth scoping in future).
+    api_key: String,
+    /// One-time registration token.  The vendor must pre-publish
+    /// `SHA-256("{vendor_id}:{registration_token}")` at
+    /// `{rp_origin}/.well-known/dis-vendor-registration`.
+    registration_token: String,
 }
 #[derive(Deserialize)]
 struct EnrollChallengeRequest { wallet_id: String }
@@ -151,23 +226,38 @@ async fn reset(State(state): State<AppState>, auth: BearerAuth) -> Resp {
     }.await)
 }
 
-async fn register_vendor(State(state): State<AppState>, Json(req): Json<RegisterVendorRequest>) -> Resp {
-    if req.vendor_id.is_empty() || req.rp_origin.is_empty() || req.api_key.is_empty() {
+async fn register_vendor(
+    State(state): State<AppState>,
+    auth: BearerAuth,
+    Json(req): Json<RegisterVendorRequest>,
+) -> Resp {
+    if let Err(denied) = require_registration_key(&state, &auth) { return denied; }
+    if req.vendor_id.is_empty() || req.rp_origin.is_empty()
+        || req.api_key.is_empty() || req.registration_token.is_empty() {
         return error("missing required fields");
     }
     // ':' is the challenge-key namespace separator.
     if req.vendor_id.contains(':') { return error("vendor_id must not contain ':'"); }
+    if req.registration_token.len() < 32 {
+        return error("registration_token must be at least 32 characters");
+    }
+    // Verify the vendor controls its declared rp_origin before writing anything.
+    if let Err(msg) = verify_origin_ownership(&state.http, &req.rp_origin, &req.vendor_id, &req.registration_token).await {
+        return (StatusCode::FORBIDDEN, Json(json!({"status":"error","message":format!("origin ownership verification failed: {msg}")})));
+    }
     finish(async {
         let res_json = serde_json::to_string(&req.allowed_resources).unwrap();
         let act_json = serde_json::to_string(&req.allowed_actions).unwrap();
-        let inserted = sqlx::query(
-            "INSERT INTO vendors (vendor_id,rp_origin,allowed_resources,allowed_actions,api_key_hash)
-             VALUES ($1,$2,$3,$4,$5) ON CONFLICT (vendor_id) DO NOTHING")
+        let inserted = sqlx::query(&format!(
+            "INSERT INTO vendors (vendor_id,rp_origin,allowed_resources,allowed_actions,api_key_hash,registration_token_hash,origin_verified_at)
+             VALUES ($1,$2,$3,$4,$5,$6,{DB_NOW}) ON CONFLICT (vendor_id) DO NOTHING"))
             .bind(&req.vendor_id).bind(&req.rp_origin).bind(res_json).bind(act_json)
             .bind(sha256_hex(req.api_key.as_bytes()))
+            .bind(sha256_hex(req.registration_token.as_bytes()))
             .execute(&state.db).await?.rows_affected();
         if inserted == 0 { return Ok(error("vendor already registered")); }
-        Ok(ok(json!({"status":"registered","vendor_id":req.vendor_id,"rp_origin":req.rp_origin,"message":"Vendor registered and persisted."})))
+        Ok(ok(json!({"status":"registered","vendor_id":req.vendor_id,"rp_origin":req.rp_origin,
+            "message":"Vendor registered: origin ownership verified and identity persisted."})))
     }.await)
 }
 
@@ -219,10 +309,14 @@ async fn challenge(State(state): State<AppState>, Json(req): Json<ChallengeReque
         let enrolled = sqlx::query("SELECT 1 FROM enrolled_keys WHERE wallet_id=$1")
             .bind(&req.wallet_id).fetch_optional(db).await?.is_some();
         if !enrolled { return Ok(error("wallet not enrolled")); }
-        let vendor = sqlx::query("SELECT rp_origin,allowed_resources,allowed_actions FROM vendors WHERE vendor_id=$1")
+        let vendor = sqlx::query("SELECT rp_origin,allowed_resources,allowed_actions,origin_verified_at FROM vendors WHERE vendor_id=$1")
             .bind(&req.vendor_id).fetch_optional(db).await?;
         let Some(vendor) = vendor else { return Ok(error("vendor not registered")) };
-        let (rp_origin, res_json, act_json): (String, String, String) = (vendor.get(0), vendor.get(1), vendor.get(2));
+        let (rp_origin, res_json, act_json, verified_at): (String, String, String, Option<i64>) =
+            (vendor.get(0), vendor.get(1), vendor.get(2), vendor.get(3));
+        if verified_at.is_none() {
+            return Ok(error("vendor origin not verified — registration incomplete"));
+        }
         let resources: Vec<String> = serde_json::from_str(&res_json).unwrap_or_default();
         if !resources.iter().any(|r| r == &req.resource_id || r == "*") {
             return Ok(error("resource not authorized for this vendor"));
@@ -387,7 +481,15 @@ async fn main() {
         Ok(_) => panic!("DIS_ADMIN_API_KEY must be at least 32 characters"),
         Err(_) => { eprintln!("DIS_ADMIN_API_KEY not set — /admin/* endpoints disabled"); None }
     };
-    let state = AppState { db: pool, admin_key_hash };
+    let registration_key_hash = match std::env::var("DIS_VENDOR_REGISTRATION_KEY") {
+        Ok(k) if k.len() >= 32 => Some(Sha256::digest(k.as_bytes()).into()),
+        Ok(_) => panic!("DIS_VENDOR_REGISTRATION_KEY must be at least 32 characters"),
+        Err(_) => { eprintln!("DIS_VENDOR_REGISTRATION_KEY not set — /vendor/register disabled"); None }
+    };
+    let http = HttpClient::builder()
+        .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS + 500))
+        .build().expect("failed to build HTTP client");
+    let state = AppState { db: pool, admin_key_hash, registration_key_hash, http };
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| "http://localhost:3000".into());
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
@@ -409,7 +511,7 @@ async fn main() {
         .layer(cors);
     let port = std::env::var("PORT").unwrap_or("3000".into());
     let addr = format!("0.0.0.0:{port}");
-    println!("DIS Vendor Server v0.4.0 (DIS-STATE-003) on {addr}");
+    println!("DIS Vendor Server v0.5.0 (DIS-SEC-004) on {addr}");
     println!("DB: PostgreSQL — {vendor_count} vendor(s), {key_count} key(s) in shared store");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

@@ -113,3 +113,54 @@ promoting to production.
   just-expired nonce can still pass a pre-check on an instance with clock
   skew relative to the DB. The `FOR UPDATE` path in `/enroll` re-reads
   the expiry from the DB, so actual acceptance requires the DB to agree.
+
+---
+
+# DIS-SEC-004 — Authenticated Vendor Registration
+
+## Status: ✅ COMPLETE (2026-10-21)
+
+## Problem
+
+`/vendor/register` was fully unauthenticated. Any caller could:
+- Claim an arbitrary vendor identity on first call (squatting).
+- Register a vendor pointing at an rp_origin they do not control
+  (origin confusion: a challenge issued under that vendor would carry
+  an rp_origin mismatch for any legitimate holder).
+
+## What was implemented
+
+| Control | Mechanism |
+|---------|-----------|
+| **Registration key** | `DIS_VENDOR_REGISTRATION_KEY` env var (≥ 32 chars, same constant-time check as admin key). Absent → HTTP 403 (disabled), wrong/missing token → 401. |
+| **Origin ownership proof** | Before writing to the DB the server fetches `{rp_origin}/.well-known/dis-vendor-registration` and checks that the response body equals `SHA-256("{vendor_id}:{registration_token}")`. Token binds to both the origin and the vendor identity, so it cannot be replayed across vendors or origins. |
+| **origin_verified_at column** | Set to `clock_timestamp()` on successful origin verification (migration 0003). Rows inserted without origin verification (e.g. migrated from an earlier schema) have `NULL` and cannot issue challenges. |
+| **Vendor identity immutability** | Once a vendor_id is registered, re-registration is rejected. The rp_origin is fixed at registration time. |
+
+## Ordering invariant for origin verification
+
+Origin ownership is verified **before** the vendor row is written to the
+database. An origin check that fails leaves no trace in the DB, so an
+attacker cannot partially claim an identity.
+
+## Acceptance tests — 5 new, 16/16 total passed (2026-10-21)
+
+Five consecutive runs; all 16 tests (11 from DIS-STATE-003, 5 new) passed every run.
+
+| Test | What is verified |
+|------|-----------------|
+| `s4_01_vendor_register_requires_registration_key` | Missing, wrong, truncated token → 401/403 on both instances; no vendor row created; correct key succeeds |
+| `s4_02_origin_ownership_verified_before_registration` | (a) nothing at well-known → 403; (b) wrong token → 403; (c) correct token → registered + `origin_verified_at` set; (d) replay of same vendor_id → rejected |
+| `s4_03_vendor_identity_takeover_prevented` | Squatting (second origin claiming same vendor_id) rejected; cross-token confusion (correct origin, wrong token binding) rejected; only one vendor row exists |
+| `s4_04_unreachable_origin_rejected` | Dead port → connection refused → 403; no vendor row created |
+| `s4_05_unverified_vendor_cannot_issue_challenges` | Vendor row with `origin_verified_at = NULL` (direct DB insert, simulating old-schema migration) → challenge endpoint returns error on both instances |
+
+## Remaining gaps (updated)
+
+- Consumed/expired `challenges` rows are never purged (no background sweep).
+- `dis_state.db*` SQLite files on earlier branches are no longer used.
+- Vendor registration tokens are single-use by convention but not enforced by
+  the DB (a second registration attempt with the same token is rejected by the
+  `already registered` check, not by a used-token table).
+- The well-known verification uses plain HTTP in tests; production deployments
+  should require HTTPS for the rp_origin to prevent MITM on the ownership proof.

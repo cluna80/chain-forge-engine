@@ -1,8 +1,10 @@
-//! DIS-STATE-003 acceptance tests: multi-instance and distributed-state security.
+//! DIS-STATE-003 / DIS-SEC-004 acceptance tests.
 //!
 //! Each test starts two independent `dis-vendor-server` processes that share a
 //! fresh PostgreSQL database. The servers reach Postgres through an in-test
 //! TCP proxy so a database outage can be simulated per test.
+//! A tiny in-process HTTP server plays the role of vendor origins (well-known
+//! endpoint) so origin-ownership verification can be tested without the network.
 //!
 //! Environment:
 //!   DIS_TEST_DATABASE_URL  admin connection, default postgres://postgres:postgres@127.0.0.1:5432/postgres
@@ -15,6 +17,7 @@ use futures::future::join_all;
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, PgPool};
 use std::{
     net::SocketAddr,
@@ -32,6 +35,68 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const TTL: i64 = 299;
 const ADMIN_KEY: &str = "test-admin-key-0123456789abcdef0123456789";
+const REGISTRATION_KEY: &str = "test-registration-key-0123456789abcdef0123456789";
+
+// ---------------------------------------------------------------- origin mock
+
+/// A tiny HTTP server that responds to `GET /.well-known/dis-vendor-registration`
+/// with the currently configured ownership token (or 404 when cleared).
+/// Each mock represents one rp_origin; tests set the token for the current
+/// registration attempt and clear it to simulate "nothing published".
+struct OriginMock {
+    port: u16,
+    /// `None` → 404; `Some(s)` → 200 with body `s`.
+    token: Arc<Mutex<Option<String>>>,
+    _handle: AbortHandle,
+}
+
+fn sha256_hex_test(b: &[u8]) -> String {
+    let h: [u8; 32] = Sha256::digest(b).into();
+    h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+impl OriginMock {
+    async fn start() -> Self {
+        let token: Arc<Mutex<Option<String>>> = Arc::default();
+        let token2 = token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        use axum::{routing::get as aGet, Router as ARouter};
+        let app = ARouter::new()
+            .route("/.well-known/dis-vendor-registration", aGet(move || {
+                let token = token2.clone();
+                async move {
+                    match token.lock().unwrap().clone() {
+                        Some(t) => (axum::http::StatusCode::OK, t),
+                        None    => (axum::http::StatusCode::NOT_FOUND, String::new()),
+                    }
+                }
+            }));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        }).abort_handle();
+        OriginMock { port, token, _handle: handle }
+    }
+
+    /// Compute and publish the ownership token for this vendor + registration_token.
+    /// Returns the token string (sha256("{vendor_id}:{registration_token}")).
+    fn set_token(&self, vendor_id: &str, registration_token: &str) -> String {
+        let t = sha256_hex_test(format!("{vendor_id}:{registration_token}").as_bytes());
+        *self.token.lock().unwrap() = Some(t.clone());
+        t
+    }
+
+    /// Remove the token (simulates "nothing published at the well-known path").
+    fn clear(&self) { *self.token.lock().unwrap() = None; }
+
+    /// Convenience: set_token is the common case; keep the old name as an alias.
+    fn register(&self, vendor_id: &str, registration_token: &str) -> String {
+        self.set_token(vendor_id, registration_token)
+    }
+
+    /// The rp_origin this mock represents (HTTP because tests don't need TLS).
+    fn origin(&self) -> String { format!("http://127.0.0.1:{}", self.port) }
+}
 
 fn admin_url() -> String {
     std::env::var("DIS_TEST_DATABASE_URL")
@@ -97,6 +162,7 @@ impl Server {
             .env("PORT", port.to_string())
             .env("DIS_DB_ACQUIRE_TIMEOUT_MS", "1500")
             .env("DIS_ADMIN_API_KEY", ADMIN_KEY)
+            .env("DIS_VENDOR_REGISTRATION_KEY", REGISTRATION_KEY)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn().expect("spawn dis-vendor-server");
@@ -123,6 +189,12 @@ impl Server {
         let code = r.status().as_u16();
         (code, r.json().await.unwrap_or(Value::Null))
     }
+    async fn post_with_reg_key(&self, path: &str, body: Value) -> (u16, Value) {
+        let r = http().post(format!("{}{path}", self.base)).json(&body)
+            .bearer_auth(REGISTRATION_KEY).send().await.unwrap();
+        let code = r.status().as_u16();
+        (code, r.json().await.unwrap_or(Value::Null))
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
@@ -134,11 +206,16 @@ fn http() -> reqwest::Client {
 
 // ---------------------------------------------------------------- cluster
 
-struct Cluster { a: Server, b: Server, proxy: DbProxy, db: PgPool, vendor: String }
+struct Cluster {
+    a: Server, b: Server, proxy: DbProxy, db: PgPool, vendor: String,
+    /// Mock HTTP server that answers well-known requests for the test vendor.
+    _mock: OriginMock,
+}
 
 impl Cluster {
     /// Fresh database, proxy, two server instances, one registered vendor.
     async fn start() -> Self {
+        let mock = OriginMock::start().await;
         let admin = admin_url();
         let mut conn = PgConnection::connect(&admin).await.expect("connect to admin Postgres");
         let db_name = format!("dis003_{}", rand_hex(6));
@@ -157,10 +234,14 @@ impl Cluster {
         let b = Server::start(&via_proxy).await;
         let db = PgPoolOptions::new().max_connections(5).connect(&direct).await.unwrap();
         let vendor = format!("vendor{}", rand_hex(4));
-        let (_, r) = a.post("/vendor/register", json!({"vendor_id":vendor,"rp_origin":"https://docs.example",
-            "allowed_resources":["doc:1"],"allowed_actions":["read"],"api_key":"k"})).await;
+        let reg_token = rand_hex(32);
+        mock.register(&vendor, &reg_token);
+        let (_, r) = a.post_with_reg_key("/vendor/register",
+            json!({"vendor_id":vendor,"rp_origin":mock.origin(),
+                   "allowed_resources":["doc:1"],"allowed_actions":["read"],
+                   "api_key":"k","registration_token":reg_token})).await;
         assert_eq!(r["status"], "registered", "{r}");
-        Cluster { a, b, proxy, db, vendor }
+        Cluster { a, b, proxy, db, vendor, _mock: mock }
     }
 }
 
@@ -620,4 +701,209 @@ async fn s3_11_enrollment_nonce_expires_and_is_single_use() {
     assert_eq!(status(&r), "enrolled", "{r}");
     let (_, r) = c.a.post("/enroll", body).await;
     assert_eq!(status(&r), "error", "nonce reuse must fail: {r}");
+}
+
+// ================================================================ DIS-SEC-004
+
+/// Registration requires the registration key; missing or wrong key → 401/403.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_01_vendor_register_requires_registration_key() {
+    let _g = SERIAL.lock().await;
+    let mock = OriginMock::start().await;
+    let admin = admin_url();
+    let mut conn = PgConnection::connect(&admin).await.unwrap();
+    let db_name = format!("dis003_{}", rand_hex(6));
+    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&mut conn).await.unwrap();
+    let base = admin.rsplit_once('/').unwrap().0.to_string();
+    let direct = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new().max_connections(2).connect(&direct).await.unwrap();
+    let via = format!("{}@127.0.0.1:5432/{db_name}", base.rsplit_once('@').unwrap().0);
+    let s = Server::start(&via).await;
+
+    let vendor = format!("vendor{}", rand_hex(4));
+    let reg_token = rand_hex(32);
+    mock.register(&vendor, &reg_token);
+    let body = json!({"vendor_id":vendor,"rp_origin":mock.origin(),
+        "allowed_resources":["doc:1"],"allowed_actions":["read"],
+        "api_key":"k","registration_token":reg_token});
+
+    // No token → 403 (endpoint disabled message) or 401
+    let r = http().post(format!("{}/vendor/register", s.base)).json(&body).send().await.unwrap();
+    assert!(r.status().as_u16() >= 401, "no token: {}", r.status());
+    // Wrong token → 401
+    let r = http().post(format!("{}/vendor/register", s.base)).json(&body)
+        .bearer_auth("wrong-token-0123456789abcdef0123456789").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    // Truncated token → 401
+    let r = http().post(format!("{}/vendor/register", s.base)).json(&body)
+        .bearer_auth(&REGISTRATION_KEY[..REGISTRATION_KEY.len()-1]).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    // Vendor must not have been created.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 0);
+    // Correct key succeeds.
+    let (code, r) = s.post_with_reg_key("/vendor/register", body).await;
+    assert_eq!(code, 200);
+    assert_eq!(status(&r), "registered", "{r}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 1);
+}
+
+/// Origin ownership verification: the server fetches the well-known token.
+/// A missing, wrong, or tampered token causes the registration to fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_02_origin_ownership_verified_before_registration() {
+    let _g = SERIAL.lock().await;
+    let mock = OriginMock::start().await;
+    let admin = admin_url();
+    let mut conn = PgConnection::connect(&admin).await.unwrap();
+    let db_name = format!("dis003_{}", rand_hex(6));
+    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&mut conn).await.unwrap();
+    let base = admin.rsplit_once('/').unwrap().0.to_string();
+    let direct = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new().max_connections(2).connect(&direct).await.unwrap();
+    let via = format!("{}@127.0.0.1:5432/{db_name}", base.rsplit_once('@').unwrap().0);
+    let s = Server::start(&via).await;
+
+    let vendor = format!("vendor{}", rand_hex(4));
+    let reg_token = rand_hex(32);
+
+    // (a) well-known endpoint serves nothing (mock not yet primed) → rejected
+    let body = json!({"vendor_id":vendor,"rp_origin":mock.origin(),
+        "allowed_resources":["doc:1"],"allowed_actions":["read"],
+        "api_key":"k","registration_token":reg_token});
+    let (code, r) = s.post_with_reg_key("/vendor/register", body.clone()).await;
+    assert_eq!(code, 403, "unprimed mock: {r}");
+    assert!(message(&r).contains("origin ownership"), "{r}");
+
+    // (b) well-known endpoint serves the wrong token (for a different vendor) → rejected
+    // set_token for "other-vendor" publishes SHA-256("other-vendor:…"), which will
+    // not match the server's expected SHA-256("{vendor}:{reg_token}").
+    mock.set_token("other-vendor", &rand_hex(32));
+    let (code, r) = s.post_with_reg_key("/vendor/register", body.clone()).await;
+    assert_eq!(code, 403, "wrong token: {r}");
+
+    // (c) well-known endpoint serves the right token → accepted
+    mock.register(&vendor, &reg_token);
+    let (code, r) = s.post_with_reg_key("/vendor/register", body.clone()).await;
+    assert_eq!(code, 200);
+    assert_eq!(status(&r), "registered", "{r}");
+    let verified: Option<i64> = sqlx::query_scalar("SELECT origin_verified_at FROM vendors WHERE vendor_id=$1")
+        .bind(&vendor).fetch_one(&db).await.unwrap();
+    assert!(verified.is_some(), "origin_verified_at must be set");
+
+    // (d) replay of the same vendor_id → rejected (already registered)
+    let (_, r) = s.post_with_reg_key("/vendor/register", body).await;
+    assert_eq!(status(&r), "error");
+    assert!(message(&r).contains("already"), "{r}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 1);
+}
+
+/// A vendor_id registered by one vendor cannot be claimed by a different rp_origin.
+/// Tests both squatting (taking an existing ID) and cross-origin confusion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_03_vendor_identity_takeover_prevented() {
+    let _g = SERIAL.lock().await;
+    // Two origin mocks = two independent vendors trying to claim the same vendor_id.
+    let mock_a = OriginMock::start().await;
+    let mock_b = OriginMock::start().await;
+    let admin = admin_url();
+    let mut conn = PgConnection::connect(&admin).await.unwrap();
+    let db_name = format!("dis003_{}", rand_hex(6));
+    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&mut conn).await.unwrap();
+    let base = admin.rsplit_once('/').unwrap().0.to_string();
+    let direct = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new().max_connections(2).connect(&direct).await.unwrap();
+    let via = format!("{}@127.0.0.1:5432/{db_name}", base.rsplit_once('@').unwrap().0);
+    let s = Server::start(&via).await;
+
+    let vendor_id = format!("vendor{}", rand_hex(4));
+
+    // Legitimate owner registers vendor_id at mock_a.
+    let reg_token_a = rand_hex(32);
+    mock_a.register(&vendor_id, &reg_token_a);
+    let (code, r) = s.post_with_reg_key("/vendor/register", json!({
+        "vendor_id":vendor_id,"rp_origin":mock_a.origin(),
+        "allowed_resources":["doc:1"],"allowed_actions":["read"],
+        "api_key":"k","registration_token":reg_token_a})).await;
+    assert_eq!(code, 200); assert_eq!(status(&r), "registered");
+
+    // Attacker at mock_b tries to claim the same vendor_id → rejected (already exists).
+    let reg_token_b = rand_hex(32);
+    mock_b.register(&vendor_id, &reg_token_b);
+    let (code, r) = s.post_with_reg_key("/vendor/register", json!({
+        "vendor_id":vendor_id,"rp_origin":mock_b.origin(),
+        "allowed_resources":["doc:1"],"allowed_actions":["read"],
+        "api_key":"k","registration_token":reg_token_b})).await;
+    assert!(message(&r).contains("already"), "squatting attempt should fail: {r}");
+
+    // The stored rp_origin is still mock_a's.
+    let stored_origin: String = sqlx::query_scalar("SELECT rp_origin FROM vendors WHERE vendor_id=$1")
+        .bind(&vendor_id).fetch_one(&db).await.unwrap();
+    assert_eq!(stored_origin, mock_a.origin());
+
+    // Attacker at mock_a tries to register their own vendor_id using mock_a
+    // but presents the registration_token meant for vendor_id → token mismatch.
+    let attacker_id = format!("vendor{}", rand_hex(4));
+    // mock_a still serves the token for vendor_id, not attacker_id.
+    let (code, r) = s.post_with_reg_key("/vendor/register", json!({
+        "vendor_id":attacker_id,"rp_origin":mock_a.origin(),
+        "allowed_resources":["doc:1"],"allowed_actions":["read"],
+        "api_key":"k","registration_token":reg_token_a})).await;
+    assert_eq!(code, 403, "cross-token confusion should fail: {r}");
+    assert!(message(&r).contains("origin ownership"), "{r}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 1, "only the legitimate vendor should be registered");
+}
+
+/// An unreachable rp_origin is rejected, not silently accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_04_unreachable_origin_rejected() {
+    let _g = SERIAL.lock().await;
+    let admin = admin_url();
+    let mut conn = PgConnection::connect(&admin).await.unwrap();
+    let db_name = format!("dis003_{}", rand_hex(6));
+    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&mut conn).await.unwrap();
+    let base = admin.rsplit_once('/').unwrap().0.to_string();
+    let direct = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new().max_connections(2).connect(&direct).await.unwrap();
+    let via = format!("{}@127.0.0.1:5432/{db_name}", base.rsplit_once('@').unwrap().0);
+    let s = Server::start(&via).await;
+
+    let vendor = format!("vendor{}", rand_hex(4));
+    let reg_token = rand_hex(32);
+    // A port that has no listener → connection refused → rejected.
+    let dead_origin = format!("http://127.0.0.1:{}", free_port());
+    let (code, r) = s.post_with_reg_key("/vendor/register", json!({
+        "vendor_id":vendor,"rp_origin":dead_origin,
+        "allowed_resources":["doc:1"],"allowed_actions":["read"],
+        "api_key":"k","registration_token":reg_token})).await;
+    assert_eq!(code, 403, "{r}");
+    assert!(message(&r).contains("origin ownership"), "{r}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&db).await.unwrap();
+    assert_eq!(count, 0, "dead origin must not create a vendor row");
+}
+
+/// A vendor registered without origin verification (direct DB insert, simulating
+/// a migration from an older schema) cannot issue challenges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_05_unverified_vendor_cannot_issue_challenges() {
+    let _g = SERIAL.lock().await;
+    let c = Cluster::start().await;
+    let w = Wallet::enroll(&c.a).await;
+    // Inject a vendor row without origin_verified_at (simulates old-schema row).
+    let bad_vendor = format!("badvendor{}", rand_hex(4));
+    sqlx::query("INSERT INTO vendors (vendor_id,rp_origin,allowed_resources,allowed_actions,api_key_hash) VALUES ($1,$2,$3,$4,$5)")
+        .bind(&bad_vendor).bind("https://bad.example")
+        .bind(r#"["doc:1"]"#).bind(r#"["read"]"#).bind("hash")
+        .execute(&c.db).await.unwrap();
+    let (_, r) = c.a.post("/challenge", json!({"wallet_id":w.id,"vendor_id":bad_vendor,
+        "resource_id":"doc:1","action":"read"})).await;
+    assert_eq!(status(&r), "error");
+    assert!(message(&r).contains("origin not verified"), "{r}");
+    let (_, r) = c.b.post("/challenge", json!({"wallet_id":w.id,"vendor_id":bad_vendor,
+        "resource_id":"doc:1","action":"read"})).await;
+    assert_eq!(status(&r), "error");
+    assert!(message(&r).contains("origin not verified"), "{r}");
 }
