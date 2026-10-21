@@ -5,10 +5,13 @@
 //! an experimental versioned profile pending external review and golden vectors.
 //! Existing Qattice DIS-AUTH-V1 is intentionally unchanged.
 
+pub mod delegation;
+pub mod privacy;
 pub mod verifier;
 pub mod wallet;
 
 use sha2::{Digest, Sha256};
+pub use hex;
 
 pub const DOMAIN: &[u8] = b"DIS-KS-V1\0";
 pub const SUITE_ML_DSA_65: u16 = 1;
@@ -154,6 +157,102 @@ mod tests {
         r.suite_id = 0;
         assert_eq!(canonical_request(&r), Err(Error::UnsupportedSuite));
     }
+    /// Golden vectors freeze the canonical transcript encoding so any accidental
+    /// wire-format change (field reordering, length prefix width, domain change)
+    /// breaks these tests immediately. Cross-platform implementations MUST produce
+    /// identical bytes for these inputs to be considered conformant.
+    ///
+    /// DO NOT update these constants without:
+    ///   1. A migration note explaining what changed and why.
+    ///   2. A new suite_id value (or version bump in DOMAIN) so existing signatures
+    ///      over the old format remain verifiable with the old constants.
+    ///   3. Updated vectors in any external client or SDK.
+    #[test]
+    fn golden_vector_no_operation_digest() {
+        // Fixed inputs — never change these without updating the frozen constants below.
+        let r = Request {
+            suite_id: SUITE_ML_DSA_65,
+            rp_id: "vendor-a".into(),
+            rp_origin: "https://vendor-a.example".into(),
+            challenge_id: [0x01; 16],
+            nonce: [0x02; 16],
+            issued_at: 1_000_000,
+            expires_at: 1_000_299,
+            resource_id: "document:123".into(),
+            action: "read".into(),
+            scopes: vec!["document:read".into()],
+            operation_digest: None,
+            policy_id: "v1".into(),
+        };
+        // Frozen canonical bytes for DIS-KS-V1 / SUITE_ML_DSA_65, no operation_digest.
+        const GOLDEN_BYTES: &str =
+            "4449532d4b532d5631000001\
+             000876656e646f722d61\
+             001868747470733a2f2f76656e646f722d612e6578616d706c65\
+             01010101010101010101010101010101\
+             02020202020202020202020202020202\
+             00000000000f4240\
+             00000000000f436b\
+             000c646f63756d656e743a313233\
+             00047265616400010\
+             00d646f63756d656e743a726561640000027631";
+        // Frozen SHA-256 of the canonical bytes above.
+        const GOLDEN_DIGEST: &str =
+            "7dd82b7c4bca9b16f29f07cada6d32cc5ad8e7e9179dc5ea075814d48cfe313e";
+
+        let bytes = canonical_request(&r).unwrap();
+        let got_bytes = hex::encode(&bytes);
+        let expected: String = GOLDEN_BYTES.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(got_bytes, expected,
+            "canonical_request encoding changed — update golden vectors and migration docs");
+        let got_digest = hex::encode(Sha256::digest(&bytes));
+        assert_eq!(got_digest, GOLDEN_DIGEST,
+            "SHA-256 of canonical bytes changed");
+    }
+
+    #[test]
+    fn golden_vector_with_operation_digest() {
+        let r = Request {
+            suite_id: SUITE_ML_DSA_65,
+            rp_id: "vendor-a".into(),
+            rp_origin: "https://vendor-a.example".into(),
+            challenge_id: [0x01; 16],
+            nonce: [0x02; 16],
+            issued_at: 1_000_000,
+            expires_at: 1_000_299,
+            resource_id: "payment:456".into(),
+            action: "submit".into(),
+            scopes: vec!["payment:submit".into()],
+            operation_digest: Some([0xab; 32]),
+            policy_id: "v1".into(),
+        };
+        // Frozen canonical bytes for DIS-KS-V1 / SUITE_ML_DSA_65, with operation_digest.
+        const GOLDEN_BYTES: &str =
+            "4449532d4b532d5631000001\
+             000876656e646f722d61\
+             001868747470733a2f2f76656e646f722d612e6578616d706c65\
+             01010101010101010101010101010101\
+             02020202020202020202020202020202\
+             00000000000f4240\
+             00000000000f436b\
+             000b7061796d656e743a343536\
+             00067375626d69740001\
+             000e7061796d656e743a7375626d697401\
+             abababababababababababababababababababababababababababababababab\
+             00027631";
+        const GOLDEN_DIGEST: &str =
+            "4f68506a27857dbc0f792ebca669fd3953318cbd1fce868de2752552c6f51731";
+
+        let bytes = canonical_request(&r).unwrap();
+        let got_bytes = hex::encode(&bytes);
+        let expected: String = GOLDEN_BYTES.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(got_bytes, expected,
+            "canonical_request encoding changed — update golden vectors and migration docs");
+        let got_digest = hex::encode(Sha256::digest(&bytes));
+        assert_eq!(got_digest, GOLDEN_DIGEST,
+            "SHA-256 of canonical bytes changed");
+    }
+
     #[test]
     fn rejects_noncanonical_scopes_and_fields() {
         let mut r = example();

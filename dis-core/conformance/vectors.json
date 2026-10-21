@@ -1,0 +1,46 @@
+{
+  "version": "DIS-KS-V1",
+  "suite": "ML-DSA-65",
+  "domain_hex": "4449532d4b532d563100",
+  "note": "canonical_request() output. Implementations MUST reproduce these bytes exactly before attempting ML-DSA-65 signing.",
+  "vectors": [
+    {
+      "id": "basic-read",
+      "description": "Single scope, no operation_digest",
+      "request": {
+        "suite_id": 1,
+        "rp_id": "vendor-acme",
+        "rp_origin": "https://acme.example.com",
+        "challenge_id": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],
+        "nonce": [16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1],
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "resource_id": "document:001",
+        "action": "read",
+        "scopes": ["document:read"],
+        "operation_digest": null,
+        "policy_id": "v1"
+      },
+      "canonical_hex": "4449532d4b532d5631000001000b76656e646f722d61636d65001868747470733a2f2f61636d652e6578616d706c652e636f6d0102030405060708090a0b0c0d0e0f10100f0e0d0c0b0a090807060504030201000000006553f100000000006553f22c000c646f63756d656e743a3030310004726561640001000d646f63756d656e743a726561640000027631"
+    },
+    {
+      "id": "multi-scope-with-digest",
+      "description": "Two scopes (sorted), with operation_digest",
+      "request": {
+        "suite_id": 1,
+        "rp_id": "vendor-beta",
+        "rp_origin": "https://beta.example.com",
+        "challenge_id": [170,170,170,170,170,170,170,170,170,170,170,170,170,170,170,170],
+        "nonce": [187,187,187,187,187,187,187,187,187,187,187,187,187,187,187,187],
+        "issued_at": 1700001000,
+        "expires_at": 1700001299,
+        "resource_id": "invoice:42",
+        "action": "approve",
+        "scopes": ["invoice:approve", "invoice:read"],
+        "operation_digest": "abababababababababababababababababababababababababababababababababab",
+        "policy_id": "v1"
+      },
+      "canonical_hex": "4449532d4b532d5631000001000b76656e646f722d62657461001868747470733a2f2f626574612e6578616d706c652e636f6daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000006553f4e8000000006553f613000a696e766f6963653a34320007617070726f76650002000f696e766f6963653a617070726f7665000c696e766f6963653a7265616401abababababababababababababababababababababababababababababababab00027631"
+    }
+  ]
+}

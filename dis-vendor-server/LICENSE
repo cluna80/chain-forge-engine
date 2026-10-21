@@ -1,19 +1,14 @@
 Business Source License 1.1
 
-Licensor: cluna80
-Licensed Work: DIS Android SDK and DIS Vendor Server
-                (dis-wallet-android/ and dis-vendor-server/)
-Additional Use Grant: You may use the Licensed Work for non-commercial,
-                      personal, research, or evaluation purposes only.
-Change Date: 2029-01-01
-Change License: Apache License, Version 2.0
-
-For commercial use, including but not limited to:
-- Integrating DIS into a commercial product or service
-- Using DIS to authenticate users in a paid application
-- Offering DIS as part of a vendor authentication service
-
-A commercial license is required. Contact: cluna80@github.com
+Licensor:             Luna Krizz
+Licensed Work:        ChainForge DIS Vendor Server
+                      The Licensed Work is (c) 2026 Luna Krizz
+Additional Use Grant: You may use the Licensed Work for any purpose other than
+                      a Competing Use. A "Competing Use" means offering the
+                      Licensed Work or a substantially similar product as a
+                      hosted or managed service to third parties.
+Change Date:          2030-01-01
+Change License:       Apache License, Version 2.0
 
 -----------------------------------------------------------------------------
 
@@ -22,9 +17,8 @@ Business Source License 1.1
 Terms
 
 The Licensor hereby grants you the right to copy, modify, create derivative
-works, redistribute, and make non-production use of the Licensed Work.
-
-The Licensor may make an Additional Use Grant, above, permitting limited
+works, redistribute, and make non-production use of the Licensed Work. The
+Licensor may make an Additional Use Grant, above, permitting limited
 production use.
 
 Effective on the Change Date, or the fourth anniversary of the first publicly
@@ -61,3 +55,28 @@ AN "AS IS" BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS,
 EXPRESS OR IMPLIED, INCLUDING (WITHOUT LIMITATION) WARRANTIES OF
 MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND
 TITLE.
+
+MariaDB hereby grants you permission to use this License's text to license
+your works, and to refer to it using the trademark "Business Source License",
+as long as you comply with the Covenants of Licensor below.
+
+Covenants of Licensor
+
+In consideration of the right to use this License's text and the "Business
+Source License" name and trademark, Licensor covenants to MariaDB, and to all
+recipients of the licensed work to be provided by Licensor:
+
+1. To specify as the Change License the GPL Version 2.0 or any later version,
+   or a license that is compatible with GPL Version 2.0 or a later version,
+   where "compatible" means that software provided under the Change License can
+   be included in a program with software provided under GPL Version 2.0 or a
+   later version. Licensor may specify additional Change Licenses without
+   limitation.
+
+2. To either: (a) specify an additional grant of rights to use that does not
+   impose any additional restriction on the right granted in this License, as
+   the Additional Use Grant; or (b) insert the text "None".
+
+3. To specify a Change Date.
+
+4. Not to modify this License in any other way.
