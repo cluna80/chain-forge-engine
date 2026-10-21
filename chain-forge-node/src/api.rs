@@ -137,10 +137,34 @@ pub async fn serve(
                         // unicode-expansion attacks (tiny chars → huge allocations)
                         // cannot consume resources in the deserialiser.
                         let raw_limit = if precheck.max_tx_bytes > 0 { precheck.max_tx_bytes } else { 1_048_576 };
-                        if body.len() > raw_limit {
+                        // F8b: JSON nesting-depth guard against deeply-nested
+                        // payloads that cause stack exhaustion in the parser.
+                        const MAX_JSON_DEPTH: usize = 32;
+                        let json_depth = {
+                            let mut depth = 0usize;
+                            let mut max_d = 0usize;
+                            let mut in_str = false;
+                            let mut esc = false;
+                            for b in body.bytes() {
+                                if esc { esc = false; continue; }
+                                if b == b'\\' && in_str { esc = true; continue; }
+                                if b == b'"' { in_str = !in_str; continue; }
+                                if in_str { continue; }
+                                if b == b'[' || b == b'{' { depth += 1; if depth > max_d { max_d = depth; } }
+                                if b == b']' || b == b'}' { depth = depth.saturating_sub(1); }
+                            }
+                            max_d
+                        };
+                        if body.len() >= raw_limit {
                             let resp = serde_json::json!({
                                 "status": "rejected",
                                 "message": format!("request body too large: {} bytes, limit {}", body.len(), raw_limit)
+                            });
+                            http_400_json(&resp.to_string())
+                        } else if json_depth > MAX_JSON_DEPTH {
+                            let resp = serde_json::json!({
+                                "status": "rejected",
+                                "message": format!("request body nesting depth {json_depth} exceeds limit {MAX_JSON_DEPTH}")
                             });
                             http_400_json(&resp.to_string())
                         } else { match serde_json::from_str::<Transaction>(body) {
@@ -162,6 +186,17 @@ pub async fn serve(
                                     "status": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            // F1/F7: reject committed-tx replays at ingress rather than
+                            // silently ignoring them after the 200 response is sent.
+                            Ok(tx) if explorer.lock().unwrap().txs.contains_key(&tx.id) => {
+                                tracing::info!(tx_id = %tx.id, "committed-tx replay rejected at ingress");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": "transaction already committed — replay not permitted"
                                 });
                                 http_400_json(&resp.to_string())
                             }

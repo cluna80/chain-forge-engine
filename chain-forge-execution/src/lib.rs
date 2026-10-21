@@ -1730,6 +1730,12 @@ pub fn check_tx(tx: &Transaction, max_tx_bytes: usize, block_gas_limit: u64) -> 
     if tx.gas_limit == 0 {
         return Err("gas_limit must be > 0".into());
     }
+    // F3: floor prevents dust-gas attacks; any real operation needs at least
+    // this much gas to be worth including.
+    const MIN_GAS_FLOOR: u64 = 1_000;
+    if tx.gas_limit < MIN_GAS_FLOOR {
+        return Err(format!("gas_limit {g} is below minimum {MIN_GAS_FLOOR}", g = tx.gas_limit));
+    }
     if block_gas_limit > 0 && tx.gas_limit > block_gas_limit {
         return Err(format!(
             "gas_limit {g} exceeds block_gas_limit {b}",
@@ -1757,11 +1763,23 @@ pub fn check_tx(tx: &Transaction, max_tx_bytes: usize, block_gas_limit: u64) -> 
         if !to.starts_with("qcb1") {
             return Err(format!("Transfer.to has invalid address prefix (expected qcb1): {to}"));
         }
+        // F2: self-send burns no value but wastes block space.
+        if *to == tx.sender {
+            return Err("Transfer.to must differ from sender (self-send not permitted)".into());
+        }
         if denom.is_empty() {
             return Err("Transfer.denom must not be empty".into());
         }
+        // F2: single-token chain — only uqcb is a valid transfer denom.
+        if denom != "uqcb" {
+            return Err(format!("Transfer.denom '{denom}' is not accepted; use 'uqcb'"));
+        }
     }
     // Structural signature checks: wrong-length blobs are always invalid.
+    // F5: all-zero public key is not a valid Ed25519 key.
+    if !tx.public_key.is_empty() && tx.public_key.iter().all(|&b| b == 0) {
+        return Err("public_key must not be all zeros".into());
+    }
     if !tx.signature.is_empty() && tx.signature.len() != 64 {
         return Err(format!(
             "malformed Ed25519 signature: expected 64 bytes, got {}",
@@ -5909,5 +5927,36 @@ mod tests {
         let tx = minimal_tx("qcb1alice", 100_000);
         // max_tx_bytes = 1 forces rejection of any real tx
         assert!(check_tx(&tx, 1, 0).is_err(), "oversized tx must be rejected");
+    }
+
+    #[test]
+    fn check_tx_rejects_below_gas_floor() {
+        let tx = minimal_tx("qcb1alice", 1);
+        assert!(check_tx(&tx, 0, 0).is_err(), "gas_limit=1 must be rejected (below floor)");
+    }
+
+    #[test]
+    fn check_tx_rejects_self_send() {
+        let mut tx = minimal_tx("qcb1alice", 100_000);
+        if let TxBody::Transfer { ref mut to, .. } = tx.body {
+            *to = "qcb1alice".into();
+        }
+        assert!(check_tx(&tx, 0, 0).is_err(), "self-send must be rejected");
+    }
+
+    #[test]
+    fn check_tx_rejects_unknown_denom() {
+        let mut tx = minimal_tx("qcb1alice", 100_000);
+        if let TxBody::Transfer { ref mut denom, .. } = tx.body {
+            *denom = "notacoin".into();
+        }
+        assert!(check_tx(&tx, 0, 0).is_err(), "unknown denom must be rejected");
+    }
+
+    #[test]
+    fn check_tx_rejects_zeroed_pubkey() {
+        let mut tx = minimal_tx("qcb1alice", 100_000);
+        tx.public_key = vec![0u8; 32];
+        assert!(check_tx(&tx, 0, 0).is_err(), "all-zero public_key must be rejected");
     }
 }
