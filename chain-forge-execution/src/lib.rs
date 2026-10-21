@@ -45,6 +45,49 @@ use chain_forge_pocd::DiscoveryRegistry;
 /// ROADMAP.md, "Validator Onboarding" section.
 pub mod validator_bond;
 
+/// Deserialize a `Vec<u8>` from either a JSON byte-array `[0,1,2,…]` or a
+/// lowercase hex string `"0102…"`.  Blockchain clients (Python, JS, Go) almost
+/// universally encode byte fields as hex strings, but Rust's default serde
+/// for `Vec<u8>` only accepts the integer-array form.  Using this deserializer
+/// instead of `#[serde(default)]` means a hex-encoded zeroed public key such
+/// as `"000…0"` is parsed as 32 zero bytes rather than silently falling back
+/// to an empty Vec, which was the root cause of the F5 pubkey=zeroed bypass.
+fn deser_hex_or_bytes<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where D: serde::Deserializer<'de>
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    struct HexOrBytes;
+    impl<'de> Visitor<'de> for HexOrBytes {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "hex string or byte array")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+            if v.is_empty() { return Ok(Vec::new()); }
+            if v.len() % 2 != 0 {
+                return Err(de::Error::custom("hex string length must be even"));
+            }
+            (0..v.len()).step_by(2)
+                .map(|i| u8::from_str_radix(&v[i..i + 2], 16)
+                    .map_err(|_| de::Error::custom(format!("invalid hex byte at position {i}"))))
+                .collect()
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut bytes = Vec::new();
+            while let Some(b) = seq.next_element::<u8>()? { bytes.push(b); }
+            Ok(bytes)
+        }
+        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> { Ok(v.to_vec()) }
+        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> { Ok(v) }
+        fn visit_unit<E: de::Error>(self) -> Result<Vec<u8>, E> { Ok(Vec::new()) }
+        fn visit_none<E: de::Error>(self) -> Result<Vec<u8>, E> { Ok(Vec::new()) }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Vec<u8>, D2::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    d.deserialize_any(HexOrBytes)
+}
+
 // -- Error --------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -751,12 +794,12 @@ pub struct Transaction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig_scheme: Option<SchemeId>,
     /// Ed25519 signature over signing_bytes(chain_id). Empty when unsigned.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_hex_or_bytes")]
     pub signature: Vec<u8>,
     /// Ed25519 public key (32 bytes) that produced `signature`. Must either
     /// match the key bound to `sender`, or -- for an account with no bound
     /// key yet -- be the key `sender` was derived from.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_hex_or_bytes")]
     pub public_key: Vec<u8>,
     /// Post-quantum signature tags.  Each entry is `"<scheme>:<hex>"`, e.g.
     /// `"mldsa65:<3293-byte-sig-hex>"`.  Empty for unsigned or Ed25519-only txs.
@@ -773,7 +816,7 @@ pub struct Transaction {
     /// ML-DSA-65 public key (1952 bytes) supplied on the FIRST signed tx from a
     /// PQ wallet so the executor can bind it to the account and verify future txs.
     /// Ignored (and may be empty) once the account already has a bound PQ key.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_hex_or_bytes")]
     pub pq_public_key: Vec<u8>,
 }
 
@@ -1727,6 +1770,14 @@ pub fn check_tx(tx: &Transaction, max_tx_bytes: usize, block_gas_limit: u64) -> 
     if tx.sender.is_empty() {
         return Err("sender must not be empty".into());
     }
+    // F1: nonce=0 is reserved; valid txs start at nonce=1.
+    // nonce=u64::MAX is rejected to prevent overflow on the next increment.
+    if tx.nonce == 0 {
+        return Err("nonce must be ≥ 1 (first transaction uses nonce 1)".into());
+    }
+    if tx.nonce == u64::MAX {
+        return Err("nonce u64::MAX is reserved and not permitted".into());
+    }
     if tx.gas_limit == 0 {
         return Err("gas_limit must be > 0".into());
     }
@@ -1735,6 +1786,15 @@ pub fn check_tx(tx: &Transaction, max_tx_bytes: usize, block_gas_limit: u64) -> 
     const MIN_GAS_FLOOR: u64 = 1_000;
     if tx.gas_limit < MIN_GAS_FLOOR {
         return Err(format!("gas_limit {g} is below minimum {MIN_GAS_FLOOR}", g = tx.gas_limit));
+    }
+    // F3: hard ceiling — reject gas values that would overflow arithmetic
+    // regardless of whether block_gas_limit is configured (0 = unconfigured).
+    const ABSOLUTE_GAS_CAP: u64 = 100_000_000_000; // 100B gas units
+    if tx.gas_limit > ABSOLUTE_GAS_CAP {
+        return Err(format!(
+            "gas_limit {g} exceeds absolute cap {ABSOLUTE_GAS_CAP}",
+            g = tx.gas_limit
+        ));
     }
     if block_gas_limit > 0 && tx.gas_limit > block_gas_limit {
         return Err(format!(
@@ -5930,6 +5990,26 @@ mod tests {
         let tx = minimal_tx("qcb1alice", 100_000);
         // max_tx_bytes = 1 forces rejection of any real tx
         assert!(check_tx(&tx, 1, 0).is_err(), "oversized tx must be rejected");
+    }
+
+    #[test]
+    fn check_tx_rejects_nonce_zero() {
+        let mut tx = minimal_tx("qcb1alice", 100_000);
+        tx.nonce = 0;
+        assert!(check_tx(&tx, 0, 0).is_err(), "nonce=0 must be rejected");
+    }
+
+    #[test]
+    fn check_tx_rejects_nonce_u64_max() {
+        let mut tx = minimal_tx("qcb1alice", 100_000);
+        tx.nonce = u64::MAX;
+        assert!(check_tx(&tx, 0, 0).is_err(), "nonce=u64::MAX must be rejected");
+    }
+
+    #[test]
+    fn check_tx_rejects_gas_above_absolute_cap() {
+        let tx = minimal_tx("qcb1alice", u64::MAX);
+        assert!(check_tx(&tx, 0, 0).is_err(), "gas=u64::MAX must be rejected by absolute cap");
     }
 
     #[test]
