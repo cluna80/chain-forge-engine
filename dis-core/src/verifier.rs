@@ -27,6 +27,8 @@ pub enum VerifyError {
     Challenge,
     #[error("key has been revoked")]
     Revoked,
+    #[error("suite_id below RP minimum; possible downgrade attempt")]
+    DowngradedSuite,
 }
 
 /// A local RP decides its own exact resource/action/scope permissions.
@@ -37,6 +39,11 @@ pub struct RpPolicy {
     pub rp_origin: String,
     pub policy_id: String,
     pub grants: HashSet<(String, String, String)>, // (resource, action, scope)
+    /// Minimum acceptable suite_id. Any request with suite_id < min_suite_id
+    /// is rejected at issue time and re-checked at verify time (belt-and-suspenders).
+    /// Set to SUITE_ML_DSA_65 for current deployments; raise when migrating to a
+    /// stronger suite to prevent downgrade attacks from legacy wallets.
+    pub min_suite_id: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +110,9 @@ impl RelyingParty {
     /// Only register requests issued by this RP, never wallet-supplied requests.
     pub fn issue(&mut self, mut request: Request) -> Result<Request, VerifyError> {
         self.check_audience(&request)?;
+        if request.suite_id < self.policy.min_suite_id {
+            return Err(VerifyError::DowngradedSuite);
+        }
         canonical_request(&request)?;
         getrandom::getrandom(&mut request.challenge_id).map_err(|_| VerifyError::Challenge)?;
         getrandom::getrandom(&mut request.nonce).map_err(|_| VerifyError::Challenge)?;
@@ -136,6 +146,11 @@ impl RelyingParty {
         now: u64,
     ) -> Result<(), VerifyError> {
         self.check_audience(request)?;
+        // Re-check suite_id: a replayed or tampered request must not slip through
+        // with a weaker suite than the RP now requires.
+        if request.suite_id < self.policy.min_suite_id {
+            return Err(VerifyError::DowngradedSuite);
+        }
         let transcript = canonical_request(request)?;
         if now < request.issued_at || now >= request.expires_at {
             return Err(VerifyError::Time);
@@ -198,6 +213,10 @@ mod tests {
     use crate::SUITE_ML_DSA_65;
 
     fn rp(name: &str, resource: &str, action: &str, scope: &str) -> RelyingParty {
+        rp_min(name, resource, action, scope, SUITE_ML_DSA_65)
+    }
+
+    fn rp_min(name: &str, resource: &str, action: &str, scope: &str, min_suite: u16) -> RelyingParty {
         let mut grants = HashSet::new();
         grants.insert((resource.into(), action.into(), scope.into()));
         RelyingParty::new(RpPolicy {
@@ -205,6 +224,7 @@ mod tests {
             rp_origin: format!("https://{name}.example"),
             policy_id: "v1".into(),
             grants,
+            min_suite_id: min_suite,
         })
     }
     fn request(name: &str, resource: &str, action: &str, scope: &str) -> Request {
@@ -357,6 +377,42 @@ mod tests {
         let req_c = c.issue(request("payments", "payment:1", "submit", "payment:submit")).unwrap();
         let proof_c = sign_for_test(&req_c, sk_c.as_bytes(), pk_c.as_bytes()).unwrap();
         assert_eq!(c.verify(&req_c, &proof_c, 1010), Ok(()));
+    }
+
+    #[test]
+    fn downgrade_rejected_at_issue() {
+        // RP requires suite 2 (future); wallet presents suite 1 → rejected before challenge is issued.
+        let mut a = rp_min("docs", "doc:1", "read", "document:read", 2);
+        let mut req = request("docs", "doc:1", "read", "document:read");
+        req.suite_id = 1;
+        assert_eq!(a.issue(req), Err(VerifyError::DowngradedSuite));
+    }
+
+    #[test]
+    fn downgrade_rejected_at_verify_belt_and_suspenders() {
+        // Simulate a tampered request: issued with suite 2 (accepted), then suite_id
+        // field mutated to 1 before submission. The verify re-check catches it.
+        let (pk, sk) = dilithium3::keypair();
+        let mut a = rp_min("docs", "doc:1", "read", "document:read", 1);
+        a.enroll_test_key(pk.as_bytes()).unwrap();
+        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+
+        // Raise the RP's minimum AFTER issue (simulating a policy upgrade mid-session).
+        a.policy.min_suite_id = 2;
+
+        let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
+        assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::DowngradedSuite));
+    }
+
+    #[test]
+    fn current_suite_meets_minimum() {
+        // Sanity: min_suite_id == SUITE_ML_DSA_65 accepts suite 1 normally.
+        let (pk, sk) = dilithium3::keypair();
+        let mut a = rp_min("docs", "doc:1", "read", "document:read", SUITE_ML_DSA_65);
+        a.enroll_test_key(pk.as_bytes()).unwrap();
+        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
+        assert_eq!(a.verify(&req, &proof, 1010), Ok(()));
     }
 
     #[test]

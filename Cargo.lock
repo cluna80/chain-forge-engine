@@ -1636,6 +1636,7 @@ name = "dis-core"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
+ "hex",
  "pqcrypto-dilithium",
  "pqcrypto-traits",
  "sha2",

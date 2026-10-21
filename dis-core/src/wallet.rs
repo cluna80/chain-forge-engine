@@ -113,6 +113,7 @@ mod tests {
                 rp_origin: origin,
                 policy_id: "v1".into(),
                 grants,
+                min_suite_id: SUITE_ML_DSA_65,
             });
             rp.enroll_test_key(&pk).unwrap();
             let req = rp.issue(request(id, resource, action, scope)).unwrap();
@@ -144,6 +145,7 @@ mod tests {
                 rp_origin: origin,
                 policy_id: "v1".into(),
                 grants,
+                min_suite_id: SUITE_ML_DSA_65,
             });
             rp.enroll_test_key(&pk).unwrap();
             rps.push(rp);
