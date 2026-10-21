@@ -100,6 +100,11 @@ fn init_db(conn: &Connection) {
             wallet_id TEXT NOT NULL, vendor_id TEXT NOT NULL,
             resource_id TEXT NOT NULL, action TEXT NOT NULL, verified_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS revoked_keys (
+            wallet_id TEXT PRIMARY KEY,
+            revoked_at INTEGER NOT NULL,
+            reason TEXT
+        );
     ").unwrap();
 }
 
@@ -128,8 +133,23 @@ fn rebuild_rps(conn: &Connection) -> HashMap<String, RelyingParty> {
     rps
 }
 
+#[derive(Deserialize)]
+struct RevokeRequest { wallet_id: String, reason: Option<String> }
+
+async fn revoke(State(state): State<AppState>, Json(req): Json<RevokeRequest>) -> Json<serde_json::Value> {
+    let db = state.db.lock().unwrap();
+    let enrolled: bool = db.query_row("SELECT 1 FROM enrolled_keys WHERE wallet_id=?1", params![req.wallet_id], |_| Ok(true)).unwrap_or(false);
+    if !enrolled {
+        return Json(serde_json::json!({"status":"error","message":"wallet not enrolled"}));
+    }
+    let reason = req.reason.unwrap_or_else(|| "revoked by admin".into());
+    db.execute("INSERT OR REPLACE INTO revoked_keys (wallet_id, revoked_at, reason) VALUES (?1, ?2, ?3)",
+        params![req.wallet_id, now_secs() as i64, reason]).unwrap();
+    Json(serde_json::json!({"status":"revoked","wallet_id":req.wallet_id,"message":"Key revoked and persisted."}))
+}
+
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status":"ok","server":"DIS Vendor Server","version":"0.3.0","security":"DIS-STATE-001","persistence":"SQLite"}))
+    Json(serde_json::json!({"status":"ok","server":"DIS Vendor Server","version":"0.3.1","security":"DIS-STATE-002","persistence":"SQLite"}))
 }
 
 async fn reset(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -230,6 +250,11 @@ async fn verify(State(state): State<AppState>, Json(req): Json<VerifyRequest>) -
         Some(pk) if *pk != req.public_key_hex => return Json(serde_json::json!({"status":"error","message":"public key does not match enrolled key"})),
         _ => {}
     }
+    // Check revocation
+    let revoked: bool = db.query_row("SELECT 1 FROM revoked_keys WHERE wallet_id=?1", params![req.wallet_id], |_| Ok(true)).unwrap_or(false);
+    if revoked {
+        return Json(serde_json::json!({"status":"rejected","message":"wallet key has been revoked"}));
+    }
     let c = &req.challenge;
     let mut challenge_id = [0u8;16]; let mut nonce = [0u8;16];
     for (i,b) in c.challenge_id.iter().take(16).enumerate() { challenge_id[i] = *b as u8; }
@@ -301,11 +326,12 @@ async fn main() {
         .route("/challenge", post(challenge))
         .route("/verify", post(verify))
         .route("/sessions", get(sessions))
+        .route("/admin/revoke", post(revoke))
         .with_state(state)
         .layer(cors);
     let port = std::env::var("PORT").unwrap_or("3000".into());
     let addr = format!("0.0.0.0:{port}");
-    println!("DIS Vendor Server v0.3.0 (DIS-STATE-001) on {addr}");
+    println!("DIS Vendor Server v0.3.1 (DIS-STATE-002) on {addr}");
     println!("DB: {db_path} — {rp_count} vendor(s), {key_count} key(s) restored");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
