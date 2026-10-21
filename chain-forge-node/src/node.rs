@@ -190,6 +190,11 @@ pub type SharedPeers = Arc<Mutex<Vec<PeerInfo>>>;
 /// Arc<Mutex<T>> pattern as SharedStatus/SharedExplorer/SharedPeers above.
 pub type SharedTxQueue = Arc<Mutex<Vec<Transaction>>>;
 
+/// Per-sender committed-nonce cache. Maps `sender_address → highest committed nonce`.
+/// Updated on every block commit; read at API ingress to reject replayed or
+/// out-of-sequence nonces without needing to hold the full state store open.
+pub type SharedNonceCache = Arc<Mutex<std::collections::HashMap<String, u64>>>;
+
 // -- Node error ---------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -308,6 +313,11 @@ pub struct Node {
     /// waits for real peer connections before attempting to participate in
     /// consensus. False means no peers are expected (solo devnet mode).
     has_bootstrap_peers: bool,
+
+    /// Per-sender committed-nonce cache (F1 ingress guard).
+    /// Updated after each block commit; exposed to the API server so it can
+    /// reject out-of-sequence or replayed nonces before queuing.
+    nonce_cache: SharedNonceCache,
 
     // ── PoCD (Proof of Cryptographic Discovery) ──────────────────────────────
 
@@ -1074,6 +1084,7 @@ impl Node {
             signing_key: None,
             validator_id,
             mempool: Vec::new(),
+            nonce_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_proposals: std::collections::HashMap::new(),
             pending_certs:     std::collections::HashMap::new(),
             last_proposed: None,
@@ -1126,6 +1137,10 @@ impl Node {
 
     pub fn block_gas_limit(&self) -> u64 {
         self.genesis.limits.block_gas_limit
+    }
+
+    pub fn nonce_cache(&self) -> SharedNonceCache {
+        self.nonce_cache.clone()
     }
 
     pub fn chain_id(&self) -> &str {
@@ -3145,6 +3160,17 @@ impl Node {
         let txs: Vec<Transaction> = serde_json::from_slice(&proposal.tx_data)
             .unwrap_or_default();
         self.remove_committed_from_mempool(&txs);
+        // F1: update per-sender nonce cache so the API can reject replayed
+        // or out-of-sequence nonces at ingress without needing state access.
+        {
+            let mut cache = self.nonce_cache.lock().unwrap();
+            for tx in &txs {
+                let entry = cache.entry(tx.sender.clone()).or_insert(0);
+                if tx.nonce > *entry {
+                    *entry = tx.nonce;
+                }
+            }
+        }
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

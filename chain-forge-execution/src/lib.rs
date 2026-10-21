@@ -1809,6 +1809,9 @@ pub fn verify_signature(tx: &Transaction, chain_id: &str) -> Result<(), String> 
     if tx.public_key.len() != 32 {
         return Err(format!("unsigned or malformed: public_key must be 32 bytes, got {}", tx.public_key.len()));
     }
+    if tx.public_key.iter().all(|&b| b == 0) {
+        return Err("public_key must not be all zeros".into());
+    }
     let sig = Signature { scheme: SchemeId::Classical, bytes: tx.signature.clone() };
     ClassicalScheme
         .verify(&tx.signing_bytes(chain_id), &sig, &tx.public_key)

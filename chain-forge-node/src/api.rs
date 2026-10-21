@@ -8,7 +8,7 @@
 /// key management, and a WebSocket feed for the explorer.
 
 use std::sync::{Arc, Mutex};
-use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS};
+use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS, SharedNonceCache};
 use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest,
                   verify_challenge_signature, identity_auth_status, authorize_scope,
                   key_binding_from_explorer, scope_policy};
@@ -54,6 +54,7 @@ pub async fn serve(
     node_id:         String,
     // Change Set T — peer capacity table (advisory, non-correctness).
     peer_capacity_table: Arc<Mutex<crate::gossip_capacity::PeerCapacityTable>>,
+    nonce_cache: SharedNonceCache,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -83,6 +84,7 @@ pub async fn serve(
                 let challenge_store     = challenge_store.clone();
                 let node_id             = node_id.clone();
                 let peer_capacity_table = peer_capacity_table.clone();
+                let nonce_cache         = nonce_cache.clone();
 
                 tokio::spawn(async move {
                     // Read the WHOLE request: headers, then Content-Length
@@ -197,6 +199,30 @@ pub async fn serve(
                                     "status": "rejected",
                                     "tx_id": tx.id,
                                     "message": "transaction already committed — replay not permitted"
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            // F1: nonce must be strictly greater than the last committed
+                            // nonce for this sender.  Senders not yet in the cache are
+                            // new accounts — their first tx is accepted at any nonce so
+                            // existing devnet tooling (which starts at nonce=1) works
+                            // without changes.
+                            Ok(ref tx) if {
+                                let cache = nonce_cache.lock().unwrap();
+                                cache.get(&tx.sender).map_or(false, |&last| tx.nonce <= last)
+                            } => {
+                                // Re-lock to get the last nonce for the error message.
+                                let last = nonce_cache.lock().unwrap()
+                                    .get(&tx.sender).copied().unwrap_or(0);
+                                // tx is already parsed; borrow its fields for the response.
+                                let (tx_id, nonce) = if let Ok(ref t) =
+                                    serde_json::from_str::<chain_forge_execution::Transaction>(body)
+                                { (t.id.clone(), t.nonce) } else { (String::new(), 0) };
+                                tracing::info!(nonce, last_committed = last, "nonce replay / out-of-sequence rejected at ingress");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx_id,
+                                    "message": format!("nonce {nonce} already used or too low (last committed: {last})")
                                 });
                                 http_400_json(&resp.to_string())
                             }
