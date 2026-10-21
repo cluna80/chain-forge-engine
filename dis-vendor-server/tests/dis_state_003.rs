@@ -31,6 +31,7 @@ use tokio::{net::TcpListener, task::AbortHandle};
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const TTL: i64 = 299;
+const ADMIN_KEY: &str = "test-admin-key-0123456789abcdef0123456789";
 
 fn admin_url() -> String {
     std::env::var("DIS_TEST_DATABASE_URL")
@@ -95,6 +96,7 @@ impl Server {
             .env("DATABASE_URL", db_url)
             .env("PORT", port.to_string())
             .env("DIS_DB_ACQUIRE_TIMEOUT_MS", "1500")
+            .env("DIS_ADMIN_API_KEY", ADMIN_KEY)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn().expect("spawn dis-vendor-server");
@@ -115,7 +117,9 @@ impl Server {
     /// SIGKILL — no graceful shutdown, no chance to flush anything.
     fn crash(&mut self) { self.child.kill().unwrap(); self.child.wait().unwrap(); }
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
-        let r = http().post(format!("{}{path}", self.base)).json(&body).send().await.unwrap();
+        let mut rq = http().post(format!("{}{path}", self.base)).json(&body);
+        if path.starts_with("/admin/") { rq = rq.bearer_auth(ADMIN_KEY); }
+        let r = rq.send().await.unwrap();
         let code = r.status().as_u16();
         (code, r.json().await.unwrap_or(Value::Null))
     }
@@ -485,7 +489,7 @@ async fn s3_08_concurrent_revocation_and_verification_ordering() {
     let mut tx = c.db.begin().await.unwrap();
     sqlx::query("SELECT 1 FROM enrolled_keys WHERE wallet_id=$1 FOR SHARE").bind(&w.id).execute(&mut *tx).await.unwrap();
     let pending = tokio::spawn({ let base = c.a.base.clone(); let id = w.id.clone();
-        async move { http().post(format!("{base}/admin/revoke")).json(&json!({"wallet_id":id})).send().await.unwrap().json::<Value>().await.unwrap() } });
+        async move { http().post(format!("{base}/admin/revoke")).bearer_auth(ADMIN_KEY).json(&json!({"wallet_id":id})).send().await.unwrap().json::<Value>().await.unwrap() } });
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert!(!pending.is_finished(), "revocation must wait for the in-flight verification");
     tx.commit().await.unwrap();
@@ -507,7 +511,7 @@ async fn s3_08_concurrent_revocation_and_verification_ordering() {
     let revoke = { let rv = revoked_at.clone(); let base = c.b.base.clone(); let id = w.id.clone();
         async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
-            let r: Value = http().post(format!("{base}/admin/revoke")).json(&json!({"wallet_id":id}))
+            let r: Value = http().post(format!("{base}/admin/revoke")).bearer_auth(ADMIN_KEY).json(&json!({"wallet_id":id}))
                 .send().await.unwrap().json().await.unwrap();
             *rv.lock().unwrap() = Some(Instant::now());
             r
@@ -564,4 +568,56 @@ async fn s3_09_expiry_enforced_from_db_window() {
     let bad = sqlx::query("UPDATE challenges SET expires_at=expires_at+1000 WHERE challenge_key=$1")
         .bind(challenge_key(&c.vendor, &ch)).execute(&c.db).await;
     assert!(bad.is_err(), "TTL CHECK constraint must reject a window != server TTL");
+}
+
+/// Admin endpoints reject missing or wrong credentials on every instance and
+/// leave state untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_10_admin_endpoints_require_authentication() {
+    let _g = SERIAL.lock().await;
+    let c = Cluster::start().await;
+    let w = Wallet::enroll(&c.a).await;
+    for s in [&c.a, &c.b] {
+        for token in [None, Some("wrong"), Some(&ADMIN_KEY[..ADMIN_KEY.len() - 1])] {
+            for (path, body) in [("/admin/revoke", json!({"wallet_id":w.id})), ("/admin/reset", json!({}))] {
+                let mut rq = http().post(format!("{}{path}", s.base)).json(&body);
+                if let Some(t) = token { rq = rq.bearer_auth(t); }
+                let r = rq.send().await.unwrap();
+                assert_eq!(r.status().as_u16(), 401, "{path} with {token:?}");
+            }
+        }
+    }
+    let revoked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM revocations").fetch_one(&c.db).await.unwrap();
+    assert_eq!(revoked, 0);
+    let ch = c.challenge(&c.b, &w).await; // reset did not run either
+    let (_, r) = c.a.post("/verify", c.proof(&w, &ch, &w.sign(&ch))).await;
+    assert_eq!(status(&r), "verified", "{r}");
+}
+
+/// Enrollment nonces are bounded in time and single-use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_11_enrollment_nonce_expires_and_is_single_use() {
+    let _g = SERIAL.lock().await;
+    let c = Cluster::start().await;
+    let (pk, sk) = dilithium3::keypair();
+    let id = format!("wallet-{}", rand_hex(4));
+    let (_, r) = c.a.post("/enroll/challenge", json!({"wallet_id":id})).await;
+    let nonce = r["nonce"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE enroll_nonces SET expires_at = expires_at - 1000 WHERE wallet_id=$1")
+        .bind(&id).execute(&c.db).await.unwrap();
+    let body = json!({"wallet_id":id,"public_key_hex":hex(pk.as_bytes()),
+        "nonce_signature_hex":hex(dilithium3::detached_sign(nonce.as_bytes(), &sk).as_bytes())});
+    let (_, r) = c.b.post("/enroll", body.clone()).await;
+    assert!(message(&r).contains("expired"), "{r}");
+    let (_, r) = c.b.post("/enroll", body).await;
+    assert!(message(&r).contains("no enroll challenge"), "expired nonce must be deleted: {r}");
+
+    let (_, r) = c.a.post("/enroll/challenge", json!({"wallet_id":id})).await;
+    let nonce = r["nonce"].as_str().unwrap().to_string();
+    let body = json!({"wallet_id":id,"public_key_hex":hex(pk.as_bytes()),
+        "nonce_signature_hex":hex(dilithium3::detached_sign(nonce.as_bytes(), &sk).as_bytes())});
+    let (_, r) = c.b.post("/enroll", body.clone()).await;
+    assert_eq!(status(&r), "enrolled", "{r}");
+    let (_, r) = c.a.post("/enroll", body).await;
+    assert_eq!(status(&r), "error", "nonce reuse must fail: {r}");
 }

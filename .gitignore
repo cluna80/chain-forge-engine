@@ -4,7 +4,6 @@
 !grand-challenge/simulations/*.py
 !scripts/*.py
 qcb-genesis.json
-Cargo.lock
 
 keys/
 __pycache__/

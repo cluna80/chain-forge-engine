@@ -43,15 +43,37 @@ const SESSIONS_API_KEY: &str = "dis-sessions-key-change-in-production";
 /// Server-enforced challenge lifetime. Must match the `challenge_ttl` CHECK
 /// constraint in migrations/0001_dis_state_003.sql.
 const CHALLENGE_TTL_SECS: i64 = 299;
+/// Lifetime of an /enroll/challenge nonce.
+const ENROLL_NONCE_TTL_SECS: i64 = 300;
 const POLICY_ID: &str = "v1";
 const DB_NOW: &str = "EXTRACT(EPOCH FROM clock_timestamp())::BIGINT";
 
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
+    /// SHA-256 of DIS_ADMIN_API_KEY; None disables the admin endpoints.
+    admin_key_hash: Option<[u8; 32]>,
 }
 
 type Resp = (StatusCode, Json<Value>);
+type BearerAuth = Option<TypedHeader<Authorization<Bearer>>>;
+
+/// Admin endpoints require `Authorization: Bearer <DIS_ADMIN_API_KEY>`.
+/// Digests are compared in constant time.
+fn require_admin(state: &AppState, auth: &BearerAuth) -> Result<(), Resp> {
+    let Some(expected) = state.admin_key_hash else {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"status":"error","message":"admin API disabled — set DIS_ADMIN_API_KEY"}))));
+    };
+    let presented: [u8; 32] = match auth {
+        Some(TypedHeader(Authorization(bearer))) => Sha256::digest(bearer.token().as_bytes()).into(),
+        None => [0u8; 32],
+    };
+    let diff = expected.iter().zip(presented.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if auth.is_none() || diff != 0 {
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"status":"error","message":"Authorization: Bearer <admin-key> required"}))));
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct RegisterVendorRequest {
@@ -119,7 +141,8 @@ async fn health(State(state): State<AppState>) -> Resp {
     (if db_up { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(body))
 }
 
-async fn reset(State(state): State<AppState>) -> Resp {
+async fn reset(State(state): State<AppState>, auth: BearerAuth) -> Resp {
+    if let Err(denied) = require_admin(&state, &auth) { return denied; }
     // Revocations are intentionally preserved across resets.
     finish(async {
         sqlx::query("TRUNCATE verified_sessions, challenges, enroll_nonces, enrolled_keys, vendors")
@@ -151,10 +174,12 @@ async fn register_vendor(State(state): State<AppState>, Json(req): Json<Register
 async fn enroll_challenge(State(state): State<AppState>, Json(req): Json<EnrollChallengeRequest>) -> Resp {
     finish(async {
         let nonce = hex_encode(&random_bytes::<32>());
-        sqlx::query("INSERT INTO enroll_nonces (wallet_id,nonce) VALUES ($1,$2)
-                     ON CONFLICT (wallet_id) DO UPDATE SET nonce = EXCLUDED.nonce")
-            .bind(&req.wallet_id).bind(&nonce).execute(&state.db).await?;
-        Ok(ok(json!({"status":"ok","wallet_id":req.wallet_id,"nonce":nonce})))
+        let expires_at: i64 = sqlx::query_scalar(&format!(
+            "INSERT INTO enroll_nonces (wallet_id,nonce,expires_at) VALUES ($1,$2,{DB_NOW}+$3)
+             ON CONFLICT (wallet_id) DO UPDATE SET nonce = EXCLUDED.nonce, expires_at = EXCLUDED.expires_at
+             RETURNING expires_at"))
+            .bind(&req.wallet_id).bind(&nonce).bind(ENROLL_NONCE_TTL_SECS).fetch_one(&state.db).await?;
+        Ok(ok(json!({"status":"ok","wallet_id":req.wallet_id,"nonce":nonce,"expires_at":expires_at})))
     }.await)
 }
 
@@ -163,9 +188,15 @@ async fn enroll(State(state): State<AppState>, Json(req): Json<EnrollRequest>) -
     let Some(sig_bytes) = hex_decode(&req.nonce_signature_hex) else { return error("invalid signature hex") };
     finish(async {
         let mut tx = state.db.begin().await?;
-        let nonce: Option<String> = sqlx::query_scalar("SELECT nonce FROM enroll_nonces WHERE wallet_id=$1 FOR UPDATE")
+        let row: Option<(String, bool)> = sqlx::query_as(&format!(
+            "SELECT nonce, expires_at <= {DB_NOW} FROM enroll_nonces WHERE wallet_id=$1 FOR UPDATE"))
             .bind(&req.wallet_id).fetch_optional(&mut *tx).await?;
-        let Some(nonce) = nonce else { return Ok(error("no enroll challenge found — call /enroll/challenge first")) };
+        let Some((nonce, expired)) = row else { return Ok(error("no enroll challenge found — call /enroll/challenge first")) };
+        if expired {
+            sqlx::query("DELETE FROM enroll_nonces WHERE wallet_id=$1").bind(&req.wallet_id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(error("enroll challenge expired — call /enroll/challenge again"));
+        }
         let Ok(pk) = dilithium3::PublicKey::from_bytes(&pk_bytes) else { return Ok(error("invalid public key")) };
         let Ok(sig) = dilithium3::DetachedSignature::from_bytes(&sig_bytes) else { return Ok(error("invalid signature")) };
         if dilithium3::verify_detached_signature(&sig, nonce.as_bytes(), &pk).is_err() {
@@ -302,7 +333,8 @@ async fn verify_inner(db: &PgPool, req: VerifyRequest) -> Result<Resp, sqlx::Err
         "vendor_id":req.vendor_id,"resource_id":c.resource_id,"action":c.action})))
 }
 
-async fn revoke(State(state): State<AppState>, Json(req): Json<RevokeRequest>) -> Resp {
+async fn revoke(State(state): State<AppState>, auth: BearerAuth, Json(req): Json<RevokeRequest>) -> Resp {
+    if let Err(denied) = require_admin(&state, &auth) { return denied; }
     finish(async {
         let mut tx = state.db.begin().await?;
         // Exclusive lock on the key row: waits for in-flight verifications of
@@ -350,7 +382,12 @@ async fn main() {
     sqlx::migrate!("./migrations").run(&pool).await.expect("database migration failed");
     let vendor_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vendors").fetch_one(&pool).await.unwrap_or(0);
     let key_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM enrolled_keys").fetch_one(&pool).await.unwrap_or(0);
-    let state = AppState { db: pool };
+    let admin_key_hash = match std::env::var("DIS_ADMIN_API_KEY") {
+        Ok(k) if k.len() >= 32 => Some(Sha256::digest(k.as_bytes()).into()),
+        Ok(_) => panic!("DIS_ADMIN_API_KEY must be at least 32 characters"),
+        Err(_) => { eprintln!("DIS_ADMIN_API_KEY not set — /admin/* endpoints disabled"); None }
+    };
+    let state = AppState { db: pool, admin_key_hash };
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| "http://localhost:3000".into());
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {

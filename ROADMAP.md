@@ -437,6 +437,7 @@ User opens Qattice app → QR challenge displayed
 | B-Security — DIS-SEC-003 | Adversarial testing — 8/8 attack scenarios rejected; enrollment replay, key replacement, cross-vendor substitution, concurrent replay | ✅ Complete (2026-10-21) |
 | C-State — DIS-STATE-001 | Persistent vendor registrations, enrolled keys, revocations, and consumed challenges across server restarts | ✅ Complete (2026-10-21) |
 | C-State — DIS-STATE-002 | Revocation persistence, DB atomicity (10 concurrent → 1 accepted), crash recovery (SIGKILL) — 9/9 tests passed | ✅ Complete (2026-10-21) |
+| C-State — DIS-STATE-003 | Shared PostgreSQL backend — two independent instances coordinate on challenges, revocations, and sessions; signature verified before any DB write; atomic consume+revocation-check in one `SELECT FOR UPDATE` transaction; fail-closed on DB errors — 11/11 tests passed | ✅ Complete (2026-10-21) |
 | B-Privacy | Selective disclosure, service-specific pseudonyms, zero-knowledge authorization | 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment + authenticated encryption | 🔲 |
 | D — Integration | Connect to Qattice wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
