@@ -182,6 +182,7 @@ async fn main() {
         modules:              node.enabled_modules(),
         settlement_operators: node.settlement_operators(),
         max_tx_bytes:         node.max_tx_bytes(),
+        block_gas_limit:      node.block_gas_limit(),
     };
     // Set the data directory for state persistence.
     if let Some(ref dir) = args.data_dir {

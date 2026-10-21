@@ -35,6 +35,10 @@ pub struct TxPrecheck {
     /// Maximum accepted tx payload size in bytes (0 = unlimited).
     /// Sourced from genesis `limits.max_tx_bytes`.
     pub max_tx_bytes: usize,
+    /// Maximum gas a single tx may request. Sourced from genesis
+    /// `limits.block_gas_limit`. A tx asking for more than one full block's
+    /// worth of gas can never be included and is rejected at ingress.
+    pub block_gas_limit: u64,
 }
 
 pub async fn serve(
@@ -129,9 +133,19 @@ pub async fn serve(
                             .unwrap_or(request.len());
                         let body = &request[body_start..];
 
-                        match serde_json::from_str::<Transaction>(body) {
-                            Ok(tx) if chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes).is_err() => {
-                                let reason = chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes)
+                        // F8: byte-length guard *before* JSON parsing so
+                        // unicode-expansion attacks (tiny chars → huge allocations)
+                        // cannot consume resources in the deserialiser.
+                        let raw_limit = if precheck.max_tx_bytes > 0 { precheck.max_tx_bytes } else { 1_048_576 };
+                        if body.len() > raw_limit {
+                            let resp = serde_json::json!({
+                                "status": "rejected",
+                                "message": format!("request body too large: {} bytes, limit {}", body.len(), raw_limit)
+                            });
+                            http_400_json(&resp.to_string())
+                        } else { match serde_json::from_str::<Transaction>(body) {
+                            Ok(tx) if chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes, precheck.block_gas_limit).is_err() => {
+                                let reason = chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes, precheck.block_gas_limit)
                                     .unwrap_err();
                                 tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at mempool ingress (check_tx)");
                                 let resp = serde_json::json!({
@@ -151,7 +165,10 @@ pub async fn serve(
                                 });
                                 http_400_json(&resp.to_string())
                             }
-                            Ok(tx) if precheck.require_signatures
+                            // F5: verify_signature runs when either the chain *requires* sigs
+                            // or the tx *carries* one -- "not required" means you may omit
+                            // the sig, not that a present sig is silently ignored.
+                            Ok(tx) if (precheck.require_signatures || !tx.signature.is_empty())
                                 && chain_forge_execution::verify_signature(&tx, &precheck.chain_id).is_err() => {
                                 let reason = chain_forge_execution::verify_signature(&tx, &precheck.chain_id)
                                     .unwrap_err();
@@ -222,7 +239,7 @@ pub async fn serve(
                                 });
                                 http_400_json(&resp.to_string())
                             }
-                        }
+                        } } // close else { match
                     } else if first_line.starts_with("POST /api/build") {
                         // Extract JSON body from the request
                         let body_start = request.find("\r\n\r\n")

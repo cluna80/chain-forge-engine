@@ -1124,6 +1124,10 @@ impl Node {
         self.genesis.limits.max_tx_bytes as usize
     }
 
+    pub fn block_gas_limit(&self) -> u64 {
+        self.genesis.limits.block_gas_limit
+    }
+
     pub fn chain_id(&self) -> &str {
         &self.genesis.chain_id
     }

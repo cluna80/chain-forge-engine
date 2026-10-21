@@ -1710,23 +1710,34 @@ pub fn module_check(tx: &Transaction, modules: &EnabledModules) -> Result<(), St
 /// Stateless mempool admission check — runs at POST /api/tx regardless of
 /// `require_signatures`, before the tx enters the queue.
 ///
-/// Catches basic malformation that has nothing to do with cryptography:
-/// empty sender, zero gas, oversized payload. These should be rejected even
-/// in dev mode (`require_signatures: false`) because they indicate a broken
-/// client or a fuzzing probe, not a legitimate unsigned dev tx.
+/// Checks that are always enforced (dev mode or not):
+/// - sender non-empty
+/// - gas_limit > 0 and <= block_gas_limit
+/// - payload within max_tx_bytes
+/// - Transfer body fields: amount > 0, `to` non-empty and qcb1-prefixed, denom non-empty
+/// - Ed25519 signature, if present, is exactly 64 bytes
+/// - ML-DSA-65 signature tag, if present, is exactly 6586 hex chars
 ///
-/// Returns `Ok(())` if all basic checks pass. The signature check itself is
-/// a separate gate controlled by `require_signatures`.
-pub fn check_tx(tx: &Transaction, max_tx_bytes: usize) -> Result<(), String> {
+/// What this does NOT check (needs state or crypto):
+/// - nonce ordering / replay (state-dependent)
+/// - balance sufficiency (state-dependent)
+/// - unknown sender / recipient (state-dependent)
+/// - crypto correctness of a 64-byte sig (that's `verify_signature`'s job)
+pub fn check_tx(tx: &Transaction, max_tx_bytes: usize, block_gas_limit: u64) -> Result<(), String> {
     if tx.sender.is_empty() {
         return Err("sender must not be empty".into());
     }
     if tx.gas_limit == 0 {
         return Err("gas_limit must be > 0".into());
     }
-    // Rough size guard: the body's JSON representation shouldn't dwarf limits.
-    // We re-serialise here rather than tracking raw bytes at the call site
-    // because the transport already decoded it; this keeps the check stateless.
+    if block_gas_limit > 0 && tx.gas_limit > block_gas_limit {
+        return Err(format!(
+            "gas_limit {g} exceeds block_gas_limit {b}",
+            g = tx.gas_limit, b = block_gas_limit
+        ));
+    }
+    // Re-serialise for the byte-size check so unicode-expanded content is
+    // counted by its actual encoded byte length, not by char count.
     if max_tx_bytes > 0 {
         let approx = serde_json::to_vec(tx).map(|v| v.len()).unwrap_or(usize::MAX);
         if approx > max_tx_bytes {
@@ -1735,11 +1746,22 @@ pub fn check_tx(tx: &Transaction, max_tx_bytes: usize) -> Result<(), String> {
             ));
         }
     }
-    // If a non-empty signature is present and require_signatures is *not* the
-    // gating decision, we still reject a signature that is structurally
-    // impossible (e.g. a 1-byte garbage blob for an Ed25519 slot that expects
-    // 64 bytes). This catches truncated/mangled sigs from fuzzers without
-    // breaking unsigned dev txs (which have signature = []).
+    // Transfer-specific field validation.
+    if let TxBody::Transfer { to, amount, denom } = &tx.body {
+        if *amount == 0 {
+            return Err("Transfer amount must be > 0".into());
+        }
+        if to.is_empty() {
+            return Err("Transfer.to must not be empty".into());
+        }
+        if !to.starts_with("qcb1") {
+            return Err(format!("Transfer.to has invalid address prefix (expected qcb1): {to}"));
+        }
+        if denom.is_empty() {
+            return Err("Transfer.denom must not be empty".into());
+        }
+    }
+    // Structural signature checks: wrong-length blobs are always invalid.
     if !tx.signature.is_empty() && tx.signature.len() != 64 {
         return Err(format!(
             "malformed Ed25519 signature: expected 64 bytes, got {}",
@@ -5839,53 +5861,53 @@ mod tests {
     #[test]
     fn check_tx_rejects_empty_sender() {
         let tx = minimal_tx("", 100_000);
-        assert!(check_tx(&tx, 0).is_err(), "empty sender must be rejected");
+        assert!(check_tx(&tx, 0, 0).is_err(), "empty sender must be rejected");
     }
 
     #[test]
     fn check_tx_rejects_zero_gas() {
         let tx = minimal_tx("qcb1alice", 0);
-        assert!(check_tx(&tx, 0).is_err(), "zero gas_limit must be rejected");
+        assert!(check_tx(&tx, 0, 0).is_err(), "zero gas_limit must be rejected");
     }
 
     #[test]
     fn check_tx_rejects_truncated_ed25519_signature() {
         let mut tx = minimal_tx("qcb1alice", 100_000);
         tx.signature = vec![0u8; 10]; // 10 bytes, not 64
-        assert!(check_tx(&tx, 0).is_err(), "truncated Ed25519 sig must be rejected");
+        assert!(check_tx(&tx, 0, 0).is_err(), "truncated Ed25519 sig must be rejected");
     }
 
     #[test]
     fn check_tx_rejects_double_length_ed25519_signature() {
         let mut tx = minimal_tx("qcb1alice", 100_000);
         tx.signature = vec![0u8; 128]; // 128 bytes, not 64
-        assert!(check_tx(&tx, 0).is_err(), "double-length Ed25519 sig must be rejected");
+        assert!(check_tx(&tx, 0, 0).is_err(), "double-length Ed25519 sig must be rejected");
     }
 
     #[test]
     fn check_tx_rejects_malformed_mldsa_signature() {
         let mut tx = minimal_tx("qcb1alice", 100_000);
         tx.pq_signatures = vec!["mldsa65:deadbeef".into()]; // 8 hex chars, not 6586
-        assert!(check_tx(&tx, 0).is_err(), "malformed ML-DSA-65 sig must be rejected");
+        assert!(check_tx(&tx, 0, 0).is_err(), "malformed ML-DSA-65 sig must be rejected");
     }
 
     #[test]
     fn check_tx_accepts_valid_unsigned_tx() {
         let tx = minimal_tx("qcb1alice", 100_000);
-        assert!(check_tx(&tx, 0).is_ok(), "valid unsigned dev tx must pass check_tx");
+        assert!(check_tx(&tx, 0, 0).is_ok(), "valid unsigned dev tx must pass check_tx");
     }
 
     #[test]
     fn check_tx_accepts_correctly_sized_ed25519_sig_field() {
         let mut tx = minimal_tx("qcb1alice", 100_000);
         tx.signature = vec![0u8; 64]; // correct size (crypto validity is verify_signature's job)
-        assert!(check_tx(&tx, 0).is_ok(), "64-byte sig field must pass structural check");
+        assert!(check_tx(&tx, 0, 0).is_ok(), "64-byte sig field must pass structural check");
     }
 
     #[test]
     fn check_tx_rejects_oversized_payload() {
         let tx = minimal_tx("qcb1alice", 100_000);
         // max_tx_bytes = 1 forces rejection of any real tx
-        assert!(check_tx(&tx, 1).is_err(), "oversized tx must be rejected");
+        assert!(check_tx(&tx, 1, 0).is_err(), "oversized tx must be rejected");
     }
 }
