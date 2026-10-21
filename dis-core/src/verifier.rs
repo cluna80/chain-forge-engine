@@ -25,6 +25,8 @@ pub enum VerifyError {
     Unauthorized,
     #[error("invalid challenge parameters")]
     Challenge,
+    #[error("key has been revoked")]
+    Revoked,
 }
 
 /// A local RP decides its own exact resource/action/scope permissions.
@@ -48,6 +50,7 @@ pub struct RelyingParty {
     policy: RpPolicy,
     pending: HashMap<[u8; 16], Request>,
     enrolled_keys: HashSet<[u8; 32]>,
+    revoked_keys: HashSet<[u8; 32]>,
 }
 
 impl RelyingParty {
@@ -56,6 +59,7 @@ impl RelyingParty {
             policy,
             pending: HashMap::new(),
             enrolled_keys: HashSet::new(),
+            revoked_keys: HashSet::new(),
         }
     }
 
@@ -65,6 +69,33 @@ impl RelyingParty {
     pub fn enroll_test_key(&mut self, public_key: &[u8]) -> Result<(), VerifyError> {
         dilithium3::PublicKey::from_bytes(public_key).map_err(|_| VerifyError::Signature)?;
         self.enrolled_keys.insert(Sha256::digest(public_key).into());
+        Ok(())
+    }
+
+    /// Revoke a previously enrolled key. Any future verification attempt with
+    /// this key returns `VerifyError::Revoked`, even if the proof is cryptographically
+    /// valid. The challenge is still consumed so revoked keys cannot be probed.
+    pub fn revoke(&mut self, public_key: &[u8]) -> Result<(), VerifyError> {
+        dilithium3::PublicKey::from_bytes(public_key).map_err(|_| VerifyError::Signature)?;
+        let fp: [u8; 32] = Sha256::digest(public_key).into();
+        self.enrolled_keys.remove(&fp);
+        self.revoked_keys.insert(fp);
+        Ok(())
+    }
+
+    /// Atomically revoke `old_public_key` and enroll `new_public_key`.
+    /// After this call: proofs signed with the old key are rejected with
+    /// `Revoked`; proofs signed with the new key are accepted (subject to
+    /// policy). Returns `Err(Signature)` if either key is malformed.
+    pub fn rotate_key(
+        &mut self,
+        old_public_key: &[u8],
+        new_public_key: &[u8],
+    ) -> Result<(), VerifyError> {
+        dilithium3::PublicKey::from_bytes(new_public_key).map_err(|_| VerifyError::Signature)?;
+        self.revoke(old_public_key)?;
+        let new_fp: [u8; 32] = Sha256::digest(new_public_key).into();
+        self.enrolled_keys.insert(new_fp);
         Ok(())
     }
 
@@ -124,6 +155,9 @@ impl RelyingParty {
             .map_err(|_| VerifyError::Signature)?;
         self.pending.remove(&request.challenge_id);
         let key_fingerprint: [u8; 32] = Sha256::digest(&proof.public_key).into();
+        if self.revoked_keys.contains(&key_fingerprint) {
+            return Err(VerifyError::Revoked);
+        }
         if !self.enrolled_keys.contains(&key_fingerprint) {
             return Err(VerifyError::Unauthorized);
         }
@@ -240,6 +274,91 @@ mod tests {
         assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::Unauthorized));
         assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::Replay));
     }
+    #[test]
+    fn revoked_key_is_rejected_and_challenge_consumed() {
+        let (pk, sk) = dilithium3::keypair();
+        let mut a = rp("docs", "doc:1", "read", "document:read");
+        a.enroll_test_key(pk.as_bytes()).unwrap();
+        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
+        a.revoke(pk.as_bytes()).unwrap();
+        // Revoked key → Revoked; challenge is consumed in the process.
+        assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::Revoked));
+        // Challenge was consumed: a fresh proof with the same challenge is also rejected.
+        assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::Replay));
+    }
+
+    #[test]
+    fn proof_signed_before_revocation_is_rejected() {
+        // Sign first, then revoke — late-arriving proof is still blocked.
+        let (pk, sk) = dilithium3::keypair();
+        let mut a = rp("docs", "doc:1", "read", "document:read");
+        a.enroll_test_key(pk.as_bytes()).unwrap();
+        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
+        a.revoke(pk.as_bytes()).unwrap();
+        assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::Revoked));
+    }
+
+    #[test]
+    fn key_rotation_old_rejected_new_accepted() {
+        let (old_pk, old_sk) = dilithium3::keypair();
+        let (new_pk, new_sk) = dilithium3::keypair();
+        let mut a = rp("docs", "doc:1", "read", "document:read");
+        a.enroll_test_key(old_pk.as_bytes()).unwrap();
+
+        // Sign a proof with the old key before rotation.
+        let req_old = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let proof_old = sign_for_test(&req_old, old_sk.as_bytes(), old_pk.as_bytes()).unwrap();
+
+        // Rotate: old key revoked, new key enrolled.
+        a.rotate_key(old_pk.as_bytes(), new_pk.as_bytes()).unwrap();
+
+        // Old proof → Revoked.
+        assert_eq!(a.verify(&req_old, &proof_old, 1010), Err(VerifyError::Revoked));
+
+        // New challenge signed with new key → accepted.
+        let req_new = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let proof_new = sign_for_test(&req_new, new_sk.as_bytes(), new_pk.as_bytes()).unwrap();
+        assert_eq!(a.verify(&req_new, &proof_new, 1010), Ok(()));
+    }
+
+    #[test]
+    fn rotation_of_one_vendor_does_not_affect_others() {
+        let (pk_a, sk_a) = dilithium3::keypair();
+        let (pk_b, sk_b) = dilithium3::keypair();
+        let (pk_c, sk_c) = dilithium3::keypair();
+        let (new_pk_a, new_sk_a) = dilithium3::keypair();
+
+        let mut a = rp("game", "game:1", "play", "game:play");
+        let mut b = rp("docs", "doc:1", "read", "document:read");
+        let mut c = rp("payments", "payment:1", "submit", "payment:submit");
+        a.enroll_test_key(pk_a.as_bytes()).unwrap();
+        b.enroll_test_key(pk_b.as_bytes()).unwrap();
+        c.enroll_test_key(pk_c.as_bytes()).unwrap();
+
+        // Rotate vendor A's key.
+        a.rotate_key(pk_a.as_bytes(), new_pk_a.as_bytes()).unwrap();
+
+        // A: old key rejected, new key accepted.
+        let req_a_old = a.issue(request("game", "game:1", "play", "game:play")).unwrap();
+        let proof_a_old = sign_for_test(&req_a_old, sk_a.as_bytes(), pk_a.as_bytes()).unwrap();
+        assert_eq!(a.verify(&req_a_old, &proof_a_old, 1010), Err(VerifyError::Revoked));
+
+        let req_a_new = a.issue(request("game", "game:1", "play", "game:play")).unwrap();
+        let proof_a_new = sign_for_test(&req_a_new, new_sk_a.as_bytes(), new_pk_a.as_bytes()).unwrap();
+        assert_eq!(a.verify(&req_a_new, &proof_a_new, 1010), Ok(()));
+
+        // B and C: unaffected by A's rotation.
+        let req_b = b.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let proof_b = sign_for_test(&req_b, sk_b.as_bytes(), pk_b.as_bytes()).unwrap();
+        assert_eq!(b.verify(&req_b, &proof_b, 1010), Ok(()));
+
+        let req_c = c.issue(request("payments", "payment:1", "submit", "payment:submit")).unwrap();
+        let proof_c = sign_for_test(&req_c, sk_c.as_bytes(), pk_c.as_bytes()).unwrap();
+        assert_eq!(c.verify(&req_c, &proof_c, 1010), Ok(()));
+    }
+
     #[test]
     fn signature_expiry_and_policy_denial() {
         let (pk, sk) = dilithium3::keypair();
