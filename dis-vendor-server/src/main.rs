@@ -169,6 +169,16 @@ fn make_rp_for(vendor_id: &str, rp_origin: &str, resources: &[String], actions: 
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
+async fn reset(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    s.rps.clear();
+    s.enrolled_keys.clear();
+    s.enroll_nonces.clear();
+    s.verified_sessions.clear();
+    s.vendor_registry.clear();
+    Json(serde_json::json!({"status": "reset", "message": "Server state cleared"}))
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
@@ -193,7 +203,13 @@ async fn register_vendor(
         return Json(serde_json::json!({"status":"error","message":"vendor already registered"}));
     }
 
-    let rp = make_rp_for(&req.vendor_id, &req.rp_origin, &req.allowed_resources, &req.allowed_actions);
+    let mut rp = make_rp_for(&req.vendor_id, &req.rp_origin, &req.allowed_resources, &req.allowed_actions);
+
+    // Enroll any already-registered wallet keys into this new vendor RP
+    for pk_bytes in s.enrolled_keys.values() {
+        let _ = rp.enroll_test_key(pk_bytes);
+    }
+
     s.rps.insert(req.vendor_id.clone(), rp);
 
     s.vendor_registry.insert(req.vendor_id.clone(), VendorRegistration {
@@ -270,8 +286,22 @@ async fn enroll(
         }));
     }
 
-    // Ownership proven — remove nonce and enroll
+    // Ownership proven — remove nonce
     s.enroll_nonces.remove(&req.wallet_id);
+
+    // Fix: block key replacement — once enrolled, key is permanent
+    if s.enrolled_keys.contains_key(&req.wallet_id) {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "wallet already enrolled — key replacement not permitted"
+        }));
+    }
+
+    // Enroll key into ALL vendor RPs so verify() works
+    for rp in s.rps.values_mut() {
+        let _ = rp.enroll_test_key(&pk_bytes);
+    }
+
     s.enrolled_keys.insert(req.wallet_id.clone(), pk_bytes);
 
     Json(serde_json::json!({
@@ -333,10 +363,10 @@ async fn challenge(
         policy_id: "v1".into(),
     };
 
-    let rp_id_clone = req.vendor_id.clone();
-    let rp_origin_clone = vendor.rp_origin.clone();
-    let rp = s.rps.entry(req.vendor_id.clone())
-        .or_insert_with(|| make_rp_for(&rp_id_clone, &rp_origin_clone, &vendor.allowed_resources, &vendor.allowed_actions));
+    let rp = match s.rps.get_mut(&req.vendor_id) {
+        Some(r) => r,
+        None => return Json(serde_json::json!({"status":"error","message":"vendor RP not found — re-register vendor"})),
+    };
 
     match rp.issue(template) {
         Ok(issued) => Json(serde_json::json!({
@@ -484,6 +514,7 @@ async fn main() {
 
     let app: Router = Router::new()
         .route("/health", get(health))
+        .route("/admin/reset", post(reset))
         .route("/vendor/register", post(register_vendor))
         .route("/enroll/challenge", post(enroll_challenge))
         .route("/enroll", post(enroll))
