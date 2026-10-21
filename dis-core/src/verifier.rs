@@ -3,7 +3,11 @@
 //! In-memory replay storage is suitable for tests, NOT multi-instance production.
 //! No issuer credential, recovery, wallet origin-authentication or unlinkability claim.
 
-use crate::{canonical_request, Error as EncodingError, Request};
+use crate::{
+    canonical_request,
+    delegation::{validate_chain, DelegatedProof, DelegationError},
+    Error as EncodingError, Request,
+};
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use sha2::{Digest, Sha256};
@@ -29,6 +33,12 @@ pub enum VerifyError {
     Revoked,
     #[error("suite_id below RP minimum; possible downgrade attempt")]
     DowngradedSuite,
+    #[error("delegation chain invalid or expired")]
+    DelegationInvalid,
+    #[error("this action requires explicit human approval")]
+    HumanApprovalRequired,
+    #[error("delegation max_uses limit reached")]
+    DelegationUsesExhausted,
 }
 
 /// A local RP decides its own exact resource/action/scope permissions.
@@ -58,6 +68,10 @@ pub struct RelyingParty {
     pending: HashMap<[u8; 16], Request>,
     enrolled_keys: HashSet<[u8; 32]>,
     revoked_keys: HashSet<[u8; 32]>,
+    /// Challenges explicitly approved by the human holder for high-risk actions.
+    approved_challenges: HashSet<[u8; 16]>,
+    /// Remaining uses for max_uses delegations. Key = SHA-256 of canonical_delegation_body.
+    delegation_uses: HashMap<[u8; 32], u32>,
 }
 
 impl RelyingParty {
@@ -67,6 +81,8 @@ impl RelyingParty {
             pending: HashMap::new(),
             enrolled_keys: HashSet::new(),
             revoked_keys: HashSet::new(),
+            approved_challenges: HashSet::new(),
+            delegation_uses: HashMap::new(),
         }
     }
 
@@ -187,6 +203,106 @@ impl RelyingParty {
         {
             return Err(VerifyError::Unauthorized);
         }
+        Ok(())
+    }
+
+    /// Human holder explicitly approves a high-risk challenge before the agent
+    /// submits its proof. Call this after presenting the pending operation to the
+    /// human out-of-band and receiving their consent.
+    pub fn approve_challenge(&mut self, challenge_id: [u8; 16]) {
+        self.approved_challenges.insert(challenge_id);
+    }
+
+    /// Verify a proof produced by an agent acting under a delegation chain.
+    ///
+    /// The root delegator (chain[0].delegator_public_key) must be enrolled at this
+    /// RP. Machine/agent keys (chain[*].delegate_public_key) are NOT enrolled in
+    /// `enrolled_keys` and must never imply human uniqueness or QPC identity.
+    pub fn verify_delegated(
+        &mut self,
+        request: &Request,
+        delegated: &DelegatedProof,
+        now: u64,
+    ) -> Result<(), VerifyError> {
+        self.check_audience(request)?;
+        if request.suite_id < self.policy.min_suite_id {
+            return Err(VerifyError::DowngradedSuite);
+        }
+        let transcript = canonical_request(request)?;
+        if now < request.issued_at || now >= request.expires_at {
+            return Err(VerifyError::Time);
+        }
+        let saved = self
+            .pending
+            .get(&request.challenge_id)
+            .ok_or(VerifyError::Replay)?;
+        if canonical_request(saved)? != transcript {
+            return Err(VerifyError::Challenge);
+        }
+
+        // Validate chain: scopes narrow, signatures valid, expiry checked.
+        let requires_approval = validate_chain(
+            &delegated.chain,
+            request,
+            &self.policy.grants,
+            now,
+        )
+        .map_err(|e| match e {
+            DelegationError::DelegationExpired => VerifyError::DelegationInvalid,
+            DelegationError::DelegationChainInvalid => VerifyError::DelegationInvalid,
+            DelegationError::DelegationScopeExceeded => VerifyError::Unauthorized,
+            DelegationError::InvalidChain => VerifyError::DelegationInvalid,
+            DelegationError::HumanApprovalRequired => VerifyError::HumanApprovalRequired,
+            DelegationError::UsesExhausted => VerifyError::DelegationUsesExhausted,
+            DelegationError::Encoding(_) => VerifyError::DelegationInvalid,
+        })?;
+
+        // Root delegator must be enrolled (not revoked).
+        let root_pk = &delegated.chain[0].delegator_public_key;
+        let root_fp: [u8; 32] = Sha256::digest(root_pk).into();
+        if self.revoked_keys.contains(&root_fp) {
+            return Err(VerifyError::Revoked);
+        }
+        if !self.enrolled_keys.contains(&root_fp) {
+            return Err(VerifyError::Unauthorized);
+        }
+
+        // Agent key must match the last link's delegate.
+        let last_delegate = &delegated.chain.last().unwrap().delegate_public_key;
+        if &delegated.agent_proof.public_key != last_delegate {
+            return Err(VerifyError::DelegationInvalid);
+        }
+
+        // Verify agent's signature on the request transcript.
+        let agent_pk = dilithium3::PublicKey::from_bytes(&delegated.agent_proof.public_key)
+            .map_err(|_| VerifyError::Signature)?;
+        let agent_sig = dilithium3::DetachedSignature::from_bytes(&delegated.agent_proof.signature)
+            .map_err(|_| VerifyError::Signature)?;
+        dilithium3::verify_detached_signature(&agent_sig, &transcript, &agent_pk)
+            .map_err(|_| VerifyError::Signature)?;
+
+        // Consume the pending challenge so it cannot be probed again.
+        self.pending.remove(&request.challenge_id);
+
+        // Human approval gate — check before consuming the approval record.
+        if requires_approval && !self.approved_challenges.contains(&request.challenge_id) {
+            return Err(VerifyError::HumanApprovalRequired);
+        }
+        self.approved_challenges.remove(&request.challenge_id);
+
+        // max_uses enforcement.
+        use crate::delegation::delegation_id;
+        for link in &delegated.chain {
+            if let Some(max) = link.max_uses {
+                let id = delegation_id(link).map_err(|_| VerifyError::DelegationInvalid)?;
+                let remaining = self.delegation_uses.entry(id).or_insert(max);
+                if *remaining == 0 {
+                    return Err(VerifyError::DelegationUsesExhausted);
+                }
+                *remaining -= 1;
+            }
+        }
+
         Ok(())
     }
 }

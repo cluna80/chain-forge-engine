@@ -5,6 +5,7 @@
 //! an experimental versioned profile pending external review and golden vectors.
 //! Existing Qattice DIS-AUTH-V1 is intentionally unchanged.
 
+pub mod delegation;
 pub mod privacy;
 pub mod verifier;
 pub mod wallet;
