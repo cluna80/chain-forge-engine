@@ -189,22 +189,27 @@ Five consecutive runs; all 16 tests (11 from DIS-STATE-003, 5 new) passed every 
 |---------|-----------|
 | **HTTPS enforcement** | `validate_origin_url` rejects any scheme other than `https` (or `http` when `DIS_ALLOW_HTTP_ORIGINS=1` is set for tests). |
 | **URL structure validation** | `validate_origin_url` rejects credentials, path components beyond `/`, query strings, and fragments. |
-| **Internal IP blocking** | `validate_origin_ips` resolves the hostname before making the request and rejects loopback (127/8, ::1), private RFC1918 (10/8, 172.16/12, 192.168/16), link-local (169.254/16), CGNAT (100.64/10), multicast, broadcast, and unspecified addresses. IP literals in the origin hostname are also checked directly. |
+| **Internal IP blocking** | `validate_origin_ips` resolves the hostname before making the request, validates all returned addresses, and returns them as `Vec<SocketAddr>`. IP literals in the origin hostname are also checked directly. Rejects loopback (127/8, ::1), private RFC1918 (10/8, 172.16/12, 192.168/16), link-local (169.254/16), CGNAT (100.64/10), multicast, broadcast, unspecified, and IPv4-mapped IPv6 addresses. |
+| **DNS rebinding prevention** | `verify_origin_ownership` builds a per-request `reqwest::Client` with `resolve_to_addrs(hostname, &validated_addrs)`, pinning the pre-validated addresses. The OS DNS resolver is bypassed for the actual connection; the hostname is preserved for TLS certificate validation and the HTTP `Host` header. |
+| **Proxy bypass prevention** | `.no_proxy()` on both the shared HTTP client and the per-request pinned client disables all proxy env-var detection (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`). Proxy env vars cannot redirect origin verification through an unintended proxy that could reach internal services. |
 | **Redirect suppression** | `reqwest::redirect::Policy::none()` set at client construction — a 302/301/etc. response from the well-known endpoint causes the request to fail, not follow. |
-| **Test-mode bypass** | `DIS_ALLOW_HTTP_ORIGINS=1` env var (read once at startup) enables HTTP origins and skips the IP check for integration tests that use localhost OriginMock servers. Set in `Server::start_on()` only. |
+| **Test-mode bypass (two-key acknowledgment)** | `DIS_ALLOW_HTTP_ORIGINS=1` enables HTTP origins and internal-IP bypass for integration tests. Requires `DIS_TEST_MODE=1` to also be set; the server panics at startup if `DIS_ALLOW_HTTP_ORIGINS=1` is set without `DIS_TEST_MODE=1`. Both keys must never appear in production. Set in `Server::start_on()` only. |
 | **Well-known URL constructed from parsed origin** | The outbound URL is built from the `url::Url`-parsed origin, not the raw string, preventing path traversal or parser inconsistency. |
 
-## Acceptance tests — 3 new, 19/19 total passed (2026-10-21)
+## Acceptance tests — 4 new, 20/20 total passed (2026-10-21)
+
+16 unit tests + 20 integration tests, 36/36 total. All three runs stable.
 
 | Test | What is verified |
 |------|-----------------|
 | `s4_06_ssrf_internal_addresses_rejected_in_prod_mode` | HTTP scheme, loopback IPv4/IPv6 literals, private RFC1918, link-local, CGNAT, and `localhost` hostname all rejected in production mode; no vendor row created |
 | `s4_07_redirect_from_well_known_blocked` | Well-known endpoint returning 302 redirect → registration rejected; redirect destination not contacted |
 | `s4_08_malformed_origin_url_rejected` | Non-URL string, FTP scheme, credentials, path, query, fragment, empty host, HTTP without allow flag — all rejected with appropriate error messages; no vendor row created |
+| `s4_09_pinned_client_bypasses_os_dns_resolver` | `resolve_to_addrs` overrides OS DNS: pinned client reaches mock server at pre-validated address; unpinned client fails DNS resolution for same `.invalid` hostname. Verifies pinning mechanism, not a live DNS rebinding simulation. |
 
 ## Remaining gaps
 
 - Consumed/expired `challenges` rows are never purged (no background sweep).
 - `dis_state.db*` SQLite files on earlier branches are no longer used.
 - Vendor registration tokens are single-use by convention but not enforced by the DB.
-- DNS rebinding window between IP pre-check and actual connection (see note above).
+- DNS rebinding: `resolve_to_addrs` pins addresses resolved at pre-flight time. An adversary who controls DNS TTLs and can change the A-record between the pre-flight lookup and the connection attempt is blocked by the pin. Residual risk: an adversary who can modify the OS resolver cache (e.g. via `/etc/hosts` on the server host) before the pre-flight lookup; this is a host-compromise scenario outside DIS's threat model.

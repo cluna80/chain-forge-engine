@@ -164,7 +164,9 @@ impl Server {
             .env("DIS_ADMIN_API_KEY", ADMIN_KEY)
             .env("DIS_VENDOR_REGISTRATION_KEY", REGISTRATION_KEY)
             // Allow HTTP origins so tests can use OriginMock (plain HTTP on localhost).
+            // Both flags are required together; neither must appear in production.
             .env("DIS_ALLOW_HTTP_ORIGINS", "1")
+            .env("DIS_TEST_MODE", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn().expect("spawn dis-vendor-server");
@@ -1138,21 +1140,32 @@ async fn s4_08_malformed_origin_url_rejected() {
     assert_eq!(count, 0, "no vendor row must be created for malformed origins");
 }
 
-/// DNS rebinding resistance: `verify_origin_ownership` builds a per-request
-/// reqwest client pinned to the pre-validated IP addresses (`resolve_to_addrs`),
-/// so the actual HTTP connection uses those addresses instead of re-invoking the
-/// OS DNS resolver.  An attacker who changes a DNS record after the pre-flight
-/// `validate_origin_ips` check cannot redirect the connection.
+/// Verifies that the `resolve_to_addrs` pinning mechanism works as expected:
+/// a reqwest client with pinned addresses connects to the target even when the
+/// URL hostname does not exist in the OS DNS resolver, while an unpinned client
+/// fails for the same hostname.
 ///
-/// This test verifies the pinning mechanism directly without a running server
-/// binary: we prove that a client built with `resolve_to_addrs` routes a request
-/// to the pinned mock even when the URL hostname (.invalid TLD) does not exist
-/// in real DNS, and that an unpinned client for the same URL fails to connect.
+/// # What this test does and does not prove
 ///
-/// Separately, `ssrf_tests::pinned_client_uses_pre_validated_address` (a unit
-/// test in `src/main.rs`) exercises the same property at the library level.
+/// **What it proves**: reqwest's `resolve_to_addrs` overrides OS DNS lookup
+/// entirely for the pinned hostname.  The production code in
+/// `verify_origin_ownership` uses the same mechanism: after `validate_origin_ips`
+/// returns validated `Vec<SocketAddr>`, the per-request client is built with
+/// `resolve_to_addrs(hostname, &validated_addrs)`.  Consequently the actual HTTP
+/// connection goes to one of the pre-checked IPs, not to whatever the OS resolver
+/// would return at the time of the connection attempt.
+///
+/// **What it does not prove**: it does not simulate an adversary operating a
+/// real DNS server that changes its A-record answers between two live queries.
+/// That scenario requires external DNS infrastructure and is out of scope for
+/// an in-process integration test.  The invariant this test exercises — that
+/// `resolve_to_addrs` routes the request without consulting the OS resolver —
+/// is the property that closes the rebinding window in production.
+///
+/// The companion unit test `ssrf_tests::pinned_client_uses_pre_validated_address`
+/// in `src/main.rs` exercises the same property at the library level.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn s4_09_dns_rebinding_pinned_addresses_used() {
+async fn s4_09_pinned_client_bypasses_os_dns_resolver() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use axum::{routing::get as aGet, Router as ARouter};
 
@@ -1172,9 +1185,11 @@ async fn s4_09_dns_rebinding_pinned_addresses_used() {
 
     // ── Case 1: pinned client reaches the mock via a .invalid hostname ────────
     //
-    // "fake-dis-pin.invalid" is guaranteed to not exist in real DNS.
-    // A client with resolve_to_addrs pinned to mock_addr routes the request
-    // to the mock server, bypassing the OS resolver entirely.
+    // The .invalid TLD is IANA-reserved and never delegates; "fake-dis-pin.invalid"
+    // cannot appear in any real DNS tree.  Building a client with resolve_to_addrs
+    // pinned to mock_addr routes the request directly to the mock, bypassing the
+    // OS resolver entirely.  This is exactly what verify_origin_ownership does in
+    // production after validate_origin_ips returns validated addresses.
     let pinned = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -1190,11 +1205,10 @@ async fn s4_09_dns_rebinding_pinned_addresses_used() {
 
     // ── Case 2: unpinned client fails for the same .invalid hostname ──────────
     //
-    // Without pinning, reqwest calls the OS resolver which cannot find
-    // "fake-dis-pin.invalid" → DNS error → request fails.  This demonstrates
-    // that the pinned path is the only way the mock is reachable via that hostname,
-    // confirming that the production code's use of resolve_to_addrs genuinely
-    // prevents DNS rebinding.
+    // Without resolve_to_addrs, reqwest falls back to the OS DNS resolver, which
+    // returns NXDOMAIN for .invalid → connection error.  This confirms the pinned
+    // path above is genuinely bypassing the OS resolver, not accidentally succeeding
+    // because .invalid happens to resolve on this machine.
     let unpinned = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .redirect(reqwest::redirect::Policy::none())

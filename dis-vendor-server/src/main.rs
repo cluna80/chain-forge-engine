@@ -24,8 +24,11 @@
 //! fragment/userinfo), blocks internal/private/loopback IPs, disables HTTP
 //! redirects, and closes the DNS rebinding window by pinning the pre-validated
 //! IP addresses into a per-request reqwest client (`resolve_to_addrs`).
-//! `DIS_ALLOW_HTTP_ORIGINS=1` (test-only) skips these checks; the server
-//! refuses to start if this flag is set and DATABASE_URL is not local.
+//! `DIS_ALLOW_HTTP_ORIGINS=1` (test-only) skips these checks; starting the
+//! server with this flag requires `DIS_TEST_MODE=1` to also be set (two-key
+//! acknowledgment), making accidental production enablement nearly impossible.
+//! Both flags must never appear in production deployments.
+//! The origin-verification HTTP client never uses proxy env vars (`no_proxy()`).
 
 use axum::{
     extract::State,
@@ -70,7 +73,7 @@ struct AppState {
     /// HTTP client used to verify vendor RP origin ownership.
     http: HttpClient,
     /// When true, HTTP origins are accepted and internal IPs are not blocked.
-    /// Set only via DIS_ALLOW_HTTP_ORIGINS=1 for integration tests.
+    /// Set only via DIS_ALLOW_HTTP_ORIGINS=1 + DIS_TEST_MODE=1 for integration tests.
     allow_http_origins: bool,
 }
 
@@ -253,10 +256,14 @@ async fn verify_origin_ownership(
             let port = parsed.port().unwrap_or(443);
             let validated_addrs = validate_origin_ips(&hostname, port).await?;
             // Build a one-shot client pinned to the validated addresses.
+            // `.no_proxy()` prevents proxy env vars from redirecting this
+            // request through an unintended proxy that could reach internal
+            // services the IP validation just blocked.
             pinned = Some(
                 HttpClient::builder()
                     .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS))
                     .redirect(reqwest::redirect::Policy::none())
+                    .no_proxy()
                     .resolve_to_addrs(&hostname, &validated_addrs)
                     .build()
                     .map_err(|_| "failed to build pinned HTTP client")?,
@@ -396,12 +403,19 @@ mod ssrf_tests {
 
     // ── DNS pinning mechanism ─────────────────────────────────────────────────
 
-    /// Verifies that a reqwest client built with `resolve_to_addrs` connects
-    /// to the pinned address even when the URL hostname would not resolve via
-    /// the OS DNS resolver.  This is the same mechanism `verify_origin_ownership`
-    /// uses in production: after `validate_origin_ips` returns validated
-    /// `Vec<SocketAddr>`, a per-request client pins those addresses so that
-    /// any DNS change between validation and connection has no effect.
+    /// Verifies that a reqwest client built with `resolve_to_addrs` routes
+    /// requests to the pinned address without consulting the OS DNS resolver.
+    ///
+    /// This exercises the mechanism used by `verify_origin_ownership`: after
+    /// `validate_origin_ips` returns validated `Vec<SocketAddr>`, a per-request
+    /// client is built with `resolve_to_addrs(hostname, &validated_addrs)` so
+    /// the actual HTTP connection uses those pre-checked IPs.  The OS resolver
+    /// is bypassed for that connection, so a DNS change between the pre-flight
+    /// check and the outbound GET has no effect on which address is reached.
+    ///
+    /// Note: this test does not simulate an adversary changing live DNS answers
+    /// between two real queries; it verifies the mechanism that makes such an
+    /// attack ineffective (bypassing the OS resolver entirely for the connection).
     #[tokio::test]
     async fn pinned_client_uses_pre_validated_address() {
         use axum::{routing::get as aGet, Router as ARouter};
@@ -797,27 +811,34 @@ async fn main() {
     };
     let allow_http_origins = std::env::var("DIS_ALLOW_HTTP_ORIGINS").map(|v| v == "1").unwrap_or(false);
     if allow_http_origins {
-        // Guard against accidental production use.  If the DATABASE_URL does not
-        // contain a loopback/localhost address this environment looks like a
-        // production or staging database.  Refuse to start rather than silently
-        // disable SSRF protections.
-        let looks_local = database_url.contains("localhost")
-            || database_url.contains("127.0.0.1")
-            || database_url.contains("::1");
-        if !looks_local {
+        // Two-key acknowledgment: DIS_TEST_MODE=1 must also be set.
+        // Requiring a second independent flag makes it nearly impossible to
+        // accidentally enable this bypass in a production deployment — an operator
+        // would need to deliberately set both test-only variables.  A legitimate
+        // production host that happens to use a local PostgreSQL instance would
+        // still be protected because neither flag belongs in any production manifest
+        // or secrets store.
+        let test_mode = std::env::var("DIS_TEST_MODE").map(|v| v == "1").unwrap_or(false);
+        if !test_mode {
             panic!(
-                "DIS_ALLOW_HTTP_ORIGINS=1 is a test-only flag. \
-                 DATABASE_URL does not point to a local/test database. \
-                 Remove DIS_ALLOW_HTTP_ORIGINS from production deployments."
+                "DIS_ALLOW_HTTP_ORIGINS=1 requires DIS_TEST_MODE=1 to also be set. \
+                 Both are test-only flags that must never be present in production. \
+                 Set DIS_TEST_MODE=1 only in integration-test environments."
             );
         }
-        eprintln!("WARNING: DIS_ALLOW_HTTP_ORIGINS=1 — HTTP origins and internal IPs allowed (test mode only)");
+        eprintln!("WARNING: DIS_ALLOW_HTTP_ORIGINS=1 + DIS_TEST_MODE=1 — \
+                   HTTP origins and internal IPs allowed. \
+                   Test mode only — never set these in production.");
     }
     let http = HttpClient::builder()
         .timeout(Duration::from_millis(ORIGIN_VERIFY_TIMEOUT_MS + 500))
         // Disable redirects: a redirect could steer the verification request to
         // an internal endpoint after the SSRF pre-checks have passed.
         .redirect(reqwest::redirect::Policy::none())
+        // Never route origin-verification requests through a proxy: a misconfigured
+        // or attacker-controlled proxy could forward the request to internal services,
+        // bypassing the IP validation checks above.
+        .no_proxy()
         .build().expect("failed to build HTTP client");
     let state = AppState { db: pool, admin_key_hash, registration_key_hash, http, allow_http_origins };
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| "http://localhost:3000".into());
