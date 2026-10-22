@@ -1183,3 +1183,44 @@ Consensus logic is unchanged.
 | API rejects | tx.nonce <= cache[sender] |
 | execution expects | tx.nonce == account.nonce (post-increment, starts at 0) |
 | cache absent | sender unknown — admits nonce=0 |
+
+---
+
+## Identity Pilot — Phase 2 Complete
+**Date:** 2026-10-22
+**Red-team suite:** github.com/cluna80/RedTeam (agent8_identity_pilot.py)
+**Final status:** 0 findings across all 16 attack scenarios
+
+### What was demonstrated
+- RegisterIdentity end-to-end: fund → register → Provisional tier ✅
+- Attestation quorum (ATTESTATION_QUORUM=3): 3 independent attestors → Verified tier ✅
+- Web-of-trust propagation: Verified identities can attest new identities ✅
+- Single controller cannot bulk-verify identities ✅
+- ConfirmSybil coordinator gate enforced at mempool ingress ✅
+- ReverseSybil coordinator gate enforced at mempool ingress ✅
+- Governance rate limiting: spam proposals blocked ✅
+- DIS delegation depth overflow (>4 links) rejected ✅
+- DIS delegation scope widening rejected ✅
+- DIS human-approval bypass rejected ✅
+- DIS max_uses enforced durably via delegation_usage DB table ✅
+- Tx ingress hardened: 0 findings across F1-F8 (27 findings closed) ✅
+- Nonce cache initialized from committed state on startup ✅
+
+### Qualification
+End-to-end security hardening and quorum-based verification confirmed.
+Verification cost measurement (< $5/human target) requires real human ceremony.
+Sybil rate measurement (< 3% target) demonstrated structurally; full pilot
+requires RegisterIdentity path wired to real attestation ceremony.
+
+### Commits
+- check_tx stateless validation: multiple commits
+- Coordinator gate: 6eecbb7
+- Nonce cache fix: 1849ed3
+- DIS delegation validation: auth.rs validate_delegation_chain_structure
+- Durable max_uses: fe7d959, 11cdb8f, 70df9d3
+
+### Next milestone: QPC-CONS-001
+Personhood-to-Consensus Integration — prove one verified human cannot
+multiply consensus influence through multiple wallets, nodes, or validator
+identities. Prerequisite: personhood-weighting overlay on TendermintEngine
+(Phase 1, partially complete).
