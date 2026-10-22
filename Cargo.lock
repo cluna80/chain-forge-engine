@@ -1655,6 +1655,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dis-test-helper"
+version = "0.1.0"
+dependencies = [
+ "dis-core",
+ "hex",
+ "pqcrypto-dilithium",
+ "pqcrypto-traits",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "dis-vendor-server"
 version = "0.6.0"
 dependencies = [

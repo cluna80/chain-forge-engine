@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "dis-vendor-server",
+    "dis-test-helper",
     "dis-wallet-android/dis-jni",
     "chain-forge-sim",
     "chain-forge-service",
