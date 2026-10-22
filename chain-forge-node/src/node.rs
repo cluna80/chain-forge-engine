@@ -1070,6 +1070,20 @@ impl Node {
             None
         };
 
+        // Build nonce cache from committed account state BEFORE state is moved
+        // into Self. account.nonce is the next expected nonce (post-increment),
+        // so last committed tx.nonce = account.nonce - 1.
+        // Absence of a cache entry admits nonce=0 for fresh accounts.
+        let initial_nonce_cache = {
+            let mut m = std::collections::HashMap::new();
+            for acct in state.all_accounts() {
+                if acct.nonce > 0 {
+                    m.insert(acct.address.clone(), acct.nonce - 1);
+                }
+            }
+            m
+        };
+
         Ok(Self {
             genesis,
             consensus: engine,
@@ -1084,7 +1098,7 @@ impl Node {
             signing_key: None,
             validator_id,
             mempool: Vec::new(),
-            nonce_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            nonce_cache: Arc::new(Mutex::new(initial_nonce_cache)),
             pending_proposals: std::collections::HashMap::new(),
             pending_certs:     std::collections::HashMap::new(),
             last_proposed: None,
