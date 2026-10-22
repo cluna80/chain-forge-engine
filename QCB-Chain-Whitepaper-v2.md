@@ -1246,3 +1246,49 @@ All five conditions must hold simultaneously and sustain for a meaningful period
 To update Machine 2 binary: `scp target/release/chain-forge-node bossking@192.168.137.3:/home/bossking/chain-forge-node`
 
 Key files are gitignored (keys/*.key.json) — never commit Ed25519 signing seeds.
+
+---
+
+## Implementation Status Update — 2026-10-22
+
+### DIS-KS-V1 (Decentralized Identity Signing) — COMPLETE
+
+The DIS vendor server (`dis-vendor-server`) implements the full DIS-001 protocol:
+
+**Enrollment**: Two-step key ownership proof — challenge nonce issued, holder signs
+with Dilithium3 (ML-DSA-65 compatible), key fingerprint stored as SHA-256(raw bytes).
+
+**Delegation**: ML-DSA-65 signed delegation chains up to depth 4. Each link carries
+`rp_id`, `resource_id`, `action`, `scopes`, `issued_at`, `expires_at`, `max_uses`,
+and `requires_human_approval`. Scope narrowing enforced (no widening at any link).
+
+**Durable max_uses**: `delegation_usage` table tracks per-delegation use counts.
+`SELECT FOR UPDATE` serializes concurrent requests. Exhausted delegations rejected
+with HTTP 403 and explicit count message.
+
+**Human-approval gate**: Links with `requires_human_approval=true` require a
+non-empty `human_approval_token` or are rejected at Phase 0.5 before any DB lookup.
+
+**Binding checks** (added 2026-10-22):
+- Root delegator key enrolled and not revoked
+- `rp_id` per link matches authenticated vendor
+- Last link `resource_id` and `action` match challenge
+- Challenge scopes subset of last delegation link scopes
+- Challenge `wallet_id` matches `req.wallet_id`
+
+### Identity Pilot — Phase 2 Complete
+
+All security gates verified on 3-node devnet (qcb-devnet-3node):
+- `RegisterIdentity` → `Provisional` tier
+- 3-attester quorum (ATTESTATION_QUORUM=3) → `Verified` tier
+- Coordinator gate enforced for `ConfirmSybil` / `ReverseSybil`
+- Tx ingress: 0 findings across 27 attack cases
+- Nonce cache initialized from committed state on startup (commit 1849ed3)
+
+**Red-team suite**: github.com/cluna80/RedTeam — agent8_identity_pilot.py
+**Result**: 16/16 scenarios passing, 0 findings
+
+### Remaining before mainnet
+1. Real human verification ceremony — measure cost per human (target < $5)
+2. QPC-CONS-001 — Personhood-to-Consensus Integration
+3. Verification cost measurement against < $5/human and < 3% sybil rate targets

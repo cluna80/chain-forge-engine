@@ -1224,3 +1224,33 @@ Personhood-to-Consensus Integration — prove one verified human cannot
 multiply consensus influence through multiple wallets, nodes, or validator
 identities. Prerequisite: personhood-weighting overlay on TendermintEngine
 (Phase 1, partially complete).
+
+---
+
+## Phase C DIS — Complete
+**Date:** 2026-10-22
+**Status: COMPLETE — All 16 agent8 identity pilot scenarios passing**
+
+### What was built and verified
+- `/api/dis/verify_delegated` endpoint with full 5-phase verification
+- Durable `max_uses` enforcement via `delegation_usage` table + `SELECT FOR UPDATE`
+- Human-approval token gate (`requires_human_approval` enforced at Phase 0.5)
+- Root delegator key fingerprint fix (SHA-256 of raw bytes, not hex string)
+- `DelegationLinkJson.human_approval_token` field added to request struct
+- `dis-test-helper` binary for Dilithium3 keygen/sign/delegation in tests
+- 5 binding checks in `verify_delegated_inner`: rp_id, resource, action, scope, wallet
+
+### Agent 8 final result (all 16 scenarios)
+| Scenario | Result |
+|----------|--------|
+| I1–I8 | Passed (attestation, coordinator gates, tx ingress) |
+| I9 Delegation depth overflow | Correctly rejected at /api/auth/verify |
+| I10 Scope widening | Correctly rejected |
+| I11 max_uses exhaustion | use1=200, use2=200, use3=403 (durable enforcement) |
+| I12 Human-approval bypass | Correctly rejected with token check |
+| I13–I16 | Passed |
+| **Total** | **16/16 passed, 0 findings, 0 errors** |
+
+### Next milestone: QPC-CONS-001
+Personhood-to-Consensus Integration — one verified human cannot multiply
+consensus influence through multiple wallets, nodes, or validator identities.
