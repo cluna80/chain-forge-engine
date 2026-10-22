@@ -1073,12 +1073,16 @@ impl Node {
         // Build nonce cache from committed account state BEFORE state is moved
         // into Self. account.nonce is the next expected nonce (post-increment),
         // so last committed tx.nonce = account.nonce - 1.
-        // Absence of a cache entry admits nonce=0 for fresh accounts.
+        // Genesis accounts with nonce=0 get a u64::MAX sentinel so F5 can
+        // distinguish "known fresh account" from "unknown/funded-on-chain account".
+        // F1 special-cases the sentinel: only nonce=0 is valid as the first tx.
         let initial_nonce_cache = {
             let mut m = std::collections::HashMap::new();
             for acct in state.all_accounts() {
                 if acct.nonce > 0 {
                     m.insert(acct.address.clone(), acct.nonce - 1);
+                } else {
+                    m.insert(acct.address.clone(), u64::MAX);
                 }
             }
             m
