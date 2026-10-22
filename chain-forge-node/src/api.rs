@@ -252,6 +252,23 @@ pub async fn serve(
                                 });
                                 http_400_json(&resp.to_string())
                             }
+                            // F5-sig: Ed25519 signatures are exactly 64 bytes.
+                            // Belt-and-suspenders: check_tx enforces this too, but an
+                            // explicit ingress arm catches any path that might slip past it
+                            // (e.g. a serde default-fallback or an older check_tx binary).
+                            Ok(ref tx) if !tx.signature.is_empty() && tx.signature.len() != 64 => {
+                                tracing::warn!(tx_id = %tx.id, sig_len = tx.signature.len(),
+                                    "tx rejected: Ed25519 signature has wrong byte length");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": format!(
+                                        "malformed Ed25519 signature: expected 64 bytes, got {}",
+                                        tx.signature.len()
+                                    )
+                                });
+                                http_400_json(&resp.to_string())
+                            }
                             // F5: verify_signature runs when either the chain *requires* sigs
                             // or the tx *carries* one -- "not required" means you may omit
                             // the sig, not that a present sig is silently ignored.
