@@ -1299,3 +1299,61 @@ consensus influence through multiple wallets, nodes, or validator identities.
 1. Restart devnet after rebuild and re-run full suite to confirm 0 findings
 2. Deploy scheduler, gossip, and treasury endpoints to enable remaining NOT_TESTED scenarios
 3. QPC-CONS-001 — Personhood-to-Consensus Integration
+
+
+---
+
+## RedTeam Devnet Debug Hooks — Intentional Simulation Boundary (2026-10-22)
+**Status: DOCUMENTED — scaffolding retained; real consensus adversarial validation OPEN**
+**Reference:** Chain Forge commit `0979750` and RedTeam `agents/agent7_consensus.py`.
+
+### Decision
+The `POST /debug/inject_view_change`, `/debug/inject_vote`,
+`/debug/inject_proposal`, and `/debug/nil_block` routes were intentionally
+introduced as devnet-only test scaffolding. They return HTTP 200 with
+`{"status":"ok","discarded":true}` and do **not** deliver payloads to the
+consensus engine. Retain for development compatibility, but do not treat
+responses from these routes as evidence of consensus security. Ensure the
+routes are unavailable in production configurations.
+
+### Evidence and limitations
+- Agent7 C1 (cross-chain votes), C2 (conflicting proposals), C6 (view-change
+  flood), and C7 (equivocation) cannot establish the advertised security
+  invariants through discard-only endpoints. Mark **SIMULATED/NOT_TESTED**
+  until real authenticated, devnet-only injection hooks or equivalent
+  network-level tests are implemented.
+- Prior RedTeam suite reported three findings: F1 nonce=0/unsigned tx queued,
+  INV-13 ConfirmSybil queued without observed freeze, and C6 height stall.
+  Commit `0979750` introduced a genesis-account nonce sentinel and debug
+  stubs, but **does not independently verify** the three findings are closed.
+- Observed live three-node status before rebuild/restart: Alice height 1;
+  Bob and Dave height 0; Alice remained at height 1 after 15 seconds;
+  all three reported two peers. This is an **open liveness/synchronization
+  investigation**; the view-change flood has not been proven causal.
+- An HTTP `{"status":"queued"}` response is not a committed execution
+  receipt. F1 must check signature enforcement and nonce replay at
+  admission and execution; INV-13 must wait for commit and verify durable
+  `frozen=true` and `sybil_confirmed=true`.
+- Agent7 `_current_height()` uses `or` fallback, which mishandles a
+  legitimate zero height; fix the harness before relying on C6 results.
+
+### Follow-up acceptance gates
+1. **CONS-LIVE-001:** On a clean three-validator baseline, all validators
+   advance and converge on the same committed height/block hashes; capture
+   startup/consensus logs and diagnose the 1/0/0 stall before attack testing.
+2. **CONS-ADV-001:** Replace discard-only checks with real consensus-path
+   tests; verify wrong-chain rejection, conflicting proposal safety,
+   equivocation evidence, and rate-limited view-change flood with measured
+   pre-attack and post-attack liveness. Stubs must never count as PASS.
+3. **TX-NONCE-001:** Verify legitimate genesis nonce=0, unsigned transaction
+   rejection, duplicate pending nonce behavior, replay after commit/restart,
+   and new funded-account onboarding; evaluate `u64::MAX` sentinel
+   semantics against execution state.
+4. **ID-SYBIL-001:** Submit ConfirmSybil, observe commit/execution result,
+   then verify frozen and sybil-confirmed flags and persistence.
+5. **REDTEAM-REPORT-001:** Distinguish PASS / FAIL / NOT_TESTED / SIMULATED
+   in suite reporting; do not equate zero findings with complete coverage.
+
+**Next planned milestone:** QPC-CONS-001 personhood-to-consensus integration.
+The devnet liveness and authentic adversarial test gates above remain open
+security-validation prerequisites, not completed findings.
