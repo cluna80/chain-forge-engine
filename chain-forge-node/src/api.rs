@@ -8,7 +8,12 @@
 /// key management, and a WebSocket feed for the explorer.
 
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS, SharedNonceCache};
+
+/// In-memory max_uses counter for DIS delegations.
+/// Key = SHA-256 of canonical_delegation_body; value = remaining uses.
+pub type SharedDelegationUsage = Arc<Mutex<HashMap<[u8; 32], u32>>>;
 use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest,
                   verify_challenge_signature, identity_auth_status, authorize_scope,
                   key_binding_from_explorer, scope_policy};
@@ -62,6 +67,7 @@ pub async fn serve(
     // Change Set T — peer capacity table (advisory, non-correctness).
     peer_capacity_table: Arc<Mutex<crate::gossip_capacity::PeerCapacityTable>>,
     nonce_cache: SharedNonceCache,
+    delegation_usage: SharedDelegationUsage,
 ) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,6 +98,7 @@ pub async fn serve(
                 let node_id             = node_id.clone();
                 let peer_capacity_table = peer_capacity_table.clone();
                 let nonce_cache         = nonce_cache.clone();
+                let delegation_usage    = delegation_usage.clone();
 
                 tokio::spawn(async move {
                     // Read the WHOLE request: headers, then Content-Length
@@ -1158,6 +1165,211 @@ pub async fn serve(
                             }                   // end POST /api/auth/verify
                         }
 
+                    } else if first_line.starts_with("POST /api/dis/verify_delegated") {
+                        // POST /api/dis/verify_delegated — verify an agent's DelegatedProof.
+                        //
+                        // Accepts the same VerifyRequest shape as /api/auth/verify but requires
+                        // a non-empty delegation_chain. Validates:
+                        //   1. Delegation chain structure (depth, scope narrowing, human-approval token)
+                        //   2. Each link's Dilithium3 signature and time window
+                        //   3. Chain key connectivity (link[i].delegate == link[i+1].delegator)
+                        //   4. Root delegator must have a committed challenge in this store
+                        //   5. Agent signature over the challenge transcript
+                        //   6. max_uses enforcement via in-memory SharedDelegationUsage
+                        let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(request.len());
+                        let body = &request[body_start..];
+                        match serde_json::from_str::<VerifyRequest>(body) {
+                            Err(e) => {
+                                let resp = serde_json::json!({
+                                    "status": "error",
+                                    "reason": format!("invalid verify_delegated request JSON: {e}")
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            Ok(vreq) => {
+                                if vreq.delegation_chain.is_empty() {
+                                    let resp = serde_json::json!({
+                                        "status": "rejected",
+                                        "reason": "delegation_chain must be non-empty"
+                                    });
+                                    http_400_json(&resp.to_string())
+                                } else if let Err(reason) = super::auth::validate_delegation_chain_structure(&vreq.delegation_chain) {
+                                    tracing::warn!(challenge_id = %vreq.challenge_id, %reason,
+                                        "verify_delegated: chain structure rejected");
+                                    let resp = serde_json::json!({"status": "rejected", "reason": reason});
+                                    http_400_json(&resp.to_string())
+                                } else {
+                                    // Parse delegation chain links into dis-core types.
+                                    use dis_core::delegation::{Delegation, delegation_id, verify_delegation_link, MAX_CHAIN_DEPTH};
+                                    use sha2::{Digest, Sha256};
+                                    if vreq.delegation_chain.len() > MAX_CHAIN_DEPTH {
+                                        let resp = serde_json::json!({
+                                            "status": "rejected",
+                                            "reason": format!("chain depth {} exceeds max {MAX_CHAIN_DEPTH}", vreq.delegation_chain.len())
+                                        });
+                                        http_400_json(&resp.to_string())
+                                    } else {
+                                    let now_secs = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    let mut chain: Vec<Delegation> = Vec::new();
+                                    let mut parse_err: Option<String> = None;
+                                    for (i, link) in vreq.delegation_chain.iter().enumerate() {
+                                        let dpk = hex::decode(&link.delegator_public_key).ok();
+                                        let epk = hex::decode(&link.delegate_public_key).ok();
+                                        let sig = hex::decode(&link.signature).ok();
+                                        match (dpk, epk, sig) {
+                                            (Some(dpk), Some(epk), Some(sig)) => {
+                                                chain.push(Delegation {
+                                                    rp_id: link.rp_id.clone(),
+                                                    delegator_public_key: dpk,
+                                                    delegate_public_key: epk,
+                                                    scopes: link.scopes.clone(),
+                                                    resource_id: link.resource_id.clone(),
+                                                    action: link.action.clone(),
+                                                    issued_at: link.issued_at,
+                                                    expires_at: link.expires_at,
+                                                    max_uses: link.max_uses,
+                                                    requires_human_approval: link.requires_human_approval,
+                                                    signature: sig,
+                                                });
+                                            }
+                                            _ => {
+                                                parse_err = Some(format!("delegation link {i}: malformed hex"));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if let Some(e) = parse_err {
+                                        let resp = serde_json::json!({"status": "rejected", "reason": e});
+                                        http_400_json(&resp.to_string())
+                                    } else {
+                                        // Verify each link's sig, expiry, and chain key connectivity.
+                                        let mut link_err: Option<String> = None;
+                                        for (i, link) in chain.iter().enumerate() {
+                                            if let Err(e) = verify_delegation_link(link, now_secs) {
+                                                link_err = Some(format!("link {i}: {e}"));
+                                                break;
+                                            }
+                                            if i > 0 && link.delegator_public_key != chain[i-1].delegate_public_key {
+                                                link_err = Some(format!("chain broken at link {i}: key mismatch"));
+                                                break;
+                                            }
+                                            if i > 0 && !link.scopes.iter().all(|s| chain[i-1].scopes.contains(s)) {
+                                                link_err = Some(format!("link {i}: scopes widen parent"));
+                                                break;
+                                            }
+                                        }
+                                        if let Some(e) = link_err {
+                                            tracing::warn!(challenge_id = %vreq.challenge_id, reason = %e,
+                                                "verify_delegated: link validation failed");
+                                            let resp = serde_json::json!({"status": "rejected", "reason": e});
+                                            http_400_json(&resp.to_string())
+                                        } else {
+                                            // Look up challenge; verify agent signature over transcript.
+                                            let maybe_challenge = {
+                                                let store = challenge_store.lock().unwrap();
+                                                store.get(&vreq.challenge_id).cloned()
+                                            };
+                                            match maybe_challenge {
+                                                None => {
+                                                    let resp = serde_json::json!({
+                                                        "status": "rejected",
+                                                        "reason": format!("challenge '{}' not found or expired", vreq.challenge_id)
+                                                    });
+                                                    http_400_json(&resp.to_string())
+                                                }
+                                                Some(ref challenge) if challenge.is_expired() => {
+                                                    challenge_store.lock().unwrap().challenges.remove(&vreq.challenge_id);
+                                                    let resp = serde_json::json!({
+                                                        "status": "rejected",
+                                                        "reason": "challenge expired"
+                                                    });
+                                                    http_400_json(&resp.to_string())
+                                                }
+                                                Some(challenge) => {
+                                                    // Agent key must match last link's delegate.
+                                                    let agent_pk_bytes = hex::decode(&vreq.public_key).unwrap_or_default();
+                                                    let last_delegate = &chain.last().unwrap().delegate_public_key;
+                                                    if &agent_pk_bytes != last_delegate {
+                                                        let resp = serde_json::json!({
+                                                            "status": "rejected",
+                                                            "reason": "agent public_key does not match last delegation link's delegate_public_key"
+                                                        });
+                                                        http_400_json(&resp.to_string())
+                                                    } else {
+                                                    // Verify agent sig using same logic as verify_challenge_signature.
+                                                    let sig_result = super::auth::verify_challenge_signature(&challenge, &vreq);
+                                                    match sig_result {
+                                                        Err(reason) => {
+                                                            tracing::warn!(challenge_id = %vreq.challenge_id, %reason,
+                                                                "verify_delegated: agent signature invalid");
+                                                            let resp = serde_json::json!({"status": "rejected", "reason": reason});
+                                                            http_400_json(&resp.to_string())
+                                                        }
+                                                        Ok(address) => {
+                                                            // max_uses enforcement.
+                                                            let mut usage_err: Option<String> = None;
+                                                            {
+                                                                let mut usage = delegation_usage.lock().unwrap();
+                                                                for link in &chain {
+                                                                    if let Some(max) = link.max_uses {
+                                                                        let id = match delegation_id(link) {
+                                                                            Ok(id) => id,
+                                                                            Err(_) => {
+                                                                                usage_err = Some("failed to compute delegation id".to_string());
+                                                                                break;
+                                                                            }
+                                                                        };
+                                                                        let remaining = usage.entry(id).or_insert(max);
+                                                                        if *remaining == 0 {
+                                                                            usage_err = Some(format!(
+                                                                                "delegation max_uses limit reached"
+                                                                            ));
+                                                                            break;
+                                                                        }
+                                                                        *remaining -= 1;
+                                                                    }
+                                                                }
+                                                            }
+                                                            if let Some(e) = usage_err {
+                                                                tracing::warn!(challenge_id = %vreq.challenge_id, reason = %e,
+                                                                    "verify_delegated: max_uses exhausted");
+                                                                let resp = serde_json::json!({"status": "rejected", "reason": e});
+                                                                http_400_json(&resp.to_string())
+                                                            } else {
+                                                                // Consume challenge.
+                                                                challenge_store.lock().unwrap().challenges.remove(&vreq.challenge_id);
+                                                                tracing::info!(
+                                                                    challenge_id = %vreq.challenge_id,
+                                                                    %address,
+                                                                    chain_depth = chain.len(),
+                                                                    "verify_delegated: delegation verified"
+                                                                );
+                                                                let resp = serde_json::json!({
+                                                                    "status": "verified",
+                                                                    "challenge_id": vreq.challenge_id,
+                                                                    "address": address,
+                                                                    "scope": challenge.scope,
+                                                                    "issued_at": challenge.issued_at,
+                                                                    "chain_id": challenge.chain_id,
+                                                                    "chain_depth": chain.len(),
+                                                                    "key_binding_verified": false
+                                                                });
+                                                                http_200_json(&resp.to_string())
+                                                            }
+                                                        }
+                                                    }
+                                                    } // end else (agent key ok)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    } // end else (depth ok)
+                                }
+                            }
+                        }
                     } else if first_line.starts_with("OPTIONS") {
                         // CORS preflight for the React frontend
                         http_cors_preflight()

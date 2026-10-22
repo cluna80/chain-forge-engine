@@ -214,6 +214,10 @@ async fn main() {
     let challenge_store = std::sync::Arc::new(std::sync::Mutex::new(
         auth::ChallengeStore::new()
     ));
+    // Phase C DIS: in-memory max_uses counter for delegation proofs.
+    let delegation_usage = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::<[u8; 32], u32>::new()
+    ));
     // Node identifier for DIS-001 challenge context.
     // Uses "chain_id:port" as a human-readable node descriptor.
     let node_id = format!("{}:{}", node.chain_id(), args.api_port);
@@ -222,7 +226,7 @@ async fn main() {
         api::serve(
             api_port, status, explorer, qrc_metrics, peers, tx_queue,
             precheck, pocd_registry, challenge_store, node_id,
-            peer_capacity_table, nonce_cache,
+            peer_capacity_table, nonce_cache, delegation_usage,
         ).await;
     });
 

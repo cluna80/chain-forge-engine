@@ -33,6 +33,7 @@ chain-forge-agents    = { path = "../chain-forge-agents" }
 chain-forge-slashing  = { path = "../chain-forge-slashing", features = ["real-crypto"] }
 chain-forge-validators = { path = "../chain-forge-validators" }
 chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto", "real-pqc"] }
+dis-core              = { path = "../dis-core" }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 sha2                  = { workspace = true }
