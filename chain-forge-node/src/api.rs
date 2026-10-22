@@ -209,14 +209,33 @@ pub async fn serve(
                                 });
                                 http_400_json(&resp.to_string())
                             }
-                            // F1: nonce must be strictly greater than the last committed
-                            // nonce for this sender.  Senders not yet in the cache are
-                            // new accounts — their first tx is accepted at any nonce so
-                            // existing devnet tooling (which starts at nonce=1) works
-                            // without changes.
+                            // F5: reject transactions from senders with no committed history.
+                            // A sender absent from the nonce cache has never had a tx
+                            // committed on this chain — accepting unknown senders allows
+                            // wallet-stuffing and bypasses all sender-level controls.
                             Ok(ref tx) if {
                                 let cache = nonce_cache.lock().unwrap();
-                                cache.get(&tx.sender).map_or(false, |&last| tx.nonce <= last)
+                                !cache.contains_key(&tx.sender)
+                            } => {
+                                tracing::warn!(sender = %tx.sender, tx_id = %tx.id,
+                                    "tx rejected: sender has no committed history on this chain");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": format!("sender {} is not a registered account on this chain", tx.sender)
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            // F1: nonce must be strictly greater than the last committed
+                            // nonce for this sender AND within MAX_NONCE_GAP of it.
+                            // The gap limit prevents nonce-stuffing: an attacker cannot
+                            // reserve future slots by submitting nonce=last+10000.
+                            Ok(ref tx) if {
+                                const MAX_NONCE_GAP: u64 = 100;
+                                let cache = nonce_cache.lock().unwrap();
+                                cache.get(&tx.sender).map_or(false, |&last| {
+                                    tx.nonce <= last || tx.nonce > last.saturating_add(MAX_NONCE_GAP)
+                                })
                             } => {
                                 // Re-lock to get the last nonce for the error message.
                                 let last = nonce_cache.lock().unwrap()
@@ -229,7 +248,7 @@ pub async fn serve(
                                 let resp = serde_json::json!({
                                     "status": "rejected",
                                     "tx_id": tx_id,
-                                    "message": format!("nonce {nonce} already used or too low (last committed: {last})")
+                                    "message": format!("nonce {nonce} out of range (last committed: {last}, max gap: 100)")
                                 });
                                 http_400_json(&resp.to_string())
                             }
