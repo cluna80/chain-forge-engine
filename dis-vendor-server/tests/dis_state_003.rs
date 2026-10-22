@@ -12,7 +12,7 @@
 //!                          (e.g. "service postgresql restart"). Without it the
 //!                          DB-restart test falls back to severing all connections.
 
-use dis_core::{canonical_request, Request};
+use dis_core::{canonical_request, delegation::{make_delegation, Delegation}, Request};
 use futures::future::join_all;
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
@@ -1220,4 +1220,254 @@ async fn s4_09_pinned_client_bypasses_os_dns_resolver() {
     );
 
     mock_handle.abort();
+}
+
+// ── DIS-I11: durable, atomic max_uses enforcement ────────────────────────────
+//
+// These tests prove that /api/dis/verify_delegated:
+//   1. Accepts legitimate delegated proofs (use 1, use 2).
+//   2. Rejects the third use with a message that names max_uses.
+//   3. Survives a server crash without resetting the counter (durability).
+//   4. Is atomic: two concurrent requests at the limit yield exactly one success.
+//
+// The tests construct a real ML-DSA-65 delegation chain in-process and post
+// the full JSON payload to a live dis-vendor-server backed by Postgres.
+
+/// Build the JSON body for POST /api/dis/verify_delegated.
+///
+/// `delegation` is a signed Delegation (from dis_core::delegation::make_delegation).
+/// `agent_sk` is the agent's secret key; `challenge` is the raw challenge Value
+/// returned by /challenge; `wallet_id` / `vendor_id` identify the session.
+fn delegated_verify_body(
+    wallet_id: &str,
+    vendor_id: &str,
+    challenge: &Value,
+    delegation: &Delegation,
+    agent_pk: &[u8],
+    agent_sk: &[u8],
+) -> Value {
+    // Agent signs the stored transcript (same bytes /verify uses).
+    let transcript = canonical_request(&to_request(challenge)).unwrap();
+    let sk = dilithium3::SecretKey::from_bytes(agent_sk).unwrap();
+    let agent_sig = dilithium3::detached_sign(&transcript, &sk);
+
+    let link_json = json!({
+        "rp_id": delegation.rp_id,
+        "delegator_public_key": hex(&delegation.delegator_public_key),
+        "delegate_public_key": hex(&delegation.delegate_public_key),
+        "scopes": delegation.scopes,
+        "resource_id": delegation.resource_id,
+        "action": delegation.action,
+        "issued_at": delegation.issued_at,
+        "expires_at": delegation.expires_at,
+        "max_uses": delegation.max_uses,
+        "requires_human_approval": delegation.requires_human_approval,
+        "signature": hex(&delegation.signature),
+    });
+
+    json!({
+        "wallet_id": wallet_id,
+        "vendor_id": vendor_id,
+        "challenge": challenge,
+        "delegation_chain": [link_json],
+        "agent_public_key_hex": hex(agent_pk),
+        "agent_signature_hex": hex(agent_sig.as_bytes()),
+    })
+}
+
+// ── i11_01: use1=200, use2=200, use3=4xx with "max_uses" in message ───────────
+//
+// The root holder is an enrolled wallet. The agent is a second keypair.
+// The delegation is issued with max_uses=2. Each use gets a fresh challenge
+// (the server marks each challenge consumed), so the counter is the only
+// thing that accumulates.
+//
+// Critically: use1 and use2 must return HTTP 200 with status "verified" before
+// the test can conclude anything about use3's rejection reason.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i11_01_max_uses_enforced_two_node() {
+    let _g = SERIAL.lock().await;
+    let c = Cluster::start().await;
+
+    // Root holder (enrolled wallet = delegator).
+    let holder = Wallet::enroll(&c.a).await;
+
+    // Agent keypair (the acting agent; never enrolled in the server).
+    let (agent_pk_c, agent_sk_c) = dilithium3::keypair();
+    let agent_pk = agent_pk_c.as_bytes().to_vec();
+    let agent_sk = agent_sk_c.as_bytes().to_vec();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+    // Build a delegation: holder → agent, max_uses=2, valid for 10 minutes.
+    // rp_id is the vendor's id (the server sets rp_id = vendor_id in challenges).
+    let delegation = make_delegation(
+        &c.vendor, &holder.pk, &holder.sk, &agent_pk,
+        vec!["doc:read".into()], "doc:1", "read",
+        now, now + 600, Some(2), false,
+    ).unwrap();
+
+    // Use 1 — must succeed on server A.
+    let ch1 = c.challenge(&c.a, &holder).await;
+    let body1 = delegated_verify_body(&holder.id, &c.vendor, &ch1, &delegation, &agent_pk, &agent_sk);
+    let (code1, r1) = c.a.post("/api/dis/verify_delegated", body1).await;
+    assert_eq!(code1, 200, "use 1 must be accepted — got {code1}: {r1}");
+    assert_eq!(status(&r1), "verified", "use 1 status: {r1}");
+
+    // Use 2 — must succeed on server B (cross-instance, shared DB).
+    let ch2 = c.challenge(&c.b, &holder).await;
+    let body2 = delegated_verify_body(&holder.id, &c.vendor, &ch2, &delegation, &agent_pk, &agent_sk);
+    let (code2, r2) = c.b.post("/api/dis/verify_delegated", body2).await;
+    assert_eq!(code2, 200, "use 2 must be accepted — got {code2}: {r2}");
+    assert_eq!(status(&r2), "verified", "use 2 status: {r2}");
+
+    // Use 3 — must be rejected because max_uses=2 is exhausted.
+    let ch3 = c.challenge(&c.a, &holder).await;
+    let body3 = delegated_verify_body(&holder.id, &c.vendor, &ch3, &delegation, &agent_pk, &agent_sk);
+    let (code3, r3) = c.a.post("/api/dis/verify_delegated", body3).await;
+    assert!(
+        code3 == 400 || code3 == 403,
+        "use 3 must be rejected (max_uses exhausted) — got {code3}: {r3}"
+    );
+    let msg3 = message(&r3);
+    assert!(
+        msg3.contains("max_uses") || msg3.contains("exhausted") || msg3.contains("limit"),
+        "rejection message must name the max_uses limit — got: {msg3}"
+    );
+}
+
+// ── i11_02: usage counter survives server crash and restart ───────────────────
+//
+// Proves the counter is in Postgres, not memory. After use 1 succeeds:
+//   - crash server A (SIGKILL, no flush)
+//   - start a fresh server A on the same DB
+//   - use 2 succeeds (still within limit)
+//   - use 3 rejected (counter persisted across crash)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i11_02_max_uses_survives_restart() {
+    let _g = SERIAL.lock().await;
+    let c = Cluster::start().await;
+    let holder = Wallet::enroll(&c.a).await;
+    let (agent_pk_c, agent_sk_c) = dilithium3::keypair();
+    let agent_pk = agent_pk_c.as_bytes().to_vec();
+    let agent_sk = agent_sk_c.as_bytes().to_vec();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // Destructure the cluster so we can drop `a` independently.
+    let Cluster { mut a, b, proxy: _proxy, db: _db, vendor, _mock } = c;
+
+    let delegation = make_delegation(
+        &vendor, &holder.pk, &holder.sk, &agent_pk,
+        vec!["doc:read".into()], "doc:1", "read",
+        now, now + 600, Some(2), false,
+    ).unwrap();
+
+    // Use 1 on A — must succeed, counter becomes 1.
+    let ch1 = {
+        let (_, r) = a.post("/challenge",
+            json!({"wallet_id": holder.id, "vendor_id": vendor, "resource_id": "doc:1", "action": "read"})).await;
+        assert_eq!(r["status"], "ok", "challenge for use1: {r}");
+        r["challenge"].clone()
+    };
+    let (code1, r1) = a.post("/api/dis/verify_delegated",
+        delegated_verify_body(&holder.id, &vendor, &ch1, &delegation, &agent_pk, &agent_sk)).await;
+    assert_eq!(code1, 200, "use 1 before crash must succeed: {r1}");
+
+    // Crash A (SIGKILL — no graceful flush).
+    let db_url = a.db_url.clone();
+    a.crash();
+    drop(a);
+
+    // Restart: new server process on the same DB URL.
+    let a2 = Server::start(&db_url).await;
+
+    // Use 2 on the fresh A — must succeed (counter=1, limit=2).
+    let ch2 = {
+        let (_, r) = b.post("/challenge",
+            json!({"wallet_id": holder.id, "vendor_id": vendor, "resource_id": "doc:1", "action": "read"})).await;
+        assert_eq!(r["status"], "ok", "challenge for use2: {r}");
+        r["challenge"].clone()
+    };
+    let (code2, r2) = a2.post("/api/dis/verify_delegated",
+        delegated_verify_body(&holder.id, &vendor, &ch2, &delegation, &agent_pk, &agent_sk)).await;
+    assert_eq!(code2, 200, "use 2 after restart must succeed: {r2}");
+
+    // Use 3 — counter was persisted across crash; must be rejected.
+    let ch3 = {
+        let (_, r) = a2.post("/challenge",
+            json!({"wallet_id": holder.id, "vendor_id": vendor, "resource_id": "doc:1", "action": "read"})).await;
+        assert_eq!(r["status"], "ok", "challenge for use3: {r}");
+        r["challenge"].clone()
+    };
+    let (code3, r3) = a2.post("/api/dis/verify_delegated",
+        delegated_verify_body(&holder.id, &vendor, &ch3, &delegation, &agent_pk, &agent_sk)).await;
+    assert!(
+        code3 == 400 || code3 == 403,
+        "use 3 after restart must be rejected: {code3}: {r3}"
+    );
+    let msg3 = message(&r3);
+    assert!(
+        msg3.contains("max_uses") || msg3.contains("exhausted") || msg3.contains("limit"),
+        "rejection must name the limit: {msg3}"
+    );
+}
+
+// ── i11_03: concurrent requests at the boundary — exactly one wins ────────────
+//
+// Builds a delegation with max_uses=2, consumes use 1, then fires use 2 and
+// use 3 concurrently. The SELECT FOR UPDATE inside the DB transaction
+// serialises them: exactly one gets code 200 and one gets 4xx.
+//
+// "Exactly one wins" is the atomic guarantee. Both getting 200 would be the
+// original pre-Phase-C bug; both getting 4xx would be overly restrictive.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i11_03_concurrent_exhaustion_atomic() {
+    let _g = SERIAL.lock().await;
+    let c = Cluster::start().await;
+    let holder = Wallet::enroll(&c.a).await;
+    let (agent_pk_c, agent_sk_c) = dilithium3::keypair();
+    let agent_pk = agent_pk_c.as_bytes().to_vec();
+    let agent_sk = agent_sk_c.as_bytes().to_vec();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let delegation = make_delegation(
+        &c.vendor, &holder.pk, &holder.sk, &agent_pk,
+        vec!["doc:read".into()], "doc:1", "read",
+        now, now + 600, Some(2), false,
+    ).unwrap();
+
+    // Use 1: consume one slot so counter = 1 (one slot remaining).
+    let ch0 = c.challenge(&c.a, &holder).await;
+    let (code0, r0) = c.a.post("/api/dis/verify_delegated",
+        delegated_verify_body(&holder.id, &c.vendor, &ch0, &delegation, &agent_pk, &agent_sk)).await;
+    assert_eq!(code0, 200, "use 1 (setup) must succeed: {r0}");
+
+    // Issue two challenges in advance (each is single-use, so we need two).
+    let ch_a = c.challenge(&c.a, &holder).await;
+    let ch_b = c.challenge(&c.b, &holder).await;
+
+    let body_a = delegated_verify_body(&holder.id, &c.vendor, &ch_a, &delegation, &agent_pk, &agent_sk);
+    let body_b = delegated_verify_body(&holder.id, &c.vendor, &ch_b, &delegation, &agent_pk, &agent_sk);
+
+    // Fire both concurrently — at most one slot remains (max_uses=2, used=1).
+    let (ra, rb) = tokio::join!(
+        c.a.post("/api/dis/verify_delegated", body_a),
+        c.b.post("/api/dis/verify_delegated", body_b),
+    );
+    let (code_a, r_a) = ra;
+    let (code_b, r_b) = rb;
+
+    let successes = [code_a, code_b].iter().filter(|&&c| c == 200).count();
+    let failures  = [code_a, code_b].iter().filter(|&&c| c != 200).count();
+
+    assert_eq!(successes, 1,
+        "exactly one concurrent request must succeed (max_uses=2, used=1): \
+         A={code_a}:{r_a}  B={code_b}:{r_b}");
+    assert_eq!(failures, 1,
+        "exactly one concurrent request must fail: \
+         A={code_a}:{r_a}  B={code_b}:{r_b}");
 }
