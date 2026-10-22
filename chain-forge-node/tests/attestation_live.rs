@@ -368,7 +368,7 @@ async fn attestation_guard_live() {
     let reg_tx = serde_json::json!({
         "id":        format!("reg-{claimant}"),
         "sender":    &claimant,
-        "nonce":     1u64,
+        "nonce":     0u64,
         "body":      "RegisterIdentity",
         "gas_limit": 100_000u64,
         "signature": [],
@@ -391,7 +391,7 @@ async fn attestation_guard_live() {
     let attest_tx = serde_json::json!({
         "id":        format!("attest-{claimant}"),
         "sender":    "qcb1bob",
-        "nonce":     1u64,
+        "nonce":     0u64,
         "body":      { "Attest": { "claimant_id": &claimant } },
         "gas_limit": 100_000u64,
         "signature": [],
@@ -550,7 +550,7 @@ async fn attestation_guard_live() {
     let sybil_tx = serde_json::json!({
         "id":        format!("sybil-{sybil_target}"),
         "sender":    "qcb1alice",
-        "nonce":     1u64,
+        "nonce":     0u64,
         "body":      { "ConfirmSybil": { "sybil_id": &sybil_target } },
         "gas_limit": 100_000u64,
         "signature": [],
@@ -641,7 +641,7 @@ async fn attestation_coordinator_gate() {
     let fake_coord_tx = serde_json::json!({
         "id":        &tx_id,
         "sender":    "qcb1bob",
-        "nonce":     1u64,
+        "nonce":     0u64,
         "body":      { "ConfirmSybil": { "sybil_id": "qcb1fakesybil" } },
         "gas_limit": 100_000u64,
         "signature": [],

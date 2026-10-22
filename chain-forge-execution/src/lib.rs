@@ -1770,11 +1770,8 @@ pub fn check_tx(tx: &Transaction, max_tx_bytes: usize, block_gas_limit: u64) -> 
     if tx.sender.is_empty() {
         return Err("sender must not be empty".into());
     }
-    // F1: nonce=0 is reserved; valid txs start at nonce=1.
     // nonce=u64::MAX is rejected to prevent overflow on the next increment.
-    if tx.nonce == 0 {
-        return Err("nonce must be ≥ 1 (first transaction uses nonce 1)".into());
-    }
+    // nonce=0 is valid: it is what execution expects for a fresh account.
     if tx.nonce == u64::MAX {
         return Err("nonce u64::MAX is reserved and not permitted".into());
     }
@@ -5993,10 +5990,11 @@ mod tests {
     }
 
     #[test]
-    fn check_tx_rejects_nonce_zero() {
+    fn check_tx_accepts_nonce_zero() {
+        // nonce=0 is valid at the check_tx level: execution expects it for a fresh account.
         let mut tx = minimal_tx("qcb1alice", 100_000);
         tx.nonce = 0;
-        assert!(check_tx(&tx, 0, 0).is_err(), "nonce=0 must be rejected");
+        assert!(check_tx(&tx, 0, 0).is_ok(), "nonce=0 must be accepted by check_tx");
     }
 
     #[test]
