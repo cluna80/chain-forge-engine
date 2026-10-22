@@ -3175,17 +3175,12 @@ impl Node {
         let txs: Vec<Transaction> = serde_json::from_slice(&proposal.tx_data)
             .unwrap_or_default();
         self.remove_committed_from_mempool(&txs);
-        // F1: update per-sender nonce cache so the API can reject replayed
-        // or out-of-sequence nonces at ingress without needing state access.
-        {
-            let mut cache = self.nonce_cache.lock().unwrap();
-            for tx in &txs {
-                let entry = cache.entry(tx.sender.clone()).or_insert(0);
-                if tx.nonce > *entry {
-                    *entry = tx.nonce;
-                }
-            }
-        }
+        // Keep a lightweight (tx_id, sender) index before txs is consumed by
+        // execute_block_with_identity so the post-execution nonce-cache update
+        // can correlate successful TransactionResults back to their senders.
+        let txs_for_cache: Vec<(String, String)> = txs.iter()
+            .map(|t| (t.id.clone(), t.sender.clone()))
+            .collect();
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3327,6 +3322,34 @@ impl Node {
                 &mut self.agents, now_ms, None,
             )
         };
+
+        // F1: update per-sender nonce cache from committed state AFTER execution so
+        // the API can reject replayed nonces at ingress. Reading state.nonce (the
+        // sequential counter incremented by execution) keeps the cache in sync with
+        // what execution actually accepted. Updating from tx.nonce before execution
+        // caused the cache to advance even for txs that failed (e.g. nonce mismatch),
+        // making it impossible to submit a corrected tx on the same sender.
+        {
+            let successful_senders: std::collections::HashSet<&str> = exec_result
+                .tx_results
+                .iter()
+                .filter(|r| r.success)
+                .filter_map(|r| {
+                    // TransactionResult carries tx_id but not sender; look up from
+                    // the (tx_id, sender) index captured before txs was consumed.
+                    txs_for_cache.iter().find(|(id, _)| id == &r.tx_id).map(|(_, s)| s.as_str())
+                })
+                .collect();
+            let mut cache = self.nonce_cache.lock().unwrap();
+            for sender in successful_senders {
+                if let Ok(acct) = self.state.get_account(sender) {
+                    let entry = cache.entry(sender.to_string()).or_insert(0);
+                    if acct.nonce > *entry {
+                        *entry = acct.nonce;
+                    }
+                }
+            }
+        }
 
         // Diagnostic: log each failed tx so tests can see the root cause.
         for r in exec_result.tx_results.iter().filter(|r| !r.success) {
