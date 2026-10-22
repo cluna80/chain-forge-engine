@@ -209,13 +209,15 @@ pub async fn serve(
                                 });
                                 http_400_json(&resp.to_string())
                             }
-                            // F5: reject transactions from senders with no committed history.
-                            // A sender absent from the nonce cache has never had a tx
-                            // committed on this chain — accepting unknown senders allows
-                            // wallet-stuffing and bypasses all sender-level controls.
+                            // F5: reject transactions from senders with no committed history
+                            // when nonce > 0. A sender absent from the cache with nonce=0
+                            // is a fresh funded account submitting its first tx — that is
+                            // legitimate. A sender absent from the cache with nonce > 0 has
+                            // never committed a tx on this chain, so the nonce is wrong and
+                            // this looks like wallet-stuffing or a replay from another chain.
                             Ok(ref tx) if {
                                 let cache = nonce_cache.lock().unwrap();
-                                !cache.contains_key(&tx.sender)
+                                tx.nonce != 0 && !cache.contains_key(&tx.sender)
                             } => {
                                 tracing::warn!(sender = %tx.sender, tx_id = %tx.id,
                                     "tx rejected: sender has no committed history on this chain");
