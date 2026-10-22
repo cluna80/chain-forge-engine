@@ -1254,3 +1254,38 @@ identities. Prerequisite: personhood-weighting overlay on TendermintEngine
 ### Next milestone: QPC-CONS-001
 Personhood-to-Consensus Integration — one verified human cannot multiply
 consensus influence through multiple wallets, nodes, or validator identities.
+
+---
+
+## Red-Team Suite — Full Run Clean (minus 2 open bugs)
+**Date:** 2026-10-22
+**Status: SUITE STABLE — 2 real findings open, all false positives resolved**
+
+### Suite run results (clean devnet, 7 agents)
+| Agent | Result | Notes |
+|-------|--------|-------|
+| Agent 1 (TxFuzzer) | **FINDINGS (2)** | F1 nonce-gap, F5 bad-sender — both return 200/queued |
+| Agent 2 (Economic) | ✅ clean | 6 scheduler/treasury endpoints not yet deployed → NOT_TESTED |
+| Agent 3 (Gossip) | ✅ clean | Gossip injection endpoints not deployed → NOT_TESTED |
+| Agent 4 (Sybil) | ✅ clean | All 7 sybil scenarios pass |
+| Agent 5 (Invariant) | ✅ clean | 0 invariant violations |
+| Agent 7 (Consensus) | ✅ clean | C1/C7 vote endpoint not deployed → NOT_TESTED |
+| Agent 8 (Identity) | ✅ clean | 16/16 DIS scenarios pass |
+
+### Suite infrastructure fixes shipped
+- `run_suite.py`: `--once` flag now forwarded only to agent5 (InvariantMonitor)
+- `run_suite.py`: removed duplicate agent8 entry in default run order
+- `run_suite.py`: agent8 entry updated to `agent8_identity_pilot.py`
+- Agents 2, 3, 7: 404 responses (undeployed endpoints) now treated as NOT_TESTED instead of findings
+
+### Open findings (real bugs)
+| ID | Agent | Severity | Description |
+|----|-------|----------|-------------|
+| F1 | agent1_tx_fuzzer | critical | Tx with nonce=gap+1000 accepted and queued (HTTP 200) — mempool not enforcing nonce ordering |
+| F5 | agent1_tx_fuzzer | critical | Tx with unknown sender accepted and queued (HTTP 200) — no sender auth check at ingress |
+
+### Next steps
+1. Fix F1: enforce nonce ordering / max gap at tx ingress in chain-forge-engine
+2. Fix F5: reject txs from unknown/unregistered senders at mempool layer
+3. Deploy scheduler, gossip, and treasury endpoints to enable remaining NOT_TESTED scenarios
+4. QPC-CONS-001 — Personhood-to-Consensus Integration
