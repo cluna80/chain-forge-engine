@@ -309,6 +309,61 @@ impl RelyingParty {
 
         Ok(())
     }
+
+    /// Identical to `verify_delegated` but skips the in-memory max_uses check.
+    /// Use this from HTTP handlers that enforce usage limits externally (e.g.,
+    /// via a `delegation_usage` DB table with SELECT FOR UPDATE) so the
+    /// authoritative persistent count is not double-decremented.
+    pub fn verify_delegated_skip_usage(
+        &mut self,
+        request:   &Request,
+        delegated: &DelegatedProof,
+        now:       u64,
+    ) -> Result<(), VerifyError> {
+        self.check_audience(request)?;
+        if request.suite_id < self.policy.min_suite_id {
+            return Err(VerifyError::DowngradedSuite);
+        }
+        let transcript = canonical_request(request)?;
+        if now < request.issued_at || now >= request.expires_at {
+            return Err(VerifyError::Time);
+        }
+        let saved = self.pending.get(&request.challenge_id).ok_or(VerifyError::Replay)?;
+        if canonical_request(saved)? != transcript {
+            return Err(VerifyError::Challenge);
+        }
+        let requires_approval = validate_chain(&delegated.chain, request, &self.policy.grants, now)
+            .map_err(|e| match e {
+                DelegationError::DelegationExpired      => VerifyError::DelegationInvalid,
+                DelegationError::DelegationChainInvalid => VerifyError::DelegationInvalid,
+                DelegationError::DelegationScopeExceeded => VerifyError::Unauthorized,
+                DelegationError::InvalidChain           => VerifyError::DelegationInvalid,
+                DelegationError::HumanApprovalRequired  => VerifyError::HumanApprovalRequired,
+                DelegationError::UsesExhausted          => VerifyError::DelegationUsesExhausted,
+                DelegationError::Encoding(_)            => VerifyError::DelegationInvalid,
+            })?;
+        let root_pk = &delegated.chain[0].delegator_public_key;
+        let root_fp: [u8; 32] = Sha256::digest(root_pk).into();
+        if self.revoked_keys.contains(&root_fp)  { return Err(VerifyError::Revoked); }
+        if !self.enrolled_keys.contains(&root_fp) { return Err(VerifyError::Unauthorized); }
+        let last_delegate = &delegated.chain.last().unwrap().delegate_public_key;
+        if &delegated.agent_proof.public_key != last_delegate {
+            return Err(VerifyError::DelegationInvalid);
+        }
+        let agent_pk  = dilithium3::PublicKey::from_bytes(&delegated.agent_proof.public_key)
+            .map_err(|_| VerifyError::Signature)?;
+        let agent_sig = dilithium3::DetachedSignature::from_bytes(&delegated.agent_proof.signature)
+            .map_err(|_| VerifyError::Signature)?;
+        dilithium3::verify_detached_signature(&agent_sig, &transcript, &agent_pk)
+            .map_err(|_| VerifyError::Signature)?;
+        self.pending.remove(&request.challenge_id);
+        if requires_approval && !self.approved_challenges.contains(&request.challenge_id) {
+            return Err(VerifyError::HumanApprovalRequired);
+        }
+        self.approved_challenges.remove(&request.challenge_id);
+        // max_uses NOT checked here — caller is responsible for DB-backed enforcement.
+        Ok(())
+    }
 }
 
 /// Demonstration wallet signing only. Production wallet must independently

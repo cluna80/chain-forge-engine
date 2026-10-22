@@ -41,7 +41,11 @@ use axum_extra::{
     headers::{Authorization, authorization::Bearer},
     TypedHeader,
 };
-use dis_core::{canonical_request, Request, SUITE_ML_DSA_65};
+use dis_core::{
+    canonical_request,
+    delegation::{delegation_id, verify_delegation_link, MAX_CHAIN_DEPTH, Delegation},
+    Request, SUITE_ML_DSA_65,
+};
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
 use serde::{Deserialize, Serialize};
@@ -807,6 +811,205 @@ async fn sessions(State(state): State<AppState>, auth: Option<TypedHeader<Author
     }
 }
 
+// ── /api/dis/verify_delegated ─────────────────────────────────────────────────
+// DIS-I11: verifies a DelegatedProof against the DB.
+//
+// Request shape mirrors /verify: the client supplies the same ChallengeResponse
+// blob issued by /challenge (wallet_id, vendor_id, challenge), plus:
+//   - delegation_chain: ordered list of signed Delegation links (JSON)
+//   - agent_public_key_hex: hex ML-DSA-65 key of the acting agent
+//   - agent_signature_hex: hex ML-DSA-65 sig of the server-stored transcript
+//
+// Verification order:
+//   1. Root holder enrolled & not revoked (DB read)
+//   2. Each delegation link: sig valid, not expired, chain keys connected,
+//      scopes narrow (never widen), depth ≤ MAX_CHAIN_DEPTH
+//   3. Agent key == last link's delegate_public_key
+//   4. Agent sig valid over server-stored transcript (same bytes as /verify)
+//   5. DB transaction: for each link with max_uses, SELECT FOR UPDATE + check
+//      used_count < max_uses, increment — fail closed if limit reached
+//
+// No in-memory state; all security-relevant checks are against the DB.
+
+#[derive(Deserialize)]
+struct DelegationLinkJson {
+    rp_id: String,
+    delegator_public_key: String,  // hex
+    delegate_public_key: String,   // hex
+    scopes: Vec<String>,
+    resource_id: String,
+    action: String,
+    issued_at: u64,
+    expires_at: u64,
+    max_uses: Option<u32>,
+    requires_human_approval: bool,
+    signature: String,             // hex Dilithium3 detached sig
+}
+
+#[derive(Deserialize)]
+struct VerifyDelegatedRequest {
+    wallet_id: String,
+    vendor_id: String,
+    challenge: ChallengeResponse,
+    delegation_chain: Vec<DelegationLinkJson>,
+    agent_public_key_hex: String,
+    agent_signature_hex: String,
+}
+
+async fn verify_delegated(State(state): State<AppState>, Json(req): Json<VerifyDelegatedRequest>) -> Resp {
+    finish(verify_delegated_inner(&state.db, req).await)
+}
+
+async fn verify_delegated_inner(db: &PgPool, req: VerifyDelegatedRequest) -> Result<Resp, sqlx::Error> {
+    let c = &req.challenge;
+    let now_secs: i64 = sqlx::query_scalar(&format!("SELECT {DB_NOW}")).fetch_one(db).await?;
+    let now = now_secs as u64;
+
+    // Parse chain.
+    if req.delegation_chain.is_empty() || req.delegation_chain.len() > MAX_CHAIN_DEPTH {
+        return Ok(rejected("delegation chain empty or exceeds max depth"));
+    }
+    let mut chain: Vec<Delegation> = Vec::with_capacity(req.delegation_chain.len());
+    for link in &req.delegation_chain {
+        let (Some(dpk), Some(epk), Some(sig)) = (
+            hex_decode(&link.delegator_public_key),
+            hex_decode(&link.delegate_public_key),
+            hex_decode(&link.signature),
+        ) else {
+            return Ok(rejected("delegation link: malformed hex in keys or signature"));
+        };
+        chain.push(Delegation {
+            rp_id: link.rp_id.clone(),
+            delegator_public_key: dpk,
+            delegate_public_key: epk,
+            scopes: link.scopes.clone(),
+            resource_id: link.resource_id.clone(),
+            action: link.action.clone(),
+            issued_at: link.issued_at,
+            expires_at: link.expires_at,
+            max_uses: link.max_uses,
+            requires_human_approval: link.requires_human_approval,
+            signature: sig,
+        });
+    }
+
+    // Phase 1: root holder enrolled and not revoked.
+    let root_fp = sha256_hex(&chain[0].delegator_public_key);
+    if sqlx::query("SELECT 1 FROM revocations WHERE key_id=$1").bind(&root_fp)
+        .fetch_optional(db).await?.is_some() {
+        return Ok(rejected("root delegator key has been revoked"));
+    }
+    if sqlx::query("SELECT 1 FROM enrolled_keys WHERE key_id=$1").bind(&root_fp)
+        .fetch_optional(db).await?.is_none() {
+        return Ok(rejected("root delegator key is not enrolled"));
+    }
+
+    // Phase 2: each delegation link sig + expiry; chain key connectivity; scope narrowing.
+    for (i, link) in chain.iter().enumerate() {
+        if let Err(e) = verify_delegation_link(link, now) {
+            return Ok(rejected(&format!("delegation link {i} invalid: {e}")));
+        }
+        if i > 0 {
+            let prev = &chain[i - 1];
+            if link.delegator_public_key != prev.delegate_public_key {
+                return Ok(rejected(&format!("delegation chain broken at link {i}: key mismatch")));
+            }
+            if !link.scopes.iter().all(|s| prev.scopes.contains(s)) {
+                return Ok(rejected(&format!("delegation chain link {i}: child scopes widen parent")));
+            }
+        }
+    }
+
+    // Phase 3: agent key == last link's delegate.
+    let Some(agent_pk_bytes) = hex_decode(&req.agent_public_key_hex) else {
+        return Ok(rejected("agent_public_key_hex: invalid hex"));
+    };
+    if agent_pk_bytes != chain.last().unwrap().delegate_public_key {
+        return Ok(rejected("agent key does not match last delegation link's delegate"));
+    }
+
+    // Phase 4: agent sig over server-stored transcript (same bytes /verify uses).
+    let (Ok(challenge_id), Ok(nonce)) = (
+        <[u8; 16]>::try_from(c.challenge_id.as_slice()),
+        <[u8; 16]>::try_from(c.nonce.as_slice()),
+    ) else {
+        return Ok(rejected("malformed challenge"));
+    };
+    let submitted = Request {
+        suite_id: c.suite_id, rp_id: c.rp_id.clone(), rp_origin: c.rp_origin.clone(),
+        challenge_id, nonce, issued_at: c.issued_at, expires_at: c.expires_at,
+        resource_id: c.resource_id.clone(), action: c.action.clone(),
+        scopes: c.scopes.clone(), operation_digest: None, policy_id: c.policy_id.clone(),
+    };
+    let Ok(submitted_transcript) = canonical_request(&submitted) else {
+        return Ok(rejected("malformed challenge fields"));
+    };
+    let challenge_key_str = challenge_key(&req.vendor_id, &hex_encode(&challenge_id));
+    let stored: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT transcript FROM challenges WHERE challenge_key=$1")
+        .bind(&challenge_key_str).fetch_optional(db).await?;
+    let Some(stored_transcript) = stored else {
+        return Ok(rejected("Replay: unknown or expired challenge"));
+    };
+    if stored_transcript != submitted_transcript {
+        return Ok(rejected("Challenge: submitted fields do not match issued challenge"));
+    }
+    let Some(agent_sig_bytes) = hex_decode(&req.agent_signature_hex) else {
+        return Ok(rejected("agent_signature_hex: invalid hex"));
+    };
+    let (Ok(agent_pk), Ok(agent_sig)) = (
+        dilithium3::PublicKey::from_bytes(&agent_pk_bytes),
+        dilithium3::DetachedSignature::from_bytes(&agent_sig_bytes),
+    ) else {
+        return Ok(rejected("agent key or signature malformed"));
+    };
+    if dilithium3::verify_detached_signature(&agent_sig, &stored_transcript, &agent_pk).is_err() {
+        return Ok(rejected("agent signature invalid"));
+    }
+
+    // Phase 5 (DIS-I11): atomic max_uses enforcement.
+    // Each link with max_uses gets a SELECT FOR UPDATE + check + increment in one
+    // transaction. Any limit hit rolls back the whole transaction (no partial increments).
+    let mut tx = db.begin().await?;
+    for link in &chain {
+        let Some(max) = link.max_uses else { continue };
+        let del_id: Vec<u8> = match delegation_id(link) {
+            Ok(id) => id.to_vec(),
+            Err(_) => return Ok(rejected("internal: failed to compute delegation id")),
+        };
+        sqlx::query(
+            "INSERT INTO delegation_usage (delegation_id, max_uses, used_count)
+             VALUES ($1, $2, 0) ON CONFLICT (delegation_id) DO NOTHING")
+            .bind(&del_id).bind(max as i32).execute(&mut *tx).await?;
+        let row = sqlx::query(
+            "SELECT used_count, max_uses FROM delegation_usage WHERE delegation_id=$1 FOR UPDATE")
+            .bind(&del_id).fetch_one(&mut *tx).await?;
+        let (used, cap): (i32, i32) = (row.try_get(0)?, row.try_get(1)?);
+        if used >= cap {
+            tx.rollback().await?;
+            return Ok(rejected(&format!(
+                "delegation max_uses ({cap}) exhausted ({used} uses already recorded)")));
+        }
+        sqlx::query(
+            "UPDATE delegation_usage SET used_count = used_count + 1 WHERE delegation_id=$1")
+            .bind(&del_id).execute(&mut *tx).await?;
+    }
+    // Mark challenge consumed (same as /verify) so it cannot be replayed.
+    sqlx::query(
+        "UPDATE challenges SET consumed_at=$2 WHERE challenge_key=$1 AND consumed_at IS NULL")
+        .bind(&challenge_key_str).bind(now_secs).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    Ok(ok(json!({
+        "status": "verified",
+        "message": "delegated proof accepted",
+        "wallet_id": req.wallet_id,
+        "vendor_id": req.vendor_id,
+        "resource_id": c.resource_id,
+        "action": c.action,
+    })))
+}
+
 #[tokio::main]
 async fn main() {
     let database_url = std::env::var("DATABASE_URL")
@@ -912,6 +1115,7 @@ async fn main() {
         .route("/enroll", post(enroll))
         .route("/challenge", post(challenge))
         .route("/verify", post(verify))
+        .route("/api/dis/verify_delegated", post(verify_delegated))
         .route("/sessions", get(sessions))
         .route("/admin/revoke", post(revoke))
         .with_state(state)
