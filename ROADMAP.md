@@ -1146,3 +1146,40 @@ These are the concrete engineering tasks to pick up next, in priority order. The
 To update Machine 2 binary: `scp target/release/chain-forge-node bossking@192.168.137.3:/home/bossking/chain-forge-node`
 
 Key files are gitignored (`keys/*.key.json`) — never commit Ed25519 signing seeds.
+
+---
+
+## Milestone: Transaction Nonce Cache Consistency and Restart Recovery
+**Status: COMPLETE**
+**Commit:** 1849ed3
+**Date:** 2026-10-22
+
+### What was fixed
+`SharedNonceCache` was initialized empty on every startup, causing the API
+admission gate to diverge from committed execution state after any restart.
+The cache now loads from `state.all_accounts()` before `state` is moved into
+`Self`, inserting `(address, account.nonce - 1)` for all accounts with
+`nonce > 0`. Absence of an entry correctly admits `nonce=0` for fresh accounts.
+
+### Verified observations (3-node devnet regression, 2026-10-22)
+- Fresh account nonce=0 executed successfully ✅
+- Sequential nonce execution advanced committed account state ✅
+- Previously committed nonce replay rejected ✅
+- Account nonce consistent across devnet restart ✅
+- Invalid future nonce=10 queued but did not advance committed account nonce=4 ✅
+- Subsequent valid nonce=4 accepted and executed ✅
+- Final committed account nonce advanced to 5 ✅
+- Final Alice balance: 499,997,677 uQCB ✅
+
+### Scope
+These results validate the tested nonce-cache recovery path on a 3-node devnet.
+They do not cover all possible concurrent or adversarial transaction scenarios.
+Consensus logic is unchanged.
+
+### Nonce semantics (now consistent end-to-end)
+| Layer | Convention |
+|-------|-----------|
+| cache stores | last committed tx.nonce |
+| API rejects | tx.nonce <= cache[sender] |
+| execution expects | tx.nonce == account.nonce (post-increment, starts at 0) |
+| cache absent | sender unknown — admits nonce=0 |
