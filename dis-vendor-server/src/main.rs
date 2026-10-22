@@ -530,7 +530,9 @@ fn vendor_permits(res_json: &str, act_json: &str, resource: &str, action: &str) 
 
 fn ok(v: Value) -> Resp { (StatusCode::OK, Json(v)) }
 fn error(msg: &str) -> Resp { ok(json!({"status":"error","message":msg})) }
-fn rejected(msg: &str) -> Resp { ok(json!({"status":"rejected","message":msg})) }
+/// Security rejections always return 403 so callers cannot mistake a denied
+/// authorization for success by checking only the HTTP status code.
+fn rejected(msg: &str) -> Resp { (StatusCode::FORBIDDEN, Json(json!({"status":"rejected","message":msg}))) }
 
 /// Fail closed: any state-store error becomes a denial, never a grant.
 fn finish(r: Result<Resp, sqlx::Error>) -> Resp {
@@ -893,19 +895,30 @@ async fn verify_delegated_inner(db: &PgPool, req: VerifyDelegatedRequest) -> Res
         });
     }
 
-    // Phase 1: root holder enrolled and not revoked.
+    // Phase 1: root holder enrolled, not revoked, and belongs to req.wallet_id.
     let root_fp = sha256_hex(&chain[0].delegator_public_key);
     if sqlx::query("SELECT 1 FROM revocations WHERE key_id=$1").bind(&root_fp)
         .fetch_optional(db).await?.is_some() {
         return Ok(rejected("root delegator key has been revoked"));
     }
-    if sqlx::query("SELECT 1 FROM enrolled_keys WHERE key_id=$1").bind(&root_fp)
-        .fetch_optional(db).await?.is_none() {
-        return Ok(rejected("root delegator key is not enrolled"));
+    let enrolled_wallet: Option<String> = sqlx::query_scalar(
+        "SELECT wallet_id FROM enrolled_keys WHERE key_id=$1").bind(&root_fp)
+        .fetch_optional(db).await?;
+    match enrolled_wallet {
+        None => return Ok(rejected("root delegator key is not enrolled")),
+        Some(ref w) if w != &req.wallet_id =>
+            return Ok(rejected("root delegator key is enrolled under a different wallet")),
+        _ => {}
     }
 
-    // Phase 2: each delegation link sig + expiry; chain key connectivity; scope narrowing.
+    // Phase 2: each delegation link sig + expiry; chain key connectivity; scope narrowing;
+    // rp_id must match the authenticated vendor for every link.
     for (i, link) in chain.iter().enumerate() {
+        if link.rp_id != c.rp_id {
+            return Ok(rejected(&format!(
+                "delegation link {i} rp_id ({}) does not match vendor ({})",
+                link.rp_id, c.rp_id)));
+        }
         if let Err(e) = verify_delegation_link(link, now) {
             return Ok(rejected(&format!("delegation link {i} invalid: {e}")));
         }
@@ -917,6 +930,27 @@ async fn verify_delegated_inner(db: &PgPool, req: VerifyDelegatedRequest) -> Res
             if !link.scopes.iter().all(|s| prev.scopes.contains(s)) {
                 return Ok(rejected(&format!("delegation chain link {i}: child scopes widen parent")));
             }
+        }
+    }
+
+    // Phase 2b: last delegation link must authorize the resource, action, and scopes
+    // the challenge was issued for.  Without this check an agent could present a
+    // delegation for doc:1/read against a challenge for doc:secret/delete.
+    let last = chain.last().unwrap();
+    if last.resource_id != c.resource_id {
+        return Ok(rejected(&format!(
+            "delegation resource ({}) does not match challenge resource ({})",
+            last.resource_id, c.resource_id)));
+    }
+    if last.action != c.action {
+        return Ok(rejected(&format!(
+            "delegation action ({}) does not match challenge action ({})",
+            last.action, c.action)));
+    }
+    for scope in &c.scopes {
+        if !last.scopes.contains(scope) {
+            return Ok(rejected(&format!(
+                "challenge scope ({scope}) is not covered by the delegation")));
         }
     }
 
@@ -945,12 +979,20 @@ async fn verify_delegated_inner(db: &PgPool, req: VerifyDelegatedRequest) -> Res
         return Ok(rejected("malformed challenge fields"));
     };
     let challenge_key_str = challenge_key(&req.vendor_id, &hex_encode(&challenge_id));
-    let stored: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT transcript FROM challenges WHERE challenge_key=$1")
+    let stored_row = sqlx::query(
+        "SELECT transcript, wallet_id, consumed_at FROM challenges WHERE challenge_key=$1")
         .bind(&challenge_key_str).fetch_optional(db).await?;
-    let Some(stored_transcript) = stored else {
+    let Some(row) = stored_row else {
         return Ok(rejected("Replay: unknown or expired challenge"));
     };
+    let (stored_transcript, challenge_wallet, consumed_at): (Vec<u8>, String, Option<i64>) =
+        (row.try_get(0)?, row.try_get(1)?, row.try_get(2)?);
+    if consumed_at.is_some() {
+        return Ok(rejected("Replay: challenge already consumed"));
+    }
+    if challenge_wallet != req.wallet_id {
+        return Ok(rejected("Challenge: issued to a different wallet"));
+    }
     if stored_transcript != submitted_transcript {
         return Ok(rejected("Challenge: submitted fields do not match issued challenge"));
     }

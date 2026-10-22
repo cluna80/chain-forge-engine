@@ -1305,7 +1305,7 @@ async fn i11_01_max_uses_enforced_two_node() {
     // rp_id is the vendor's id (the server sets rp_id = vendor_id in challenges).
     let delegation = make_delegation(
         &c.vendor, &holder.pk, &holder.sk, &agent_pk,
-        vec!["doc:read".into()], "doc:1", "read",
+        vec!["document:read".into()], "doc:1", "read",
         now, now + 600, Some(2), false,
     ).unwrap();
 
@@ -1361,7 +1361,7 @@ async fn i11_02_max_uses_survives_restart() {
 
     let delegation = make_delegation(
         &vendor, &holder.pk, &holder.sk, &agent_pk,
-        vec!["doc:read".into()], "doc:1", "read",
+        vec!["document:read".into()], "doc:1", "read",
         now, now + 600, Some(2), false,
     ).unwrap();
 
@@ -1436,7 +1436,7 @@ async fn i11_03_concurrent_exhaustion_atomic() {
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let delegation = make_delegation(
         &c.vendor, &holder.pk, &holder.sk, &agent_pk,
-        vec!["doc:read".into()], "doc:1", "read",
+        vec!["document:read".into()], "doc:1", "read",
         now, now + 600, Some(2), false,
     ).unwrap();
 
