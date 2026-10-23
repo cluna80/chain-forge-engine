@@ -1073,20 +1073,36 @@ impl Node {
         // Build nonce cache from committed account state BEFORE state is moved
         // into Self. account.nonce is the next expected nonce (post-increment),
         // so last committed tx.nonce = account.nonce - 1.
-        // Genesis accounts with nonce=0 get a u64::MAX sentinel so F5 can
-        // distinguish "known fresh account" from "unknown/funded-on-chain account".
-        // F1 special-cases the sentinel: only nonce=0 is valid as the first tx.
+        // Genesis accounts seed the nonce cache with their current nonce so F5
+        // knows they're valid senders. Nonces start at 0 (first valid tx nonce=1).
+        // A fresh account (nonce=0 in genesis) is seeded with last=0, so its first
+        // valid tx must use nonce=1 (not nonce=0).
         let initial_nonce_cache = {
             let mut m = std::collections::HashMap::new();
             for acct in state.all_accounts() {
-                if acct.nonce > 0 {
-                    m.insert(acct.address.clone(), acct.nonce - 1);
-                } else {
-                    m.insert(acct.address.clone(), u64::MAX);
-                }
+                m.insert(acct.address.clone(), acct.nonce);
             }
             m
         };
+
+        // Seed the explorer with genesis account balances so that
+        // /qcb/resource/balance and the F2 balance guard work before the
+        // first block is committed (height 0).
+        {
+            let mut ex = explorer.lock().unwrap();
+            for acct in state.all_accounts() {
+                ex.accounts.insert(acct.address.clone(), AccountSummary {
+                    address:        acct.address.clone(),
+                    role:           acct.role.clone(),
+                    nonce:          acct.nonce,
+                    balances:       acct.balances.clone(),
+                    tier:           acct.verification_tier().map(|t| t.to_string()),
+                    exemption_days: acct.exemption_days(),
+                    frozen:         false,
+                    sybil_confirmed: false,
+                });
+            }
+        }
 
         Ok(Self {
             genesis,
