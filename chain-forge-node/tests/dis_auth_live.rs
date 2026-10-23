@@ -842,3 +842,197 @@ async fn dis_auth_live() {
     println!("\n── DIS-001-13 PASSED ────────────────────────────────────────────────");
     println!("   All 8 steps verified against live 4-node devnet.");
 }
+
+/// A04 — Revocation Propagation Live Devnet Test (QPC-CONS-001 Phase C)
+///
+/// Confirms that revoking an attestation that drops a Verified identity below
+/// ATTESTATION_QUORUM (3) correctly downgrades it back to Provisional on ALL
+/// nodes end-to-end.  This is the PR #10 merge blocker.
+///
+/// Flow:
+///   1. Register Wallet C
+///   2. Bob, Carol, Dave each attest → tier=Verified
+///   3. Bob revokes his attestation (RevokeAttestation) → count drops to 2 < 3
+///   4. Assert tier=Provisional on all 4 nodes
+///   5. Assert scope_authorized=false for identity:attest (RequiresVerified)
+///   6. Re-attest Bob → count back to 3 → assert tier=Verified again
+#[tokio::test]
+async fn a04_revocation_propagation() {
+    if skip_if_no_binary() { return; }
+
+    let ports   = DevnetPorts::new();
+    let log_dir = tempdir("qcb-a04-revocation");
+
+    println!("\n── A04 Revocation Propagation live devnet test ──────────────────────");
+    println!("   log dir: {}", log_dir.display());
+    println!("   alice_api={} bob_api={} carol_api={} dave_api={}",
+             ports.alice_api, ports.bob_api, ports.carol_api, ports.dave_api);
+
+    let scheme = MlDsaScheme;
+    let kp_c   = SignatureScheme::generate_keypair(&scheme, "random")
+        .expect("keypair C generation failed");
+    let addr_c = derive_address_from_pq_key(&kp_c.public_key);
+    let pub_c  = kp_c.public_key_hex();
+    println!("   wallet C : {addr_c}");
+
+    let _nodes = spawn_devnet(&ports, &log_dir);
+    let all_ports = ports.all_api_ports();
+
+    println!("   Waiting for API ports...");
+    for (name, port) in [("alice", ports.alice_api), ("bob", ports.bob_api),
+                          ("carol", ports.carol_api), ("dave", ports.dave_api)] {
+        assert!(
+            wait_for_port(port, Duration::from_secs(30)),
+            "{name} API (:{port}) did not come up within 30s"
+        );
+    }
+    assert!(
+        poll_until_height(&all_ports, 1, Duration::from_secs(30)),
+        "devnet did not reach height 1 within 30s"
+    );
+
+    // ── Fund Wallet C for gas ──────────────────────────────────────────────
+    let fund_c = serde_json::json!({
+        "id":         format!("fund-{addr_c}"),
+        "sender":     "qcb1alice",
+        "nonce":      0u64,
+        "body":       { "Transfer": { "to": addr_c, "denom": "uqcb", "amount": 10_000u64 } },
+        "gas_limit":  100_000u64,
+        "signature":  [],
+        "public_key": []
+    });
+    let r = api_post_tx(ports.alice_api, &fund_c.to_string()).expect("fund C: no response");
+    println!("   Fund C: {r}");
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let nonce: u64 = api_get(ports.alice_api, "/api/accounts/qcb1alice")
+                .and_then(|v| v["nonce"].as_u64()).unwrap_or(0);
+            if nonce >= 1 { break; }
+            assert!(Instant::now() < deadline, "fund C did not settle within 30s");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    // ── Step 1: RegisterIdentity for Wallet C ─────────────────────────────
+    println!("\n── Step 1: RegisterIdentity for Wallet C ────────────────────────────");
+    let reg_c = serde_json::json!({
+        "id":         format!("reg-{addr_c}"),
+        "sender":     addr_c,
+        "nonce":      0u64,
+        "body":       "RegisterIdentity",
+        "gas_limit":  100_000u64,
+        "signature":  [],
+        "public_key": []
+    });
+    let r = api_post_tx(ports.alice_api, &reg_c.to_string()).expect("RegisterIdentity C: no response");
+    println!("   Register C: {r}");
+    assert!(
+        poll_until_registered(&all_ports, &addr_c, Duration::from_secs(30)),
+        "Wallet C did not register on all nodes within 30s"
+    );
+    println!("   ✓ Wallet C registered");
+
+    // ── Step 2: Bob + Carol + Dave attest → Verified ──────────────────────
+    println!("\n── Step 2: Three attestations → Verified ────────────────────────────");
+    for (attester_addr, attester_port, label) in [
+        ("qcb1bob",   ports.bob_api,   "bob"),
+        ("qcb1carol", ports.carol_api, "carol"),
+        ("qcb1dave",  ports.dave_api,  "dave"),
+    ] {
+        let attest = serde_json::json!({
+            "id":         format!("attest-{label}-{addr_c}"),
+            "sender":     attester_addr,
+            "nonce":      0u64,
+            "body":       { "Attest": { "claimant_id": addr_c } },
+            "gas_limit":  100_000u64,
+            "signature":  [],
+            "public_key": []
+        });
+        let r = api_post_tx(attester_port, &attest.to_string())
+            .unwrap_or_else(|| panic!("Attest {label}: no response"));
+        println!("   attest {label}: {r}");
+    }
+
+    assert!(
+        poll_until_tier(&all_ports, &addr_c, "Verified", Duration::from_secs(30)),
+        "Wallet C did not reach Verified tier on all nodes within 30s"
+    );
+    println!("   ✓ Wallet C is Verified on all nodes");
+
+    // Confirm scope_authorized=true while Verified
+    let resp = auth_round(ports.alice_api, "identity:attest", &pub_c, &kp_c,
+                          "WalletC-verified/identity:attest");
+    assert_eq!(resp["scope_authorized"].as_bool(), Some(true),
+        "Step 2: Verified wallet must have scope_authorized=true, got {resp}");
+    println!("   ✓ scope_authorized=true for Verified wallet");
+
+    // ── Step 3: Bob revokes → count drops to 2 → Provisional ─────────────
+    println!("\n── Step 3: Bob revokes attestation → tier drops to Provisional ──────");
+    let revoke_bob = serde_json::json!({
+        "id":         format!("revoke-bob-{addr_c}"),
+        "sender":     "qcb1bob",
+        "nonce":      1u64,   // bob used nonce 0 for Attest
+        "body":       { "RevokeAttestation": { "attested_id": addr_c } },
+        "gas_limit":  100_000u64,
+        "signature":  [],
+        "public_key": []
+    });
+    let r = api_post_tx(ports.bob_api, &revoke_bob.to_string())
+        .expect("RevokeAttestation bob: no response");
+    println!("   RevokeAttestation bob: {r}");
+
+    // ── Step 4: Assert tier=Provisional on all 4 nodes ───────────────────
+    println!("\n── Step 4: Assert tier=Provisional on all nodes ─────────────────────");
+    assert!(
+        poll_until_tier(&all_ports, &addr_c, "Provisional", Duration::from_secs(30)),
+        "Wallet C did not downgrade to Provisional tier on all nodes within 30s \
+         after attestation count dropped below quorum"
+    );
+    println!("   ✓ Wallet C is Provisional on all nodes — revocation propagation confirmed");
+
+    // ── Step 5: Scope denied after downgrade ─────────────────────────────
+    println!("\n── Step 5: Assert scope_authorized=false after downgrade ────────────");
+    let resp = auth_round(ports.alice_api, "identity:attest", &pub_c, &kp_c,
+                          "WalletC-downgraded/identity:attest");
+    assert_eq!(resp["scope_authorized"].as_bool(), Some(false),
+        "Step 5: downgraded-to-Provisional wallet must have scope_authorized=false, got {resp}");
+    println!("   ✓ scope_authorized=false after revocation downgrade");
+
+    // ── Step 6: Alice attests → back to Verified (bob is on cooldown) ────
+    // Bob is subject to REVOCATION_COOLDOWN_EPOCHS and cannot immediately
+    // re-attest.  Use alice (a Verified genesis validator who has not yet
+    // attested Wallet C) as the 4th attester to bring the count back to 3.
+    println!("\n── Step 6: Alice attests Wallet C → back to Verified ────────────────");
+    let attest_alice = serde_json::json!({
+        "id":         format!("reattest-alice-{addr_c}"),
+        "sender":     "qcb1alice",
+        "nonce":      1u64,   // alice nonce 0 used for Fund C
+        "body":       { "Attest": { "claimant_id": addr_c } },
+        "gas_limit":  100_000u64,
+        "signature":  [],
+        "public_key": []
+    });
+    let r = api_post_tx(ports.alice_api, &attest_alice.to_string())
+        .expect("Re-attest alice: no response");
+    println!("   Re-attest alice: {r}");
+
+    assert!(
+        poll_until_tier(&all_ports, &addr_c, "Verified", Duration::from_secs(30)),
+        "Wallet C did not recover to Verified after alice re-attestation within 30s \
+         (alice is the 4th attester; bob is on REVOCATION_COOLDOWN_EPOCHS)"
+    );
+    println!("   ✓ Wallet C recovered to Verified (alice as 4th attester)");
+
+    let resp = auth_round(ports.alice_api, "identity:attest", &pub_c, &kp_c,
+                          "WalletC-recovered/identity:attest");
+    assert_eq!(resp["scope_authorized"].as_bool(), Some(true),
+        "Step 6: re-verified wallet must have scope_authorized=true, got {resp}");
+    println!("   ✓ scope_authorized=true restored after re-attestation");
+
+    println!("\n── A04 PASSED ───────────────────────────────────────────────────────");
+    println!("   Revocation propagation confirmed: attestation count below quorum");
+    println!("   correctly downgrades Verified → Provisional on all 4 nodes.");
+    println!("   Recovery via a fresh attester (alice) restores Verified tier.");
+    println!("   Note: REVOCATION_COOLDOWN_EPOCHS=1 applies to the revoking attester (bob).");
+}

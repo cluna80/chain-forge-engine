@@ -3446,6 +3446,15 @@ impl Node {
                     }
                 }
             }
+            // F5 bootstrap: seed any account that now exists in state but has never
+            // committed a tx (e.g. Transfer recipients). Without this, newly funded
+            // addresses are blocked from submitting their first tx (RegisterIdentity,
+            // BondValidator, etc.) because the F5 check only allows known senders.
+            // u64::MAX is the NO_PRIOR_TX sentinel: the nonce check allows any nonce
+            // in 0..MAX_NONCE_GAP as the first tx.
+            for acct in self.state.all_accounts() {
+                cache.entry(acct.address.clone()).or_insert(u64::MAX);
+            }
         }
 
         // Diagnostic: log each failed tx so tests can see the root cause.
