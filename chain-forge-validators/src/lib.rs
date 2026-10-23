@@ -1773,4 +1773,159 @@ mod tests {
         let v1 = vs.validators.iter().find(|v| v.id.0 == "v1").unwrap();
         assert!(v1.public_key.is_empty());
     }
+
+    // -- Epoch-boundary revocation invariant tests ----------------------------
+    //
+    // Protocol invariant (Section 3.3 / QPC-CONS-001):
+    //   At epoch advance, any validator whose owner identity tier no longer
+    //   grants_consensus() MUST have pop_verified = false and status = Candidate
+    //   in the ValidatorRegistry, and MUST NOT appear with non-zero voting power
+    //   in the validator set used by the consensus engine.
+    //
+    // The epoch-boundary window (between identity lapse and the next epoch
+    // advance) is intentional: it bounds the delay at one epoch but does not
+    // eliminate it. These tests confirm the boundary semantics are correct and
+    // that the window is closed as soon as epoch_advance fires.
+
+    #[test]
+    fn epoch_boundary_revocation_removes_consensus_power() {
+        // A validator that was Active+pop_verified MUST lose all voting power
+        // as soon as revoke_pop() is called (simulating the epoch-advance sweep).
+        // This is the core invariant: no lapsed validator may contribute to quorum.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+
+        // Pre-condition: validator is in the active set with non-zero power.
+        let vs_before = reg.build_validator_set(1);
+        let power_before = vs_before.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert!(power_before > 0,
+            "pre-condition: validator must have non-zero power before epoch-boundary revocation");
+
+        // Epoch advance fires: identity tier no longer grants consensus.
+        reg.revoke_pop("val1", 2).unwrap();
+
+        // Post-condition: validator must not appear in the active set with power.
+        let vs_after = reg.build_validator_set(2);
+        let power_after = vs_after.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert_eq!(power_after, 0,
+            "epoch-boundary invariant violated: lapsed validator must have zero consensus power \
+             immediately after revoke_pop (epoch-advance window is closed)");
+
+        let record = reg.get("val1").unwrap();
+        assert!(!record.pop_verified,
+            "pop_verified must be false after epoch-boundary revocation");
+        assert_eq!(record.status, ValidatorStatus::Candidate,
+            "status must be Candidate after epoch-boundary revocation");
+    }
+
+    #[test]
+    fn epoch_boundary_revocation_affects_only_lapsed_validator() {
+        // When one validator lapses at epoch advance, other validators with
+        // valid identity must retain their full consensus power. The sweep is
+        // per-validator, not a global reset.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.register(req("val2", "qcb1val2", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+        reg.confirm_pop("val2", VerificationTier::Verified, 1).unwrap();
+
+        // Only val1 lapses at epoch 2 (identity no longer grants_consensus).
+        reg.revoke_pop("val1", 2).unwrap();
+
+        let vs = reg.build_validator_set(2);
+
+        let power_val1 = vs.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        let power_val2 = vs.validators.iter()
+            .find(|v| v.id.0 == "val2")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+
+        assert_eq!(power_val1, 0,
+            "lapsed validator val1 must have zero power after epoch-boundary revocation");
+        assert!(power_val2 > 0,
+            "valid validator val2 must retain non-zero power after a different validator lapses; \
+             epoch-boundary sweep must not affect validators whose identity is still eligible");
+    }
+
+    #[test]
+    fn revoke_pop_is_idempotent_across_multiple_epoch_advances() {
+        // revoke_pop() is called once per eligible validator per epoch advance.
+        // If the sweep fires twice (concurrent epoch advances, duplicate calls),
+        // the second call must be a no-op — it must not corrupt the record or
+        // return an error that would abort the sweep loop.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+
+        // First revoke at epoch 2 — simulates normal epoch-advance sweep.
+        reg.revoke_pop("val1", 2).unwrap();
+        let record_after_first = reg.get("val1").unwrap().clone();
+
+        // Second revoke at epoch 3 — simulates duplicate call or racing advance.
+        let result = reg.revoke_pop("val1", 3);
+        assert!(result.is_ok(),
+            "revoke_pop must be idempotent: a second call on an already-Candidate \
+             validator must not return an error; got: {:?}", result.err());
+
+        let record_after_second = reg.get("val1").unwrap();
+        assert_eq!(record_after_second.pop_verified, record_after_first.pop_verified,
+            "pop_verified must be unchanged after idempotent revoke_pop");
+        assert_eq!(record_after_second.status, record_after_first.status,
+            "status must be unchanged after idempotent revoke_pop");
+        assert_eq!(record_after_second.consensus_power(), 0,
+            "consensus power must remain zero after idempotent revoke_pop");
+    }
+
+    #[test]
+    fn validator_reenter_consensus_after_identity_restored() {
+        // After an epoch-boundary revocation, a validator whose owner re-attains
+        // a consensus-eligible identity tier must be able to re-enter the active
+        // set via confirm_pop. The re-entry must restore full consensus power and
+        // must not leave any residue from the lapse that would reduce power.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+
+        // Epoch 2: identity lapses, epoch-boundary sweep fires.
+        reg.revoke_pop("val1", 2).unwrap();
+        assert_eq!(reg.get("val1").unwrap().consensus_power(), 0,
+            "pre-condition for re-entry test: power must be zero after revocation");
+
+        // Epoch 3: owner re-verifies identity, confirm_pop fires.
+        reg.confirm_pop("val1", VerificationTier::Verified, 3).unwrap();
+
+        let record = reg.get("val1").unwrap();
+        assert!(record.pop_verified,
+            "pop_verified must be true after identity is restored via confirm_pop");
+        assert_eq!(record.status, ValidatorStatus::Active,
+            "status must be Active after identity is restored via confirm_pop");
+        assert!(record.consensus_power() > 0,
+            "consensus power must be restored after identity re-verification; \
+             a validator whose owner re-attains eligibility must re-enter the active set");
+
+        // The restored validator must appear with non-zero power in the validator set.
+        let vs = reg.build_validator_set(3);
+        let power = vs.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert!(power > 0,
+            "epoch-boundary re-entry invariant: validator set must reflect restored \
+             consensus power after confirm_pop (power={})", power);
+
+        // Jail records must remain empty — lapse+re-verify is not a slashing event.
+        assert!(record.jail_records.is_empty(),
+            "jail_records must remain empty after lapse+re-verify cycle: \
+             lapse is an inactivity event, not a punishable offense (Section 3.3)");
+    }
 }
