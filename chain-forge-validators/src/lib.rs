@@ -57,6 +57,9 @@ pub enum ValidatorError {
 
     #[error("internal validator error: {0}")]
     Internal(String),
+
+    #[error("verification tier {tier} does not grant consensus for validator {id}")]
+    IneligibleTier { id: String, tier: String },
 }
 
 pub type ValResult<T> = Result<T, ValidatorError>;
@@ -379,8 +382,14 @@ impl ValidatorRecord {
 
     /// Voting power to assign in the consensus ValidatorSet.
     /// Non-verified validators get 0 power regardless of stake.
+    /// A stored verification tier that does not satisfy `grants_consensus()`
+    /// also produces zero power — defense-in-depth against stale state.
     pub fn consensus_power(&self) -> u64 {
-        if self.pop_verified && self.status == ValidatorStatus::Active {
+        let tier_eligible = self.verification_tier
+            .as_ref()
+            .map(|t| t.grants_consensus())
+            .unwrap_or(false);
+        if self.pop_verified && self.status == ValidatorStatus::Active && tier_eligible {
             1 // Equal per-human weight; apply_personhood_cap handles the ceiling
         } else {
             0
@@ -852,6 +861,13 @@ impl ValidatorRegistry {
         verification_tier: VerificationTier,
         epoch:             u64,
     ) -> ValResult<()> {
+        if !verification_tier.grants_consensus() {
+            return Err(ValidatorError::IneligibleTier {
+                id:   validator_id.to_string(),
+                tier: format!("{verification_tier:?}"),
+            });
+        }
+
         let record = self.validators.get_mut(validator_id)
             .ok_or_else(|| ValidatorError::NotFound(validator_id.to_string()))?;
 
@@ -1000,9 +1016,19 @@ impl ValidatorRegistry {
     /// Candidates, Jailed, and Tombstoned validators are excluded.
     /// apply_personhood_cap() is applied to enforce the power ceiling.
     pub fn build_validator_set(&self, height: u64) -> ValidatorSet {
-        // Collect all active, PoP-verified validators as candidates.
+        // Collect all active, PoP-verified validators whose stored tier
+        // grants consensus. The tier check is defense-in-depth: consensus_power()
+        // already returns 0 for ineligible tiers, but filtering here ensures
+        // ineligible validators are fully absent from the set, not just zero-powered.
         let candidates: Vec<&ValidatorRecord> = self.validators.values()
-            .filter(|r| r.status == ValidatorStatus::Active && r.pop_verified)
+            .filter(|r| {
+                r.status == ValidatorStatus::Active
+                    && r.pop_verified
+                    && r.verification_tier
+                        .as_ref()
+                        .map(|t| t.grants_consensus())
+                        .unwrap_or(false)
+            })
             .collect();
 
         // Per-human power budget: tracks how much of power_cap this human has
@@ -1927,5 +1953,100 @@ mod tests {
         assert!(record.jail_records.is_empty(),
             "jail_records must remain empty after lapse+re-verify cycle: \
              lapse is an inactivity event, not a punishable offense (Section 3.3)");
+    }
+
+    // -- Registry eligibility enforcement tests ------------------------------
+    //
+    // These tests cover the defense-in-depth guard added to the registry:
+    //   confirm_pop() rejects tiers that do not satisfy grants_consensus().
+    //   consensus_power() returns 0 when the stored tier is ineligible.
+    //   build_validator_set() excludes ineligible-tier validators entirely.
+    //
+    // These guarantees hold even if the node sweep were to call confirm_pop
+    // with a stale or downgraded tier — the registry refuses the call at the
+    // boundary rather than requiring the sweep to self-correct.
+
+    fn make_reg_single(id: &str) -> ValidatorRegistry {
+        let mut reg = registry();
+        reg.register_genesis_validator(id, 0);
+        reg
+    }
+
+    #[test]
+    fn confirm_pop_rejects_provisional_tier() {
+        let mut reg = make_reg_single("v1");
+        let err = reg.confirm_pop("v1", VerificationTier::Provisional, 1)
+            .expect_err("confirm_pop must reject VerificationTier::Provisional");
+        assert!(
+            matches!(err, ValidatorError::IneligibleTier { .. }),
+            "expected IneligibleTier, got {err:?}"
+        );
+        // Validator must remain in its prior state: not pop_verified, not Active.
+        let r = reg.get("v1").unwrap();
+        assert!(!r.pop_verified, "pop_verified must stay false after rejected confirm_pop");
+        assert_eq!(r.consensus_power(), 0, "consensus_power must remain 0");
+    }
+
+    #[test]
+    fn consensus_power_zero_for_ineligible_tier_via_direct_field_write() {
+        // Documents the defense-in-depth in consensus_power(): even if a record
+        // somehow ends up with pop_verified=true and an ineligible tier (e.g. via
+        // deserialization of corrupt state), consensus_power() returns 0.
+        let mut reg = make_reg_single("v1");
+
+        // Bypass confirm_pop and corrupt the record directly (simulates bad state).
+        {
+            let record = reg.validators.get_mut("v1").unwrap();
+            record.pop_verified      = true;
+            record.verification_tier = Some(VerificationTier::Provisional);
+            record.status            = ValidatorStatus::Active;
+        }
+
+        let r = reg.get("v1").unwrap();
+        assert_eq!(
+            r.consensus_power(), 0,
+            "consensus_power must return 0 for Active+pop_verified validator \
+             whose stored tier is Provisional (ineligible)"
+        );
+    }
+
+    #[test]
+    fn build_validator_set_excludes_ineligible_tier_validator() {
+        // Even with pop_verified=true and Active status, a validator with an
+        // ineligible tier must not appear in the built validator set.
+        let mut reg = registry();
+        reg.register_genesis_validator("eligible",   0);
+        reg.register_genesis_validator("ineligible", 0);
+
+        reg.confirm_pop("eligible", VerificationTier::Verified, 1).unwrap();
+
+        // Corrupt the ineligible validator's record directly.
+        {
+            let record = reg.validators.get_mut("ineligible").unwrap();
+            record.pop_verified      = true;
+            record.verification_tier = Some(VerificationTier::Provisional);
+            record.status            = ValidatorStatus::Active;
+        }
+
+        let vs = reg.build_validator_set(1);
+        assert!(
+            vs.validators.iter().all(|v| v.id.0 != "ineligible"),
+            "build_validator_set must exclude the ineligible-tier validator entirely"
+        );
+        let eligible_power = vs.validators.iter()
+            .find(|v| v.id.0 == "eligible")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert!(eligible_power > 0, "eligible Verified validator must have non-zero power");
+    }
+
+    #[test]
+    fn confirm_pop_verified_tier_still_works_after_eligibility_guard() {
+        // Regression: adding the eligibility guard must not break the normal path.
+        let mut reg = make_reg_single("v1");
+        reg.confirm_pop("v1", VerificationTier::Verified, 1).unwrap();
+        let r = reg.get("v1").unwrap();
+        assert!(r.pop_verified);
+        assert_eq!(r.consensus_power(), 1);
     }
 }

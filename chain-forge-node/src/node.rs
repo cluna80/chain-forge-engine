@@ -10172,17 +10172,19 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_does_not_restore_validator_with_downgraded_identity() {
-        // Invariant C: the epoch-boundary sweep only calls confirm_pop when a
-        // validator's identity CURRENTLY grants_consensus(). It must NOT call
-        // confirm_pop for an identity that is Provisional after a lapse. This
-        // test verifies the guard property: after a revocation, a second sweep
-        // pass on a still-lapsed identity does not restore consensus power.
+        // Invariant C (two-layer enforcement):
         //
-        // Design note: confirm_pop() itself trusts the VerificationTier passed
-        // by the caller and does not independently check the identity store. The
-        // safety guarantee is entirely in the sweep's pre-condition: it reads
-        // the live identity tier and calls revoke_pop for ineligible validators,
-        // never confirm_pop. This test proves that property holds end-to-end.
+        // Layer 1 — sweep guard: the epoch-boundary sweep only calls confirm_pop
+        //   when a validator's identity CURRENTLY grants_consensus(). A second
+        //   sweep pass on a still-lapsed identity must not restore consensus power.
+        //
+        // Layer 2 — registry guard: confirm_pop() itself now rejects any tier
+        //   that does not satisfy grants_consensus() (ValidatorError::IneligibleTier).
+        //   This prevents any internal caller from accidentally granting power to
+        //   an ineligible tier, even if the sweep's pre-condition were bypassed.
+        //
+        // Together: Ineligible identity tier => consensus_power() == 0, enforced
+        // at both the call site and the registry boundary.
         use chain_forge_identity::LIVENESS_EPOCH_WINDOW;
         use chain_forge_identity::VerificationTier;
 
@@ -10195,7 +10197,7 @@ mod tests {
         }
         node.identity.advance_epoch_to(target_epoch);
 
-        // First propose_block: sweep fires, Alice is revoked.
+        // Layer 1 — sweep guard: first propose_block revokes Alice.
         let h0 = chain_forge_consensus::BlockHash("h0-stale".into());
         node.propose_block(h0).await.unwrap();
         assert!(
@@ -10204,59 +10206,42 @@ mod tests {
             "pre-condition: Alice must be !pop_verified after first sweep"
         );
 
-        // Second propose_block: sweep fires again on the same still-lapsed
-        // identity. The sweep must NOT call confirm_pop — it must call revoke_pop
-        // (idempotent) or do nothing. Alice must remain !pop_verified.
+        // Layer 1 continued: second sweep pass on the still-lapsed identity.
+        // The sweep must call revoke_pop (idempotent), not confirm_pop.
         let h1 = chain_forge_consensus::BlockHash("h1-stale".into());
         node.propose_block(h1).await.unwrap();
         let alice_after_second = node.validator_registry.get("qcb1alice").unwrap();
         assert!(
             !alice_after_second.pop_verified,
-            "stale-identity guard: a second sweep pass on a still-lapsed identity \
-             must not restore pop_verified — the sweep must only call revoke_pop \
-             for ineligible validators, never confirm_pop"
+            "sweep guard: a second sweep pass on a still-lapsed identity must not \
+             restore pop_verified — the sweep calls revoke_pop, never confirm_pop, \
+             for ineligible validators"
         );
         assert_eq!(
             alice_after_second.consensus_power(), 0,
-            "stale-identity guard: Alice must still have zero power after a \
-             second sweep pass on her lapsed identity"
+            "sweep guard: Alice must have zero power after a second sweep pass"
         );
 
-        // The registry-level property: confirm_pop trusts its caller, so the
-        // entire safety guarantee lives in the sweep's pre-condition. Document
-        // this explicitly: calling confirm_pop with Provisional tier WOULD grant
-        // consensus power (this is by design — the registry is a dumb store).
-        // The sweep's guard is what prevents this from happening in production.
-        node.validator_registry.confirm_pop(
+        // Layer 2 — registry guard: confirm_pop with an ineligible tier is now
+        // rejected at the registry boundary, not just at the sweep call site.
+        let err = node.validator_registry.confirm_pop(
             "qcb1alice",
             VerificationTier::Provisional,
             target_epoch + 1,
-        ).unwrap();
-        let alice_after_stale_confirm = node.validator_registry.get("qcb1alice").unwrap();
-        // confirm_pop with any tier sets pop_verified=true and activates the
-        // validator — the registry does not re-check the identity store.
-        // This is the documented design: confirm_pop is a trusted internal API.
-        // The guard is in the sweep (Integration Point 3), not in confirm_pop.
+        ).expect_err("registry guard: confirm_pop must reject Provisional tier");
         assert!(
-            alice_after_stale_confirm.pop_verified,
-            "registry design: confirm_pop with Provisional tier sets pop_verified=true \
-             (confirm_pop trusts its caller — the guard is in the sweep, not here)"
+            matches!(err, chain_forge_validators::ValidatorError::IneligibleTier { .. }),
+            "registry guard: expected IneligibleTier error, got {err:?}"
         );
-        // A third sweep pass will immediately correct this: the next propose_block
-        // reads Alice's still-Provisional identity and calls revoke_pop again.
-        let h2 = chain_forge_consensus::BlockHash("h2-stale".into());
-        node.propose_block(h2).await.unwrap();
-        let alice_corrected = node.validator_registry.get("qcb1alice").unwrap();
-        assert!(
-            !alice_corrected.pop_verified,
-            "sweep correction: after a stale confirm_pop, the next propose_block \
-             sweep must re-revoke Alice because her identity still does not grant \
-             consensus — the sweep catches any out-of-band confirm_pop call within \
-             one block"
-        );
+        // Alice's state must be unchanged after the rejected call.
+        let alice_unchanged = node.validator_registry.get("qcb1alice").unwrap();
+        assert!(!alice_unchanged.pop_verified,
+            "registry guard: rejected confirm_pop must leave pop_verified=false");
+        assert_eq!(alice_unchanged.consensus_power(), 0,
+            "registry guard: rejected confirm_pop must leave consensus_power=0");
 
-        // Finally: confirm that a LEGITIMATE re-verification DOES restore power.
-        // First update Alice's identity tier in the identity store.
+        // Legitimate re-verification: update identity store to Verified, then
+        // confirm_pop with the correct tier must succeed and restore power.
         node.identity.get_mut("qcb1alice")
             .map(|r| r.charm.tier = VerificationTier::Verified);
         node.validator_registry.confirm_pop(
@@ -10265,24 +10250,17 @@ mod tests {
             target_epoch + 2,
         ).unwrap();
         let alice_restored = node.validator_registry.get("qcb1alice").unwrap();
-        assert!(
-            alice_restored.pop_verified,
-            "legitimate re-verification: confirm_pop with Verified tier must set \
-             pop_verified=true"
-        );
-        assert!(
-            alice_restored.consensus_power() > 0,
-            "legitimate re-verification: confirm_pop with Verified tier must \
-             restore non-zero consensus power"
-        );
-        // And the next sweep must NOT re-revoke her (identity now grants consensus).
-        let h3 = chain_forge_consensus::BlockHash("h3-stale".into());
-        node.propose_block(h3).await.unwrap();
+        assert!(alice_restored.pop_verified,
+            "re-verification: confirm_pop with Verified tier must set pop_verified=true");
+        assert!(alice_restored.consensus_power() > 0,
+            "re-verification: confirm_pop with Verified tier must restore consensus power");
+
+        // The next sweep must NOT re-revoke Alice (her identity now grants consensus).
+        let h2 = chain_forge_consensus::BlockHash("h2-stale".into());
+        node.propose_block(h2).await.unwrap();
         let alice_stable = node.validator_registry.get("qcb1alice").unwrap();
-        assert!(
-            alice_stable.pop_verified,
-            "after legitimate re-verification, the sweep must leave Alice as \
-             pop_verified because her identity tier now grants consensus"
-        );
+        assert!(alice_stable.pop_verified,
+            "after re-verification, the sweep must leave Alice as pop_verified \
+             because her identity tier now grants consensus");
     }
 }
