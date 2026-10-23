@@ -293,6 +293,15 @@ pub struct GenesisConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_coordinator: Option<String>,
 
+    /// Hex-encoded Groth16 verification key for the ZK-VRC multi-issuer
+    /// personhood proof circuit (QPC-GAP-002).  When present and the node
+    /// is compiled with `--features zk-vrc`, the execution layer accepts
+    /// `VerifyIdentityWithProof` transactions and upgrades submitters from
+    /// Provisional → Verified without requiring the `attestation_coordinator`.
+    /// Omitting this field keeps the existing coordinator-only path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pop_vk_bytes_hex: Option<String>,
+
     /// Optional Proof of Cryptographic Discovery configuration.
     ///
     /// When present and `enabled = true`, the node activates the PoCD mining

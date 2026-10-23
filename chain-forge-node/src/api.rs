@@ -11,9 +11,59 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS, SharedNonceCache};
 
-/// In-memory max_uses counter for DIS delegations.
-/// Key = SHA-256 of canonical_delegation_body; value = remaining uses.
-pub type SharedDelegationUsage = Arc<Mutex<HashMap<[u8; 32], u32>>>;
+/// Durable max_uses counter for DIS delegations.
+///
+/// Wraps a `HashMap<delegation_id, remaining_uses>` and optionally persists it
+/// to `<data_dir>/persist/dis_delegation_usage.json` so counts survive node
+/// restarts (closes I11).  When no data_dir is configured the counter is
+/// memory-only (same as before) — the node still enforces max_uses within a
+/// session; it just resets on restart.
+#[derive(Default)]
+pub struct DelegationUsageStore {
+    pub counts: HashMap<[u8; 32], u32>,
+    persist_path: Option<std::path::PathBuf>,
+}
+
+impl DelegationUsageStore {
+    /// Create a new store, loading existing counts from disk when a path is given.
+    pub fn new(data_dir: Option<&std::path::Path>) -> Self {
+        let persist_path = data_dir.map(|d| d.join("persist").join("dis_delegation_usage.json"));
+        let counts = if let Some(ref p) = persist_path {
+            if let Ok(bytes) = std::fs::read(p) {
+                // Stored as [{hex_id: String, remaining: u32}, ...]
+                #[derive(serde::Deserialize)]
+                struct Row { hex_id: String, remaining: u32 }
+                if let Ok(rows) = serde_json::from_slice::<Vec<Row>>(&bytes) {
+                    rows.into_iter().filter_map(|r| {
+                        let b = hex::decode(&r.hex_id).ok()?;
+                        let arr: [u8; 32] = b.try_into().ok()?;
+                        Some((arr, r.remaining))
+                    }).collect()
+                } else {
+                    HashMap::new()
+                }
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+        Self { counts, persist_path }
+    }
+
+    /// Flush counts to disk (best-effort; ignores write errors).
+    pub fn flush(&self) {
+        let Some(ref p) = self.persist_path else { return };
+        #[derive(serde::Serialize)]
+        struct Row<'a> { hex_id: String, remaining: u32, #[allow(dead_code)] _phantom: std::marker::PhantomData<&'a ()> }
+        let rows: Vec<_> = self.counts.iter().map(|(id, &rem)| {
+            serde_json::json!({ "hex_id": hex::encode(id), "remaining": rem })
+        }).collect();
+        let _ = std::fs::write(p, serde_json::to_vec(&rows).unwrap_or_default());
+    }
+}
+
+pub type SharedDelegationUsage = Arc<Mutex<DelegationUsageStore>>;
 use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest,
                   verify_challenge_signature, identity_auth_status, authorize_scope,
                   key_binding_from_explorer, scope_policy};
@@ -1259,7 +1309,7 @@ pub async fn serve(
                         //   3. Chain key connectivity (link[i].delegate == link[i+1].delegator)
                         //   4. Root delegator must have a committed challenge in this store
                         //   5. Agent signature over the challenge transcript
-                        //   6. max_uses enforcement via in-memory SharedDelegationUsage
+                        //   6. max_uses enforcement via DelegationUsageStore (durable, flushed to disk)
                         let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(request.len());
                         let body = &request[body_start..];
                         // Accept both the native VerifyRequest format and the DIS vendor-server
@@ -1422,7 +1472,7 @@ pub async fn serve(
                                                             Ok(address) => {
                                                                 let mut usage_err: Option<String> = None;
                                                                 {
-                                                                    let mut usage = delegation_usage.lock().unwrap();
+                                                                    let mut store = delegation_usage.lock().unwrap();
                                                                     for link in &chain {
                                                                         if let Some(max) = link.max_uses {
                                                                             let id = match delegation_id(link) {
@@ -1432,13 +1482,16 @@ pub async fn serve(
                                                                                     break;
                                                                                 }
                                                                             };
-                                                                            let remaining = usage.entry(id).or_insert(max);
+                                                                            let remaining = store.counts.entry(id).or_insert(max);
                                                                             if *remaining == 0 {
                                                                                 usage_err = Some("delegation max_uses limit reached".to_string());
                                                                                 break;
                                                                             }
                                                                             *remaining -= 1;
                                                                         }
+                                                                    }
+                                                                    if usage_err.is_none() {
+                                                                        store.flush();
                                                                     }
                                                                 }
                                                                 if let Some(e) = usage_err {

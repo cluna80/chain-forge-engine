@@ -510,6 +510,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::BondValidator { .. }             => "bond_validator",
         TxBody::UnbondValidator                  => "unbond_validator",
         TxBody::RegisterValidatorKey { .. }      => "register_validator_key",
+        // QPC-GAP-002: ZK-VRC multi-issuer personhood proof
+        TxBody::VerifyIdentityWithProof { .. }   => "verify_identity_with_proof",
     }
 }
 
@@ -727,7 +729,24 @@ impl Node {
         };
 
         // Build executor
-        let exec_config = ExecutionConfig::from_genesis(&genesis);
+        let mut exec_config = ExecutionConfig::from_genesis(&genesis);
+        // QPC-GAP-002: wire ZK-VRC multi-issuer verifier when feature is enabled
+        // and genesis supplies a verification key.
+        #[cfg(feature = "zk-vrc")]
+        if let Some(ref hex_vk) = genesis.pop_vk_bytes_hex {
+            match hex::decode(hex_vk)
+                .map_err(|e| e.to_string())
+                .and_then(|b| chain_forge_personhood::Groth16VrcVerifier::from_vk_bytes(&b))
+            {
+                Ok(v) => {
+                    exec_config.pop_verifier = Some(std::sync::Arc::new(v));
+                    tracing::info!("ZK-VRC verifier loaded from genesis pop_vk_bytes_hex");
+                }
+                Err(e) => {
+                    return Err(NodeError::Genesis(format!("invalid pop_vk_bytes_hex: {e}")));
+                }
+            }
+        }
         let executor = Executor::new(exec_config);
 
         // Build network config from genesis, applying the CLI port

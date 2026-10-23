@@ -214,9 +214,10 @@ async fn main() {
     let challenge_store = std::sync::Arc::new(std::sync::Mutex::new(
         auth::ChallengeStore::new()
     ));
-    // Phase C DIS: in-memory max_uses counter for delegation proofs.
+    // Phase C DIS: durable max_uses counter for delegation proofs (I11).
+    // Loaded from data_dir/persist/dis_delegation_usage.json when available.
     let delegation_usage = std::sync::Arc::new(std::sync::Mutex::new(
-        std::collections::HashMap::<[u8; 32], u32>::new()
+        api::DelegationUsageStore::new(args.data_dir.as_deref())
     ));
     // Node identifier for DIS-001 challenge context.
     // Uses "chain_id:port" as a human-readable node descriptor.

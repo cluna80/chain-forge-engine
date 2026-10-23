@@ -213,6 +213,9 @@ impl GasModel {
                     // replay-key write + treasury debit + recipient credit.
                     // Comparable to QrcContributionSettle (also 12×).
                     TxBody::ClaimResearchReward { .. }   => op_multiplier * 12,
+                    // VerifyIdentityWithProof: Groth16 proof verification; higher gas than
+                    // a plain attestation to reflect the ZK-VRC verification cost.
+                    TxBody::VerifyIdentityWithProof { .. } => op_multiplier * 8,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -628,6 +631,34 @@ pub enum TxBody {
         /// Reward kind: `"primary"` | `"replication"`.
         reward_kind: String,
     },
+
+    /// Upgrade a Provisional identity to Verified via a ZK-VRC membership
+    /// proof (QPC-GAP-002 — multi-issuer decentralized personhood verification).
+    ///
+    /// Replaces the single-coordinator bootstrap path for non-genesis validators:
+    /// any identity holder with a valid Groth16 VRC proof from an approved issuer
+    /// (registered in the node's IssuerRegistry) can self-promote to Verified
+    /// without waiting for ATTESTATION_QUORUM human attestations.
+    ///
+    /// Effects:
+    ///   - Calls `identity.verify_identity(sender, attestation, Some(verifier))`
+    ///     where `verifier` is the node's configured `Groth16VrcVerifier`.
+    ///   - On success, syncs the Verified charm to on-chain AccountState and
+    ///     refreshes the Merkle leaf so `pop_verified` picks it up at the next
+    ///     validator-set update.
+    ///
+    /// Enforced invariants:
+    ///   - Sender must be registered (Provisional tier).
+    ///   - Node must have a `pop_verifier` configured (fails closed otherwise).
+    ///   - `proof_bytes` must be a valid compressed Groth16 proof.
+    ///   - `public_inputs_bytes` must encode the IssuerRegistry Merkle root
+    ///     matching the node's current approved-issuer set.
+    VerifyIdentityWithProof {
+        /// Compressed canonical `ark_groth16::Proof<Bls12_381>` bytes.
+        proof_bytes: Vec<u8>,
+        /// Compressed canonical `Fr` public inputs (IssuerRegistry Merkle root).
+        public_inputs_bytes: Vec<u8>,
+    },
 }
 
 impl TxBody {
@@ -670,6 +701,7 @@ impl TxBody {
             // Resource Job Lifecycle
             // PoCD Research Reward Settlement (Change Set L)
             TxBody::ClaimResearchReward { .. }     => "ClaimResearchReward",
+            TxBody::VerifyIdentityWithProof { .. } => "VerifyIdentityWithProof",
         }
     }
 }
@@ -930,6 +962,10 @@ impl Transaction {
                 claim_id.len() + objective_id.len() + task_id.len() + result_id.len()
                     + contribution_hash.len() + recipient.len() + policy_version.len()
                     + reward_kind.len() + 16
+            }
+            // VerifyIdentityWithProof: proof + public inputs bytes.
+            TxBody::VerifyIdentityWithProof { proof_bytes, public_inputs_bytes } => {
+                proof_bytes.len() + public_inputs_bytes.len()
             }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
@@ -1370,7 +1406,7 @@ impl CryptoMigrationState {
 }
 
 /// Runtime execution parameters derived from genesis.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionConfig {
     pub gas_model:       GasModel,
     pub block_gas_limit: u64,
@@ -1403,6 +1439,14 @@ pub struct ExecutionConfig {
     /// are credited here after each transaction executes. Defaults to
     /// `"treasury:fees"` when not specified in genesis.
     pub fee_collector: String,
+
+    /// Optional ZK-VRC proof verifier (QPC-GAP-002).
+    ///
+    /// When set, `VerifyIdentityWithProof` transactions are accepted and the
+    /// verifier is used to check the Groth16 membership proof against the
+    /// node's IssuerRegistry root. When `None`, all `VerifyIdentityWithProof`
+    /// transactions are rejected with "no pop_verifier configured" (fail-closed).
+    pub pop_verifier: Option<std::sync::Arc<dyn chain_forge_identity::PopProofVerifier + Send + Sync>>,
 }
 
 impl ExecutionConfig {
@@ -1424,6 +1468,7 @@ impl ExecutionConfig {
             fee_collector: genesis.execution.fee_collector
                 .clone()
                 .unwrap_or_else(|| "treasury:fees".to_string()),
+            pop_verifier: None,
         }
     }
 }
@@ -1751,6 +1796,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // CS-001 P4: EmergencyDeprecateAlgorithm is a core constitutional tx;
         // no optional module gate — governed exclusively by crypto_governors list.
         TxBody::EmergencyDeprecateAlgorithm { .. } => None,
+        // VerifyIdentityWithProof: requires identity module (ZK-VRC path).
+        TxBody::VerifyIdentityWithProof { .. } => Some("identity"),
     }
 }
 
@@ -2510,6 +2557,39 @@ impl Executor {
                         state.refresh_leaf(claimant_id);
                     })
                     .map_err(|e| e.to_string())
+            }
+
+            TxBody::VerifyIdentityWithProof { proof_bytes, public_inputs_bytes } => {
+                // ZK-VRC direct verification path (QPC-GAP-002).
+                // Fails closed if no verifier is configured.
+                match self.config.pop_verifier.as_deref() {
+                    None => Err("VerifyIdentityWithProof: no pop_verifier configured on this node".to_string()),
+                    Some(verifier) => {
+                        let epoch = identity.clock.current_epoch;
+                        let attestation = chain_forge_identity::PopAttestation {
+                            identity_id: tx.sender.clone(),
+                            attester:    tx.sender.clone(),
+                            epoch,
+                            proof:       proof_bytes.clone(),
+                            note:        Some("zkp-vrc".to_string()),
+                        };
+                        identity.verify_identity(&tx.sender, attestation, Some(verifier))
+                            .map(|_| {
+                                events.push(format!(
+                                    "verify_identity_with_proof: {} upgraded to Verified via ZK-VRC",
+                                    tx.sender
+                                ));
+                                if let (Ok(record), Ok(acct)) = (
+                                    identity.get(&tx.sender),
+                                    state.get_account_mut(&tx.sender),
+                                ) {
+                                    acct.attach_charm(record.charm.clone());
+                                }
+                                state.refresh_leaf(&tx.sender);
+                            })
+                            .map_err(|e| e.to_string())
+                    }
+                }
             }
 
             TxBody::SponsorAgent { agent_address } => {
@@ -3404,6 +3484,10 @@ impl Executor {
             // ClaimResearchReward requires the full identity- and state-aware executor.
             TxBody::ClaimResearchReward { .. } => {
                 Err("ClaimResearchReward requires the full identity- and state-aware executor".to_string())
+            }
+            // VerifyIdentityWithProof requires the full identity- and state-aware executor.
+            TxBody::VerifyIdentityWithProof { .. } => {
+                Err("VerifyIdentityWithProof requires the full identity- and state-aware executor".to_string())
             }
         };
 
