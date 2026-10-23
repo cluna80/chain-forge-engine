@@ -655,7 +655,8 @@ pub mod real {
                 transport,
                 behaviour,
                 local_peer_id,
-                libp2p::swarm::Config::with_tokio_executor(),
+                libp2p::swarm::Config::with_tokio_executor()
+                    .with_idle_connection_timeout(Duration::from_secs(60)),
             );
 
             // Listen on configured port
