@@ -250,8 +250,30 @@ pub enum TxBody {
     /// whether the resulting total clears the minimum bond threshold only
     /// matters for active-set eligibility, not for this tx succeeding.
     /// See `validator_bond::ValidatorBondStore::bond()`.
+    ///
+    /// QPC-CONS-001 Phase B: authenticated human-identity binding.
+    ///
+    /// `owner_identity_id` must be the address that holds an active, unfrozen
+    /// personhood credential (i.e. `grants_consensus()` is true for that address
+    /// in IdentityStore).  The executor enforces two authentication rules:
+    ///   1. `tx.sender == owner_identity_id` — only the identity holder can
+    ///      bind their own validators; prevents identity spoofing.
+    ///   2. `owner_identity_id` must have `grants_consensus() == true` at
+    ///      execution time — derived from authoritative IdentityStore state,
+    ///      not a user-supplied claim.
+    ///
+    /// When `None` (backward-compat / genesis exemption): the validator is
+    /// admitted with `pop_verified=false` and therefore `voting_power=0` via
+    /// `gate_voting_power()`.  It can never gain consensus influence until an
+    /// authenticated `owner_identity_id` is established (future rotation tx).
+    /// This closes the QPC-GAP-001 omission-bypass: omitting the field is
+    /// fail-closed, not fail-open.
     BondValidator {
         amount: u128,
+        /// The verified human identity that owns this validator.
+        /// See above for authentication rules and fail-closed semantics.
+        #[serde(default)]
+        owner_identity_id: Option<String>,
     },
     /// Validator Onboarding (ROADMAP.md): begin unbonding the sender's
     /// entire current validator stake. Stops counting toward the active
@@ -955,7 +977,7 @@ impl Transaction {
             id: id.to_string(),
             sender: sender.to_string(),
             nonce,
-            body: TxBody::BondValidator { amount },
+            body: TxBody::BondValidator { amount, owner_identity_id: None },
             gas_limit: 50_000,
             signature: vec![],
             public_key: vec![],
@@ -2109,17 +2131,71 @@ impl Executor {
             // ConsensusEngine's ValidatorSet at epoch boundaries, is the
             // remaining integration work -- see the module doc comment in
             // `validator_bond.rs` and ROADMAP.md.
-            TxBody::BondValidator { amount } => {
-                let bond_account = format!("validator-bond:{}", tx.sender);
-                state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
-                    .map(|_| {
-                        events.push(format!(
-                            "bond_validator: {} {} bonded by {}",
-                            amount, self.config.native_denom, tx.sender
-                        ));
-                        identity.record_activity_by_address(&tx.sender);
-                    })
-                    .map_err(|e| e.to_string())
+            TxBody::BondValidator { amount, owner_identity_id } => {
+                // QPC-CONS-001 Phase B: authenticate owner_identity_id before
+                // moving funds.  Fail-closed: a missing binding means the bond
+                // is accepted (stake moves) but the validator will receive no
+                // consensus voting power.  A supplied binding that fails
+                // authentication is rejected outright to prevent spoofing.
+                if let Some(owner) = owner_identity_id {
+                    // Rule 1: sender must equal owner (proves address control).
+                    if tx.sender != *owner {
+                        Err(format!(
+                            "bond_validator: sender {} cannot bind to identity \
+                             {}: tx.sender must equal owner_identity_id",
+                            tx.sender, owner
+                        ))
+                    } else {
+                        // Rule 2: owner must have an active, unfrozen personhood
+                        // credential — resolved from authoritative IdentityStore
+                        // state, not from the tx payload.
+                        let owner_eligible = identity.get(owner)
+                            .map(|r| !r.frozen && r.charm.tier.grants_consensus())
+                            .unwrap_or(false);
+                        if !owner_eligible {
+                            Err(format!(
+                                "bond_validator: identity {} does not hold an active \
+                                 personhood credential (frozen or tier insufficient); \
+                                 binding rejected",
+                                owner
+                            ))
+                        } else {
+                            // Auth passed: move stake and emit binding event.
+                            let bond_account = format!("validator-bond:{}", tx.sender);
+                            state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
+                                .map(|_| {
+                                    events.push(format!(
+                                        "bond_validator: {} {} bonded by {}",
+                                        amount, self.config.native_denom, tx.sender
+                                    ));
+                                    // Authenticated binding event consumed by node.rs
+                                    // to record the human→validator association in
+                                    // ValidatorRegistry for per-human cap enforcement.
+                                    events.push(format!(
+                                        "bond_validator_owner_binding:{}:{}",
+                                        tx.sender, owner
+                                    ));
+                                    identity.record_activity_by_address(&tx.sender);
+                                })
+                                .map_err(|e| e.to_string())
+                        }
+                    }
+                } else {
+                    // No binding: stake moves but this validator is unbound.
+                    // Fail-closed: pop_verified stays false, voting_power = 0.
+                    // A future authenticated re-bond or rotation tx can establish
+                    // the binding.
+                    let bond_account = format!("validator-bond:{}", tx.sender);
+                    state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
+                        .map(|_| {
+                            events.push(format!(
+                                "bond_validator: {} {} bonded by {} (unbound: no consensus voting power until owner_identity_id is authenticated)",
+                                amount, self.config.native_denom, tx.sender
+                            ));
+                            identity.record_activity_by_address(&tx.sender);
+                        })
+                        .map_err(|e| e.to_string())
+                }
             }
 
             TxBody::UnbondValidator => {

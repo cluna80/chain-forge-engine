@@ -670,6 +670,85 @@ impl ValidatorRegistry {
         tracing::info!(id, "genesis validator registered as Candidate");
     }
 
+    /// Record an authenticated human→validator binding for a post-genesis
+    /// validator admitted via a `BondValidator` tx that carried a verified
+    /// `owner_identity_id`.
+    ///
+    /// QPC-CONS-001 Phase B: the epoch-boundary admission path pushes
+    /// `ValidatorInfo` directly into the live ValidatorSet without calling
+    /// `register()` (which requires keys, commission, and full stake).  This
+    /// lightweight method inserts—or updates—just the binding so that:
+    ///   1. `build_validator_set()` can enforce the per-human power cap.
+    ///   2. The per-block PoP refresh in node.rs can distinguish authenticated
+    ///      post-genesis validators (who get power through their owner's cred)
+    ///      from unbound ones (fail-closed: no power).
+    ///
+    /// Idempotent: calling it again with the same `(id, owner)` is a no-op;
+    /// calling it with a changed `owner` updates the mapping (key rotation).
+    pub fn admit_bonded_validator(
+        &mut self,
+        id:              &str,
+        owner_identity_id: String,
+        epoch:           u64,
+    ) {
+        if let Some(record) = self.validators.get_mut(id) {
+            // Already in registry — just update the binding.
+            let old_owner = record.owner_identity_id.clone()
+                .unwrap_or_else(|| id.to_string());
+            record.owner_identity_id = Some(owner_identity_id.clone());
+            // Rebuild the validators_by_human index for this entry.
+            if old_owner != owner_identity_id {
+                if let Some(list) = self.validators_by_human.get_mut(&old_owner) {
+                    list.retain(|v| v != id);
+                }
+                self.validators_by_human
+                    .entry(owner_identity_id)
+                    .or_default()
+                    .push(id.to_string());
+            }
+            return;
+        }
+        // Not in registry yet: insert a minimal Candidate record so the
+        // per-human cap and PoP-refresh logic can see this validator.
+        let validator_id = ValidatorId(id.to_string());
+        let seq = self.next_registration_seq;
+        self.next_registration_seq += 1;
+        let record = ValidatorRecord {
+            id:                validator_id,
+            keys:              KeyBundle {
+                consensus_pubkey: String::new(),
+                account_address:  id.to_string(),
+                pqc_pubkey:       None,
+                scheme:           "bonded-stub".to_string(),
+            },
+            commission:        Commission {
+                rate_bps:           0,
+                max_rate_bps:       2000,
+                last_changed_epoch: epoch,
+            },
+            bonded_uqcb:       self.min_stake_uqcb,
+            stake_tier:        StakeTier::from_bonded(self.min_stake_uqcb),
+            status:            ValidatorStatus::Active,
+            pop_verified:      false,
+            verification_tier: None,
+            registered_epoch:  epoch,
+            registration_seq:  seq,
+            last_status_epoch: epoch,
+            blocks_proposed:   0,
+            blocks_missed:     0,
+            jail_records:      Vec::new(),
+            moniker:           id.to_string(),
+            website:           None,
+            owner_identity_id: Some(owner_identity_id.clone()),
+        };
+        self.validators_by_human
+            .entry(owner_identity_id)
+            .or_default()
+            .push(id.to_string());
+        self.validators.insert(id.to_string(), record);
+        tracing::info!(id, epoch, "bonded validator admitted to registry with authenticated owner binding");
+    }
+
     /// Register (or rotate) the authenticated consensus public key for a
     /// validator address — CF-VAL-KEY-002.
     ///

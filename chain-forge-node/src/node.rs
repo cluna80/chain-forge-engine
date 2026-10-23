@@ -447,6 +447,20 @@ pub struct Node {
     /// already performs at `update_validator_set` / `init` in all three BFT
     /// engines (Tendermint, HotStuff, FBA).
     personhood_power_cap: Option<u64>,
+
+    /// QPC-CONS-001 Phase B: authenticated human→validator bindings.
+    ///
+    /// Populated from `bond_validator_owner_binding:{validator}:{owner}` events
+    /// emitted by successful `BondValidator` txs that carried a verified
+    /// `owner_identity_id`.  Maps `validator_address → owner_identity_id`.
+    ///
+    /// Used by the per-block PoP refresh to enforce fail-closed semantics
+    /// for post-genesis validators: only validators whose entry appears here
+    /// may have `pop_verified=true`; all others are forced to `false`.
+    ///
+    /// Genesis validators (registered_epoch == 0 in ValidatorRegistry) are
+    /// exempt: they check their own address in IdentityStore, as before.
+    bond_owner_bindings: std::collections::HashMap<String, String>,
 }
 
 /// Default validator-set epoch length in blocks. Matches the scale PoCD's
@@ -1146,6 +1160,7 @@ impl Node {
             min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
             personhood_power_cap,
+            bond_owner_bindings: std::collections::HashMap::new(),
         })
     }
 
@@ -3327,6 +3342,19 @@ impl Node {
             })
             .collect();
 
+        // QPC-CONS-001 Phase B: snapshot BondValidator txs before execution
+        // so we can process successful authenticated bindings after the block
+        // runs.  Tuple: (tx_index, validator_addr, owner_identity_id).
+        let bond_validator_attempts: Vec<(usize, String, Option<String>)> = txs.iter().enumerate()
+            .filter_map(|(i, t)| {
+                if let chain_forge_execution::TxBody::BondValidator { owner_identity_id, .. } = &t.body {
+                    Some((i, t.sender.clone(), owner_identity_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // PQ-VAL-002 R4: capture indices of any EDA txs that target
         // ml-dsa-65 consensus signatures — if one succeeds we re-zero
         // all ML-DSA-only validators' voting power in this block.
@@ -3492,6 +3520,46 @@ impl Node {
                 if is_rotation {
                     key_registered_this_block.push(sender.clone());
                 }
+            }
+        }
+
+        // QPC-CONS-001 Phase B: for each successful BondValidator tx that
+        // carried an authenticated owner_identity_id, record the binding in
+        // `bond_owner_bindings` and admit the validator into the registry so
+        // `build_validator_set()` can enforce the per-human power cap.
+        {
+            let epoch = self.identity.clock.current_epoch;
+            for (idx, validator_addr, owner_opt) in &bond_validator_attempts {
+                let Some(result) = exec_result.tx_results.get(*idx) else { continue };
+                if !result.success { continue; }
+                let Some(owner) = owner_opt else {
+                    // Unbound bond — ensure no stale binding from a prior bonded tx.
+                    // (Intentionally do NOT remove an existing binding set by an
+                    //  earlier authenticated BondValidator; incremental bonding is
+                    //  allowed and the first binding is the canonical one.)
+                    continue;
+                };
+                // Verify the binding event was actually emitted by the executor
+                // (double-check: executor only emits it after auth passes).
+                let binding_event = format!("bond_validator_owner_binding:{}:{}", validator_addr, owner);
+                if !result.events.iter().any(|e| e == &binding_event) {
+                    warn!(
+                        validator = %validator_addr,
+                        owner     = %owner,
+                        "BondValidator: expected binding event not found in result — skipping registry update"
+                    );
+                    continue;
+                }
+                self.bond_owner_bindings.insert(validator_addr.clone(), owner.clone());
+                self.validator_registry.admit_bonded_validator(
+                    validator_addr, owner.clone(), epoch,
+                );
+                info!(
+                    validator = %validator_addr,
+                    owner     = %owner,
+                    epoch,
+                    "QPC-CONS-001 Phase B: authenticated owner binding recorded"
+                );
             }
         }
 
@@ -3665,18 +3733,50 @@ impl Node {
             for v in &mut updated_vs.validators {
                 // INV-13: a frozen (ConfirmSybil) identity loses consensus power
                 // immediately, regardless of its VerificationTier.
-                let now_verified = self.identity.get(&v.id.0)
-                    .map(|r| !r.frozen && r.charm.tier.grants_consensus())
+                //
+                // QPC-CONS-001 Phase B: distinguish genesis validators (exempt,
+                // check own identity) from post-genesis validators (must have
+                // an authenticated owner binding; fail-closed otherwise).
+                let is_genesis = self.validator_registry
+                    .get(&v.id.0)
+                    .map(|r| r.registered_epoch == 0)
                     .unwrap_or(false);
+
+                let now_verified = if is_genesis {
+                    // Genesis validators: check their own identity record (existing behavior).
+                    self.identity.get(&v.id.0)
+                        .map(|r| !r.frozen && r.charm.tier.grants_consensus())
+                        .unwrap_or(false)
+                } else {
+                    // Post-genesis validators: resolve canonical human binding from
+                    // verified identity state.  No binding = fail-closed (no power).
+                    match self.bond_owner_bindings.get(&v.id.0) {
+                        Some(owner_id) => {
+                            self.identity.get(owner_id)
+                                .map(|r| !r.frozen && r.charm.tier.grants_consensus())
+                                .unwrap_or(false)
+                        }
+                        None => {
+                            // Unbound post-genesis validator: fail-closed.
+                            false
+                        }
+                    }
+                };
                 if v.pop_verified != now_verified {
                     if now_verified {
                         info!(validator = %v.id, "PoP gate: identity Verified — granting consensus power");
                     } else {
-                        let frozen = self.identity.get(&v.id.0).map(|r| r.frozen).unwrap_or(false);
-                        if frozen {
-                            warn!(validator = %v.id, "PoP gate: identity frozen (ConfirmSybil) — revoking consensus power");
+                        if is_genesis {
+                            let frozen = self.identity.get(&v.id.0).map(|r| r.frozen).unwrap_or(false);
+                            if frozen {
+                                warn!(validator = %v.id, "PoP gate: identity frozen (ConfirmSybil) — revoking consensus power");
+                            } else {
+                                warn!(validator = %v.id, "PoP gate: identity not Verified — revoking consensus power");
+                            }
+                        } else if self.bond_owner_bindings.contains_key(&v.id.0) {
+                            warn!(validator = %v.id, "PoP gate: owner identity no longer eligible — revoking consensus power");
                         } else {
-                            warn!(validator = %v.id, "PoP gate: identity not Verified — revoking consensus power");
+                            warn!(validator = %v.id, "PoP gate: no authenticated owner binding — revoking consensus power (QPC-CONS-001 fail-closed)");
                         }
                     }
                     v.pop_verified = now_verified;
@@ -3800,6 +3900,59 @@ impl Node {
                     }
                 }
             }
+
+            // QPC-CONS-001 Phase B: enforce per-human power cap.
+            //
+            // After individual pop_verified flags are set, scan for multiple
+            // validators that share the same owner_identity_id.  For each human,
+            // only one validator may have pop_verified=true (power_cap = 1).
+            // The canonical winner is the one with the lowest registration_seq
+            // in ValidatorRegistry; all others are forced to pop_verified=false.
+            {
+                // Build owner → [(seq, validator_id)] map for pop_verified=true validators.
+                let mut owner_candidates: std::collections::HashMap<String, Vec<(u64, String)>> =
+                    std::collections::HashMap::new();
+                for v in &updated_vs.validators {
+                    if !v.pop_verified { continue; }
+                    let owner = self.bond_owner_bindings.get(&v.id.0)
+                        .cloned()
+                        .or_else(|| {
+                            self.validator_registry.get(&v.id.0).ok()
+                                .and_then(|r| r.owner_identity_id.clone())
+                        })
+                        .unwrap_or_else(|| v.id.0.clone());
+                    let seq = self.validator_registry.get(&v.id.0).ok()
+                        .map(|r| r.registration_seq)
+                        .unwrap_or(u64::MAX);
+                    owner_candidates.entry(owner).or_default().push((seq, v.id.0.clone()));
+                }
+                // For any human with more than one pop_verified validator, keep
+                // only the one with the lowest seq; zero the rest.
+                let mut to_revoke: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (_owner, mut candidates) in owner_candidates {
+                    if candidates.len() <= 1 { continue; }
+                    candidates.sort_by_key(|(seq, _)| *seq);
+                    // Keep candidates[0]; revoke all others.
+                    for (_, vid) in candidates.into_iter().skip(1) {
+                        to_revoke.insert(vid);
+                    }
+                }
+                if !to_revoke.is_empty() {
+                    for v in &mut updated_vs.validators {
+                        if to_revoke.contains(&v.id.0) && v.pop_verified {
+                            warn!(
+                                validator = %v.id,
+                                "QPC-CONS-001 per-human cap: revoking pop_verified \
+                                 (another validator from the same human is already granted)"
+                            );
+                            v.pop_verified  = false;
+                            v.voting_power  = 0;
+                            any_changed     = true;
+                        }
+                    }
+                }
+            }
+
             if any_changed {
                 updated_vs.height = cert.height;
                 let _ = self.consensus.update_validator_set(updated_vs);
