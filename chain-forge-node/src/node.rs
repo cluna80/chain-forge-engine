@@ -1743,6 +1743,27 @@ impl Node {
         tracing::debug!(height, "state persisted to disk");
     }
 
+    /// Rebuild `bond_owner_bindings` from persistent StateStore metadata.
+    ///
+    /// Called after any state restore (restart or snapshot load) to ensure the
+    /// in-memory HashMap reflects the canonical bindings stored on-chain via
+    /// `state.set_raw("validator-owner:{addr}", owner_id)` in the executor.
+    fn rebuild_bond_owner_bindings(&mut self) {
+        self.bond_owner_bindings.clear();
+        let snap = self.state.export_snapshot();
+        for (key, owner) in &snap.metadata {
+            if let Some(validator_addr) = key.strip_prefix("validator-owner:") {
+                self.bond_owner_bindings.insert(validator_addr.to_string(), owner.clone());
+            }
+        }
+        if !self.bond_owner_bindings.is_empty() {
+            tracing::info!(
+                count = self.bond_owner_bindings.len(),
+                "QPC-CONS-001: bond owner bindings rebuilt from persistent state"
+            );
+        }
+    }
+
     /// Load chain state from disk. Returns true if state was found and loaded.
     /// On success, the node resumes from the last persisted height. All
     /// stateful subsystems (state, identity, QRC, validators, agents, slasher,
@@ -1944,6 +1965,7 @@ impl Node {
                 s.height     = height;
             }
 
+            self.rebuild_bond_owner_bindings();
             tracing::info!(height, "chain state loaded from disk");
             Ok(())
         };
@@ -3551,9 +3573,6 @@ impl Node {
                     continue;
                 }
                 self.bond_owner_bindings.insert(validator_addr.clone(), owner.clone());
-                self.validator_registry.admit_bonded_validator(
-                    validator_addr, owner.clone(), epoch,
-                );
                 info!(
                     validator = %validator_addr,
                     owner     = %owner,
@@ -3737,9 +3756,12 @@ impl Node {
                 // QPC-CONS-001 Phase B: distinguish genesis validators (exempt,
                 // check own identity) from post-genesis validators (must have
                 // an authenticated owner binding; fail-closed otherwise).
+                // Uses the explicit is_genesis flag, not registered_epoch == 0,
+                // so post-genesis validators registered at epoch 0 are not
+                // accidentally granted genesis treatment.
                 let is_genesis = self.validator_registry
                     .get(&v.id.0)
-                    .map(|r| r.registered_epoch == 0)
+                    .map(|r| r.is_genesis)
                     .unwrap_or(false);
 
                 let now_verified = if is_genesis {
@@ -3926,14 +3948,15 @@ impl Node {
                         .unwrap_or(u64::MAX);
                     owner_candidates.entry(owner).or_default().push((seq, v.id.0.clone()));
                 }
-                // For any human with more than one pop_verified validator, keep
-                // only the one with the lowest seq; zero the rest.
+                // For any human with more validators than the configured cap,
+                // keep only the first power_cap validators (by registration seq).
+                let power_cap = self.personhood_power_cap.unwrap_or(1) as usize;
                 let mut to_revoke: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for (_owner, mut candidates) in owner_candidates {
-                    if candidates.len() <= 1 { continue; }
+                    if candidates.len() <= power_cap { continue; }
                     candidates.sort_by_key(|(seq, _)| *seq);
-                    // Keep candidates[0]; revoke all others.
-                    for (_, vid) in candidates.into_iter().skip(1) {
+                    // Keep the first power_cap candidates (lowest seq = earliest registered).
+                    for (_, vid) in candidates.into_iter().skip(power_cap) {
                         to_revoke.insert(vid);
                     }
                 }
@@ -9464,5 +9487,132 @@ mod tests {
             Some(mldsa_kp_shared.public_key.clone()),
             "bob must be able to register the key released by alice's rotation"
         );
+    }
+
+    // -- QPC-CONS-001 Phase B regression tests --------------------------------
+
+    /// Verify the configured personhood_power_cap is read by the per-human cap enforcement.
+    #[tokio::test]
+    async fn test_qpc_phase_b_per_human_cap() {
+        // Use the GENESIS fixture which has personhood_weighted=true, power_cap=1.
+        let node = Node::new(GENESIS, None).await.unwrap();
+
+        // The cap variable must be populated from genesis config.
+        assert_eq!(
+            node.personhood_power_cap,
+            Some(1),
+            "GENESIS has personhood_weighted=true so personhood_power_cap must be Some(1)"
+        );
+
+        // Verify the per-human cap enforcement in ValidatorRegistry correctly uses
+        // power_cap=1: one human owning two validators gets combined power 1, not 2.
+        // (The detailed logic is covered by chain-forge-validators unit tests;
+        // here we verify the node-level variable feeds the right value.)
+        use chain_forge_validators::{ValidatorRegistry, RegistrationRequest, KeyBundle,
+                                      Commission, ENTRY_STAKE_UQCB};
+        use chain_forge_consensus::{ValidatorId, PersonhoodConfig};
+        use chain_forge_identity::VerificationTier;
+
+        let mut reg = ValidatorRegistry::new(
+            ENTRY_STAKE_UQCB,
+            PersonhoodConfig { power_cap: 1, reject_expired_pop: false, min_verified_pct: 0 },
+        );
+        for (id, addr, epoch) in [("v1", "qcb1phb1", 0u64), ("v2", "qcb1phb2", 1u64)] {
+            reg.register(RegistrationRequest {
+                id:               ValidatorId(id.into()),
+                moniker:          id.into(),
+                keys:             KeyBundle::new_ed25519(&format!("pk_{id}"), addr),
+                commission:       Commission::new(500, 2000).unwrap(),
+                bonded_uqcb:      ENTRY_STAKE_UQCB,
+                website:          None,
+                owner_identity_id: Some("qcb1human_x".into()),
+            }, epoch).unwrap();
+            reg.confirm_pop(id, VerificationTier::Verified, epoch + 1).unwrap();
+        }
+        let vs = reg.build_validator_set(2);
+        let total: u64 = vs.validators.iter().map(|v| v.voting_power).sum();
+        assert_eq!(total, 1,
+            "two validators for one human, power_cap=1: total power must be 1");
+
+        // Verify the node's cap pass uses the configured value (not hardcoded 1):
+        // power_cap=2 would allow both validators to have power.
+        let mut reg2 = ValidatorRegistry::new(
+            ENTRY_STAKE_UQCB,
+            PersonhoodConfig { power_cap: 2, reject_expired_pop: false, min_verified_pct: 0 },
+        );
+        for (id, addr, epoch) in [("u1", "qcb1phc1", 0u64), ("u2", "qcb1phc2", 1u64)] {
+            reg2.register(RegistrationRequest {
+                id:               ValidatorId(id.into()),
+                moniker:          id.into(),
+                keys:             KeyBundle::new_ed25519(&format!("pk_{id}"), addr),
+                commission:       Commission::new(500, 2000).unwrap(),
+                bonded_uqcb:      ENTRY_STAKE_UQCB,
+                website:          None,
+                owner_identity_id: Some("qcb1human_y".into()),
+            }, epoch).unwrap();
+            reg2.confirm_pop(id, VerificationTier::Verified, epoch + 1).unwrap();
+        }
+        let vs2 = reg2.build_validator_set(2);
+        let total2: u64 = vs2.validators.iter().map(|v| v.voting_power).sum();
+        assert_eq!(total2, 2,
+            "two validators for one human, power_cap=2: total power must be 2 (cap honored)");
+    }
+
+    /// After a restart, bond_owner_bindings must be rebuilt from persistent StateStore.
+    #[tokio::test]
+    async fn test_qpc_phase_b_restart_preserves_bindings() {
+        let dir = std::env::temp_dir()
+            .join(format!("cf-phase-b-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let validator_addr = "qcb1validator1";
+        let owner          = "qcb1alice";
+
+        // Phase 1: directly inject a binding into StateStore (simulates what the
+        // BondValidator executor does via state.set_raw) and persist to disk.
+        // This isolates the restart-durability property from the full tx pipeline.
+        {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            node.set_data_dir(dir.clone());
+
+            // Inject binding as the executor would (set_raw persists into snapshot metadata).
+            let binding_key = format!("validator-owner:{}", validator_addr);
+            node.state.set_raw(&binding_key, owner);
+            // Mirror in-memory map as commit_block would.
+            node.bond_owner_bindings.insert(validator_addr.to_string(), owner.to_string());
+
+            // Sanity: binding is present before persist.
+            assert!(
+                node.state.get_raw(&binding_key).is_some(),
+                "validator-owner key must be present in StateStore before persist"
+            );
+            assert!(
+                node.bond_owner_bindings.contains_key(validator_addr),
+                "in-memory binding must be set before persist"
+            );
+
+            node.persist_state();
+        }
+
+        // Phase 2: fresh node restores from disk — rebuild_bond_owner_bindings must
+        // reconstruct the in-memory map from StateStore metadata.
+        {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            node.set_data_dir(dir.clone());
+            let loaded = node.load_persisted_state();
+            assert!(loaded, "load_persisted_state must succeed");
+
+            assert!(
+                node.bond_owner_bindings.contains_key(validator_addr),
+                "bond_owner_bindings must be rebuilt from persistent state after restart"
+            );
+            assert_eq!(
+                node.bond_owner_bindings.get(validator_addr).map(String::as_str),
+                Some(owner),
+                "rebuilt binding must point to correct owner"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

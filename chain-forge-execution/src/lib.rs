@@ -2137,6 +2137,7 @@ impl Executor {
                 // is accepted (stake moves) but the validator will receive no
                 // consensus voting power.  A supplied binding that fails
                 // authentication is rejected outright to prevent spoofing.
+                let binding_key = format!("validator-owner:{}", tx.sender);
                 if let Some(owner) = owner_identity_id {
                     // Rule 1: sender must equal owner (proves address control).
                     if tx.sender != *owner {
@@ -2145,6 +2146,34 @@ impl Executor {
                              {}: tx.sender must equal owner_identity_id",
                             tx.sender, owner
                         ))
+                    } else if let Some(existing_owner) = state.get_raw(&binding_key) {
+                        // Rule 3: reject unauthorized ownership changes. Once a
+                        // binding is established, it is immutable via this tx path.
+                        // Rotation requires a separately authorized recovery process.
+                        if existing_owner != owner.as_str() {
+                            Err(format!(
+                                "bond_validator: owner_identity_id cannot be changed \
+                                 once set; unauthorized ownership change rejected \
+                                 (current owner: {}, attempted: {})",
+                                existing_owner, owner
+                            ))
+                        } else {
+                            // Same owner re-bonding (idempotent): just move stake.
+                            let bond_account = format!("validator-bond:{}", tx.sender);
+                            state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
+                                .map(|_| {
+                                    events.push(format!(
+                                        "bond_validator: {} {} bonded by {}",
+                                        amount, self.config.native_denom, tx.sender
+                                    ));
+                                    events.push(format!(
+                                        "bond_validator_owner_binding:{}:{}",
+                                        tx.sender, owner
+                                    ));
+                                    identity.record_activity_by_address(&tx.sender);
+                                })
+                                .map_err(|e| e.to_string())
+                        }
                     } else {
                         // Rule 2: owner must have an active, unfrozen personhood
                         // credential — resolved from authoritative IdentityStore
@@ -2160,7 +2189,9 @@ impl Executor {
                                 owner
                             ))
                         } else {
-                            // Auth passed: move stake and emit binding event.
+                            // All checks passed: persist binding in canonical chain
+                            // state so it survives node restarts, then move stake.
+                            state.set_raw(&binding_key, owner);
                             let bond_account = format!("validator-bond:{}", tx.sender);
                             state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
                                 .map(|_| {
@@ -2169,8 +2200,7 @@ impl Executor {
                                         amount, self.config.native_denom, tx.sender
                                     ));
                                     // Authenticated binding event consumed by node.rs
-                                    // to record the human→validator association in
-                                    // ValidatorRegistry for per-human cap enforcement.
+                                    // to record the human→validator association.
                                     events.push(format!(
                                         "bond_validator_owner_binding:{}:{}",
                                         tx.sender, owner
