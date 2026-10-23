@@ -72,6 +72,7 @@ chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-cryp
 chain-forge-execution = { path = "../chain-forge-execution" }
 chain-forge-vca-pq    = { path = "../chain-forge-vca-pq" }
 chain-forge-wallet    = { path = "../chain-forge-wallet" }
+tempfile              = { version = "3" }
 
 [[bench]]
 name    = "bft_round_mldsa"

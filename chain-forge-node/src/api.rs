@@ -1812,4 +1812,44 @@ mod tests {
         // The saturation edge case should not panic.
         let _ = f1_nonce_rejected(last, u64::MAX);
     }
+
+    // -- I11: DelegationUsageStore persistence (load/flush round-trip) ---------
+
+    #[test]
+    fn delegation_usage_store_persists_counts_across_instances() {
+        let dir = tempfile::tempdir().expect("tempdir must be creatable");
+        let id: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[0] = 0xde; b[1] = 0xad; b[31] = 0x01;
+            b
+        };
+
+        // The store writes to <data_dir>/persist/; create that subdir first.
+        std::fs::create_dir_all(dir.path().join("persist")).unwrap();
+
+        // First instance: insert a count and flush to disk.
+        {
+            let mut store = DelegationUsageStore::new(Some(dir.path()));
+            store.counts.insert(id, 7);
+            store.flush();
+        }
+
+        // Second instance: load from same path and verify count survived.
+        {
+            let store = DelegationUsageStore::new(Some(dir.path()));
+            assert_eq!(
+                store.counts.get(&id).copied(),
+                Some(7),
+                "remaining count must survive a flush/reload cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_usage_store_starts_empty_without_persist_dir() {
+        let store = DelegationUsageStore::new(None);
+        assert!(store.counts.is_empty(), "no-dir store must start empty");
+        // flush must be a no-op (must not panic)
+        store.flush();
+    }
 }

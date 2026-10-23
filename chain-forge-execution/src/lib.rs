@@ -3898,6 +3898,7 @@ mod tests {
             settlement_operators: vec![],
             crypto_governors:     vec![],
             fee_collector:   "treasury:fees".into(),
+            pop_verifier:    None,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -6314,6 +6315,101 @@ mod tests {
             state.get_account("qcb1newbie").unwrap().verification_tier(),
             Some(&VerificationTier::Provisional),
             "on-chain account charm must be synced to Provisional (Phase C)"
+        );
+    }
+
+    // -- QPC-GAP-002: VerifyIdentityWithProof fail-closed ----------------------
+
+    #[test]
+    fn verify_identity_with_proof_fails_closed_when_no_verifier_configured() {
+        // When pop_verifier is None (default), VerifyIdentityWithProof must
+        // return a failure with the "no pop_verifier configured" sentinel.
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config = ExecutionConfig::from_genesis(&genesis);  // pop_verifier = None
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let att = chain_forge_identity::PopAttestation::genesis("qcb1alice", 0);
+        identity.register("qcb1alice".into(), "qcb1alice".into(), att.clone()).unwrap();
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        let tx = Transaction {
+            id:           "vip1".into(),
+            sender:       "qcb1alice".into(),
+            nonce:        0,
+            body:         TxBody::VerifyIdentityWithProof {
+                proof_bytes: vec![0u8; 32],
+                public_inputs_bytes: vec![],
+            },
+            gas_limit:    1_000_000,
+            signature:    vec![],
+            public_key:   vec![],
+            pq_signatures: vec![],
+            sig_scheme:   None,
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        assert!(!r.success, "must fail when no pop_verifier is wired");
+        let err = r.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("no pop_verifier configured"),
+            "error must contain sentinel text; got: {err}"
+        );
+    }
+
+    // -- QPC-GAP-002: VerifyIdentityWithProof upgrades Provisional → Verified --
+
+    struct AlwaysOkVerifier;
+    impl chain_forge_identity::PopProofVerifier for AlwaysOkVerifier {
+        fn verify_pop_proof(&self, _proof_bytes: &[u8], _public_inputs: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn verify_identity_with_proof_upgrades_provisional_to_verified() {
+        use std::sync::Arc;
+        use chain_forge_identity::VerificationTier;
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut exec_config = ExecutionConfig::from_genesis(&genesis);
+        exec_config.pop_verifier = Some(Arc::new(AlwaysOkVerifier));
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        // Register qcb1bob as Provisional only (no verify_identity call).
+        let reg_att = chain_forge_identity::PopAttestation::genesis("qcb1bob", 0);
+        identity.register("qcb1bob".into(), "qcb1bob".into(), reg_att).unwrap();
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(exec_config);
+
+        assert_eq!(
+            *identity.get("qcb1bob").unwrap().tier(),
+            VerificationTier::Provisional,
+            "precondition: bob must be Provisional before proof submission"
+        );
+
+        let tx = Transaction {
+            id:           "vip2".into(),
+            sender:       "qcb1bob".into(),
+            nonce:        0,
+            body:         TxBody::VerifyIdentityWithProof {
+                proof_bytes: vec![1u8; 64],
+                public_inputs_bytes: vec![2u8; 16],
+            },
+            gas_limit:    1_000_000,
+            signature:    vec![],
+            public_key:   vec![],
+            pq_signatures: vec![],
+            sig_scheme:   None,
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "VerifyIdentityWithProof must succeed with stub verifier: {:?}", r.error);
+        assert_eq!(
+            *identity.get("qcb1bob").unwrap().tier(),
+            VerificationTier::Verified,
+            "bob must be Verified after successful proof submission"
         );
     }
 }
