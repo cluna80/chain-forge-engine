@@ -1473,6 +1473,12 @@ pub async fn serve(
                                                                 let mut usage_err: Option<String> = None;
                                                                 {
                                                                     let mut store = delegation_usage.lock().unwrap();
+                                                                    // Two-pass: validate all IDs and limits first,
+                                                                    // then decrement atomically. This prevents partial
+                                                                    // consumption when a mid-chain link fails to resolve
+                                                                    // its delegation ID.
+                                                                    struct LinkCheck { id: [u8; 32], max: u32 }
+                                                                    let mut checks: Vec<LinkCheck> = Vec::new();
                                                                     for link in &chain {
                                                                         if let Some(max) = link.max_uses {
                                                                             let id = match delegation_id(link) {
@@ -1482,15 +1488,19 @@ pub async fn serve(
                                                                                     break;
                                                                                 }
                                                                             };
-                                                                            let remaining = store.counts.entry(id).or_insert(max);
-                                                                            if *remaining == 0 {
+                                                                            let remaining = store.counts.get(&id).copied().unwrap_or(max);
+                                                                            if remaining == 0 {
                                                                                 usage_err = Some("delegation max_uses limit reached".to_string());
                                                                                 break;
                                                                             }
-                                                                            *remaining -= 1;
+                                                                            checks.push(LinkCheck { id, max });
                                                                         }
                                                                     }
                                                                     if usage_err.is_none() {
+                                                                        for c in &checks {
+                                                                            let remaining = store.counts.entry(c.id).or_insert(c.max);
+                                                                            *remaining -= 1;
+                                                                        }
                                                                         store.flush();
                                                                     }
                                                                 }
@@ -1851,5 +1861,49 @@ mod tests {
         assert!(store.counts.is_empty(), "no-dir store must start empty");
         // flush must be a no-op (must not panic)
         store.flush();
+    }
+
+    // Finding 4 regression: exhausted mid-chain entry must not decrement
+    // earlier entries (two-pass validation before any decrement).
+    #[test]
+    fn delegation_usage_no_partial_decrement_on_exhausted_mid_chain_entry() {
+        let mut store = DelegationUsageStore::new(None);
+
+        let id_a: [u8; 32] = { let mut b = [0u8; 32]; b[0] = 0xaa; b };
+        let id_b: [u8; 32] = { let mut b = [0u8; 32]; b[0] = 0xbb; b };
+
+        // id_a has 5 remaining, id_b is exhausted (0 remaining).
+        store.counts.insert(id_a, 5);
+        store.counts.insert(id_b, 0);
+
+        // Simulate the two-pass validation logic from the verify_delegated handler:
+        // first validate all entries, then decrement only if all pass.
+        struct Check { id: [u8; 32], max: u32 }
+        let chain = [(id_a, 10u32), (id_b, 10u32)];
+        let mut usage_err: Option<&str> = None;
+        let mut checks: Vec<Check> = Vec::new();
+        for (id, max) in &chain {
+            let remaining = store.counts.get(id).copied().unwrap_or(*max);
+            if remaining == 0 {
+                usage_err = Some("delegation max_uses limit reached");
+                break;
+            }
+            checks.push(Check { id: *id, max: *max });
+        }
+        // Error detected: do NOT decrement anything.
+        if usage_err.is_none() {
+            for c in &checks {
+                let remaining = store.counts.entry(c.id).or_insert(c.max);
+                *remaining -= 1;
+            }
+        }
+
+        assert!(usage_err.is_some(), "exhausted mid-chain entry must be detected");
+        // id_a must be unchanged — no partial decrement.
+        assert_eq!(
+            store.counts.get(&id_a).copied(),
+            Some(5),
+            "id_a must not be decremented when id_b is exhausted"
+        );
     }
 }
