@@ -1087,14 +1087,16 @@ impl Node {
         // Build nonce cache from committed account state BEFORE state is moved
         // into Self. account.nonce is the next expected nonce (post-increment),
         // so last committed tx.nonce = account.nonce - 1.
-        // Genesis accounts seed the nonce cache with their current nonce so F5
-        // knows they're valid senders. Nonces start at 0 (first valid tx nonce=1).
-        // A fresh account (nonce=0 in genesis) is seeded with last=0, so its first
-        // valid tx must use nonce=1 (not nonce=0).
+        // Genesis accounts seed the nonce cache so F5 knows they're valid senders.
+        // Accounts with nonce=0 haven't committed any tx yet; we seed them with
+        // u64::MAX (NO_PRIOR_TX sentinel) so the F1 mempool guard knows to accept
+        // nonce=0 as the first tx.  Accounts whose nonce is already >0 (replayed
+        // genesis state) are seeded with their actual nonce as the last committed.
         let initial_nonce_cache = {
             let mut m = std::collections::HashMap::new();
             for acct in state.all_accounts() {
-                m.insert(acct.address.clone(), acct.nonce);
+                let seed = if acct.nonce == 0 { u64::MAX } else { acct.nonce };
+                m.insert(acct.address.clone(), seed);
             }
             m
         };

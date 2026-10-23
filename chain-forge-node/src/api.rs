@@ -223,7 +223,7 @@ pub async fn serve(
                             }
                             // F5: reject transactions from unknown senders (absent from the
                             // nonce cache). Genesis accounts are seeded at startup so they
-                            // pass F5; their first tx must use nonce=1 (nonce=0 is base).
+                            // pass F5; their first tx may use nonce=0 (executor expects 0).
                             Ok(ref tx) if {
                                 let cache = nonce_cache.lock().unwrap();
                                 !cache.contains_key(&tx.sender)
@@ -239,13 +239,20 @@ pub async fn serve(
                             }
                             // F1: nonce must be strictly greater than the last committed
                             // nonce for this sender AND within MAX_NONCE_GAP of it.
-                            // Genesis accounts seed with last=0; nonce=0 is rejected (0 <= 0),
-                            // nonce=1..100 are valid as first txs.
+                            // Fresh genesis accounts are seeded with last=u64::MAX (NO_PRIOR_TX),
+                            // meaning any nonce 0..MAX_NONCE_GAP is valid as the first tx.
+                            // After a tx commits, the cache stores tx.nonce, so replay is blocked.
                             Ok(ref tx) if {
                                 const MAX_NONCE_GAP: u64 = 100;
+                                const NO_PRIOR_TX: u64 = u64::MAX;
                                 let cache = nonce_cache.lock().unwrap();
                                 cache.get(&tx.sender).map_or(false, |&last| {
-                                    tx.nonce <= last || tx.nonce > last.saturating_add(MAX_NONCE_GAP)
+                                    if last == NO_PRIOR_TX {
+                                        // Fresh account: accept nonce 0..MAX_NONCE_GAP
+                                        tx.nonce > MAX_NONCE_GAP
+                                    } else {
+                                        tx.nonce <= last || tx.nonce > last.saturating_add(MAX_NONCE_GAP)
+                                    }
                                 })
                             } => {
                                 // Re-lock to get the last nonce for the error message.
