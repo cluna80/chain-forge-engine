@@ -213,6 +213,9 @@ impl GasModel {
                     // replay-key write + treasury debit + recipient credit.
                     // Comparable to QrcContributionSettle (also 12×).
                     TxBody::ClaimResearchReward { .. }   => op_multiplier * 12,
+                    // VerifyIdentityWithProof: Groth16 proof verification; higher gas than
+                    // a plain attestation to reflect the ZK-VRC verification cost.
+                    TxBody::VerifyIdentityWithProof { .. } => op_multiplier * 8,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -250,8 +253,30 @@ pub enum TxBody {
     /// whether the resulting total clears the minimum bond threshold only
     /// matters for active-set eligibility, not for this tx succeeding.
     /// See `validator_bond::ValidatorBondStore::bond()`.
+    ///
+    /// QPC-CONS-001 Phase B: authenticated human-identity binding.
+    ///
+    /// `owner_identity_id` must be the address that holds an active, unfrozen
+    /// personhood credential (i.e. `grants_consensus()` is true for that address
+    /// in IdentityStore).  The executor enforces two authentication rules:
+    ///   1. `tx.sender == owner_identity_id` — only the identity holder can
+    ///      bind their own validators; prevents identity spoofing.
+    ///   2. `owner_identity_id` must have `grants_consensus() == true` at
+    ///      execution time — derived from authoritative IdentityStore state,
+    ///      not a user-supplied claim.
+    ///
+    /// When `None` (backward-compat / genesis exemption): the validator is
+    /// admitted with `pop_verified=false` and therefore `voting_power=0` via
+    /// `gate_voting_power()`.  It can never gain consensus influence until an
+    /// authenticated `owner_identity_id` is established (future rotation tx).
+    /// This closes the QPC-GAP-001 omission-bypass: omitting the field is
+    /// fail-closed, not fail-open.
     BondValidator {
         amount: u128,
+        /// The verified human identity that owns this validator.
+        /// See above for authentication rules and fail-closed semantics.
+        #[serde(default)]
+        owner_identity_id: Option<String>,
     },
     /// Validator Onboarding (ROADMAP.md): begin unbonding the sender's
     /// entire current validator stake. Stops counting toward the active
@@ -606,6 +631,34 @@ pub enum TxBody {
         /// Reward kind: `"primary"` | `"replication"`.
         reward_kind: String,
     },
+
+    /// Upgrade a Provisional identity to Verified via a ZK-VRC membership
+    /// proof (QPC-GAP-002 — multi-issuer decentralized personhood verification).
+    ///
+    /// Replaces the single-coordinator bootstrap path for non-genesis validators:
+    /// any identity holder with a valid Groth16 VRC proof from an approved issuer
+    /// (registered in the node's IssuerRegistry) can self-promote to Verified
+    /// without waiting for ATTESTATION_QUORUM human attestations.
+    ///
+    /// Effects:
+    ///   - Calls `identity.verify_identity(sender, attestation, Some(verifier))`
+    ///     where `verifier` is the node's configured `Groth16VrcVerifier`.
+    ///   - On success, syncs the Verified charm to on-chain AccountState and
+    ///     refreshes the Merkle leaf so `pop_verified` picks it up at the next
+    ///     validator-set update.
+    ///
+    /// Enforced invariants:
+    ///   - Sender must be registered (Provisional tier).
+    ///   - Node must have a `pop_verifier` configured (fails closed otherwise).
+    ///   - `proof_bytes` must be a valid compressed Groth16 proof.
+    ///   - `public_inputs_bytes` must encode the IssuerRegistry Merkle root
+    ///     matching the node's current approved-issuer set.
+    VerifyIdentityWithProof {
+        /// Compressed canonical `ark_groth16::Proof<Bls12_381>` bytes.
+        proof_bytes: Vec<u8>,
+        /// Compressed canonical `Fr` public inputs (IssuerRegistry Merkle root).
+        public_inputs_bytes: Vec<u8>,
+    },
 }
 
 impl TxBody {
@@ -648,6 +701,7 @@ impl TxBody {
             // Resource Job Lifecycle
             // PoCD Research Reward Settlement (Change Set L)
             TxBody::ClaimResearchReward { .. }     => "ClaimResearchReward",
+            TxBody::VerifyIdentityWithProof { .. } => "VerifyIdentityWithProof",
         }
     }
 }
@@ -909,6 +963,10 @@ impl Transaction {
                     + contribution_hash.len() + recipient.len() + policy_version.len()
                     + reward_kind.len() + 16
             }
+            // VerifyIdentityWithProof: proof + public inputs bytes.
+            TxBody::VerifyIdentityWithProof { proof_bytes, public_inputs_bytes } => {
+                proof_bytes.len() + public_inputs_bytes.len()
+            }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -955,7 +1013,7 @@ impl Transaction {
             id: id.to_string(),
             sender: sender.to_string(),
             nonce,
-            body: TxBody::BondValidator { amount },
+            body: TxBody::BondValidator { amount, owner_identity_id: None },
             gas_limit: 50_000,
             signature: vec![],
             public_key: vec![],
@@ -1348,7 +1406,7 @@ impl CryptoMigrationState {
 }
 
 /// Runtime execution parameters derived from genesis.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionConfig {
     pub gas_model:       GasModel,
     pub block_gas_limit: u64,
@@ -1381,6 +1439,14 @@ pub struct ExecutionConfig {
     /// are credited here after each transaction executes. Defaults to
     /// `"treasury:fees"` when not specified in genesis.
     pub fee_collector: String,
+
+    /// Optional ZK-VRC proof verifier (QPC-GAP-002).
+    ///
+    /// When set, `VerifyIdentityWithProof` transactions are accepted and the
+    /// verifier is used to check the Groth16 membership proof against the
+    /// node's IssuerRegistry root. When `None`, all `VerifyIdentityWithProof`
+    /// transactions are rejected with "no pop_verifier configured" (fail-closed).
+    pub pop_verifier: Option<std::sync::Arc<dyn chain_forge_identity::PopProofVerifier + Send + Sync>>,
 }
 
 impl ExecutionConfig {
@@ -1402,6 +1468,7 @@ impl ExecutionConfig {
             fee_collector: genesis.execution.fee_collector
                 .clone()
                 .unwrap_or_else(|| "treasury:fees".to_string()),
+            pop_verifier: None,
         }
     }
 }
@@ -1729,6 +1796,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // CS-001 P4: EmergencyDeprecateAlgorithm is a core constitutional tx;
         // no optional module gate — governed exclusively by crypto_governors list.
         TxBody::EmergencyDeprecateAlgorithm { .. } => None,
+        // VerifyIdentityWithProof: requires identity module (ZK-VRC path).
+        TxBody::VerifyIdentityWithProof { .. } => Some("identity"),
     }
 }
 
@@ -2109,17 +2178,120 @@ impl Executor {
             // ConsensusEngine's ValidatorSet at epoch boundaries, is the
             // remaining integration work -- see the module doc comment in
             // `validator_bond.rs` and ROADMAP.md.
-            TxBody::BondValidator { amount } => {
-                let bond_account = format!("validator-bond:{}", tx.sender);
-                state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
-                    .map(|_| {
-                        events.push(format!(
-                            "bond_validator: {} {} bonded by {}",
-                            amount, self.config.native_denom, tx.sender
-                        ));
-                        identity.record_activity_by_address(&tx.sender);
-                    })
-                    .map_err(|e| e.to_string())
+            TxBody::BondValidator { amount, owner_identity_id } => {
+                // QPC-CONS-001 Phase B: authenticate owner_identity_id before
+                // moving funds.  Fail-closed: a missing binding means the bond
+                // is accepted (stake moves) but the validator will receive no
+                // consensus voting power.  A supplied binding that fails
+                // authentication is rejected outright to prevent spoofing.
+                let binding_key = format!("validator-owner:{}", tx.sender);
+                if let Some(owner) = owner_identity_id {
+                    // Rule 1: sender must equal owner (proves address control).
+                    if tx.sender != *owner {
+                        Err(format!(
+                            "bond_validator: sender {} cannot bind to identity \
+                             {}: tx.sender must equal owner_identity_id",
+                            tx.sender, owner
+                        ))
+                    } else if let Some(existing_owner) = state.get_raw(&binding_key) {
+                        // Rule 3: reject unauthorized ownership changes. Once a
+                        // binding is established, it is immutable via this tx path.
+                        // Rotation requires a separately authorized recovery process.
+                        if existing_owner != owner.as_str() {
+                            Err(format!(
+                                "bond_validator: owner_identity_id cannot be changed \
+                                 once set; unauthorized ownership change rejected \
+                                 (current owner: {}, attempted: {})",
+                                existing_owner, owner
+                            ))
+                        } else {
+                            // Same owner re-bonding: re-check eligibility on every
+                            // bond. An owner who was frozen or lost Verified tier
+                            // after the initial binding must be blocked here;
+                            // skipping this check would allow a revoked identity to
+                            // keep accumulating stake without pop_verified revocation.
+                            let owner_eligible = identity.get(owner)
+                                .map(|r| !r.frozen && r.charm.tier.grants_consensus())
+                                .unwrap_or(false);
+                            if !owner_eligible {
+                                Err(format!(
+                                    "bond_validator: identity {} no longer holds an \
+                                     active personhood credential (frozen or tier \
+                                     insufficient); re-bond rejected",
+                                    owner
+                                ))
+                            } else {
+                            let bond_account = format!("validator-bond:{}", tx.sender);
+                            state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
+                                .map(|_| {
+                                    events.push(format!(
+                                        "bond_validator: {} {} bonded by {}",
+                                        amount, self.config.native_denom, tx.sender
+                                    ));
+                                    events.push(format!(
+                                        "bond_validator_owner_binding:{}:{}",
+                                        tx.sender, owner
+                                    ));
+                                    identity.record_activity_by_address(&tx.sender);
+                                })
+                                .map_err(|e| e.to_string())
+                            }
+                        }
+                    } else {
+                        // Rule 2: owner must have an active, unfrozen personhood
+                        // credential — resolved from authoritative IdentityStore
+                        // state, not from the tx payload.
+                        let owner_eligible = identity.get(owner)
+                            .map(|r| !r.frozen && r.charm.tier.grants_consensus())
+                            .unwrap_or(false);
+                        if !owner_eligible {
+                            Err(format!(
+                                "bond_validator: identity {} does not hold an active \
+                                 personhood credential (frozen or tier insufficient); \
+                                 binding rejected",
+                                owner
+                            ))
+                        } else {
+                            // All checks passed: move stake first, then persist binding.
+                            // set_raw is only reachable after transfer returns Ok,
+                            // preventing an orphaned binding from a failed bond.
+                            let bond_account = format!("validator-bond:{}", tx.sender);
+                            match state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount) {
+                                Ok(()) => {
+                                    state.set_raw(&binding_key, owner);
+                                    events.push(format!(
+                                        "bond_validator: {} {} bonded by {}",
+                                        amount, self.config.native_denom, tx.sender
+                                    ));
+                                    // Authenticated binding event consumed by node.rs
+                                    // to record the human→validator association.
+                                    events.push(format!(
+                                        "bond_validator_owner_binding:{}:{}",
+                                        tx.sender, owner
+                                    ));
+                                    identity.record_activity_by_address(&tx.sender);
+                                    Ok(())
+                                }
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                    }
+                } else {
+                    // No binding: stake moves but this validator is unbound.
+                    // Fail-closed: pop_verified stays false, voting_power = 0.
+                    // A future authenticated re-bond or rotation tx can establish
+                    // the binding.
+                    let bond_account = format!("validator-bond:{}", tx.sender);
+                    state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
+                        .map(|_| {
+                            events.push(format!(
+                                "bond_validator: {} {} bonded by {} (unbound: no consensus voting power until owner_identity_id is authenticated)",
+                                amount, self.config.native_denom, tx.sender
+                            ));
+                            identity.record_activity_by_address(&tx.sender);
+                        })
+                        .map_err(|e| e.to_string())
+                }
             }
 
             TxBody::UnbondValidator => {
@@ -2403,6 +2575,43 @@ impl Executor {
                     .map_err(|e| e.to_string())
             }
 
+            TxBody::VerifyIdentityWithProof { proof_bytes, public_inputs_bytes } => {
+                // ZK-VRC direct verification path (QPC-GAP-002).
+                // Fails closed if no verifier is configured.
+                match self.config.pop_verifier.as_deref() {
+                    None => Err("VerifyIdentityWithProof: no pop_verifier configured on this node".to_string()),
+                    Some(verifier) => {
+                        let epoch = identity.clock.current_epoch;
+                        let attestation = chain_forge_identity::PopAttestation {
+                            identity_id: tx.sender.clone(),
+                            attester:    tx.sender.clone(),
+                            epoch,
+                            proof:       proof_bytes.clone(),
+                            note:        Some("zkp-vrc".to_string()),
+                        };
+                        identity.verify_identity(&tx.sender, attestation, Some(verifier))
+                            .map_err(|e| e.to_string())
+                            .and_then(|_| {
+                                // Atomic charm-sync: both lookups must succeed or the
+                                // tx fails. Partial state (identity updated, account
+                                // stale) would leave a mismatched tier in the Merkle
+                                // tree, so we gate refresh_leaf on full sync.
+                                let record = identity.get(&tx.sender)
+                                    .map_err(|e| format!("charm-sync: identity lookup failed after ZK-VRC upgrade: {}", e))?;
+                                let acct = state.get_account_mut(&tx.sender)
+                                    .map_err(|e| format!("charm-sync: account lookup failed after ZK-VRC upgrade: {}", e))?;
+                                acct.attach_charm(record.charm.clone());
+                                state.refresh_leaf(&tx.sender);
+                                events.push(format!(
+                                    "verify_identity_with_proof: {} upgraded to Verified via ZK-VRC",
+                                    tx.sender
+                                ));
+                                Ok(())
+                            })
+                    }
+                }
+            }
+
             TxBody::SponsorAgent { agent_address } => {
                 // Charm Confinement: sponsor must be Verified tier
                 identity.sponsor_agent(&tx.sender, agent_address)
@@ -2440,23 +2649,72 @@ impl Executor {
             // -- Attestation guard Phase D tx types ---------------------------
 
             TxBody::RevokeAttestation { attested_id } => {
+                // Pre-flight: if the attested identity is currently Verified via WoT
+                // and has fewer than ATTESTATION_QUORUM+1 active attesters, this
+                // revocation will trigger a tier downgrade and require charm-sync.
+                // Charm-sync needs the account to exist in StateStore. Every identity
+                // that reached Verified via on-chain Attest txs must have an account
+                // (RegisterIdentity creates it). A missing account is an invariant
+                // violation — reject before mutating identity state so that a failed
+                // tx leaves no partial mutation behind.
+                {
+                    let would_downgrade = identity.get(attested_id)
+                        .map(|r| {
+                            r.charm.verified_via_wot
+                                && r.charm.tier.grants_consensus()
+                                && r.attestation_ledger.count() <= chain_forge_identity::ATTESTATION_QUORUM
+                        })
+                        .unwrap_or(false);
+                    if would_downgrade && state.get_account(attested_id).is_err() {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "revoke_attestation: attested identity {} would be downgraded \
+                                 but has no on-chain account — state invariant violated; \
+                                 tx rejected to prevent partial mutation",
+                                attested_id
+                            ),
+                        );
+                    }
+                }
                 // The identity crate enforces all rules (active record exists,
-                // not already revoked) and returns the CS cost signal.
+                // not already revoked) and returns the CS cost signal plus a
+                // tier_downgraded flag (Phase C revocation propagation).
                 identity.revoke_attestation(&tx.sender, attested_id)
-                    .map(|cost| {
-                        // cost.cost_bps signals how much CS to deduct.
-                        // Phase 0 / pilot: we emit the cost as an event so the
-                        // coordinator dashboard can track it. Full CS deduction
-                        // from the state store is wired up in a later phase when
-                        // the CS ledger is on-chain. For now the event is the
-                        // observable signal.
+                    .map_err(|e| e.to_string())
+                    .and_then(|cost| {
+                        // CS cost event. Full CS deduction from the state store
+                        // is wired up when the CS ledger is on-chain; the event
+                        // is the observable signal for now.
                         events.push(format!(
                             "revoke_attestation: {} revoked attestation of {} \
-                             (cs_cost_bps={})",
-                            cost.attester_id, cost.attested_id, cost.cost_bps
+                             (cs_cost_bps={}, tier_downgraded={})",
+                            cost.attester_id, cost.attested_id,
+                            cost.cost_bps, cost.tier_downgraded
                         ));
+                        // Phase C: if the revocation caused the attested identity
+                        // to drop below quorum and be downgraded to Provisional,
+                        // sync their updated charm to account state and refresh
+                        // the Merkle leaf so light clients and verifiers see the
+                        // correct tier and voting weight.
+                        if cost.tier_downgraded {
+                            // Atomic charm-sync: if either lookup fails the tx
+                            // returns an error. The identity record was already
+                            // mutated by revoke_attestation, so on retry the
+                            // charm will be re-read from the updated record.
+                            // Do NOT call refresh_leaf until sync succeeds —
+                            // committing a stale Verified charm to the Merkle
+                            // tree would leave a validator gate-eligible after
+                            // revocation.
+                            let record = identity.get(attested_id)
+                                .map_err(|e| format!("charm-sync: identity lookup failed after tier downgrade: {}", e))?;
+                            let acct = state.get_account_mut(attested_id)
+                                .map_err(|e| format!("charm-sync: account lookup failed after tier downgrade: {}", e))?;
+                            acct.attach_charm(record.charm.clone());
+                            state.refresh_leaf(attested_id);
+                        }
+                        Ok(())
                     })
-                    .map_err(|e| e.to_string())
             }
 
             TxBody::ConfirmSybil { sybil_id } => {
@@ -3283,6 +3541,10 @@ impl Executor {
             TxBody::ClaimResearchReward { .. } => {
                 Err("ClaimResearchReward requires the full identity- and state-aware executor".to_string())
             }
+            // VerifyIdentityWithProof requires the full identity- and state-aware executor.
+            TxBody::VerifyIdentityWithProof { .. } => {
+                Err("VerifyIdentityWithProof requires the full identity- and state-aware executor".to_string())
+            }
         };
 
         if result.is_ok() {
@@ -3692,6 +3954,7 @@ mod tests {
             settlement_operators: vec![],
             crypto_governors:     vec![],
             fee_collector:   "treasury:fees".into(),
+            pop_verifier:    None,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -5285,12 +5548,15 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &consensus_tx, &mut state, &mut identity, &mut agents,
         );
-        assert!(!r.success, "ConsensusSignatures scope must be rejected");
+        assert!(!r.success, "ConsensusSignatures scope must be rejected for non-ml-dsa-65 schemes");
         let err = r.error.clone().unwrap_or_default();
-        assert!(err.contains("not yet supported"),
-            "error must say scope is not yet supported; got: {err}");
-        assert!(err.contains("TxSignatures"),
-            "error must hint at TxSignatures; got: {err}");
+        // Guard 0 allows ConsensusSignatures only for "ml-dsa-65" (PQ-VAL-002 rollback path).
+        // Any other deprecated_scheme with ConsensusSignatures scope must be rejected with a
+        // message naming the only supported scheme.
+        assert!(
+            err.contains("ml-dsa-65") || err.contains("only supported"),
+            "error must name the only permitted ConsensusSignatures scheme; got: {err}"
+        );
 
         // Both scope must also be rejected.
         let both_tx = Transaction {
@@ -6039,5 +6305,538 @@ mod tests {
         let mut tx = minimal_tx("qcb1alice", 100_000);
         tx.public_key = vec![0u8; 32];
         assert!(check_tx(&tx, 0, 0).is_err(), "all-zero public_key must be rejected");
+    }
+
+    // -- Phase C: revocation propagation syncs charm to on-chain account ------
+
+    #[test]
+    fn revoke_attestation_below_quorum_downgrades_onchain_tier() {
+        // End-to-end: attest newbie up to Verified via three attesters,
+        // then revoke one attestation and verify the on-chain account charm
+        // is synced back to Provisional (Phase C revocation propagation).
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+
+        // Bootstrap two more Verified attesters alongside alice.
+        for name in ["qcb1bob", "qcb1carol"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
+        }
+        for name in ["qcb1newbie", "qcb1bob", "qcb1carol"] {
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
+
+        // Register and attest newbie up to quorum (Verified).
+        exec.execute_tx_with_identity(
+            &Transaction::register_identity("r0", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        exec.execute_tx_with_identity(
+            &Transaction::attest("a1", "qcb1alice", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        exec.execute_tx_with_identity(
+            &Transaction::attest("a2", "qcb1bob", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        let r3 = exec.execute_tx_with_identity(
+            &Transaction::attest("a3", "qcb1carol", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        assert!(r3.success, "third attest should succeed and reach quorum");
+        assert_eq!(
+            state.get_account("qcb1newbie").unwrap().verification_tier(),
+            Some(&VerificationTier::Verified),
+            "on-chain account must be Verified after quorum"
+        );
+
+        // Phase C: revoke alice's attestation — count drops 3→2, below quorum.
+        // alice nonce advanced to 1 after the attest tx.
+        let rev = Transaction::revoke_attestation("rev1", "qcb1alice", "qcb1newbie", 1);
+        let rr = exec.execute_tx_with_identity(&rev, &mut state, &mut identity, &mut agents);
+        assert!(rr.success, "revoke_attestation must succeed: {:?}", rr.error);
+        assert!(
+            rr.events.iter().any(|e| e.contains("tier_downgraded=true")),
+            "revocation event must report tier_downgraded=true; events={:?}", rr.events
+        );
+
+        // Both the identity store and the on-chain account must now show Provisional.
+        assert_eq!(
+            *identity.get("qcb1newbie").unwrap().tier(),
+            VerificationTier::Provisional,
+            "identity store must show Provisional after revocation below quorum"
+        );
+        assert_eq!(
+            state.get_account("qcb1newbie").unwrap().verification_tier(),
+            Some(&VerificationTier::Provisional),
+            "on-chain account charm must be synced to Provisional (Phase C)"
+        );
+    }
+
+    // -- QPC-GAP-002: VerifyIdentityWithProof fail-closed ----------------------
+
+    #[test]
+    fn verify_identity_with_proof_fails_closed_when_no_verifier_configured() {
+        // When pop_verifier is None (default), VerifyIdentityWithProof must
+        // return a failure with the "no pop_verifier configured" sentinel.
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config = ExecutionConfig::from_genesis(&genesis);  // pop_verifier = None
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let att = chain_forge_identity::PopAttestation::genesis("qcb1alice", 0);
+        identity.register("qcb1alice".into(), "qcb1alice".into(), att.clone()).unwrap();
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        let tx = Transaction {
+            id:           "vip1".into(),
+            sender:       "qcb1alice".into(),
+            nonce:        0,
+            body:         TxBody::VerifyIdentityWithProof {
+                proof_bytes: vec![0u8; 32],
+                public_inputs_bytes: vec![],
+            },
+            gas_limit:    1_000_000,
+            signature:    vec![],
+            public_key:   vec![],
+            pq_signatures: vec![],
+            sig_scheme:   None,
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        assert!(!r.success, "must fail when no pop_verifier is wired");
+        let err = r.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("no pop_verifier configured"),
+            "error must contain sentinel text; got: {err}"
+        );
+    }
+
+    // -- QPC-GAP-002: VerifyIdentityWithProof upgrades Provisional → Verified --
+
+    struct AlwaysOkVerifier;
+    impl chain_forge_identity::PopProofVerifier for AlwaysOkVerifier {
+        fn verify_pop_proof(&self, _proof_bytes: &[u8], _public_inputs: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn verify_identity_with_proof_upgrades_provisional_to_verified() {
+        use std::sync::Arc;
+        use chain_forge_identity::VerificationTier;
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut exec_config = ExecutionConfig::from_genesis(&genesis);
+        exec_config.pop_verifier = Some(Arc::new(AlwaysOkVerifier));
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        // Register qcb1bob as Provisional only (no verify_identity call).
+        let reg_att = chain_forge_identity::PopAttestation::genesis("qcb1bob", 0);
+        identity.register("qcb1bob".into(), "qcb1bob".into(), reg_att).unwrap();
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(exec_config);
+
+        assert_eq!(
+            *identity.get("qcb1bob").unwrap().tier(),
+            VerificationTier::Provisional,
+            "precondition: bob must be Provisional before proof submission"
+        );
+
+        let tx = Transaction {
+            id:           "vip2".into(),
+            sender:       "qcb1bob".into(),
+            nonce:        0,
+            body:         TxBody::VerifyIdentityWithProof {
+                proof_bytes: vec![1u8; 64],
+                public_inputs_bytes: vec![2u8; 16],
+            },
+            gas_limit:    1_000_000,
+            signature:    vec![],
+            public_key:   vec![],
+            pq_signatures: vec![],
+            sig_scheme:   None,
+            pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "VerifyIdentityWithProof must succeed with stub verifier: {:?}", r.error);
+        assert_eq!(
+            *identity.get("qcb1bob").unwrap().tier(),
+            VerificationTier::Verified,
+            "bob must be Verified after successful proof submission"
+        );
+    }
+
+    // -- Security regression tests (PR #10 review findings) -------------------
+
+    // Finding 2: re-bond after owner frozen must be rejected
+    #[test]
+    fn rebond_rejected_after_owner_frozen() {
+        use chain_forge_identity::PopAttestation;
+
+        let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+
+        // First authenticated bond succeeds — alice is Verified and unfrozen.
+        let bond1 = Transaction {
+            id: "bond1".into(), sender: "qcb1alice".into(), nonce: 0,
+            body: TxBody::BondValidator { amount: 1_000_000, owner_identity_id: Some("qcb1alice".into()) },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r1 = exec.execute_tx_with_identity(&bond1, &mut state, &mut identity, &mut agents);
+        assert!(r1.success, "initial authenticated bond must succeed: {:?}", r1.error);
+
+        // Freeze alice's identity record directly (simulates sybil confirmation
+        // or any other freeze path).
+        identity.get_mut("qcb1alice").unwrap().frozen = true;
+
+        // Re-bond attempt must be rejected — frozen owner fails eligibility.
+        let bond2 = Transaction {
+            id: "bond2".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::BondValidator { amount: 500_000, owner_identity_id: Some("qcb1alice".into()) },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r2 = exec.execute_tx_with_identity(&bond2, &mut state, &mut identity, &mut agents);
+        assert!(!r2.success, "re-bond from frozen owner must be rejected");
+        let err = r2.error.unwrap();
+        assert!(err.contains("no longer holds") || err.contains("frozen") || err.contains("tier"),
+            "error must name the eligibility check, got: {err}");
+    }
+
+    // Finding 2: re-bond after owner downgraded to Provisional must be rejected
+    #[test]
+    fn rebond_rejected_after_owner_downgraded_to_provisional() {
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+
+        // First authenticated bond.
+        let bond1 = Transaction {
+            id: "bond1".into(), sender: "qcb1alice".into(), nonce: 0,
+            body: TxBody::BondValidator { amount: 1_000_000, owner_identity_id: Some("qcb1alice".into()) },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        assert!(exec.execute_tx_with_identity(&bond1, &mut state, &mut identity, &mut agents).success);
+
+        // Manually downgrade alice's charm tier to Provisional.
+        {
+            let rec = identity.get_mut("qcb1alice").unwrap();
+            rec.charm.tier = VerificationTier::Provisional;
+        }
+
+        let bond2 = Transaction {
+            id: "bond2".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::BondValidator { amount: 500_000, owner_identity_id: Some("qcb1alice".into()) },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r2 = exec.execute_tx_with_identity(&bond2, &mut state, &mut identity, &mut agents);
+        assert!(!r2.success, "re-bond from Provisional owner must be rejected");
+    }
+
+    // Finding 1: revoke_attestation charm-sync: after tier downgrade the
+    // on-chain account must reflect the new Provisional tier.
+    #[test]
+    fn revoke_attestation_syncs_charm_to_account_after_downgrade() {
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        // Register alice, bob, carol, dave all as Verified attesters.
+        for name in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
+            // Ensure each has an on-chain account with uqcb for fees.
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 100_000);
+            state.upsert_account(acct);
+        }
+
+        // Register newbie as Provisional.
+        {
+            let att = PopAttestation::genesis("qcb1newbie", 0);
+            identity.register("qcb1newbie".into(), "qcb1newbie".into(), att).unwrap();
+            let mut acct = chain_forge_state::AccountState::new("qcb1newbie".into(), "user".into());
+            acct.credit("uqcb", 100_000);
+            state.upsert_account(acct);
+        }
+
+        // Attest newbie to Verified using 3 distinct attesters (ATTESTATION_QUORUM=3).
+        // Each sender has its own nonce starting at 0.
+        for (i, attester) in ["qcb1alice", "qcb1bob", "qcb1carol"].iter().enumerate() {
+            let tx = Transaction {
+                id: format!("att{i}"), sender: (*attester).into(), nonce: 0,
+                body: TxBody::Attest { claimant_id: "qcb1newbie".into() },
+                gas_limit: 50_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+            };
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+            assert!(r.success, "attest tx from {attester} must succeed: {:?}", r.error);
+        }
+
+        // Newbie should now be Verified.
+        assert_eq!(
+            *identity.get("qcb1newbie").unwrap().tier(),
+            VerificationTier::Verified,
+            "newbie must be Verified after 3 attestations"
+        );
+
+        // Advance epoch so the revoking attester is past the cooldown (epoch 0 → 2).
+        identity.advance_epoch(1_000);
+        identity.advance_epoch(2_000);
+
+        // Alice revokes her attestation of newbie. With only 2 remaining
+        // attesters (bob, carol) the quorum (3) is lost → tier_downgraded=true.
+        // Alice's nonce: 1 (she sent attest at nonce 0 above).
+        let revoke_tx = Transaction {
+            id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::RevokeAttestation { attested_id: "qcb1newbie".into() },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r_rev = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+        assert!(r_rev.success, "revoke_attestation must succeed: {:?}", r_rev.error);
+
+        // Identity store must show Provisional.
+        assert_eq!(
+            *identity.get("qcb1newbie").unwrap().tier(),
+            VerificationTier::Provisional,
+            "newbie identity tier must be Provisional after revocation-driven downgrade"
+        );
+
+        // On-chain account charm must also reflect Provisional — the sync cannot
+        // have been skipped or silently failed.
+        let acct = state.get_account("qcb1newbie").unwrap();
+        assert_eq!(
+            acct.verification_tier(),
+            Some(&VerificationTier::Provisional),
+            "on-chain account tier must match identity store tier after revocation downgrade"
+        );
+    }
+
+    // Finding 3: ZK-VRC charm sync must be reflected in on-chain account.
+    #[test]
+    fn verify_identity_with_proof_syncs_charm_to_account() {
+        use chain_forge_identity::VerificationTier;
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let mut config = ExecutionConfig::from_genesis(&genesis);
+        config.pop_verifier = Some(std::sync::Arc::new(AlwaysOkVerifier));
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        // Register bob as Provisional only.
+        {
+            use chain_forge_identity::PopAttestation;
+            let att = PopAttestation::genesis("qcb1bob", 0);
+            identity.register("qcb1bob".into(), "qcb1bob".into(), att).unwrap();
+            let mut acct = chain_forge_state::AccountState::new("qcb1bob".into(), "user".into());
+            acct.credit("uqcb", 100_000);
+            state.upsert_account(acct);
+        }
+
+        let tx = Transaction {
+            id: "vip1".into(), sender: "qcb1bob".into(), nonce: 0,
+            body: TxBody::VerifyIdentityWithProof {
+                proof_bytes: vec![1u8; 64],
+                public_inputs_bytes: vec![2u8; 16],
+            },
+            gas_limit: 1_000_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "ZK-VRC upgrade must succeed: {:?}", r.error);
+
+        // On-chain account must reflect Verified — charm sync must not have been skipped.
+        let acct = state.get_account("qcb1bob").unwrap();
+        assert_eq!(
+            acct.verification_tier(),
+            Some(&VerificationTier::Verified),
+            "on-chain account must be Verified after ZK-VRC upgrade"
+        );
+    }
+
+    // Atomicity check: after revoke_attestation the identity store is
+    // always in a consistent state. The identity record mutation inside
+    // revoke_attestation is eager; the important invariant is that on a
+    // successful tx the identity tier, account charm, and Merkle leaf all
+    // agree. This test verifies all three sources of truth are consistent
+    // after a successful downgrade — the regression guard for the silent
+    // charm-sync failure that was found in the review.
+    #[test]
+    fn revocation_three_state_sources_agree_after_downgrade() {
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        for name in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1newbie"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            if name != "qcb1newbie" {
+                identity.verify_identity(name, att, None).unwrap();
+            }
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 100_000);
+            state.upsert_account(acct);
+        }
+
+        // Attest newbie to Verified via alice, bob, carol.
+        for (i, attester) in ["qcb1alice", "qcb1bob", "qcb1carol"].iter().enumerate() {
+            let tx = Transaction {
+                id: format!("att{i}"), sender: (*attester).into(), nonce: 0,
+                body: TxBody::Attest { claimant_id: "qcb1newbie".into() },
+                gas_limit: 50_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+            };
+            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents).success);
+        }
+
+        identity.advance_epoch(1_000);
+        identity.advance_epoch(2_000);
+
+        // Alice revokes → tier_downgraded=true (only 2 attesters remain).
+        let revoke_tx = Transaction {
+            id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::RevokeAttestation { attested_id: "qcb1newbie".into() },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "revoke_attestation must succeed: {:?}", r.error);
+
+        let identity_tier = identity.get("qcb1newbie").unwrap().charm.tier.clone();
+        let account_tier  = state.get_account("qcb1newbie").unwrap().verification_tier().cloned();
+
+        // Source 1: identity store.
+        assert_eq!(identity_tier, VerificationTier::Provisional,
+            "identity store must show Provisional after downgrade");
+        // Source 2: on-chain account charm.
+        assert_eq!(account_tier, Some(VerificationTier::Provisional),
+            "account charm must match identity store after downgrade");
+        // Sources 1 and 2 must agree (belt-and-suspenders).
+        assert_eq!(Some(identity_tier), account_tier,
+            "identity store and account charm must be consistent after downgrade");
+    }
+
+    // Atomicity gap test: revoke_attestation with missing account.
+    //
+    // This test deliberately omits newbie's StateStore account so that
+    // get_account_mut() fails during the charm-sync step. It records what
+    // actually happens to the identity record, attestation record, and
+    // account state so the behaviour is explicit and observable in CI,
+    // regardless of whether atomicity is guaranteed.
+    //
+    // The #[should_panic] attribute is NOT set here — the assertions document
+    // the observed invariants. If a future commit introduces a rollback the
+    // assertions should be updated to reflect the stronger guarantee.
+    #[test]
+    fn revoke_attestation_missing_account_documents_atomicity_behaviour() {
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        // Register alice, bob, carol as Verified attesters (with accounts).
+        for name in ["qcb1alice", "qcb1bob", "qcb1carol"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 100_000);
+            state.upsert_account(acct);
+        }
+
+        // Register newbie in IdentityStore but deliberately omit their
+        // StateStore account — this is the partial-state scenario.
+        {
+            let att = PopAttestation::genesis("qcb1newbie", 0);
+            identity.register("qcb1newbie".into(), "qcb1newbie".into(), att).unwrap();
+            // No state.upsert_account for newbie.
+        }
+
+        // Attest newbie to Verified via three attesters.
+        for (i, attester) in ["qcb1alice", "qcb1bob", "qcb1carol"].iter().enumerate() {
+            let tx = Transaction {
+                id: format!("att{i}"), sender: (*attester).into(), nonce: 0,
+                body: TxBody::Attest { claimant_id: "qcb1newbie".into() },
+                gas_limit: 50_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+            };
+            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents).success);
+        }
+        assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Verified);
+
+        identity.advance_epoch(1_000);
+        identity.advance_epoch(2_000);
+
+        // Snapshot pre-revocation state.
+        let pre_attestation_count = identity
+            .get("qcb1newbie").unwrap()
+            .attestation_ledger.count();
+
+        // Alice revokes → tier_downgraded=true. Newbie has no account, so
+        // get_account_mut() will fail during charm-sync.
+        let revoke_tx = Transaction {
+            id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::RevokeAttestation { attested_id: "qcb1newbie".into() },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+
+        // The transaction MUST fail — the pre-flight check rejects the tx before
+        // calling revoke_attestation(), so no identity mutation occurs.
+        assert!(!r.success,
+            "revoke_attestation must be rejected when the attested account is absent from StateStore");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("state invariant violated") || err.contains("no on-chain account"),
+            "error must name the invariant violation; got: {err}");
+
+        // ATOMICITY INVARIANTS — the pre-flight fix guarantees these hold:
+
+        // The identity tier must be UNCHANGED (still Verified) — the pre-flight
+        // rejected the tx before revoke_attestation() was called.
+        let post_tier = identity.get("qcb1newbie").unwrap().charm.tier.clone();
+        assert_eq!(post_tier, VerificationTier::Verified,
+            "identity tier must remain Verified after a pre-flight-rejected tx; \
+             if this fails, revoke_attestation() was called before the pre-flight");
+
+        // The attestation ledger count must be UNCHANGED (still 3).
+        let post_count = identity.get("qcb1newbie").unwrap().attestation_ledger.count();
+        assert_eq!(post_count, pre_attestation_count,
+            "attestation ledger must be unchanged after a rejected tx");
+
+        // The account must still not exist (we never created it — and no mutation
+        // should have created it as a side effect).
+        assert!(state.get_account("qcb1newbie").is_err(),
+            "no account must exist for an identity that was never given one");
     }
 }

@@ -93,13 +93,19 @@ mod tests {
     #[test]
     fn cross_vendor_public_keys_are_distinct() {
         let mut wallet = DemoWallet::new();
-        let pk_game = wallet.provision("game", "https://game.example", "v1").unwrap();
-        let pk_docs = wallet.provision("docs", "https://docs.example", "v1").unwrap();
-        let pk_pay  = wallet.provision("pay",  "https://pay.example",  "v1").unwrap();
+        let pk_game = wallet
+            .provision("game", "https://game.example", "v1")
+            .unwrap();
+        let pk_docs = wallet
+            .provision("docs", "https://docs.example", "v1")
+            .unwrap();
+        let pk_pay = wallet
+            .provision("pay", "https://pay.example", "v1")
+            .unwrap();
 
         assert_ne!(pk_game, pk_docs, "game and docs share a key — linkable!");
-        assert_ne!(pk_docs, pk_pay,  "docs and pay share a key — linkable!");
-        assert_ne!(pk_game, pk_pay,  "game and pay share a key — linkable!");
+        assert_ne!(pk_docs, pk_pay, "docs and pay share a key — linkable!");
+        assert_ne!(pk_game, pk_pay, "game and pay share a key — linkable!");
     }
 
     /// Proofs presented to different vendors carry no shared public material that
@@ -107,9 +113,9 @@ mod tests {
     #[test]
     fn cross_vendor_proofs_are_not_linkable() {
         let vendors = [
-            ("game",    "game:1",    "play",   "game:play"),
-            ("docs",    "doc:1",     "read",   "document:read"),
-            ("pay",     "payment:1", "submit", "payment:submit"),
+            ("game", "game:1", "play", "game:play"),
+            ("docs", "doc:1", "read", "document:read"),
+            ("pay", "payment:1", "submit", "payment:submit"),
         ];
         let mut wallet = DemoWallet::new();
         let mut rps: Vec<RelyingParty> = Vec::new();
@@ -147,7 +153,9 @@ mod tests {
     #[test]
     fn same_vendor_proofs_are_linkable() {
         let mut wallet = DemoWallet::new();
-        wallet.provision("docs", "https://docs.example", "v1").unwrap();
+        wallet
+            .provision("docs", "https://docs.example", "v1")
+            .unwrap();
         let pk = wallet.provision("docs2", "https://docs.example", "v1");
         // provision rejects a duplicate id but the same key is used for both proofs
         // to "docs"; demonstrate with two requests signed by the same wallet key.
@@ -166,11 +174,15 @@ mod tests {
         let mut rp3 = make_rp("docs", "doc:1", "read", "document:read");
         rp3.enroll_test_key(&pk3).unwrap();
 
-        let req1 = rp3.issue(make_req("docs", "doc:1", "read", "document:read")).unwrap();
+        let req1 = rp3
+            .issue(make_req("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof1 = w3.sign(&req1, "doc:1", "read").unwrap();
         assert_eq!(rp3.verify(&req1, &proof1, 1010), Ok(()));
 
-        let req2 = rp3.issue(make_req("docs", "doc:1", "read", "document:read")).unwrap();
+        let req2 = rp3
+            .issue(make_req("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof2 = w3.sign(&req2, "doc:1", "read").unwrap();
         assert_eq!(rp3.verify(&req2, &proof2, 1010), Ok(()));
 
@@ -184,7 +196,7 @@ mod tests {
     fn disclosure_info_contains_no_cross_vendor_identifier() {
         let vendors = [
             ("game", "game:1", "play", "game:play"),
-            ("docs", "doc:1",  "read", "document:read"),
+            ("docs", "doc:1", "read", "document:read"),
         ];
         let mut wallet = DemoWallet::new();
         let mut rps: Vec<RelyingParty> = Vec::new();
@@ -219,14 +231,20 @@ mod tests {
     #[test]
     fn cross_vendor_proof_submission_rejected() {
         let mut wallet = DemoWallet::new();
-        let pk_game = wallet.provision("game", "https://game.example", "v1").unwrap();
-        let pk_docs = wallet.provision("docs", "https://docs.example", "v1").unwrap();
+        let pk_game = wallet
+            .provision("game", "https://game.example", "v1")
+            .unwrap();
+        let pk_docs = wallet
+            .provision("docs", "https://docs.example", "v1")
+            .unwrap();
         let mut rp_game = make_rp("game", "game:1", "play", "game:play");
         let mut rp_docs = make_rp("docs", "doc:1", "read", "document:read");
         rp_game.enroll_test_key(&pk_game).unwrap();
         rp_docs.enroll_test_key(&pk_docs).unwrap();
 
-        let req = rp_game.issue(make_req("game", "game:1", "play", "game:play")).unwrap();
+        let req = rp_game
+            .issue(make_req("game", "game:1", "play", "game:play"))
+            .unwrap();
         let proof = wallet.sign(&req, "game:1", "play").unwrap();
 
         // game's proof to docs RP → audience mismatch.
@@ -256,6 +274,9 @@ mod tests {
         let issued = rp.issue(req).unwrap();
         let proof = sign_for_test(&issued, sk.as_bytes(), pk.as_bytes()).unwrap();
 
-        assert_eq!(rp.verify(&issued, &proof, 1010), Err(VerifyError::Unauthorized));
+        assert_eq!(
+            rp.verify(&issued, &proof, 1010),
+            Err(VerifyError::Unauthorized)
+        );
     }
 }

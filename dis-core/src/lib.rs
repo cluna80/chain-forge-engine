@@ -10,8 +10,8 @@ pub mod privacy;
 pub mod verifier;
 pub mod wallet;
 
-use sha2::{Digest, Sha256};
 pub use hex;
+use sha2::{Digest, Sha256};
 
 pub const DOMAIN: &[u8] = b"DIS-KS-V1\0";
 pub const SUITE_ML_DSA_65: u16 = 1;
@@ -185,8 +185,7 @@ mod tests {
             policy_id: "v1".into(),
         };
         // Frozen canonical bytes for DIS-KS-V1 / SUITE_ML_DSA_65, no operation_digest.
-        const GOLDEN_BYTES: &str =
-            "4449532d4b532d5631000001\
+        const GOLDEN_BYTES: &str = "4449532d4b532d5631000001\
              000876656e646f722d61\
              001868747470733a2f2f76656e646f722d612e6578616d706c65\
              01010101010101010101010101010101\
@@ -202,12 +201,19 @@ mod tests {
 
         let bytes = canonical_request(&r).unwrap();
         let got_bytes = hex::encode(&bytes);
-        let expected: String = GOLDEN_BYTES.chars().filter(|c| !c.is_whitespace()).collect();
-        assert_eq!(got_bytes, expected,
-            "canonical_request encoding changed — update golden vectors and migration docs");
+        let expected: String = GOLDEN_BYTES
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            got_bytes, expected,
+            "canonical_request encoding changed — update golden vectors and migration docs"
+        );
         let got_digest = hex::encode(Sha256::digest(&bytes));
-        assert_eq!(got_digest, GOLDEN_DIGEST,
-            "SHA-256 of canonical bytes changed");
+        assert_eq!(
+            got_digest, GOLDEN_DIGEST,
+            "SHA-256 of canonical bytes changed"
+        );
     }
 
     #[test]
@@ -227,8 +233,7 @@ mod tests {
             policy_id: "v1".into(),
         };
         // Frozen canonical bytes for DIS-KS-V1 / SUITE_ML_DSA_65, with operation_digest.
-        const GOLDEN_BYTES: &str =
-            "4449532d4b532d5631000001\
+        const GOLDEN_BYTES: &str = "4449532d4b532d5631000001\
              000876656e646f722d61\
              001868747470733a2f2f76656e646f722d612e6578616d706c65\
              01010101010101010101010101010101\
@@ -245,12 +250,19 @@ mod tests {
 
         let bytes = canonical_request(&r).unwrap();
         let got_bytes = hex::encode(&bytes);
-        let expected: String = GOLDEN_BYTES.chars().filter(|c| !c.is_whitespace()).collect();
-        assert_eq!(got_bytes, expected,
-            "canonical_request encoding changed — update golden vectors and migration docs");
+        let expected: String = GOLDEN_BYTES
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            got_bytes, expected,
+            "canonical_request encoding changed — update golden vectors and migration docs"
+        );
         let got_digest = hex::encode(Sha256::digest(&bytes));
-        assert_eq!(got_digest, GOLDEN_DIGEST,
-            "SHA-256 of canonical bytes changed");
+        assert_eq!(
+            got_digest, GOLDEN_DIGEST,
+            "SHA-256 of canonical bytes changed"
+        );
     }
 
     #[test]

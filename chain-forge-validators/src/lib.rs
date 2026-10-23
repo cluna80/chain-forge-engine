@@ -357,6 +357,13 @@ pub struct ValidatorRecord {
     /// as the owner key). This preserves backward compatibility for genesis
     /// validators and the existing test suite.
     pub owner_identity_id: Option<String>,
+    /// True only for validators registered by `register_genesis_validator()`.
+    /// Cannot be set through any post-genesis transaction path. Used by the
+    /// per-block PoP refresh in node.rs to distinguish genesis validators
+    /// (which check their own identity) from post-genesis validators (which
+    /// must have an authenticated owner binding via StateStore).
+    #[serde(default)]
+    pub is_genesis: bool,
 }
 
 impl ValidatorRecord {
@@ -574,6 +581,7 @@ impl ValidatorRegistry {
             moniker:           req.moniker,
             website:           req.website,
             owner_identity_id: req.owner_identity_id.clone(),
+            is_genesis:        false,
         };
 
         // Maintain per-human index for personhood cap enforcement.
@@ -659,6 +667,7 @@ impl ValidatorRegistry {
             moniker:           id.to_string(),
             website:           None,
             owner_identity_id: None, // genesis validators own themselves
+            is_genesis:        true,
         };
         // Genesis validators own themselves (owner_identity_id = None → key = id).
         self.validators_by_human
@@ -777,6 +786,7 @@ impl ValidatorRegistry {
                     moniker:           validator_id.to_string(),
                     website:           None,
                     owner_identity_id: None,
+                    is_genesis:        false,
                 };
                 self.validators_by_human
                     .entry(validator_id.to_string())

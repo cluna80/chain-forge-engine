@@ -83,7 +83,8 @@ fn write_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 fn write_bytes(out: &mut Vec<u8>, b: &[u8]) -> Result<(), DelegationError> {
-    let n = u16::try_from(b.len()).map_err(|_| DelegationError::Encoding(EncodingError::InvalidField))?;
+    let n = u16::try_from(b.len())
+        .map_err(|_| DelegationError::Encoding(EncodingError::InvalidField))?;
     write_u16(out, n);
     out.extend_from_slice(b);
     Ok(())
@@ -99,8 +100,11 @@ pub fn canonical_delegation_body(d: &Delegation) -> Result<Vec<u8>, DelegationEr
     write_str(&mut out, &d.rp_id)?;
     write_bytes(&mut out, &d.delegator_public_key)?;
     write_bytes(&mut out, &d.delegate_public_key)?;
-    write_u16(&mut out, u16::try_from(d.scopes.len())
-        .map_err(|_| DelegationError::Encoding(EncodingError::InvalidField))?);
+    write_u16(
+        &mut out,
+        u16::try_from(d.scopes.len())
+            .map_err(|_| DelegationError::Encoding(EncodingError::InvalidField))?,
+    );
     for scope in &d.scopes {
         write_str(&mut out, scope)?;
     }
@@ -109,8 +113,13 @@ pub fn canonical_delegation_body(d: &Delegation) -> Result<Vec<u8>, DelegationEr
     write_u64(&mut out, d.issued_at);
     write_u64(&mut out, d.expires_at);
     match d.max_uses {
-        Some(n) => { out.push(1); write_u32(&mut out, n); }
-        None    => { out.push(0); }
+        Some(n) => {
+            out.push(1);
+            write_u32(&mut out, n);
+        }
+        None => {
+            out.push(0);
+        }
     }
     out.push(d.requires_human_approval as u8);
     Ok(out)
@@ -150,6 +159,7 @@ pub fn delegation_id(d: &Delegation) -> Result<[u8; 32], DelegationError> {
 }
 
 /// Create and sign a delegation in one call (test/demo helper).
+#[allow(clippy::too_many_arguments)]
 pub fn make_delegation(
     rp_id: &str,
     delegator_pk: &[u8],
@@ -236,8 +246,8 @@ pub fn validate_chain(
         }
         temp = link.scopes.clone();
         parent_scopes = &temp; // safe: temp lives for this iteration, then we reborrow
-        // (actually we can't reborrow temp across iterations without the borrow checker complaining;
-        //  restructure with an owned Vec)
+                               // (actually we can't reborrow temp across iterations without the borrow checker complaining;
+                               //  restructure with an owned Vec)
         let _ = parent_scopes; // suppress unused
         parent_scopes = &chain[i].scopes; // borrow from the slice which has 'chain lifetime
     }
@@ -293,7 +303,13 @@ mod tests {
         }
     }
 
-    fn issued_req(rp: &mut RelyingParty, id: &str, resource: &str, action: &str, scope: &str) -> Request {
+    fn issued_req(
+        rp: &mut RelyingParty,
+        id: &str,
+        resource: &str,
+        action: &str,
+        scope: &str,
+    ) -> Request {
         rp.issue(make_req(id, resource, action, scope)).unwrap()
     }
 
@@ -307,15 +323,25 @@ mod tests {
 
         let del = make_delegation(
             "docs",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 2000, None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            2000,
+            None,
+            false,
+        )
+        .unwrap();
 
         let req = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let agent_proof = sign_for_test(&req, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
-        let delegated = DelegatedProof { chain: vec![del], agent_proof };
+        let delegated = DelegatedProof {
+            chain: vec![del],
+            agent_proof,
+        };
 
         assert_eq!(rp.verify_delegated(&req, &delegated, 1010), Ok(()));
     }
@@ -331,7 +357,10 @@ mod tests {
         let req = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let proof = sign_for_test(&req, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
         // Direct verify must reject the agent key (not enrolled).
-        assert_eq!(rp.verify(&req, &proof, 1010), Err(VerifyError::Unauthorized));
+        assert_eq!(
+            rp.verify(&req, &proof, 1010),
+            Err(VerifyError::Unauthorized)
+        );
     }
 
     /// Scope not in delegation is rejected.
@@ -345,19 +374,32 @@ mod tests {
         // Delegation only grants document:read; request asks for document:admin.
         let del = make_delegation(
             "docs",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 2000, None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            2000,
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut req = make_req("docs", "doc:1", "read", "document:read");
         req.scopes = vec!["document:admin".into()];
         let req = rp.issue(req).unwrap();
         let agent_proof = sign_for_test(&req, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
-        let delegated = DelegatedProof { chain: vec![del], agent_proof };
+        let delegated = DelegatedProof {
+            chain: vec![del],
+            agent_proof,
+        };
 
-        assert_eq!(rp.verify_delegated(&req, &delegated, 1010), Err(VerifyError::Unauthorized));
+        assert_eq!(
+            rp.verify_delegated(&req, &delegated, 1010),
+            Err(VerifyError::Unauthorized)
+        );
     }
 
     /// Expired delegation is rejected.
@@ -370,19 +412,31 @@ mod tests {
 
         let del = make_delegation(
             "docs",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 1000, // expires_at == issued_at for request → already expired
-            None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            1000, // expires_at == issued_at for request → already expired
+            None,
+            false,
+        )
+        .unwrap();
 
         let req = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let agent_proof = sign_for_test(&req, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
-        let delegated = DelegatedProof { chain: vec![del], agent_proof };
+        let delegated = DelegatedProof {
+            chain: vec![del],
+            agent_proof,
+        };
 
         // now=1010 > delegation.expires_at=1000 → expired
-        assert_eq!(rp.verify_delegated(&req, &delegated, 1010), Err(VerifyError::DelegationInvalid));
+        assert_eq!(
+            rp.verify_delegated(&req, &delegated, 1010),
+            Err(VerifyError::DelegationInvalid)
+        );
     }
 
     /// Two-level chain: human → agent → subagent.
@@ -396,22 +450,39 @@ mod tests {
 
         let del1 = make_delegation(
             "docs",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 2000, None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            2000,
+            None,
+            false,
+        )
+        .unwrap();
         let del2 = make_delegation(
             "docs",
-            agent_pk.as_bytes(), agent_sk.as_bytes(),
+            agent_pk.as_bytes(),
+            agent_sk.as_bytes(),
             sub_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 2000, None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            2000,
+            None,
+            false,
+        )
+        .unwrap();
 
         let req = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let sub_proof = sign_for_test(&req, sub_sk.as_bytes(), sub_pk.as_bytes()).unwrap();
-        let delegated = DelegatedProof { chain: vec![del1, del2], agent_proof: sub_proof };
+        let delegated = DelegatedProof {
+            chain: vec![del1, del2],
+            agent_proof: sub_proof,
+        };
 
         assert_eq!(rp.verify_delegated(&req, &delegated, 1010), Ok(()));
     }
@@ -428,25 +499,45 @@ mod tests {
         // Agent gets document:read only.
         let del1 = make_delegation(
             "docs",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 2000, None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            2000,
+            None,
+            false,
+        )
+        .unwrap();
         // Agent tries to grant document:admin — wider than what it has.
         let del2 = make_delegation(
             "docs",
-            agent_pk.as_bytes(), agent_sk.as_bytes(),
+            agent_pk.as_bytes(),
+            agent_sk.as_bytes(),
             sub_pk.as_bytes(),
             vec!["document:admin".into()], // not in del1.scopes
-            "doc:1", "read", 900, 2000, None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            2000,
+            None,
+            false,
+        )
+        .unwrap();
 
         let req = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let sub_proof = sign_for_test(&req, _sub_sk.as_bytes(), sub_pk.as_bytes()).unwrap();
-        let delegated = DelegatedProof { chain: vec![del1, del2], agent_proof: sub_proof };
+        let delegated = DelegatedProof {
+            chain: vec![del1, del2],
+            agent_proof: sub_proof,
+        };
 
-        assert_eq!(rp.verify_delegated(&req, &delegated, 1010), Err(VerifyError::Unauthorized));
+        assert_eq!(
+            rp.verify_delegated(&req, &delegated, 1010),
+            Err(VerifyError::Unauthorized)
+        );
     }
 
     /// High-risk action: delegation requires human approval; without it, rejected.
@@ -459,16 +550,25 @@ mod tests {
 
         let del = make_delegation(
             "pay",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["payment:submit".into()],
-            "payment:1", "submit", 900, 2000, None,
+            "payment:1",
+            "submit",
+            900,
+            2000,
+            None,
             true, // requires_human_approval
-        ).unwrap();
+        )
+        .unwrap();
 
         let req = issued_req(&mut rp, "pay", "payment:1", "submit", "payment:submit");
         let agent_proof = sign_for_test(&req, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
-        let delegated = DelegatedProof { chain: vec![del.clone()], agent_proof: agent_proof.clone() };
+        let delegated = DelegatedProof {
+            chain: vec![del.clone()],
+            agent_proof: agent_proof.clone(),
+        };
 
         // Without approval: rejected.
         assert_eq!(
@@ -480,7 +580,10 @@ mod tests {
         let req2 = issued_req(&mut rp, "pay", "payment:1", "submit", "payment:submit");
         rp.approve_challenge(req2.challenge_id);
         let agent_proof2 = sign_for_test(&req2, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
-        let delegated2 = DelegatedProof { chain: vec![del], agent_proof: agent_proof2 };
+        let delegated2 = DelegatedProof {
+            chain: vec![del],
+            agent_proof: agent_proof2,
+        };
         assert_eq!(rp.verify_delegated(&req2, &delegated2, 1010), Ok(()));
     }
 
@@ -494,19 +597,31 @@ mod tests {
 
         let del = make_delegation(
             "docs",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 2000,
+            "doc:1",
+            "read",
+            900,
+            2000,
             Some(1), // max_uses = 1
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         // First use: ok.
         let req1 = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let proof1 = sign_for_test(&req1, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
         assert_eq!(
-            rp.verify_delegated(&req1, &DelegatedProof { chain: vec![del.clone()], agent_proof: proof1 }, 1010),
+            rp.verify_delegated(
+                &req1,
+                &DelegatedProof {
+                    chain: vec![del.clone()],
+                    agent_proof: proof1
+                },
+                1010
+            ),
             Ok(())
         );
 
@@ -514,7 +629,14 @@ mod tests {
         let req2 = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let proof2 = sign_for_test(&req2, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
         assert_eq!(
-            rp.verify_delegated(&req2, &DelegatedProof { chain: vec![del], agent_proof: proof2 }, 1010),
+            rp.verify_delegated(
+                &req2,
+                &DelegatedProof {
+                    chain: vec![del],
+                    agent_proof: proof2
+                },
+                1010
+            ),
             Err(VerifyError::DelegationUsesExhausted)
         );
     }
@@ -529,18 +651,31 @@ mod tests {
 
         let del = make_delegation(
             "docs",
-            human_pk.as_bytes(), human_sk.as_bytes(),
+            human_pk.as_bytes(),
+            human_sk.as_bytes(),
             agent_pk.as_bytes(),
             vec!["document:read".into()],
-            "doc:1", "read", 900, 2000, None, false,
-        ).unwrap();
+            "doc:1",
+            "read",
+            900,
+            2000,
+            None,
+            false,
+        )
+        .unwrap();
 
         rp.revoke(human_pk.as_bytes()).unwrap();
 
         let req = issued_req(&mut rp, "docs", "doc:1", "read", "document:read");
         let agent_proof = sign_for_test(&req, agent_sk.as_bytes(), agent_pk.as_bytes()).unwrap();
-        let delegated = DelegatedProof { chain: vec![del], agent_proof };
+        let delegated = DelegatedProof {
+            chain: vec![del],
+            agent_proof,
+        };
 
-        assert_eq!(rp.verify_delegated(&req, &delegated, 1010), Err(VerifyError::Revoked));
+        assert_eq!(
+            rp.verify_delegated(&req, &delegated, 1010),
+            Err(VerifyError::Revoked)
+        );
     }
 }

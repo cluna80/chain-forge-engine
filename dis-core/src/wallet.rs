@@ -72,7 +72,12 @@ impl DemoWallet {
         dilithium3::SecretKey::from_bytes(sk).map_err(|_| VerifyError::Signature)?;
         self.keys.insert(
             id.into(),
-            Key { origin: origin.into(), policy: policy.into(), pk: pk.to_vec(), sk: sk.to_vec() },
+            Key {
+                origin: origin.into(),
+                policy: policy.into(),
+                pk: pk.to_vec(),
+                sk: sk.to_vec(),
+            },
         );
         Ok(())
     }
@@ -169,9 +174,9 @@ mod tests {
         let mut rps: Vec<RelyingParty> = Vec::new();
 
         let vendors = [
-            ("game",     "game:1",     "play",   "game:play"),
-            ("docs",     "doc:1",      "read",   "document:read"),
-            ("payments", "payment:1",  "submit", "payment:submit"),
+            ("game", "game:1", "play", "game:play"),
+            ("docs", "doc:1", "read", "document:read"),
+            ("payments", "payment:1", "submit", "payment:submit"),
         ];
 
         for (id, resource, action, scope) in vendors {
@@ -195,13 +200,17 @@ mod tests {
         rps[1].rotate_key(&old_pk, &new_pk).unwrap();
 
         // docs: sign with new key → accepted.
-        let req = rps[1].issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req = rps[1]
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof = wallet.sign(&req, "doc:1", "read").unwrap();
         assert_eq!(rps[1].verify(&req, &proof, 1010), Ok(()));
 
         // game and payments: unaffected.
         for (i, (id, resource, action, scope)) in vendors.iter().enumerate() {
-            if *id == "docs" { continue; }
+            if *id == "docs" {
+                continue;
+            }
             let req = rps[i].issue(request(id, resource, action, scope)).unwrap();
             let proof = wallet.sign(&req, resource, action).unwrap();
             assert_eq!(rps[i].verify(&req, &proof, 1010), Ok(()));

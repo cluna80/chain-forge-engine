@@ -33,6 +33,7 @@ chain-forge-agents    = { path = "../chain-forge-agents" }
 chain-forge-slashing  = { path = "../chain-forge-slashing", features = ["real-crypto"] }
 chain-forge-validators = { path = "../chain-forge-validators" }
 chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-crypto", "real-pqc"] }
+chain-forge-personhood = { path = "../chain-forge-personhood", optional = true }
 dis-core              = { path = "../dis-core" }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
@@ -52,6 +53,11 @@ getrandom             = { version = "0.2" }
 # Unit tests (cfg(test)) are carved out inside node.rs so they still
 # use the fast in-memory mock regardless of this feature flag.
 real-network = []
+# Enable ZK-VRC personhood proof verification in the execution layer (QPC-GAP-002).
+# Adds chain-forge-personhood (Groth16/ark-*) as a build dependency.
+# Without this feature, VerifyIdentityWithProof txs are accepted as a tx type
+# but execution fails closed ("no pop_verifier configured").
+zk-vrc = ["chain-forge-personhood"]
 default = ["real-network"]
 
 [dev-dependencies]
@@ -66,6 +72,7 @@ chain-forge-crypto    = { path = "../chain-forge-crypto", features = ["real-cryp
 chain-forge-execution = { path = "../chain-forge-execution" }
 chain-forge-vca-pq    = { path = "../chain-forge-vca-pq" }
 chain-forge-wallet    = { path = "../chain-forge-wallet" }
+tempfile              = { version = "3" }
 
 [[bench]]
 name    = "bft_round_mldsa"

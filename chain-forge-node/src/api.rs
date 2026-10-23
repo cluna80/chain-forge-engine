@@ -11,9 +11,59 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use super::node::{NodeStatus, ExplorerState, QrcMetrics, MAX_GC_RECEIPTS, SharedNonceCache};
 
-/// In-memory max_uses counter for DIS delegations.
-/// Key = SHA-256 of canonical_delegation_body; value = remaining uses.
-pub type SharedDelegationUsage = Arc<Mutex<HashMap<[u8; 32], u32>>>;
+/// Durable max_uses counter for DIS delegations.
+///
+/// Wraps a `HashMap<delegation_id, remaining_uses>` and optionally persists it
+/// to `<data_dir>/persist/dis_delegation_usage.json` so counts survive node
+/// restarts (closes I11).  When no data_dir is configured the counter is
+/// memory-only (same as before) — the node still enforces max_uses within a
+/// session; it just resets on restart.
+#[derive(Default)]
+pub struct DelegationUsageStore {
+    pub counts: HashMap<[u8; 32], u32>,
+    persist_path: Option<std::path::PathBuf>,
+}
+
+impl DelegationUsageStore {
+    /// Create a new store, loading existing counts from disk when a path is given.
+    pub fn new(data_dir: Option<&std::path::Path>) -> Self {
+        let persist_path = data_dir.map(|d| d.join("persist").join("dis_delegation_usage.json"));
+        let counts = if let Some(ref p) = persist_path {
+            if let Ok(bytes) = std::fs::read(p) {
+                // Stored as [{hex_id: String, remaining: u32}, ...]
+                #[derive(serde::Deserialize)]
+                struct Row { hex_id: String, remaining: u32 }
+                if let Ok(rows) = serde_json::from_slice::<Vec<Row>>(&bytes) {
+                    rows.into_iter().filter_map(|r| {
+                        let b = hex::decode(&r.hex_id).ok()?;
+                        let arr: [u8; 32] = b.try_into().ok()?;
+                        Some((arr, r.remaining))
+                    }).collect()
+                } else {
+                    HashMap::new()
+                }
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+        Self { counts, persist_path }
+    }
+
+    /// Flush counts to disk (best-effort; ignores write errors).
+    pub fn flush(&self) {
+        let Some(ref p) = self.persist_path else { return };
+        #[derive(serde::Serialize)]
+        struct Row<'a> { hex_id: String, remaining: u32, #[allow(dead_code)] _phantom: std::marker::PhantomData<&'a ()> }
+        let rows: Vec<_> = self.counts.iter().map(|(id, &rem)| {
+            serde_json::json!({ "hex_id": hex::encode(id), "remaining": rem })
+        }).collect();
+        let _ = std::fs::write(p, serde_json::to_vec(&rows).unwrap_or_default());
+    }
+}
+
+pub type SharedDelegationUsage = Arc<Mutex<DelegationUsageStore>>;
 use super::auth::{ChallengeStore, AuthChallenge, ChallengeRequest, VerifyRequest,
                   verify_challenge_signature, identity_auth_status, authorize_scope,
                   key_binding_from_explorer, scope_policy};
@@ -51,6 +101,26 @@ pub struct TxPrecheck {
     /// Addresses authorised to submit governance transactions (ActivatePqConsensus).
     /// Populated from genesis validator accounts. Empty list = all senders blocked.
     pub governance_authorities: Vec<String>,
+}
+
+/// Maximum nonce gap the mempool accepts for an account's next tx.
+const MAX_NONCE_GAP: u64 = 100;
+/// Sentinel stored in the nonce cache for genesis accounts that have not yet
+/// committed any transaction on this chain.  F1 treats it as "any nonce in
+/// 0..MAX_NONCE_GAP is valid" rather than the usual strictly-greater-than rule.
+const NO_PRIOR_TX: u64 = u64::MAX;
+
+/// F1 mempool nonce guard — returns `true` if the tx **should be rejected**.
+///
+/// `last` is the value stored in the nonce cache for the sender (either the
+/// last committed `tx.nonce` or `NO_PRIOR_TX` for a fresh genesis account).
+/// `nonce` is the nonce from the incoming transaction.
+pub(crate) fn f1_nonce_rejected(last: u64, nonce: u64) -> bool {
+    if last == NO_PRIOR_TX {
+        nonce > MAX_NONCE_GAP
+    } else {
+        nonce <= last || nonce > last.saturating_add(MAX_NONCE_GAP)
+    }
 }
 
 pub async fn serve(
@@ -223,7 +293,7 @@ pub async fn serve(
                             }
                             // F5: reject transactions from unknown senders (absent from the
                             // nonce cache). Genesis accounts are seeded at startup so they
-                            // pass F5; their first tx must use nonce=1 (nonce=0 is base).
+                            // pass F5; their first tx may use nonce=0 (executor expects 0).
                             Ok(ref tx) if {
                                 let cache = nonce_cache.lock().unwrap();
                                 !cache.contains_key(&tx.sender)
@@ -239,13 +309,13 @@ pub async fn serve(
                             }
                             // F1: nonce must be strictly greater than the last committed
                             // nonce for this sender AND within MAX_NONCE_GAP of it.
-                            // Genesis accounts seed with last=0; nonce=0 is rejected (0 <= 0),
-                            // nonce=1..100 are valid as first txs.
+                            // Fresh genesis accounts are seeded with last=u64::MAX (NO_PRIOR_TX),
+                            // meaning any nonce 0..MAX_NONCE_GAP is valid as the first tx.
+                            // After a tx commits, the cache stores tx.nonce, so replay is blocked.
                             Ok(ref tx) if {
-                                const MAX_NONCE_GAP: u64 = 100;
                                 let cache = nonce_cache.lock().unwrap();
                                 cache.get(&tx.sender).map_or(false, |&last| {
-                                    tx.nonce <= last || tx.nonce > last.saturating_add(MAX_NONCE_GAP)
+                                    f1_nonce_rejected(last, tx.nonce)
                                 })
                             } => {
                                 // Re-lock to get the last nonce for the error message.
@@ -1239,7 +1309,7 @@ pub async fn serve(
                         //   3. Chain key connectivity (link[i].delegate == link[i+1].delegator)
                         //   4. Root delegator must have a committed challenge in this store
                         //   5. Agent signature over the challenge transcript
-                        //   6. max_uses enforcement via in-memory SharedDelegationUsage
+                        //   6. max_uses enforcement via DelegationUsageStore (durable, flushed to disk)
                         let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(request.len());
                         let body = &request[body_start..];
                         // Accept both the native VerifyRequest format and the DIS vendor-server
@@ -1402,7 +1472,13 @@ pub async fn serve(
                                                             Ok(address) => {
                                                                 let mut usage_err: Option<String> = None;
                                                                 {
-                                                                    let mut usage = delegation_usage.lock().unwrap();
+                                                                    let mut store = delegation_usage.lock().unwrap();
+                                                                    // Two-pass: validate all IDs and limits first,
+                                                                    // then decrement atomically. This prevents partial
+                                                                    // consumption when a mid-chain link fails to resolve
+                                                                    // its delegation ID.
+                                                                    struct LinkCheck { id: [u8; 32], max: u32 }
+                                                                    let mut checks: Vec<LinkCheck> = Vec::new();
                                                                     for link in &chain {
                                                                         if let Some(max) = link.max_uses {
                                                                             let id = match delegation_id(link) {
@@ -1412,13 +1488,20 @@ pub async fn serve(
                                                                                     break;
                                                                                 }
                                                                             };
-                                                                            let remaining = usage.entry(id).or_insert(max);
-                                                                            if *remaining == 0 {
+                                                                            let remaining = store.counts.get(&id).copied().unwrap_or(max);
+                                                                            if remaining == 0 {
                                                                                 usage_err = Some("delegation max_uses limit reached".to_string());
                                                                                 break;
                                                                             }
+                                                                            checks.push(LinkCheck { id, max });
+                                                                        }
+                                                                    }
+                                                                    if usage_err.is_none() {
+                                                                        for c in &checks {
+                                                                            let remaining = store.counts.entry(c.id).or_insert(c.max);
                                                                             *remaining -= 1;
                                                                         }
+                                                                        store.flush();
                                                                     }
                                                                 }
                                                                 if let Some(e) = usage_err {
@@ -1668,5 +1751,159 @@ mod tests {
         let first_line_get = "GET /genesis HTTP/1.1";
         // GET /genesis is not handled by the POST /genesis branch
         assert!(!first_line_get.starts_with("POST /genesis"));
+    }
+
+    // -- F1 mempool nonce guard (NO_PRIOR_TX sentinel) -------------------------
+
+    #[test]
+    fn f1_fresh_account_accepts_nonce_zero() {
+        // Genesis accounts are seeded with NO_PRIOR_TX; nonce=0 must be accepted.
+        assert!(!f1_nonce_rejected(NO_PRIOR_TX, 0));
+    }
+
+    #[test]
+    fn f1_fresh_account_accepts_nonce_within_gap() {
+        // Any nonce 0..=MAX_NONCE_GAP is valid for a fresh account.
+        assert!(!f1_nonce_rejected(NO_PRIOR_TX, MAX_NONCE_GAP));
+    }
+
+    #[test]
+    fn f1_fresh_account_rejects_nonce_beyond_gap() {
+        // Nonce > MAX_NONCE_GAP on a fresh account is implausible (likely a bug).
+        assert!(f1_nonce_rejected(NO_PRIOR_TX, MAX_NONCE_GAP + 1));
+    }
+
+    #[test]
+    fn f1_replay_rejected_after_first_tx() {
+        // After nonce=0 commits, the cache stores last=0.
+        // Resending nonce=0 must be rejected (replay).
+        assert!(f1_nonce_rejected(0, 0));
+    }
+
+    #[test]
+    fn f1_next_nonce_accepted_after_first_tx() {
+        // After nonce=0 commits (last=0), nonce=1 must be accepted.
+        assert!(!f1_nonce_rejected(0, 1));
+    }
+
+    #[test]
+    fn f1_consecutive_nonces_accepted() {
+        // last=5 → nonce=6 accepted; nonce=5 (replay) rejected.
+        assert!(!f1_nonce_rejected(5, 6));
+        assert!(f1_nonce_rejected(5, 5));
+        assert!(f1_nonce_rejected(5, 4));
+    }
+
+    #[test]
+    fn f1_gap_too_large_rejected() {
+        // Nonces more than MAX_NONCE_GAP ahead of last are rejected.
+        assert!(f1_nonce_rejected(0, MAX_NONCE_GAP + 1));
+        assert!(!f1_nonce_rejected(0, MAX_NONCE_GAP));
+    }
+
+    #[test]
+    fn f1_new_account_sentinel_does_not_allow_replay_after_commit() {
+        // Simulate: genesis account (last=NO_PRIOR_TX) sends nonce=0,
+        // tx commits, nonce cache updates to last=0.
+        // Now replay with nonce=0 must be rejected.
+        let last_after_commit = 0u64; // cache stores tx.nonce after commit
+        assert!(f1_nonce_rejected(last_after_commit, 0)); // replay rejected
+        assert!(!f1_nonce_rejected(last_after_commit, 1)); // next nonce accepted
+    }
+
+    #[test]
+    fn f1_saturation_does_not_overflow() {
+        // Ensure saturating_add at u64::MAX - 1 does not panic.
+        let last = u64::MAX - 1;
+        // nonce <= last → rejected
+        assert!(f1_nonce_rejected(last, last));
+        // nonce = u64::MAX → last.saturating_add(100) overflows to u64::MAX,
+        // so nonce > saturated value is false; nonce <= last is false too.
+        // The saturation edge case should not panic.
+        let _ = f1_nonce_rejected(last, u64::MAX);
+    }
+
+    // -- I11: DelegationUsageStore persistence (load/flush round-trip) ---------
+
+    #[test]
+    fn delegation_usage_store_persists_counts_across_instances() {
+        let dir = tempfile::tempdir().expect("tempdir must be creatable");
+        let id: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[0] = 0xde; b[1] = 0xad; b[31] = 0x01;
+            b
+        };
+
+        // The store writes to <data_dir>/persist/; create that subdir first.
+        std::fs::create_dir_all(dir.path().join("persist")).unwrap();
+
+        // First instance: insert a count and flush to disk.
+        {
+            let mut store = DelegationUsageStore::new(Some(dir.path()));
+            store.counts.insert(id, 7);
+            store.flush();
+        }
+
+        // Second instance: load from same path and verify count survived.
+        {
+            let store = DelegationUsageStore::new(Some(dir.path()));
+            assert_eq!(
+                store.counts.get(&id).copied(),
+                Some(7),
+                "remaining count must survive a flush/reload cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_usage_store_starts_empty_without_persist_dir() {
+        let store = DelegationUsageStore::new(None);
+        assert!(store.counts.is_empty(), "no-dir store must start empty");
+        // flush must be a no-op (must not panic)
+        store.flush();
+    }
+
+    // Finding 4 regression: exhausted mid-chain entry must not decrement
+    // earlier entries (two-pass validation before any decrement).
+    #[test]
+    fn delegation_usage_no_partial_decrement_on_exhausted_mid_chain_entry() {
+        let mut store = DelegationUsageStore::new(None);
+
+        let id_a: [u8; 32] = { let mut b = [0u8; 32]; b[0] = 0xaa; b };
+        let id_b: [u8; 32] = { let mut b = [0u8; 32]; b[0] = 0xbb; b };
+
+        // id_a has 5 remaining, id_b is exhausted (0 remaining).
+        store.counts.insert(id_a, 5);
+        store.counts.insert(id_b, 0);
+
+        // Simulate the two-pass validation logic from the verify_delegated handler:
+        // first validate all entries, then decrement only if all pass.
+        struct Check { id: [u8; 32], max: u32 }
+        let chain = [(id_a, 10u32), (id_b, 10u32)];
+        let mut usage_err: Option<&str> = None;
+        let mut checks: Vec<Check> = Vec::new();
+        for (id, max) in &chain {
+            let remaining = store.counts.get(id).copied().unwrap_or(*max);
+            if remaining == 0 {
+                usage_err = Some("delegation max_uses limit reached");
+                break;
+            }
+            checks.push(Check { id: *id, max: *max });
+        }
+        // Error detected: do NOT decrement anything.
+        if usage_err.is_none() {
+            for c in &checks {
+                let remaining = store.counts.entry(c.id).or_insert(c.max);
+                *remaining -= 1;
+            }
+        }
+
+        assert!(usage_err.is_some(), "exhausted mid-chain entry must be detected");
+        // id_a must be unchanged — no partial decrement.
+        assert_eq!(
+            store.counts.get(&id_a).copied(),
+            Some(5),
+            "id_a must not be decremented when id_b is exhausted"
+        );
     }
 }

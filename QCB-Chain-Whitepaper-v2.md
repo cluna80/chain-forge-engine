@@ -90,7 +90,9 @@ Chain Forge has crossed its first major milestone. The following capabilities ar
 
 **P2P gossip.** PoCD proof gossip ensures all nodes converge to the same proof pool before epoch boundaries. Capacity advertisement (CapacityAd gossip topic) gives the scheduler live peer load data for task assignment.
 
-**Attestation guard.** On-chain sybil-resistance layer implemented through Phase D: quadratic-cost cap on attestations, revocation with cost, sybil confirmation with contribution-score penalty, and coordinator-gated reversal. 65 tests passing.
+**Attestation guard.** On-chain sybil-resistance layer implemented through Phase D: quadratic-cost cap on attestations, revocation with cost, sybil confirmation with contribution-score penalty, and coordinator-gated reversal. 69 tests passing.
+
+**QPC-CONS-001 — Personhood-to-Consensus Integration (Phase B + C).** Authenticated validator-to-human binding and revocation propagation are implemented and tested. Phase B (commit `890b060`): `BondValidator` rejects cross-owner bonding at the execution layer — `tx.sender` must match `owner_identity_id`; `NO_PRIOR_TX = u64::MAX` nonce sentinel fixed for fresh genesis accounts with 9 regression tests (commit `8014652`). Phase C (commit `17ab814`): revocation propagation now downgrades WoT-verified identities back to Provisional when attestation count drops below `ATTESTATION_QUORUM`; `IntrinsicCharm.verified_via_wot` flag tracks the upgrade path; executor syncs charm and refreshes Merkle leaf on `tier_downgraded`. 6 new identity + executor tests. A01/A03/A10 live PASS; A04 live devnet re-run COMPLETE (commit `f19e095`) — Verified→Provisional→Verified revocation cycle confirmed end-to-end on 4-node in-process devnet; PR #10 merge blocker resolved. **QPC-GAP-002 closed** (commit `4113f4e`): ZK-VRC multi-issuer admission wired — `VerifyIdentityWithProof` tx type, `pop_vk_bytes_hex` genesis field, `Groth16VrcVerifier` in chain-forge-personhood, fail-closed path confirmed by unit tests. **I11 durable max_uses closed** (commit `4113f4e`): `DelegationUsageStore` persists delegation use counts across node restarts.
 
 ---
 
@@ -273,7 +275,7 @@ DIS is the authentication layer that sits on top of the identity layer. The iden
 
 **What DIS guarantees:** key non-exposure; replay resistance (single-use challenges); audience binding (rp_id + rp_origin + policy_id — cross-RP replay is cryptographically impossible); post-quantum authentication (ML-DSA-65 / NIST FIPS 204); per-vendor unlinkable identifiers (cross-vendor correlation is impossible without holder cooperation); scope-minimality enforcement (RP rejects any scope not in its grant set); downgrade resistance (suite_id floor enforced at both issue and verify); delegated agent authorization (human → agent chains, scope-narrowing only, depth limit 4, human-approval gate for high-risk actions, max_uses counter).
 
-**What DIS does not guarantee on its own:** transport-layer privacy; device compromise protection beyond encrypted-at-rest storage; ZK selective disclosure (that is QCB-PM-001, a research milestone); durable max_uses storage across RP restarts (in-memory only in v0.1).
+**What DIS does not guarantee on its own:** transport-layer privacy; device compromise protection beyond encrypted-at-rest storage; ZK selective disclosure (that is QCB-PM-001, a research milestone). Note: durable max_uses storage across RP restarts is now wired in chain-forge-node via `DelegationUsageStore` (I11, commit `4113f4e`); per-delegation revocation remains pending.
 
 > **Implementation status (2026-10-21 — DIS-KS-V1 standalone stack, merged to main):**
 >
@@ -290,7 +292,7 @@ DIS is the authentication layer that sits on top of the identity layer. The iden
 > - Replace `enroll_test_key` / `DemoWallet` with HSM-backed key storage and authenticated enrollment ceremony
 > - Independent cryptographic audit of `canonical_request` encoding and domain separator
 > - Conformance test suite run against a non-Rust (Kotlin/Swift) implementation
-> - Durable `max_uses` and per-delegation revocation (currently in-memory only)
+> - Durable `max_uses` ✅ wired in chain-forge-node (I11, commit `4113f4e`); per-delegation revocation 🔲 (in-memory only)
 > - PQ hybrid TLS on all `rp_origin` endpoints
 > - Phases C (PQ credential storage), D (integration), E (full security audit) remain pending
 
@@ -794,7 +796,12 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 
 | Item | Status | Notes |
 |---|---|---|
-| Attestation guard Phases A–D (chain-forge-identity) | ✅ | 65 tests passing; coordinator-gated |
+| Attestation guard Phases A–D (chain-forge-identity) | ✅ | 69 tests passing; coordinator-gated |
+| QPC-CONS-001 Phase B — Authenticated Validator Binding | ✅ Complete (commit `890b060`) | `BondValidator` Rule 1: `tx.sender == owner_identity_id`; cross-owner bond rejected at execution; `NO_PRIOR_TX` nonce sentinel + 9 regression tests (commit `8014652`) |
+| QPC-CONS-001 Phase C — Revocation Propagation | ✅ Complete (commit `17ab814`) | `verified_via_wot` flag; `downgrade_to_provisional()` on quorum drop; executor charm sync + `refresh_leaf()`; 5 identity tests + 1 executor integration test |
+| A04 — live devnet revocation end-to-end | ✅ Complete (commit `f19e095`) | 4-node in-process devnet: Verified→Provisional on quorum drop confirmed; `scope_authorized` toggled correctly; tier restored after fresh attester reaches quorum; ~42s run; PR #10 merge blocker resolved |
+| QPC-GAP-002 — ZK-VRC multi-issuer admission | ✅ Complete (commit `4113f4e`) | `VerifyIdentityWithProof` tx type; `pop_vk_bytes_hex` in GenesisConfig; `#[cfg(feature="zk-vrc")]` init block in node.rs; `PopProofVerifier` trait; `Groth16VrcVerifier` in chain-forge-personhood; fail-closed when no verifier wired; 2 unit tests (fail-closed + Provisional→Verified upgrade via stub verifier) |
+| I11 — durable max_uses for delegated auth | ✅ Complete (commit `4113f4e`) | `DelegationUsageStore` persists per-delegation use counts to `<data_dir>/persist/dis_delegation_usage.json`; flush after each decrement; load on startup; 2 unit tests (round-trip + no-persist-dir no-op) |
 | ZK-VRC prototype (chain-forge-personhood) | ✅ | Groth16 / BLS12-381; 5 binaries; integrated into workspace |
 | governance_authority.rs — uses real ValidatorSet | ✅ | Quorum tied to quorum_power() / revocation_quorum_power() |
 | /api/identity/{address} REST endpoint | ✅ | Returns verification tier + CS score |
@@ -891,7 +898,7 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 | A — Identity and authentication | ML-DSA-65 wallet identity, QR challenges, signature verification, anti-replay | ✅ Complete |
 | B — Security hardening | Chain-ID binding, nonce/balance/gas enforcement, restart+replay persistence, 4-node finality | ✅ Complete |
 | B-Privacy — Unlinkable authorization | Per-vendor keypairs (no shared public correlator), `are_linkable()` + `DisclosureInfo`, RP-enforced scope minimality | ✅ Complete v0.1 — ZK selective disclosure remains 🔲 (QCB-PM-001) |
-| B-Delegation — Agent/machine authorization | `Delegation` + `DelegatedProof`, chain depth ≤ 4, scopes narrow only, `requires_human_approval`, `max_uses` counter | ✅ Complete v0.1 — durable storage + per-delegation revocation 🔲 |
+| B-Delegation — Agent/machine authorization | `Delegation` + `DelegatedProof`, chain depth ≤ 4, scopes narrow only, `requires_human_approval`, `max_uses` counter | ✅ Complete v0.1 — durable `max_uses` storage ✅ I11 (commit `4113f4e`); per-delegation revocation 🔲 |
 | C — Post-quantum credential storage | Encrypted credential storage using PQ key-establishment | 🔲 |
 | D — Integration | Wallets, personhood, Charmed Agents, enterprise authorization, private multisig | 🔲 |
 | E — Security testing | 33 adversarial scenarios passed (DIS-SEC-001); full external audit, fuzz testing, timing analysis pending | 🔄 Partial |
@@ -1291,4 +1298,10 @@ All security gates verified on 3-node devnet (qcb-devnet-3node):
 ### Remaining before mainnet
 1. Real human verification ceremony — measure cost per human (target < $5)
 2. QPC-CONS-001 — Personhood-to-Consensus Integration
+   - ✅ Phase B complete (authenticated validator binding, commit `890b060`)
+   - ✅ Phase C complete (revocation propagation, commit `17ab814`)
+   - ✅ A04 live devnet re-run complete (commit `f19e095`) — end-to-end revocation propagation confirmed on 4-node in-process devnet; PR #10 merge blocker resolved
+   - ✅ QPC-GAP-002 closed (commit `4113f4e`) — ZK-VRC multi-issuer admission wired into validator admission path; `VerifyIdentityWithProof` tx type; fail-closed unit tests pass
+   - ✅ I11 durable max_uses closed (commit `4113f4e`) — `DelegationUsageStore` persists use counts across node restarts
+   - ⬜ Phase D/E: CS ledger deduction, `gate_voting_power()` re-evaluation after tier downgrade, coordinator dashboard, penalty mechanics
 3. Verification cost measurement against < $5/human and < 3% sybil rate targets
