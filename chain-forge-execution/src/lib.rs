@@ -2649,6 +2649,34 @@ impl Executor {
             // -- Attestation guard Phase D tx types ---------------------------
 
             TxBody::RevokeAttestation { attested_id } => {
+                // Pre-flight: if the attested identity is currently Verified via WoT
+                // and has fewer than ATTESTATION_QUORUM+1 active attesters, this
+                // revocation will trigger a tier downgrade and require charm-sync.
+                // Charm-sync needs the account to exist in StateStore. Every identity
+                // that reached Verified via on-chain Attest txs must have an account
+                // (RegisterIdentity creates it). A missing account is an invariant
+                // violation — reject before mutating identity state so that a failed
+                // tx leaves no partial mutation behind.
+                {
+                    let would_downgrade = identity.get(attested_id)
+                        .map(|r| {
+                            r.charm.verified_via_wot
+                                && r.charm.tier.grants_consensus()
+                                && r.attestation_ledger.count() <= chain_forge_identity::ATTESTATION_QUORUM
+                        })
+                        .unwrap_or(false);
+                    if would_downgrade && state.get_account(attested_id).is_err() {
+                        return TransactionResult::err(
+                            tx.id.clone(), gas_required, tx.gas_limit,
+                            format!(
+                                "revoke_attestation: attested identity {} would be downgraded \
+                                 but has no on-chain account — state invariant violated; \
+                                 tx rejected to prevent partial mutation",
+                                attested_id
+                            ),
+                        );
+                    }
+                }
                 // The identity crate enforces all rules (active record exists,
                 // not already revoked) and returns the CS cost signal plus a
                 // tier_downgraded flag (Phase C revocation propagation).
@@ -6711,5 +6739,104 @@ mod tests {
         // Sources 1 and 2 must agree (belt-and-suspenders).
         assert_eq!(Some(identity_tier), account_tier,
             "identity store and account charm must be consistent after downgrade");
+    }
+
+    // Atomicity gap test: revoke_attestation with missing account.
+    //
+    // This test deliberately omits newbie's StateStore account so that
+    // get_account_mut() fails during the charm-sync step. It records what
+    // actually happens to the identity record, attestation record, and
+    // account state so the behaviour is explicit and observable in CI,
+    // regardless of whether atomicity is guaranteed.
+    //
+    // The #[should_panic] attribute is NOT set here — the assertions document
+    // the observed invariants. If a future commit introduces a rollback the
+    // assertions should be updated to reflect the stronger guarantee.
+    #[test]
+    fn revoke_attestation_missing_account_documents_atomicity_behaviour() {
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        // Register alice, bob, carol as Verified attesters (with accounts).
+        for name in ["qcb1alice", "qcb1bob", "qcb1carol"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 100_000);
+            state.upsert_account(acct);
+        }
+
+        // Register newbie in IdentityStore but deliberately omit their
+        // StateStore account — this is the partial-state scenario.
+        {
+            let att = PopAttestation::genesis("qcb1newbie", 0);
+            identity.register("qcb1newbie".into(), "qcb1newbie".into(), att).unwrap();
+            // No state.upsert_account for newbie.
+        }
+
+        // Attest newbie to Verified via three attesters.
+        for (i, attester) in ["qcb1alice", "qcb1bob", "qcb1carol"].iter().enumerate() {
+            let tx = Transaction {
+                id: format!("att{i}"), sender: (*attester).into(), nonce: 0,
+                body: TxBody::Attest { claimant_id: "qcb1newbie".into() },
+                gas_limit: 50_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+            };
+            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents).success);
+        }
+        assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Verified);
+
+        identity.advance_epoch(1_000);
+        identity.advance_epoch(2_000);
+
+        // Snapshot pre-revocation state.
+        let pre_attestation_count = identity
+            .get("qcb1newbie").unwrap()
+            .attestation_ledger.count();
+
+        // Alice revokes → tier_downgraded=true. Newbie has no account, so
+        // get_account_mut() will fail during charm-sync.
+        let revoke_tx = Transaction {
+            id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::RevokeAttestation { attested_id: "qcb1newbie".into() },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+
+        // The transaction MUST fail — the pre-flight check rejects the tx before
+        // calling revoke_attestation(), so no identity mutation occurs.
+        assert!(!r.success,
+            "revoke_attestation must be rejected when the attested account is absent from StateStore");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("state invariant violated") || err.contains("no on-chain account"),
+            "error must name the invariant violation; got: {err}");
+
+        // ATOMICITY INVARIANTS — the pre-flight fix guarantees these hold:
+
+        // The identity tier must be UNCHANGED (still Verified) — the pre-flight
+        // rejected the tx before revoke_attestation() was called.
+        let post_tier = identity.get("qcb1newbie").unwrap().charm.tier.clone();
+        assert_eq!(post_tier, VerificationTier::Verified,
+            "identity tier must remain Verified after a pre-flight-rejected tx; \
+             if this fails, revoke_attestation() was called before the pre-flight");
+
+        // The attestation ledger count must be UNCHANGED (still 3).
+        let post_count = identity.get("qcb1newbie").unwrap().attestation_ledger.count();
+        assert_eq!(post_count, pre_attestation_count,
+            "attestation ledger must be unchanged after a rejected tx");
+
+        // The account must still not exist (we never created it — and no mutation
+        // should have created it as a side effect).
+        assert!(state.get_account("qcb1newbie").is_err(),
+            "no account must exist for an identity that was never given one");
     }
 }
