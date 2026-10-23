@@ -2550,20 +2550,33 @@ impl Executor {
 
             TxBody::RevokeAttestation { attested_id } => {
                 // The identity crate enforces all rules (active record exists,
-                // not already revoked) and returns the CS cost signal.
+                // not already revoked) and returns the CS cost signal plus a
+                // tier_downgraded flag (Phase C revocation propagation).
                 identity.revoke_attestation(&tx.sender, attested_id)
                     .map(|cost| {
-                        // cost.cost_bps signals how much CS to deduct.
-                        // Phase 0 / pilot: we emit the cost as an event so the
-                        // coordinator dashboard can track it. Full CS deduction
-                        // from the state store is wired up in a later phase when
-                        // the CS ledger is on-chain. For now the event is the
-                        // observable signal.
+                        // CS cost event. Full CS deduction from the state store
+                        // is wired up when the CS ledger is on-chain; the event
+                        // is the observable signal for now.
                         events.push(format!(
                             "revoke_attestation: {} revoked attestation of {} \
-                             (cs_cost_bps={})",
-                            cost.attester_id, cost.attested_id, cost.cost_bps
+                             (cs_cost_bps={}, tier_downgraded={})",
+                            cost.attester_id, cost.attested_id,
+                            cost.cost_bps, cost.tier_downgraded
                         ));
+                        // Phase C: if the revocation caused the attested identity
+                        // to drop below quorum and be downgraded to Provisional,
+                        // sync their updated charm to account state and refresh
+                        // the Merkle leaf so light clients and verifiers see the
+                        // correct tier and voting weight.
+                        if cost.tier_downgraded {
+                            if let (Ok(record), Ok(acct)) = (
+                                identity.get(attested_id),
+                                state.get_account_mut(attested_id),
+                            ) {
+                                acct.attach_charm(record.charm.clone());
+                            }
+                            state.refresh_leaf(attested_id);
+                        }
                     })
                     .map_err(|e| e.to_string())
             }
@@ -6148,5 +6161,75 @@ mod tests {
         let mut tx = minimal_tx("qcb1alice", 100_000);
         tx.public_key = vec![0u8; 32];
         assert!(check_tx(&tx, 0, 0).is_err(), "all-zero public_key must be rejected");
+    }
+
+    // -- Phase C: revocation propagation syncs charm to on-chain account ------
+
+    #[test]
+    fn revoke_attestation_below_quorum_downgrades_onchain_tier() {
+        // End-to-end: attest newbie up to Verified via three attesters,
+        // then revoke one attestation and verify the on-chain account charm
+        // is synced back to Provisional (Phase C revocation propagation).
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+
+        // Bootstrap two more Verified attesters alongside alice.
+        for name in ["qcb1bob", "qcb1carol"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            identity.verify_identity(name, att, None).unwrap();
+        }
+        for name in ["qcb1newbie", "qcb1bob", "qcb1carol"] {
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 10_000);
+            state.upsert_account(acct);
+        }
+
+        // Register and attest newbie up to quorum (Verified).
+        exec.execute_tx_with_identity(
+            &Transaction::register_identity("r0", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        exec.execute_tx_with_identity(
+            &Transaction::attest("a1", "qcb1alice", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        exec.execute_tx_with_identity(
+            &Transaction::attest("a2", "qcb1bob", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        let r3 = exec.execute_tx_with_identity(
+            &Transaction::attest("a3", "qcb1carol", "qcb1newbie", 0),
+            &mut state, &mut identity, &mut agents,
+        );
+        assert!(r3.success, "third attest should succeed and reach quorum");
+        assert_eq!(
+            state.get_account("qcb1newbie").unwrap().verification_tier(),
+            Some(&VerificationTier::Verified),
+            "on-chain account must be Verified after quorum"
+        );
+
+        // Phase C: revoke alice's attestation — count drops 3→2, below quorum.
+        // alice nonce advanced to 1 after the attest tx.
+        let rev = Transaction::revoke_attestation("rev1", "qcb1alice", "qcb1newbie", 1);
+        let rr = exec.execute_tx_with_identity(&rev, &mut state, &mut identity, &mut agents);
+        assert!(rr.success, "revoke_attestation must succeed: {:?}", rr.error);
+        assert!(
+            rr.events.iter().any(|e| e.contains("tier_downgraded=true")),
+            "revocation event must report tier_downgraded=true; events={:?}", rr.events
+        );
+
+        // Both the identity store and the on-chain account must now show Provisional.
+        assert_eq!(
+            *identity.get("qcb1newbie").unwrap().tier(),
+            VerificationTier::Provisional,
+            "identity store must show Provisional after revocation below quorum"
+        );
+        assert_eq!(
+            state.get_account("qcb1newbie").unwrap().verification_tier(),
+            Some(&VerificationTier::Provisional),
+            "on-chain account charm must be synced to Provisional (Phase C)"
+        );
     }
 }

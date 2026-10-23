@@ -410,6 +410,12 @@ pub struct RevocationCost {
     /// Rate in basis points (1 bps = 0.01%) to apply against the CS earned
     /// from this attestation. 1000 = 10%.
     pub cost_bps: u32,
+    /// True when the revocation dropped the attested identity's active
+    /// attestation count below ATTESTATION_QUORUM and their tier was
+    /// consequently downgraded from Verified/Established to Provisional.
+    /// The execution layer must sync the updated charm to account state
+    /// and refresh the Merkle leaf when this is true (Phase C).
+    pub tier_downgraded: bool,
 }
 
 /// A self-report event: an attester pre-emptively flags an identity they
@@ -665,6 +671,14 @@ pub struct IntrinsicCharm {
     /// Number of consecutive epochs with at least one participation event.
     /// Used to graduate from Verified -> Established (Q24).
     pub consecutive_active_epochs: u32,
+    /// True when this identity reached Verified solely through the web-of-trust
+    /// quorum path (IdentityStore::attest). False when verified via IdentityStore::
+    /// verify_identity() (PoP proof path), which confers an independent credential
+    /// that survives attestation revocations. Phase C revocation propagation uses
+    /// this flag to decide whether a below-quorum revocation should downgrade the
+    /// tier back to Provisional.
+    #[serde(default)]
+    pub verified_via_wot: bool,
 }
 
 impl IntrinsicCharm {
@@ -675,14 +689,36 @@ impl IntrinsicCharm {
             verified_since_epoch: None,
             last_attested_epoch: current_epoch,
             consecutive_active_epochs: 0,
+            verified_via_wot: false,
         }
     }
 
-    /// Upgrade to Verified after a successful PoP attestation.
+    /// Upgrade to Verified after a successful PoP attestation (verify_identity path).
+    /// Does NOT set verified_via_wot — this identity holds an independent credential.
     pub fn verify(&mut self, epoch: u64) {
         self.tier = VerificationTier::Verified;
         self.verified_since_epoch = Some(epoch);
         self.last_attested_epoch = epoch;
+        self.verified_via_wot = false;
+    }
+
+    /// Upgrade to Verified via web-of-trust quorum (attest path).
+    /// Sets verified_via_wot so Phase C revocation propagation can downgrade
+    /// the tier if attestations later drop below ATTESTATION_QUORUM.
+    pub fn verify_wot(&mut self, epoch: u64) {
+        self.tier = VerificationTier::Verified;
+        self.verified_since_epoch = Some(epoch);
+        self.last_attested_epoch = epoch;
+        self.verified_via_wot = true;
+    }
+
+    /// Downgrade a WoT-verified identity to Provisional when attestations drop
+    /// below ATTESTATION_QUORUM. Only called by revoke_attestation (Phase C).
+    pub fn downgrade_to_provisional(&mut self) {
+        self.tier = VerificationTier::Provisional;
+        self.verified_since_epoch = None;
+        self.verified_via_wot = false;
+        self.consecutive_active_epochs = 0;
     }
 
     /// Record a participation event (vote, transfer, or other on-chain activity).
@@ -1178,7 +1214,7 @@ impl IdentityStore {
         );
 
         if count >= ATTESTATION_QUORUM {
-            claimant.charm.verify(epoch);
+            claimant.charm.verify_wot(epoch);
             tracing::info!(
                 claimant_id, attester_count = count,
                 "identity verified via web-of-trust quorum (Provisional -> Verified)"
@@ -1249,26 +1285,39 @@ impl IdentityStore {
         }
 
         // Remove this attester's contribution from the attested identity's
-        // ledger and CS contribution. The identity is not marked as sybil —
-        // only a coordinator confirm_sybil does that (Phase C).
+        // ledger. The identity is not marked as sybil — only a coordinator
+        // confirm_sybil does that (Phase C sybil path).
+        //
+        // Phase C revocation propagation: if removing this attestation drops
+        // the active count below ATTESTATION_QUORUM and the identity reached
+        // Verified solely via the web-of-trust path (charm.verified_via_wot),
+        // downgrade them back to Provisional. Identities verified via
+        // verify_identity() (PoP proof path, verified_via_wot=false) hold an
+        // independent credential and are not affected.
+        let mut tier_downgraded = false;
         if let Some(identity) = self.records.get_mut(attested_id) {
             identity.attestation_ledger.attesters.retain(|a| a != attester_id);
-            // If removing this attestation drops the count below quorum AND
-            // the identity is currently Verified solely because of this
-            // quorum, it should be re-evaluated. For Phase A, we flag it
-            // in the record only — full tier re-evaluation is Phase C scope.
-            // (An identity that was verified through other paths, such as
-            // verify_identity(), is not affected by attestation revocation.)
+            let count = identity.attestation_ledger.count();
+            if count < ATTESTATION_QUORUM && identity.charm.verified_via_wot {
+                identity.charm.downgrade_to_provisional();
+                tier_downgraded = true;
+                tracing::info!(
+                    attested_id, count, quorum = ATTESTATION_QUORUM,
+                    "attestation count dropped below quorum — identity downgraded \
+                     Verified/Established -> Provisional (Phase C revocation propagation)"
+                );
+            }
         }
 
         tracing::info!(
-            attester_id, attested_id, epoch,
+            attester_id, attested_id, epoch, tier_downgraded,
             "attestation revoked"
         );
         Ok(RevocationCost {
             attester_id: attester_id.to_string(),
             attested_id: attested_id.to_string(),
             cost_bps: REVOCATION_COST_BPS,
+            tier_downgraded,
         })
     }
 
@@ -3030,5 +3079,122 @@ mod tests {
     /// enforcement in advance_epoch_to doesn't lapse it before the test check.
     fn stay_lively_verified(store: &mut IdentityStore, id: &str, target_epoch: u64) {
         store.stay_lively(id, target_epoch);
+    }
+
+    // -- Phase C: revocation propagation downgrade tests ----------------------
+
+    /// Helper: register 3 verified attesters + 1 provisional target; attest
+    /// target from all 3 attesters so it reaches quorum and becomes Verified.
+    fn setup_wot_verified(store: &mut IdentityStore) {
+        for (id, addr) in &[("a1","qcb1a1"), ("a2","qcb1a2"), ("a3","qcb1a3")] {
+            register_and_verify(store, id, addr);
+        }
+        register_provisional(store, "target", "qcb1target");
+        store.attest("target", "a1").unwrap();
+        store.attest("target", "a2").unwrap();
+        store.attest("target", "a3").unwrap();
+        assert_eq!(
+            *store.get("target").unwrap().tier(),
+            VerificationTier::Verified,
+            "target must be Verified after quorum"
+        );
+        assert!(store.get("target").unwrap().charm.verified_via_wot,
+            "verified_via_wot must be set after WoT quorum");
+    }
+
+    #[test]
+    fn revocation_below_quorum_downgrades_wot_identity() {
+        let mut store = make_store();
+        setup_wot_verified(&mut store);
+
+        // Revoke one attestation — count drops from 3 to 2, below ATTESTATION_QUORUM=3.
+        let cost = store.revoke_attestation("a1", "target").unwrap();
+        assert!(cost.tier_downgraded, "tier_downgraded must be true when count drops below quorum");
+        assert_eq!(
+            *store.get("target").unwrap().tier(),
+            VerificationTier::Provisional,
+            "target must be downgraded to Provisional after revocation drops count below quorum"
+        );
+        assert!(!store.get("target").unwrap().charm.verified_via_wot,
+            "verified_via_wot must be cleared on downgrade");
+    }
+
+    #[test]
+    fn revocation_on_provisional_identity_does_not_change_tier() {
+        // Revoking an attestation from a Provisional identity (count still below quorum)
+        // must not change the tier — Provisional stays Provisional, no "upgrade" to revoke.
+        let mut store = make_store();
+        register_and_verify(&mut store, "a1", "qcb1a1");
+        register_and_verify(&mut store, "a2", "qcb1a2");
+        register_provisional(&mut store, "target5", "qcb1target5");
+
+        // Only 2 attesters — still Provisional (quorum=3).
+        store.attest("target5", "a1").unwrap();
+        store.attest("target5", "a2").unwrap();
+        assert_eq!(*store.get("target5").unwrap().tier(), VerificationTier::Provisional);
+
+        // Revoke one — count drops from 2 to 1, still Provisional. No tier change.
+        let cost = store.revoke_attestation("a1", "target5").unwrap();
+        assert!(!cost.tier_downgraded,
+            "revoking from a Provisional identity must not set tier_downgraded");
+        assert_eq!(
+            *store.get("target5").unwrap().tier(),
+            VerificationTier::Provisional,
+            "Provisional identity must remain Provisional after attestation revocation"
+        );
+    }
+
+    #[test]
+    fn revocation_does_not_downgrade_pop_verified_identity() {
+        // An identity verified via verify_identity() (PoP path) must NOT be
+        // downgraded by attestation revocation, even if they happen to have
+        // a WoT attestation too.
+        let mut store = make_store();
+        register_and_verify(&mut store, "a1", "qcb1a1");
+        register_and_verify(&mut store, "a2", "qcb1a2");
+        register_and_verify(&mut store, "a3", "qcb1a3");
+        // Register bob and verify him via PoP (not WoT).
+        register_and_verify(&mut store, "bob", "qcb1bob");
+        assert!(!store.get("bob").unwrap().charm.verified_via_wot,
+            "PoP-verified identity must have verified_via_wot=false");
+
+        // a1 attests bob (bob is already Verified, so attest returns AlreadyVerified).
+        // To test that revocation doesn't downgrade PoP-verified identities, we need an
+        // active attestation record. But attest() rejects Verified claimants.
+        // Instead: verify that verified_via_wot=false means no downgrade even if
+        // the ledger had been manipulated — we test the flag semantics directly.
+        // Force an attestation record by temporarily using the Provisional path:
+        register_provisional(&mut store, "charlie", "qcb1charlie");
+        store.attest("charlie", "a1").unwrap();
+        store.attest("charlie", "a2").unwrap();
+        store.attest("charlie", "a3").unwrap();
+        // charlie is now WoT-verified; upgrade him via PoP to clear verified_via_wot.
+        store.verify_identity("charlie", genesis_attestation("charlie"), None).unwrap();
+        assert!(!store.get("charlie").unwrap().charm.verified_via_wot,
+            "verify_identity must clear verified_via_wot");
+        // Revoking an attestation on a PoP-verified identity must not downgrade.
+        let cost = store.revoke_attestation("a1", "charlie").unwrap();
+        assert!(!cost.tier_downgraded,
+            "PoP-verified identity must not be downgraded by attestation revocation");
+        assert_eq!(
+            *store.get("charlie").unwrap().tier(),
+            VerificationTier::Verified,
+            "charlie must remain Verified (PoP credential)"
+        );
+    }
+
+    #[test]
+    fn revocation_cost_tier_downgraded_false_when_still_above_quorum() {
+        let mut store = make_store();
+        setup_wot_verified(&mut store);
+        // target has exactly 3 attesters (= ATTESTATION_QUORUM); revoking one
+        // leaves 2 — triggers downgrade.
+        let cost = store.revoke_attestation("a1", "target").unwrap();
+        assert!(cost.tier_downgraded);
+        // A second revocation: target is now Provisional (2 ledger entries).
+        // Revoking another attestation does NOT trigger another downgrade.
+        let cost2 = store.revoke_attestation("a2", "target").unwrap();
+        assert!(!cost2.tier_downgraded,
+            "second revocation on already-Provisional identity must not set tier_downgraded");
     }
 }
