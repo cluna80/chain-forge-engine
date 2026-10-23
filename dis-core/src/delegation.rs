@@ -159,6 +159,7 @@ pub fn delegation_id(d: &Delegation) -> Result<[u8; 32], DelegationError> {
 }
 
 /// Create and sign a delegation in one call (test/demo helper).
+#[allow(clippy::too_many_arguments)]
 pub fn make_delegation(
     rp_id: &str,
     delegator_pk: &[u8],
