@@ -3948,16 +3948,30 @@ impl Node {
                         .unwrap_or(u64::MAX);
                     owner_candidates.entry(owner).or_default().push((seq, v.id.0.clone()));
                 }
-                // For any human with more validators than the configured cap,
-                // keep only the first power_cap validators (by registration seq).
-                let power_cap = self.personhood_power_cap.unwrap_or(1) as usize;
+                // Enforce ∑ voting_power ≤ power_cap per human.
+                // Sort by registration seq (lowest = earliest = highest priority).
+                // Deduct each validator's actual voting_power from a per-human budget;
+                // any validator that would exceed the budget is revoked.
+                let power_cap = self.personhood_power_cap.unwrap_or(1) as u64;
                 let mut to_revoke: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for (_owner, mut candidates) in owner_candidates {
-                    if candidates.len() <= power_cap { continue; }
                     candidates.sort_by_key(|(seq, _)| *seq);
-                    // Keep the first power_cap candidates (lowest seq = earliest registered).
-                    for (_, vid) in candidates.into_iter().skip(power_cap) {
-                        to_revoke.insert(vid);
+                    let mut remaining_budget = power_cap;
+                    for (_, vid) in &candidates {
+                        let vp = updated_vs.validators.iter()
+                            .find(|v| v.id.0 == *vid)
+                            .map(|v| v.voting_power)
+                            .unwrap_or(0);
+                        if vp == 0 {
+                            // Already zeroed (pop_verified=false or gated); no budget cost.
+                            continue;
+                        }
+                        if vp <= remaining_budget {
+                            remaining_budget -= vp;
+                        } else {
+                            // Would exceed budget: revoke this validator.
+                            to_revoke.insert(vid.clone());
+                        }
                     }
                 }
                 if !to_revoke.is_empty() {
@@ -9614,5 +9628,287 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end regression for Phase B BondValidator scenarios:
+    /// successful bond, insufficient funds, spoofed identity, ineligible identity,
+    /// multi-validator cap, and restart cap preservation.
+    #[tokio::test]
+    async fn test_qpc_phase_b_e2e_bond_scenarios() {
+        use chain_forge_execution::{Transaction, TxBody};
+        use chain_forge_consensus::BlockHash;
+
+        const GAS_BUFFER: u128 = 10_000;
+        let genesis_hash = BlockHash("0000000000000000".into());
+
+        // ── Sub-test 1: Successful bond with authenticated binding ────────────
+        {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            node.validator_epoch_blocks = 1;
+            let addr = "qcb1e2e_v1";
+
+            // Give addr personhood so the identity check passes.
+            let epoch = node.identity.clock.current_epoch;
+            let att = chain_forge_identity::PopAttestation::genesis(addr, epoch);
+            let _ = node.identity.register(addr.to_string(), addr.to_string(), att.clone());
+            node.identity.verify_identity(addr, att, None).unwrap();
+
+            // Fund addr.
+            node.submit_tx(Transaction::transfer("fund1", "qcb1alice", addr, "uqcb", 2_000_000 + GAS_BUFFER, 0));
+            let c0 = node.propose_block(genesis_hash.clone()).await.unwrap();
+
+            // Bond with owner_identity_id = addr (sender == owner: passes Rule 1 & 2).
+            let bond_tx = Transaction {
+                id:     "bond1".into(),
+                sender: addr.into(),
+                nonce:  0,
+                body:   TxBody::BondValidator { amount: 2_000_000, owner_identity_id: Some(addr.into()) },
+                gas_limit: 50_000,
+                signature: vec![], public_key: vec![], pq_signatures: vec![],
+                sig_scheme: None, pq_public_key: vec![],
+            };
+            node.submit_tx(bond_tx);
+            node.propose_block(c0.block_hash.clone()).await.unwrap();
+
+            // bond_owner_bindings is populated by commit_block (multi-node path);
+            // propose_block (single-node devnet) uses the executor directly.
+            // Check persistent StateStore instead — set_raw() runs in the executor.
+            assert_eq!(
+                node.state.get_raw(&format!("validator-owner:{}", addr)),
+                Some(addr),
+                "Sub-test 1: binding must be written to persistent StateStore after successful bond"
+            );
+        }
+
+        // ── Sub-test 2: Insufficient funds — no binding written ───────────────
+        {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let addr = "qcb1e2e_v2";
+
+            let epoch = node.identity.clock.current_epoch;
+            let att = chain_forge_identity::PopAttestation::genesis(addr, epoch);
+            let _ = node.identity.register(addr.to_string(), addr.to_string(), att.clone());
+            node.identity.verify_identity(addr, att, None).unwrap();
+
+            // Fund addr with LESS than the bond amount (no headroom: bond will fail).
+            node.submit_tx(Transaction::transfer("fund2", "qcb1alice", addr, "uqcb", 100_000, 0));
+            let c0 = node.propose_block(genesis_hash.clone()).await.unwrap();
+
+            // Bond 2 M but addr only has ~100 K.
+            let bond_tx = Transaction {
+                id:     "bond2".into(),
+                sender: addr.into(),
+                nonce:  0,
+                body:   TxBody::BondValidator { amount: 2_000_000, owner_identity_id: Some(addr.into()) },
+                gas_limit: 50_000,
+                signature: vec![], public_key: vec![], pq_signatures: vec![],
+                sig_scheme: None, pq_public_key: vec![],
+            };
+            node.submit_tx(bond_tx);
+            node.propose_block(c0.block_hash.clone()).await.unwrap();
+
+            assert!(
+                node.state.get_raw(&format!("validator-owner:{}", addr)).is_none(),
+                "Sub-test 2: failed transfer must not write binding to StateStore (set_raw after transfer)"
+            );
+        }
+
+        // ── Sub-test 3: Spoofed identity — sender ≠ owner_identity_id ────────
+        {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let sender = "qcb1e2e_sender";
+            let victim = "qcb1alice"; // trying to claim alice's identity
+
+            node.submit_tx(Transaction::transfer("fund3", "qcb1alice", sender, "uqcb", 2_010_000, 0));
+            let c0 = node.propose_block(genesis_hash.clone()).await.unwrap();
+
+            let bond_tx = Transaction {
+                id:     "bond3".into(),
+                sender: sender.into(),
+                nonce:  0,
+                // sender != owner_identity_id: Rule 1 violation
+                body:   TxBody::BondValidator { amount: 2_000_000, owner_identity_id: Some(victim.into()) },
+                gas_limit: 50_000,
+                signature: vec![], public_key: vec![], pq_signatures: vec![],
+                sig_scheme: None, pq_public_key: vec![],
+            };
+            node.submit_tx(bond_tx);
+            node.propose_block(c0.block_hash.clone()).await.unwrap();
+
+            assert!(
+                node.state.get_raw(&format!("validator-owner:{}", sender)).is_none(),
+                "Sub-test 3: spoofed identity must be rejected — no binding in StateStore for sender"
+            );
+            // victim already has no binding in this fresh node
+            assert!(
+                node.state.get_raw(&format!("validator-owner:{}", victim)).is_none(),
+                "Sub-test 3: spoofed identity must not establish a binding for the victim"
+            );
+        }
+
+        // ── Sub-test 4: Ineligible identity (frozen) ─────────────────────────
+        {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let addr = "qcb1e2e_frozen";
+
+            // Register addr but do NOT verify identity (stays unverified/uneligible).
+            // No call to verify_identity means grants_consensus() returns false.
+
+            node.submit_tx(Transaction::transfer("fund4", "qcb1alice", addr, "uqcb", 2_010_000, 0));
+            let c0 = node.propose_block(genesis_hash.clone()).await.unwrap();
+
+            let bond_tx = Transaction {
+                id:     "bond4".into(),
+                sender: addr.into(),
+                nonce:  0,
+                body:   TxBody::BondValidator { amount: 2_000_000, owner_identity_id: Some(addr.into()) },
+                gas_limit: 50_000,
+                signature: vec![], public_key: vec![], pq_signatures: vec![],
+                sig_scheme: None, pq_public_key: vec![],
+            };
+            node.submit_tx(bond_tx);
+            node.propose_block(c0.block_hash.clone()).await.unwrap();
+
+            assert!(
+                node.state.get_raw(&format!("validator-owner:{}", addr)).is_none(),
+                "Sub-test 4: unverified identity must be rejected — no binding in StateStore"
+            );
+        }
+
+        // ── Sub-test 5: Two validators, same human, cap=1 enforced (via registry) ──
+        // The Phase B cap enforcement (grouping by owner from bond_owner_bindings)
+        // runs in commit_block (multi-node path). In the single-node propose_block
+        // path the same invariant is enforced via ValidatorRegistry.build_validator_set().
+        // Verify that at the registry level, two validators under the same human
+        // are capped to aggregate power ≤ power_cap.
+        {
+            use chain_forge_validators::{ValidatorRegistry, RegistrationRequest, KeyBundle,
+                                          Commission, ENTRY_STAKE_UQCB};
+            use chain_forge_consensus::{ValidatorId, PersonhoodConfig};
+            use chain_forge_identity::VerificationTier;
+
+            let human = "qcb1e2e_human5";
+            let mut reg = ValidatorRegistry::new(
+                ENTRY_STAKE_UQCB,
+                PersonhoodConfig { power_cap: 1, reject_expired_pop: false, min_verified_pct: 0 },
+            );
+            for (id, addr, epoch) in [("v5a", "qcb1e2e_v5a_addr", 0u64), ("v5b", "qcb1e2e_v5b_addr", 1u64)] {
+                reg.register(RegistrationRequest {
+                    id:               ValidatorId(id.into()),
+                    moniker:          id.into(),
+                    keys:             KeyBundle::new_ed25519(&format!("pk_{id}"), addr),
+                    commission:       Commission::new(500, 2000).unwrap(),
+                    bonded_uqcb:      ENTRY_STAKE_UQCB,
+                    website:          None,
+                    owner_identity_id: Some(human.into()),
+                }, epoch).unwrap();
+                reg.confirm_pop(id, VerificationTier::Verified, epoch + 1).unwrap();
+            }
+            let vs = reg.build_validator_set(2);
+            let total: u64 = vs.validators.iter().map(|v| v.voting_power).sum();
+            assert_eq!(total, 1,
+                "Sub-test 5: two validators for one human, power_cap=1: aggregate power must be ≤ 1");
+
+            // Also verify StateStore-level: two authenticated BondValidator txs from the
+            // same human addr establish bindings in state; the second (re-bond, same owner)
+            // is idempotent and doesn't double-write.
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            node.validator_epoch_blocks = 1;
+            let addr_a = "qcb1e2e_v5a_node";
+            let epoch = node.identity.clock.current_epoch;
+            let att = chain_forge_identity::PopAttestation::genesis(addr_a, epoch);
+            let _ = node.identity.register(addr_a.to_string(), addr_a.to_string(), att.clone());
+            node.identity.verify_identity(addr_a, att.clone(), None).unwrap();
+
+            node.submit_tx(Transaction::transfer("fA5", "qcb1alice", addr_a, "uqcb", 4_020_000, 0));
+            let c0 = node.propose_block(genesis_hash.clone()).await.unwrap();
+
+            // First bond with owner binding.
+            let bond_a1 = Transaction {
+                id:     "bondA5_1".into(),
+                sender: addr_a.into(),
+                nonce:  0,
+                body:   TxBody::BondValidator { amount: 2_000_000, owner_identity_id: Some(addr_a.into()) },
+                gas_limit: 50_000,
+                signature: vec![], public_key: vec![], pq_signatures: vec![],
+                sig_scheme: None, pq_public_key: vec![],
+            };
+            node.submit_tx(bond_a1);
+            let c1 = node.propose_block(c0.block_hash.clone()).await.unwrap();
+
+            assert_eq!(
+                node.state.get_raw(&format!("validator-owner:{}", addr_a)),
+                Some(addr_a),
+                "Sub-test 5: first bond must establish binding in StateStore"
+            );
+
+            // Second bond from same addr with same owner: idempotent re-bond.
+            let bond_a2 = Transaction {
+                id:     "bondA5_2".into(),
+                sender: addr_a.into(),
+                nonce:  1,
+                body:   TxBody::BondValidator { amount: 500_000, owner_identity_id: Some(addr_a.into()) },
+                gas_limit: 50_000,
+                signature: vec![], public_key: vec![], pq_signatures: vec![],
+                sig_scheme: None, pq_public_key: vec![],
+            };
+            node.submit_tx(bond_a2);
+            node.propose_block(c1.block_hash.clone()).await.unwrap();
+
+            // Binding must still be the same owner (not corrupted by re-bond).
+            assert_eq!(
+                node.state.get_raw(&format!("validator-owner:{}", addr_a)),
+                Some(addr_a),
+                "Sub-test 5: re-bond must not corrupt existing binding"
+            );
+        }
+
+        // ── Sub-test 6: Restart preserves cap enforcement ────────────────────
+        {
+            let dir = std::env::temp_dir()
+                .join(format!("cf-phase-b-e2e-restart-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let addr  = "qcb1e2e_restart";
+            let human = addr;
+
+            // Phase 1: bond with binding and persist.
+            let cap_before;
+            {
+                let mut node = Node::new(GENESIS, None).await.unwrap();
+                node.set_data_dir(dir.clone());
+
+                let epoch = node.identity.clock.current_epoch;
+                let att = chain_forge_identity::PopAttestation::genesis(addr, epoch);
+                let _ = node.identity.register(addr.to_string(), addr.to_string(), att.clone());
+                node.identity.verify_identity(addr, att, None).unwrap();
+
+                node.state.set_raw(&format!("validator-owner:{}", addr), human);
+                node.bond_owner_bindings.insert(addr.to_string(), human.to_string());
+                node.persist_state();
+                cap_before = node.personhood_power_cap;
+            }
+
+            // Phase 2: fresh node, load state, verify cap config and bindings survive.
+            {
+                let mut node = Node::new(GENESIS, None).await.unwrap();
+                node.set_data_dir(dir.clone());
+                assert!(node.load_persisted_state(), "load_persisted_state must succeed");
+
+                assert_eq!(node.personhood_power_cap, cap_before,
+                    "Sub-test 6: power_cap must survive restart");
+                assert!(
+                    node.bond_owner_bindings.contains_key(addr),
+                    "Sub-test 6: binding must survive restart via rebuild_bond_owner_bindings"
+                );
+                assert_eq!(
+                    node.bond_owner_bindings.get(addr).map(String::as_str),
+                    Some(human),
+                    "Sub-test 6: rebuilt binding must point to correct human"
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

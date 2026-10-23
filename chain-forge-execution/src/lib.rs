@@ -2189,12 +2189,13 @@ impl Executor {
                                 owner
                             ))
                         } else {
-                            // All checks passed: persist binding in canonical chain
-                            // state so it survives node restarts, then move stake.
-                            state.set_raw(&binding_key, owner);
+                            // All checks passed: move stake first, then persist binding.
+                            // set_raw is only reachable after transfer returns Ok,
+                            // preventing an orphaned binding from a failed bond.
                             let bond_account = format!("validator-bond:{}", tx.sender);
-                            state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount)
-                                .map(|_| {
+                            match state.transfer(&tx.sender, &bond_account, &self.config.native_denom, *amount) {
+                                Ok(()) => {
+                                    state.set_raw(&binding_key, owner);
                                     events.push(format!(
                                         "bond_validator: {} {} bonded by {}",
                                         amount, self.config.native_denom, tx.sender
@@ -2206,8 +2207,10 @@ impl Executor {
                                         tx.sender, owner
                                     ));
                                     identity.record_activity_by_address(&tx.sender);
-                                })
-                                .map_err(|e| e.to_string())
+                                    Ok(())
+                                }
+                                Err(e) => Err(e.to_string()),
+                            }
                         }
                     }
                 } else {
