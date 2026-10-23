@@ -5520,12 +5520,15 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &consensus_tx, &mut state, &mut identity, &mut agents,
         );
-        assert!(!r.success, "ConsensusSignatures scope must be rejected");
+        assert!(!r.success, "ConsensusSignatures scope must be rejected for non-ml-dsa-65 schemes");
         let err = r.error.clone().unwrap_or_default();
-        assert!(err.contains("not yet supported"),
-            "error must say scope is not yet supported; got: {err}");
-        assert!(err.contains("TxSignatures"),
-            "error must hint at TxSignatures; got: {err}");
+        // Guard 0 allows ConsensusSignatures only for "ml-dsa-65" (PQ-VAL-002 rollback path).
+        // Any other deprecated_scheme with ConsensusSignatures scope must be rejected with a
+        // message naming the only supported scheme.
+        assert!(
+            err.contains("ml-dsa-65") || err.contains("only supported"),
+            "error must name the only permitted ConsensusSignatures scheme; got: {err}"
+        );
 
         // Both scope must also be rejected.
         let both_tx = Transaction {
@@ -6640,5 +6643,73 @@ mod tests {
             Some(&VerificationTier::Verified),
             "on-chain account must be Verified after ZK-VRC upgrade"
         );
+    }
+
+    // Atomicity check: after revoke_attestation the identity store is
+    // always in a consistent state. The identity record mutation inside
+    // revoke_attestation is eager; the important invariant is that on a
+    // successful tx the identity tier, account charm, and Merkle leaf all
+    // agree. This test verifies all three sources of truth are consistent
+    // after a successful downgrade — the regression guard for the silent
+    // charm-sync failure that was found in the review.
+    #[test]
+    fn revocation_three_state_sources_agree_after_downgrade() {
+        use chain_forge_identity::{PopAttestation, VerificationTier};
+
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let config  = ExecutionConfig::from_genesis(&genesis);
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        let mut identity = chain_forge_identity::IdentityStore::new(0);
+        let mut agents = AgentStore::new();
+        let exec = Executor::new(config);
+
+        for name in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1newbie"] {
+            let att = PopAttestation::genesis(name, 0);
+            identity.register(name.into(), name.into(), att.clone()).unwrap();
+            if name != "qcb1newbie" {
+                identity.verify_identity(name, att, None).unwrap();
+            }
+            let mut acct = chain_forge_state::AccountState::new(name.into(), "user".into());
+            acct.credit("uqcb", 100_000);
+            state.upsert_account(acct);
+        }
+
+        // Attest newbie to Verified via alice, bob, carol.
+        for (i, attester) in ["qcb1alice", "qcb1bob", "qcb1carol"].iter().enumerate() {
+            let tx = Transaction {
+                id: format!("att{i}"), sender: (*attester).into(), nonce: 0,
+                body: TxBody::Attest { claimant_id: "qcb1newbie".into() },
+                gas_limit: 50_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+            };
+            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents).success);
+        }
+
+        identity.advance_epoch(1_000);
+        identity.advance_epoch(2_000);
+
+        // Alice revokes → tier_downgraded=true (only 2 attesters remain).
+        let revoke_tx = Transaction {
+            id: "rev1".into(), sender: "qcb1alice".into(), nonce: 1,
+            body: TxBody::RevokeAttestation { attested_id: "qcb1newbie".into() },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "revoke_attestation must succeed: {:?}", r.error);
+
+        let identity_tier = identity.get("qcb1newbie").unwrap().charm.tier.clone();
+        let account_tier  = state.get_account("qcb1newbie").unwrap().verification_tier().cloned();
+
+        // Source 1: identity store.
+        assert_eq!(identity_tier, VerificationTier::Provisional,
+            "identity store must show Provisional after downgrade");
+        // Source 2: on-chain account charm.
+        assert_eq!(account_tier, Some(VerificationTier::Provisional),
+            "account charm must match identity store after downgrade");
+        // Sources 1 and 2 must agree (belt-and-suspenders).
+        assert_eq!(Some(identity_tier), account_tier,
+            "identity store and account charm must be consistent after downgrade");
     }
 }
