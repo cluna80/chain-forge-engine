@@ -53,6 +53,26 @@ pub struct TxPrecheck {
     pub governance_authorities: Vec<String>,
 }
 
+/// Maximum nonce gap the mempool accepts for an account's next tx.
+const MAX_NONCE_GAP: u64 = 100;
+/// Sentinel stored in the nonce cache for genesis accounts that have not yet
+/// committed any transaction on this chain.  F1 treats it as "any nonce in
+/// 0..MAX_NONCE_GAP is valid" rather than the usual strictly-greater-than rule.
+const NO_PRIOR_TX: u64 = u64::MAX;
+
+/// F1 mempool nonce guard — returns `true` if the tx **should be rejected**.
+///
+/// `last` is the value stored in the nonce cache for the sender (either the
+/// last committed `tx.nonce` or `NO_PRIOR_TX` for a fresh genesis account).
+/// `nonce` is the nonce from the incoming transaction.
+pub(crate) fn f1_nonce_rejected(last: u64, nonce: u64) -> bool {
+    if last == NO_PRIOR_TX {
+        nonce > MAX_NONCE_GAP
+    } else {
+        nonce <= last || nonce > last.saturating_add(MAX_NONCE_GAP)
+    }
+}
+
 pub async fn serve(
     port: u16,
     status:          Arc<Mutex<NodeStatus>>,
@@ -243,16 +263,9 @@ pub async fn serve(
                             // meaning any nonce 0..MAX_NONCE_GAP is valid as the first tx.
                             // After a tx commits, the cache stores tx.nonce, so replay is blocked.
                             Ok(ref tx) if {
-                                const MAX_NONCE_GAP: u64 = 100;
-                                const NO_PRIOR_TX: u64 = u64::MAX;
                                 let cache = nonce_cache.lock().unwrap();
                                 cache.get(&tx.sender).map_or(false, |&last| {
-                                    if last == NO_PRIOR_TX {
-                                        // Fresh account: accept nonce 0..MAX_NONCE_GAP
-                                        tx.nonce > MAX_NONCE_GAP
-                                    } else {
-                                        tx.nonce <= last || tx.nonce > last.saturating_add(MAX_NONCE_GAP)
-                                    }
+                                    f1_nonce_rejected(last, tx.nonce)
                                 })
                             } => {
                                 // Re-lock to get the last nonce for the error message.
@@ -1675,5 +1688,75 @@ mod tests {
         let first_line_get = "GET /genesis HTTP/1.1";
         // GET /genesis is not handled by the POST /genesis branch
         assert!(!first_line_get.starts_with("POST /genesis"));
+    }
+
+    // -- F1 mempool nonce guard (NO_PRIOR_TX sentinel) -------------------------
+
+    #[test]
+    fn f1_fresh_account_accepts_nonce_zero() {
+        // Genesis accounts are seeded with NO_PRIOR_TX; nonce=0 must be accepted.
+        assert!(!f1_nonce_rejected(NO_PRIOR_TX, 0));
+    }
+
+    #[test]
+    fn f1_fresh_account_accepts_nonce_within_gap() {
+        // Any nonce 0..=MAX_NONCE_GAP is valid for a fresh account.
+        assert!(!f1_nonce_rejected(NO_PRIOR_TX, MAX_NONCE_GAP));
+    }
+
+    #[test]
+    fn f1_fresh_account_rejects_nonce_beyond_gap() {
+        // Nonce > MAX_NONCE_GAP on a fresh account is implausible (likely a bug).
+        assert!(f1_nonce_rejected(NO_PRIOR_TX, MAX_NONCE_GAP + 1));
+    }
+
+    #[test]
+    fn f1_replay_rejected_after_first_tx() {
+        // After nonce=0 commits, the cache stores last=0.
+        // Resending nonce=0 must be rejected (replay).
+        assert!(f1_nonce_rejected(0, 0));
+    }
+
+    #[test]
+    fn f1_next_nonce_accepted_after_first_tx() {
+        // After nonce=0 commits (last=0), nonce=1 must be accepted.
+        assert!(!f1_nonce_rejected(0, 1));
+    }
+
+    #[test]
+    fn f1_consecutive_nonces_accepted() {
+        // last=5 → nonce=6 accepted; nonce=5 (replay) rejected.
+        assert!(!f1_nonce_rejected(5, 6));
+        assert!(f1_nonce_rejected(5, 5));
+        assert!(f1_nonce_rejected(5, 4));
+    }
+
+    #[test]
+    fn f1_gap_too_large_rejected() {
+        // Nonces more than MAX_NONCE_GAP ahead of last are rejected.
+        assert!(f1_nonce_rejected(0, MAX_NONCE_GAP + 1));
+        assert!(!f1_nonce_rejected(0, MAX_NONCE_GAP));
+    }
+
+    #[test]
+    fn f1_new_account_sentinel_does_not_allow_replay_after_commit() {
+        // Simulate: genesis account (last=NO_PRIOR_TX) sends nonce=0,
+        // tx commits, nonce cache updates to last=0.
+        // Now replay with nonce=0 must be rejected.
+        let last_after_commit = 0u64; // cache stores tx.nonce after commit
+        assert!(f1_nonce_rejected(last_after_commit, 0)); // replay rejected
+        assert!(!f1_nonce_rejected(last_after_commit, 1)); // next nonce accepted
+    }
+
+    #[test]
+    fn f1_saturation_does_not_overflow() {
+        // Ensure saturating_add at u64::MAX - 1 does not panic.
+        let last = u64::MAX - 1;
+        // nonce <= last → rejected
+        assert!(f1_nonce_rejected(last, last));
+        // nonce = u64::MAX → last.saturating_add(100) overflows to u64::MAX,
+        // so nonce > saturated value is false; nonce <= last is false too.
+        // The saturation edge case should not panic.
+        let _ = f1_nonce_rejected(last, u64::MAX);
     }
 }
