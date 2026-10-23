@@ -245,21 +245,16 @@ impl RelyingParty {
         }
 
         // Validate chain: scopes narrow, signatures valid, expiry checked.
-        let requires_approval = validate_chain(
-            &delegated.chain,
-            request,
-            &self.policy.grants,
-            now,
-        )
-        .map_err(|e| match e {
-            DelegationError::DelegationExpired => VerifyError::DelegationInvalid,
-            DelegationError::DelegationChainInvalid => VerifyError::DelegationInvalid,
-            DelegationError::DelegationScopeExceeded => VerifyError::Unauthorized,
-            DelegationError::InvalidChain => VerifyError::DelegationInvalid,
-            DelegationError::HumanApprovalRequired => VerifyError::HumanApprovalRequired,
-            DelegationError::UsesExhausted => VerifyError::DelegationUsesExhausted,
-            DelegationError::Encoding(_) => VerifyError::DelegationInvalid,
-        })?;
+        let requires_approval = validate_chain(&delegated.chain, request, &self.policy.grants, now)
+            .map_err(|e| match e {
+                DelegationError::DelegationExpired => VerifyError::DelegationInvalid,
+                DelegationError::DelegationChainInvalid => VerifyError::DelegationInvalid,
+                DelegationError::DelegationScopeExceeded => VerifyError::Unauthorized,
+                DelegationError::InvalidChain => VerifyError::DelegationInvalid,
+                DelegationError::HumanApprovalRequired => VerifyError::HumanApprovalRequired,
+                DelegationError::UsesExhausted => VerifyError::DelegationUsesExhausted,
+                DelegationError::Encoding(_) => VerifyError::DelegationInvalid,
+            })?;
 
         // Root delegator must be enrolled (not revoked).
         let root_pk = &delegated.chain[0].delegator_public_key;
@@ -316,9 +311,9 @@ impl RelyingParty {
     /// authoritative persistent count is not double-decremented.
     pub fn verify_delegated_skip_usage(
         &mut self,
-        request:   &Request,
+        request: &Request,
         delegated: &DelegatedProof,
-        now:       u64,
+        now: u64,
     ) -> Result<(), VerifyError> {
         self.check_audience(request)?;
         if request.suite_id < self.policy.min_suite_id {
@@ -328,29 +323,36 @@ impl RelyingParty {
         if now < request.issued_at || now >= request.expires_at {
             return Err(VerifyError::Time);
         }
-        let saved = self.pending.get(&request.challenge_id).ok_or(VerifyError::Replay)?;
+        let saved = self
+            .pending
+            .get(&request.challenge_id)
+            .ok_or(VerifyError::Replay)?;
         if canonical_request(saved)? != transcript {
             return Err(VerifyError::Challenge);
         }
         let requires_approval = validate_chain(&delegated.chain, request, &self.policy.grants, now)
             .map_err(|e| match e {
-                DelegationError::DelegationExpired      => VerifyError::DelegationInvalid,
+                DelegationError::DelegationExpired => VerifyError::DelegationInvalid,
                 DelegationError::DelegationChainInvalid => VerifyError::DelegationInvalid,
                 DelegationError::DelegationScopeExceeded => VerifyError::Unauthorized,
-                DelegationError::InvalidChain           => VerifyError::DelegationInvalid,
-                DelegationError::HumanApprovalRequired  => VerifyError::HumanApprovalRequired,
-                DelegationError::UsesExhausted          => VerifyError::DelegationUsesExhausted,
-                DelegationError::Encoding(_)            => VerifyError::DelegationInvalid,
+                DelegationError::InvalidChain => VerifyError::DelegationInvalid,
+                DelegationError::HumanApprovalRequired => VerifyError::HumanApprovalRequired,
+                DelegationError::UsesExhausted => VerifyError::DelegationUsesExhausted,
+                DelegationError::Encoding(_) => VerifyError::DelegationInvalid,
             })?;
         let root_pk = &delegated.chain[0].delegator_public_key;
         let root_fp: [u8; 32] = Sha256::digest(root_pk).into();
-        if self.revoked_keys.contains(&root_fp)  { return Err(VerifyError::Revoked); }
-        if !self.enrolled_keys.contains(&root_fp) { return Err(VerifyError::Unauthorized); }
+        if self.revoked_keys.contains(&root_fp) {
+            return Err(VerifyError::Revoked);
+        }
+        if !self.enrolled_keys.contains(&root_fp) {
+            return Err(VerifyError::Unauthorized);
+        }
         let last_delegate = &delegated.chain.last().unwrap().delegate_public_key;
         if &delegated.agent_proof.public_key != last_delegate {
             return Err(VerifyError::DelegationInvalid);
         }
-        let agent_pk  = dilithium3::PublicKey::from_bytes(&delegated.agent_proof.public_key)
+        let agent_pk = dilithium3::PublicKey::from_bytes(&delegated.agent_proof.public_key)
             .map_err(|_| VerifyError::Signature)?;
         let agent_sig = dilithium3::DetachedSignature::from_bytes(&delegated.agent_proof.signature)
             .map_err(|_| VerifyError::Signature)?;
@@ -391,7 +393,13 @@ mod tests {
         rp_min(name, resource, action, scope, SUITE_ML_DSA_65)
     }
 
-    fn rp_min(name: &str, resource: &str, action: &str, scope: &str, min_suite: u16) -> RelyingParty {
+    fn rp_min(
+        name: &str,
+        resource: &str,
+        action: &str,
+        scope: &str,
+        min_suite: u16,
+    ) -> RelyingParty {
         let mut grants = HashSet::new();
         grants.insert((resource.into(), action.into(), scope.into()));
         RelyingParty::new(RpPolicy {
@@ -474,7 +482,9 @@ mod tests {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp("docs", "doc:1", "read", "document:read");
         a.enroll_test_key(pk.as_bytes()).unwrap();
-        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req = a
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
         a.revoke(pk.as_bytes()).unwrap();
         // Revoked key → Revoked; challenge is consumed in the process.
@@ -489,7 +499,9 @@ mod tests {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp("docs", "doc:1", "read", "document:read");
         a.enroll_test_key(pk.as_bytes()).unwrap();
-        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req = a
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
         a.revoke(pk.as_bytes()).unwrap();
         assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::Revoked));
@@ -503,17 +515,24 @@ mod tests {
         a.enroll_test_key(old_pk.as_bytes()).unwrap();
 
         // Sign a proof with the old key before rotation.
-        let req_old = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req_old = a
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof_old = sign_for_test(&req_old, old_sk.as_bytes(), old_pk.as_bytes()).unwrap();
 
         // Rotate: old key revoked, new key enrolled.
         a.rotate_key(old_pk.as_bytes(), new_pk.as_bytes()).unwrap();
 
         // Old proof → Revoked.
-        assert_eq!(a.verify(&req_old, &proof_old, 1010), Err(VerifyError::Revoked));
+        assert_eq!(
+            a.verify(&req_old, &proof_old, 1010),
+            Err(VerifyError::Revoked)
+        );
 
         // New challenge signed with new key → accepted.
-        let req_new = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req_new = a
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof_new = sign_for_test(&req_new, new_sk.as_bytes(), new_pk.as_bytes()).unwrap();
         assert_eq!(a.verify(&req_new, &proof_new, 1010), Ok(()));
     }
@@ -536,20 +555,32 @@ mod tests {
         a.rotate_key(pk_a.as_bytes(), new_pk_a.as_bytes()).unwrap();
 
         // A: old key rejected, new key accepted.
-        let req_a_old = a.issue(request("game", "game:1", "play", "game:play")).unwrap();
+        let req_a_old = a
+            .issue(request("game", "game:1", "play", "game:play"))
+            .unwrap();
         let proof_a_old = sign_for_test(&req_a_old, sk_a.as_bytes(), pk_a.as_bytes()).unwrap();
-        assert_eq!(a.verify(&req_a_old, &proof_a_old, 1010), Err(VerifyError::Revoked));
+        assert_eq!(
+            a.verify(&req_a_old, &proof_a_old, 1010),
+            Err(VerifyError::Revoked)
+        );
 
-        let req_a_new = a.issue(request("game", "game:1", "play", "game:play")).unwrap();
-        let proof_a_new = sign_for_test(&req_a_new, new_sk_a.as_bytes(), new_pk_a.as_bytes()).unwrap();
+        let req_a_new = a
+            .issue(request("game", "game:1", "play", "game:play"))
+            .unwrap();
+        let proof_a_new =
+            sign_for_test(&req_a_new, new_sk_a.as_bytes(), new_pk_a.as_bytes()).unwrap();
         assert_eq!(a.verify(&req_a_new, &proof_a_new, 1010), Ok(()));
 
         // B and C: unaffected by A's rotation.
-        let req_b = b.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req_b = b
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof_b = sign_for_test(&req_b, sk_b.as_bytes(), pk_b.as_bytes()).unwrap();
         assert_eq!(b.verify(&req_b, &proof_b, 1010), Ok(()));
 
-        let req_c = c.issue(request("payments", "payment:1", "submit", "payment:submit")).unwrap();
+        let req_c = c
+            .issue(request("payments", "payment:1", "submit", "payment:submit"))
+            .unwrap();
         let proof_c = sign_for_test(&req_c, sk_c.as_bytes(), pk_c.as_bytes()).unwrap();
         assert_eq!(c.verify(&req_c, &proof_c, 1010), Ok(()));
     }
@@ -570,13 +601,18 @@ mod tests {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp_min("docs", "doc:1", "read", "document:read", 1);
         a.enroll_test_key(pk.as_bytes()).unwrap();
-        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req = a
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
 
         // Raise the RP's minimum AFTER issue (simulating a policy upgrade mid-session).
         a.policy.min_suite_id = 2;
 
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
-        assert_eq!(a.verify(&req, &proof, 1010), Err(VerifyError::DowngradedSuite));
+        assert_eq!(
+            a.verify(&req, &proof, 1010),
+            Err(VerifyError::DowngradedSuite)
+        );
     }
 
     #[test]
@@ -585,7 +621,9 @@ mod tests {
         let (pk, sk) = dilithium3::keypair();
         let mut a = rp_min("docs", "doc:1", "read", "document:read", SUITE_ML_DSA_65);
         a.enroll_test_key(pk.as_bytes()).unwrap();
-        let req = a.issue(request("docs", "doc:1", "read", "document:read")).unwrap();
+        let req = a
+            .issue(request("docs", "doc:1", "read", "document:read"))
+            .unwrap();
         let proof = sign_for_test(&req, sk.as_bytes(), pk.as_bytes()).unwrap();
         assert_eq!(a.verify(&req, &proof, 1010), Ok(()));
     }

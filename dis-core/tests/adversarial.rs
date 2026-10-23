@@ -86,7 +86,10 @@ fn attack_forged_signature() {
         signature: sign_raw(&transcript, &attacker_sk), // signed with wrong sk
     };
     let _ = sk; // legitimate sk unused — attacker doesn't have it
-    assert_eq!(rp.verify(&req, &bad_proof, NOW), Err(VerifyError::Signature));
+    assert_eq!(
+        rp.verify(&req, &bad_proof, NOW),
+        Err(VerifyError::Signature)
+    );
 }
 
 // ── Attack 2: bit-flip in signature bytes ─────────────────────────────────────
@@ -116,7 +119,10 @@ fn attack_signature_over_wrong_message() {
         public_key: pk.clone(),
         signature: sign_raw(&other_transcript, &sk),
     };
-    assert_eq!(rp.verify(&req, &bad_proof, NOW), Err(VerifyError::Signature));
+    assert_eq!(
+        rp.verify(&req, &bad_proof, NOW),
+        Err(VerifyError::Signature)
+    );
 }
 
 // ── Attack 4: replay — present the same challenge twice ───────────────────────
@@ -159,7 +165,10 @@ fn attack_cross_rp_challenge_replay() {
     let proof = valid_proof(&issued_a, &pk, &sk);
 
     // Audience check on rp_b must reject (wrong rp_id)
-    assert_eq!(rp_b.verify(&issued_a, &proof, NOW), Err(VerifyError::Audience));
+    assert_eq!(
+        rp_b.verify(&issued_a, &proof, NOW),
+        Err(VerifyError::Audience)
+    );
 }
 
 // ── Attack 6: wrong rp_id in request ──────────────────────────────────────────
@@ -210,7 +219,10 @@ fn attack_request_not_yet_valid() {
     let req = enroll_and_issue(&mut rp, &pk, base_request());
     let proof = valid_proof(&req, &pk, &sk);
     let before_issuance = req.issued_at - 1;
-    assert_eq!(rp.verify(&req, &proof, before_issuance), Err(VerifyError::Time));
+    assert_eq!(
+        rp.verify(&req, &proof, before_issuance),
+        Err(VerifyError::Time)
+    );
 }
 
 // ── Attack 10: key substitution — swap public key in proof ────────────────────
@@ -225,11 +237,14 @@ fn attack_key_substitution_in_proof() {
     let transcript = canonical_request(&req).unwrap();
     // Attacker claims legitimate pk but uses their own signature (can't pass)
     let bad_proof = HolderProof {
-        public_key: attacker_pk.clone(), // not enrolled
+        public_key: attacker_pk.clone(),       // not enrolled
         signature: sign_raw(&transcript, &sk), // valid sig over legitimate transcript
     };
     // sig won't verify with wrong pk → Signature error
-    assert_eq!(rp.verify(&req, &bad_proof, NOW), Err(VerifyError::Signature));
+    assert_eq!(
+        rp.verify(&req, &bad_proof, NOW),
+        Err(VerifyError::Signature)
+    );
 }
 
 // ── Attack 11: unenrolled key ─────────────────────────────────────────────────
@@ -247,7 +262,10 @@ fn attack_unenrolled_key() {
         signature: sign_raw(&transcript, &attacker_sk),
     };
     let _ = sk;
-    assert_eq!(rp.verify(&req, &bad_proof, NOW), Err(VerifyError::Unauthorized));
+    assert_eq!(
+        rp.verify(&req, &bad_proof, NOW),
+        Err(VerifyError::Unauthorized)
+    );
 }
 
 // ── Attack 12: revoked key ────────────────────────────────────────────────────
@@ -290,7 +308,10 @@ fn attack_unauthorized_resource() {
     req.scopes = vec!["doc:read".into()];
     let issued = enroll_and_issue(&mut rp, &pk, req);
     let proof = valid_proof(&issued, &pk, &sk);
-    assert_eq!(rp.verify(&issued, &proof, NOW), Err(VerifyError::Unauthorized));
+    assert_eq!(
+        rp.verify(&issued, &proof, NOW),
+        Err(VerifyError::Unauthorized)
+    );
 }
 
 // ── Attack 15: permission escalation — unauthorized action ────────────────────
@@ -304,7 +325,10 @@ fn attack_unauthorized_action() {
     req.scopes = vec!["doc:read".into()];
     let issued = enroll_and_issue(&mut rp, &pk, req);
     let proof = valid_proof(&issued, &pk, &sk);
-    assert_eq!(rp.verify(&issued, &proof, NOW), Err(VerifyError::Unauthorized));
+    assert_eq!(
+        rp.verify(&issued, &proof, NOW),
+        Err(VerifyError::Unauthorized)
+    );
 }
 
 // ── Attack 16: scope injection — extra scope not in grants ────────────────────
@@ -317,7 +341,10 @@ fn attack_scope_injection() {
     req.scopes = vec!["doc:admin".into(), "doc:read".into()]; // doc:admin not granted
     let issued = enroll_and_issue(&mut rp, &pk, req);
     let proof = valid_proof(&issued, &pk, &sk);
-    assert_eq!(rp.verify(&issued, &proof, NOW), Err(VerifyError::Unauthorized));
+    assert_eq!(
+        rp.verify(&issued, &proof, NOW),
+        Err(VerifyError::Unauthorized)
+    );
 }
 
 // ── Attack 17: empty scopes ───────────────────────────────────────────────────
@@ -336,7 +363,10 @@ fn attack_empty_scopes() {
         Err(_) => { /* structural rejection at issue — also fine */ }
         Ok(issued) => {
             let proof = valid_proof(&issued, &pk, &sk);
-            assert_eq!(rp.verify(&issued, &proof, NOW), Err(VerifyError::Unauthorized));
+            assert_eq!(
+                rp.verify(&issued, &proof, NOW),
+                Err(VerifyError::Unauthorized)
+            );
         }
     }
 }
@@ -357,7 +387,10 @@ fn attack_downgrade_at_issue() {
 #[test]
 fn attack_tampered_resource_after_issue() {
     let (pk, sk) = keypair();
-    let mut rp = rp(&[("doc:1", "read", "doc:read"), ("doc:99", "read", "doc:read")]);
+    let mut rp = rp(&[
+        ("doc:1", "read", "doc:read"),
+        ("doc:99", "read", "doc:read"),
+    ]);
     let req = enroll_and_issue(&mut rp, &pk, base_request());
     // Sign the issued (legitimate) transcript
     let proof = valid_proof(&req, &pk, &sk);
@@ -365,7 +398,10 @@ fn attack_tampered_resource_after_issue() {
     let mut tampered = req.clone();
     tampered.resource_id = "doc:99".into();
     // canonical_request of tampered ≠ saved → Challenge error
-    assert_eq!(rp.verify(&tampered, &proof, NOW), Err(VerifyError::Challenge));
+    assert_eq!(
+        rp.verify(&tampered, &proof, NOW),
+        Err(VerifyError::Challenge)
+    );
 }
 
 // ── Attack 20: tampered nonce after issue ─────────────────────────────────────
@@ -378,7 +414,10 @@ fn attack_tampered_nonce_after_issue() {
     let proof = valid_proof(&req, &pk, &sk);
     let mut tampered = req.clone();
     tampered.nonce[0] ^= 0x01;
-    assert_eq!(rp.verify(&tampered, &proof, NOW), Err(VerifyError::Challenge));
+    assert_eq!(
+        rp.verify(&tampered, &proof, NOW),
+        Err(VerifyError::Challenge)
+    );
 }
 
 // ── Attack 21: phantom challenge (challenge_id never issued) ──────────────────
@@ -392,7 +431,10 @@ fn attack_phantom_challenge() {
     let mut req = base_request();
     req.challenge_id = [0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let transcript = canonical_request(&req).unwrap();
-    let proof = HolderProof { public_key: pk, signature: sign_raw(&transcript, &sk) };
+    let proof = HolderProof {
+        public_key: pk,
+        signature: sign_raw(&transcript, &sk),
+    };
     assert_eq!(rp.verify(&req, &proof, NOW), Err(VerifyError::Replay));
 }
 
@@ -402,15 +444,27 @@ fn attack_phantom_challenge() {
 fn attack_delegation_scope_escalation() {
     let (human_pk, human_sk) = keypair();
     let (agent_pk, agent_sk) = keypair();
-    let mut rp = rp(&[("doc:1", "read", "doc:read"), ("doc:1", "write", "doc:write")]);
+    let mut rp = rp(&[
+        ("doc:1", "read", "doc:read"),
+        ("doc:1", "write", "doc:write"),
+    ]);
     rp.enroll_test_key(&human_pk).unwrap();
 
     // Human delegates only "read"
     let link = make_delegation(
-        "acme", &human_pk, &human_sk, &agent_pk,
-        vec!["doc:read".into()], "doc:1", "read",
-        NOW, NOW + 299, None, false,
-    ).unwrap();
+        "acme",
+        &human_pk,
+        &human_sk,
+        &agent_pk,
+        vec!["doc:read".into()],
+        "doc:1",
+        "read",
+        NOW,
+        NOW + 299,
+        None,
+        false,
+    )
+    .unwrap();
 
     // Agent tries to get "write" access
     let mut req = base_request();
@@ -423,7 +477,10 @@ fn attack_delegation_scope_escalation() {
         public_key: agent_pk,
         signature: sign_raw(&transcript, &agent_sk),
     };
-    let delegated = DelegatedProof { chain: vec![link], agent_proof };
+    let delegated = DelegatedProof {
+        chain: vec![link],
+        agent_proof,
+    };
     assert_eq!(
         rp.verify_delegated(&issued, &delegated, NOW),
         Err(VerifyError::DelegationInvalid)
@@ -440,11 +497,19 @@ fn attack_delegation_expired_link() {
     rp.enroll_test_key(&human_pk).unwrap();
 
     let link = make_delegation(
-        "acme", &human_pk, &human_sk, &agent_pk,
-        vec!["doc:read".into()], "doc:1", "read",
-        1_000, 2_000, // expired well before NOW
-        None, false,
-    ).unwrap();
+        "acme",
+        &human_pk,
+        &human_sk,
+        &agent_pk,
+        vec!["doc:read".into()],
+        "doc:1",
+        "read",
+        1_000,
+        2_000, // expired well before NOW
+        None,
+        false,
+    )
+    .unwrap();
 
     let issued = rp.issue(base_request()).unwrap();
     let transcript = canonical_request(&issued).unwrap();
@@ -452,7 +517,10 @@ fn attack_delegation_expired_link() {
         public_key: agent_pk,
         signature: sign_raw(&transcript, &agent_sk),
     };
-    let delegated = DelegatedProof { chain: vec![link], agent_proof };
+    let delegated = DelegatedProof {
+        chain: vec![link],
+        agent_proof,
+    };
     assert_eq!(
         rp.verify_delegated(&issued, &delegated, NOW),
         Err(VerifyError::DelegationInvalid)
@@ -474,10 +542,19 @@ fn attack_delegation_chain_too_deep() {
     for _ in 0..=MAX_CHAIN_DEPTH {
         let (next_pk, next_sk) = keypair();
         let link = make_delegation(
-            "acme", &prev_pk, &prev_sk, &next_pk,
-            vec!["doc:read".into()], "doc:1", "read",
-            NOW, NOW + 299, None, false,
-        ).unwrap();
+            "acme",
+            &prev_pk,
+            &prev_sk,
+            &next_pk,
+            vec!["doc:read".into()],
+            "doc:1",
+            "read",
+            NOW,
+            NOW + 299,
+            None,
+            false,
+        )
+        .unwrap();
         chain.push(link);
         prev_pk = next_pk;
         prev_sk = next_sk;
@@ -528,7 +605,10 @@ fn attack_delegation_forged_signature() {
         public_key: agent_pk,
         signature: sign_raw(&transcript, &agent_sk),
     };
-    let delegated = DelegatedProof { chain: vec![link], agent_proof };
+    let delegated = DelegatedProof {
+        chain: vec![link],
+        agent_proof,
+    };
     assert_eq!(
         rp.verify_delegated(&issued, &delegated, NOW),
         Err(VerifyError::DelegationInvalid)
@@ -545,11 +625,19 @@ fn attack_high_risk_no_approval() {
     rp.enroll_test_key(&human_pk).unwrap();
 
     let link = make_delegation(
-        "acme", &human_pk, &human_sk, &agent_pk,
-        vec!["doc:read".into()], "doc:1", "read",
-        NOW, NOW + 299, None,
+        "acme",
+        &human_pk,
+        &human_sk,
+        &agent_pk,
+        vec!["doc:read".into()],
+        "doc:1",
+        "read",
+        NOW,
+        NOW + 299,
+        None,
         true, // requires_human_approval
-    ).unwrap();
+    )
+    .unwrap();
 
     let issued = rp.issue(base_request()).unwrap();
     // No approve_challenge() called
@@ -558,7 +646,10 @@ fn attack_high_risk_no_approval() {
         public_key: agent_pk,
         signature: sign_raw(&transcript, &agent_sk),
     };
-    let delegated = DelegatedProof { chain: vec![link], agent_proof };
+    let delegated = DelegatedProof {
+        chain: vec![link],
+        agent_proof,
+    };
     assert_eq!(
         rp.verify_delegated(&issued, &delegated, NOW),
         Err(VerifyError::HumanApprovalRequired)
@@ -575,24 +666,44 @@ fn attack_delegation_uses_exhausted() {
     rp.enroll_test_key(&human_pk).unwrap();
 
     let link = make_delegation(
-        "acme", &human_pk, &human_sk, &agent_pk,
-        vec!["doc:read".into()], "doc:1", "read",
-        NOW, NOW + 299, Some(1), // only 1 use allowed
+        "acme",
+        &human_pk,
+        &human_sk,
+        &agent_pk,
+        vec!["doc:read".into()],
+        "doc:1",
+        "read",
+        NOW,
+        NOW + 299,
+        Some(1), // only 1 use allowed
         false,
-    ).unwrap();
+    )
+    .unwrap();
 
     // First use succeeds
     let issued1 = rp.issue(base_request()).unwrap();
     let t1 = canonical_request(&issued1).unwrap();
-    let p1 = HolderProof { public_key: agent_pk.clone(), signature: sign_raw(&t1, &agent_sk) };
-    let d1 = DelegatedProof { chain: vec![link.clone()], agent_proof: p1 };
+    let p1 = HolderProof {
+        public_key: agent_pk.clone(),
+        signature: sign_raw(&t1, &agent_sk),
+    };
+    let d1 = DelegatedProof {
+        chain: vec![link.clone()],
+        agent_proof: p1,
+    };
     assert!(rp.verify_delegated(&issued1, &d1, NOW).is_ok());
 
     // Second use must fail
     let issued2 = rp.issue(base_request()).unwrap();
     let t2 = canonical_request(&issued2).unwrap();
-    let p2 = HolderProof { public_key: agent_pk.clone(), signature: sign_raw(&t2, &agent_sk) };
-    let d2 = DelegatedProof { chain: vec![link], agent_proof: p2 };
+    let p2 = HolderProof {
+        public_key: agent_pk.clone(),
+        signature: sign_raw(&t2, &agent_sk),
+    };
+    let d2 = DelegatedProof {
+        chain: vec![link],
+        agent_proof: p2,
+    };
     assert_eq!(
         rp.verify_delegated(&issued2, &d2, NOW),
         Err(VerifyError::DelegationUsesExhausted)
@@ -635,7 +746,10 @@ fn attack_agent_key_enrolled_directly() {
         public_key: agent_pk,
         signature: sign_raw(&transcript, &agent_sk),
     };
-    let delegated = DelegatedProof { chain: vec![link], agent_proof };
+    let delegated = DelegatedProof {
+        chain: vec![link],
+        agent_proof,
+    };
     // validate_chain checks: chain[0].delegator_public_key must be enrolled human key.
     // agent_pk IS enrolled, so chain[0].delegator = agent_pk passes enrollment check,
     // but sig verification: signed by human_sk over body containing agent_pk → won't verify.
@@ -652,22 +766,43 @@ fn attack_delegation_scope_widening_mid_chain() {
     let (human_pk, human_sk) = keypair();
     let (agent1_pk, agent1_sk) = keypair();
     let (agent2_pk, agent2_sk) = keypair();
-    let mut rp = rp(&[("doc:1", "read", "doc:read"), ("doc:1", "write", "doc:write")]);
+    let mut rp = rp(&[
+        ("doc:1", "read", "doc:read"),
+        ("doc:1", "write", "doc:write"),
+    ]);
     rp.enroll_test_key(&human_pk).unwrap();
 
     // Human → agent1: read only
     let link1 = make_delegation(
-        "acme", &human_pk, &human_sk, &agent1_pk,
-        vec!["doc:read".into()], "doc:1", "read",
-        NOW, NOW + 299, None, false,
-    ).unwrap();
+        "acme",
+        &human_pk,
+        &human_sk,
+        &agent1_pk,
+        vec!["doc:read".into()],
+        "doc:1",
+        "read",
+        NOW,
+        NOW + 299,
+        None,
+        false,
+    )
+    .unwrap();
 
     // agent1 → agent2: claims write (wider than read — invalid)
     let link2 = make_delegation(
-        "acme", &agent1_pk, &agent1_sk, &agent2_pk,
-        vec!["doc:read".into(), "doc:write".into()], "doc:1", "write",
-        NOW, NOW + 299, None, false,
-    ).unwrap();
+        "acme",
+        &agent1_pk,
+        &agent1_sk,
+        &agent2_pk,
+        vec!["doc:read".into(), "doc:write".into()],
+        "doc:1",
+        "write",
+        NOW,
+        NOW + 299,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut req = base_request();
     req.action = "write".into();
@@ -678,7 +813,10 @@ fn attack_delegation_scope_widening_mid_chain() {
         public_key: agent2_pk,
         signature: sign_raw(&transcript, &agent2_sk),
     };
-    let delegated = DelegatedProof { chain: vec![link1, link2], agent_proof };
+    let delegated = DelegatedProof {
+        chain: vec![link1, link2],
+        agent_proof,
+    };
     assert_eq!(
         rp.verify_delegated(&issued, &delegated, NOW),
         Err(VerifyError::DelegationInvalid)
@@ -702,7 +840,10 @@ fn attack_stolen_device_key_revoked_new_enrolled() {
     // Attacker with stolen device tries to use stolen_pk
     let issued = rp.issue(base_request()).unwrap();
     let bad_proof = valid_proof(&issued, &stolen_pk, &stolen_sk);
-    assert_eq!(rp.verify(&issued, &bad_proof, NOW), Err(VerifyError::Revoked));
+    assert_eq!(
+        rp.verify(&issued, &bad_proof, NOW),
+        Err(VerifyError::Revoked)
+    );
 
     // Legitimate owner with new key succeeds on a fresh challenge
     let issued2 = rp.issue(base_request()).unwrap();
@@ -723,7 +864,10 @@ fn attack_operation_digest_swap() {
     // Attacker swaps the operation_digest after signing
     let mut tampered = issued.clone();
     tampered.operation_digest = Some([0xbb; 32]);
-    assert_eq!(rp.verify(&tampered, &proof, NOW), Err(VerifyError::Challenge));
+    assert_eq!(
+        rp.verify(&tampered, &proof, NOW),
+        Err(VerifyError::Challenge)
+    );
 }
 
 // ── Attack 32: malformed public key in proof ──────────────────────────────────
