@@ -90,7 +90,9 @@ Chain Forge has crossed its first major milestone. The following capabilities ar
 
 **P2P gossip.** PoCD proof gossip ensures all nodes converge to the same proof pool before epoch boundaries. Capacity advertisement (CapacityAd gossip topic) gives the scheduler live peer load data for task assignment.
 
-**Attestation guard.** On-chain sybil-resistance layer implemented through Phase D: quadratic-cost cap on attestations, revocation with cost, sybil confirmation with contribution-score penalty, and coordinator-gated reversal. 65 tests passing.
+**Attestation guard.** On-chain sybil-resistance layer implemented through Phase D: quadratic-cost cap on attestations, revocation with cost, sybil confirmation with contribution-score penalty, and coordinator-gated reversal. 69 tests passing.
+
+**QPC-CONS-001 — Personhood-to-Consensus Integration (Phase B + C).** Authenticated validator-to-human binding and revocation propagation are implemented and tested. Phase B (commit `890b060`): `BondValidator` rejects cross-owner bonding at the execution layer — `tx.sender` must match `owner_identity_id`; `NO_PRIOR_TX = u64::MAX` nonce sentinel fixed for fresh genesis accounts with 9 regression tests (commit `8014652`). Phase C (commit `17ab814`): revocation propagation now downgrades WoT-verified identities back to Provisional when attestation count drops below `ATTESTATION_QUORUM`; `IntrinsicCharm.verified_via_wot` flag tracks the upgrade path; executor syncs charm and refreshes Merkle leaf on `tier_downgraded`. 6 new identity + executor tests. Agent 9 QPC-A01/A03/A10 live PASS on Phase B devnet; A04 live re-run pending (PR #10 merge blocker).
 
 ---
 
@@ -794,7 +796,9 @@ All 8 checks green on Alice, Bob, Dave at height=17. Five-transaction sequence c
 
 | Item | Status | Notes |
 |---|---|---|
-| Attestation guard Phases A–D (chain-forge-identity) | ✅ | 65 tests passing; coordinator-gated |
+| Attestation guard Phases A–D (chain-forge-identity) | ✅ | 69 tests passing; coordinator-gated |
+| QPC-CONS-001 Phase B — Authenticated Validator Binding | ✅ Complete (commit `890b060`) | `BondValidator` Rule 1: `tx.sender == owner_identity_id`; cross-owner bond rejected at execution; `NO_PRIOR_TX` nonce sentinel + 9 regression tests (commit `8014652`) |
+| QPC-CONS-001 Phase C — Revocation Propagation | ✅ Complete (commit `17ab814`) | `verified_via_wot` flag; `downgrade_to_provisional()` on quorum drop; executor charm sync + `refresh_leaf()`; 5 identity tests + 1 executor integration test; PR #10 pending A04 live devnet re-run |
 | ZK-VRC prototype (chain-forge-personhood) | ✅ | Groth16 / BLS12-381; 5 binaries; integrated into workspace |
 | governance_authority.rs — uses real ValidatorSet | ✅ | Quorum tied to quorum_power() / revocation_quorum_power() |
 | /api/identity/{address} REST endpoint | ✅ | Returns verification tier + CS score |
@@ -1291,4 +1295,8 @@ All security gates verified on 3-node devnet (qcb-devnet-3node):
 ### Remaining before mainnet
 1. Real human verification ceremony — measure cost per human (target < $5)
 2. QPC-CONS-001 — Personhood-to-Consensus Integration
+   - ✅ Phase B complete (authenticated validator binding, commit `890b060`)
+   - ✅ Phase C complete (revocation propagation, commit `17ab814`)
+   - 🔄 PR #10 pending: live devnet A04 re-run to confirm revocation correctly downgrades tier end-to-end; all unit + integration tests passing
+   - ⬜ Phase D/E: CS ledger deduction, `gate_voting_power()` re-evaluation after tier downgrade, coordinator dashboard, penalty mechanics
 3. Verification cost measurement against < $5/human and < 3% sybil rate targets
