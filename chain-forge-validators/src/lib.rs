@@ -2192,4 +2192,144 @@ mod tests {
         assert!(r.pop_verified);
         assert_eq!(r.consensus_power(), 1);
     }
+
+    // ── FS-03 epoch-reward acceptance tests ────────────────────────────────────
+
+    /// Build a registry with `n` active, pop_verified validators.
+    /// Each validator signs `signed` out of `epoch_blocks` in epoch 1.
+    /// Returns (registry, vec of validator ids).
+    fn make_active_validators(n: usize, signed: u64, epoch_blocks: u64) -> (ValidatorRegistry, Vec<String>) {
+        let mut reg = registry();
+        let ids: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+        for id in &ids {
+            reg.register_genesis_validator(id, 0);
+            reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
+            // Simulate precommits in epoch 1.
+            for _ in 0..signed {
+                reg.record_precommit(id, 1);
+            }
+        }
+        // Confirm all are Active after confirm_pop.
+        for id in &ids {
+            assert_eq!(reg.get(id).unwrap().status, ValidatorStatus::Active);
+        }
+        (reg, ids)
+    }
+
+    #[test]
+    fn fs03_epoch_all_eligible_at_full_participation() {
+        let epoch_blocks: u64 = 100;
+        let (reg, ids) = make_active_validators(4, epoch_blocks, epoch_blocks);
+        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
+        assert_eq!(eligible.len(), 4, "all 4 fully-participating validators must be eligible");
+        let mut sorted = eligible.clone();
+        sorted.sort();
+        let mut expected: Vec<_> = ids.clone();
+        expected.sort();
+        assert_eq!(sorted, expected, "eligible set must match the registered validators");
+    }
+
+    #[test]
+    fn fs03_epoch_below_threshold_excluded() {
+        let epoch_blocks: u64 = 100;
+        // v0..v2 sign 95/100 (exactly at threshold), v3 signs only 50/100.
+        let (mut reg, _) = make_active_validators(3, 95, epoch_blocks);
+        reg.register_genesis_validator("v3", 0);
+        reg.confirm_pop("v3", VerificationTier::Verified, 1).unwrap();
+        for _ in 0..50 { reg.record_precommit("v3", 1); }
+
+        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
+        assert_eq!(eligible.len(), 3, "v3 at 50% must be excluded (threshold 95%)");
+        assert!(!eligible.contains(&"v3".to_string()), "v3 must not appear in eligible list");
+    }
+
+    #[test]
+    fn fs03_epoch_zero_eligible_when_none_participate() {
+        let epoch_blocks: u64 = 100;
+        // Register two validators but never call record_precommit — 0% participation.
+        let mut reg = registry();
+        for id in ["v0", "v1"] {
+            reg.register_genesis_validator(id, 0);
+            reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
+        }
+        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
+        assert!(eligible.is_empty(),
+            "zero eligible validators must produce empty list, not panic or partial list");
+    }
+
+    #[test]
+    fn fs03_epoch_per_human_dedup_one_share_per_human() {
+        // Two validators with the same owner_identity_id represent the same human.
+        // Only the one with higher participation should appear in the eligible list.
+        let epoch_blocks: u64 = 100;
+        let mut reg = registry();
+
+        // Register two validators under the same owner using the full registration path.
+        let mut req_high = req("v_high", "qcb1high", ENTRY_STAKE_UQCB);
+        req_high.owner_identity_id = Some("human1".to_string());
+        let mut req_low  = req("v_low",  "qcb1low",  ENTRY_STAKE_UQCB);
+        req_low.owner_identity_id  = Some("human1".to_string());
+
+        reg.register(req_high, 0).unwrap();
+        reg.register(req_low,  0).unwrap();
+        reg.confirm_pop("v_high", VerificationTier::Verified, 1).unwrap();
+        reg.confirm_pop("v_low",  VerificationTier::Verified, 1).unwrap();
+
+        // v_high signs 98 blocks, v_low signs 96 blocks (both above 95% threshold).
+        for _ in 0..98 { reg.record_precommit("v_high", 1); }
+        for _ in 0..96 { reg.record_precommit("v_low",  1); }
+
+        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
+        assert_eq!(eligible.len(), 1, "one human must get exactly one reward share");
+        assert_eq!(eligible[0], "v_high",
+            "the node with higher participation (v_high=98) must win the dedup");
+    }
+
+    #[test]
+    fn fs03_epoch_boundary_uses_completed_epoch_counters() {
+        // This test verifies that epoch N's participation counters are read
+        // BEFORE record_precommit resets them for epoch N+1.
+        //
+        // Correct ordering: reward eligibility is checked at epoch close for
+        // epoch N.  If the node calls record_precommit with epoch N+1 BEFORE
+        // calling eligible_validators_for_epoch_reward, the counters reset to 0
+        // and no validator appears eligible (off-by-one epoch bug).
+        let epoch_blocks: u64 = 100;
+        let (mut reg, ids) = make_active_validators(2, epoch_blocks, epoch_blocks);
+
+        // At epoch close of epoch 1, query BEFORE advancing to epoch 2.
+        let eligible_epoch1 = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
+        assert_eq!(eligible_epoch1.len(), 2, "both validators eligible at epoch 1 close");
+
+        // Simulate epoch 2 starting: record_precommit with epoch=2 resets counters.
+        reg.record_precommit(&ids[0], 2);
+        reg.record_precommit(&ids[1], 2);
+
+        // Now query for epoch 1 again — counters are epoch 2, so epoch 1 query
+        // returns 0 signed (counters reset).  This documents the invariant:
+        // always query eligible_validators_for_epoch_reward(N, ...) BEFORE
+        // issuing record_precommit calls for epoch N+1.
+        let eligible_after_reset = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
+        assert!(eligible_after_reset.is_empty(),
+            "after epoch counters reset for epoch 2, epoch 1 query must return empty — \
+             reward distribution MUST precede record_precommit for the new epoch");
+
+        // But epoch 2 query works (only 1 block signed so far — below 95%):
+        let eligible_epoch2_partial = reg.eligible_validators_for_epoch_reward(2, epoch_blocks, 95);
+        assert!(eligible_epoch2_partial.is_empty(),
+            "epoch 2 with only 1 signed block (< 95% of 100) must have no eligible validators");
+    }
+
+    #[test]
+    fn fs03_epoch_not_eligible_when_not_pop_verified() {
+        let epoch_blocks: u64 = 100;
+        let mut reg = registry();
+        reg.register_genesis_validator("v_unverified", 0);
+        // Do NOT call confirm_pop — pop_verified stays false.
+        for _ in 0..100 { reg.record_precommit("v_unverified", 1); }
+
+        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
+        assert!(eligible.is_empty(),
+            "validator without personhood verification must not receive epoch rewards");
+    }
 }

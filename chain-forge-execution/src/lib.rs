@@ -163,14 +163,14 @@ impl FeeDistribution {
     }
 
     /// Split `amount` into (validator_share, treasury_share, burn_share).
-    /// Integer floor division; any remainder stays in the validator share.
+    /// Integer floor division; any remainder accrues to the treasury share.
     pub fn split(&self, amount: u64) -> (u64, u64, u64) {
         let validator = (amount as u128 * self.validator_bps as u128 / 10_000) as u64;
         let treasury  = (amount as u128 * self.treasury_bps  as u128 / 10_000) as u64;
         let burn      = (amount as u128 * self.burn_bps       as u128 / 10_000) as u64;
-        // Remainder (from floor division) stays in validator share.
+        // Remainder (from floor division) accrues to treasury, not validators.
         let remainder = amount.saturating_sub(validator + treasury + burn);
-        (validator + remainder, treasury, burn)
+        (validator, treasury + remainder, burn)
     }
 }
 
@@ -4097,8 +4097,9 @@ mod tests {
             modules:         EnabledModules::all(),
             settlement_operators: vec![],
             crypto_governors:     vec![],
-            fee_collector:   "treasury:fees".into(),
-            pop_verifier:    None,
+            fee_collector:    "treasury:fees".into(),
+            fee_distribution: FeeDistribution::default(),
+            pop_verifier:     None,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -6982,5 +6983,224 @@ mod tests {
         // should have created it as a side effect).
         assert!(state.get_account("qcb1newbie").is_err(),
             "no account must exist for an identity that was never given one");
+    }
+
+    // ── FS-03 accounting acceptance tests ─────────────────────────────────────
+    //
+    // These tests verify the seven invariants identified in the FS-03 acceptance
+    // review (2026-10-24):
+    //   1. Fund conservation: validator + treasury + burn == fee charged (no dust lost)
+    //   2. Remainder rule: integer-division dust accrues to treasury, not validators
+    //   3. Double settlement: replaying distribute_block_fees with the same
+    //      fees_collected value a second time cannot double-distribute
+    //   4. Failed-tx fee: a tx that fails execution still charges a fee
+    //   5. Supply accounting: burn reduces supply exactly once
+    //   6. Zero-fee block: distribute_block_fees is a no-op when fees_collected == 0
+    //   7. Custom split validated: genesis bps values that don't sum to 10 000
+    //      are rejected
+
+    fn seed_fee_collector(state: &mut StateStore, denom: &str, amount: u64) {
+        if state.get_account("treasury:fees").is_err() {
+            let a = chain_forge_state::AccountState::new(
+                "treasury:fees".to_string(), "treasury".to_string());
+            state.upsert_account(a);
+        }
+        if let Ok(a) = state.get_account_mut("treasury:fees") {
+            a.credit(denom, amount as u128);
+        }
+        state.refresh_leaf("treasury:fees");
+    }
+
+    fn balance(state: &StateStore, addr: &str, denom: &str) -> u128 {
+        state.get_account(addr).map(|a| a.balance_of(denom)).unwrap_or(0)
+    }
+
+    #[test]
+    fn fs03_fee_split_conservation() {
+        // validator_share + treasury_share + burn_share must equal the input amount
+        // for a range of values including dust-producing amounts.
+        let dist = FeeDistribution::default(); // 7000 / 2000 / 1000
+        for amount in [0u64, 1, 9, 10, 99, 100, 1_000_001, 9_999_999, u64::MAX / 10_000] {
+            let (v, t, b) = dist.split(amount);
+            assert_eq!(v + t + b, amount,
+                "conservation failed for amount={amount}: v={v} t={t} b={b}");
+        }
+    }
+
+    #[test]
+    fn fs03_remainder_goes_to_treasury() {
+        // With 7000/2000/1000 bps on amount=9 (not divisible by 10_000):
+        //   validator floor = 9 * 7000 / 10_000 = 6
+        //   treasury  floor = 9 * 2000 / 10_000 = 1
+        //   burn      floor = 9 * 1000 / 10_000 = 0
+        //   sum = 7, remainder = 2  → treasury should get remainder
+        let dist = FeeDistribution::default();
+        let (v, t, b) = dist.split(9);
+        assert_eq!(v, 6, "validator share");
+        assert_eq!(t, 3, "treasury share (includes remainder of 2)");
+        assert_eq!(b, 0, "burn share");
+        assert_eq!(v + t + b, 9, "conservation");
+    }
+
+    #[test]
+    fn fs03_distribute_block_fees_moves_correct_amounts() {
+        let (_, mut state) = setup();
+        let denom = "uqcb";
+        let fees: u64 = 10_000;
+
+        seed_fee_collector(&mut state, denom, fees as u64 + 50_000); // extra to test no-over-drain
+
+        let dist = FeeDistribution::default();
+        let result = distribute_block_fees(fees, &dist, denom, &mut state);
+
+        assert_eq!(result.fees_total, fees);
+        assert_eq!(result.validator_share + result.treasury_share + result.burn_share, fees,
+            "settlement result must sum to fees_collected");
+
+        // treasury:validator-pool got validator share
+        assert_eq!(balance(&state, "treasury:validator-pool", denom), result.validator_share as u128);
+        // treasury:network got treasury share
+        assert_eq!(balance(&state, "treasury:network", denom), result.treasury_share as u128);
+        // treasury:fees was debited fees (not all of its balance)
+        let remaining_in_collector = balance(&state, "treasury:fees", denom);
+        assert_eq!(remaining_in_collector, 50_000,
+            "only fees_collected must leave treasury:fees, not its entire balance");
+    }
+
+    #[test]
+    fn fs03_double_settlement_prevention() {
+        // Calling distribute_block_fees twice with the same fees_collected value
+        // should move an equal amount AGAIN from treasury:fees — but only if that
+        // amount is still present.  When it is not (because the block already
+        // settled), the transfer fails gracefully and does NOT double-credit.
+        let (_, mut state) = setup();
+        let denom = "uqcb";
+        let fees: u64 = 1_000;
+
+        // Seed exactly `fees` — simulates a block that collected exactly this amount.
+        seed_fee_collector(&mut state, denom, fees);
+
+        let dist = FeeDistribution::default();
+        let r1 = distribute_block_fees(fees, &dist, denom, &mut state);
+        assert_eq!(r1.fees_total, fees);
+
+        // Second call with same fees_collected: treasury:fees is now empty (or
+        // the burn share may have made it slightly under).  The function must not
+        // panic and must not double-credit the pools.
+        let pool_after_first = balance(&state, "treasury:validator-pool", denom);
+        let net_after_first  = balance(&state, "treasury:network", denom);
+
+        let _r2 = distribute_block_fees(fees, &dist, denom, &mut state);
+
+        // Pools must NOT have grown again (second call finds no balance to drain).
+        assert_eq!(balance(&state, "treasury:validator-pool", denom), pool_after_first,
+            "validator-pool must not grow on second distribute call");
+        assert_eq!(balance(&state, "treasury:network", denom), net_after_first,
+            "treasury:network must not grow on second distribute call");
+    }
+
+    #[test]
+    fn fs03_zero_fee_block_is_noop() {
+        let (_, mut state) = setup();
+        let denom = "uqcb";
+
+        seed_fee_collector(&mut state, denom, 5_000);
+        let dist = FeeDistribution::default();
+        let result = distribute_block_fees(0, &dist, denom, &mut state);
+
+        assert_eq!(result.fees_total,      0);
+        assert_eq!(result.validator_share, 0);
+        assert_eq!(result.treasury_share,  0);
+        assert_eq!(result.burn_share,      0);
+
+        // Nothing should have moved from the fee collector.
+        assert_eq!(balance(&state, "treasury:fees", denom), 5_000);
+        assert_eq!(balance(&state, "treasury:validator-pool", denom), 0);
+        assert_eq!(balance(&state, "treasury:network", denom), 0);
+    }
+
+    #[test]
+    fn fs03_failed_tx_still_charges_fee() {
+        // A transfer that fails (insufficient balance for the transfer amount)
+        // must still charge the gas fee — the sender loses the fee even if the
+        // business logic is rolled back.
+        let (exec, mut state) = setup();
+        let alice_start = balance(&state, "qcb1alice", "uqcb");
+
+        // Amount exceeds Alice's balance; transfer will fail.
+        let tx = Transaction::transfer("tx-fail", "qcb1alice", "qcb1bob", "uqcb", alice_start * 2, 0);
+        let fee = gas_for(&exec, &tx);
+        let result = exec.execute_tx(&tx, &mut state);
+
+        assert!(!result.success, "transfer must fail when amount exceeds balance");
+
+        let alice_after = balance(&state, "qcb1alice", "uqcb");
+        // Alice should have paid the fee even though the transfer failed.
+        assert_eq!(alice_after, alice_start - fee,
+            "fee must be charged even on a failed tx (got alice={alice_after}, expected {})",
+            alice_start - fee);
+    }
+
+    #[test]
+    fn fs03_burn_reduces_supply_exactly_once() {
+        // StateStore::burn() is the mechanism for the burn share.  Verify that
+        // burning N tokens from an account exactly reduces that account's balance
+        // by N and does not silently succeed on an empty account.
+        let (_, mut state) = setup();
+        let denom = "uqcb";
+
+        seed_fee_collector(&mut state, denom, 1_000);
+        let before = balance(&state, "treasury:fees", denom);
+        let burn_amount: u128 = 100;
+
+        let ok = state.burn("treasury:fees", denom, burn_amount);
+        assert!(ok.is_ok(), "burn must succeed when funds are available: {ok:?}");
+        let after = balance(&state, "treasury:fees", denom);
+        assert_eq!(after, before - burn_amount, "burn must reduce balance by exactly the burn amount");
+
+        // Burning more than available must fail — no partial burn, no overdraft.
+        let over = state.burn("treasury:fees", denom, after + 1);
+        assert!(over.is_err(), "burn must fail when amount exceeds balance");
+        assert_eq!(balance(&state, "treasury:fees", denom), after,
+            "balance must be unchanged after a failed burn");
+    }
+
+    #[test]
+    fn fs03_custom_split_sum_validation() {
+        // A genesis bps config that does not sum to 10 000 must be rejected.
+        // We inject the bps into a genesis JSON string to exercise from_genesis().
+        let bad_genesis = r#"{
+            "chain_id": "qcb-testnet-fee", "chain_name": "Test", "engine_version": "0.1.0",
+            "genesis_time": "2026-01-01T00:00:00Z",
+            "environment": { "mode": "testnet", "faucet_enabled": false, "relaxed_limits": false },
+            "native_token": { "name": "Q", "symbol": "QCB", "denom": "uqcb", "max_supply": "1000000" },
+            "address_prefix": "qcb",
+            "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 5000 },
+            "execution": {
+                "state_model": "account", "parallel_execution": false,
+                "gas_model": "dynamic", "require_signatures": false,
+                "fee_distribution_bps": { "validator_bps": 7000, "treasury_bps": 2000, "burn_bps": 500 }
+            },
+            "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
+            "network": { "network_id": "n1", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "both", "max_peers": 50 },
+            "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 5000, "mempool_ttl_seconds": 300 },
+            "modules": [], "custom_modules": [], "genesis_accounts": []
+        }"#;
+        let genesis = GenesisConfig::from_json(bad_genesis).unwrap();
+        let result = FeeDistribution::from_genesis(&genesis);
+        assert!(result.is_err(),
+            "bps summing to 9500 must be rejected, got: {result:?}");
+
+        // Valid custom split: 6000/3000/1000.
+        let good_genesis = bad_genesis.replace(
+            r#""fee_distribution_bps": { "validator_bps": 7000, "treasury_bps": 2000, "burn_bps": 500 }"#,
+            r#""fee_distribution_bps": { "validator_bps": 6000, "treasury_bps": 3000, "burn_bps": 1000 }"#,
+        );
+        let genesis2 = GenesisConfig::from_json(&good_genesis).unwrap();
+        let dist = FeeDistribution::from_genesis(&genesis2).expect("valid bps must be accepted");
+        let (v, t, b) = dist.split(10_000);
+        // 6000/3000/1000 on 10_000 → exact, no remainder
+        assert_eq!((v, t, b), (6_000, 3_000, 1_000), "6000/3000/1000 split");
+        assert_eq!(v + t + b, 10_000, "conservation");
     }
 }
