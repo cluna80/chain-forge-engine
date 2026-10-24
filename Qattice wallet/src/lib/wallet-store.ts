@@ -190,7 +190,7 @@ export const useWallet = create<State>()(
         if (identity) {
           update.attestations = identity.attestation_count;
           update.attested_by = identity.attested_by;
-          if (identity.tier) update.tier = identity.tier as Tier;
+          if (identity.tier) update.tier = identity.tier.toLowerCase() as Tier;
         }
         set(update);
       },
