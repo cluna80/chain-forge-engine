@@ -10821,4 +10821,291 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // QPC-CONS-001-AV3
+    // Revocation of an actively-voting validator (registered key, power > 0).
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    // Acceptance criteria:
+    //   Phase A–C — same real on-chain identity + bond + epoch admission as AV2.
+    //   Phase C.key — RegisterValidatorKey → next block → voting_power > 0;
+    //                 Eve's signed prevote is accepted by receive_vote.
+    //   Phase D     — real RevokeAttestation → Eve drops to Provisional.
+    //   Phase E     — next propose_block: pop_verified refresh sees Provisional
+    //                 → pop_verified=false → gate_voting_power zeros power.
+    //                 Eve's signed prevote is now rejected by receive_vote.
+    //   Phase F     — exclusion survives restart.
+    //
+    // Effective revocation boundary: the consensus ValidatorSet pop_verified /
+    // voting_power refresh runs EVERY block (not only at epoch boundaries).
+    // The registry revoke_pop fires at the next epoch boundary (IP3). Both are
+    // verified here.
+    #[tokio::test]
+    async fn revocation_zeros_voting_power_for_keyed_active_validator() {
+        use chain_forge_consensus::{VoteType, Vote};
+        use chain_forge_execution::{Transaction, TxBody};
+        use chain_forge_identity::VerificationTier;
+
+        // Use a keyed_candidate so the account's signing key can authorize the
+        // RegisterValidatorKey tx (which always requires a real account signature,
+        // even when require_signatures=false; see verify_authorization_for).
+        // The same keypair is reused as the consensus keypair — standard V1 PoP
+        // path used by all single-key-pair validators.
+        let (eve_kp, eve_addr) = keyed_candidate("seed-av3-eve");
+        let e = eve_addr.as_str(); // shorthand
+
+        let dir = std::env::temp_dir()
+            .join(format!("cf-qpc-cons-001-av3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        node.set_data_dir(dir.clone()).unwrap();
+
+        // ── Phase A: real on-chain identity path ──
+
+        // h0 → h1: fund Eve (alice nonce=0)
+        node.submit_tx(Transaction::transfer(
+            "fund-eve-av3", "qcb1alice", e, "uqcb", 2_100_000, 0,
+        ));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        // h1 → h2: RegisterIdentity (nonce=0, unsigned — require_signatures=false)
+        node.submit_tx(Transaction::register_identity("reg-eve-av3", e, 0));
+        let cert1 = node.propose_block(cert0.block_hash.clone()).await.unwrap();
+
+        // h2 → h3: Attest×3 → Verified
+        node.submit_tx(Transaction::attest("a-bob-eve-av3",   "qcb1bob",   e, 0));
+        node.submit_tx(Transaction::attest("a-carol-eve-av3", "qcb1carol", e, 0));
+        node.submit_tx(Transaction::attest("a-dave-eve-av3",  "qcb1dave",  e, 0));
+        let cert2 = node.propose_block(cert1.block_hash.clone()).await.unwrap();
+
+        {
+            let rec = node.identity.get(e).expect("Eve must exist after Attest×3");
+            assert!(matches!(rec.charm.tier, VerificationTier::Verified),
+                "Phase A: must be Verified; got {:?}", rec.charm.tier);
+        }
+
+        // ── Phase B: BondValidator with owner_identity_id ──
+
+        // h3 → h4: BondValidator (nonce=1, unsigned)
+        node.submit_tx(Transaction {
+            id:           "bond-eve-av3".into(),
+            sender:       e.to_string(),
+            nonce:        1,
+            body:         TxBody::BondValidator {
+                              amount:            1_000_000,
+                              owner_identity_id: Some(e.to_string()),
+                          },
+            gas_limit:    50_000,
+            signature:    vec![],
+            public_key:   vec![],
+            pq_signatures: vec![],
+            sig_scheme:   None,
+            pq_public_key: vec![],
+        });
+        let cert3 = node.propose_block(cert2.block_hash.clone()).await.unwrap();
+
+        assert!(
+            node.bond_owner_bindings.get(e).map(|o| o == e).unwrap_or(false),
+            "Phase B: bond_owner_bindings must record {e} → {e}"
+        );
+
+        // ── Phase C: epoch boundary (h5) admits Eve with pop_verified=true ──
+        //
+        // validator_epoch_blocks=5 → epoch rolls at height 5 (5/5=1).
+        //   h3: BondValidator  (cert3) → current_height=4 after
+        //   h4: filler         (cert4) → current_height=5 after
+        //   h5: epoch boundary (cert5) → Eve admitted
+        let cert4 = node.propose_block(cert3.block_hash.clone()).await.unwrap();
+        let cert5 = node.propose_block(cert4.block_hash.clone()).await.unwrap();
+
+        {
+            let vs = node.consensus.validator_set();
+            let eve_vs = vs.validators.iter().find(|v| v.id.0 == e)
+                .expect("Phase C: Eve must be in the live validator set after epoch boundary");
+            assert!(eve_vs.pop_verified,
+                "Phase C: Eve must be pop_verified=true in the validator set");
+            // voting_power = 0 at this point — no consensus key yet (AV2 verified this).
+        }
+
+        // ── Phase C.key: RegisterValidatorKey → voting_power > 0 ──
+        //
+        // The RegisterValidatorKey tx always requires a real account signature
+        // (verify_authorization_for, regardless of require_signatures).
+        // eve_kp was generated from the keyed_candidate seed, so its derived
+        // address is eve_addr — the signature is valid for this sender.
+        //
+        // Per PQ-VAL-003 R6, power is held at 0 for one block after key
+        // registration; the next block's refresh restores it.
+        //
+        // h5 → h6: RegisterValidatorKey (nonce=2, signed by eve_kp).
+        // Power activates on the same block as key registration (no gap in this engine).
+        node.submit_tx(register_key_tx(e, 2, &eve_kp, node.chain_id()));
+        let cert6 = node.propose_block(cert5.block_hash.clone()).await.unwrap();
+
+        {
+            let explorer = node.explorer.lock().unwrap();
+            let r = explorer.txs.get(&format!("regkey-{e}-2"))
+                .expect("RegisterValidatorKey tx must be in explorer");
+            assert!(r.success,
+                "Phase C.key: RegisterValidatorKey must succeed; error={:?}", r.error);
+        }
+
+        let eve_power_before: u64;
+        {
+            let vs = node.consensus.validator_set();
+            let eve_vs = vs.validators.iter().find(|v| v.id.0 == e)
+                .expect("Phase C.key: Eve must remain in the validator set after key registration");
+            assert!(!eve_vs.public_key.is_empty(),
+                "Phase C.key: Eve must have a registered consensus key");
+            assert!(eve_vs.voting_power > 0,
+                "Phase C.key: Eve must have voting_power > 0 after RegisterValidatorKey");
+            assert!(eve_vs.pop_verified,
+                "Phase C.key: Eve must still be pop_verified=true");
+            eve_power_before = eve_vs.voting_power;
+        }
+
+        let cert7 = &cert6; // alias — no extra block needed
+
+        // Verify Eve's signed prevote is ACCEPTED.
+        {
+            let height = node.consensus.current_height();
+            let round  = node.consensus.current_round();
+            let bytes = vote_signing_bytes(
+                node.chain_id(), &VoteType::Prevote, height, round, Some(&cert7.block_hash),
+            );
+            let sig = ClassicalScheme.sign(&bytes, &eve_kp).unwrap();
+            let vote = Vote {
+                vote_type:  VoteType::Prevote,
+                height,
+                round,
+                validator:  chain_forge_consensus::ValidatorId(e.to_string()),
+                block_hash: Some(cert7.block_hash.clone()),
+                signature:  sig.bytes,
+                scheme:     Vote::default_scheme(),
+            };
+            node.consensus.receive_vote(vote).await
+                .expect("Phase C.key: Eve's signed prevote must be ACCEPTED \
+                         (pop_verified=true, voting_power > 0)");
+        }
+
+        // ── Phase D: real RevokeAttestation drops Eve to Provisional ──
+        //
+        // Bob nonce=1 (after Attest at h2). Count 3→2 < ATTESTATION_QUORUM=3.
+        node.submit_tx(Transaction::revoke_attestation(
+            "rev-bob-eve-av3", "qcb1bob", e, 1,
+        ));
+        let cert8 = node.propose_block(cert7.block_hash.clone()).await.unwrap();
+
+        {
+            let tier = node.identity.get(e)
+                .map(|r| r.charm.tier.clone())
+                .expect("Eve must have an identity record after revocation");
+            assert!(matches!(tier, VerificationTier::Provisional),
+                "Phase D: Eve must be Provisional after RevokeAttestation; got {tier:?}");
+        }
+
+        // ── Phase E: next block — pop_verified refresh zeros Eve's voting_power ──
+        //
+        // The consensus ValidatorSet refresh runs every block (not only at epoch
+        // boundaries).  The block immediately after RevokeAttestation sees
+        // Provisional → pop_verified=false → gate_voting_power zeros power.
+        let cert9 = node.propose_block(cert8.block_hash.clone()).await.unwrap();
+        let _ = cert9;
+
+        {
+            let vs = node.consensus.validator_set();
+            let eve_vs = vs.validators.iter().find(|v| v.id.0 == e)
+                .expect("Phase E: Eve must remain in the validator set (seat kept, power zeroed)");
+            assert!(!eve_vs.pop_verified,
+                "Phase E: Eve must be pop_verified=false in the consensus set after revocation block");
+            assert_eq!(eve_vs.voting_power, 0,
+                "Phase E: Eve's voting_power must be 0 after pop_verified=false \
+                 (gate_voting_power); was {} before revocation", eve_power_before);
+        }
+
+        // Verify Eve's signed prevote is now REJECTED.
+        {
+            let height = node.consensus.current_height();
+            let round  = node.consensus.current_round();
+            let bytes = vote_signing_bytes(
+                node.chain_id(), &VoteType::Prevote, height, round, Some(&cert8.block_hash),
+            );
+            let sig = ClassicalScheme.sign(&bytes, &eve_kp).unwrap();
+            let vote = Vote {
+                vote_type:  VoteType::Prevote,
+                height,
+                round,
+                validator:  chain_forge_consensus::ValidatorId(e.to_string()),
+                block_hash: Some(cert8.block_hash.clone()),
+                signature:  sig.bytes,
+                scheme:     Vote::default_scheme(),
+            };
+            // receive_vote must reject: voting_power=0 means Eve can't contribute to quorum.
+            let result = node.consensus.receive_vote(vote).await;
+            assert!(
+                result.is_err(),
+                "Phase E: Eve's signed prevote must be REJECTED after revocation \
+                 (voting_power=0, pop_verified=false)"
+            );
+        }
+
+        // ── Phase E.registry: next epoch boundary — IP3 revoke_pop in registry ──
+        //
+        // validator_epoch_blocks=5.  Heights so far: 0–9 (cert0–cert9).
+        // Next epoch boundary at height 10 (10/5=2).  Advance there.
+        let h_e2a = node.propose_block(cert8.block_hash.clone()).await.unwrap();
+        let h_e2b = node.propose_block(h_e2a.block_hash.clone()).await.unwrap();
+        let _ = node.propose_block(h_e2b.block_hash.clone()).await.unwrap();
+
+        {
+            let eve_reg = node.validator_registry.get(e)
+                .expect("Eve must be in the registry");
+            assert!(!eve_reg.pop_verified,
+                "Phase E.registry: Eve must be pop_verified=false in the registry after IP3 sweep");
+            assert_eq!(eve_reg.status, chain_forge_validators::ValidatorStatus::Candidate,
+                "Phase E.registry: Eve must be Candidate after IP3 revoke_pop sweep");
+            assert_eq!(eve_reg.consensus_power(), 0,
+                "Phase E.registry: Eve's consensus_power must be 0 after revocation");
+        }
+
+        // ── Phase F: exclusion survives node restart ──
+        node.persist_state();
+        drop(node);
+
+        let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state(),
+            "Phase F: load_persisted_state must succeed");
+
+        // Bond-owner binding must be restored.
+        assert!(
+            restarted.bond_owner_bindings.get(e).map(|o| o == e).unwrap_or(false),
+            "Phase F: bond_owner_bindings must survive restart"
+        );
+
+        // Eve's revoked state must survive restart in the consensus set.
+        {
+            let vs = restarted.consensus.validator_set();
+            let eve_vs = vs.validators.iter().find(|v| v.id.0 == e)
+                .expect("Phase F: Eve must be in the restored validator set");
+            assert!(!eve_vs.pop_verified,
+                "Phase F: Eve's pop_verified=false must survive restart");
+            assert_eq!(eve_vs.voting_power, 0,
+                "Phase F: Eve's voting_power=0 must survive restart");
+        }
+
+        // And in the registry.
+        let eve_reg_after = restarted.validator_registry.get(e)
+            .expect("Phase F: Eve must be in the registry after restart");
+        assert!(!eve_reg_after.pop_verified,
+            "Phase F: Eve's registry pop_verified=false must survive restart");
+        assert_eq!(eve_reg_after.status, chain_forge_validators::ValidatorStatus::Candidate,
+            "Phase F: Eve's Candidate status must survive restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
