@@ -5,6 +5,7 @@ const config: CapacitorConfig = {
   appName: "Qattice",
   webDir: "dist-cap",
   android: {
+    allowMixedContent: true,
     buildOptions: {
       // Produce a debug APK by default. For release: set keystorePath etc.
     },
