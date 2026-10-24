@@ -666,6 +666,26 @@ Integrates with: `PersonhoodMultisig`, `SponsorID`, `AgentTreasury`, Enterprise 
 
 **Prerequisite**: Phase 1 complete.
 
+### Identity Pilot — Staged Vision
+
+The ceremony today isn't a limitation — it is the honest first step of a ladder where each stage makes human involvement smaller and cryptographic proof stronger, ending with something no other chain has: post-quantum, privacy-preserving, device-native personhood that other protocols can query instead of building their own.
+
+**Stage 1 — Bootstrap (can start now)**
+- You + 2 trusted people form the genesis verified set; round-robin attest each other on a video call, then collectively verify relatives and early testers.
+- Measure: time per person, friction, cost toward the <$5/human target; <3% sybil rate.
+
+**Stage 2 — Wallet Liveness (near-term engineering)**
+- Wallet generates randomized real-time challenges during the ceremony; person must respond live — proves a human is holding the device.
+- Makes the ceremony harder to fake even before ZK. Built on top of the QR scan-to-sign flow already running on the Galaxy A15.
+
+**Stage 3 — ZK Credential (QCB-PM-001, medium term)**
+- Wallet produces a zero-knowledge proof: "I am a verified unique human" without revealing which human.
+- No iris scan, no government ID, no hardware token. This is where Qattice leaps ahead of most competitors on privacy.
+
+**Stage 4 — Universal Proof of Personhood (long term)**
+- Other protocols query Qattice's identity layer instead of building their own.
+- The chain becomes post-quantum identity infrastructure for the broader ecosystem.
+
 | Item | Status | Notes |
 |------|--------|-------|
 | Identity pilot design — cost/sybil targets finalized | ❓ | Provisional: <3% sybil rate, <$5/verification; see Open Q1 |
