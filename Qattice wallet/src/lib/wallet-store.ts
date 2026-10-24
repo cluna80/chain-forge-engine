@@ -197,7 +197,7 @@ export const useWallet = create<State>()(
       attest: async () => {
         const s = get();
         if (s.tier === "verified") return { ok: false, error: "Already verified." };
-        const body = { type: "Attest", claimant_id: getAddress() };
+        const body = { Attest: { claimant_id: getAddress() } };
         const result = await submitNodeTx({
           chain_id: (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle",
           sender: getAddress(),
