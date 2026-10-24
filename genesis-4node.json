@@ -17,7 +17,7 @@
   "address_prefix": "qcb",
   "consensus": {
     "type": "proof-of-stake",
-    "validator_set_size": 4,
+    "validator_set_size": 1,
     "block_time_ms": 1000,
     "personhood_weighted": true
   },
@@ -74,21 +74,21 @@
       "label": "Bob",
       "address": "qcb1bob",
       "balance": "100000000",
-      "role": "validator",
+      "role": "user",
       "public_key": "e88d88dcfb29e249468eb7ecac131b3cfe6af53c6ebe7eb3d771ce4c2b0bbb02"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
       "balance": "100000000",
-      "role": "validator",
+      "role": "user",
       "public_key": "6a5d93dee87bc3b9a62476ec3ff1f6290c133e53fd86add16e4ef4327a5ff2fa"
     },
     {
       "label": "Dave",
       "address": "qcb1dave",
       "balance": "100000000",
-      "role": "validator",
+      "role": "user",
       "public_key": "e6e0a2a2b21db8a99ad877e4a3cf88ddad5009fe704fd7fa904d8b5a5d4f490f"
     },
     {
