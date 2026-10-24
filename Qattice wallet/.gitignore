@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-cap/
+.env
+.env.local
+
+# Android build outputs (keep android/ project source in git)
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
