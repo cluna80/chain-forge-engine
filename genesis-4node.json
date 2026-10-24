@@ -4,7 +4,7 @@
   "engine_version": "0.1.0",
   "genesis_time": "2026-09-28T00:00:00Z",
   "environment": {
-    "mode": "testnet",
+    "mode": "devnet",
     "faucet_enabled": true,
     "relaxed_limits": true
   },
@@ -38,12 +38,7 @@
     "network_id": "qcb-testnet-4node",
     "p2p_port": 26656,
     "rpc_port": 26657,
-    "bootstrap_nodes": [
-      "/ip4/192.168.137.2/tcp/26656",
-      "/ip4/192.168.137.2/tcp/26657",
-      "/ip4/192.168.137.2/tcp/26658",
-      "/ip4/192.168.137.3/tcp/26659"
-    ],
+    "bootstrap_nodes": [],
     "peer_discovery": "mdns",
     "max_peers": 10
   },
