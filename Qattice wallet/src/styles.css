@@ -1,0 +1,60 @@
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,520;0,9..144,640;1,9..144,520&family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Fraunces", ui-serif, Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  --color-ink: #12110e;
+  --color-panel: #1c1a16;
+  --color-raised: #26231c;
+  --color-line: #3d372c;
+  --color-parchment: #f3ecdf;
+  --color-mist: #a89b88;
+  --color-brass: #d7a15a;
+  --color-clay: #c45c48;
+
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+}
+
+@layer base {
+  html,
+  body {
+    background: var(--color-ink);
+    color: var(--color-parchment);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: var(--color-brass);
+    color: var(--color-ink);
+  }
+}
+
+.lattice {
+  background-image: radial-gradient(var(--color-line) 0.7px, transparent 0.75px);
+  background-size: 18px 18px;
+}
+
+.qr-frame svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
