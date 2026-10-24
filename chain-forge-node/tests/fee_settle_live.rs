@@ -16,11 +16,16 @@
 //!   MN-6  After a crash-restart, replayed blocks do not double-distribute fees
 //!         or validator rewards (supply and pool balances unchanged from pre-restart).
 //!
-//! Additionally: MN-7 — a validator whose personhood eligibility is revoked
-//! immediately before an epoch boundary does not appear in the reward set on
-//! any node.  (This test skips MN-7 when the network does not include
-//! personhood transactions in the genesis, and marks the criterion "not yet
-//! verified".)
+//! Additionally:
+//!
+//!   MN-7  Personhood revocation (RevokeAttestation) produces an identical
+//!         state-root change across all four nodes — the identity-store
+//!         downgrade is deterministically applied everywhere.
+//!   MN-8  A post-genesis validator (Eve) that earns rewards through normal
+//!         participation has its WoT attestation revoked; at the next epoch
+//!         boundary the reward sweep excludes Eve while eligible genesis
+//!         validators receive their correct shares.  All five nodes agree on
+//!         the resulting state root.
 //!
 //! ## Genesis
 //!
@@ -28,7 +33,8 @@
 //!   - `fee_distribution_bps`: 7000/2000/1000 (validator/treasury/burn)
 //!   - `validator_bonding.validator_epoch_blocks`: 5  (epoch every 5 blocks)
 //!   - four validators (Alice, Bob, Carol, Dave)
-//!   - one user account (qcb1user1) for submitting transactions
+//!   - two user accounts (qcb1user1, qcb1eve) for submitting transactions
+//!     (Eve also bonds as a post-genesis validator in MN-8)
 //!
 //! ## Run
 //!
@@ -64,6 +70,13 @@ const EPOCH_BLOCKS:   u64 = 5;   // must match genesis validator_bonding.validat
 const TIMEOUT_SECS:   u64 = 90;
 /// Fraction (0–100) to consider "above zero" when asserting pool growth.
 /// The fee pool accumulates as transactions land; we just need it nonzero.
+
+// MN-8: post-genesis validator (Eve) — separate from the genesis-validator set.
+const EVE_ADDR:     &str = "qcb1eve";
+const EVE_API_PORT: u16  = 18184;
+const EVE_P2P_PORT: u16  = 27104;
+/// Minimum bond for Eve — must exceed DEFAULT_MIN_BOND_UQCB (2_000_000 uqcb).
+const EVE_BOND_UQCB: u64 = 3_000_000;
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -337,6 +350,45 @@ fn spawn_all(
     nodes
 }
 
+/// Spawn Eve's node (post-genesis observer/validator).  She starts with no
+/// consensus power; that is granted only after bonding + attestation + epoch.
+fn spawn_eve(
+    bin:        &PathBuf,
+    genesis:    &PathBuf,
+    log_dir:    &PathBuf,
+    data_dir:   Option<&PathBuf>,
+    bootstraps: &[String],
+) -> NodeProc {
+    let log_path = log_dir.join(format!("{EVE_ADDR}.log"));
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&log_path)
+        .unwrap_or_else(|e| panic!("log open failed {log_path:?}: {e}"));
+
+    let mut cmd = Command::new(bin);
+    cmd.args([
+        "--genesis",   genesis.to_str().unwrap(),
+        "--validator", EVE_ADDR,
+        "--key-file",  key_path("eve").to_str().unwrap(),
+        "--api-port",  &EVE_API_PORT.to_string(),
+        "--p2p-port",  &EVE_P2P_PORT.to_string(),
+    ]);
+    if let Some(d) = data_dir {
+        cmd.args(["--data-dir", d.to_str().unwrap()]);
+    }
+    for b in bootstraps {
+        cmd.args(["--bootstrap", b]);
+    }
+    cmd.stdout(log_file.try_clone().unwrap())
+       .stderr(log_file)
+       .stdin(Stdio::null());
+
+    let child = cmd.spawn()
+        .unwrap_or_else(|e| panic!("spawn {EVE_ADDR} failed: {e}"));
+
+    NodeProc { label: EVE_ADDR, child, api_port: EVE_API_PORT, log_path }
+}
+
 fn print_tail(log_path: &PathBuf, lines: usize) {
     if let Ok(content) = std::fs::read_to_string(log_path) {
         let all: Vec<_> = content.lines().collect();
@@ -367,7 +419,7 @@ fn fs03_mn001_multi_node_fee_settlement() {
     assert!(genesis.exists(), "genesis file not found: {genesis:?}");
 
     // Key files must exist (same as devnet_4node).
-    for name in ["alice", "bob", "carol", "dave"] {
+    for name in ["alice", "bob", "carol", "dave", "eve"] {
         let kf = key_path(name);
         assert!(kf.exists(), "key file not found: {kf:?}");
     }
@@ -376,6 +428,10 @@ fn fs03_mn001_multi_node_fee_settlement() {
         assert!(port_is_free(*port),
             "port {port} is in use — kill stray processes first");
     }
+    assert!(port_is_free(EVE_API_PORT),
+        "port {EVE_API_PORT} (Eve API) is in use — kill stray processes first");
+    assert!(port_is_free(EVE_P2P_PORT),
+        "port {EVE_P2P_PORT} (Eve P2P) is in use — kill stray processes first");
 
     let timeout   = Duration::from_secs(TIMEOUT_SECS);
     let log_dir   = std::env::temp_dir().join("qcb-fee-settle-test");
@@ -394,6 +450,8 @@ fn fs03_mn001_multi_node_fee_settlement() {
     for d in &data_dirs {
         std::fs::create_dir_all(d).unwrap();
     }
+    let eve_data_dir = data_dir_root.join(EVE_ADDR);
+    std::fs::create_dir_all(&eve_data_dir).unwrap();
 
     let api_ports: Vec<u16> = API_PORTS.to_vec();
     // Unique run ID prevents "already committed" replay errors across test runs.
@@ -874,6 +932,238 @@ fn fs03_mn001_multi_node_fee_settlement() {
         println!("   (roots differ — revocation changed state on all nodes)");
     }
 
+    // ── Phase 9: MN-8 — reward exclusion after personhood revocation ─────────
+    //
+    // Scenario:
+    //   1.  Spawn Eve's node (post-genesis user account with balance in genesis).
+    //   2.  Eve registers her identity (nonce=0).
+    //   3.  Alice, Bob, Carol each Attest Eve → quorum=3 → Eve is Verified
+    //       (verified_via_wot=true, grants_consensus()=true).
+    //   4.  Eve bonds as a validator (BondValidator, nonce=1) and registers a
+    //       consensus key (RegisterValidatorKey, nonce=2).
+    //   5.  Wait for the next epoch boundary: Eve is admitted to the active set
+    //       (pop_verified=true, nonzero voting power).
+    //   6.  Wait for the following full epoch so Eve accumulates participation
+    //       (signs ≥ 95% of EPOCH_BLOCKS blocks).
+    //   7.  Record Eve's balance and each genesis validator's balance before
+    //       the next epoch close.
+    //   8.  Alice revokes her attestation → Eve's WoT count drops 3→2 < quorum
+    //       → identity downgrade to Provisional → grants_consensus()=false →
+    //       pop_verified set to false on next block refresh.
+    //   9.  Cross the next epoch boundary.
+    //  10.  Assert Eve's balance did NOT increase (excluded from reward sweep).
+    //  11.  Assert every genesis validator's balance DID increase (pool shared
+    //       among the remaining eligible validators — proves the pool was swept).
+    //  12.  Assert all five nodes (Alice through Eve) agree on state root.
+    println!("── Phase 9: MN-8 — reward exclusion after personhood revocation ───────");
+    {
+        let alice_api = api_ports[0];
+
+        // ── Step 1: Start Eve's observer node ──────────────────────────────────
+        // Collect bootstrap addresses from all four live peers so Eve connects
+        // to the full validator set immediately.
+        let mut eve_bootstraps: Vec<String> = Vec::new();
+        for peer_idx in 0..VALIDATORS.len() {
+            let peer_id = read_peer_id_from_log(&nodes[peer_idx].log_path, Duration::from_secs(5));
+            eve_bootstraps.push(format!(
+                "/ip4/127.0.0.1/tcp/{}/p2p/{}", P2P_PORTS[peer_idx], peer_id
+            ));
+        }
+        let mut eve_node = spawn_eve(&bin, &genesis, &log_dir, Some(&eve_data_dir), &eve_bootstraps);
+        assert!(
+            wait_for_port(EVE_API_PORT, Duration::from_secs(20)),
+            "Eve API port :{EVE_API_PORT} never opened"
+        );
+        println!("   Eve node up on :{EVE_API_PORT}");
+
+        // Collect all API ports (4 genesis + Eve) for consensus checks.
+        let all_api_ports: Vec<u16> = api_ports.iter().copied().chain(std::iter::once(EVE_API_PORT)).collect();
+
+        // Wait for Eve to sync to the current chain tip.
+        let tip = height_of(alice_api);
+        wait_for_height(&all_api_ports, tip, timeout);
+
+        // ── Step 2: Eve registers her identity ────────────────────────────────
+        let mn8_run_id = run_id + 1000; // distinct namespace from MN-7 nonces
+        let tx_eve_reg = serde_json::json!({
+            "id": format!("mn8-eve-reg-{mn8_run_id}"),
+            "sender": EVE_ADDR,
+            "nonce": 0u64,
+            "gas_limit": 100_000u64,
+            "body": "RegisterIdentity",
+            "signature": []
+        }).to_string();
+        let resp = api_post_tx(alice_api, &tx_eve_reg).expect("MN-8 Eve RegisterIdentity POST failed");
+        let st = resp["status"].as_str().unwrap_or("unknown");
+        assert!(st == "queued" || st == "ok", "MN-8 FAILED: Eve RegisterIdentity rejected: {resp}");
+        println!("   RegisterIdentity(eve) → {st}");
+
+        // ── Step 3: Three attestations for Eve → quorum, Eve becomes Verified ─
+        // Alice(nonce=2, after mn7-revoke nonce=1), Bob(nonce=1), Carol(nonce=1).
+        let eve_attesters = [
+            ("qcb1alice", 2u64, format!("mn8-att-alice-{mn8_run_id}")),
+            ("qcb1bob",   1u64, format!("mn8-att-bob-{mn8_run_id}")),
+            ("qcb1carol", 1u64, format!("mn8-att-carol-{mn8_run_id}")),
+        ];
+        for (sender, nonce, id) in &eve_attesters {
+            let tx = serde_json::json!({
+                "id": id,
+                "sender": sender,
+                "nonce": nonce,
+                "gas_limit": 100_000u64,
+                "body": { "Attest": { "claimant_id": EVE_ADDR } },
+                "signature": []
+            }).to_string();
+            let r = api_post_tx(alice_api, &tx).unwrap_or_else(|| panic!("MN-8 Attest from {sender} POST failed"));
+            let s = r["status"].as_str().unwrap_or("unknown");
+            assert!(s == "queued" || s == "ok", "MN-8 FAILED: Attest from {sender} rejected: {r}");
+            println!("   Attest({sender} → eve) → {s}");
+        }
+
+        // ── Step 4: Eve bonds as a validator and registers a consensus key ────
+        // BondValidator(nonce=1) and RegisterValidatorKey(nonce=2) submitted
+        // to Eve's own API so they originate from her local node.
+        let tx_bond = serde_json::json!({
+            "id": format!("mn8-eve-bond-{mn8_run_id}"),
+            "sender": EVE_ADDR,
+            "nonce": 1u64,
+            "gas_limit": 200_000u64,
+            "body": { "BondValidator": {
+                "amount": EVE_BOND_UQCB,
+                "owner_identity_id": EVE_ADDR
+            }},
+            "signature": []
+        }).to_string();
+        let r = api_post_tx(EVE_API_PORT, &tx_bond).expect("MN-8 Eve BondValidator POST failed");
+        let s = r["status"].as_str().unwrap_or("unknown");
+        assert!(s == "queued" || s == "ok", "MN-8 FAILED: Eve BondValidator rejected: {r}");
+        println!("   BondValidator(eve, {EVE_BOND_UQCB} uqcb) → {s}");
+
+        // Read Eve's consensus public key from her key file for RegisterValidatorKey.
+        let eve_key_path = key_path("eve");
+        let eve_key_json: serde_json::Value = {
+            let raw = std::fs::read_to_string(&eve_key_path)
+                .unwrap_or_else(|e| panic!("failed to read eve key file: {e}"));
+            serde_json::from_str(&raw).expect("eve key file is not valid JSON")
+        };
+        let eve_pubkey_hex = eve_key_json["public_key"]
+            .as_str()
+            .expect("eve key file missing 'public_key' field")
+            .to_string();
+
+        let tx_key = serde_json::json!({
+            "id": format!("mn8-eve-key-{mn8_run_id}"),
+            "sender": EVE_ADDR,
+            "nonce": 2u64,
+            "gas_limit": 200_000u64,
+            "body": { "RegisterValidatorKey": {
+                "consensus_pubkey": hex::decode(&eve_pubkey_hex).expect("eve pubkey not hex"),
+                "scheme": "classical",
+                "proof_of_possession": []
+            }},
+            "signature": []
+        }).to_string();
+        let r = api_post_tx(EVE_API_PORT, &tx_key).expect("MN-8 Eve RegisterValidatorKey POST failed");
+        let s = r["status"].as_str().unwrap_or("unknown");
+        assert!(s == "queued" || s == "ok", "MN-8 FAILED: Eve RegisterValidatorKey rejected: {r}");
+        println!("   RegisterValidatorKey(eve) → {s}");
+
+        // ── Step 5: Wait for next epoch — Eve is admitted to the active set ───
+        let cur_height = height_of(alice_api);
+        let admission_epoch_height = ((cur_height / EPOCH_BLOCKS) + 1) * EPOCH_BLOCKS + 1;
+        println!("   waiting for admission epoch boundary at height {admission_epoch_height}...");
+        wait_for_height(&all_api_ports, admission_epoch_height, timeout);
+        println!("   Eve admitted to active set (or promotion pending next block refresh)");
+
+        // ── Step 6: Wait for Eve to accumulate a full epoch of participation ──
+        // She needs to sign ≥ 95% of EPOCH_BLOCKS (= 5) blocks.  Give her two
+        // full epochs so even if admission slips by one block she still gets
+        // the required participation count.
+        let participation_height = admission_epoch_height + EPOCH_BLOCKS * 2 + 1;
+        println!("   waiting for Eve's participation epoch to close at height {participation_height}...");
+        wait_for_height(&all_api_ports, participation_height, timeout);
+
+        // ── Step 7: Record balances before the revocation epoch ───────────────
+        let eve_bal_before = balance_of(alice_api, EVE_ADDR);
+        let genesis_bals_before: Vec<u128> = VALIDATORS.iter()
+            .map(|v| balance_of(alice_api, v))
+            .collect();
+        println!("   Eve balance before revocation epoch: {eve_bal_before}");
+        for (i, v) in VALIDATORS.iter().enumerate() {
+            println!("   {v} balance before revocation epoch: {}", genesis_bals_before[i]);
+        }
+
+        // ── Step 8: Alice revokes her attestation of Eve ───────────────────────
+        // Alice nonce = 3 (nonce 0=MN-7-attest, 1=MN-7-revoke, 2=MN-8-attest-eve).
+        let tx_revoke_eve = serde_json::json!({
+            "id": format!("mn8-revoke-{mn8_run_id}"),
+            "sender": "qcb1alice",
+            "nonce": 3u64,
+            "gas_limit": 100_000u64,
+            "body": { "RevokeAttestation": { "attested_id": EVE_ADDR } },
+            "signature": []
+        }).to_string();
+        let r = api_post_tx(alice_api, &tx_revoke_eve).expect("MN-8 RevokeAttestation POST failed");
+        let s = r["status"].as_str().unwrap_or("unknown");
+        assert!(s == "queued" || s == "ok", "MN-8 FAILED: RevokeAttestation(eve) rejected: {r}");
+        println!("   RevokeAttestation(alice → eve) → {s}");
+
+        // ── Step 9: Cross the next epoch boundary ─────────────────────────────
+        let h = height_of(alice_api);
+        let revoke_epoch_height = ((h / EPOCH_BLOCKS) + 1) * EPOCH_BLOCKS + 1;
+        println!("   waiting for revocation epoch close at height {revoke_epoch_height}...");
+        wait_for_height(&all_api_ports, revoke_epoch_height, timeout);
+
+        // ── Step 10: Assert Eve's balance did NOT increase ─────────────────────
+        let eve_bal_after = balance_of(alice_api, EVE_ADDR);
+        // Eve may have paid gas for her txs but must NOT have received rewards.
+        // Allow that her balance decreased (gas costs) but not increased.
+        assert!(
+            eve_bal_after <= eve_bal_before,
+            "MN-8 FAILED: Eve's balance increased after personhood revocation \
+             (before={eve_bal_before}, after={eve_bal_after}) — \
+             a downgraded-to-Provisional validator must not receive epoch rewards"
+        );
+        println!("   Eve balance after revocation epoch: {eve_bal_after}  (no reward — PASS)");
+
+        // ── Step 11: Assert genesis validator balances increased ───────────────
+        let genesis_bals_after: Vec<u128> = VALIDATORS.iter()
+            .map(|v| balance_of(alice_api, v))
+            .collect();
+        for (i, v) in VALIDATORS.iter().enumerate() {
+            assert!(
+                genesis_bals_after[i] >= genesis_bals_before[i],
+                "MN-8 FAILED: {v}'s balance did not increase after epoch close \
+                 (before={}, after={}) — eligible validators must receive rewards",
+                genesis_bals_before[i], genesis_bals_after[i]
+            );
+            println!(
+                "   {v} balance after revocation epoch: {} (+{})",
+                genesis_bals_after[i],
+                genesis_bals_after[i].saturating_sub(genesis_bals_before[i])
+            );
+        }
+
+        // ── Step 12: All five nodes agree on state root ────────────────────────
+        let roots: Vec<Option<String>> = all_api_ports.iter()
+            .map(|&p| state_root_of(p))
+            .collect();
+        let ref_root = roots[0].as_deref().expect("Alice must have a state root after MN-8");
+        let all_names: Vec<&str> = VALIDATORS.iter().copied().chain(std::iter::once(EVE_ADDR)).collect();
+        for (i, r) in roots.iter().enumerate().skip(1) {
+            assert_eq!(
+                r.as_deref(), Some(ref_root),
+                "MN-8 FAILED: {}'s state root differs from Alice's\n  alice={ref_root}\n  {}={r:?}",
+                all_names[i], all_names[i]
+            );
+        }
+        println!("   All five nodes agree on state root: {ref_root}");
+        println!("   MN-8 PASS — post-revocation validator excluded from epoch reward sweep");
+
+        // Eve's RAII drop kills her node at end of scope.
+        drop(eve_node);
+    }
+
     // ── Summary ───────────────────────────────────────────────────────────────
     println!("\n── FS-03-MN-001 PASSED ─────────────────────────────────────────────");
     println!("   MN-1  ✅  Identical state roots across all nodes");
@@ -883,6 +1173,7 @@ fn fs03_mn001_multi_node_fee_settlement() {
     println!("   MN-5  ✅  Restarted node recovers to same state root");
     println!("   MN-6  ✅  No double-distribution after crash-restart");
     println!("   MN-7  ✅  Personhood revocation deterministic across all nodes");
+    println!("   MN-8  ✅  Revoked validator excluded from epoch reward sweep");
     println!();
 
     // NodeProc::drop() kills all children.

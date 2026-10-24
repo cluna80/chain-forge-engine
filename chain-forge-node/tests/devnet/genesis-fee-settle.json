@@ -99,6 +99,13 @@
       "balance": "10000000",
       "role": "user",
       "_comment": "10 QCB for submitting fee-bearing transactions during the test"
+    },
+    {
+      "label": "Eve",
+      "address": "qcb1eve",
+      "balance": "20000000",
+      "role": "user",
+      "_comment": "20 QCB: enough to bond as a post-genesis validator (MN-8)"
     }
   ],
   "attestation_coordinator": "qcb1alice",
