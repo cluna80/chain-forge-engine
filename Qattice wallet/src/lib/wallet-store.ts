@@ -201,6 +201,7 @@ export const useWallet = create<State>()(
         const chainId = (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle";
         // Register identity first if not yet on-chain
         const identity = await fetchNodeIdentity(addr);
+        let attestNonce = s.nonce;
         if (!identity?.registered) {
           const regResult = await submitNodeTx({
             id: `reg-${addr}`,
@@ -211,15 +212,17 @@ export const useWallet = create<State>()(
             body: "RegisterIdentity",
           });
           if (!regResult.ok) return { ok: false, error: `RegisterIdentity failed: ${regResult.error}` };
+          // reg consumed nonce s.nonce, attest must use s.nonce + 1
+          attestNonce = s.nonce + 1;
           // Wait briefly for the node to process before attesting
           await new Promise(r => setTimeout(r, 2000));
         }
         const body = { Attest: { claimant_id: addr } };
         const result = await submitNodeTx({
-          id: `attest-${addr}-${s.nonce}`,
+          id: `attest-${addr}-${attestNonce}`,
           chain_id: chainId,
           sender: addr,
-          nonce: s.nonce,
+          nonce: attestNonce,
           gas_limit: GAS_LIMIT,
           body,
         });
