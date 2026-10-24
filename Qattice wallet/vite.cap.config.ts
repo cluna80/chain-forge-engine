@@ -19,7 +19,8 @@ export default defineConfig({
     outDir: "dist-cap",
     emptyOutDir: true,
     rollupOptions: {
-      input: resolve(__dirname, "index.cap.html"),
+      input: { index: resolve(__dirname, "index.html") },
+      output: { entryFileNames: "assets/[name]-[hash].js" },
     },
   },
   resolve: {
