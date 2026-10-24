@@ -10263,4 +10263,233 @@ mod tests {
             "after re-verification, the sweep must leave Alice as pop_verified \
              because her identity tier now grants consensus");
     }
+
+    // ── QPC-CONS-001-AV: RevokeAttestation end-to-end lifecycle ─────────────
+
+    #[tokio::test]
+    async fn revoke_attestation_tx_triggers_epoch_boundary_validator_exclusion() {
+        // QPC-CONS-001-AV acceptance test.
+        //
+        // Exercises the full revocation lifecycle through the production code path:
+        //
+        //   Phase A — real on-chain txs advance a new identity to Verified:
+        //     1. RegisterIdentity Eve (nonce 0) → Provisional
+        //     2. Attest Bob→Eve, Carol→Eve, Dave→Eve via Attest txs → quorum reached,
+        //        Eve upgraded to Verified (verified_via_wot=true)
+        //
+        //   Phase B — Eve is registered as a validator (pop_verified=true):
+        //     Registry entry seeded directly, same pattern as genesis validators in
+        //     fund_bond_and_verify_personhood; acceptable because this test's focus
+        //     is the RevokeAttestation integration, not validator bonding.
+        //
+        //   Phase C — real RevokeAttestation tx drops Eve below attestation quorum:
+        //     3. RevokeAttestation Bob→Eve → attestation count drops 3→2, below
+        //        ATTESTATION_QUORUM=3; Eve downgraded to Provisional; events include
+        //        "tier_downgraded=true".
+        //
+        //   Phase D — epoch-boundary sweep through propose_block revokes Eve:
+        //     4. propose_block fires Integration Point 3 sweep; Eve's identity is now
+        //        Provisional (grants_consensus()=false) → revoke_pop called →
+        //        pop_verified=false, status=Candidate, consensus_power()=0.
+        //
+        //   Phase E — revocation survives node restart:
+        //     5. persist_state → restart → load_persisted_state → Eve still revoked.
+        //
+        // Note: commit_block is private; propose_block in single-node tests calls
+        // cast_and_broadcast_own_votes → commit_block internally, so every assert
+        // here exercises the same commit path that multi-node consensus uses.
+        use chain_forge_execution::Transaction;
+        use chain_forge_identity::VerificationTier;
+
+        let dir = std::env::temp_dir()
+            .join(format!("cf-qpc-cons-001-av-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        // ── Phase A: build Eve's identity to Verified via real on-chain txs ──
+
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        node.set_data_dir(dir.clone()).unwrap();
+
+        // Fund Eve so she can pay gas on RegisterIdentity.
+        // Alice's first tx → Alice nonce=0.
+        node.submit_tx(Transaction::transfer(
+            "fund-eve", "qcb1alice", "qcb1eve", "uqcb", 1_000_000, 0,
+        ));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        // RegisterIdentity for Eve → Eve nonce=0.
+        node.submit_tx(Transaction::register_identity("reg-eve", "qcb1eve", 0));
+        let cert1 = node.propose_block(cert0.block_hash.clone()).await.unwrap();
+
+        // Confirm Eve is now Provisional in the identity store.
+        {
+            let eve_tier = node.identity.get("qcb1eve")
+                .map(|r| r.charm.tier.clone())
+                .expect("Eve must have an identity record after RegisterIdentity");
+            assert!(
+                matches!(eve_tier, VerificationTier::Provisional),
+                "after RegisterIdentity: Eve must be Provisional, got {eve_tier:?}"
+            );
+        }
+
+        // Attest Eve to quorum via Bob (nonce=0), Carol (nonce=0), Dave (nonce=0).
+        node.submit_tx(Transaction::attest("attest-bob-eve",   "qcb1bob",   "qcb1eve", 0));
+        node.submit_tx(Transaction::attest("attest-carol-eve", "qcb1carol", "qcb1eve", 0));
+        node.submit_tx(Transaction::attest("attest-dave-eve",  "qcb1dave",  "qcb1eve", 0));
+        let cert2 = node.propose_block(cert1.block_hash.clone()).await.unwrap();
+
+        // Phase A assertion: Eve must now be Verified (verified_via_wot=true).
+        {
+            let eve_record = node.identity.get("qcb1eve")
+                .expect("Eve must have an identity record after Attest txs");
+            assert!(
+                matches!(eve_record.charm.tier, VerificationTier::Verified),
+                "Phase A: Eve must be Verified after 3 Attest txs reaching quorum; \
+                 got {:?}", eve_record.charm.tier
+            );
+            assert!(
+                eve_record.charm.verified_via_wot,
+                "Phase A: Eve must be verified_via_wot=true so RevokeAttestation \
+                 can later downgrade her tier"
+            );
+        }
+
+        // ── Phase B: seed Eve in the validator registry as Active+pop_verified ──
+        //
+        // Direct registry manipulation mirrors what the node does at genesis for
+        // genesis validators. This test's scope is the RevokeAttestation → sweep
+        // integration; validator bonding is a separate concern.
+        let current_epoch = node.identity.clock.current_epoch;
+        node.validator_registry
+            .register_genesis_validator("qcb1eve", current_epoch);
+        node.validator_registry
+            .confirm_pop("qcb1eve", VerificationTier::Verified, current_epoch)
+            .expect("Phase B: confirm_pop(Verified) must succeed for Eve");
+
+        {
+            let eve_reg = node.validator_registry.get("qcb1eve")
+                .expect("Eve must be in the validator registry after Phase B setup");
+            assert!(
+                eve_reg.pop_verified,
+                "Phase B: Eve must be pop_verified=true after confirm_pop(Verified)"
+            );
+            assert!(
+                eve_reg.consensus_power() > 0,
+                "Phase B: Eve must have non-zero consensus_power after confirm_pop(Verified)"
+            );
+        }
+
+        // ── Phase C: real RevokeAttestation tx drops Eve below quorum ──
+        //
+        // Bob revokes his attestation. Count drops 3→2, below ATTESTATION_QUORUM=3.
+        // Because Eve's identity was verified_via_wot=true, the identity store
+        // downgrades her to Provisional and emits "tier_downgraded=true".
+        //
+        // Bob's nonce is now 1 (after his Attest tx committed in cert2).
+        node.submit_tx(Transaction::revoke_attestation(
+            "revoke-bob-eve", "qcb1bob", "qcb1eve", 1,
+        ));
+        let cert3 = node.propose_block(cert2.block_hash.clone()).await.unwrap();
+        let _ = cert3; // hash not needed beyond this point
+
+        // Verify the RevokeAttestation tx succeeded and emitted tier_downgraded=true.
+        {
+            let explorer = node.explorer.lock().unwrap();
+            let rev_result = explorer.txs.get("revoke-bob-eve")
+                .expect("revoke-bob-eve tx must be committed");
+            assert!(
+                rev_result.success,
+                "Phase C: RevokeAttestation tx must succeed; error={:?}", rev_result.error
+            );
+            assert!(
+                rev_result.events.iter().any(|e| e.contains("tier_downgraded=true")),
+                "Phase C: RevokeAttestation events must include tier_downgraded=true; \
+                 events={:?}", rev_result.events
+            );
+        }
+
+        // Phase C: Eve's identity store tier must now be Provisional.
+        {
+            let eve_tier = node.identity.get("qcb1eve")
+                .map(|r| r.charm.tier.clone())
+                .expect("Eve must still have an identity record after RevokeAttestation");
+            assert!(
+                matches!(eve_tier, VerificationTier::Provisional),
+                "Phase C: Eve's identity must be Provisional after revocation below quorum; \
+                 got {eve_tier:?}"
+            );
+        }
+
+        // ── Phase D: epoch-boundary sweep via propose_block revokes Eve ──
+        //
+        // propose_block drives Integration Point 3: the sweep iterates the validator
+        // registry and calls revoke_pop for any validator whose identity no longer
+        // grants_consensus(). Eve's identity is now Provisional → sweep revokes her.
+        //
+        // Note: commit_block is private. In single-node devnet mode, propose_block
+        // calls cast_and_broadcast_own_votes → commit_block, so this exercises the
+        // full production commit path.
+        let h_sweep = chain_forge_consensus::BlockHash("h-sweep-av".into());
+        node.propose_block(h_sweep).await.unwrap();
+
+        {
+            let eve_reg = node.validator_registry.get("qcb1eve")
+                .expect("Eve must still be in the registry after sweep");
+            assert!(
+                !eve_reg.pop_verified,
+                "Phase D: epoch-boundary sweep must set pop_verified=false for Eve \
+                 after RevokeAttestation downgraded her identity to Provisional"
+            );
+            assert_eq!(
+                eve_reg.status,
+                chain_forge_validators::ValidatorStatus::Candidate,
+                "Phase D: sweep must demote Eve to Candidate status"
+            );
+            assert_eq!(
+                eve_reg.consensus_power(), 0,
+                "Phase D: Eve must have zero consensus_power after sweep"
+            );
+        }
+
+        // build_validator_set must also exclude Eve.
+        {
+            let vs = node.validator_registry.build_validator_set(0);
+            assert!(
+                !vs.validators.iter().any(|v| v.id.0 == "qcb1eve"),
+                "Phase D: Eve must be absent from the built validator set after \
+                 RevokeAttestation + epoch-boundary sweep"
+            );
+        }
+
+        // ── Phase E: revocation survives node restart ──
+        node.persist_state();
+        drop(node);
+
+        let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(
+            restarted.load_persisted_state(),
+            "Phase E: load_persisted_state must succeed after restart"
+        );
+
+        let eve_after_restart = restarted.validator_registry.get("qcb1eve")
+            .expect("Eve must be in the registry after restart");
+        assert!(
+            !eve_after_restart.pop_verified,
+            "Phase E: Eve's pop_verified=false must survive node restart"
+        );
+        assert_eq!(
+            eve_after_restart.status,
+            chain_forge_validators::ValidatorStatus::Candidate,
+            "Phase E: Eve's Candidate status must survive node restart"
+        );
+        assert_eq!(
+            eve_after_restart.consensus_power(), 0,
+            "Phase E: Eve's consensus_power=0 must survive node restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
