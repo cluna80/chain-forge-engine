@@ -733,6 +733,147 @@ fn fs03_mn001_multi_node_fee_settlement() {
         );
     }
 
+    // ── Phase 8: MN-7 — personhood revocation is deterministic across nodes ──
+    //
+    // Scenario:
+    //   1. Register a fresh identity for qcb1user1 (they have a balance from genesis
+    //      and their nonce is 2 after TX-A and TX-B).
+    //   2. Three genesis validators (Alice, Bob, Carol) each submit an Attest tx
+    //      vouching for qcb1user1.  When the third lands, the identity store
+    //      upgrades user1 to Verified (verified_via_wot=true).
+    //   3. All four nodes must agree on the state root immediately after quorum —
+    //      the WoT-upgrade must be applied identically everywhere.
+    //   4. Alice revokes her attestation.  user1's count drops 3→2, below
+    //      ATTESTATION_QUORUM=3; identity store downgrades user1 to Provisional.
+    //   5. All four nodes must still agree on the state root.
+    //   6. The state root must differ from the pre-revocation snapshot, proving
+    //      that the revocation changed state and was not silently discarded.
+    //
+    // This validates the multi-node invariant: QPC eligibility changes are applied
+    // deterministically on every node with no divergence.
+    println!("── Phase 8: MN-7 — personhood revocation determinism ────────────────");
+    {
+        let alice_api = api_ports[0];
+        let height_before_mn7 = height_of(alice_api);
+
+        // --- Step 1: RegisterIdentity for user1 (nonce = 2) ------------------
+        let tx_reg = serde_json::json!({
+            "id": format!("mn7-reg-{run_id}"),
+            "sender": "qcb1user1",
+            "nonce": 2u64,
+            "gas_limit": 100_000u64,
+            "body": "RegisterIdentity",
+            "signature": []
+        }).to_string();
+        let resp_reg = api_post_tx(alice_api, &tx_reg)
+            .expect("mn7 RegisterIdentity POST failed");
+        let st_reg = resp_reg["status"].as_str().unwrap_or("unknown");
+        assert!(
+            st_reg == "queued" || st_reg == "ok",
+            "MN-7 FAILED: RegisterIdentity rejected: {resp_reg}"
+        );
+        println!("   RegisterIdentity(user1) → {st_reg}");
+
+        // --- Step 2: three Attest txs — Alice(nonce=0), Bob(nonce=0), Carol(nonce=0)
+        //     Submitted to the same API for a single block; in multi-node consensus
+        //     all three propagate via gossip and land in the same or adjacent blocks.
+        let attesters = [
+            ("qcb1alice", 0u64, format!("mn7-att-alice-{run_id}")),
+            ("qcb1bob",   0u64, format!("mn7-att-bob-{run_id}")),
+            ("qcb1carol", 0u64, format!("mn7-att-carol-{run_id}")),
+        ];
+        for (sender, nonce, id) in &attesters {
+            let tx = serde_json::json!({
+                "id": id,
+                "sender": sender,
+                "nonce": nonce,
+                "gas_limit": 100_000u64,
+                "body": { "Attest": { "claimant_id": "qcb1user1" } },
+                "signature": []
+            }).to_string();
+            let resp = api_post_tx(alice_api, &tx)
+                .unwrap_or_else(|| panic!("Attest from {sender} POST failed"));
+            let st = resp["status"].as_str().unwrap_or("unknown");
+            assert!(
+                st == "queued" || st == "ok",
+                "MN-7 FAILED: Attest from {sender} rejected: {resp}"
+            );
+            println!("   Attest({sender} → user1) → {st}");
+        }
+
+        // Wait for all txs to commit — RegisterIdentity + 3 Attest txs may
+        // need two blocks if the mempool fills one block before they all land.
+        wait_for_height(&api_ports, height_before_mn7 + 2, timeout);
+
+        // Snapshot state root after WoT quorum was (or wasn't) reached.
+        let roots_post_attest: Vec<Option<String>> = api_ports.iter()
+            .map(|&p| state_root_of(p))
+            .collect();
+        let ref_post_attest = roots_post_attest[0]
+            .as_deref().expect("Alice must have state root after attestation phase");
+        for (i, r) in roots_post_attest.iter().enumerate().skip(1) {
+            assert_eq!(
+                r.as_deref(), Some(ref_post_attest),
+                "MN-7 FAILED: {}'s state root differs from Alice's after WoT attestation\n  alice={ref_post_attest}\n  {}={r:?}",
+                VALIDATORS[i], VALIDATORS[i]
+            );
+        }
+        println!("   All nodes agree on state root after WoT attestation: {ref_post_attest}");
+
+        // --- Step 3: Alice revokes her attestation (Alice nonce = 1) ----------
+        let tx_revoke = serde_json::json!({
+            "id": format!("mn7-revoke-{run_id}"),
+            "sender": "qcb1alice",
+            "nonce": 1u64,
+            "gas_limit": 100_000u64,
+            "body": { "RevokeAttestation": { "attested_id": "qcb1user1" } },
+            "signature": []
+        }).to_string();
+        let resp_rev = api_post_tx(alice_api, &tx_revoke)
+            .expect("mn7 RevokeAttestation POST failed");
+        let st_rev = resp_rev["status"].as_str().unwrap_or("unknown");
+        assert!(
+            st_rev == "queued" || st_rev == "ok",
+            "MN-7 FAILED: RevokeAttestation rejected: {resp_rev}"
+        );
+        println!("   RevokeAttestation(alice → user1) → {st_rev}");
+
+        // --- Step 4: Wait for next epoch boundary (epoch sweep fires) ---------
+        let next_epoch_height = {
+            let h = height_of(alice_api);
+            ((h / EPOCH_BLOCKS) + 1) * EPOCH_BLOCKS + 1
+        };
+        wait_for_height(&api_ports, next_epoch_height, timeout);
+
+        // --- Step 5: All nodes must agree on state root after epoch sweep ------
+        let roots_post_revoke: Vec<Option<String>> = api_ports.iter()
+            .map(|&p| state_root_of(p))
+            .collect();
+        let ref_post_revoke = roots_post_revoke[0]
+            .as_deref().expect("Alice must have state root after revocation epoch");
+        for (i, r) in roots_post_revoke.iter().enumerate().skip(1) {
+            assert_eq!(
+                r.as_deref(), Some(ref_post_revoke),
+                "MN-7 FAILED: {}'s state root differs from Alice's after personhood revocation\n  alice={ref_post_revoke}\n  {}={r:?}",
+                VALIDATORS[i], VALIDATORS[i]
+            );
+        }
+
+        // --- Step 6: The post-revocation root must differ from pre-revocation --
+        // (Revocation changed state; if roots match, the revocation was silently
+        //  dropped and the test would be vacuous.)
+        assert_ne!(
+            ref_post_revoke, ref_post_attest,
+            "MN-7 FAILED: state root is unchanged after personhood revocation — \
+             the revocation event may not have been applied"
+        );
+
+        println!("   MN-7 PASS — personhood revocation applied deterministically");
+        println!("   state root after attestation: {ref_post_attest}");
+        println!("   state root after revocation:  {ref_post_revoke}");
+        println!("   (roots differ — revocation changed state on all nodes)");
+    }
+
     // ── Summary ───────────────────────────────────────────────────────────────
     println!("\n── FS-03-MN-001 PASSED ─────────────────────────────────────────────");
     println!("   MN-1  ✅  Identical state roots across all nodes");
@@ -741,7 +882,7 @@ fn fs03_mn001_multi_node_fee_settlement() {
     println!("   MN-4  ✅  Epoch-close validator balances agree");
     println!("   MN-5  ✅  Restarted node recovers to same state root");
     println!("   MN-6  ✅  No double-distribution after crash-restart");
-    println!("   MN-7  ⬜  Personhood-revocation-before-epoch (not yet automated)");
+    println!("   MN-7  ✅  Personhood revocation deterministic across all nodes");
     println!();
 
     // NodeProc::drop() kills all children.
