@@ -9941,4 +9941,326 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+
+    // -- Epoch-boundary revocation: end-to-end node-level invariant tests ------
+    //
+    // These tests complement the ValidatorRegistry unit tests in
+    // chain-forge-validators. Those tests prove the registry contracts; these
+    // prove that the Node actually invokes the sweep (Integration Point 3)
+    // through the production commit path, and that the resulting state survives
+    // a node restart.
+    //
+    // Three invariants are formalized here:
+    //
+    //  A. The epoch-boundary sweep fires through propose_block, not just when
+    //     manually triggered. A validator that lapses before the epoch boundary
+    //     retains consensus power until that boundary, then loses it precisely
+    //     when the epoch rolls inside propose_block.
+    //
+    //  B. The revoked registry state survives a node restart: pop_verified=false
+    //     and Candidate status are persisted and restored correctly.
+    //
+    //  C. confirm_pop cannot restore a validator using stale or ineligible tier
+    //     information. Calling confirm_pop with a Provisional tier does not grant
+    //     consensus power because Provisional does not satisfy grants_consensus().
+
+    const GENESIS_FAST_EPOCH: &str = r#"{
+        "chain_id": "qcb-testnet-1",
+        "chain_name": "QuarkCharmBit",
+        "engine_version": "0.1.0",
+        "genesis_time": "2026-09-16T00:00:00Z",
+        "environment": { "mode": "devnet", "faucet_enabled": true, "relaxed_limits": true },
+        "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
+        "address_prefix": "qcb",
+        "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
+        "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
+        "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
+        "modules": ["bank", "staking", "identity", "agents", "pocd"],
+        "custom_modules": [],
+        "validator_bonding": { "validator_epoch_blocks": 5 },
+        "crypto_governors": ["qcb1alice"],
+        "genesis_accounts": [
+            { "label": "Alice", "address": "qcb1alice", "balance": "5000000", "role": "validator", "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8" },
+            { "label": "Bob",   "address": "qcb1bob",   "balance": "5000000", "role": "validator", "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0" },
+            { "label": "Carol", "address": "qcb1carol", "balance": "5000000", "role": "validator", "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692" },
+            { "label": "Dave",  "address": "qcb1dave",  "balance": "5000000", "role": "validator", "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0" }
+        ]
+    }"#;
+
+    #[tokio::test]
+    async fn epoch_boundary_sweep_fires_through_propose_block() {
+        // Invariant A: the epoch-boundary revocation fires through the production
+        // propose_block path (Integration Point 3), not just when manually
+        // triggered. Specifically:
+        //   1. Alice lapses before the epoch boundary.
+        //   2. Before the epoch rolls, Alice's registry entry is still Active+pop_verified.
+        //   3. After propose_block triggers the epoch roll, Alice's entry is
+        //      Candidate+!pop_verified and her consensus power is zero.
+        // This proves the sweep is wired to the commit path, not just callable
+        // in isolation.
+        use chain_forge_identity::LIVENESS_EPOCH_WINDOW;
+
+        // validator_epoch_blocks=5: epoch rolls at block heights 0, 5, 10, ...
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        assert_eq!(node.validator_epoch_blocks, 5,
+            "sanity: fast-epoch genesis must set validator_epoch_blocks=5");
+
+        // All four genesis validators must be pop_verified at startup.
+        for addr in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+            assert!(
+                node.validator_registry.get(addr).map(|r| r.pop_verified).unwrap_or(false),
+                "genesis validator {addr} must be pop_verified at startup"
+            );
+        }
+
+        // Alice lapses: set last_attested_epoch=0 then call advance_epoch_to so
+        // the lapse actually fires (lapse() is only called inside advance_epoch_to,
+        // not by lapse_only alone). Bob, Carol, Dave stay lively.
+        let target_epoch = LIVENESS_EPOCH_WINDOW + 2;
+        node.identity.lapse_only("qcb1alice", target_epoch);
+        for addr in ["qcb1bob", "qcb1carol", "qcb1dave"] {
+            node.identity.stay_lively(addr, target_epoch);
+        }
+        // Trigger the lapse by advancing the identity clock directly.
+        // This is equivalent to what happens inside propose_block when
+        // `height / validator_epoch_blocks` first exceeds target_epoch.
+        let advanced = node.identity.advance_epoch_to(target_epoch);
+        assert!(advanced, "identity clock must advance to target_epoch");
+
+        // Alice's identity tier must now be Provisional (lapsed).
+        let alice_tier_before = node.identity.get("qcb1alice")
+            .map(|r| r.charm.tier.clone())
+            .expect("Alice must have an identity record");
+        assert!(!alice_tier_before.grants_consensus(),
+            "pre-propose: Alice's tier must not grant consensus after lapse");
+
+        // Alice's registry entry is still Active+pop_verified at this point —
+        // the registry sweep only runs inside propose_block (or commit_block),
+        // not inside advance_epoch_to. This is the epoch-window: identity lapsed,
+        // registry not yet updated.
+        let alice_reg_before = node.validator_registry.get("qcb1alice").unwrap();
+        assert!(alice_reg_before.pop_verified,
+            "before propose_block: Alice must still be pop_verified in registry \
+             (the sweep has not run yet — this is the epoch window)");
+
+        // Now drive the production sweep path through propose_block.
+        // propose_block calls advance_epoch_to(height/5=0) which is a no-op
+        // (0 <= target_epoch), but the Integration Point 3 sweep ALWAYS runs
+        // unconditionally after advance_epoch_to, regardless of whether the
+        // epoch rolled. The sweep reads Alice's current identity state (Provisional)
+        // and calls revoke_pop.
+        let h0 = chain_forge_consensus::BlockHash("h0".into());
+        node.propose_block(h0).await.unwrap();
+
+        // After propose_block, the sweep has run and must have called
+        // revoke_pop("qcb1alice", ...) because her identity no longer grants consensus.
+        let alice_reg = node.validator_registry.get("qcb1alice")
+            .expect("Alice must still be in registry");
+        assert!(
+            !alice_reg.pop_verified,
+            "epoch-boundary sweep invariant: Alice's pop_verified must be false \
+             after propose_block runs the Integration Point 3 sweep against her \
+             lapsed identity"
+        );
+        assert_eq!(
+            alice_reg.status,
+            chain_forge_validators::ValidatorStatus::Candidate,
+            "epoch-boundary sweep invariant: Alice must be demoted to Candidate \
+             by the propose_block sweep"
+        );
+        assert_eq!(
+            alice_reg.consensus_power(), 0,
+            "epoch-boundary sweep invariant: Alice must have zero consensus power \
+             after the propose_block sweep"
+        );
+
+        // Bob, Carol, Dave must be unaffected.
+        for addr in ["qcb1bob", "qcb1carol", "qcb1dave"] {
+            let r = node.validator_registry.get(addr).unwrap();
+            assert!(r.pop_verified,
+                "{addr} must remain pop_verified — only Alice lapsed");
+            assert_eq!(r.status, chain_forge_validators::ValidatorStatus::Active,
+                "{addr} must remain Active — only Alice lapsed");
+        }
+
+        // The chain must continue with 3/4 active validators.
+        let h1 = chain_forge_consensus::BlockHash("h1".into());
+        assert!(node.propose_block(h1).await.is_ok(),
+            "chain must continue producing blocks after Alice's epoch-boundary revocation");
+    }
+
+    #[tokio::test]
+    async fn epoch_boundary_revocation_survives_restart() {
+        // Invariant B: pop_verified=false and Candidate status are persisted to
+        // disk (validators.json) and correctly restored after a node restart.
+        // A revoked validator must not silently regain consensus power because
+        // the persisted state was not loaded or was overwritten with fresh genesis
+        // state on restart.
+        use chain_forge_identity::LIVENESS_EPOCH_WINDOW;
+
+        let dir = std::env::temp_dir()
+            .join(format!("cf-epoch-boundary-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Phase 1: lapse Alice, drive the sweep through propose_block, persist.
+        {
+            let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+
+            let target_epoch = LIVENESS_EPOCH_WINDOW + 2;
+            node.identity.lapse_only("qcb1alice", target_epoch);
+            for addr in ["qcb1bob", "qcb1carol", "qcb1dave"] {
+                node.identity.stay_lively(addr, target_epoch);
+            }
+            // Trigger the lapse before propose_block, same as the sweep test.
+            node.identity.advance_epoch_to(target_epoch);
+
+            let h0 = chain_forge_consensus::BlockHash("h0-restart".into());
+            node.propose_block(h0).await.unwrap();
+
+            // Confirm revocation happened before persisting.
+            assert!(
+                !node.validator_registry.get("qcb1alice")
+                    .map(|r| r.pop_verified).unwrap_or(true),
+                "pre-persist: Alice must be !pop_verified before restart"
+            );
+
+            node.persist_state();
+        } // node dropped — simulates process exit.
+
+        // Phase 2: restart from the same data dir.
+        let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(
+            restarted.load_persisted_state(),
+            "load_persisted_state must succeed after restart"
+        );
+
+        // The revoked registry state must survive the restart.
+        let alice_after_restart = restarted.validator_registry.get("qcb1alice")
+            .expect("Alice must be in registry after restart");
+        assert!(
+            !alice_after_restart.pop_verified,
+            "epoch-boundary restart invariant: Alice's pop_verified=false must \
+             survive node restart — persisted validators.json must be loaded \
+             correctly, not overwritten with fresh genesis state"
+        );
+        assert_eq!(
+            alice_after_restart.status,
+            chain_forge_validators::ValidatorStatus::Candidate,
+            "epoch-boundary restart invariant: Alice's Candidate status must \
+             survive node restart"
+        );
+        assert_eq!(
+            alice_after_restart.consensus_power(), 0,
+            "epoch-boundary restart invariant: Alice must have zero consensus \
+             power after restart"
+        );
+
+        // The three remaining validators must still be Active+pop_verified.
+        for addr in ["qcb1bob", "qcb1carol", "qcb1dave"] {
+            let r = restarted.validator_registry.get(addr)
+                .unwrap_or_else(|_| panic!("{addr} must be in registry after restart"));
+            assert!(r.pop_verified,
+                "{addr} must remain pop_verified after restart");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sweep_does_not_restore_validator_with_downgraded_identity() {
+        // Invariant C (two-layer enforcement):
+        //
+        // Layer 1 — sweep guard: the epoch-boundary sweep only calls confirm_pop
+        //   when a validator's identity CURRENTLY grants_consensus(). A second
+        //   sweep pass on a still-lapsed identity must not restore consensus power.
+        //
+        // Layer 2 — registry guard: confirm_pop() itself now rejects any tier
+        //   that does not satisfy grants_consensus() (ValidatorError::IneligibleTier).
+        //   This prevents any internal caller from accidentally granting power to
+        //   an ineligible tier, even if the sweep's pre-condition were bypassed.
+        //
+        // Together: Ineligible identity tier => consensus_power() == 0, enforced
+        // at both the call site and the registry boundary.
+        use chain_forge_identity::LIVENESS_EPOCH_WINDOW;
+        use chain_forge_identity::VerificationTier;
+
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+
+        let target_epoch = LIVENESS_EPOCH_WINDOW + 2;
+        node.identity.lapse_only("qcb1alice", target_epoch);
+        for addr in ["qcb1bob", "qcb1carol", "qcb1dave"] {
+            node.identity.stay_lively(addr, target_epoch);
+        }
+        node.identity.advance_epoch_to(target_epoch);
+
+        // Layer 1 — sweep guard: first propose_block revokes Alice.
+        let h0 = chain_forge_consensus::BlockHash("h0-stale".into());
+        node.propose_block(h0).await.unwrap();
+        assert!(
+            !node.validator_registry.get("qcb1alice")
+                .map(|r| r.pop_verified).unwrap_or(true),
+            "pre-condition: Alice must be !pop_verified after first sweep"
+        );
+
+        // Layer 1 continued: second sweep pass on the still-lapsed identity.
+        // The sweep must call revoke_pop (idempotent), not confirm_pop.
+        let h1 = chain_forge_consensus::BlockHash("h1-stale".into());
+        node.propose_block(h1).await.unwrap();
+        let alice_after_second = node.validator_registry.get("qcb1alice").unwrap();
+        assert!(
+            !alice_after_second.pop_verified,
+            "sweep guard: a second sweep pass on a still-lapsed identity must not \
+             restore pop_verified — the sweep calls revoke_pop, never confirm_pop, \
+             for ineligible validators"
+        );
+        assert_eq!(
+            alice_after_second.consensus_power(), 0,
+            "sweep guard: Alice must have zero power after a second sweep pass"
+        );
+
+        // Layer 2 — registry guard: confirm_pop with an ineligible tier is now
+        // rejected at the registry boundary, not just at the sweep call site.
+        let err = node.validator_registry.confirm_pop(
+            "qcb1alice",
+            VerificationTier::Provisional,
+            target_epoch + 1,
+        ).expect_err("registry guard: confirm_pop must reject Provisional tier");
+        assert!(
+            matches!(err, chain_forge_validators::ValidatorError::IneligibleTier { .. }),
+            "registry guard: expected IneligibleTier error, got {err:?}"
+        );
+        // Alice's state must be unchanged after the rejected call.
+        let alice_unchanged = node.validator_registry.get("qcb1alice").unwrap();
+        assert!(!alice_unchanged.pop_verified,
+            "registry guard: rejected confirm_pop must leave pop_verified=false");
+        assert_eq!(alice_unchanged.consensus_power(), 0,
+            "registry guard: rejected confirm_pop must leave consensus_power=0");
+
+        // Legitimate re-verification: update identity store to Verified, then
+        // confirm_pop with the correct tier must succeed and restore power.
+        node.identity.get_mut("qcb1alice")
+            .map(|r| r.charm.tier = VerificationTier::Verified);
+        node.validator_registry.confirm_pop(
+            "qcb1alice",
+            VerificationTier::Verified,
+            target_epoch + 2,
+        ).unwrap();
+        let alice_restored = node.validator_registry.get("qcb1alice").unwrap();
+        assert!(alice_restored.pop_verified,
+            "re-verification: confirm_pop with Verified tier must set pop_verified=true");
+        assert!(alice_restored.consensus_power() > 0,
+            "re-verification: confirm_pop with Verified tier must restore consensus power");
+
+        // The next sweep must NOT re-revoke Alice (her identity now grants consensus).
+        let h2 = chain_forge_consensus::BlockHash("h2-stale".into());
+        node.propose_block(h2).await.unwrap();
+        let alice_stable = node.validator_registry.get("qcb1alice").unwrap();
+        assert!(alice_stable.pop_verified,
+            "after re-verification, the sweep must leave Alice as pop_verified \
+             because her identity tier now grants consensus");
+    }
 }

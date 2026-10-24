@@ -57,6 +57,9 @@ pub enum ValidatorError {
 
     #[error("internal validator error: {0}")]
     Internal(String),
+
+    #[error("verification tier {tier} does not grant consensus for validator {id}")]
+    IneligibleTier { id: String, tier: String },
 }
 
 pub type ValResult<T> = Result<T, ValidatorError>;
@@ -379,8 +382,14 @@ impl ValidatorRecord {
 
     /// Voting power to assign in the consensus ValidatorSet.
     /// Non-verified validators get 0 power regardless of stake.
+    /// A stored verification tier that does not satisfy `grants_consensus()`
+    /// also produces zero power — defense-in-depth against stale state.
     pub fn consensus_power(&self) -> u64 {
-        if self.pop_verified && self.status == ValidatorStatus::Active {
+        let tier_eligible = self.verification_tier
+            .as_ref()
+            .map(|t| t.grants_consensus())
+            .unwrap_or(false);
+        if self.pop_verified && self.status == ValidatorStatus::Active && tier_eligible {
             1 // Equal per-human weight; apply_personhood_cap handles the ceiling
         } else {
             0
@@ -852,6 +861,13 @@ impl ValidatorRegistry {
         verification_tier: VerificationTier,
         epoch:             u64,
     ) -> ValResult<()> {
+        if !verification_tier.grants_consensus() {
+            return Err(ValidatorError::IneligibleTier {
+                id:   validator_id.to_string(),
+                tier: format!("{verification_tier:?}"),
+            });
+        }
+
         let record = self.validators.get_mut(validator_id)
             .ok_or_else(|| ValidatorError::NotFound(validator_id.to_string()))?;
 
@@ -1000,9 +1016,19 @@ impl ValidatorRegistry {
     /// Candidates, Jailed, and Tombstoned validators are excluded.
     /// apply_personhood_cap() is applied to enforce the power ceiling.
     pub fn build_validator_set(&self, height: u64) -> ValidatorSet {
-        // Collect all active, PoP-verified validators as candidates.
+        // Collect all active, PoP-verified validators whose stored tier
+        // grants consensus. The tier check is defense-in-depth: consensus_power()
+        // already returns 0 for ineligible tiers, but filtering here ensures
+        // ineligible validators are fully absent from the set, not just zero-powered.
         let candidates: Vec<&ValidatorRecord> = self.validators.values()
-            .filter(|r| r.status == ValidatorStatus::Active && r.pop_verified)
+            .filter(|r| {
+                r.status == ValidatorStatus::Active
+                    && r.pop_verified
+                    && r.verification_tier
+                        .as_ref()
+                        .map(|t| t.grants_consensus())
+                        .unwrap_or(false)
+            })
             .collect();
 
         // Per-human power budget: tracks how much of power_cap this human has
@@ -1772,5 +1798,255 @@ mod tests {
         let vs = reg.build_validator_set(1);
         let v1 = vs.validators.iter().find(|v| v.id.0 == "v1").unwrap();
         assert!(v1.public_key.is_empty());
+    }
+
+    // -- Epoch-boundary revocation invariant tests ----------------------------
+    //
+    // Protocol invariant (Section 3.3 / QPC-CONS-001):
+    //   At epoch advance, any validator whose owner identity tier no longer
+    //   grants_consensus() MUST have pop_verified = false and status = Candidate
+    //   in the ValidatorRegistry, and MUST NOT appear with non-zero voting power
+    //   in the validator set used by the consensus engine.
+    //
+    // The epoch-boundary window (between identity lapse and the next epoch
+    // advance) is intentional: it bounds the delay at one epoch but does not
+    // eliminate it. These tests confirm the boundary semantics are correct and
+    // that the window is closed as soon as epoch_advance fires.
+
+    #[test]
+    fn epoch_boundary_revocation_removes_consensus_power() {
+        // A validator that was Active+pop_verified MUST lose all voting power
+        // as soon as revoke_pop() is called (simulating the epoch-advance sweep).
+        // This is the core invariant: no lapsed validator may contribute to quorum.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+
+        // Pre-condition: validator is in the active set with non-zero power.
+        let vs_before = reg.build_validator_set(1);
+        let power_before = vs_before.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert!(power_before > 0,
+            "pre-condition: validator must have non-zero power before epoch-boundary revocation");
+
+        // Epoch advance fires: identity tier no longer grants consensus.
+        reg.revoke_pop("val1", 2).unwrap();
+
+        // Post-condition: validator must not appear in the active set with power.
+        let vs_after = reg.build_validator_set(2);
+        let power_after = vs_after.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert_eq!(power_after, 0,
+            "epoch-boundary invariant violated: lapsed validator must have zero consensus power \
+             immediately after revoke_pop (epoch-advance window is closed)");
+
+        let record = reg.get("val1").unwrap();
+        assert!(!record.pop_verified,
+            "pop_verified must be false after epoch-boundary revocation");
+        assert_eq!(record.status, ValidatorStatus::Candidate,
+            "status must be Candidate after epoch-boundary revocation");
+    }
+
+    #[test]
+    fn epoch_boundary_revocation_affects_only_lapsed_validator() {
+        // When one validator lapses at epoch advance, other validators with
+        // valid identity must retain their full consensus power. The sweep is
+        // per-validator, not a global reset.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.register(req("val2", "qcb1val2", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+        reg.confirm_pop("val2", VerificationTier::Verified, 1).unwrap();
+
+        // Only val1 lapses at epoch 2 (identity no longer grants_consensus).
+        reg.revoke_pop("val1", 2).unwrap();
+
+        let vs = reg.build_validator_set(2);
+
+        let power_val1 = vs.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        let power_val2 = vs.validators.iter()
+            .find(|v| v.id.0 == "val2")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+
+        assert_eq!(power_val1, 0,
+            "lapsed validator val1 must have zero power after epoch-boundary revocation");
+        assert!(power_val2 > 0,
+            "valid validator val2 must retain non-zero power after a different validator lapses; \
+             epoch-boundary sweep must not affect validators whose identity is still eligible");
+    }
+
+    #[test]
+    fn revoke_pop_is_idempotent_across_multiple_epoch_advances() {
+        // revoke_pop() is called once per eligible validator per epoch advance.
+        // If the sweep fires twice (concurrent epoch advances, duplicate calls),
+        // the second call must be a no-op — it must not corrupt the record or
+        // return an error that would abort the sweep loop.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+
+        // First revoke at epoch 2 — simulates normal epoch-advance sweep.
+        reg.revoke_pop("val1", 2).unwrap();
+        let record_after_first = reg.get("val1").unwrap().clone();
+
+        // Second revoke at epoch 3 — simulates duplicate call or racing advance.
+        let result = reg.revoke_pop("val1", 3);
+        assert!(result.is_ok(),
+            "revoke_pop must be idempotent: a second call on an already-Candidate \
+             validator must not return an error; got: {:?}", result.err());
+
+        let record_after_second = reg.get("val1").unwrap();
+        assert_eq!(record_after_second.pop_verified, record_after_first.pop_verified,
+            "pop_verified must be unchanged after idempotent revoke_pop");
+        assert_eq!(record_after_second.status, record_after_first.status,
+            "status must be unchanged after idempotent revoke_pop");
+        assert_eq!(record_after_second.consensus_power(), 0,
+            "consensus power must remain zero after idempotent revoke_pop");
+    }
+
+    #[test]
+    fn validator_reenter_consensus_after_identity_restored() {
+        // After an epoch-boundary revocation, a validator whose owner re-attains
+        // a consensus-eligible identity tier must be able to re-enter the active
+        // set via confirm_pop. The re-entry must restore full consensus power and
+        // must not leave any residue from the lapse that would reduce power.
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+
+        // Epoch 2: identity lapses, epoch-boundary sweep fires.
+        reg.revoke_pop("val1", 2).unwrap();
+        assert_eq!(reg.get("val1").unwrap().consensus_power(), 0,
+            "pre-condition for re-entry test: power must be zero after revocation");
+
+        // Epoch 3: owner re-verifies identity, confirm_pop fires.
+        reg.confirm_pop("val1", VerificationTier::Verified, 3).unwrap();
+
+        let record = reg.get("val1").unwrap();
+        assert!(record.pop_verified,
+            "pop_verified must be true after identity is restored via confirm_pop");
+        assert_eq!(record.status, ValidatorStatus::Active,
+            "status must be Active after identity is restored via confirm_pop");
+        assert!(record.consensus_power() > 0,
+            "consensus power must be restored after identity re-verification; \
+             a validator whose owner re-attains eligibility must re-enter the active set");
+
+        // The restored validator must appear with non-zero power in the validator set.
+        let vs = reg.build_validator_set(3);
+        let power = vs.validators.iter()
+            .find(|v| v.id.0 == "val1")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert!(power > 0,
+            "epoch-boundary re-entry invariant: validator set must reflect restored \
+             consensus power after confirm_pop (power={})", power);
+
+        // Jail records must remain empty — lapse+re-verify is not a slashing event.
+        assert!(record.jail_records.is_empty(),
+            "jail_records must remain empty after lapse+re-verify cycle: \
+             lapse is an inactivity event, not a punishable offense (Section 3.3)");
+    }
+
+    // -- Registry eligibility enforcement tests ------------------------------
+    //
+    // These tests cover the defense-in-depth guard added to the registry:
+    //   confirm_pop() rejects tiers that do not satisfy grants_consensus().
+    //   consensus_power() returns 0 when the stored tier is ineligible.
+    //   build_validator_set() excludes ineligible-tier validators entirely.
+    //
+    // These guarantees hold even if the node sweep were to call confirm_pop
+    // with a stale or downgraded tier — the registry refuses the call at the
+    // boundary rather than requiring the sweep to self-correct.
+
+    fn make_reg_single(id: &str) -> ValidatorRegistry {
+        let mut reg = registry();
+        reg.register_genesis_validator(id, 0);
+        reg
+    }
+
+    #[test]
+    fn confirm_pop_rejects_provisional_tier() {
+        let mut reg = make_reg_single("v1");
+        let err = reg.confirm_pop("v1", VerificationTier::Provisional, 1)
+            .expect_err("confirm_pop must reject VerificationTier::Provisional");
+        assert!(
+            matches!(err, ValidatorError::IneligibleTier { .. }),
+            "expected IneligibleTier, got {err:?}"
+        );
+        // Validator must remain in its prior state: not pop_verified, not Active.
+        let r = reg.get("v1").unwrap();
+        assert!(!r.pop_verified, "pop_verified must stay false after rejected confirm_pop");
+        assert_eq!(r.consensus_power(), 0, "consensus_power must remain 0");
+    }
+
+    #[test]
+    fn consensus_power_zero_for_ineligible_tier_via_direct_field_write() {
+        // Documents the defense-in-depth in consensus_power(): even if a record
+        // somehow ends up with pop_verified=true and an ineligible tier (e.g. via
+        // deserialization of corrupt state), consensus_power() returns 0.
+        let mut reg = make_reg_single("v1");
+
+        // Bypass confirm_pop and corrupt the record directly (simulates bad state).
+        {
+            let record = reg.validators.get_mut("v1").unwrap();
+            record.pop_verified      = true;
+            record.verification_tier = Some(VerificationTier::Provisional);
+            record.status            = ValidatorStatus::Active;
+        }
+
+        let r = reg.get("v1").unwrap();
+        assert_eq!(
+            r.consensus_power(), 0,
+            "consensus_power must return 0 for Active+pop_verified validator \
+             whose stored tier is Provisional (ineligible)"
+        );
+    }
+
+    #[test]
+    fn build_validator_set_excludes_ineligible_tier_validator() {
+        // Even with pop_verified=true and Active status, a validator with an
+        // ineligible tier must not appear in the built validator set.
+        let mut reg = registry();
+        reg.register_genesis_validator("eligible",   0);
+        reg.register_genesis_validator("ineligible", 0);
+
+        reg.confirm_pop("eligible", VerificationTier::Verified, 1).unwrap();
+
+        // Corrupt the ineligible validator's record directly.
+        {
+            let record = reg.validators.get_mut("ineligible").unwrap();
+            record.pop_verified      = true;
+            record.verification_tier = Some(VerificationTier::Provisional);
+            record.status            = ValidatorStatus::Active;
+        }
+
+        let vs = reg.build_validator_set(1);
+        assert!(
+            vs.validators.iter().all(|v| v.id.0 != "ineligible"),
+            "build_validator_set must exclude the ineligible-tier validator entirely"
+        );
+        let eligible_power = vs.validators.iter()
+            .find(|v| v.id.0 == "eligible")
+            .map(|v| v.voting_power)
+            .unwrap_or(0);
+        assert!(eligible_power > 0, "eligible Verified validator must have non-zero power");
+    }
+
+    #[test]
+    fn confirm_pop_verified_tier_still_works_after_eligibility_guard() {
+        // Regression: adding the eligibility guard must not break the normal path.
+        let mut reg = make_reg_single("v1");
+        reg.confirm_pop("v1", VerificationTier::Verified, 1).unwrap();
+        let r = reg.get("v1").unwrap();
+        assert!(r.pop_verified);
+        assert_eq!(r.consensus_power(), 1);
     }
 }
