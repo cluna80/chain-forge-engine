@@ -688,6 +688,66 @@ impl ValidatorRegistry {
         tracing::info!(id, "genesis validator registered as Candidate");
     }
 
+    /// Register a validator that arrived via the stake-bond admission path
+    /// (`compute_stake_active_set`).  Unlike `register_genesis_validator` this
+    /// may be called at any block height; unlike `register()` it does not
+    /// require a pre-registered consensus key.  The validator starts as
+    /// Candidate with `pop_verified=false`; `confirm_pop` / the pop_verified
+    /// refresh in `propose_block` promote it once its identity is verified.
+    ///
+    /// This is a no-op if the validator is already registered (idempotent, same
+    /// as `register_genesis_validator`).
+    pub fn register_bonded_validator(
+        &mut self,
+        id: &str,
+        bonded_uqcb: u128,
+        owner_identity_id: Option<String>,
+        epoch: u64,
+    ) {
+        if self.validators.contains_key(id) {
+            return;
+        }
+        let validator_id = ValidatorId(id.to_string());
+        let seq = self.next_registration_seq;
+        self.next_registration_seq += 1;
+        let record = ValidatorRecord {
+            id:                validator_id.clone(),
+            keys:              KeyBundle {
+                consensus_pubkey: String::new(),
+                account_address:  id.to_string(),
+                pqc_pubkey:       None,
+                scheme:           "bond-stub".to_string(),
+            },
+            commission:        Commission {
+                rate_bps:           0,
+                max_rate_bps:       2000,
+                last_changed_epoch: epoch,
+            },
+            bonded_uqcb:       bonded_uqcb.min(u64::MAX as u128) as u128,
+            stake_tier:        StakeTier::from_bonded(bonded_uqcb),
+            status:            ValidatorStatus::Candidate,
+            pop_verified:      false,
+            verification_tier: None,
+            registered_epoch:  epoch,
+            registration_seq:  seq,
+            last_status_epoch: epoch,
+            blocks_proposed:   0,
+            blocks_missed:     0,
+            jail_records:      Vec::new(),
+            moniker:           id.to_string(),
+            website:           None,
+            owner_identity_id: owner_identity_id.clone(),
+            is_genesis:        false,
+        };
+        let human_key = owner_identity_id.as_deref().unwrap_or(id).to_string();
+        self.validators_by_human
+            .entry(human_key)
+            .or_default()
+            .push(id.to_string());
+        self.validators.insert(id.to_string(), record);
+        tracing::info!(id, epoch, "bonded validator registered as Candidate");
+    }
+
     /// Register (or rotate) the authenticated consensus public key for a
     /// validator address — CF-VAL-KEY-002.
     ///

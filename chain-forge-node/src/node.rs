@@ -3757,6 +3757,13 @@ impl Node {
                     pop_verified: false,
                     public_key,
                 });
+                // QPC-CONS-001 Phase B: also register in the ValidatorRegistry
+                // so Integration Point 3 can sweep it on revocation.
+                let owner = self.bond_owner_bindings.get(addr).cloned();
+                let epoch = self.identity.clock.current_epoch;
+                self.validator_registry.register_bonded_validator(
+                    addr, *bonded_uqcb, owner, epoch,
+                );
                 admitted += 1;
                 any_changed = true;
             }
@@ -4415,6 +4422,19 @@ impl Node {
             })
             .collect();
 
+        // QPC-CONS-001 Phase B: same BondValidator snapshot as the multi-node
+        // commit_block path -- see that path's full comment.
+        // Tuple: (tx_index, validator_addr, owner_identity_id).
+        let bond_validator_attempts: Vec<(usize, String, Option<String>)> = txs.iter().enumerate()
+            .filter_map(|(i, t)| {
+                if let chain_forge_execution::TxBody::BondValidator { owner_identity_id, .. } = &t.body {
+                    Some((i, t.sender.clone(), owner_identity_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Snapshot the validator set that actually produced this cert
         // BEFORE any epoch-boundary mutation below -- same reasoning as the
         // multi-node commit_block path (see `historical_validator_sets`'s
@@ -4565,6 +4585,35 @@ impl Node {
             }
         }
 
+        // QPC-CONS-001 Phase B: same bond_owner_bindings recording as the
+        // multi-node commit_block path.  Must run before the epoch-boundary
+        // pop_verified sweep so a validator bonded in this block can already
+        // have its owner binding available for the sweep.
+        {
+            let epoch = self.identity.clock.current_epoch;
+            for (idx, validator_addr, owner_opt) in &bond_validator_attempts {
+                let Some(result) = exec_result.tx_results.get(*idx) else { continue };
+                if !result.success { continue; }
+                let Some(owner) = owner_opt else { continue; };
+                let binding_event = format!("bond_validator_owner_binding:{}:{}", validator_addr, owner);
+                if !result.events.iter().any(|e| e == &binding_event) {
+                    warn!(
+                        validator = %validator_addr,
+                        owner     = %owner,
+                        "propose_block BondValidator: expected binding event not found — skipping"
+                    );
+                    continue;
+                }
+                self.bond_owner_bindings.insert(validator_addr.clone(), owner.clone());
+                info!(
+                    validator = %validator_addr,
+                    owner     = %owner,
+                    epoch,
+                    "QPC-CONS-001 Phase B (propose_block): authenticated owner binding recorded"
+                );
+            }
+        }
+
         // Integration Point 4 (Push) — same stake-bond admission as the
         // multi-node commit path (see the full design comment there). This
         // is the devnet/single-node auto-commit path, so it needs its own
@@ -4608,6 +4657,13 @@ impl Node {
                     pop_verified: false,
                     public_key,
                 });
+                // QPC-CONS-001 Phase B: also register the admitted validator in
+                // the ValidatorRegistry so Integration Point 3 can sweep it.
+                let owner = self.bond_owner_bindings.get(addr).cloned();
+                let epoch = self.identity.clock.current_epoch;
+                self.validator_registry.register_bonded_validator(
+                    addr, *bonded_uqcb, owner, epoch,
+                );
                 admitted += 1;
             }
             if admitted > 0 {
@@ -4705,6 +4761,33 @@ impl Node {
             if any_changed {
                 updated_vs.height = height;
                 let _ = self.consensus.update_validator_set(updated_vs);
+            }
+        }
+
+        // QPC-CONS-001 Phase B: sync pop_verified=true into the ValidatorRegistry
+        // for any bond-admitted validator whose identity now grants consensus.
+        // Integration Point 3 (above) handles pop_verified=false; this block
+        // handles the true direction so registry.pop_verified stays in sync with
+        // the consensus ValidatorSet.
+        {
+            let epoch = self.identity.clock.current_epoch;
+            let vs = self.consensus.validator_set();
+            let verified_addrs: Vec<String> = vs.validators.iter()
+                .filter(|v| v.pop_verified)
+                .map(|v| v.id.0.clone())
+                .collect();
+            drop(vs);
+            for addr in &verified_addrs {
+                if let Ok(rec) = self.validator_registry.get(addr) {
+                    if !rec.pop_verified {
+                        if let Some(tier) = self.identity.get(addr).ok()
+                            .map(|r| r.charm.tier.clone())
+                            .filter(|t| t.grants_consensus())
+                        {
+                            let _ = self.validator_registry.confirm_pop(addr, tier, epoch);
+                        }
+                    }
+                }
             }
         }
 
@@ -10489,6 +10572,252 @@ mod tests {
             eve_after_restart.consensus_power(), 0,
             "Phase E: Eve's consensus_power=0 must survive node restart"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── QPC-CONS-001-AV2: full production validator-onboarding + revocation ──
+
+    #[tokio::test]
+    async fn bond_validator_owner_binding_revocation_excludes_validator() {
+        // QPC-CONS-001-AV2 acceptance test.
+        //
+        // Exercises the complete production validator path without any manual
+        // registry setup:
+        //
+        //   Phase A — Eve's identity reaches Verified via real on-chain txs:
+        //     RegisterIdentity Eve → Provisional; Attest×3 (Bob, Carol, Dave)
+        //     → quorum → Verified (verified_via_wot=true).
+        //
+        //   Phase B — BondValidator with owner_identity_id:
+        //     BondValidator { owner_identity_id: Some("qcb1eve") } →
+        //     executor emits bond_validator_owner_binding:qcb1eve:qcb1eve →
+        //     node records bond_owner_bindings["qcb1eve"] = "qcb1eve".
+        //
+        //   Phase C — epoch boundary admits Eve and grants pop_verified=true:
+        //     propose_block at h5 rolls validator_epoch=1; compute_stake_active_set
+        //     seats Eve; pop_verified refresh reads bond_owner_bindings →
+        //     identity.get("qcb1eve") → Verified → pop_verified=true.
+        //
+        //   Phase D — real RevokeAttestation tx drops Eve below quorum:
+        //     RevokeAttestation Bob→Eve → tier_downgraded=true → Provisional.
+        //
+        //   Phase E — next propose_block sweep revokes Eve:
+        //     Integration Point 3 sees Provisional (grants_consensus()=false) →
+        //     revoke_pop → pop_verified=false, Candidate, consensus_power()=0.
+        //
+        //   Phase F — revocation and binding survive node restart:
+        //     persist_state → restart → rebuild_bond_owner_bindings from
+        //     persisted StateStore → load_persisted_state → Eve still revoked.
+        use chain_forge_execution::{Transaction, TxBody};
+        use chain_forge_identity::VerificationTier;
+
+        let dir = std::env::temp_dir()
+            .join(format!("cf-qpc-cons-001-av2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        node.set_data_dir(dir.clone()).unwrap();
+
+        // ── Phase A: real on-chain identity path for Eve ──
+
+        // h1: fund Eve (Alice nonce=0)
+        node.submit_tx(Transaction::transfer(
+            "fund-eve-av2", "qcb1alice", "qcb1eve", "uqcb", 2_100_000, 0,
+        ));
+        let cert0 = node.propose_block(genesis_hash).await.unwrap();
+
+        // h2: RegisterIdentity Eve (Eve nonce=0)
+        node.submit_tx(Transaction::register_identity("reg-eve-av2", "qcb1eve", 0));
+        let cert1 = node.propose_block(cert0.block_hash.clone()).await.unwrap();
+
+        {
+            let tier = node.identity.get("qcb1eve")
+                .map(|r| r.charm.tier.clone())
+                .expect("Eve must have an identity record");
+            assert!(matches!(tier, VerificationTier::Provisional),
+                "Phase A: Eve must be Provisional after RegisterIdentity");
+        }
+
+        // h3: Attest Bob→Eve, Carol→Eve, Dave→Eve (all nonce=0)
+        node.submit_tx(Transaction::attest("a-bob-eve-av2",   "qcb1bob",   "qcb1eve", 0));
+        node.submit_tx(Transaction::attest("a-carol-eve-av2", "qcb1carol", "qcb1eve", 0));
+        node.submit_tx(Transaction::attest("a-dave-eve-av2",  "qcb1dave",  "qcb1eve", 0));
+        let cert2 = node.propose_block(cert1.block_hash.clone()).await.unwrap();
+
+        {
+            let rec = node.identity.get("qcb1eve").expect("Eve must exist");
+            assert!(matches!(rec.charm.tier, VerificationTier::Verified),
+                "Phase A: Eve must be Verified after 3 Attest txs; got {:?}", rec.charm.tier);
+            assert!(rec.charm.verified_via_wot,
+                "Phase A: Eve must be verified_via_wot=true");
+        }
+
+        // ── Phase B: BondValidator with owner_identity_id ──
+        //
+        // The public Transaction::bond_validator() helper sets owner_identity_id=None.
+        // To exercise the production binding path, construct the tx body directly.
+        // Executor rules: tx.sender must equal owner_identity_id, and owner must
+        // hold an active Verified credential at bond time.
+        //
+        // h4: BondValidator Eve (Eve nonce=1; RegisterIdentity used nonce=0)
+        node.submit_tx(Transaction {
+            id:           "bond-eve-av2".into(),
+            sender:       "qcb1eve".into(),
+            nonce:        1,
+            body:         TxBody::BondValidator {
+                              amount:           1_000_000,
+                              owner_identity_id: Some("qcb1eve".into()),
+                          },
+            gas_limit:    50_000,
+            signature:    vec![],
+            public_key:   vec![],
+            pq_signatures: vec![],
+            sig_scheme:   None,
+            pq_public_key: vec![],
+        });
+        let cert3 = node.propose_block(cert2.block_hash.clone()).await.unwrap();
+
+        // Confirm the binding event was emitted and recorded.
+        {
+            let explorer = node.explorer.lock().unwrap();
+            let bond_result = explorer.txs.get("bond-eve-av2")
+                .expect("bond-eve-av2 tx must be committed");
+            assert!(bond_result.success,
+                "Phase B: BondValidator tx must succeed; error={:?}", bond_result.error);
+            assert!(
+                bond_result.events.iter().any(|e| e == "bond_validator_owner_binding:qcb1eve:qcb1eve"),
+                "Phase B: bond_validator_owner_binding event must be emitted; events={:?}",
+                bond_result.events
+            );
+        }
+        assert!(
+            node.bond_owner_bindings.get("qcb1eve").map(|o| o == "qcb1eve").unwrap_or(false),
+            "Phase B: bond_owner_bindings must record qcb1eve → qcb1eve after BondValidator"
+        );
+
+        // ── Phase C: epoch boundary (h5) admits Eve and sets pop_verified=true ──
+        //
+        // Heights are 0-indexed. validator_epoch_blocks=5 → epoch rolls at
+        // height 5 (5/5=1 > 0). Block sequence:
+        //   h0: fund-eve (cert0)
+        //   h1: register-eve (cert1)
+        //   h2: attest ×3 (cert2)
+        //   h3: BondValidator (cert3)          ← after cert3, current_height()=4
+        //   h4: empty filler (cert4)           ← after cert4, current_height()=5
+        //   h5: epoch rolls → admit Eve (cert5) ← this is the boundary block
+        //
+        // compute_stake_active_set seats Eve (1_000_000 ≥ DEFAULT_MIN_BOND_UQCB).
+        // pop_verified refresh: bond_owner_bindings["qcb1eve"] = "qcb1eve" →
+        //   identity.get("qcb1eve").tier = Verified → pop_verified=true.
+
+        // h4: empty filler block — needed so h5 is the first block where
+        // height / 5 = 1 (the epoch boundary).
+        let cert4 = node.propose_block(cert3.block_hash.clone()).await.unwrap();
+
+        // h5: actual epoch-boundary block.
+        let cert5 = node.propose_block(cert4.block_hash.clone()).await.unwrap();
+
+        {
+            // Eve must now be in the live validator set with pop_verified=true.
+            let vs = node.consensus.validator_set();
+            let eve_vs = vs.validators.iter().find(|v| v.id.0 == "qcb1eve")
+                .expect("Phase C: Eve must be in the live validator set after epoch boundary");
+            assert!(eve_vs.pop_verified,
+                "Phase C: Eve must be pop_verified=true in the validator set");
+
+            // Eve must also be in the registry as pop_verified=true.
+            let eve_reg = node.validator_registry.get("qcb1eve")
+                .expect("Phase C: Eve must be in the validator registry");
+            assert!(eve_reg.pop_verified,
+                "Phase C: Eve must be pop_verified=true in the validator registry");
+            // voting_power is 0 here: gate_voting_power() zeros power for validators
+            // without a registered consensus key.  Key registration (RegisterValidatorKey)
+            // is a separate step that follows admission; what matters at Phase C is that
+            // Eve IS in the set and IS pop_verified.  No voting_power assertion here.
+        }
+
+        // ── Phase D: real RevokeAttestation tx drops Eve below quorum ──
+        //
+        // Bob nonce=1 (after Attest at h2). Attestation count drops 3→2 < ATTESTATION_QUORUM=3.
+        // verified_via_wot=true → tier_downgraded=true.
+        node.submit_tx(Transaction::revoke_attestation(
+            "rev-bob-eve-av2", "qcb1bob", "qcb1eve", 1,
+        ));
+        let cert6 = node.propose_block(cert5.block_hash.clone()).await.unwrap();
+        let _ = cert6;
+
+        {
+            let explorer = node.explorer.lock().unwrap();
+            let rev = explorer.txs.get("rev-bob-eve-av2")
+                .expect("rev-bob-eve-av2 tx must be committed");
+            assert!(rev.success,
+                "Phase D: RevokeAttestation tx must succeed; error={:?}", rev.error);
+            assert!(
+                rev.events.iter().any(|e| e.contains("tier_downgraded=true")),
+                "Phase D: events must include tier_downgraded=true; events={:?}", rev.events
+            );
+        }
+        {
+            let tier = node.identity.get("qcb1eve")
+                .map(|r| r.charm.tier.clone())
+                .expect("Eve must still have an identity record");
+            assert!(matches!(tier, VerificationTier::Provisional),
+                "Phase D: Eve must be Provisional after RevokeAttestation; got {tier:?}");
+        }
+
+        // ── Phase E: next propose_block sweep revokes Eve from the registry ──
+        //
+        // Integration Point 3: bond_owner_bindings["qcb1eve"] = "qcb1eve" →
+        //   identity.get("qcb1eve").tier = Provisional → grants_consensus()=false →
+        //   revoke_pop called → pop_verified=false, Candidate, consensus_power()=0.
+        let h_sweep = chain_forge_consensus::BlockHash("h-sweep-av2".into());
+        node.propose_block(h_sweep).await.unwrap();
+
+        {
+            let eve_reg = node.validator_registry.get("qcb1eve")
+                .expect("Eve must still be in the registry after sweep");
+            assert!(!eve_reg.pop_verified,
+                "Phase E: sweep must set pop_verified=false for Eve after RevokeAttestation");
+            assert_eq!(eve_reg.status, chain_forge_validators::ValidatorStatus::Candidate,
+                "Phase E: sweep must demote Eve to Candidate");
+            assert_eq!(eve_reg.consensus_power(), 0,
+                "Phase E: Eve must have zero consensus_power after sweep");
+        }
+        {
+            let vs = node.validator_registry.build_validator_set(0);
+            assert!(!vs.validators.iter().any(|v| v.id.0 == "qcb1eve"),
+                "Phase E: Eve must be absent from the built validator set after sweep");
+        }
+
+        // ── Phase F: binding and revocation survive node restart ──
+        //
+        // bond_owner_bindings is rebuilt from persisted StateStore key
+        // "validator-owner:qcb1eve" via rebuild_bond_owner_bindings().
+        node.persist_state();
+        drop(node);
+
+        let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state(),
+            "Phase F: load_persisted_state must succeed after restart");
+
+        // Owner binding must be restored from persisted StateStore.
+        assert!(
+            restarted.bond_owner_bindings.get("qcb1eve").map(|o| o == "qcb1eve").unwrap_or(false),
+            "Phase F: bond_owner_bindings must survive restart (rebuilt from StateStore)"
+        );
+
+        let eve_after_restart = restarted.validator_registry.get("qcb1eve")
+            .expect("Eve must be in the registry after restart");
+        assert!(!eve_after_restart.pop_verified,
+            "Phase F: Eve's pop_verified=false must survive node restart");
+        assert_eq!(eve_after_restart.status, chain_forge_validators::ValidatorStatus::Candidate,
+            "Phase F: Eve's Candidate status must survive node restart");
+        assert_eq!(eve_after_restart.consensus_power(), 0,
+            "Phase F: Eve's consensus_power=0 must survive node restart");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
