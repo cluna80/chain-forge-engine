@@ -211,9 +211,16 @@ export const useWallet = create<State>()(
             gas_limit: GAS_LIMIT,
             body: "RegisterIdentity",
           });
-          if (!regResult.ok) return { ok: false, error: `RegisterIdentity failed: ${regResult.error}` };
-          // reg consumed nonce s.nonce, attest must use s.nonce + 1
-          attestNonce = s.nonce + 1;
+          if (!regResult.ok) {
+            // "already committed" means identity exists on chain — treat as success
+            const alreadyRegistered = regResult.error?.includes("already committed") || regResult.error?.includes("replay not permitted");
+            if (!alreadyRegistered) return { ok: false, error: `RegisterIdentity failed: ${regResult.error}` };
+            // identity already on chain; attest uses same nonce (reg was never consumed this run)
+            attestNonce = s.nonce;
+          } else {
+            // reg consumed nonce s.nonce, attest must use s.nonce + 1
+            attestNonce = s.nonce + 1;
+          }
           // Wait briefly for the node to process before attesting
           await new Promise(r => setTimeout(r, 2000));
         }
