@@ -97,6 +97,13 @@ pub struct AccountSummary {
     /// Cleared by ReverseSybil after a successful appeal.
     #[serde(default)]
     pub sybil_confirmed: bool,
+    /// Number of active (non-revoked) WoT attestations for this identity.
+    /// 0 for genesis validators (PoP-verified, not WoT-attested).
+    #[serde(default)]
+    pub attestation_count: usize,
+    /// Addresses that have actively attested this identity (non-revoked).
+    #[serde(default)]
+    pub attested_by: Vec<String>,
 }
 
 /// Voting-power snapshot for one validator.
@@ -1139,6 +1146,8 @@ impl Node {
                     exemption_days: acct.exemption_days(),
                     frozen:         false,
                     sybil_confirmed: false,
+                    attestation_count: 0,
+                    attested_by:       vec![],
                 });
             }
         }
@@ -1858,9 +1867,9 @@ impl Node {
                 // Accounts: derive from the restored StateStore snapshot.
                 ex.accounts.clear();
                 for a in self.state.all_accounts() {
-                    let (frozen, sybil_confirmed) = self.identity.get(&a.address)
-                        .map(|r| (r.frozen, r.sybil_confirmed))
-                        .unwrap_or((false, false));
+                    let (frozen, sybil_confirmed, att_count, att_by) = self.identity.get(&a.address)
+                        .map(|r| (r.frozen, r.sybil_confirmed, r.attestation_ledger.count(), r.attestation_ledger.attesters.clone()))
+                        .unwrap_or((false, false, 0, vec![]));
                     ex.accounts.insert(a.address.clone(), AccountSummary {
                         address:        a.address.clone(),
                         role:           a.role.clone(),
@@ -1870,6 +1879,8 @@ impl Node {
                         exemption_days: a.exemption_days(),
                         frozen,
                         sybil_confirmed,
+                        attestation_count: att_count,
+                        attested_by:       att_by,
                     });
                 }
 
@@ -4122,9 +4133,9 @@ impl Node {
             }
             ex.accounts.clear();
             for a in self.state.all_accounts() {
-                let (frozen, sybil_confirmed) = self.identity.get(&a.address)
-                    .map(|r| (r.frozen, r.sybil_confirmed))
-                    .unwrap_or((false, false));
+                let (frozen, sybil_confirmed, att_count, att_by) = self.identity.get(&a.address)
+                    .map(|r| (r.frozen, r.sybil_confirmed, r.attestation_ledger.count(), r.attestation_ledger.attesters.clone()))
+                    .unwrap_or((false, false, 0, vec![]));
                 ex.accounts.insert(a.address.clone(), AccountSummary {
                     address:        a.address.clone(),
                     role:           a.role.clone(),
@@ -4134,6 +4145,8 @@ impl Node {
                     exemption_days: a.exemption_days(),
                     frozen,
                     sybil_confirmed,
+                    attestation_count: att_count,
+                    attested_by:       att_by,
                 });
             }
 
@@ -4887,9 +4900,9 @@ impl Node {
             // Refresh account snapshots (includes IntrinsicCharm surface)
             ex.accounts.clear();
             for a in self.state.all_accounts() {
-                let (frozen, sybil_confirmed) = self.identity.get(&a.address)
-                    .map(|r| (r.frozen, r.sybil_confirmed))
-                    .unwrap_or((false, false));
+                let (frozen, sybil_confirmed, att_count, att_by) = self.identity.get(&a.address)
+                    .map(|r| (r.frozen, r.sybil_confirmed, r.attestation_ledger.count(), r.attestation_ledger.attesters.clone()))
+                    .unwrap_or((false, false, 0, vec![]));
                 ex.accounts.insert(a.address.clone(), AccountSummary {
                     address:        a.address.clone(),
                     role:           a.role.clone(),
@@ -4899,6 +4912,8 @@ impl Node {
                     exemption_days: a.exemption_days(),
                     frozen,
                     sybil_confirmed,
+                    attestation_count: att_count,
+                    attested_by:       att_by,
                 });
             }
 

@@ -616,17 +616,14 @@ pub async fn serve(
                             Some(a) => {
                                 let is_registered = a.tier.is_some();
                                 let resp = serde_json::json!({
-                                    "address":        address,
-                                    "registered":     is_registered,
-                                    "tier":           a.tier,
-                                    "exemption_days": a.exemption_days,
-                                    // INV-13 fields: set by ConfirmSybil, cleared by ReverseSybil.
-                                    "frozen":         a.frozen,
-                                    "sybil_confirmed": a.sybil_confirmed,
-                                    // attestation_count and attester_list are
-                                    // available via the identity crate's IdentityStore
-                                    // directly; ExplorerState carries tier/charm only.
-                                    "note": "full attestation history available via IdentityStore"
+                                    "address":           address,
+                                    "registered":        is_registered,
+                                    "tier":              a.tier,
+                                    "exemption_days":    a.exemption_days,
+                                    "frozen":            a.frozen,
+                                    "sybil_confirmed":   a.sybil_confirmed,
+                                    "attestation_count": a.attestation_count,
+                                    "attested_by":       a.attested_by,
                                 });
                                 http_200_json(&resp.to_string())
                             }
