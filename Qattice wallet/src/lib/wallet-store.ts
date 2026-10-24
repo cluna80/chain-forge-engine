@@ -198,10 +198,26 @@ export const useWallet = create<State>()(
         const s = get();
         if (s.tier === "verified") return { ok: false, error: "Already verified." };
         const addr = getAddress();
+        const chainId = (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle";
+        // Register identity first if not yet on-chain
+        const identity = await fetchNodeIdentity(addr);
+        if (!identity?.registered) {
+          const regResult = await submitNodeTx({
+            id: `reg-${addr}`,
+            chain_id: chainId,
+            sender: addr,
+            nonce: s.nonce,
+            gas_limit: GAS_LIMIT,
+            body: "RegisterIdentity",
+          });
+          if (!regResult.ok) return { ok: false, error: `RegisterIdentity failed: ${regResult.error}` };
+          // Wait briefly for the node to process before attesting
+          await new Promise(r => setTimeout(r, 2000));
+        }
         const body = { Attest: { claimant_id: addr } };
         const result = await submitNodeTx({
           id: `attest-${addr}-${s.nonce}`,
-          chain_id: (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle",
+          chain_id: chainId,
           sender: addr,
           nonce: s.nonce,
           gas_limit: GAS_LIMIT,
