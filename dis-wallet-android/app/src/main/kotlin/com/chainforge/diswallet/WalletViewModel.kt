@@ -96,48 +96,54 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     fun getSavedVendors(): Set<String> = keyStore.getVendorIds()
 
-    suspend fun serverAuth(serverUrl: String, vendorId: String, resourceId: String, action: String): String =
-        withContext(Dispatchers.IO) {
-            try {
-                val client = VendorServerClient(serverUrl)
+    fun vendorOrigin(vendorId: String): String? = keyStore.loadVendor(vendorId)?.origin
 
-                // Get public key for this vendor
-                val exported = wallet.exportKey(vendorId)
-                if (exported.startsWith("ERROR"))
-                    return@withContext "ERROR: vendor not provisioned — provision first"
-                val pk = exported.split(":").firstOrNull()
-                    ?: return@withContext "ERROR: could not get public key"
+    data class ServerChallenge(
+        val serverUrl: String,
+        val vendorId: String,
+        val challenge: JSONObject,
+    )
 
-                // Enroll with server (idempotent)
-                client.enroll(vendorId, pk)
-
-                // Get challenge from server
-                val challengeResp = client.challenge(vendorId, resourceId, action)
-                if (challengeResp.getString("status") != "ok")
-                    return@withContext "ERROR getting challenge: ${challengeResp.optString("message")}"
-
-                val challenge = challengeResp.getJSONObject("challenge")
-
-                // Sign with DIS wallet
-                val proofStr = wallet.signChallenge(vendorId, challenge.toString())
-                if (proofStr.startsWith("ERROR"))
-                    return@withContext "ERROR signing: $proofStr"
-
-                val proofObj = JSONObject(proofStr)
-                val pubKey = proofObj.getString("public_key")
-                val sig = proofObj.getString("signature")
-
-                // Send proof to server for verification
-                val verifyResp = client.verify(vendorId, challenge, pubKey, sig)
-                val status = verifyResp.getString("status")
-
-                if (status == "verified") {
-                    "✅ SERVER VERIFIED!\n\nAccess granted to:\n${verifyResp.optString("resource_id")}\nAction: ${verifyResp.optString("action")}\nWallet: ${verifyResp.optString("wallet_id")}"
-                } else {
-                    "❌ Rejected: ${verifyResp.optString("message")}"
-                }
-            } catch (e: Exception) {
-                "ERROR: ${e.message}"
-            }
+    /** Enroll and fetch a challenge. Does not sign. */
+    suspend fun fetchServerChallenge(
+        serverUrl: String,
+        vendorId: String,
+        resourceId: String,
+        action: String,
+    ): ServerChallenge = withContext(Dispatchers.IO) {
+        val client = VendorServerClient(serverUrl)
+        val exported = wallet.exportKey(vendorId)
+        if (exported.startsWith("ERROR")) error("Vendor not provisioned. Provision first.")
+        val pk = exported.split(":").firstOrNull() ?: error("Could not get the public key.")
+        client.enroll(vendorId, pk)
+        val challengeResp = client.challenge(vendorId, resourceId, action)
+        if (challengeResp.optString("status") != "ok") {
+            error(challengeResp.optString("message").ifBlank { "The server did not return a challenge." })
         }
+        ServerChallenge(serverUrl, vendorId, challengeResp.getJSONObject("challenge"))
+    }
+
+    suspend fun submitServerProof(
+        serverUrl: String,
+        vendorId: String,
+        challenge: JSONObject,
+        proofStr: String,
+    ): String = withContext(Dispatchers.IO) {
+        try {
+            val proofObj = JSONObject(proofStr)
+            val verifyResp = VendorServerClient(serverUrl).verify(
+                vendorId,
+                challenge,
+                proofObj.getString("public_key"),
+                proofObj.getString("signature"),
+            )
+            if (verifyResp.optString("status") == "verified") {
+                "✅ SERVER VERIFIED!\n\nAccess granted to:\n${verifyResp.optString("resource_id")}\nAction: ${verifyResp.optString("action")}\nWallet: ${verifyResp.optString("wallet_id")}"
+            } else {
+                "❌ Rejected: ${verifyResp.optString("message")}"
+            }
+        } catch (e: Exception) {
+            "ERROR: ${e.message}"
+        }
+    }
 }
