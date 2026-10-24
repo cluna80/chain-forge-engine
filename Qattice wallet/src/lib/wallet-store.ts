@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { getAddress } from "@/lib/keypair-store";
 import {
-  ADDRESS,
   GAS_LIMIT,
   ATTESTATION_QUORUM,
   type Activity,
@@ -173,9 +173,10 @@ export const useWallet = create<State>()(
           set({ nodeConnected: false, nodeError: "Set VITE_NODE_URL to connect to a live node." });
           return;
         }
+        const address = getAddress();
         const [identity, account] = await Promise.all([
-          fetchNodeIdentity(ADDRESS),
-          fetchNodeAccount(ADDRESS),
+          fetchNodeIdentity(address),
+          fetchNodeAccount(address),
         ]);
         if (!identity && !account) {
           set({ nodeConnected: false, nodeError: `Cannot reach node at ${NODE_URL}` });
@@ -196,10 +197,10 @@ export const useWallet = create<State>()(
       attest: async () => {
         const s = get();
         if (s.tier === "verified") return { ok: false, error: "Already verified." };
-        const body = { type: "Attest", claimant_id: ADDRESS };
+        const body = { type: "Attest", claimant_id: getAddress() };
         const result = await submitNodeTx({
           chain_id: (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle",
-          sender: ADDRESS,
+          sender: getAddress(),
           nonce: s.nonce,
           gas_limit: GAS_LIMIT,
           body,
@@ -289,7 +290,7 @@ export const useWallet = create<State>()(
         const s = get();
         const dest = to.trim();
         if (!dest.startsWith("qcb1")) return { ok: false, error: "Recipient must be a qcb1 address." };
-        if (dest === ADDRESS) return { ok: false, error: "That is this wallet." };
+        if (dest === getAddress()) return { ok: false, error: "That is this wallet." };
         if (!Number.isInteger(amountUqcb) || amountUqcb <= 0) {
           return { ok: false, error: "Amount must be a positive whole number of uQCB." };
         }
@@ -300,7 +301,7 @@ export const useWallet = create<State>()(
         if (NODE_URL) {
           const result = await submitNodeTx({
             chain_id: (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle",
-            sender: ADDRESS,
+            sender: getAddress(),
             nonce: s.nonce,
             gas_limit: GAS_LIMIT,
             body,
@@ -638,7 +639,7 @@ export const useWallet = create<State>()(
             {
               id: uid("act"),
               title: kind === "agent" ? "Agent sponsored" : "Contract sponsored",
-              detail: `${clean} · sponsor ${ADDRESS}`,
+              detail: `${clean} · sponsor ${getAddress()}`,
               at: nowStamp(),
             },
             ...s.activity,

@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import QRCode from "qrcode";
 import { toast } from "sonner";
+import { getAddress } from "@/lib/keypair-store";
 import {
-  ADDRESS,
   ATTESTATION_QUORUM,
   CHAIN_ID,
   DIS_DOMAIN,
@@ -112,12 +112,12 @@ export function HomeScreen({ go }: { go: (tab: Tab) => void }) {
 
       <button
         type="button"
-        onClick={() => void copyText(ADDRESS, "Address copied")}
+        onClick={() => void copyText(getAddress(), "Address copied")}
         className="flex w-full items-center justify-between rounded-2xl border border-line bg-panel px-4 py-3 text-left"
       >
         <span>
           <span className="block text-xs text-mist">Chain account</span>
-          <span className="font-mono text-sm text-parchment">{shortAddress(ADDRESS)}</span>
+          <span className="font-mono text-sm text-parchment">{shortAddress(getAddress())}</span>
         </span>
         <span className="text-sm text-brass">Copy</span>
       </button>
@@ -618,11 +618,11 @@ export function MoveScreen() {
 
       {mode === "receive" ? (
         <Card className="text-center">
-          <AddressQr value={ADDRESS} />
-          <p className="mt-4 font-mono text-sm break-all text-parchment">{ADDRESS}</p>
+          <AddressQr value={getAddress()} />
+          <p className="mt-4 font-mono text-sm break-all text-parchment">{getAddress()}</p>
           <p className="mt-2 text-sm text-mist">qcb1pq · post-quantum account. Pay in uQCB.</p>
           <div className="mt-4">
-            <PrimaryButton onClick={() => void copyText(ADDRESS, "Address copied")}>Copy address</PrimaryButton>
+            <PrimaryButton onClick={() => void copyText(getAddress(), "Address copied")}>Copy address</PrimaryButton>
           </div>
         </Card>
       ) : (
@@ -665,7 +665,7 @@ export function MoveScreen() {
           <SectionLabel>SignedTxEnvelope</SectionLabel>
           <dl className="mt-2">
             <Row k="chain_id" v={CHAIN_ID} />
-            <Row k="sender" v={shortAddress(ADDRESS)} />
+            <Row k="sender" v={shortAddress(getAddress())} />
             <Row k="nonce" v={String(nonce)} />
             <Row k="gas_limit" v={GAS_LIMIT.toLocaleString("en-US")} />
             <Row k="denom" v="uqcb" />
@@ -746,7 +746,7 @@ export function AgentsScreen() {
       <Card>
         <SectionLabel>Sponsor desk</SectionLabel>
         {verified ? (
-          <p className="mt-2 text-sm text-mist">Sponsor id {shortAddress(ADDRESS)}. Nothing here is deployed to the devnet.</p>
+          <p className="mt-2 text-sm text-mist">Sponsor id {shortAddress(getAddress())}. Nothing here is deployed to the devnet.</p>
         ) : (
           <p className="mt-2 text-sm text-clay">Locked. Only a verified human can sponsor. A vendor session will not do it.</p>
         )}
@@ -822,7 +822,7 @@ export function AgentsScreen() {
                 </div>
                 <p className="mt-1 text-sm text-parchment">{item.purpose}</p>
                 <p className="mt-1 text-sm text-mist">
-                  Sponsor {shortAddress(ADDRESS)}
+                  Sponsor {shortAddress(getAddress())}
                   {item.kind === "agent" ? ` · cap ${formatQcb(item.spendCapUqcb)} QCB` : ""}
                 </p>
               </li>

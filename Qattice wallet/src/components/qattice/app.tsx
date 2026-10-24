@@ -1,9 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Toaster } from "sonner";
 import { ArrowLeftRight, Bot, Fingerprint, Hexagon, ListChecks } from "lucide-react";
 import type { Tab } from "@/lib/qattice";
+import { loadKeypair } from "@/lib/keypair-store";
 import { useWallet } from "@/lib/wallet-store";
 import { AgentsScreen, HomeScreen, MoveScreen, SpecScreen, StoneScreen } from "@/components/qattice/screens";
+import { InitWallet } from "@/components/qattice/init-wallet";
 
 const NAV: { id: Tab; label: string; icon: typeof Hexagon }[] = [
   { id: "home", label: "Home", icon: Hexagon },
@@ -16,10 +18,15 @@ const NAV: { id: Tab; label: string; icon: typeof Hexagon }[] = [
 export function QatticeApp() {
   const tab = useWallet((s) => s.tab);
   const setTab = useWallet((s) => s.setTab);
+  const [initialized, setInitialized] = useState(() => loadKeypair() !== null);
 
   useEffect(() => {
     void useWallet.persist.rehydrate();
   }, []);
+
+  if (!initialized) {
+    return <InitWallet onDone={() => setInitialized(true)} />;
+  }
 
   function go(next: Tab) {
     setTab(next);
