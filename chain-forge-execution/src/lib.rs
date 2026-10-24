@@ -116,6 +116,137 @@ pub enum ExecutionError {
 
 pub type ExecResult<T> = Result<T, ExecutionError>;
 
+// -- Fee distribution ---------------------------------------------------------
+
+/// How collected fees are split at each block close (basis points, sum = 10_000).
+///
+/// Default: 7000 validators / 2000 treasury / 1000 burn.
+/// Any remainder from integer division stays in the validator pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeDistribution {
+    pub validator_bps: u32,
+    pub treasury_bps:  u32,
+    pub burn_bps:      u32,
+}
+
+impl FeeDistribution {
+    pub const DEFAULT_VALIDATOR_BPS: u32 = 7_000;
+    pub const DEFAULT_TREASURY_BPS:  u32 = 2_000;
+    pub const DEFAULT_BURN_BPS:      u32 = 1_000;
+
+    pub fn default() -> Self {
+        Self {
+            validator_bps: Self::DEFAULT_VALIDATOR_BPS,
+            treasury_bps:  Self::DEFAULT_TREASURY_BPS,
+            burn_bps:      Self::DEFAULT_BURN_BPS,
+        }
+    }
+
+    /// Construct from genesis config, validating the bps sum.
+    pub fn from_genesis(genesis: &chain_forge_core::GenesisConfig) -> Result<Self, String> {
+        if let Some(bps) = &genesis.execution.fee_distribution_bps {
+            let sum = bps.validator_bps + bps.treasury_bps + bps.burn_bps;
+            if sum != 10_000 {
+                return Err(format!(
+                    "fee_distribution_bps must sum to 10000; got {}+{}+{}={}",
+                    bps.validator_bps, bps.treasury_bps, bps.burn_bps, sum,
+                ));
+            }
+            Ok(Self {
+                validator_bps: bps.validator_bps,
+                treasury_bps:  bps.treasury_bps,
+                burn_bps:      bps.burn_bps,
+            })
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Split `amount` into (validator_share, treasury_share, burn_share).
+    /// Integer floor division; any remainder stays in the validator share.
+    pub fn split(&self, amount: u64) -> (u64, u64, u64) {
+        let validator = (amount as u128 * self.validator_bps as u128 / 10_000) as u64;
+        let treasury  = (amount as u128 * self.treasury_bps  as u128 / 10_000) as u64;
+        let burn      = (amount as u128 * self.burn_bps       as u128 / 10_000) as u64;
+        // Remainder (from floor division) stays in validator share.
+        let remainder = amount.saturating_sub(validator + treasury + burn);
+        (validator + remainder, treasury, burn)
+    }
+}
+
+/// Result of distributing one block's collected fees.
+#[derive(Debug, Clone)]
+pub struct FeeSettlementResult {
+    pub fees_total:      u64,
+    pub validator_share: u64,
+    pub treasury_share:  u64,
+    pub burn_share:      u64,
+}
+
+/// Distribute `fees_collected` from one block into the three destination accounts.
+///
+/// - `treasury:validator-pool` receives the validator share.
+/// - `treasury:network`        receives the treasury share.
+/// - The burn share is permanently removed via `StateStore::burn()`.
+///
+/// Only `fees_collected` (from the current block's `BlockExecutionResult`) is
+/// moved — NOT the total balance of `treasury:fees`.  This prevents replay,
+/// restart, or partial-commit errors from double-distributing prior epochs.
+pub fn distribute_block_fees(
+    fees_collected: u64,
+    dist:           &FeeDistribution,
+    native_denom:   &str,
+    state:          &mut chain_forge_state::StateStore,
+) -> FeeSettlementResult {
+    if fees_collected == 0 {
+        return FeeSettlementResult {
+            fees_total: 0, validator_share: 0, treasury_share: 0, burn_share: 0,
+        };
+    }
+
+    let (validator_share, treasury_share, burn_share) = dist.split(fees_collected);
+    let fee_src = "treasury:fees";
+
+    // Helper: credit an account, auto-creating if absent.
+    let credit_account = |state: &mut chain_forge_state::StateStore, addr: &str, amount: u64| {
+        if state.get_account(addr).is_err() {
+            let a = chain_forge_state::AccountState::new(addr.to_string(), "treasury".to_string());
+            state.upsert_account(a);
+        }
+        if let Ok(a) = state.get_account_mut(addr) {
+            a.credit(native_denom, amount as u128);
+        }
+        state.refresh_leaf(addr);
+    };
+
+    // Move validator share: treasury:fees → treasury:validator-pool
+    if validator_share > 0 {
+        let _ = state.transfer(fee_src, "treasury:validator-pool", native_denom, validator_share as u128);
+    }
+
+    // Move treasury share: treasury:fees → treasury:network
+    if treasury_share > 0 {
+        // Ensure destination exists before transfer.
+        credit_account(state, "treasury:network", 0);
+        let _ = state.transfer(fee_src, "treasury:network", native_denom, treasury_share as u128);
+    }
+
+    // Burn the burn share permanently.
+    if burn_share > 0 {
+        let _ = state.burn(fee_src, native_denom, burn_share as u128);
+    }
+
+    tracing::debug!(
+        fees_total      = fees_collected,
+        validator_share,
+        treasury_share,
+        burn_share,
+        "block fee settlement"
+    );
+
+    FeeSettlementResult { fees_total: fees_collected, validator_share, treasury_share, burn_share }
+}
+
 // -- Gas models ---------------------------------------------------------------
 
 /// Fee model, read from genesis config.
@@ -1440,6 +1571,10 @@ pub struct ExecutionConfig {
     /// `"treasury:fees"` when not specified in genesis.
     pub fee_collector: String,
 
+    /// How fees collected per block are split among validator pool, network
+    /// treasury, and permanent burn.  Applied by `distribute_block_fees()`.
+    pub fee_distribution: FeeDistribution,
+
     /// Optional ZK-VRC proof verifier (QPC-GAP-002).
     ///
     /// When set, `VerifyIdentityWithProof` transactions are accepted and the
@@ -1468,6 +1603,8 @@ impl ExecutionConfig {
             fee_collector: genesis.execution.fee_collector
                 .clone()
                 .unwrap_or_else(|| "treasury:fees".to_string()),
+            fee_distribution: FeeDistribution::from_genesis(genesis)
+                .unwrap_or_else(|_| FeeDistribution::default()),
             pop_verifier: None,
         }
     }
@@ -3615,6 +3752,10 @@ impl Executor {
             "block executed"
         );
 
+        // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
+        // Operates only on fees_collected (this block) — not the treasury:fees balance.
+        distribute_block_fees(fees_collected, &self.config.fee_distribution, &self.config.native_denom, state);
+
         BlockExecutionResult {
             height,
             tx_results:    results,
@@ -3762,6 +3903,9 @@ impl Executor {
                 }
             }
         }
+
+        // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
+        distribute_block_fees(fees_collected, &self.config.fee_distribution, &self.config.native_denom, state);
 
         let take_snapshot = height % 100 == 0;
         let state_root = state.commit(height, timestamp_ms, take_snapshot);

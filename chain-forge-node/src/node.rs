@@ -469,6 +469,10 @@ pub struct Node {
 /// a separate magic number to remember.
 pub const DEFAULT_VALIDATOR_EPOCH_BLOCKS: u64 = 100;
 
+/// Minimum participation percentage (0–100) a validator must have signed
+/// within the epoch to be eligible for the epoch reward pool.
+pub const VALIDATOR_REWARD_PARTICIPATION_PCT: u8 = 95;
+
 /// Map a transaction body to a short string label for the explorer.
 ///
 /// This function is the single source of truth for the kind string used
@@ -3348,8 +3352,53 @@ impl Node {
         // gets their activity stamped for this epoch. This means validators earn
         // QRC yield for doing their job — producing/signing blocks — without
         // needing to submit separate Transfer or Stake txs.
+        // Also record epoch_blocks_signed for per-epoch reward eligibility.
+        let current_epoch = self.identity.clock.current_epoch;
         for vote in &cert.precommits {
             self.identity.record_activity(&vote.validator.0);
+            self.validator_registry.record_precommit(&vote.validator.0, current_epoch);
+        }
+
+        // ── Epoch-close: distribute validator reward pool equally among
+        //    eligible, active, personhood-verified validators (70/20/10 split
+        //    already moved fees into treasury:validator-pool at block close).
+        //
+        // Eligibility: Active, pop_verified, nonzero consensus power, not
+        // currently jailed, participation >= VALIDATOR_REWARD_PARTICIPATION_PCT.
+        // Per-human dedup: one share per unique owner_identity_id.
+        // Zero eligible → pool carries forward unchanged.
+        if epoch_rolled {
+            let eligible = self.validator_registry.eligible_validators_for_epoch_reward(
+                current_epoch,
+                self.validator_epoch_blocks,
+                VALIDATOR_REWARD_PARTICIPATION_PCT,
+            );
+            if !eligible.is_empty() {
+                let pool_bal = self.state.get_account("treasury:validator-pool")
+                    .map(|a| a.balance_of(self.executor.native_denom()))
+                    .unwrap_or(0);
+                let share = (pool_bal / eligible.len() as u128) as u64;
+                if share > 0 {
+                    for vid in &eligible {
+                        let _ = self.state.transfer(
+                            "treasury:validator-pool", vid,
+                            self.executor.native_denom(), share as u128,
+                        );
+                    }
+                    info!(
+                        epoch         = current_epoch,
+                        eligible      = eligible.len(),
+                        share_per_val = share,
+                        pool_balance  = pool_bal,
+                        "epoch-close: validator reward pool distributed"
+                    );
+                }
+            } else {
+                debug!(
+                    epoch = current_epoch,
+                    "epoch-close: no eligible validators — validator reward pool carried forward"
+                );
+            }
         }
 
         // Snapshot Attest tx metadata before txs is consumed by execute_block.

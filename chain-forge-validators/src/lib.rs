@@ -337,10 +337,16 @@ pub struct ValidatorRecord {
     pub registration_seq: u64,
     /// Epoch of last status change.
     pub last_status_epoch: u64,
-    /// Blocks proposed by this validator (for performance tracking).
+    /// Blocks proposed by this validator (cumulative lifetime).
     pub blocks_proposed:  u64,
-    /// Blocks missed in recent window (for liveness tracking, Q14).
+    /// Blocks missed in recent window (cumulative lifetime, for liveness tracking, Q14).
     pub blocks_missed:    u64,
+    /// Blocks signed in the current epoch (reset at each epoch boundary).
+    #[serde(default)]
+    pub epoch_blocks_signed: u64,
+    /// Epoch in which epoch_blocks_signed was last reset.
+    #[serde(default)]
+    pub epoch_counter_epoch: u64,
     /// Jail history (slashing prerequisite, Q6).
     pub jail_records:     Vec<JailRecord>,
     /// Human-readable moniker (display name).
@@ -586,6 +592,8 @@ impl ValidatorRegistry {
             last_status_epoch: epoch,
             blocks_proposed:   0,
             blocks_missed:     0,
+            epoch_blocks_signed: 0,
+            epoch_counter_epoch: 0,
             jail_records:      Vec::new(),
             moniker:           req.moniker,
             website:           req.website,
@@ -672,6 +680,8 @@ impl ValidatorRegistry {
             last_status_epoch: 0,
             blocks_proposed:   0,
             blocks_missed:     0,
+            epoch_blocks_signed: 0,
+            epoch_counter_epoch: 0,
             jail_records:      Vec::new(),
             moniker:           id.to_string(),
             website:           None,
@@ -733,6 +743,8 @@ impl ValidatorRegistry {
             last_status_epoch: epoch,
             blocks_proposed:   0,
             blocks_missed:     0,
+            epoch_blocks_signed: 0,
+            epoch_counter_epoch: 0,
             jail_records:      Vec::new(),
             moniker:           id.to_string(),
             website:           None,
@@ -851,6 +863,8 @@ impl ValidatorRegistry {
                     last_status_epoch: epoch,
                     blocks_proposed:   0,
                     blocks_missed:     0,
+            epoch_blocks_signed: 0,
+            epoch_counter_epoch: 0,
                     jail_records:      Vec::new(),
                     moniker:           validator_id.to_string(),
                     website:           None,
@@ -1056,6 +1070,75 @@ impl ValidatorRegistry {
                 record.blocks_missed += 1;
             }
         }
+    }
+
+    /// Record that a validator signed a precommit in the current epoch.
+    /// `current_epoch` is passed so stale counters are reset on first call.
+    pub fn record_precommit(&mut self, validator_id: &str, current_epoch: u64) {
+        if let Some(record) = self.validators.get_mut(validator_id) {
+            if record.epoch_counter_epoch != current_epoch {
+                record.epoch_blocks_signed = 0;
+                record.epoch_counter_epoch = current_epoch;
+            }
+            record.epoch_blocks_signed += 1;
+        }
+    }
+
+    /// Determine which validators are eligible for epoch rewards and
+    /// distribute the validator pool equally among them.
+    ///
+    /// Eligibility (all must hold):
+    /// - `Active` status, `pop_verified=true`, nonzero `consensus_power()`
+    /// - Not jailed (no active jail record)
+    /// - `epoch_blocks_signed / validator_epoch_blocks >= participation_threshold_pct / 100`
+    /// - Owner identity unique per human (one share per human owner)
+    ///
+    /// Distribution:
+    /// - Pool amount split equally among eligible count (integer floor).
+    /// - Remainder stays in `treasury:validator-pool` for the next epoch.
+    /// - Zero eligible validators → no distribution, pool untouched.
+    ///
+    /// Returns the list of (validator_id, reward_amount) pairs that were credited.
+    pub fn eligible_validators_for_epoch_reward(
+        &self,
+        current_epoch:            u64,
+        validator_epoch_blocks:   u64,
+        participation_threshold:  u8, // 0–100 (percentage, e.g. 95)
+    ) -> Vec<String> {
+        use std::collections::HashMap;
+
+        // Collect candidates: one per human owner, best participation wins.
+        // Map: owner_key → (validator_id, signed_blocks)
+        let mut best_per_human: HashMap<String, (String, u64)> = HashMap::new();
+
+        for (id, record) in &self.validators {
+            if !record.pop_verified { continue; }
+            if record.status != ValidatorStatus::Active { continue; }
+            if record.consensus_power() == 0 { continue; }
+            // Jailed: any jail record where unjail_after epoch hasn't passed.
+            if record.jail_records.iter().any(|j| j.unjail_after >= current_epoch) { continue; }
+
+            // Epoch participation check.
+            let signed = if record.epoch_counter_epoch == current_epoch {
+                record.epoch_blocks_signed
+            } else {
+                0
+            };
+            if validator_epoch_blocks > 0 {
+                let pct = (signed * 100) / validator_epoch_blocks;
+                if pct < participation_threshold as u64 { continue; }
+            }
+
+            // Per-human dedup: keep the one with the highest signed count.
+            let owner_key = record.owner_identity_id.clone()
+                .unwrap_or_else(|| id.clone());
+            let entry = best_per_human.entry(owner_key).or_insert((id.clone(), 0));
+            if signed > entry.1 {
+                *entry = (id.clone(), signed);
+            }
+        }
+
+        best_per_human.into_values().map(|(id, _)| id).collect()
     }
 
     /// Check if a validator's liveness is below threshold and should be warned.

@@ -510,6 +510,23 @@ pub struct GenesisExecution {
     /// Defaults to `"treasury:fees"` when absent in genesis.
     #[serde(default)]
     pub fee_collector: Option<String>,
+
+    /// How collected fees are split at each block close.
+    /// Expressed in basis points (10_000 = 100%).  Must sum to 10_000.
+    /// Defaults to 70% validators / 20% treasury / 10% burn.
+    #[serde(default)]
+    pub fee_distribution_bps: Option<FeeDistributionBps>,
+}
+
+/// Basis-point split for collected transaction fees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeDistributionBps {
+    /// Share routed to the validator reward pool.  Default 7000.
+    pub validator_bps: u32,
+    /// Share routed to the network treasury.  Default 2000.
+    pub treasury_bps:  u32,
+    /// Share permanently burned.  Default 1000.
+    pub burn_bps:      u32,
 }
 
 fn default_require_signatures() -> bool { true }
