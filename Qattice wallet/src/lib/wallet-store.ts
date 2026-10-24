@@ -26,6 +26,10 @@ import {
   sha256Hex,
   txPreimage,
   uid,
+  fetchNodeIdentity,
+  fetchNodeAccount,
+  submitNodeTx,
+  NODE_URL,
 } from "@/lib/qattice";
 
 type State = {
@@ -36,6 +40,9 @@ type State = {
   nonce: number;
   tier: Tier;
   attestations: number;
+  attested_by: string[];
+  nodeConnected: boolean | null;
+  nodeError: string | null;
   vendors: Vendor[];
   challenges: Challenge[];
   agents: Agent[];
@@ -51,7 +58,8 @@ type State = {
   setTab: (tab: Tab) => void;
   setMoveMode: (mode: "send" | "receive") => void;
   reset: () => void;
-  attest: () => void;
+  syncFromNode: () => Promise<void>;
+  attest: () => Promise<{ ok: true; tx_id: string } | { ok: false; error: string }>;
   claim: () => { ok: true } | { ok: false; error: string };
   castVote: (choice: "yes" | "no") => { ok: true } | { ok: false; error: string };
   send: (to: string, amountUqcb: number) => Promise<{ ok: true; digest: string } | { ok: false; error: string }>;
@@ -87,6 +95,7 @@ function base(): Omit<
   | "setTab"
   | "setMoveMode"
   | "reset"
+  | "syncFromNode"
   | "attest"
   | "claim"
   | "castVote"
@@ -116,6 +125,9 @@ function base(): Omit<
     nonce: 7,
     tier: "provisional",
     attestations: 1,
+    attested_by: [],
+    nodeConnected: null,
+    nodeError: null,
     vendors: seedVendors(),
     challenges: [freshChallenge(now)],
     agents: seedAgents(),
@@ -156,28 +168,83 @@ export const useWallet = create<State>()(
       setTab: (tab) => set({ tab }),
       setMoveMode: (moveMode) => set({ moveMode }),
       reset: () => set({ ...base(), hydrated: true }),
-      attest: () => {
+      syncFromNode: async () => {
+        if (!NODE_URL) {
+          set({ nodeConnected: false, nodeError: "Set VITE_NODE_URL to connect to a live node." });
+          return;
+        }
+        const [identity, account] = await Promise.all([
+          fetchNodeIdentity(ADDRESS),
+          fetchNodeAccount(ADDRESS),
+        ]);
+        if (!identity && !account) {
+          set({ nodeConnected: false, nodeError: `Cannot reach node at ${NODE_URL}` });
+          return;
+        }
+        const update: Partial<State> = { nodeConnected: true, nodeError: null };
+        if (account) {
+          update.balanceUqcb = account.balances["uqcb"] ?? get().balanceUqcb;
+          update.nonce = account.nonce;
+        }
+        if (identity) {
+          update.attestations = identity.attestation_count;
+          update.attested_by = identity.attested_by;
+          if (identity.tier) update.tier = identity.tier as Tier;
+        }
+        set(update);
+      },
+      attest: async () => {
         const s = get();
-        if (s.tier === "verified") return;
-        const attestations = Math.min(ATTESTATION_QUORUM, s.attestations + 1);
-        const tier: Tier = attestations >= ATTESTATION_QUORUM ? "verified" : "provisional";
+        if (s.tier === "verified") return { ok: false, error: "Already verified." };
+        const body = { type: "Attest", claimant_id: ADDRESS };
+        const result = await submitNodeTx({
+          chain_id: (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle",
+          sender: ADDRESS,
+          nonce: s.nonce,
+          gas_limit: GAS_LIMIT,
+          body,
+        });
+        if (!result.ok) {
+          // fall back to local rehearsal if no node
+          if (!NODE_URL) {
+            const attestations = Math.min(ATTESTATION_QUORUM, s.attestations + 1);
+            const tier: Tier = attestations >= ATTESTATION_QUORUM ? "verified" : "provisional";
+            set({
+              attestations,
+              tier,
+              rehearsed: tier === "verified" ? mark(s.rehearsed, "verified") : s.rehearsed,
+              activity: [
+                {
+                  id: uid("act"),
+                  title: tier === "verified" ? "Verified tier" : "Attestation recorded",
+                  detail:
+                    tier === "verified"
+                      ? "Quorum of 3 reached in rehearsal."
+                      : `${attestations} of ${ATTESTATION_QUORUM} attestors.`,
+                  at: nowStamp(),
+                },
+                ...s.activity,
+              ],
+            });
+            return { ok: true, tx_id: "rehearsal" };
+          }
+          return result;
+        }
         set({
-          attestations,
-          tier,
-          rehearsed: tier === "verified" ? mark(s.rehearsed, "verified") : s.rehearsed,
+          nonce: s.nonce + 1,
           activity: [
             {
               id: uid("act"),
-              title: tier === "verified" ? "Verified tier" : "Attestation recorded",
-              detail:
-                tier === "verified"
-                  ? "Quorum of 3 reached in this rehearsal. Personhood is still a separate credential from DIS login."
-                  : `${attestations} of ${ATTESTATION_QUORUM} independent attestors.`,
+              title: "Attest tx submitted",
+              detail: `tx ${result.tx_id}`,
               at: nowStamp(),
             },
             ...s.activity,
           ],
         });
+        // refresh identity from node after a short delay
+        setTimeout(() => void get().syncFromNode(), 1500);
+        return result;
       },
       claim: () => {
         const s = get();
@@ -227,14 +294,36 @@ export const useWallet = create<State>()(
           return { ok: false, error: "Amount must be a positive whole number of uQCB." };
         }
         if (amountUqcb > s.balanceUqcb) return { ok: false, error: "Balance is short." };
-        const body = {
-          type: "Transfer",
-          to: dest,
-          amount: amountUqcb,
-          denom: "uqcb",
-        };
+        const body = { type: "Transfer", to: dest, amount: amountUqcb, denom: "uqcb" };
         const bodyJson = JSON.stringify(body);
         const digest = await sha256Hex(txPreimage(bodyJson));
+        if (NODE_URL) {
+          const result = await submitNodeTx({
+            chain_id: (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle",
+            sender: ADDRESS,
+            nonce: s.nonce,
+            gas_limit: GAS_LIMIT,
+            body,
+          });
+          if (!result.ok) return result;
+          set({
+            balanceUqcb: s.balanceUqcb - amountUqcb,
+            nonce: s.nonce + 1,
+            rehearsed: mark(s.rehearsed, "send"),
+            activity: [
+              {
+                id: uid("act"),
+                title: "Transfer submitted",
+                detail: `${amountUqcb.toLocaleString("en-US")} uQCB → ${dest} · tx ${result.tx_id}`,
+                at: nowStamp(),
+              },
+              ...s.activity,
+            ],
+          });
+          setTimeout(() => void get().syncFromNode(), 1500);
+          return { ok: true, digest: result.tx_id };
+        }
+        // rehearsal fallback (no node configured)
         set({
           balanceUqcb: s.balanceUqcb - amountUqcb,
           nonce: s.nonce + 1,

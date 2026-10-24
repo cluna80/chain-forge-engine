@@ -7,6 +7,7 @@ import {
   CHAIN_ID,
   DIS_DOMAIN,
   GAS_LIMIT,
+  NODE_URL,
   SPEC,
   TX_DOMAIN,
   PROPOSAL,
@@ -68,7 +69,20 @@ export function HomeScreen({ go }: { go: (tab: Tab) => void }) {
   const vendors = useWallet((s) => s.vendors);
   const setMoveMode = useWallet((s) => s.setMoveMode);
   const sessions = useWallet((s) => s.sessions);
+  const nodeConnected = useWallet((s) => s.nodeConnected);
+  const nodeError = useWallet((s) => s.nodeError);
+  const syncFromNode = useWallet((s) => s.syncFromNode);
   const openSessions = sessions.filter((ses) => ses.exp > Date.now());
+
+  useEffect(() => {
+    void syncFromNode();
+  }, [syncFromNode]);
+
+  const nodeLabel = nodeConnected === null
+    ? "connecting…"
+    : nodeConnected
+    ? "node live"
+    : "rehearsal mode";
 
   return (
     <div className="space-y-6">
@@ -78,9 +92,17 @@ export function HomeScreen({ go }: { go: (tab: Tab) => void }) {
             <Mark className="h-7 w-7" />
             <h1 className="font-display text-3xl font-medium tracking-tight text-parchment">Qattice</h1>
           </div>
-          <p className="mt-1 text-sm text-mist">Rehearsal wallet · keys stay on the phone</p>
+          <p className="mt-1 text-sm text-mist">{NODE_URL ? "Live wallet" : "Rehearsal wallet"} · keys stay on the phone</p>
         </div>
-        <p className="rounded-full border border-line px-3 py-1 text-xs text-mist">{CHAIN_ID.replace("qcb-", "")}</p>
+        <div className="flex flex-col items-end gap-1">
+          <p className="rounded-full border border-line px-3 py-1 text-xs text-mist">{CHAIN_ID.replace("qcb-", "")}</p>
+          <p
+            className={`text-xs ${nodeConnected === true ? "text-brass" : nodeConnected === false ? "text-clay" : "text-mist"}`}
+            title={nodeError ?? undefined}
+          >
+            {nodeLabel}
+          </p>
+        </div>
       </header>
 
       <div>
@@ -113,7 +135,16 @@ export function HomeScreen({ go }: { go: (tab: Tab) => void }) {
         </div>
         {tier === "provisional" ? (
           <div className="mt-4">
-            <PrimaryButton onClick={attest}>Record attestation</PrimaryButton>
+            <PrimaryButton
+              onClick={() =>
+                void attest().then((r) => {
+                  if (!r.ok) toast(r.error);
+                  else toast(NODE_URL ? "Attest tx submitted" : "Attestation recorded");
+                })
+              }
+            >
+              Record attestation
+            </PrimaryButton>
           </div>
         ) : (
           <div className="mt-4">

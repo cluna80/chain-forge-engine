@@ -2,6 +2,78 @@ export const UQCB = 1_000_000;
 export const CHAIN_ID = "qcb-testnet-4node";
 export const ADDRESS = "qcb1pq1k4rm7w4llet9h0lder2charm";
 export const TX_DOMAIN = "chain-forge/pq-tx/v1";
+
+// ---------------------------------------------------------------------------
+// Node connectivity
+// ---------------------------------------------------------------------------
+
+/** Base URL of a running Qattice node. Set VITE_NODE_URL to override. */
+export const NODE_URL: string | null =
+  (typeof import.meta !== "undefined" &&
+    (import.meta as { env?: Record<string, string> }).env?.VITE_NODE_URL) ||
+  null;
+
+export type NodeIdentity = {
+  address: string;
+  registered: boolean;
+  tier: string | null;
+  attestation_count: number;
+  attested_by: string[];
+  frozen: boolean;
+};
+
+export type NodeAccount = {
+  address: string;
+  nonce: number;
+  balances: Record<string, number>;
+};
+
+export type NodeTxResult =
+  | { ok: true; tx_id: string }
+  | { ok: false; error: string };
+
+async function nodeGet<T>(path: string): Promise<T | null> {
+  if (!NODE_URL) return null;
+  try {
+    const res = await fetch(`${NODE_URL}${path}`, {
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchNodeIdentity(address: string): Promise<NodeIdentity | null> {
+  return nodeGet<NodeIdentity>(`/api/identity/${address}`);
+}
+
+export async function fetchNodeAccount(address: string): Promise<NodeAccount | null> {
+  return nodeGet<NodeAccount>(`/api/accounts/${address}`);
+}
+
+export async function submitNodeTx(body: Record<string, unknown>): Promise<NodeTxResult> {
+  if (!NODE_URL) return { ok: false, error: "No node URL configured (set VITE_NODE_URL)." };
+  try {
+    const res = await fetch(`${NODE_URL}/api/tx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let json: Record<string, unknown> = {};
+    try { json = JSON.parse(text) as Record<string, unknown>; } catch { /* ignore */ }
+    if (!res.ok) {
+      const msg = (json.error as string) || (json.message as string) || text.slice(0, 120);
+      return { ok: false, error: msg };
+    }
+    const tx_id = (json.tx_id as string) || (json.id as string) || "submitted";
+    return { ok: true, tx_id };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
 export const DIS_DOMAIN = "DIS-KS-V1";
 export const GAS_LIMIT = 80_000;
 export const ATTESTATION_QUORUM = 3;
