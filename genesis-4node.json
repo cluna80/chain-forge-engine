@@ -92,6 +92,30 @@
       "public_key": "e6e0a2a2b21db8a99ad877e4a3cf88ddad5009fe704fd7fa904d8b5a5d4f490f"
     },
     {
+      "label": "Laptop",
+      "address": "qcb1pq24b67e077504e2c860c25845e8d7da24e699e84d",
+      "balance": "100000000",
+      "role": "user"
+    },
+    {
+      "label": "BossKing",
+      "address": "qcb1pq8a6c7879af17bb8f3ddb12f961ce1d01bf38f783",
+      "balance": "100000000",
+      "role": "user"
+    },
+    {
+      "label": "King-OptiPlex-990",
+      "address": "qcb1pq8103f0befa5190e4654661e8dd4c4f6c3472f941",
+      "balance": "100000000",
+      "role": "user"
+    },
+    {
+      "label": "Phone",
+      "address": "qcb1pqbd74a9cbd9e745ad1d5d84799abdd5bdc761964a",
+      "balance": "100000000",
+      "role": "user"
+    },
+    {
       "label": "PoCD Treasury",
       "address": "treasury:pocd",
       "balance": "50000000000",
