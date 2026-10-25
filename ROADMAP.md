@@ -86,6 +86,8 @@
 
 This decision is final. Do not re-litigate it during Phase 0 or Phase 1 work.
 
+**Why not change devnet validators to ML-DSA now?** `chain-forge-consensus` is hardwired to `ClassicalScheme` (Ed25519) for all BFT vote signing and verification — `ValidatorInfo.public_key` is a 32-byte Ed25519 key, votes are signed with `SchemeId::Classical`, and `ClassicalScheme.verify()` is called directly in `receive_vote` and `verify_commit`. Switching consensus keys to ML-DSA requires updating those paths, regenerating all validator key files with 1952-byte ML-DSA keys, and auditing every test that constructs `ValidatorInfo` or signs votes. That is Phase 1 / mainnet genesis work, not a devnet patch. The devnet already proves the full ML-DSA user-transaction path end-to-end (P0-3 through P0-6). That is sufficient for Phase 0.
+
 **Token model (current — single token)**:
 - **QCB / uQCB** — the one and only token on Qattice. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, PoCD rewards, staking, and governance use uQCB. There is no second token.
 - **PoCD research rewards** — paid from `treasury:pocd-research` in uQCB.
