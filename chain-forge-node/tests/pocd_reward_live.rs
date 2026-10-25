@@ -305,8 +305,13 @@ fn dump_logs(nodes: &[NodeHandle]) {
         match std::fs::read_to_string(&n.log_path) {
             Ok(s) => {
                 let lines: Vec<&str> = s.lines().collect();
-                let start = lines.len().saturating_sub(60);
-                for line in &lines[start..] { eprintln!("  {line}"); }
+                eprintln!("  ── first 30 lines (startup) ──");
+                for line in lines.iter().take(30) { eprintln!("  {line}"); }
+                if lines.len() > 60 {
+                    eprintln!("  ── last 40 lines ──");
+                    let start = lines.len().saturating_sub(40);
+                    for line in &lines[start..] { eprintln!("  {line}"); }
+                }
             }
             Err(e) => eprintln!("  (could not read log: {e})"),
         }
