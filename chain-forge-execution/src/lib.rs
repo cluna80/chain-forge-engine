@@ -2171,6 +2171,20 @@ impl Executor {
         if let Err(e) = module_check(tx, &self.config.modules) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
+
+        // Nonce check runs before signature verification: it is a cheap state
+        // lookup that catches replays and out-of-sequence txs before any crypto.
+        {
+            let expected_nonce = state.get_account(&tx.sender)
+                .map(|a| a.nonce).unwrap_or(0);
+            if tx.nonce != expected_nonce {
+                return TransactionResult::err(
+                    tx.id.clone(), gas_required, tx.gas_limit,
+                    format!("nonce mismatch: expected {expected_nonce}, got {}", tx.nonce),
+                );
+            }
+        }
+
         if let Err(e) = verify_authorization_for(&self.config, tx, state) {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
@@ -2239,15 +2253,6 @@ impl Executor {
                     );
                 }
             }
-        }
-
-        let expected_nonce = state.get_account(&tx.sender)
-            .map(|a| a.nonce).unwrap_or(0);
-        if tx.nonce != expected_nonce {
-            return TransactionResult::err(
-                tx.id.clone(), gas_required, tx.gas_limit,
-                format!("nonce mismatch: expected {expected_nonce}, got {}", tx.nonce),
-            );
         }
 
         // FS-03: Debit per-tx fee from sender before executing the body.
