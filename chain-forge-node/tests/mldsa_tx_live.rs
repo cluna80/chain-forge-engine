@@ -320,9 +320,12 @@ fn wait_tx_result(port: u16, tx_id: &str, timeout: Duration) -> Option<serde_jso
 }
 
 fn balance_of(port: u16, addr: &str) -> u128 {
+    // AccountSnapshot response: {"balances": {"uqcb": N, ...}, "nonce": N, ...}
     api_get(port, &format!("/api/accounts/{addr}"))
-        .and_then(|v| v["balance"].as_str().and_then(|s| s.parse().ok())
-            .or_else(|| v["balance"].as_u64().map(|n| n as u128)))
+        .and_then(|v| {
+            v["balances"]["uqcb"].as_u64().map(|n| n as u128)
+                .or_else(|| v["balances"]["uqcb"].as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0)
 }
 
