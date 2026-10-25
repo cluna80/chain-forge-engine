@@ -987,7 +987,7 @@ pub struct Transaction {
     #[serde(default, deserialize_with = "deser_hex_or_bytes")]
     pub public_key: Vec<u8>,
     /// Post-quantum signature tags.  Each entry is `"<scheme>:<hex>"`, e.g.
-    /// `"mldsa65:<3293-byte-sig-hex>"`.  Empty for unsigned or Ed25519-only txs.
+    /// `"mldsa65:<3309-byte-sig-hex>"`.  Empty for unsigned or Ed25519-only txs.
     ///
     /// When present the executor verifies the ML-DSA signature over
     /// SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || body_json).
@@ -1965,7 +1965,7 @@ pub fn module_check(tx: &Transaction, modules: &EnabledModules) -> Result<(), St
 /// - payload within max_tx_bytes
 /// - Transfer body fields: amount > 0, `to` non-empty and qcb1-prefixed, denom non-empty
 /// - Ed25519 signature, if present, is exactly 64 bytes
-/// - ML-DSA-65 signature tag, if present, is exactly 6586 hex chars
+/// - ML-DSA-65 signature tag, if present, is exactly 6618 hex chars
 ///
 /// What this does NOT check (needs state or crypto):
 /// - nonce ordering / replay (state-dependent)
@@ -2052,10 +2052,10 @@ pub fn check_tx(tx: &Transaction, max_tx_bytes: usize, block_gas_limit: u64) -> 
     if !tx.pq_signatures.is_empty() {
         for tag in &tx.pq_signatures {
             if let Some(hex) = tag.strip_prefix("mldsa65:") {
-                // ML-DSA-65 signatures are 3293 bytes = 6586 hex chars.
-                if hex.len() != 6586 {
+                // ML-DSA-65 signatures are 3309 bytes = 6618 hex chars (pqcrypto dilithium3 detached sig).
+                if hex.len() != 6618 {
                     return Err(format!(
-                        "malformed ML-DSA-65 signature: expected 6586 hex chars, got {}",
+                        "malformed ML-DSA-65 signature: expected 6618 hex chars, got {}",
                         hex.len()
                     ));
                 }
@@ -6376,7 +6376,7 @@ mod tests {
     #[test]
     fn check_tx_rejects_malformed_mldsa_signature() {
         let mut tx = minimal_tx("qcb1alice", 100_000);
-        tx.pq_signatures = vec!["mldsa65:deadbeef".into()]; // 8 hex chars, not 6586
+        tx.pq_signatures = vec!["mldsa65:deadbeef".into()]; // 8 hex chars, not 6618
         assert!(check_tx(&tx, 0, 0).is_err(), "malformed ML-DSA-65 sig must be rejected");
     }
 

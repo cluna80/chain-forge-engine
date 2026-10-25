@@ -377,7 +377,7 @@ fn build_mldsa_transfer(
 /// Build an ML-DSA-65 Transfer tx with a garbage (random) signature.
 fn build_garbage_sig_tx(seed: &str, sender: &str, nonce: u64) -> Transaction {
     let kp = MlDsaScheme.generate_keypair(seed).expect("ML-DSA keygen");
-    let garbage_hex: String = (0..3293).map(|i| format!("{:02x}", (i * 7 + 13) as u8)).collect();
+    let garbage_hex: String = (0..3309).map(|i| format!("{:02x}", (i * 7 + 13) as u8)).collect();
 
     let body = TxBody::Transfer {
         to:     RECV_ADDR.to_string(),
