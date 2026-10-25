@@ -25,7 +25,7 @@ workspace with no borrowed consensus or state-machine code from any other chain.
 | Post-quantum identity (DIS protocol) | ✅ 4 pilot devices at Verified tier |
 | Fee accounting (70/20/10 bps split) | ✅ 5-node multi-machine devnet |
 | Epoch-close validator reward distribution | ✅ Per-human dedup, participation gate |
-| PoCD reward settlement (`ClaimResearchReward`) | 🔄 Test in progress (P0-9) |
+| PoCD reward settlement (`ClaimResearchReward`) | ✅ Happy path + 3 rejection cases pass |
 | FeeSponsor live authorization | 🔲 Crypto + store done; execution wiring pending |
 
 **Not yet working / out of scope for Phase 0:**
