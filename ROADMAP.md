@@ -106,7 +106,7 @@ This decision is final. Do not re-litigate it during Phase 0 or Phase 1 work.
 | P0-6 | Incorrect nonces are rejected | ✅ | `mldsa_tx_live` P0-6 case: nonce-999 tx (expected 1) → rejected with nonce mismatch |
 | P0-7 | Timestamp monotonicity finding resolved and regression-tested | ✅ | `node.rs`: both commit paths now use `proposal.timestamp_ms.max(last+1)`; `last_committed_timestamp_ms` field enforces strict monotonicity; `timestamp_monotonic_live` regression test (commit `0b0a611`) |
 | P0-8 | Consensus safety and finality pass under current validator config | ✅ | Partition tolerance test (iptables DROP, 5s), equivocation detection, restart recovery — all confirmed; adversarial gossip 3/3 |
-| P0-9 | PoCD proof submission and reward settlement verified on current code | ✅ | `pocd_reward_live`: valid claim (A), replay rejected (B), unauthorized operator rejected (C), insolvent treasury rejected (D) — all pass on 4-node devnet |
+| P0-9 | PoCD proof submission and reward settlement verified on current code | ✅ | `pocd_reward_live` (7 cases): valid claim (A), replay rejected (B), unauthorized operator rejected (C), insolvent treasury rejected (D), concurrent claims both settle (E), unknown objective_id/task_id accepted by trusted operator (F), settlement persists across block boundary (G) — all pass on 4-node devnet |
 
 ### Resource-Market Phase 0 — Archived (2026-10-25)
 
