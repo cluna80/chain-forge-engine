@@ -72,16 +72,76 @@
 
 ---
 
-## Phase 0 — Chain Forge Engine Foundation
+## Phase 0 — Core Network and Post-Quantum Identity Validation
 
-**Goal**: A working, partition-tolerant BFT consensus engine plus one complete, adversarially-verified, cross-machine resource purchase and a live PoCD research pipeline — Machine 1's agent buys computation from Machine 2's resource node, escrow settles, and the settlement survives ten deliberate attack scenarios. Separately, external miners submit SHA-256 cryptographic discovery proofs that are independently verified and rewarded in uQCB from `treasury:pocd-research`.
+> **Re-scoped 2026-10-25.** The original Phase 0 goal — an adversarially-verified cross-machine resource purchase — was invalidated when `chain-forge-resource` and `chain-forge-qrc` were removed from the workspace on 2026-10-18 (commit `211430c`). The execution infrastructure for that acceptance test (escrow tx types, `ResourceNode`, `RegisterMachine`, `SubmitUsefulWork`) no longer exists. Re-introducing those crates solely to satisfy an outdated roadmap would create unnecessary work. The historical resource-market Phase 0 milestones and test results are preserved in the archive section below. Resource-market functionality is deferred as a future optional Chain Forge module; it does not block Qattice's identity and consensus development.
+
+**New goal**: Demonstrate that the Qattice core network — BFT consensus, ML-DSA-65 post-quantum identity, replay and nonce protection, and PoCD reward settlement — operates correctly and safely under the *current* codebase. Phase 0 is complete when every exit criterion below has a passing test mapped to it.
 
 **Token model (current — single token)**:
-- **QCB / uQCB** — the one and only token on Qattice. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, escrow, job payments, PoCD rewards, staking, and governance use uQCB. There is no second token.
+- **QCB / uQCB** — the one and only token on Qattice. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, PoCD rewards, staking, and governance use uQCB. There is no second token.
 - **PoCD research rewards** — paid from `treasury:pocd-research` in uQCB.
-- **Job escrow** — `LockQrcForJob` / `ReleaseQrcForJob` tx types operate in uQCB despite the legacy "Qrc" name; no `PurchaseQrc` step is needed or used.
 
-> **QRC is retired.** `chain-forge-qrc` (`QrcEngine`, `uqrc` balances, `PurchaseQrc`, `QrcContributionSettle`, `CreditProvider`) remains compiled into the workspace as a vestigial crate but is not active in any current devnet flow. The "Qrc" in escrow tx type names is a naming artifact — those tx types already operate entirely in uQCB. A future cleanup change set will rename the escrow tx types and formally remove or tombstone the `chain-forge-qrc` crate.
+### Phase 0 Exit Criteria
+
+> A milestone is ✅ only when implementation **and** a passing acceptance test both exist. Code alone is not sufficient.
+
+| # | Criterion | Status | Acceptance evidence |
+|---|-----------|--------|---------------------|
+| P0-1 | Clean genesis launches successfully across independent machines | ✅ | 4-node devnet (`genesis-4node.json`) starts, reaches block 5, all validators active — confirmed multiple sessions |
+| P0-2 | All four DIS pilot identities remain Verified after node restart | ✅ | BossKing, Laptop, Phone, King-OptiPlex-990 all Verified (2026-10-25); wallet re-fetches from node on refresh |
+| P0-3 | An ML-DSA-65-signed transaction is accepted and finalized across the network | ⬜ | Need end-to-end test: `qcb1pq…` sender, ML-DSA-65 sig, accepted + committed on ≥3 nodes |
+| P0-4 | Invalid signatures are rejected | ⬜ | Adversarial test: forged / garbage ML-DSA sig → tx rejected before mempool admission |
+| P0-5 | Replayed transactions are rejected | ⬜ | Adversarial test: same tx_id and nonce submitted twice → second rejected with replay error |
+| P0-6 | Incorrect nonces are rejected | ⬜ | Adversarial test: nonce skipped / out-of-order → rejected with nonce mismatch |
+| P0-7 | Timestamp monotonicity finding resolved and regression-tested | ⬜ | Fix `proposal.timestamp_ms` drift in `/api/blocks` explorer path; monotonicity + drift-bound enforcement; regression test confirms no proposer-controlled timestamp inflation |
+| P0-8 | Consensus safety and finality pass under current validator config | ✅ | Partition tolerance test (iptables DROP, 5s), equivocation detection, restart recovery — all confirmed; adversarial gossip 3/3 |
+| P0-9 | PoCD proof submission and reward settlement verified on current code | ⬜ | Audit current `chain-forge-pocd` + `treasury:pocd-research` settlement path; map to existing tests or identify missing test |
+
+### Resource-Market Phase 0 — Archived (2026-10-25)
+
+> The following section records the original Phase 0 scope and historical test results. It is preserved for reference. **Do not treat these milestones as current requirements.** The execution path they describe was removed from the workspace on 2026-10-18.
+
+<details>
+<summary>Original Phase 0 — Cross-Machine Resource Purchase (archived)</summary>
+
+**Original goal**: Machine 1's agent buys computation from Machine 2's resource node; escrow settles; settlement survives ten deliberate attack scenarios.
+
+**Happy path (historical)**:
+```
+Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
+  → Agent-A requests computation → P2P resource discovery
+  → Machine 2 (Carol) Resource Node accepts job
+  → Job runs in sandboxed container → Carol returns result
+  → ResourceExecutionReceipt generated + verified
+  → uQCB escrow releases → Carol receives uQCB
+```
+
+**Adversarial scenarios (historical — 6 of 10 had zero coverage before removal):**
+
+| # | Attack | Coverage at removal |
+|---|--------|---------------------|
+| 1 | Fake completion | ❌ No test — `SubmitUsefulWork` removed |
+| 2 | Duplicate settlement | ❌ No test — settlement path removed |
+| 3 | Replayed receipt | ❌ No test — never wired to execution |
+| 4 | Provider disconnect mid-job | ❌ No test — `ResourceNode` never built |
+| 5 | Requester disconnect mid-job | ❌ No test — same reason |
+| 6 | Tampered result | ⚠️ Unit test in orphaned crate only |
+| 7 | Unauthorized agent spending | ✅ Unit test in `chain-forge-agents` |
+| 8 | Spending-limit bypass | ✅ `SpendingLimits::check_per_job()` unit test |
+| 9 | Forged provider identity | ❌ No test — `RegisterMachine` removed |
+| 10 | Double payment / idempotency | ⚠️ Exists for PoCD; not for resource settlement |
+
+**Infrastructure that was removed (commit `211430c`, 2026-10-18):**
+- `chain-forge-resource` crate (removed from workspace)
+- `chain-forge-qrc` crate (removed from workspace)
+- `LockQrcForJob`, `ReleaseQrcForJob`, `RefundQrcForJob`, `RegisterMachine`, `SubmitUsefulWork` tx types
+
+**Future path**: Resource-market functionality may return as an optional Chain Forge module after Phase 0 and DIS-002 are complete. Design should use the uQCB single-token model from the start. Scope and acceptance criteria must be redefined before any re-implementation begins.
+
+</details>
+
+**Token model note**: `chain-forge-qrc` and `chain-forge-resource` have been removed. No escrow tx types exist in the current workspace. The QRC concept is fully retired.
 
 ### Consensus & Networking
 
@@ -121,84 +181,6 @@
 
 > **Security hardening milestones QCB-CS-001 and QCB-KR-001** are Phase 1 items that build directly on the work above. See Phase 1 → Cryptographic Security Hardening.
 
-### QRC Layer (`chain-forge-qrc`) — Retired
-
-> **QRC is a retired concept.** Qattice is a single-token chain. All balances, escrow, job payments, PoCD rewards, staking, and governance use **uQCB** only. The `chain-forge-qrc` crate remains compiled into the workspace as a vestigial artifact but none of its logic runs in any active devnet flow.
-
-| Component | Status | Direction |
-|-----------|--------|-----------|
-| `QrcEngine`, `uqrc` balances, serde + persistence | ⬜ | **Retired** — no active code path; not called in any current devnet flow |
-| Dynamic QCB→QRC conversion rate (Control 1) | ⬜ | **Retired** — second token does not exist; rate has no meaning |
-| Epoch conversion cap (Control 2) | ⬜ | **Retired** — no conversion path exists |
-| CoverageRatio circuit breaker (Control 5) | ⬜ | **Retired** — designed for a contribution-minting model that was abandoned |
-| Per-resource congestion pricing in QRC | ⬜ | **Retired** — resource pricing now expressed in uQCB |
-| `PurchaseQrc` tx type | ⬜ | **Retired** — no Qattice→QRC on-ramp needed; single token only |
-| `CapacityReport` / `CapacityEvidence_v0` | ⬜ | **Superseded** → `ResourceExecutionReceipt` in `chain-forge-resource` |
-| `CreditProvider` tx type | ⬜ | **Retired** — minting-era primitive; never used in uQCB flows |
-| `QrcContributionSettle` | ⬜ | **Retired** — contribution-minting model artifact |
-| Consumption burn (Control 4) — `p_burn = 0.25` | ⬜ | **Retired** — burning uQCB held by providers was never activated |
-| On-chain capacity tracking (Control 3) | ⬜ | **Retired** — capacity ads handled by Change Set T (`GossipTopic::CapacityAd`) |
-| `LockQrcForJob` / `ReleaseQrcForJob` tx type names | ✅ | **Legacy naming artifact** — these tx types operate entirely in uQCB; a future cleanup change set will rename them to remove the "Qrc" reference |
-
-> A future cleanup change set will formally tombstone or remove `chain-forge-qrc` and rename the escrow tx types to `LockUqcbForJob` / `ReleaseUqcbForJob`.
-
-### Resource Market Layer (`chain-forge-resource`) — NEW CRATE
-
-> **Separation principle**: `chain-forge-qrc` handles money. `chain-forge-resource` handles what was bought with the money. This separation matters enormously when the market scales.
-
-| Item | Status | Notes |
-|------|--------|-------|
-| `chain-forge-resource` crate scaffold | ✅ | `MachineRecord`, `ResourceCapabilityDescriptor`, `ResourceJob`, `ResourceExecutionReceipt`, `LockQrcForJob`/`ReleaseQrcForJob`/`RefundQrcForJob`; 23 unit tests passing |
-| `ResourceCapabilityDescriptor` | ✅ | `ComputeClass`, `MemoryTier`, `StorageTier`, `PriceModel`, ISA tags; `satisfies()` matcher lets agents check if provider meets job requirements; 8 unit tests |
-| `ResourceJob` state machine | ✅ | Full `CREATED→FUNDED→MATCHED→RUNNING→(COMPLETED/FAILED)→(VERIFIED/REFUND)→SETTLED` + `DISPUTED→RESOLUTION` branch; `is_terminal()` guard; 9 unit tests covering all paths + invalid-transition rejection |
-| `ResourceExecutionReceipt` | ✅ | `ResourceExecutionReceipt` + `UsefulWorkReceipt`; `compute_seal_hash`, `find_seal_nonce`, `meets_difficulty`, `verify_seal`; 6 unit tests |
-| P2P resource discovery | ⬜ | Agents broadcast `ResourceRequest` over libp2p gossip; providers respond with `ResourceOffer`; live availability stays off-chain; only economically important commitments/results go on-chain |
-| uQCB job escrow (`LockQrcForJob` / `ReleaseQrcForJob` / `RefundQrcForJob`) | ✅ | Agent locks uQCB before job starts; provider receives only on verified completion; refund path for failure/timeout; N3/N4/N5 guards tested; `DisputeResourceJob` stub for Phase 1; `RefundReason` enum covers all failure cases. Note: tx type names carry legacy "Qrc" label — amounts are entirely in uQCB |
-| `ResourceNode` prototype (Machine 2) | ⬜ | Machine 2 (Carol) advertises: `ProviderID`, `SponsorID`, **`MachineID`**, resource capabilities, `container_execution` + `python_execution` runtime types, availability, price, location/latency region, resource limits |
-| Secure workload sandbox (container) | ⬜ | Resource providers cannot execute arbitrary agent code on bare host; Docker/container prototype for Phase 0; note: production hostile multi-tenant workloads need stronger isolation — containers are a Phase 0 approximation only |
-| Job cancellation / failure / timeout handling | ⬜ | Explicit handling for: provider disappear mid-job, agent sends invalid workload, connection fails, provider produces wrong output, agent falsely claims failure, provider claims completion but result is unusable |
-
-### Agent Economic Identity (AEI) — Moved forward from Phase 4
-
-> Required to properly test the resource escrow model. Without it you cannot prove Alice's agent cannot exceed Alice's authorization.
-
-| Item | Status | Notes |
-|------|--------|-------|
-| `AgentID` + `SponsorID` linkage primitive | ✅ | `AgentId` in `chain-forge-resource`; `SponsorId` in `MachineRecord.owner`; `MachineID → ProviderID → SponsorID` hierarchy is expressed via `ProviderOwner` |
-| **`MachineID` formalization** | ✅ | `MachineRecord { machine_id, owner: ProviderOwner, attestation_key, capability_descriptor, mode, status }`; `MachineAttestationKey` (Ed25519 pubkey, base64); `MachineStatus` (Pending/Active/Inactive/Banned) |
-| **`ProviderOwner` enum** | ✅ | `enum ProviderOwner { Individual(SponsorId), Enterprise(EnterpriseId) }` — defined; Phase 0 uses `Individual(Carol)`; Phase 1 adds `Enterprise(Acme)` without ripping apart ResourceJob, escrow, or discovery |
-| `AgentTreasury` primitive | ✅ | `treasury:{agent_id}` virtual account; credited by `DepositToTreasury` tx; debited by `LockQrcForJob` (treasury-first, fallback to agent wallet) in uQCB; `per_job_limit_uqrc` cap enforced at execution; sponsor gate on deposit |
-| `CapabilitySet` + `SpendingLimits` | ✅ | `SpendingLimits` struct (`epoch_limit`, `lifetime_limit`, `max_balance`, `per_job_limit`); `check_per_job()` enforcer; `resource_agent()` preset; agent cannot exceed sponsor's authorization |
-| `RevenuePolicy` primitive | ⬜ | Configurable destination for agent revenue; e.g. `Sponsor: 30% / AgentTreasury: 60% / Reserve: 10%`; successful service settles automatically |
-
-### Phase 0 Acceptance Test — Cross-Machine Resource Purchase
-
-> **The new Phase 0 completion criterion**: not merely "working BFT + resource economy crate" — but one real, adversarially-verified, cross-machine resource purchase using QRC.
-
-**Happy path**:
-```
-Machine 1 (Alice) → creates Agent-A → funds 100 test QRC
-  → Agent-A requests computation → P2P resource discovery
-  → Machine 2 (Carol) Resource Node accepts job
-  → Job runs in sandboxed container → Carol returns result
-  → ResourceExecutionReceipt generated + verified
-  → QRC escrow releases → Carol receives QRC
-```
-
-**Attack scenarios** (must survive all ten before Phase 0 is complete):
-
-| # | Attack | Expected outcome |
-|---|--------|-----------------|
-| 1 | Fake completion (Carol claims done; job never ran) | Escrow not released; refund to Agent-A |
-| 2 | Duplicate settlement (Carol submits receipt twice) | Second settlement rejected |
-| 3 | Replayed receipt (old job receipt submitted for new job) | Receipt rejected (job_id + height scoped) |
-| 4 | Provider disconnect mid-job | Job → FAILED; escrow refunded after timeout |
-| 5 | Requester disconnect mid-job | Job continues; result held; no double-payment |
-| 6 | Tampered result (output_hash mismatch) | Verification fails; escrow refund |
-| 7 | Unauthorized agent spending (Agent-A tries to exceed Alice's limit) | Tx rejected at execution layer |
-| 8 | Spending-limit bypass attempt | SpendingLimits enforced; rejection confirmed in test |
-| 9 | Forged provider identity (unknown ProviderID submits receipt) | Unknown provider → receipt rejected |
-| 10 | Double payment (two settlement attempts for one job) | Second payment rejected; idempotency guard |
 
 ### Execution Layer
 
