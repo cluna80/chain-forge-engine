@@ -80,6 +80,11 @@ pub struct AccountState {
     /// every transaction from this account must be signed by this key.
     #[serde(default)]
     pub public_key: Option<Vec<u8>>,
+    /// DIS-002A: monotonically increasing key version. 0 = initial bind;
+    /// incremented by 1 on each successful RotateAccountKey execution.
+    /// Used to prevent replay of stale rotation transactions.
+    #[serde(default)]
+    pub key_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +103,7 @@ impl AccountState {
             role,
             charm: None,
             public_key: None,
+            key_version: 0,
             escrow: None,
         }
     }
@@ -113,6 +119,7 @@ impl AccountState {
             role,
             charm: Some(IntrinsicCharm::provisional(current_epoch)),
             public_key: None,
+            key_version: 0,
             escrow: None,
         }
     }

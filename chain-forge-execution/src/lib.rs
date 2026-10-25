@@ -347,6 +347,8 @@ impl GasModel {
                     // VerifyIdentityWithProof: Groth16 proof verification; higher gas than
                     // a plain attestation to reflect the ZK-VRC verification cost.
                     TxBody::VerifyIdentityWithProof { .. } => op_multiplier * 8,
+                    // RotateAccountKey: two ML-DSA verifications (outer tx sig + PoP).
+                    TxBody::RotateAccountKey { .. } => op_multiplier * 6,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -784,6 +786,36 @@ pub enum TxBody {
     ///   - `proof_bytes` must be a valid compressed Groth16 proof.
     ///   - `public_inputs_bytes` must encode the IssuerRegistry Merkle root
     ///     matching the node's current approved-issuer set.
+    /// DIS-002A: Replace the authorized signing key for the sender's account.
+    ///
+    /// Authorization: the transaction's outer pq_signature must be valid under
+    /// the account's CURRENT bound key (enforced by verify_mldsa_authorization
+    /// before execution reaches this handler).
+    ///
+    /// Guards (in order):
+    ///   1. Sender must have a bound key (cannot rotate before first use).
+    ///   2. key_version must be exactly current + 1 (prevents replay).
+    ///   3. new_public_key must be valid ML-DSA-65 (2592 bytes).
+    ///   4. new_public_key must differ from the current bound key.
+    ///   5. pop_signature must verify under new_public_key over the
+    ///      domain-separated message from account_key_rotation_signing_bytes().
+    ///
+    /// Effects on success:
+    ///   account.public_key  = Some(new_public_key)
+    ///   account.key_version += 1
+    ///   account.nonce       += 1  (standard)
+    ///   everything else:    unchanged (balance, identity record, permissions)
+    RotateAccountKey {
+        /// The replacement ML-DSA-65 public key (2592 bytes, hex-encoded in JSON).
+        new_public_key: Vec<u8>,
+        /// Must be "ml-dsa-65".
+        new_key_scheme: String,
+        /// Must equal account.key_version + 1.  Prevents replay of stale rotations.
+        key_version: u32,
+        /// Proof-of-possession: new key signs account_key_rotation_signing_bytes().
+        pop_signature: Vec<u8>,
+    },
+
     VerifyIdentityWithProof {
         /// Compressed canonical `ark_groth16::Proof<Bls12_381>` bytes.
         proof_bytes: Vec<u8>,
@@ -833,6 +865,7 @@ impl TxBody {
             // PoCD Research Reward Settlement (Change Set L)
             TxBody::ClaimResearchReward { .. }     => "ClaimResearchReward",
             TxBody::VerifyIdentityWithProof { .. } => "VerifyIdentityWithProof",
+            TxBody::RotateAccountKey { .. }         => "RotateAccountKey",
         }
     }
 }
@@ -1097,6 +1130,10 @@ impl Transaction {
             // VerifyIdentityWithProof: proof + public inputs bytes.
             TxBody::VerifyIdentityWithProof { proof_bytes, public_inputs_bytes } => {
                 proof_bytes.len() + public_inputs_bytes.len()
+            }
+            // RotateAccountKey: new_public_key (2592) + pop_signature (4595) + overhead.
+            TxBody::RotateAccountKey { new_public_key, pop_signature, new_key_scheme, .. } => {
+                new_public_key.len() + pop_signature.len() + new_key_scheme.len() + 8
             }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
@@ -1767,6 +1804,35 @@ pub fn validator_key_registration_signing_bytes_v2(
     b
 }
 
+/// DIS-002A: Domain-separated proof-of-possession message for account key rotation.
+///
+/// The new key signs this message to prove possession before being activated.
+/// Binds to:
+///   - chain_id       — prevents cross-chain replay
+///   - sender_address — prevents registration under a different account
+///   - key_version    — prevents replay of old rotation PoPs
+///   - new_public_key — prevents key substitution
+///
+/// Format: `CFAR|<chain_id>|<sender_address>|<key_version_decimal>|<hex(new_public_key)>`
+/// `CFAR` = "Chain Forge Account Rotation" domain tag.
+pub fn account_key_rotation_signing_bytes(
+    chain_id:       &str,
+    sender_address: &str,
+    key_version:    u32,
+    new_public_key: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFAR|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(sender_address.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(key_version.to_string().as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(hex_encode_bytes(new_public_key).as_bytes());
+    b
+}
+
 /// PQ-VAL-002 R2: Domain-separated signing bytes for consensus precommit votes.
 ///
 /// Format (spec §Precommit-signing-bytes):
@@ -1935,6 +2001,7 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::EmergencyDeprecateAlgorithm { .. } => None,
         // VerifyIdentityWithProof: requires identity module (ZK-VRC path).
         TxBody::VerifyIdentityWithProof { .. } => Some("identity"),
+        TxBody::RotateAccountKey { .. }         => Some("key_management"),
     }
 }
 
@@ -2113,6 +2180,107 @@ fn bind_key_if_unbound(config: &ExecutionConfig, tx: &Transaction, state: &mut S
         }
         state.refresh_leaf(&tx.sender);
     }
+}
+
+/// DIS-002A: Execute a RotateAccountKey transaction.
+///
+/// Called from both the simple and the full (identity-aware) executor.
+/// Authorization (outer pq_signature checks) is already done by
+/// verify_mldsa_authorization before this function is reached.
+fn execute_rotate_account_key(
+    config:         &ExecutionConfig,
+    tx:             &Transaction,
+    state:          &mut StateStore,
+    new_public_key: &[u8],
+    new_key_scheme: &str,
+    key_version:    &u32,
+    pop_signature:  &[u8],
+) -> Result<(), String> {
+    use chain_forge_crypto::Signature as CfSig;
+
+    // Guard 1: sender must have a bound key.
+    let current_key = state
+        .get_account(&tx.sender)
+        .ok()
+        .and_then(|a| a.public_key.clone())
+        .ok_or_else(|| format!(
+            "RotateAccountKey: {} has no bound key; submit a regular transaction first",
+            tx.sender
+        ))?;
+    if current_key.is_empty() {
+        return Err(format!(
+            "RotateAccountKey: {} has an empty bound key; internal state inconsistency",
+            tx.sender
+        ));
+    }
+
+    // Guard 2: key_version must be exactly current + 1.
+    let current_version = state
+        .get_account(&tx.sender)
+        .map(|a| a.key_version)
+        .unwrap_or(0);
+    if *key_version != current_version + 1 {
+        return Err(format!(
+            "RotateAccountKey: key_version mismatch: expected {}, got {}",
+            current_version + 1, key_version
+        ));
+    }
+
+    // Guard 3: new_key_scheme must be "ml-dsa-65".
+    if new_key_scheme != "ml-dsa-65" {
+        return Err(format!(
+            "RotateAccountKey: unsupported key scheme '{}'; only 'ml-dsa-65' is accepted",
+            new_key_scheme
+        ));
+    }
+
+    // Guard 4: new_public_key must be a valid ML-DSA-65 key (2592 bytes).
+    const MLDSA65_PK_BYTES: usize = 2592;
+    if new_public_key.len() != MLDSA65_PK_BYTES {
+        return Err(format!(
+            "RotateAccountKey: new_public_key must be {} bytes (ML-DSA-65), got {}",
+            MLDSA65_PK_BYTES, new_public_key.len()
+        ));
+    }
+
+    // Guard 5: new_public_key must differ from the current bound key.
+    if new_public_key == current_key.as_slice() {
+        return Err(format!(
+            "RotateAccountKey: new_public_key is identical to the current bound key for {}",
+            tx.sender
+        ));
+    }
+
+    // Guard 6: proof-of-possession — new key signs the domain-separated message.
+    let pop_message = account_key_rotation_signing_bytes(
+        &config.chain_id,
+        &tx.sender,
+        *key_version,
+        new_public_key,
+    );
+    let pop_sig = CfSig { scheme: SchemeId::MlDsa, bytes: pop_signature.to_vec() };
+    MlDsaScheme
+        .verify(&pop_message, &pop_sig, new_public_key)
+        .map_err(|e| format!("RotateAccountKey: proof-of-possession verification failed: {e}"))?;
+
+    // All guards passed — commit the rotation.
+    {
+        let acct = state
+            .get_account_mut(&tx.sender)
+            .map_err(|e| format!("RotateAccountKey: account lookup failed: {e}"))?;
+        acct.public_key  = Some(new_public_key.to_vec());
+        acct.key_version = current_version + 1;
+    }
+    state.refresh_leaf(&tx.sender);
+
+    tracing::info!(
+        sender    = %tx.sender,
+        new_ver   = current_version + 1,
+        pk_len    = new_public_key.len(),
+        "DIS-002A: account key rotated"
+    );
+
+    Ok(())
 }
 
 // -- Executor -----------------------------------------------------------------
@@ -2752,6 +2920,14 @@ impl Executor {
                             })
                     }
                 }
+            }
+
+            // DIS-002A: key rotation does not touch identity store.
+            TxBody::RotateAccountKey { new_public_key, new_key_scheme, key_version, pop_signature } => {
+                execute_rotate_account_key(
+                    &self.config, tx, state,
+                    new_public_key, new_key_scheme, key_version, pop_signature,
+                )
             }
 
             TxBody::SponsorAgent { agent_address } => {
@@ -3686,6 +3862,13 @@ impl Executor {
             // VerifyIdentityWithProof requires the full identity- and state-aware executor.
             TxBody::VerifyIdentityWithProof { .. } => {
                 Err("VerifyIdentityWithProof requires the full identity- and state-aware executor".to_string())
+            }
+            // RotateAccountKey is handled in the simple executor (no identity store needed).
+            TxBody::RotateAccountKey { new_public_key, new_key_scheme, key_version, pop_signature } => {
+                execute_rotate_account_key(
+                    &self.config, tx, state,
+                    new_public_key, new_key_scheme, key_version, pop_signature,
+                )
             }
         };
 

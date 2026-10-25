@@ -530,6 +530,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RegisterValidatorKey { .. }      => "register_validator_key",
         // QPC-GAP-002: ZK-VRC multi-issuer personhood proof
         TxBody::VerifyIdentityWithProof { .. }   => "verify_identity_with_proof",
+        // DIS-002A: authenticated account key rotation
+        TxBody::RotateAccountKey { .. }          => "rotate_account_key",
     }
 }
 
