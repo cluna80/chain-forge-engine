@@ -102,58 +102,98 @@ impl DevnetPorts {
 
 // ── File / path helpers ───────────────────────────────────────────────────────
 
-fn repo_root() -> PathBuf {
+fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().to_path_buf()
+}
+
+fn repo_root() -> PathBuf {
+    manifest_dir().parent().unwrap().to_path_buf()
 }
 
 fn node_bin() -> PathBuf {
-    repo_root().join("target").join("debug").join("chain-forge-node")
+    let target = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("target"));
+    let exe = format!("chain-forge-node{}", std::env::consts::EXE_SUFFIX);
+    let debug   = target.join("debug").join(&exe);
+    let release = target.join("release").join(&exe);
+    match (debug.metadata().and_then(|m| m.modified()),
+           release.metadata().and_then(|m| m.modified())) {
+        (Ok(dt), Ok(rt)) => if dt >= rt { debug } else { release },
+        (Ok(_),  Err(_)) => debug,
+        (Err(_), Ok(_))  => release,
+        (Err(_), Err(_)) => debug,
+    }
 }
 
 fn genesis_path() -> PathBuf {
-    repo_root().join("tests").join("devnet").join("genesis-dis002a.json")
+    manifest_dir().join("tests").join("devnet").join("genesis-dis002a.json")
 }
 
 fn key_file(label: &str) -> PathBuf {
-    repo_root().join("tests").join("devnet").join("keys")
+    manifest_dir().join("tests").join("devnet").join("keys")
         .join(format!("{label}.key.json"))
 }
 
 // ── Node lifecycle ────────────────────────────────────────────────────────────
 
-struct GuardedChild(Child);
-impl Drop for GuardedChild {
-    fn drop(&mut self) { let _ = self.0.kill(); }
+struct NodeHandle {
+    name:     String,
+    process:  Child,
+    log_path: PathBuf,
+}
+
+impl Drop for NodeHandle {
+    fn drop(&mut self) { let _ = self.process.kill(); }
 }
 
 fn spawn_node(
-    label: &str, api: u16, p2p: u16,
-    peers: &[String],
-) -> GuardedChild {
+    name: &str, api: u16, p2p: u16,
+    log_dir: &PathBuf,
+    peers: &[u16],
+    key_file_path: Option<PathBuf>,
+) -> NodeHandle {
+    let log_path = log_dir.join(format!("{name}.log"));
+    let log_file = std::fs::File::create(&log_path).expect("create log file");
+
     let mut cmd = Command::new(node_bin());
     cmd.arg("--genesis").arg(genesis_path())
-       .arg("--validator").arg(format!("qcb1{label}"))
-       .arg("--key-file").arg(key_file(label))
+       .arg("--validator").arg(name)
        .arg("--api-port").arg(api.to_string())
        .arg("--p2p-port").arg(p2p.to_string());
-    for p in peers {
-        cmd.arg("--peer").arg(p);
+    for &p in peers {
+        cmd.arg("--bootstrap").arg(format!("/ip4/127.0.0.1/tcp/{p}"));
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    GuardedChild(cmd.spawn().expect("spawn_node: failed to start node"))
+    if let Some(kf) = key_file_path {
+        cmd.arg("--key-file").arg(kf);
+    }
+    cmd.stdout(log_file.try_clone().unwrap())
+       .stderr(log_file)
+       .stdin(Stdio::null());
+
+    let process = cmd.spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {name}: {e}"));
+    NodeHandle { name: name.to_string(), process, log_path }
 }
 
-fn spawn_devnet(ports: &DevnetPorts) -> [GuardedChild; 4] {
-    let ap = format!("127.0.0.1:{}", ports.alice_p2p);
-    let bp = format!("127.0.0.1:{}", ports.bob_p2p);
-    let cp = format!("127.0.0.1:{}", ports.carol_p2p);
-    let dp = format!("127.0.0.1:{}", ports.dave_p2p);
+fn spawn_devnet(ports: &DevnetPorts) -> [NodeHandle; 4] {
+    let log_dir = std::env::temp_dir().join("dis002a_devnet_logs");
+    std::fs::create_dir_all(&log_dir).expect("create log dir");
+
+    let kf = |label: &str| -> Option<PathBuf> {
+        let p = key_file(label);
+        if p.exists() { Some(p) } else { None }
+    };
+
     [
-        spawn_node("alice", ports.alice_api, ports.alice_p2p, &[bp.clone(), cp.clone(), dp.clone()]),
-        spawn_node("bob",   ports.bob_api,   ports.bob_p2p,   &[ap.clone(), cp.clone(), dp.clone()]),
-        spawn_node("carol", ports.carol_api, ports.carol_p2p, &[ap.clone(), bp.clone(), dp.clone()]),
-        spawn_node("dave",  ports.dave_api,  ports.dave_p2p,  &[ap.clone(), bp.clone(), cp.clone()]),
+        spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p, &log_dir,
+            &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice")),
+        spawn_node("qcb1bob",   ports.bob_api,   ports.bob_p2p,   &log_dir,
+            &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob")),
+        spawn_node("qcb1carol", ports.carol_api, ports.carol_p2p, &log_dir,
+            &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol")),
+        spawn_node("qcb1dave",  ports.dave_api,  ports.dave_p2p,  &log_dir,
+            &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave")),
     ]
 }
 
@@ -417,23 +457,20 @@ fn build_rotation_wrong_signer(
 
 // ── Diagnostic ───────────────────────────────────────────────────────────────
 
-fn dump_logs(children: &mut [GuardedChild; 4]) {
-    let labels = ["alice", "bob", "carol", "dave"];
-    for (i, child) in children.iter_mut().enumerate() {
-        use std::io::Read;
-        if let Some(stderr) = child.0.stderr.as_mut() {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
-            let lines: Vec<&str> = buf.lines().collect();
-            let head = lines.iter().take(50);
-            let tail = if lines.len() > 50 { lines.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>() } else { vec![] };
-            eprintln!("=== {} (first 50 lines) ===", labels[i]);
-            for l in head { eprintln!("{l}"); }
-            if !tail.is_empty() {
-                eprintln!("... ({} lines omitted) ...", lines.len().saturating_sub(90));
-                eprintln!("=== {} (last 40 lines) ===", labels[i]);
-                for l in tail { eprintln!("{l}"); }
-            }
+fn dump_logs(nodes: &[NodeHandle; 4]) {
+    for node in nodes {
+        let buf = std::fs::read_to_string(&node.log_path).unwrap_or_default();
+        let lines: Vec<&str> = buf.lines().collect();
+        let head: Vec<&str> = lines.iter().copied().take(50).collect();
+        let tail: Vec<&str> = if lines.len() > 90 {
+            lines.iter().copied().rev().take(40).collect::<Vec<_>>()
+                .into_iter().rev().collect()
+        } else { vec![] };
+        eprintln!("=== {} log ({} lines) ===", node.name, lines.len());
+        for l in &head { eprintln!("{l}"); }
+        if !tail.is_empty() {
+            eprintln!("... ({} lines omitted) ...", lines.len().saturating_sub(90));
+            for l in &tail { eprintln!("{l}"); }
         }
     }
 }
