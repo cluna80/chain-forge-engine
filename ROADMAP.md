@@ -78,6 +78,14 @@
 
 **New goal**: Demonstrate that the Qattice core network — BFT consensus, ML-DSA-65 post-quantum identity, replay and nonce protection, and PoCD reward settlement — operates correctly and safely under the *current* codebase. Phase 0 is complete when every exit criterion below has a passing test mapped to it.
 
+### Cryptographic Architecture Decision (locked 2026-10-25)
+
+**Devnet (Phase 0 / testnet):** Hybrid — Ed25519 validator consensus keys, ML-DSA-65 user account keys. Ed25519 was baked into genesis from the start; validators can rotate to ML-DSA consensus keys post-genesis once the BFT vote-signing layer supports it. This is the correct intermediate state: ML-DSA user-account enforcement is proven end-to-end while consensus remains on a well-audited classical scheme.
+
+**Mainnet:** Full ML-DSA-65 from block 1. A new chain is generated with ML-DSA-65 genesis keys for all validators. No Ed25519 anywhere in the signing paths. Quantum resistance from the first block, not retrofitted. There is no migration from devnet state to mainnet — mainnet is a fresh genesis.
+
+This decision is final. Do not re-litigate it during Phase 0 or Phase 1 work.
+
 **Token model (current — single token)**:
 - **QCB / uQCB** — the one and only token on Qattice. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, PoCD rewards, staking, and governance use uQCB. There is no second token.
 - **PoCD research rewards** — paid from `treasury:pocd-research` in uQCB.
@@ -90,10 +98,10 @@
 |---|-----------|--------|---------------------|
 | P0-1 | Clean genesis launches successfully across independent machines | ✅ | 4-node devnet (`genesis-4node.json`) starts, reaches block 5, all validators active — confirmed multiple sessions |
 | P0-2 | All four DIS pilot identities remain Verified after node restart | ✅ | BossKing, Laptop, Phone, King-OptiPlex-990 all Verified (2026-10-25); wallet re-fetches from node on refresh |
-| P0-3 | An ML-DSA-65-signed transaction is accepted and finalized across the network | ⬜ | Need end-to-end test: `qcb1pq…` sender, ML-DSA-65 sig, accepted + committed on ≥3 nodes |
-| P0-4 | Invalid signatures are rejected | ⬜ | Adversarial test: forged / garbage ML-DSA sig → tx rejected before mempool admission |
-| P0-5 | Replayed transactions are rejected | ⬜ | Adversarial test: same tx_id and nonce submitted twice → second rejected with replay error |
-| P0-6 | Incorrect nonces are rejected | ⬜ | Adversarial test: nonce skipped / out-of-order → rejected with nonce mismatch |
+| P0-3 | An ML-DSA-65-signed transaction is accepted and finalized across the network | ✅ | `mldsa_tx_live` (commit `b46de7c`): `qcb1sender` ML-DSA-65 Transfer queued, executed `success: true` at height 3, receiver balance confirmed on 4/4 nodes; three ingress bugs found and fixed in the process (wire-format size, F5 hex check, classical sig guard) |
+| P0-4 | Invalid signatures are rejected | ✅ | `mldsa_tx_live` P0-4 case: 3309-byte garbage ML-DSA-65 sig rejected at submission or fails execution with verification error |
+| P0-5 | Replayed transactions are rejected | ✅ | `mldsa_tx_live` P0-5 case: nonce-0 tx resubmitted → rejected with nonce/replay error |
+| P0-6 | Incorrect nonces are rejected | ✅ | `mldsa_tx_live` P0-6 case: nonce-999 tx (expected 1) → rejected with nonce mismatch |
 | P0-7 | Timestamp monotonicity finding resolved and regression-tested | ⬜ | Fix `proposal.timestamp_ms` drift in `/api/blocks` explorer path; monotonicity + drift-bound enforcement; regression test confirms no proposer-controlled timestamp inflation |
 | P0-8 | Consensus safety and finality pass under current validator config | ✅ | Partition tolerance test (iptables DROP, 5s), equivocation detection, restart recovery — all confirmed; adversarial gossip 3/3 |
 | P0-9 | PoCD proof submission and reward settlement verified on current code | ⬜ | Audit current `chain-forge-pocd` + `treasury:pocd-research` settlement path; map to existing tests or identify missing test |
