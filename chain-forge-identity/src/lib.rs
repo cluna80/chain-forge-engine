@@ -326,7 +326,7 @@ impl PopAttestation {
 /// target: 3 attestations." Provisional here means governance-adjustable,
 /// not fixed at the protocol layer -- Section 6.6 governs QRC-adjacent
 /// parameters like this one the same way it governs decay rates.
-pub const ATTESTATION_QUORUM: usize = 3;
+pub const ATTESTATION_QUORUM: usize = 1;
 
 /// Maximum number of distinct claimants one identity can vouch for within
 /// a single epoch. Named in the Identity Pilot Design (Section 3.1) as a

@@ -90,25 +90,25 @@
       "label": "Laptop",
       "address": "qcb1pq65cb61183a2729d5a78bbd227eb9dfa5e4706bc4",
       "balance": "100000000",
-      "role": "validator"
+      "role": "user"
     },
     {
       "label": "BossKing",
       "address": "qcb1pq8a6c7879af17bb8f3ddb12f961ce1d01bf38f783",
       "balance": "100000000",
-      "role": "validator"
+      "role": "user"
     },
     {
       "label": "King-OptiPlex-990",
       "address": "qcb1pq8103f0befa5190e4654661e8dd4c4f6c3472f941",
       "balance": "100000000",
-      "role": "validator"
+      "role": "user"
     },
     {
       "label": "Phone",
       "address": "qcb1pqbd74a9cbd9e745ad1d5d84799abdd5bdc761964a",
       "balance": "100000000",
-      "role": "validator"
+      "role": "user"
     },
     {
       "label": "PoCD Treasury",
