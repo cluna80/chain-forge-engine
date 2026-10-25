@@ -102,7 +102,7 @@ This decision is final. Do not re-litigate it during Phase 0 or Phase 1 work.
 | P0-4 | Invalid signatures are rejected | ✅ | `mldsa_tx_live` P0-4 case: 3309-byte garbage ML-DSA-65 sig rejected at submission or fails execution with verification error |
 | P0-5 | Replayed transactions are rejected | ✅ | `mldsa_tx_live` P0-5 case: nonce-0 tx resubmitted → rejected with nonce/replay error |
 | P0-6 | Incorrect nonces are rejected | ✅ | `mldsa_tx_live` P0-6 case: nonce-999 tx (expected 1) → rejected with nonce mismatch |
-| P0-7 | Timestamp monotonicity finding resolved and regression-tested | ⬜ | Fix `proposal.timestamp_ms` drift in `/api/blocks` explorer path; monotonicity + drift-bound enforcement; regression test confirms no proposer-controlled timestamp inflation |
+| P0-7 | Timestamp monotonicity finding resolved and regression-tested | ✅ | `node.rs`: both commit paths now use `proposal.timestamp_ms.max(last+1)`; `last_committed_timestamp_ms` field enforces strict monotonicity; `timestamp_monotonic_live` regression test (commit `0b0a611`) |
 | P0-8 | Consensus safety and finality pass under current validator config | ✅ | Partition tolerance test (iptables DROP, 5s), equivocation detection, restart recovery — all confirmed; adversarial gossip 3/3 |
 | P0-9 | PoCD proof submission and reward settlement verified on current code | ⬜ | Audit current `chain-forge-pocd` + `treasury:pocd-research` settlement path; map to existing tests or identify missing test |
 
