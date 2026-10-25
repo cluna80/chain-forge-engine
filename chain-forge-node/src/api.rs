@@ -334,13 +334,17 @@ pub async fn serve(
                                 http_400_json(&resp.to_string())
                             }
                             // F5: reject malformed PQ signature entries.
-                            // Each non-empty entry must be valid lowercase hex AND at least
-                            // as long as the smallest known PQ signature (ML-DSA-44 = 2420
-                            // bytes = 4840 hex chars).  A short or non-hex entry is garbage.
+                            // Entries use a "<scheme>:<hex>" format; strip the known tag first,
+                            // then validate the hex payload.  Smallest known PQ sig is
+                            // ML-DSA-44 = 2420 bytes = 4840 hex chars.
                             Ok(ref tx) if !tx.pq_signatures.is_empty() && tx.pq_signatures.iter().any(|s| {
                                 const MIN_PQ_SIG_HEX: usize = 4840;
-                                s.len() < MIN_PQ_SIG_HEX || s.len() % 2 != 0
-                                    || !s.bytes().all(|b| b.is_ascii_hexdigit())
+                                let hex_part = s.strip_prefix("mldsa65:")
+                                    .or_else(|| s.strip_prefix("slhdsa:"))
+                                    .or_else(|| s.strip_prefix("fndsa:"))
+                                    .unwrap_or(s.as_str());
+                                hex_part.len() < MIN_PQ_SIG_HEX || hex_part.len() % 2 != 0
+                                    || !hex_part.bytes().all(|b| b.is_ascii_hexdigit())
                             }) => {
                                 let resp = serde_json::json!({
                                     "status": "rejected",
