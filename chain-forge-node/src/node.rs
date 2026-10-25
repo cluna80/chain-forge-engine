@@ -388,6 +388,13 @@ pub struct Node {
     /// every `CAPACITY_AD_INTERVAL_SECS` seconds.
     last_capacity_ad_ms: u64,
 
+    /// Timestamp of the last committed block recorded in the explorer (ms since
+    /// UNIX epoch).  Used to enforce monotonicity: each new block's
+    /// timestamp_ms is clamped to max(proposal.timestamp_ms, last + 1).
+    /// Prevents clock drift or proposer rotation from producing backwards
+    /// timestamps in /api/blocks.
+    last_committed_timestamp_ms: u64,
+
     // ── Deterministic block-height validator-set epochs ──────────────────────
 
     /// Number of blocks per validator-set epoch. Every decision that can
@@ -1190,6 +1197,7 @@ impl Node {
             // Change Set T
             peer_capacity_table: Arc::new(Mutex::new(crate::gossip_capacity::PeerCapacityTable::new())),
             last_capacity_ad_ms: 0,
+            last_committed_timestamp_ms: 0,
             validator_epoch_blocks,
             min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
@@ -4121,10 +4129,12 @@ impl Node {
                     error:    r.error.clone(),
                 });
             }
+            let block_ts = proposal.timestamp_ms
+                .max(self.last_committed_timestamp_ms.saturating_add(1));
             ex.blocks.push_front(BlockSummary {
                 height:       exec_result.height,
                 state_root:   exec_result.state_root.clone(),
-                timestamp_ms: now_ms,
+                timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
                 tx_ids,
             });
@@ -4164,6 +4174,8 @@ impl Node {
                 }).collect();
             }
         }
+        self.last_committed_timestamp_ms = proposal.timestamp_ms
+            .max(self.last_committed_timestamp_ms.saturating_add(1));
 
         // Drop proposals and parked certs at or below the height we just
         // committed -- they can no longer be voted on and would otherwise
@@ -4886,10 +4898,12 @@ impl Node {
                 });
             }
 
+            let block_ts = proposal.timestamp_ms
+                .max(self.last_committed_timestamp_ms.saturating_add(1));
             ex.blocks.push_front(BlockSummary {
                 height:       exec_result.height,
                 state_root:   exec_result.state_root.clone(),
-                timestamp_ms: now_ms,
+                timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
                 tx_ids,
             });
@@ -4932,6 +4946,9 @@ impl Node {
         }
 
         // QrcMetrics update removed: QRC engine retired; /api/qrc returns empty metrics.
+
+        self.last_committed_timestamp_ms = proposal.timestamp_ms
+            .max(self.last_committed_timestamp_ms.saturating_add(1));
 
         Ok(cert)
     }

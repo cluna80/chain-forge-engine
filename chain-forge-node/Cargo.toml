@@ -113,3 +113,7 @@ path = "tests/dis_auth_live.rs"
 [[test]]
 name = "mldsa_tx_live"
 path = "tests/mldsa_tx_live.rs"
+
+[[test]]
+name = "timestamp_monotonic_live"
+path = "tests/timestamp_monotonic_live.rs"
