@@ -513,7 +513,7 @@ fn p0_9_pocd_reward_settlement() {
     eprintln!("   Submitting P0-9-D (amount > treasury balance)…");
     let claim_id_d  = "p09-claim-d-001";
     let overdrawn   = treasury_after_b + 999_999_999; // definitely more than treasury holds
-    let tx_d = build_claim_tx("p09-tx-d", OPERATOR, 2, claim_id_d, RECIPIENT, overdrawn as u64);
+    let tx_d = build_claim_tx("p09-tx-d", OPERATOR, 1, claim_id_d, RECIPIENT, overdrawn as u64);
     let (_, resp_d) = api_post(alice_api, "/api/tx", &tx_d)
         .expect("P0-9-D: POST failed");
     let ingress_d = resp_d["status"].as_str().unwrap_or("?");
