@@ -57,6 +57,14 @@
   "validator_bonding": {
     "validator_epoch_blocks": 5
   },
+  "pocd": {
+    "enabled": true,
+    "chain_id": "qcb-devnet-pocd",
+    "challenge_tracks": ["Mathematics", "Cryptography"],
+    "reward_epoch_blocks": 720,
+    "require_verified_identity": false,
+    "min_seal_difficulty_bits": 8
+  },
   "modules": [
     "bank",
     "staking",

@@ -299,6 +299,20 @@ fn wait_tx_result(port: u16, tx_id: &str, timeout: Duration) -> Option<serde_jso
     None
 }
 
+fn dump_logs(nodes: &[NodeHandle]) {
+    for n in nodes {
+        eprintln!("\n══ {} log ({}) ══", n.name, n.log_path.display());
+        match std::fs::read_to_string(&n.log_path) {
+            Ok(s) => {
+                let lines: Vec<&str> = s.lines().collect();
+                let start = lines.len().saturating_sub(60);
+                for line in &lines[start..] { eprintln!("  {line}"); }
+            }
+            Err(e) => eprintln!("  (could not read log: {e})"),
+        }
+    }
+}
+
 // ── Tx builder ────────────────────────────────────────────────────────────────
 
 fn build_claim_tx(
@@ -344,16 +358,16 @@ fn p0_9_pocd_reward_settlement() {
 
     eprintln!("\n── P0-9: PoCD reward settlement ────────────────────────────────────");
 
-    let _nodes = spawn_devnet(&ports, &log_dir);
+    let nodes = spawn_devnet(&ports, &log_dir);
 
     assert!(
         wait_all_apis(&all_api, &labels, Duration::from_secs(30)),
         "P0-9: node APIs did not come up"
     );
-    assert!(
-        poll_height(&all_api, 2, Duration::from_secs(90)),
-        "P0-9: nodes did not reach height 2"
-    );
+    if !poll_height(&all_api, 2, Duration::from_secs(90)) {
+        dump_logs(&nodes);
+        panic!("P0-9: nodes did not reach height 2");
+    }
 
     let alice_api = ports.alice_api;
     let _ = CHAIN_ID; // used in doc; confirm it matches genesis
