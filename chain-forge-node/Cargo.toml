@@ -117,3 +117,7 @@ path = "tests/mldsa_tx_live.rs"
 [[test]]
 name = "timestamp_monotonic_live"
 path = "tests/timestamp_monotonic_live.rs"
+
+[[test]]
+name = "pocd_reward_live"
+path = "tests/pocd_reward_live.rs"
