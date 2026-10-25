@@ -2,7 +2,7 @@
 
 **Branch:** `feature/dis-002b-identity-continuity`  
 **Depends on:** DIS-002A ✅ (authenticated account key rotation)  
-**Status:** 🔄 In progress
+**Status:** ⏸ Deferred — spec complete, implementation scheduled for a future session
 
 ---
 
