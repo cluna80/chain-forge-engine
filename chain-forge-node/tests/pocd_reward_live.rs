@@ -144,49 +144,13 @@ impl Drop for NodeHandle {
     }
 }
 
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                let _ = chars.next();
-                for nc in chars.by_ref() { if nc == 'm' { break; } }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn read_peer_id_from_log(log_path: &PathBuf, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(content) = std::fs::read_to_string(log_path) {
-            for raw_line in content.lines() {
-                let line = strip_ansi(raw_line);
-                if let Some(pos) = line.find("local_peer_id=") {
-                    let after = &line[pos + "local_peer_id=".len()..];
-                    let id: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
-                    if !id.is_empty() { return id; }
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            panic!("peer ID never appeared in log {log_path:?}");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn spawn_node(
-    name:       &str,
-    api_port:   u16,
-    p2p_port:   u16,
-    log_dir:    &PathBuf,
-    bootstraps: &[String],
-    key_file:   Option<PathBuf>,
+    name:     &str,
+    api_port: u16,
+    p2p_port: u16,
+    log_dir:  &PathBuf,
+    peers:    &[u16],
+    key_file: Option<PathBuf>,
 ) -> NodeHandle {
     let log_path = log_dir.join(format!("{name}.log"));
     let log_file = std::fs::File::create(&log_path).expect("create log file");
@@ -196,8 +160,8 @@ fn spawn_node(
        .arg("--validator").arg(name)
        .arg("--api-port").arg(api_port.to_string())
        .arg("--p2p-port").arg(p2p_port.to_string());
-    for b in bootstraps {
-        cmd.arg("--bootstrap").arg(b);
+    for &p in peers {
+        cmd.arg("--bootstrap").arg(format!("/ip4/127.0.0.1/tcp/{p}"));
     }
     if let Some(kf) = key_file {
         cmd.arg("--key-file").arg(kf);
@@ -213,39 +177,16 @@ fn spawn_node(
 
 fn spawn_devnet(ports: &DevnetPorts, log_dir: &PathBuf) -> Vec<NodeHandle> {
     let kf = |label: &str| Some(key_file(label));
-
-    // Start Alice first with no bootstrap peers.
-    let alice = spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p,
-                           log_dir, &[], kf("alice"));
-    // Wait for Alice's API to be reachable before reading her peer ID.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", ports.alice_api).parse().unwrap(),
-            Duration::from_millis(200),
-        ).is_ok() { break; }
-        if Instant::now() >= deadline {
-            panic!("Alice API port {} never opened", ports.alice_api);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    eprintln!("   alice API up on :{}", ports.alice_api);
-
-    let alice_peer_id = read_peer_id_from_log(&alice.log_path, Duration::from_secs(10));
-    let alice_bootstrap = format!("/ip4/127.0.0.1/tcp/{}/p2p/{}", ports.alice_p2p, alice_peer_id);
-    eprintln!("   Alice peer ID: {alice_peer_id}");
-
-    let mut nodes = vec![alice];
-    let rest = [
-        ("qcb1bob",   ports.bob_api,   ports.bob_p2p,   "bob"),
-        ("qcb1carol", ports.carol_api, ports.carol_p2p, "carol"),
-        ("qcb1dave",  ports.dave_api,  ports.dave_p2p,  "dave"),
-    ];
-    for (name, api, p2p, label) in rest {
-        nodes.push(spawn_node(name, api, p2p, log_dir,
-                              &[alice_bootstrap.clone()], kf(label)));
-    }
-    nodes
+    vec![
+        spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p, log_dir,
+                   &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice")),
+        spawn_node("qcb1bob",   ports.bob_api,   ports.bob_p2p,   log_dir,
+                   &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob")),
+        spawn_node("qcb1carol", ports.carol_api, ports.carol_p2p, log_dir,
+                   &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol")),
+        spawn_node("qcb1dave",  ports.dave_api,  ports.dave_p2p,  log_dir,
+                   &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave")),
+    ]
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────

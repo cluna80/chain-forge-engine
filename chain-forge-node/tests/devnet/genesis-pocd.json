@@ -19,13 +19,18 @@
     "type": "proof-of-stake",
     "validator_set_size": 4,
     "block_time_ms": 2000,
-    "personhood_weighted": false
+    "personhood_weighted": true
   },
   "execution": {
     "state_model": "account",
     "parallel_execution": false,
     "gas_model": "dynamic",
-    "require_signatures": false
+    "require_signatures": false,
+    "fee_distribution_bps": {
+      "validator_bps": 7000,
+      "treasury_bps":  2000,
+      "burn_bps":      1000
+    }
   },
   "cryptography": {
     "signature_scheme": "hybrid",
@@ -36,8 +41,8 @@
   },
   "network": {
     "network_id": "qcb-devnet-pocd",
-    "p2p_port": 27000,
-    "rpc_port": 27001,
+    "p2p_port": 27200,
+    "rpc_port": 27201,
     "bootstrap_nodes": [],
     "peer_discovery": "bootstrap",
     "max_peers": 10
@@ -48,6 +53,9 @@
     "block_gas_limit": 10000000,
     "mempool_size": 100,
     "mempool_ttl_seconds": 60
+  },
+  "validator_bonding": {
+    "validator_epoch_blocks": 5
   },
   "modules": [
     "bank",
