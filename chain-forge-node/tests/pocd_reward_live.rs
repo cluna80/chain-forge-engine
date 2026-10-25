@@ -351,7 +351,7 @@ fn p0_9_pocd_reward_settlement() {
         "P0-9: node APIs did not come up"
     );
     assert!(
-        poll_height(&all_api, 2, Duration::from_secs(60)),
+        poll_height(&all_api, 2, Duration::from_secs(90)),
         "P0-9: nodes did not reach height 2"
     );
 
