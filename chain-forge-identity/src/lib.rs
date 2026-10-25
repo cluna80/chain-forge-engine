@@ -344,7 +344,7 @@ pub const MAX_ATTESTATIONS_PER_EPOCH: u32 = 5;
 /// Pilot value: 3. Governance-tunable. The cap is enforced on the derived
 /// count from attestation_records, not from a separate ring buffer — at pilot
 /// scale this is acceptable; add a ring buffer index if count grows past ~50k.
-pub const ATTESTATION_CAP_PER_WINDOW: u32 = 3;
+pub const ATTESTATION_CAP_PER_WINDOW: u32 = 10;
 
 /// Rolling window size in epochs for the attestation cap (Phase B).
 ///
