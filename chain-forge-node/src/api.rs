@@ -400,10 +400,12 @@ pub async fn serve(
                                 });
                                 http_400_json(&resp.to_string())
                             }
-                            // F5: verify_signature runs when either the chain *requires* sigs
-                            // or the tx *carries* one -- "not required" means you may omit
-                            // the sig, not that a present sig is silently ignored.
-                            Ok(tx) if (precheck.require_signatures || !tx.signature.is_empty())
+                            // F5: verify_signature runs for Ed25519 txs when either the chain
+                            // *requires* sigs or the tx *carries* one.  ML-DSA txs use a
+                            // separate PQ path; verify_signature is classical-only and must
+                            // not be called for them.
+                            Ok(tx) if tx.sig_scheme != Some(chain_forge_crypto::SchemeId::MlDsa)
+                                && (precheck.require_signatures || !tx.signature.is_empty())
                                 && chain_forge_execution::verify_signature(&tx, &precheck.chain_id).is_err() => {
                                 let reason = chain_forge_execution::verify_signature(&tx, &precheck.chain_id)
                                     .unwrap_err();
