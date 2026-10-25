@@ -109,3 +109,7 @@ path = "tests/dis_parity.rs"
 [[test]]
 name = "dis_auth_live"
 path = "tests/dis_auth_live.rs"
+
+[[test]]
+name = "mldsa_tx_live"
+path = "tests/mldsa_tx_live.rs"

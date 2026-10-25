@@ -1,0 +1,130 @@
+{
+  "chain_id": "qcb-devnet-mldsa",
+  "chain_name": "QuarkCharmBit P0-3/P0-6 ML-DSA-65 Acceptance Fixture",
+  "engine_version": "0.1.0",
+  "genesis_time": "2026-10-25T00:00:00Z",
+  "environment": {
+    "mode": "testnet",
+    "faucet_enabled": true,
+    "relaxed_limits": true
+  },
+  "native_token": {
+    "name": "QuarkCharm",
+    "symbol": "QCB",
+    "denom": "uqcb",
+    "max_supply": "210000000"
+  },
+  "address_prefix": "qcb",
+  "consensus": {
+    "type": "proof-of-stake",
+    "validator_set_size": 4,
+    "block_time_ms": 2000,
+    "personhood_weighted": false
+  },
+  "execution": {
+    "state_model": "account",
+    "parallel_execution": false,
+    "gas_model": "dynamic",
+    "require_signatures": true,
+    "_comment": "require_signatures: true is the key difference from genesis-val002.json — this fixture enforces ML-DSA-65 signature verification on all non-admin tx types (P0-3/P0-6 acceptance criteria)."
+  },
+  "cryptography": {
+    "signature_scheme": "hybrid",
+    "pqc_algorithm": "ml-dsa",
+    "migration_trigger": "nist-guidance",
+    "hash_width": 256,
+    "validator_scheme": "pqc-native"
+  },
+  "network": {
+    "network_id": "qcb-devnet-mldsa",
+    "p2p_port": 27000,
+    "rpc_port": 27001,
+    "bootstrap_nodes": [],
+    "peer_discovery": "bootstrap",
+    "max_peers": 10
+  },
+  "limits": {
+    "max_block_bytes": 1048576,
+    "max_tx_bytes": 65536,
+    "block_gas_limit": 10000000,
+    "mempool_size": 100,
+    "mempool_ttl_seconds": 60
+  },
+  "modules": [
+    "bank",
+    "staking",
+    "identity",
+    "agents",
+    "pocd"
+  ],
+  "custom_modules": [],
+  "genesis_accounts": [
+    {
+      "label": "Alice",
+      "address": "qcb1alice",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8",
+      "_comment": "Ed25519 verifying key from tests/devnet/keys/alice.key.json — validators use classical Ed25519 for consensus regardless of user tx scheme."
+    },
+    {
+      "label": "Bob",
+      "address": "qcb1bob",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0"
+    },
+    {
+      "label": "Carol",
+      "address": "qcb1carol",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692"
+    },
+    {
+      "label": "Dave",
+      "address": "qcb1dave",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0"
+    },
+    {
+      "label": "Sender",
+      "address": "qcb1sender",
+      "balance": "10000000",
+      "role": "user",
+      "_comment": "ML-DSA-65 user account — no pre-bound public key (first-use registration path). 10 QCB for test transfers."
+    },
+    {
+      "label": "Receiver",
+      "address": "qcb1recv",
+      "balance": "0",
+      "role": "user"
+    },
+    {
+      "label": "PoCD Treasury",
+      "address": "treasury:pocd",
+      "balance": "50000000000",
+      "role": "treasury"
+    },
+    {
+      "label": "PoCD Research Treasury",
+      "address": "treasury:pocd-research",
+      "balance": "10000000000",
+      "role": "treasury"
+    }
+  ],
+  "attestation_coordinator": "qcb1alice",
+  "pocd": {
+    "enabled": true,
+    "chain_id": "qcb-devnet-mldsa",
+    "challenge_tracks": ["Mathematics", "Cryptography"],
+    "reward_epoch_blocks": 720,
+    "require_verified_identity": false,
+    "min_seal_difficulty_bits": 8
+  },
+  "settlement_operators": ["qcb1alice"],
+  "validator_bonding": {
+    "validator_epoch_blocks": 10
+  }
+}
