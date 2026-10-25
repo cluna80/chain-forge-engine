@@ -2235,8 +2235,9 @@ fn execute_rotate_account_key(
         ));
     }
 
-    // Guard 4: new_public_key must be a valid ML-DSA-65 key (2592 bytes).
-    const MLDSA65_PK_BYTES: usize = 2592;
+    // Guard 4: new_public_key must be a valid ML-DSA-65 key (1952 bytes).
+    // ML-DSA-65 (Dilithium3) pk = 1952 bytes; 2592 is ML-DSA-87.
+    const MLDSA65_PK_BYTES: usize = 1952;
     if new_public_key.len() != MLDSA65_PK_BYTES {
         return Err(format!(
             "RotateAccountKey: new_public_key must be {} bytes (ML-DSA-65), got {}",
