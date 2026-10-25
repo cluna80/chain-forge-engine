@@ -2001,7 +2001,8 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::EmergencyDeprecateAlgorithm { .. } => None,
         // VerifyIdentityWithProof: requires identity module (ZK-VRC path).
         TxBody::VerifyIdentityWithProof { .. } => Some("identity"),
-        TxBody::RotateAccountKey { .. }         => Some("key_management"),
+        // Key rotation is a core account right (always-on, like Transfer/Burn).
+        TxBody::RotateAccountKey { .. }         => None,
     }
 }
 

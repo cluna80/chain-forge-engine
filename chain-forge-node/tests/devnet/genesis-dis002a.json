@@ -53,8 +53,7 @@
     "bank",
     "staking",
     "identity",
-    "agents",
-    "key_management"
+    "agents"
   ],
   "custom_modules": [],
   "genesis_accounts": [
