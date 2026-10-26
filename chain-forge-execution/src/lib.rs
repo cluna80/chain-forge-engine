@@ -353,6 +353,8 @@ impl GasModel {
                     TxBody::EnrollRecoveryPolicy { .. } => op_multiplier * 5,
                     // RecoverAccountKey: N guardian ML-DSA verifications + PoP; high cost.
                     TxBody::RecoverAccountKey { .. } => op_multiplier * 10,
+                    // RevokeRecoveryPolicy: simple state write.
+                    TxBody::RevokeRecoveryPolicy => op_multiplier * 2,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -854,7 +856,16 @@ pub enum TxBody {
         pop_signature:       Vec<u8>,
         /// Guardian co-authorizations.
         guardian_signatures: Vec<GuardianAuth>,
+        /// DIS-003A: must match the policy_id on the enrolled RecoveryPolicy.
+        /// Prevents replay of guardian signatures under a re-enrolled policy.
+        policy_id:           u64,
     },
+
+    /// DIS-003A: Revoke the enrolled recovery policy for the sender's account.
+    /// Signed by the current account key (same authorization path as
+    /// EnrollRecoveryPolicy). Clears `recovery_policy`; does NOT reset
+    /// `policy_generation` — the generation counter is monotone forever.
+    RevokeRecoveryPolicy,
 }
 
 /// One guardian's authorization for a `RecoverAccountKey` transaction.
@@ -910,6 +921,7 @@ impl TxBody {
             TxBody::RotateAccountKey { .. }         => "RotateAccountKey",
             TxBody::EnrollRecoveryPolicy { .. }     => "EnrollRecoveryPolicy",
             TxBody::RecoverAccountKey { .. }        => "RecoverAccountKey",
+            TxBody::RevokeRecoveryPolicy            => "RevokeRecoveryPolicy",
         }
     }
 }
@@ -1191,6 +1203,7 @@ impl Transaction {
                     + guardian_signatures.iter().map(|g| g.guardian_public_key.len() + g.signature.len()).sum::<usize>()
                     + 16
             }
+            TxBody::RevokeRecoveryPolicy => 8,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -2094,6 +2107,7 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         // Recovery policy enrollment and execution are core account rights.
         TxBody::EnrollRecoveryPolicy { .. }     => None,
         TxBody::RecoverAccountKey { .. }        => None,
+        TxBody::RevokeRecoveryPolicy            => None,
     }
 }
 
@@ -2427,19 +2441,21 @@ fn execute_enroll_recovery_policy(
         }
     }
 
-    let current_version = state
+    let (current_version, next_generation) = state
         .get_account(&tx.sender)
-        .map(|a| a.key_version)
-        .unwrap_or(0);
+        .map(|a| (a.key_version, a.policy_generation + 1))
+        .unwrap_or((0, 1));
 
     {
         let acct = state
             .get_account_mut(&tx.sender)
             .map_err(|e| format!("EnrollRecoveryPolicy: account lookup failed: {e}"))?;
+        acct.policy_generation = next_generation;
         acct.recovery_policy = Some(chain_forge_state::RecoveryPolicy {
             guardians:               guardians.to_vec(),
             threshold,
             enrolled_at_key_version: current_version,
+            policy_id:               next_generation,
         });
     }
     state.refresh_leaf(&tx.sender);
@@ -2448,7 +2464,8 @@ fn execute_enroll_recovery_policy(
         sender    = %tx.sender,
         threshold,
         guardians = guardians.len(),
-        "DIS-002B: recovery policy enrolled"
+        policy_id = next_generation,
+        "DIS-003A: recovery policy enrolled"
     );
     Ok(())
 }
@@ -2478,6 +2495,7 @@ fn execute_recover_account_key(
     key_version:          &u32,
     pop_signature:        &[u8],
     guardian_signatures:  &[GuardianAuth],
+    policy_id:            u64,
 ) -> Result<(), String> {
     use chain_forge_crypto::Signature as CfSig;
 
@@ -2502,6 +2520,16 @@ fn execute_recover_account_key(
         return Err(format!(
             "RecoverAccountKey: stale policy (enrolled at key_version {}, current {})",
             policy.enrolled_at_key_version, current_version
+        ));
+    }
+
+    // Guard 2b (DIS-003A): policy_id must match the enrolled policy's generation.
+    // This prevents replay of guardian signatures created for a previous (now
+    // superseded or revoked) policy, even if the guardian set is identical.
+    if policy_id != policy.policy_id {
+        return Err(format!(
+            "RecoverAccountKey: policy_id mismatch: tx carries {policy_id}, enrolled policy has {}",
+            policy.policy_id
         ));
     }
 
@@ -2603,6 +2631,35 @@ fn execute_recover_account_key(
         pk_len    = new_public_key.len(),
         "DIS-002B: account key recovered via guardian policy"
     );
+    Ok(())
+}
+
+/// DIS-003A: Execute a RevokeRecoveryPolicy transaction.
+///
+/// Clears `recovery_policy` on the sender's account. Does NOT reset
+/// `policy_generation` — the counter is monotone and survives revocation so
+/// that old guardian signatures cannot be replayed if a policy with the same
+/// guardian set is later re-enrolled.
+fn execute_revoke_recovery_policy(
+    tx:    &Transaction,
+    state: &mut StateStore,
+) -> Result<(), String> {
+    {
+        let acct = state
+            .get_account_mut(&tx.sender)
+            .map_err(|e| format!("RevokeRecoveryPolicy: account lookup failed: {e}"))?;
+        if acct.recovery_policy.is_none() {
+            return Err(format!(
+                "RevokeRecoveryPolicy: {} has no enrolled recovery policy to revoke",
+                tx.sender
+            ));
+        }
+        acct.recovery_policy = None;
+        // policy_generation is intentionally NOT touched.
+    }
+    state.refresh_leaf(&tx.sender);
+
+    tracing::info!(sender = %tx.sender, "DIS-003A: recovery policy revoked");
     Ok(())
 }
 
@@ -3259,11 +3316,16 @@ impl Executor {
             }
             TxBody::RecoverAccountKey {
                 new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+                policy_id,
             } => {
                 execute_recover_account_key(
                     &self.config, tx, state,
                     new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+                    *policy_id,
                 )
+            }
+            TxBody::RevokeRecoveryPolicy => {
+                execute_revoke_recovery_policy(tx, state)
             }
 
             TxBody::SponsorAgent { agent_address } => {
@@ -4212,11 +4274,16 @@ impl Executor {
             }
             TxBody::RecoverAccountKey {
                 new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+                policy_id,
             } => {
                 execute_recover_account_key(
                     &self.config, tx, state,
                     new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+                    *policy_id,
                 )
+            }
+            TxBody::RevokeRecoveryPolicy => {
+                execute_revoke_recovery_policy(tx, state)
             }
         };
 

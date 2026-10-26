@@ -386,6 +386,7 @@ fn build_recover_account_key(
     key_version: u32,
     guardian_seeds: &[&str],
     tx_id: &str,
+    policy_id: u64,
 ) -> Transaction {
     let new_kp = MlDsaScheme.generate_keypair(new_seed).expect("new key keygen");
 
@@ -417,6 +418,7 @@ fn build_recover_account_key(
             key_version,
             pop_signature:       pop_sig.bytes.clone(),
             guardian_signatures,
+            policy_id,
         },
         gas_limit:     2_000_000,
         signature:     vec![],
@@ -526,10 +528,12 @@ fn dis_002b_recovery() {
     eprintln!("\n--- B-09: RecoverAccountKey (valid, 2-of-3 guardians) ---");
 
     // nonce=2 (0=register, 1=enroll), key_version=1 (current=0, rotating to 1).
+    // policy_id=1: this is the first enrollment on this account (policy_generation=1).
     let recover_tx = build_recover_account_key(
         SEED_REC, PILOT_ADDR, 2, 1,
         &[SEED_G1, SEED_G2],
         "rec-recover-001",
+        1,
     );
     let recover_json = serde_json::to_string(&recover_tx).unwrap();
     let _ = submit_tx(ports.alice_api, &recover_json);
@@ -581,11 +585,13 @@ fn dis_002b_recovery() {
     eprintln!("  Re-enrolled policy at key_version=1");
 
     // Try recovery with only 1 guardian (below threshold=2) — must fail.
+    // policy_id=2: second enrollment (policy_generation increments on each EnrollRecoveryPolicy).
     let insufficient_tx = build_recover_account_key(
         "dis002b-new-key-b10-seed-000000000000000000000000000",
         PILOT_ADDR, 5, 2,
         &[SEED_G1],
         "rec-recover-b10-fail",
+        2,
     );
     let insufficient_json = serde_json::to_string(&insufficient_tx).unwrap();
     let _ = submit_tx(ports.alice_api, &insufficient_json);
@@ -628,6 +634,7 @@ fn dis_002b_recovery() {
             key_version:         2,
             pop_signature:       pop_b11.bytes.clone(),
             guardian_signatures: forged_guardian_sigs,
+            policy_id:           2,
         },
         gas_limit:     2_000_000,
         signature:     vec![],

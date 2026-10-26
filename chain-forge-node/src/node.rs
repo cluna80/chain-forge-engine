@@ -539,6 +539,7 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         // DIS-002B: lost-device recovery policy enrollment and recovery
         TxBody::EnrollRecoveryPolicy { .. }      => "enroll_recovery_policy",
         TxBody::RecoverAccountKey { .. }         => "recover_account_key",
+        TxBody::RevokeRecoveryPolicy             => "revoke_recovery_policy",
     }
 }
 

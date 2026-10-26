@@ -89,6 +89,12 @@ pub struct AccountState {
     /// account holder while they still control the signing key.
     #[serde(default)]
     pub recovery_policy: Option<RecoveryPolicy>,
+    /// DIS-003A: monotonically increasing generation counter. Incremented on
+    /// every EnrollRecoveryPolicy; never reset, not even after revocation.
+    /// Ensures old guardian signatures cannot be replayed under a re-enrolled
+    /// policy that happens to share the same guardian set.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// An enrolled threshold-guardian recovery policy for lost-device recovery.
@@ -104,6 +110,9 @@ pub struct RecoveryPolicy {
     /// is only valid if `account.key_version == enrolled_at_key_version`,
     /// preventing a stale policy from being used after a legitimate rotation.
     pub enrolled_at_key_version: u32,
+    /// DIS-003A: the policy_generation value at enrollment time. A
+    /// `RecoverAccountKey` tx must carry the matching policy_id.
+    pub policy_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +134,7 @@ impl AccountState {
             key_version: 0,
             escrow: None,
             recovery_policy: None,
+            policy_generation: 0,
         }
     }
 
@@ -142,6 +152,7 @@ impl AccountState {
             key_version: 0,
             escrow: None,
             recovery_policy: None,
+            policy_generation: 0,
         }
     }
 
@@ -242,11 +253,14 @@ impl AccountState {
             parts.push(format!("escrow={}", serde_json::to_string(binding).unwrap()));
         }
         if let Some(rp) = &self.recovery_policy {
-            // Include a compact summary so policy enrollment/revocation affects
-            // the state root and is visible to all nodes.
+            // Include policy_id so replacement policies produce distinct state roots.
             parts.push(format!(
-                "recovery=t{}/{}/{}", rp.threshold, rp.guardians.len(), rp.enrolled_at_key_version
+                "recovery=t{}/{}/{}/pid{}", rp.threshold, rp.guardians.len(),
+                rp.enrolled_at_key_version, rp.policy_id
             ));
+        }
+        if self.policy_generation > 0 {
+            parts.push(format!("pgen={}", self.policy_generation));
         }
         parts.join("|").into_bytes()
     }
