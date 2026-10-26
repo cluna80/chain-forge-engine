@@ -307,11 +307,11 @@ fn build_recover_custom(
     let pop_sig = MlDsaScheme.sign(&pop_msg, &new_kp).expect("PoP sign");
 
     // Guardians sign g_chain_id / g_account / g_kv / g_pk_kp.pk
-    let rec_msg = recovery_domain_signing_bytes(g_chain_id, g_account, g_kv, &g_pk_kp.public_key);
+    let rec_msg = recovery_domain_signing_bytes(g_chain_id, g_account, g_kv, &g_pk_kp.public_key, None);
     let guardian_signatures: Vec<GuardianAuth> = guardian_seeds.iter().map(|&gs| {
         let gkp = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
         let sig = MlDsaScheme.sign(&rec_msg, &gkp).expect("guardian sign");
-        GuardianAuth { guardian_public_key: gkp.public_key.clone(), signature: sig.bytes.clone() }
+        GuardianAuth { guardian_public_key: gkp.public_key.clone(), signature: sig.bytes.clone(), expires_at_height: None }
     }).collect();
 
     Transaction {
@@ -505,11 +505,11 @@ fn dis_003c_replay_attacks() {
 
         // Guardians sign correctly for new_kp_good.
         let rec_msg = recovery_domain_signing_bytes(
-            CHAIN_ID, PILOT_ADDR, 1, &new_kp_good.public_key);
+            CHAIN_ID, PILOT_ADDR, 1, &new_kp_good.public_key, None);
         let guardian_signatures: Vec<GuardianAuth> = [SEED_G1, SEED_G2].iter().map(|&gs| {
             let gkp = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
             let sig = MlDsaScheme.sign(&rec_msg, &gkp).expect("guardian sign");
-            GuardianAuth { guardian_public_key: gkp.public_key.clone(), signature: sig.bytes.clone() }
+            GuardianAuth { guardian_public_key: gkp.public_key.clone(), signature: sig.bytes.clone(), expires_at_height: None }
         }).collect();
 
         let n_e05 = current_nonce(ports.alice, PILOT_ADDR);

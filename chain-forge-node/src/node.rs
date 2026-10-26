@@ -7545,7 +7545,7 @@ mod tests {
         );
         // Execute directly through the executor (the node's internal path).
         let result = restarted.executor.execute_tx_with_identity(
-            &classical_tx, &mut restarted.state, &mut restarted.identity, &mut restarted.agents,
+            &classical_tx, &mut restarted.state, &mut restarted.identity, &mut restarted.agents, 0,
         );
         assert!(
             !result.success,
@@ -7607,7 +7607,7 @@ mod tests {
         node.identity.clock.current_epoch = 55;
         let mldsa_tx = p7_mldsa_transfer_with_kp("mldsa-grace", "qcb1pquser", 0, &pquser_kp);
         let r = node.executor.execute_tx_with_identity(
-            &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents,
+            &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
         assert!(
             r.success,
@@ -7621,7 +7621,7 @@ mod tests {
         node.identity.clock.current_epoch = 61;
         let mldsa_tx2 = p7_mldsa_transfer_with_kp("mldsa-post-cutoff", "qcb1pquser", 1, &pquser_kp);
         let r2 = node.executor.execute_tx_with_identity(
-            &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents,
+            &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
         assert!(
             r2.success,

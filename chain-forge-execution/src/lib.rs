@@ -886,8 +886,15 @@ pub enum TxBody {
 pub struct GuardianAuth {
     /// The guardian's ML-DSA-65 public key (1952 bytes).
     pub guardian_public_key: Vec<u8>,
-    /// Signature over `recovery_domain_signing_bytes(chain_id, account, key_version, new_pk)`.
+    /// Signature over `recovery_domain_signing_bytes(chain_id, account, key_version, new_pk, expires_at_height)`.
     pub signature:           Vec<u8>,
+    /// DIS-003D: optional block-height expiry bound into the guardian's signature.
+    /// If `Some(h)`, the authorization is valid only while `block_height <= h`.
+    /// Rejected at height h+1 and beyond. `None` means no expiry.
+    /// **Must be bound inside the signing bytes** so attackers cannot extend
+    /// the lifetime of a captured signature by modifying this field.
+    #[serde(default)]
+    pub expires_at_height: Option<u64>,
 }
 
 impl TxBody {
@@ -1925,19 +1932,21 @@ pub fn account_key_rotation_signing_bytes(
     b
 }
 
-/// DIS-002B Path 2: Domain-separated signing bytes for guardian recovery
-/// authorization signatures.
+/// DIS-002B Path 2 / DIS-003D: Domain-separated signing bytes for guardian
+/// recovery authorization signatures.
 ///
-/// Format: `b"CFREC|" || chain_id || b"|" || account_address || b"|" || key_version || b"|" || hex(new_public_key)`
+/// Format: `b"CFREC|" || chain_id || b"|" || account_address || b"|" || key_version || b"|" || hex(new_public_key) || b"|" || expires_at_height`
 ///
-/// Guardians sign this message to authorize a `RecoverAccountKey` tx.
-/// Distinct domain prefix from rotation bytes ("CFAR|") prevents cross-context
-/// replay of guardian signatures.
+/// `expires_at_height` is encoded as the decimal string of the height, or
+/// `"none"` when `None`. Binding it inside the signed bytes prevents an attacker
+/// from extending the lifetime of a captured signature by modifying the
+/// `GuardianAuth.expires_at_height` field in the transaction.
 pub fn recovery_domain_signing_bytes(
-    chain_id:       &str,
-    account:        &str,
-    key_version:    u32,
-    new_public_key: &[u8],
+    chain_id:          &str,
+    account:           &str,
+    key_version:       u32,
+    new_public_key:    &[u8],
+    expires_at_height: Option<u64>,
 ) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(b"CFREC|");
@@ -1948,6 +1957,11 @@ pub fn recovery_domain_signing_bytes(
     b.extend_from_slice(key_version.to_string().as_bytes());
     b.push(b'|');
     b.extend_from_slice(hex_encode_bytes(new_public_key).as_bytes());
+    b.push(b'|');
+    match expires_at_height {
+        Some(h) => b.extend_from_slice(h.to_string().as_bytes()),
+        None    => b.extend_from_slice(b"none"),
+    }
     b
 }
 
@@ -2514,6 +2528,7 @@ fn execute_recover_account_key(
     pop_signature:        &[u8],
     guardian_signatures:  &[GuardianAuth],
     policy_id:            u64,
+    block_height:         u64,
 ) -> Result<(), String> {
     use chain_forge_crypto::Signature as CfSig;
 
@@ -2575,14 +2590,8 @@ fn execute_recover_account_key(
         ));
     }
 
-    // Guard 6+7+8: verify guardian signatures, check policy membership, no duplicates.
-    let recovery_msg = recovery_domain_signing_bytes(
-        &config.chain_id,
-        &tx.sender,
-        *key_version,
-        new_public_key,
-    );
-
+    // Guard 6+7+8+10: verify guardian signatures, check policy membership, no duplicates,
+    // and check per-guardian expiry (DIS-003D).
     let mut seen_guardian_keys: Vec<&[u8]> = Vec::new();
     let mut valid_count: u32 = 0;
 
@@ -2602,7 +2611,23 @@ fn execute_recover_account_key(
         }
         seen_guardian_keys.push(&ga.guardian_public_key);
 
-        // Verify signature.
+        // Guard 10 (DIS-003D): check block-height expiry.
+        if let Some(exp) = ga.expires_at_height {
+            if block_height > exp {
+                return Err(format!(
+                    "RecoverAccountKey: guardian_signatures[{i}] authorization expired at height {exp}, current height is {block_height}"
+                ));
+            }
+        }
+
+        // Verify signature — each guardian's message encodes their own expires_at_height.
+        let recovery_msg = recovery_domain_signing_bytes(
+            &config.chain_id,
+            &tx.sender,
+            *key_version,
+            new_public_key,
+            ga.expires_at_height,
+        );
         let sig = CfSig { scheme: SchemeId::MlDsa, bytes: ga.signature.clone() };
         MlDsaScheme
             .verify(&recovery_msg, &sig, &ga.guardian_public_key)
@@ -2805,10 +2830,11 @@ impl Executor {
     /// and agent-registered tx types.
     pub fn execute_tx_with_identity(
         &self,
-        tx:       &Transaction,
-        state:    &mut StateStore,
-        identity: &mut IdentityStore,
-        agents:   &mut AgentStore,
+        tx:           &Transaction,
+        state:        &mut StateStore,
+        identity:     &mut IdentityStore,
+        agents:       &mut AgentStore,
+        block_height: u64,
     ) -> TransactionResult {
         let gas_required = self.config.gas_model.calculate_gas(tx);
 
@@ -3434,7 +3460,7 @@ impl Executor {
                 execute_recover_account_key(
                     &self.config, tx, state,
                     new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
-                    *policy_id,
+                    *policy_id, block_height,
                 )
             }
             TxBody::RevokeRecoveryPolicy => {
@@ -4236,8 +4262,9 @@ impl Executor {
     /// failed txs still consume gas and advance the nonce.
     pub fn execute_tx(
         &self,
-        tx: &Transaction,
-        state: &mut StateStore,
+        tx:           &Transaction,
+        state:        &mut StateStore,
+        block_height: u64,
     ) -> TransactionResult {
         let gas_required = self.config.gas_model.calculate_gas(tx);
 
@@ -4395,7 +4422,7 @@ impl Executor {
                 execute_recover_account_key(
                     &self.config, tx, state,
                     new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
-                    *policy_id,
+                    *policy_id, block_height,
                 )
             }
             TxBody::RevokeRecoveryPolicy => {
@@ -4452,7 +4479,7 @@ impl Executor {
                 continue;
             }
 
-            let result = self.execute_tx(tx, state);
+            let result = self.execute_tx(tx, state, height);
             total_gas     += result.gas_used;
             // FS-03: fee in uQCB == gas_used (GasModel returns uQCB directly).
             // debit_fee() already moved this amount sender → fee_collector.
@@ -4531,7 +4558,7 @@ impl Executor {
                 continue;
             }
 
-            let result = self.execute_tx_with_identity(tx, state, identity, agents);
+            let result = self.execute_tx_with_identity(tx, state, identity, agents, height);
             total_gas      += result.gas_used;
             // FS-03: debit_fee() already moved fee amount sender → fee_collector.
             fees_collected += result.gas_used;
@@ -4704,7 +4731,7 @@ mod tests {
         let (exec, mut state) = setup();
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100_000, 0);
         let fee = gas_for(&exec, &tx);
-        let result = exec.execute_tx(&tx, &mut state);
+        let result = exec.execute_tx(&tx, &mut state, 0);
 
         assert!(result.success, "transfer should succeed: {:?}", result.error);
         // FS-03: alice pays transfer amount + fee; bob receives transfer amount only
@@ -4716,7 +4743,7 @@ mod tests {
     fn transfer_fails_insufficient_balance() {
         let (exec, mut state) = setup();
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 999_000_000, 0);
-        let result = exec.execute_tx(&tx, &mut state);
+        let result = exec.execute_tx(&tx, &mut state, 0);
         assert!(!result.success);
         assert!(!result.success, "transfer should fail with insufficient balance");
     }
@@ -4726,7 +4753,7 @@ mod tests {
         let (exec, mut state) = setup();
         let tx = Transaction::burn("tx1", "qcb1alice", "uqcb", 500_000, 0);
         let fee = gas_for(&exec, &tx);
-        let result = exec.execute_tx(&tx, &mut state);
+        let result = exec.execute_tx(&tx, &mut state, 0);
 
         assert!(result.success, "{:?}", result.error);
         // FS-03: alice pays burn amount + fee
@@ -4738,7 +4765,7 @@ mod tests {
         let (exec, mut state) = setup();
         // Send with nonce=1 when account expects nonce=0
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 1);
-        let result = exec.execute_tx(&tx, &mut state);
+        let result = exec.execute_tx(&tx, &mut state, 0);
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("nonce"));
     }
@@ -4747,12 +4774,12 @@ mod tests {
     fn nonce_advances_after_tx() {
         let (exec, mut state) = setup();
         let tx1 = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0);
-        let r1 = exec.execute_tx(&tx1, &mut state);
+        let r1 = exec.execute_tx(&tx1, &mut state, 0);
         assert!(r1.success);
 
         // Second tx with nonce=1 should succeed
         let tx2 = Transaction::transfer("tx2", "qcb1alice", "qcb1bob", "uqcb", 1_000, 1);
-        let r2 = exec.execute_tx(&tx2, &mut state);
+        let r2 = exec.execute_tx(&tx2, &mut state, 0);
         assert!(r2.success, "{:?}", r2.error);
     }
 
@@ -4858,7 +4885,7 @@ mod tests {
             pq_public_key: vec![],
         };
 
-        let result = exec.execute_tx(&tx, &mut state);
+        let result = exec.execute_tx(&tx, &mut state, 0);
         assert!(result.success);
         assert!(result.events.iter().any(|e| e.contains("charm-confinement")));
     }
@@ -4882,7 +4909,7 @@ mod tests {
             pq_public_key: vec![],
         };
 
-        let result = exec.execute_tx(&tx, &mut state);
+        let result = exec.execute_tx(&tx, &mut state, 0);
         assert!(result.success, "{:?}", result.error);
         assert_eq!(state.get_account("qcb1val").unwrap().balance_of("uqcb"), 1_200_000);
     }
@@ -4925,7 +4952,7 @@ mod tests {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let tx = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
         let fee = gas_for(&exec, &tx);
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "{:?}", r.error);
         // FS-03: alice pays bond amount + fee; bond account receives bond amount only
         assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), 5_000_000 - 2_000_000 - fee);
@@ -4936,10 +4963,10 @@ mod tests {
     fn bonding_is_incremental_and_accumulates() {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let tx1 = Transaction::bond_validator("bond1", "qcb1alice", 500_000, 0);
-        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut agents);
+        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut agents, 0);
         assert!(r1.success, "{:?}", r1.error);
         let tx2 = Transaction::bond_validator("bond2", "qcb1alice", 300_000, 1);
-        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut agents);
+        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut agents, 0);
         assert!(r2.success, "{:?}", r2.error);
         assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 800_000);
     }
@@ -4950,7 +4977,7 @@ mod tests {
         // Alice only has 5_000_000 at genesis.
         let tx = Transaction::bond_validator("bond1", "qcb1alice", 50_000_000, 0);
         let fee = gas_for(&exec, &tx);
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success);
         // FS-03: the fee is consumed even on failure (EVM semantics).
         // The bond body is not executed, so no partial debit to the bond account.
@@ -4962,7 +4989,7 @@ mod tests {
     fn unbond_without_any_bond_is_rejected() {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let tx = Transaction::unbond_validator("unbond1", "qcb1alice", 0);
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("no bonded stake"));
     }
@@ -4972,11 +4999,11 @@ mod tests {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
         let fee_bond = gas_for(&exec, &bond);
-        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents, 0);
 
         let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
         let fee_unbond = gas_for(&exec, &unbond);
-        let r = exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "{:?}", r.error);
         // No longer counted as bonded -- stops counting toward the active set immediately.
         assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 0);
@@ -4992,17 +5019,17 @@ mod tests {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
         let fee_bond = gas_for(&exec, &bond);
-        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents, 0);
         let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
         let fee_unbond = gas_for(&exec, &unbond);
-        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents, 0);
 
         // Still epoch 0 -- cooldown (21 epochs) has not elapsed. A second
         // UnbondValidator call (the only way to attempt a sweep) must be
         // rejected, and must NOT move any funds.
         let sweep_attempt = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
         let fee_sweep = gas_for(&exec, &sweep_attempt);
-        let r = exec.execute_tx_with_identity(&sweep_attempt, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&sweep_attempt, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("cooldown not complete"));
         assert_eq!(state.get_account("validator-unbonding:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
@@ -5015,9 +5042,9 @@ mod tests {
     fn claiming_unbonded_stake_after_cooldown_elapses_releases_funds_exactly_once() {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
-        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents, 0);
         let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
-        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents, 0);
 
         // Advance past the 21-epoch cooldown.
         identity.clock.current_epoch = 21;
@@ -5026,7 +5053,7 @@ mod tests {
         let fee_bond   = gas_for(&exec, &Transaction::bond_validator("x", "qcb1alice", 2_000_000, 0));
         let fee_unbond = gas_for(&exec, &Transaction::unbond_validator("x", "qcb1alice", 0));
         let fee_sweep  = gas_for(&exec, &sweep);
-        let r = exec.execute_tx_with_identity(&sweep, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&sweep, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "{:?}", r.error);
         // FS-03: bond, unbond, and sweep all pay fees; but full principal returns via sweep
         let expected_after_sweep = 5_000_000 - fee_bond - fee_unbond - fee_sweep;
@@ -5037,7 +5064,7 @@ mod tests {
         // matured left to sweep -- it must not double-release funds.
         let double_sweep = Transaction::unbond_validator("unbond3", "qcb1alice", 3);
         let fee_double = gas_for(&exec, &double_sweep);
-        let r2 = exec.execute_tx_with_identity(&double_sweep, &mut state, &mut identity, &mut agents);
+        let r2 = exec.execute_tx_with_identity(&double_sweep, &mut state, &mut identity, &mut agents, 0);
         assert!(!r2.success);
         assert!(r2.error.unwrap().contains("no bonded stake"));
         // FS-03: failed double-sweep still consumes fee
@@ -5052,15 +5079,15 @@ mod tests {
         // locked -- there is nothing bonded left to start a new one from.
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
-        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents, 0);
         let unbond1 = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
-        exec.execute_tx_with_identity(&unbond1, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&unbond1, &mut state, &mut identity, &mut agents, 0);
 
         // Still cooling down (epoch 0 < unlock epoch 21); a second attempt
         // at the same nonce-advancing call correctly reports "not complete",
         // not a fresh, separately-tracked unbonding request.
         let unbond2 = Transaction::unbond_validator("unbond2", "qcb1alice", 2);
-        let r = exec.execute_tx_with_identity(&unbond2, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&unbond2, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("cooldown not complete"));
     }
@@ -5070,14 +5097,14 @@ mod tests {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
         let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
-        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut agents).success);
-        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut agents, 0).success);
+        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut agents, 0).success);
         assert_eq!(state.get_account("validator-bond:qcb1alice").unwrap().balance_of("uqcb"), 2_000_000);
         assert_eq!(state.get_account("validator-bond:qcb1bob").unwrap().balance_of("uqcb"), 4_000_000);
 
         // Unbonding Alice must not touch Bob's independent bond.
         let unbond_a = Transaction::unbond_validator("unbondA", "qcb1alice", 1);
-        assert!(exec.execute_tx_with_identity(&unbond_a, &mut state, &mut identity, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&unbond_a, &mut state, &mut identity, &mut agents, 0).success);
         assert_eq!(state.get_account("validator-bond:qcb1bob").unwrap().balance_of("uqcb"), 4_000_000);
     }
 
@@ -5087,9 +5114,9 @@ mod tests {
         let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
         let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
         let v = Transaction::bond_validator("bondV", "qcb1val", 500_000, 0); // below default min
-        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut agents).success);
-        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut agents).success);
-        assert!(exec.execute_tx_with_identity(&v, &mut state, &mut identity, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut agents, 0).success);
+        assert!(exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut agents, 0).success);
+        assert!(exec.execute_tx_with_identity(&v, &mut state, &mut identity, &mut agents, 0).success);
 
         let active = validator_bond::compute_stake_active_set(
             &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
@@ -5106,7 +5133,7 @@ mod tests {
     fn compute_stake_active_set_drops_validators_who_fully_unbond() {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let bond = Transaction::bond_validator("bond1", "qcb1alice", 2_000_000, 0);
-        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&bond, &mut state, &mut identity, &mut agents, 0);
         let active_before = validator_bond::compute_stake_active_set(
             &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
         );
@@ -5116,7 +5143,7 @@ mod tests {
         // immediately (cooldown only gates when the *funds* return, not
         // when the validator stops counting toward the active set).
         let unbond = Transaction::unbond_validator("unbond1", "qcb1alice", 1);
-        assert!(exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&unbond, &mut state, &mut identity, &mut agents, 0).success);
         let active_after = validator_bond::compute_stake_active_set(
             &state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, validator_bond::DEFAULT_MAX_ACTIVE_VALIDATORS,
         );
@@ -5128,8 +5155,8 @@ mod tests {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
         let a = Transaction::bond_validator("bondA", "qcb1alice", 2_000_000, 0);
         let b = Transaction::bond_validator("bondB", "qcb1bob", 4_000_000, 0);
-        exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut agents);
-        exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&a, &mut state, &mut identity, &mut agents, 0);
+        exec.execute_tx_with_identity(&b, &mut state, &mut identity, &mut agents, 0);
 
         let active = validator_bond::compute_stake_active_set(&state, "uqcb", validator_bond::DEFAULT_MIN_BOND_UQCB, 1);
         // Capped to 1: only the higher-staked validator (Bob) makes it in.
@@ -5144,7 +5171,7 @@ mod tests {
         // reject them explicitly rather than silently no-op or panic.
         let (exec, mut state) = setup();
         let tx = Transaction::bond_validator("bond1", "qcb1alice", 1_000_000, 0);
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("identity-aware executor"));
     }
@@ -5155,7 +5182,7 @@ mod tests {
 
         // Bob is not in identity store -- should fail
         let tx = Transaction::sponsor_agent("tx1", "qcb1bob", "qcb1agent1", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!result.success, "unverified identity cannot sponsor agents");
     }
 
@@ -5164,7 +5191,7 @@ mod tests {
         let (exec, mut state, mut identity, mut agents) = setup_with_identity();
 
         let tx = Transaction::sponsor_agent("tx1", "qcb1alice", "qcb1agent1", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
 
         assert!(result.success, "{:?}", result.error);
         assert!(identity.is_agent_authorized("qcb1agent1", "qcb1alice"),
@@ -5186,7 +5213,7 @@ mod tests {
 
         // Transfer triggers spend -> exemption credit
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0);
-        exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
 
         assert_eq!(state.get_account("qcb1alice").unwrap().exemption_days(), 1,
             "spending should earn 1 day of decay exemption");
@@ -5206,7 +5233,7 @@ mod tests {
         }
 
         let tx = Transaction::register_identity("tx1", "qcb1newbie", 0);
-        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let result = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
 
         assert!(result.success, "registration should succeed: {:?}", result.error);
         assert!(result.events.iter().any(|e| e.contains("register_identity")));
@@ -5243,13 +5270,13 @@ mod tests {
 
         // Register the real claimant via the actual transaction path.
         let reg_tx = Transaction::register_identity("tx0", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&reg_tx, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&reg_tx, &mut state, &mut identity, &mut agents, 0);
 
         // Two attestations: still Provisional on-chain.
         let a1 = Transaction::attest("tx1", "qcb1alice", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut agents, 0);
         let a2 = Transaction::attest("tx2", "qcb1bob", "qcb1newbie", 0);
-        exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut agents);
+        exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut agents, 0);
         assert_eq!(
             state.get_account("qcb1newbie").unwrap().verification_tier(),
             Some(&VerificationTier::Provisional)
@@ -5258,7 +5285,7 @@ mod tests {
         // Third distinct attestation crosses quorum -- both IdentityStore
         // AND the on-chain account must now show Verified.
         let a3 = Transaction::attest("tx3", "qcb1carol", "qcb1newbie", 0);
-        let result = exec.execute_tx_with_identity(&a3, &mut state, &mut identity, &mut agents);
+        let result = exec.execute_tx_with_identity(&a3, &mut state, &mut identity, &mut agents, 0);
         assert!(result.success);
         assert!(result.events.iter().any(|e| e.contains("now Verified")));
         assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Verified);
@@ -5278,11 +5305,11 @@ mod tests {
         state.apply_genesis(&genesis).unwrap();
 
         let reg_tx = Transaction::register_identity("tx1", "qcb1newbie", 0);
-        let r1 = exec.execute_tx(&reg_tx, &mut state);
+        let r1 = exec.execute_tx(&reg_tx, &mut state, 0);
         assert!(!r1.success, "RegisterIdentity must be rejected by the non-identity-aware executor");
 
         let attest_tx = Transaction::attest("tx2", "qcb1alice", "qcb1newbie", 0);
-        let r2 = exec.execute_tx(&attest_tx, &mut state);
+        let r2 = exec.execute_tx(&attest_tx, &mut state, 0);
         assert!(!r2.success, "Attest must be rejected by the non-identity-aware executor");
     }
 
@@ -5306,27 +5333,27 @@ mod tests {
 
         // Registration advances the new account's nonce 0 -> 1.
         let reg = Transaction::register_identity("r0", "qcb1newbie", 0);
-        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents, 0).success);
         assert_eq!(state.get_account("qcb1newbie").unwrap().nonce, 1);
 
         // Replaying the exact same registration is now a nonce mismatch,
         // not a second trip into the identity logic.
-        let replay = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents);
+        let replay = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents, 0);
         assert!(!replay.success);
         assert!(replay.error.as_deref().unwrap_or("").contains("nonce mismatch"));
 
         // An attester's first attest advances their nonce, so their second
         // transaction must use nonce 1 -- and does succeed with it.
         let a1 = Transaction::attest("a1", "qcb1alice", "qcb1newbie", 0);
-        assert!(exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut agents, 0).success);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 1);
 
         exec.execute_tx_with_identity(
             &Transaction::register_identity("r1", "qcb1other", 0),
-            &mut state, &mut identity, &mut agents,
+            &mut state, &mut identity, &mut agents, 0,
         );
         let a2 = Transaction::attest("a2", "qcb1alice", "qcb1other", 1);
-        let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&a2, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "second attest with nonce 1 must succeed: {:?}", r.error);
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 2);
     }
@@ -5354,7 +5381,7 @@ mod tests {
     fn unsigned_tx_rejected_when_signatures_required() {
         let (exec, mut state, _) = signed_setup();
         let tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("unsigned"));
         assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 0, "rejected tx must not advance nonce");
@@ -5365,7 +5392,7 @@ mod tests {
         let (exec, mut state, alice) = signed_setup();
         let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
         tx.sign(&alice, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(r.success, "{:?}", r.error);
     }
 
@@ -5375,7 +5402,7 @@ mod tests {
         let mallory = key("mallory");
         let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1mallory", "uqcb", 100, 0);
         tx.sign(&mallory, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("does not match the key bound"));
     }
@@ -5386,7 +5413,7 @@ mod tests {
         let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
         tx.sign(&alice, "qcb-testnet-1").unwrap();
         tx.body = TxBody::Transfer { to: "qcb1bob".into(), denom: "uqcb".into(), amount: 4_000_000 };
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("invalid signature"));
     }
@@ -5427,7 +5454,7 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &tx, &mut state,
             &mut chain_forge_identity::IdentityStore::new(0),
-            &mut AgentStore::new(),
+            &mut AgentStore::new(), 0,
         );
         assert!(r.success, "{:?}", r.error);
         assert!(r.events.iter().any(|e| e.starts_with("register_validator_key:")));
@@ -5449,7 +5476,7 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &tx, &mut state,
             &mut chain_forge_identity::IdentityStore::new(0),
-            &mut AgentStore::new(),
+            &mut AgentStore::new(), 0,
         );
         assert!(!r.success);
         assert!(r.error.unwrap().contains("proof-of-possession"));
@@ -5471,7 +5498,7 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &tx, &mut state,
             &mut chain_forge_identity::IdentityStore::new(0),
-            &mut AgentStore::new(),
+            &mut AgentStore::new(), 0,
         );
         assert!(
             !r.success,
@@ -5484,7 +5511,7 @@ mod tests {
         // RegisterValidatorKey's unconditional check, not an accidental
         // side effect of some other change.
         let transfer = Transaction::transfer("t1", "qcb1val", "qcb1alice", "uqcb", 10, 0);
-        let r2 = exec.execute_tx(&transfer, &mut state);
+        let r2 = exec.execute_tx(&transfer, &mut state, 0);
         assert!(r2.success, "{:?}", r2.error);
     }
 
@@ -5499,7 +5526,7 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &tx, &mut state,
             &mut chain_forge_identity::IdentityStore::new(0),
-            &mut AgentStore::new(),
+            &mut AgentStore::new(), 0,
         );
         assert!(!r.success);
         assert!(r.error.unwrap().contains("must not be empty"));
@@ -5510,7 +5537,7 @@ mod tests {
         let (exec, mut state, alice) = signed_setup();
         let mut tx = Transaction::transfer("tx1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
         tx.sign(&alice, "some-other-chain").unwrap();
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("invalid signature"));
     }
@@ -5525,7 +5552,7 @@ mod tests {
         tx.sign(&alice, "qcb-testnet-1").unwrap();
         assert_eq!(tx.sig_scheme, Some(SchemeId::Classical),
             "sign() must set sig_scheme = Classical for a classical keypair");
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(r.success, "tx with explicit Classical scheme tag must succeed");
     }
 
@@ -5535,7 +5562,7 @@ mod tests {
         let (exec, mut state, _) = signed_setup();
         let mut tx = Transaction::transfer("tx2", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
         tx.sig_scheme = Some(SchemeId::Classical);  // claim classical but no sig bytes
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success, "Classical scheme tag with empty signature must fail");
     }
 
@@ -5571,7 +5598,7 @@ mod tests {
         legacy_tx.sender = alice_addr.as_str().to_string();
 
         let exec = Executor::new(config);
-        let r = exec.execute_tx(&legacy_tx, &mut state);
+        let r = exec.execute_tx(&legacy_tx, &mut state, 0);
         // Should succeed: verifier falls back to pq_signatures prefix scan
         assert!(r.success,
             "legacy ML-DSA tx without sig_scheme tag must still be accepted (backward compat): {:?}",
@@ -5590,7 +5617,7 @@ mod tests {
 
         let mut tx = Transaction::transfer("tx3", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
         tx.sig_scheme = Some(SchemeId::MlDsa);  // claim ML-DSA but provide no pq_signatures
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success, "MlDsa scheme tag with empty pq_signatures must fail");
         let err = r.error.unwrap();
         assert!(err.contains("mldsa65") || err.contains("pq_signatures"),
@@ -5605,7 +5632,7 @@ mod tests {
         let mallory = key("mallory");
         let mut tx = Transaction::transfer("tx1", "qcb1bob", "qcb1mallory", "uqcb", 100, 0);
         tx.sign(&mallory, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("not derived from the signing key"));
     }
@@ -5630,7 +5657,7 @@ mod tests {
 
         let mut reg = Transaction::register_identity("r0", addr.as_str(), 0);
         reg.sign(&user, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "{:?}", r.error);
 
         let acct = state.get_account(addr.as_str()).unwrap();
@@ -5641,7 +5668,7 @@ mod tests {
         let other = key("someone-else");
         let mut hijack = Transaction::attest("h1", addr.as_str(), "qcb1alice", 1);
         hijack.sign(&other, "qcb-testnet-1").unwrap();
-        let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&hijack, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success);
         assert!(r.error.unwrap().contains("does not match the key bound"));
     }
@@ -5692,7 +5719,7 @@ mod tests {
 
         // Register newcomer -- should change the state root (Provisional charm attached).
         let reg = Transaction::register_identity("t-reg", "qcb1newcomer", 0);
-        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "registration failed: {:?}", r.error);
         let root_after_reg = state.commit(0, 0, false).root_hash;
         assert_ne!(root_before, root_after_reg,
@@ -5704,7 +5731,7 @@ mod tests {
             let attest = Transaction::attest(
                 &format!("t-attest-{i}"), attester, "qcb1newcomer", 0
             );
-            let r = exec.execute_tx_with_identity(&attest, &mut state, &mut identity, &mut agents);
+            let r = exec.execute_tx_with_identity(&attest, &mut state, &mut identity, &mut agents, 0);
             assert!(r.success, "attest {i} failed: {:?}", r.error);
         }
         let root_after_verify = state.commit(0, 0, false).root_hash;
@@ -5726,7 +5753,7 @@ mod tests {
             (Transaction::sponsor_agent("t4", "qcb1alice", "qcb1agent", 0), "agents"),
         ];
         for (tx, module) in cases {
-            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
             assert!(!r.success, "{} must be rejected on a plain chain", tx.id);
             assert!(r.error.unwrap().contains(&format!("module \"{module}\" is not enabled")));
         }
@@ -5738,7 +5765,7 @@ mod tests {
         let (_, mut state, mut identity, mut agents) = setup_with_identity();
         let exec = plain_chain_exec();
         let tx = Transaction::transfer("t1", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "{:?}", r.error);
     }
 
@@ -5880,7 +5907,7 @@ mod tests {
         const CHAIN: &str = "qcb-b4-test";
         let (tx, _pk) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "b4-alice-seed");
         let (exec, mut state) = setup_signed(CHAIN, "qcb1sender");
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(r.success,
             "valid ML-DSA tx with correct chain_id must be accepted; error: {:?}", r.error);
     }
@@ -5895,7 +5922,7 @@ mod tests {
         let (tx, _pk) = make_pq_tx_with_chain(SIGNING_CHAIN, "qcb1sender", 0, "b4-bob-seed");
         // … but verified against chain B's executor (cross-chain replay attack)
         let (exec, mut state) = setup_signed(WRONG_CHAIN, "qcb1sender");
-        let r = exec.execute_tx(&tx, &mut state);
+        let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(!r.success,
             "ML-DSA tx signed for chain '{SIGNING_CHAIN}' must be rejected on chain '{WRONG_CHAIN}'");
         let err = r.error.unwrap_or_default();
@@ -5950,7 +5977,7 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &tx, &mut state,
             &mut IdentityStore::new(0),
-            &mut AgentStore::new(),
+            &mut AgentStore::new(), 0,
         );
         assert!(!r.success, "gas_limit=0 must be rejected; got success=true");
         let err = r.error.unwrap_or_default();
@@ -6003,7 +6030,7 @@ mod tests {
         let r = exec.execute_tx_with_identity(
             &tx, &mut state,
             &mut IdentityStore::new(0),
-            &mut AgentStore::new(),
+            &mut AgentStore::new(), 0,
         );
         assert!(!r.success, "gas_limit=10B must be rejected; got success=true");
         let err = r.error.unwrap_or_default();
@@ -6083,7 +6110,7 @@ mod tests {
         let tx = emergency_deprecate_tx("eda1", gov, 0,
             "Ed25519", "ML-DSA-65", 30, "Credible CRQC report from NIST-2026");
 
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "authorized governor should succeed: {:?}", r.error);
 
         // Migration state must now be persisted.
@@ -6111,7 +6138,7 @@ mod tests {
         let tx = emergency_deprecate_tx("eda2", "qcb1alice", 0,
             "Ed25519", "ML-DSA-65", 30, "Unauthorized attempt");
 
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "non-governor must be rejected");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("not a crypto governor"), "error: {err}");
@@ -6128,7 +6155,7 @@ mod tests {
             "Ed25519", "ML-DSA-65", MIN_CRYPTO_GRACE_EPOCHS - 1,
             "Short grace period test");
 
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "grace below minimum must be rejected");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("grace_epochs") && err.contains("out of range"), "error: {err}");
@@ -6143,7 +6170,7 @@ mod tests {
             "Ed25519", "ML-DSA-65", MAX_CRYPTO_GRACE_EPOCHS + 1,
             "Long grace period test");
 
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "grace above maximum must be rejected");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("grace_epochs") && err.contains("out of range"), "error: {err}");
@@ -6157,7 +6184,7 @@ mod tests {
         let tx = emergency_deprecate_tx("eda5", gov, 0,
             "Ed25519", "Ed25519", 30, "Noop migration test");
 
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "same deprecated/replacement must be rejected");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("must be different"), "error: {err}");
@@ -6171,7 +6198,7 @@ mod tests {
         let tx = emergency_deprecate_tx("eda6", gov, 0,
             "Ed25519", "ML-DSA-65", 30, "   ");
 
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "blank rationale must be rejected");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("rationale must not be empty"), "error: {err}");
@@ -6187,13 +6214,13 @@ mod tests {
         // First deprecation — should succeed.
         let tx1 = emergency_deprecate_tx("eda7a", gov, 0,
             "Ed25519", "ML-DSA-65", 30, "First migration");
-        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut agents);
+        let r1 = exec.execute_tx_with_identity(&tx1, &mut state, &mut identity, &mut agents, 0);
         assert!(r1.success, "first deprecation must succeed: {:?}", r1.error);
 
         // Second deprecation while first is in progress — must be rejected.
         let tx2 = emergency_deprecate_tx("eda7b", gov, 1,
             "ML-DSA-65", "Hybrid-Ed25519-ML-DSA", 50, "Second migration");
-        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut agents);
+        let r2 = exec.execute_tx_with_identity(&tx2, &mut state, &mut identity, &mut agents, 0);
         assert!(!r2.success, "second deprecation while one is active must be rejected");
         let err = r2.error.unwrap_or_default();
         assert!(err.contains("already in progress"), "error: {err}");
@@ -6234,7 +6261,7 @@ mod tests {
             pq_public_key: vec![], sig_scheme: None,
         };
 
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "compromise simulation tx must succeed: {:?}", r.error);
 
         // ── Step 2: Check migration state during grace window ─────────────────
@@ -6297,7 +6324,7 @@ mod tests {
 
         let tx = emergency_deprecate_tx("eda9", "qcb1alice", 0,
             "Ed25519", "ML-DSA-65", 30, "No governors configured");
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "no crypto_governors must deny all deprecation txs");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("no crypto_governors configured"), "error: {err}");
@@ -6321,7 +6348,7 @@ mod tests {
         // hard_cutoff_epoch = 42 + 10 - 1 = 51.
         let dep_tx = emergency_deprecate_tx("cutoff-dep", gov, 0,
             "ed25519", "ml-dsa", 10, "Simulated CRQC break");
-        let r = exec.execute_tx_with_identity(&dep_tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&dep_tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "deprecation tx must succeed: {:?}", r.error);
 
         // Sanity: epoch 51 is the last grace epoch — transfer with Classical
@@ -6331,7 +6358,7 @@ mod tests {
             "t-grace", "qcb1alice", "qcb1bob", "uqcb", 1, 1
         );
         in_grace.sig_scheme = Some(SchemeId::Classical);
-        let r = exec.execute_tx_with_identity(&in_grace, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&in_grace, &mut state, &mut identity, &mut agents, 0);
         // May fail for other reasons (balance, nonce) but must NOT fail with the
         // cutoff message while still in the grace window.
         if !r.success {
@@ -6346,7 +6373,7 @@ mod tests {
             "t-post-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, 2
         );
         post_cutoff.sig_scheme = Some(SchemeId::Classical);
-        let r = exec.execute_tx_with_identity(&post_cutoff, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&post_cutoff, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "Classical scheme must be rejected after hard cutoff");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("was deprecated"),
@@ -6360,7 +6387,7 @@ mod tests {
             "t-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, 2
         );
         pq_tx.sig_scheme = Some(SchemeId::MlDsa);
-        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents, 0);
         if !r.success {
             let err = r.error.unwrap_or_default();
             assert!(!err.contains("was deprecated"),
@@ -6375,7 +6402,7 @@ mod tests {
             "t-untagged", "qcb1alice", "qcb1bob", "uqcb", 1, 2
         );
         assert!(untagged.sig_scheme.is_none());
-        let r = exec.execute_tx_with_identity(&untagged, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&untagged, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "Untagged classical tx must be blocked by cutoff after P6 (gap G2 closed)");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("was deprecated") || err.contains("deprecated"),
@@ -6413,7 +6440,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &consensus_tx, &mut state, &mut identity, &mut agents,
+            &consensus_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success, "ConsensusSignatures scope must be rejected for non-ml-dsa-65 schemes");
         let err = r.error.clone().unwrap_or_default();
@@ -6446,7 +6473,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &both_tx, &mut state, &mut identity, &mut agents,
+            &both_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success, "Both scope must be rejected");
         let err = r.error.unwrap_or_default();
@@ -6459,7 +6486,7 @@ mod tests {
             MIN_CRYPTO_GRACE_EPOCHS, "scope guard sanity",
         );
         let r = exec.execute_tx_with_identity(
-            &good_tx, &mut state, &mut identity, &mut agents,
+            &good_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(r.success, "TxSignatures scope must succeed: {:?}", r.error);
         // Verify scope is persisted in migration state.
@@ -6488,7 +6515,7 @@ mod tests {
             MIN_CRYPTO_GRACE_EPOCHS, "Restart survival test",
         );
         let r = exec.execute_tx_with_identity(
-            &dep_tx, &mut state, &mut identity, &mut agents,
+            &dep_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(r.success, "deprecation must succeed: {:?}", r.error);
 
@@ -6529,7 +6556,7 @@ mod tests {
         );
         cutoff_tx.sig_scheme = Some(SchemeId::Classical);
         let r = exec.execute_tx_with_identity(
-            &cutoff_tx, &mut state, &mut identity, &mut agents,
+            &cutoff_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success,
             "deprecated scheme must still be rejected post-restart");
@@ -6570,7 +6597,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &bad_rep_tx, &mut state, &mut identity, &mut agents,
+            &bad_rep_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success,
             "unknown replacement scheme must be rejected");
@@ -6601,7 +6628,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &bad_dep_tx, &mut state, &mut identity, &mut agents,
+            &bad_dep_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success,
             "unknown deprecated scheme must be rejected");
@@ -6615,7 +6642,7 @@ mod tests {
             MIN_CRYPTO_GRACE_EPOCHS, "valid schemes",
         );
         let r = exec.execute_tx_with_identity(
-            &good_tx, &mut state, &mut identity, &mut agents,
+            &good_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(r.success, "valid scheme tx must succeed: {:?}", r.error);
     }
@@ -6636,7 +6663,7 @@ mod tests {
             MIN_CRYPTO_GRACE_EPOCHS, "First migration",
         );
         let r = exec.execute_tx_with_identity(
-            &first_tx, &mut state, &mut identity, &mut agents,
+            &first_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(r.success, "first migration must succeed: {:?}", r.error);
 
@@ -6646,7 +6673,7 @@ mod tests {
             MIN_CRYPTO_GRACE_EPOCHS, "Duplicate migration",
         );
         let r = exec.execute_tx_with_identity(
-            &dup_tx, &mut state, &mut identity, &mut agents,
+            &dup_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success, "duplicate migration must be rejected");
         let err = r.error.clone().unwrap_or_default();
@@ -6675,7 +6702,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &conflict_tx, &mut state, &mut identity, &mut agents,
+            &conflict_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success, "conflicting migration must be rejected");
         let err = r.error.unwrap_or_default();
@@ -6720,7 +6747,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &transfer_tx, &mut state, &mut identity, &mut agents,
+            &transfer_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success, "tx must be rejected when migration state is corrupt");
         let err = r.error.unwrap_or_default();
@@ -6747,7 +6774,7 @@ mod tests {
             "eda-p6g2", gov, 0, "ed25519", "ml-dsa", 10,
             "P6 gate2 test — untagged classical bypass",
         );
-        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "EDA must succeed: {:?}", r.error);
 
         // Advance to epoch 53 — one past the hard cutoff (cutoff = 52, rejected at 53).
@@ -6772,7 +6799,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &untagged_tx, &mut state, &mut identity, &mut agents,
+            &untagged_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success, "untagged classical tx must be rejected after cutoff");
         let err = r.error.unwrap_or_default();
@@ -6803,7 +6830,7 @@ mod tests {
             "eda-bound", gov, 0, "ed25519", "ml-dsa", 10,
             "P6 boundary test",
         );
-        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "EDA must succeed: {:?}", r.error);
 
         // hard_cutoff_epoch = initiated_epoch + grace_epochs - 1 = 42 + 10 - 1 = 51.
@@ -6834,7 +6861,7 @@ mod tests {
         // At epoch 51 (== hard_cutoff_epoch): classical still accepted.
         identity.clock.current_epoch = 51;
         let r51 = exec.execute_tx_with_identity(
-            &make_transfer("p6-bound-51", 1), &mut state, &mut identity, &mut agents,
+            &make_transfer("p6-bound-51", 1), &mut state, &mut identity, &mut agents, 0,
         );
         assert!(r51.success,
             "classical tx must be accepted AT hard_cutoff_epoch (51); got: {:?}", r51.error);
@@ -6842,7 +6869,7 @@ mod tests {
         // At epoch 52 (== hard_cutoff_epoch + 1): classical rejected.
         identity.clock.current_epoch = 52;
         let r52 = exec.execute_tx_with_identity(
-            &make_transfer("p6-bound-52", 2), &mut state, &mut identity, &mut agents,
+            &make_transfer("p6-bound-52", 2), &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r52.success,
             "classical tx must be REJECTED at hard_cutoff_epoch + 1 (52)");
@@ -6894,7 +6921,7 @@ mod tests {
         // Verify the tx is accepted — the deprecated classical scheme is blocked,
         // but ML-DSA is the replacement and must succeed.
         let r = exec.execute_tx_with_identity(
-            &mldsa_tx, &mut state, &mut identity, &mut agents,
+            &mldsa_tx, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(r.success,
             "ML-DSA-65 tx must be accepted after classical cutoff; got: {:?}", r.error);
@@ -6920,7 +6947,7 @@ mod tests {
             "eda-cfg", gov, 0, "ed25519", "ml-dsa", 10,
             "P6 config-independence test",
         );
-        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&eda, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "EDA must succeed: {:?}", r.error);
 
         // Advance past hard cutoff (epoch 52 > cutoff 51).
@@ -6946,7 +6973,7 @@ mod tests {
             pq_public_key: vec![],
         };
         let r = exec.execute_tx_with_identity(
-            &unsigned_classical, &mut state, &mut identity, &mut agents,
+            &unsigned_classical, &mut state, &mut identity, &mut agents, 0,
         );
         assert!(!r.success,
             "unsigned classical tx must be rejected by cutoff gate even with require_signatures=false");
@@ -6980,12 +7007,12 @@ mod tests {
 
         // Fund from alice (nonce 0) — alice genesis balance ~5M; fund 4M to stay under
         let fund_tx = Transaction::transfer("fund-diag", "qcb1alice", &addr, "uqcb", 4_000_000, 0);
-        let r = exec.execute_tx_with_identity(&fund_tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&fund_tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "fund: {:?}", r.error);
 
         // Bond (addr nonce 0)
         let bond_tx = Transaction::bond_validator("bond-diag", &addr, 2_000_000, 0);
-        let r = exec.execute_tx_with_identity(&bond_tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&bond_tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "bond: {:?}", r.error);
 
         // Grant personhood in identity store
@@ -7019,7 +7046,7 @@ mod tests {
         };
         reg1.sign(&account_kp, &config.chain_id).unwrap();
 
-        let r1 = exec.execute_tx_with_identity(&reg1, &mut state, &mut identity, &mut agents);
+        let r1 = exec.execute_tx_with_identity(&reg1, &mut state, &mut identity, &mut agents, 0);
         assert!(r1.success, "first registration must succeed: {:?}", r1.error);
 
         // Second ML-DSA key registration / rotation (addr nonce 2)
@@ -7047,7 +7074,7 @@ mod tests {
         };
         reg2.sign(&account_kp, &config.chain_id).unwrap();
 
-        let r2 = exec.execute_tx_with_identity(&reg2, &mut state, &mut identity, &mut agents);
+        let r2 = exec.execute_tx_with_identity(&reg2, &mut state, &mut identity, &mut agents, 0);
         assert!(r2.success,
             "rotation (second RegisterValidatorKey) must be accepted by executor: {:?}", r2.error);
     }
@@ -7200,19 +7227,19 @@ mod tests {
         // Register and attest newbie up to quorum (Verified).
         exec.execute_tx_with_identity(
             &Transaction::register_identity("r0", "qcb1newbie", 0),
-            &mut state, &mut identity, &mut agents,
+            &mut state, &mut identity, &mut agents, 0,
         );
         exec.execute_tx_with_identity(
             &Transaction::attest("a1", "qcb1alice", "qcb1newbie", 0),
-            &mut state, &mut identity, &mut agents,
+            &mut state, &mut identity, &mut agents, 0,
         );
         exec.execute_tx_with_identity(
             &Transaction::attest("a2", "qcb1bob", "qcb1newbie", 0),
-            &mut state, &mut identity, &mut agents,
+            &mut state, &mut identity, &mut agents, 0,
         );
         let r3 = exec.execute_tx_with_identity(
             &Transaction::attest("a3", "qcb1carol", "qcb1newbie", 0),
-            &mut state, &mut identity, &mut agents,
+            &mut state, &mut identity, &mut agents, 0,
         );
         assert!(r3.success, "third attest should succeed and reach quorum");
         assert_eq!(
@@ -7224,7 +7251,7 @@ mod tests {
         // Phase C: revoke alice's attestation — count drops 3→2, below quorum.
         // alice nonce advanced to 1 after the attest tx.
         let rev = Transaction::revoke_attestation("rev1", "qcb1alice", "qcb1newbie", 1);
-        let rr = exec.execute_tx_with_identity(&rev, &mut state, &mut identity, &mut agents);
+        let rr = exec.execute_tx_with_identity(&rev, &mut state, &mut identity, &mut agents, 0);
         assert!(rr.success, "revoke_attestation must succeed: {:?}", rr.error);
         assert!(
             rr.events.iter().any(|e| e.contains("tier_downgraded=true")),
@@ -7275,7 +7302,7 @@ mod tests {
             sig_scheme:   None,
             pq_public_key: vec![],
         };
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(!r.success, "must fail when no pop_verifier is wired");
         let err = r.error.as_deref().unwrap_or("");
         assert!(
@@ -7330,7 +7357,7 @@ mod tests {
             sig_scheme:   None,
             pq_public_key: vec![],
         };
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "VerifyIdentityWithProof must succeed with stub verifier: {:?}", r.error);
         assert_eq!(
             *identity.get("qcb1bob").unwrap().tier(),
@@ -7355,7 +7382,7 @@ mod tests {
             gas_limit: 50_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        let r1 = exec.execute_tx_with_identity(&bond1, &mut state, &mut identity, &mut agents);
+        let r1 = exec.execute_tx_with_identity(&bond1, &mut state, &mut identity, &mut agents, 0);
         assert!(r1.success, "initial authenticated bond must succeed: {:?}", r1.error);
 
         // Freeze alice's identity record directly (simulates sybil confirmation
@@ -7369,7 +7396,7 @@ mod tests {
             gas_limit: 50_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        let r2 = exec.execute_tx_with_identity(&bond2, &mut state, &mut identity, &mut agents);
+        let r2 = exec.execute_tx_with_identity(&bond2, &mut state, &mut identity, &mut agents, 0);
         assert!(!r2.success, "re-bond from frozen owner must be rejected");
         let err = r2.error.unwrap();
         assert!(err.contains("no longer holds") || err.contains("frozen") || err.contains("tier"),
@@ -7390,7 +7417,7 @@ mod tests {
             gas_limit: 50_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        assert!(exec.execute_tx_with_identity(&bond1, &mut state, &mut identity, &mut agents).success);
+        assert!(exec.execute_tx_with_identity(&bond1, &mut state, &mut identity, &mut agents, 0).success);
 
         // Manually downgrade alice's charm tier to Provisional.
         {
@@ -7404,7 +7431,7 @@ mod tests {
             gas_limit: 50_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        let r2 = exec.execute_tx_with_identity(&bond2, &mut state, &mut identity, &mut agents);
+        let r2 = exec.execute_tx_with_identity(&bond2, &mut state, &mut identity, &mut agents, 0);
         assert!(!r2.success, "re-bond from Provisional owner must be rejected");
     }
 
@@ -7451,7 +7478,7 @@ mod tests {
                 gas_limit: 50_000, signature: vec![], public_key: vec![],
                 pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
             };
-            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
             assert!(r.success, "attest tx from {attester} must succeed: {:?}", r.error);
         }
 
@@ -7475,7 +7502,7 @@ mod tests {
             gas_limit: 50_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        let r_rev = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+        let r_rev = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r_rev.success, "revoke_attestation must succeed: {:?}", r_rev.error);
 
         // Identity store must show Provisional.
@@ -7528,7 +7555,7 @@ mod tests {
             gas_limit: 1_000_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "ZK-VRC upgrade must succeed: {:?}", r.error);
 
         // On-chain account must reflect Verified — charm sync must not have been skipped.
@@ -7578,7 +7605,7 @@ mod tests {
                 gas_limit: 50_000, signature: vec![], public_key: vec![],
                 pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
             };
-            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents).success);
+            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0).success);
         }
 
         identity.advance_epoch(1_000);
@@ -7591,7 +7618,7 @@ mod tests {
             gas_limit: 50_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents, 0);
         assert!(r.success, "revoke_attestation must succeed: {:?}", r.error);
 
         let identity_tier = identity.get("qcb1newbie").unwrap().charm.tier.clone();
@@ -7657,7 +7684,7 @@ mod tests {
                 gas_limit: 50_000, signature: vec![], public_key: vec![],
                 pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
             };
-            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents).success);
+            assert!(exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 0).success);
         }
         assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Verified);
 
@@ -7677,7 +7704,7 @@ mod tests {
             gas_limit: 50_000, signature: vec![], public_key: vec![],
             pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
         };
-        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents);
+        let r = exec.execute_tx_with_identity(&revoke_tx, &mut state, &mut identity, &mut agents, 0);
 
         // The transaction MUST fail — the pre-flight check rejects the tx before
         // calling revoke_attestation(), so no identity mutation occurs.
@@ -7852,7 +7879,7 @@ mod tests {
         // Amount exceeds Alice's balance; transfer will fail.
         let tx = Transaction::transfer("tx-fail", "qcb1alice", "qcb1bob", "uqcb", alice_start * 2, 0);
         let fee = gas_for(&exec, &tx);
-        let result = exec.execute_tx(&tx, &mut state);
+        let result = exec.execute_tx(&tx, &mut state, 0);
 
         assert!(!result.success, "transfer must fail when amount exceeds balance");
 

@@ -396,7 +396,7 @@ fn build_recover_account_key(
     let pop_sig = MlDsaScheme.sign(&pop_msg, &new_kp).expect("PoP sign");
 
     let rec_msg = recovery_domain_signing_bytes(
-        CHAIN_ID, sender, key_version, &new_kp.public_key,
+        CHAIN_ID, sender, key_version, &new_kp.public_key, None,
     );
 
     let guardian_signatures: Vec<GuardianAuth> = guardian_seeds.iter().map(|&gs| {
@@ -405,6 +405,7 @@ fn build_recover_account_key(
         GuardianAuth {
             guardian_public_key: gkp.public_key.clone(),
             signature:           sig.bytes.clone(),
+            expires_at_height:   None,
         }
     }).collect();
 
@@ -611,7 +612,7 @@ fn dis_002b_recovery() {
     let atk_kp = MlDsaScheme.generate_keypair(SEED_ATK).expect("atk keygen");
     let new_kp_b11 = MlDsaScheme.generate_keypair("dis002b-new-key-b11-seed-0000000000000")
         .expect("b11 new key");
-    let rec_msg_b11 = recovery_domain_signing_bytes(CHAIN_ID, PILOT_ADDR, 2, &new_kp_b11.public_key);
+    let rec_msg_b11 = recovery_domain_signing_bytes(CHAIN_ID, PILOT_ADDR, 2, &new_kp_b11.public_key, None);
     let atk_sig1 = MlDsaScheme.sign(&rec_msg_b11, &atk_kp).expect("atk sign");
     let atk_sig2 = MlDsaScheme.sign(&rec_msg_b11, &atk_kp).expect("atk sign 2");
     let pop_msg_b11 = account_key_rotation_signing_bytes(
@@ -621,8 +622,8 @@ fn dis_002b_recovery() {
 
     // Both guardian entries use the attacker's pk — which is not in the enrolled policy.
     let forged_guardian_sigs = vec![
-        GuardianAuth { guardian_public_key: atk_kp.public_key.clone(), signature: atk_sig1.bytes.clone() },
-        GuardianAuth { guardian_public_key: atk_kp.public_key.clone(), signature: atk_sig2.bytes.clone() },
+        GuardianAuth { guardian_public_key: atk_kp.public_key.clone(), signature: atk_sig1.bytes.clone(), expires_at_height: None },
+        GuardianAuth { guardian_public_key: atk_kp.public_key.clone(), signature: atk_sig2.bytes.clone(), expires_at_height: None },
     ];
     let forged_tx = Transaction {
         id:            "rec-recover-b11-forged".to_string(),
