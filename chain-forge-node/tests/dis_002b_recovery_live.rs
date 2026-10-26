@@ -486,12 +486,6 @@ fn dis_002b_recovery() {
         "qcb1pilot not registered on all nodes after 30s"
     );
 
-    let id_before = identity_of(ports.alice_api, PILOT_ADDR)
-        .expect("identity_of qcb1pilot");
-    let tier_before = id_before["tier"].as_str().unwrap_or("").to_string();
-    let attest_count_before = id_before["attestation_count"].as_u64().unwrap_or(0);
-    eprintln!("  Snapshot: tier={tier_before} attest_count={attest_count_before}");
-
     // ── Phase 2: Enroll recovery policy (nonce=1 because RegisterIdentity=0) ──
 
     eprintln!("\n--- Phase 2: EnrollRecoveryPolicy ---");
@@ -519,6 +513,13 @@ fn dis_002b_recovery() {
         "EnrollRecoveryPolicy should succeed: {:?}", enroll_result
     );
     eprintln!("  [+] recovery policy enrolled (threshold=2/3)");
+
+    // Snapshot tier right before recovery so B-13 can verify it is unchanged.
+    let id_before = identity_of(ports.alice_api, PILOT_ADDR)
+        .expect("identity_of qcb1pilot before recovery");
+    let tier_before       = id_before["tier"].as_str().unwrap_or("").to_string();
+    let attest_count_before = id_before["attestation_count"].as_u64().unwrap_or(0);
+    eprintln!("  Pre-recovery snapshot: tier={tier_before} attest_count={attest_count_before}");
 
     // ── B-09: Recovery with valid policy and threshold met (2-of-3) ───────────
 
