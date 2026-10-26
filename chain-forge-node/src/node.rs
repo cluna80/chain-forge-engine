@@ -104,6 +104,10 @@ pub struct AccountSummary {
     /// Addresses that have actively attested this identity (non-revoked).
     #[serde(default)]
     pub attested_by: Vec<String>,
+    /// DIS-002A/B: monotonically increasing key rotation counter.
+    /// Incremented by RotateAccountKey and RecoverAccountKey.
+    #[serde(default)]
+    pub key_version: u32,
 }
 
 /// Voting-power snapshot for one validator.
@@ -1160,6 +1164,7 @@ impl Node {
                     sybil_confirmed: false,
                     attestation_count: 0,
                     attested_by:       vec![],
+                    key_version:    acct.key_version,
                 });
             }
         }
@@ -1894,6 +1899,7 @@ impl Node {
                         sybil_confirmed,
                         attestation_count: att_count,
                         attested_by:       att_by,
+                        key_version:    a.key_version,
                     });
                 }
 
@@ -4162,6 +4168,7 @@ impl Node {
                     sybil_confirmed,
                     attestation_count: att_count,
                     attested_by:       att_by,
+                    key_version:    a.key_version,
                 });
             }
 
@@ -4933,6 +4940,7 @@ impl Node {
                     sybil_confirmed,
                     attestation_count: att_count,
                     attested_by:       att_by,
+                    key_version:    a.key_version,
                 });
             }
 
