@@ -206,7 +206,11 @@ fn wait_tx_result(port: u16, tx_id: &str, timeout: Duration) -> Option<serde_jso
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(v) = api_get(port, &format!("/api/tx/{tx_id}")) {
-            if v.get("success").is_some() || v.get("error").is_some() { return Some(v); }
+            // "not found" means the tx hasn't been processed yet — keep polling.
+            let is_not_found = v["error"].as_str().map_or(false, |e| e.contains("not found"));
+            if !is_not_found && (v.get("success").is_some() || v.get("error").is_some()) {
+                return Some(v);
+            }
         }
         std::thread::sleep(Duration::from_millis(300));
     }
