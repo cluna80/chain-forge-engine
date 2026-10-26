@@ -725,14 +725,19 @@ fn dis_002b_recovery() {
         assert_eq!(kv, 1, "B-13: node{i} key_version={kv}, expected 1");
     }
 
-    let id_values: Vec<Option<String>> = all_api.iter().map(|&p| {
+    // Qattice's stable identity anchor is the account address (derived from
+    // the initial public key; invariant across key rotation and recovery).
+    // The /api/identity/ response does not expose a separate identity_id field,
+    // so we assert that all four nodes return the expected stable address.
+    let addr_values: Vec<String> = all_api.iter().map(|&p| {
         identity_of(p, PILOT_ADDR)
-            .and_then(|v| v["identity_id"].as_str().map(str::to_string))
+            .and_then(|v| v["address"].as_str().map(str::to_string))
+            .expect("B-13: identity address missing from /api/identity/ response")
     }).collect();
-    eprintln!("  identity_ids: {:?}", id_values);
-    let id_ref = &id_values[0];
-    for (i, id) in id_values.iter().enumerate() {
-        assert_eq!(id, id_ref, "B-13: node{i} identity_id differs from node0");
+    eprintln!("  addresses: {:?}", addr_values);
+    for (i, addr) in addr_values.iter().enumerate() {
+        assert_eq!(addr, PILOT_ADDR,
+            "B-13: node{i} identity address mismatch after recovery");
     }
 
     let tier_values: Vec<String> = all_api.iter().map(|&p| {
