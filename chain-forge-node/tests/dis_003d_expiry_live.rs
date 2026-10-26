@@ -432,15 +432,17 @@ fn dis_003d_expiry_live() {
 
     // ── F-01: Recovery with expires_at_height: None on all guardians succeeds ─
     println!("\n── F-01: Recovery with None expiry (baseline) ──────────────────────");
+    let kv1   = acct["key_version"].as_u64().unwrap_or(0) as u32;
     let nonce1 = current_nonce(port, PILOT_ADDR);
     let rec_f01 = build_recover(
         "dis003d-new-key-f01-seed-000000000000000000000001",
-        PILOT_ADDR, nonce1, nonce1 as u32 + 1,
+        PILOT_ADDR, nonce1, kv1 + 1,
         &[SEED_G1, SEED_G2],
         &[None, None],
         policy_id, "rec-d-f01",
     );
-    let _ = submit_tx(port, &tx_json(&rec_f01));
+    let sub_f01 = submit_tx(port, &tx_json(&rec_f01));
+    println!("F-01 submit: {sub_f01}");
     let r_f01 = wait_tx_result(port, "rec-d-f01", Duration::from_secs(20))
         .expect("F-01 result");
     println!("F-01: {r_f01}");
