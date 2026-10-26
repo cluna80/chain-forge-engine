@@ -222,8 +222,8 @@ fn account_of(port: u16, addr: &str) -> Option<serde_json::Value> {
 }
 
 fn state_root(port: u16) -> String {
-    api_get(port, "/api/state/root")
-        .and_then(|v| v["root"].as_str().map(str::to_string))
+    api_get(port, "/api/status")
+        .and_then(|v| v["state_root"].as_str().map(str::to_string))
         .unwrap_or_default()
 }
 
