@@ -104,6 +104,10 @@ pub struct AccountSummary {
     /// Addresses that have actively attested this identity (non-revoked).
     #[serde(default)]
     pub attested_by: Vec<String>,
+    /// DIS-002A/B: monotonically increasing key rotation counter.
+    /// Incremented by RotateAccountKey and RecoverAccountKey.
+    #[serde(default)]
+    pub key_version: u32,
 }
 
 /// Voting-power snapshot for one validator.
@@ -530,6 +534,11 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RegisterValidatorKey { .. }      => "register_validator_key",
         // QPC-GAP-002: ZK-VRC multi-issuer personhood proof
         TxBody::VerifyIdentityWithProof { .. }   => "verify_identity_with_proof",
+        // DIS-002A: authenticated account key rotation
+        TxBody::RotateAccountKey { .. }          => "rotate_account_key",
+        // DIS-002B: lost-device recovery policy enrollment and recovery
+        TxBody::EnrollRecoveryPolicy { .. }      => "enroll_recovery_policy",
+        TxBody::RecoverAccountKey { .. }         => "recover_account_key",
     }
 }
 
@@ -1155,6 +1164,7 @@ impl Node {
                     sybil_confirmed: false,
                     attestation_count: 0,
                     attested_by:       vec![],
+                    key_version:    acct.key_version,
                 });
             }
         }
@@ -1889,6 +1899,7 @@ impl Node {
                         sybil_confirmed,
                         attestation_count: att_count,
                         attested_by:       att_by,
+                        key_version:    a.key_version,
                     });
                 }
 
@@ -4157,6 +4168,7 @@ impl Node {
                     sybil_confirmed,
                     attestation_count: att_count,
                     attested_by:       att_by,
+                    key_version:    a.key_version,
                 });
             }
 
@@ -4928,6 +4940,7 @@ impl Node {
                     sybil_confirmed,
                     attestation_count: att_count,
                     attested_by:       att_by,
+                    key_version:    a.key_version,
                 });
             }
 

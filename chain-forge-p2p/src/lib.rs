@@ -606,6 +606,15 @@ pub mod real {
                 // Alice/Bob had added her to their mesh, so the votes were
                 // silently dropped and Carol accumulated liveness misses.
                 .flood_publish(true)
+                // Block proposals contain JSON-encoded tx_data (Vec<u8>) which
+                // re-encodes as a JSON integer array when the proposal is itself
+                // serialized for gossip (~3x expansion). A RotateAccountKey tx
+                // carries ~5KB of binary fields, pushing a single-tx proposal
+                // to ~73KB — above the 64KB gossipsub default. Set an explicit
+                // limit large enough for any valid block (max_tx_bytes=64KB per
+                // tx, up to mempool_size=100 txs → at most ~19MB worst-case
+                // integer-array encoding). 16MB is a safe practical ceiling.
+                .max_transmit_size(16 * 1024 * 1024)
                 .message_id_fn(|msg: &gossipsub::Message| {
                     // Include source peer + sequence number so that the same
                     // content (e.g. an empty block proposal retransmitted across

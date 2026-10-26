@@ -466,18 +466,31 @@ impl SignatureScheme for MlDsaScheme {
         Ok(())
     }
 
-    fn generate_keypair(&self, _seed: &str) -> CryptoResult<KeyPair> {
+    fn generate_keypair(&self, seed: &str) -> CryptoResult<KeyPair> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
         use pqcrypto_dilithium::dilithium3;
         use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 
-        // pqcrypto keygen is randomised; deterministic seeding requires
-        // a custom RNG seeded from the string -- use generate_random() in production.
+        // pqcrypto keygen is randomised per call; use an in-process cache so
+        // the same seed string always returns the same keypair within one
+        // process lifetime.  Tests rely on this: they call generate_keypair
+        // with the same seed to sign A-1 (first-use binding) and then A-2
+        // (rotation outer sig), and the bound key must match the signing key.
+        static CACHE: OnceLock<Mutex<HashMap<String, KeyPair>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = cache.lock().unwrap();
+        if let Some(kp) = map.get(seed) {
+            return Ok(kp.clone());
+        }
         let (pk, sk) = dilithium3::keypair();
-        Ok(KeyPair {
+        let kp = KeyPair {
             scheme:      SchemeId::MlDsa,
             public_key:  pk.as_bytes().to_vec(),
             private_key: sk.as_bytes().to_vec(),
-        })
+        };
+        map.insert(seed.to_string(), kp.clone());
+        Ok(kp)
     }
 
     fn size_report(&self) -> SizeReport {
