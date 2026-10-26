@@ -108,6 +108,11 @@ pub struct AccountSummary {
     /// Incremented by RotateAccountKey and RecoverAccountKey.
     #[serde(default)]
     pub key_version: u32,
+    /// DIS-003A/B: monotone recovery-policy generation counter.
+    /// Incremented by EnrollRecoveryPolicy, RevokeRecoveryPolicy (via re-enroll),
+    /// and UpdateGuardianPolicy. Never reset to zero.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// Voting-power snapshot for one validator.
@@ -1168,6 +1173,7 @@ impl Node {
                     attestation_count: 0,
                     attested_by:       vec![],
                     key_version:    acct.key_version,
+                    policy_generation: acct.policy_generation,
                 });
             }
         }
@@ -1903,6 +1909,7 @@ impl Node {
                         attestation_count: att_count,
                         attested_by:       att_by,
                         key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                     });
                 }
 
@@ -4172,6 +4179,7 @@ impl Node {
                     attestation_count: att_count,
                     attested_by:       att_by,
                     key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                 });
             }
 
@@ -4944,6 +4952,7 @@ impl Node {
                     attestation_count: att_count,
                     attested_by:       att_by,
                     key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                 });
             }
 
