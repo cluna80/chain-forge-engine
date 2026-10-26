@@ -148,11 +148,16 @@ impl Drop for NodeHandle {
     fn drop(&mut self) { let _ = self.process.kill(); }
 }
 
+fn devnet_dirs() -> PathBuf {
+    std::env::temp_dir().join("dis002b_recovery_devnet")
+}
+
 fn spawn_node(
     name: &str, api: u16, p2p: u16,
     log_dir: &PathBuf,
     peers: &[u16],
     key_file_path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
 ) -> NodeHandle {
     let log_path = log_dir.join(format!("{name}.log"));
     let log_file = std::fs::File::create(&log_path).expect("create log file");
@@ -168,6 +173,10 @@ fn spawn_node(
     if let Some(kf) = key_file_path {
         cmd.arg("--key-file").arg(kf);
     }
+    if let Some(dd) = data_dir {
+        std::fs::create_dir_all(&dd).expect("create data dir");
+        cmd.arg("--data-dir").arg(dd);
+    }
     cmd.stdout(log_file.try_clone().unwrap())
        .stderr(log_file)
        .stdin(Stdio::null());
@@ -178,23 +187,25 @@ fn spawn_node(
 }
 
 fn spawn_devnet(ports: &DevnetPorts) -> [NodeHandle; 4] {
-    let log_dir = std::env::temp_dir().join("dis002b_recovery_devnet_logs");
+    let base  = devnet_dirs();
+    let log_dir = base.join("logs");
     std::fs::create_dir_all(&log_dir).expect("create log dir");
 
     let kf = |label: &str| -> Option<PathBuf> {
         let p = key_file(label);
         if p.exists() { Some(p) } else { None }
     };
+    let dd = |name: &str| -> Option<PathBuf> { Some(base.join("data").join(name)) };
 
     [
         spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p, &log_dir,
-            &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice")),
+            &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice"), dd("qcb1alice")),
         spawn_node("qcb1bob",   ports.bob_api,   ports.bob_p2p,   &log_dir,
-            &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob")),
+            &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob"), dd("qcb1bob")),
         spawn_node("qcb1carol", ports.carol_api, ports.carol_p2p, &log_dir,
-            &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol")),
+            &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol"), dd("qcb1carol")),
         spawn_node("qcb1dave",  ports.dave_api,  ports.dave_p2p,  &log_dir,
-            &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave")),
+            &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave"), dd("qcb1dave")),
     ]
 }
 
@@ -437,6 +448,10 @@ fn build_transfer_with_seed(
 
 #[test]
 fn dis_002b_recovery() {
+    // Clean data dirs so each run starts from genesis (prevents stale persist
+    // from a previous run causing double-spend or nonce mismatches).
+    let _ = std::fs::remove_dir_all(devnet_dirs());
+
     let ports = DevnetPorts::new();
     eprintln!("\n=== DIS-002B Path 2: Lost-Device Recovery ===");
     eprintln!("    alice_api={} bob_api={} carol_api={} dave_api={}",
@@ -637,20 +652,22 @@ fn dis_002b_recovery() {
     drop(nodes);
     std::thread::sleep(Duration::from_millis(500));
 
-    let log_dir = std::env::temp_dir().join("dis002b_recovery_devnet_logs");
+    let base = devnet_dirs();
+    let log_dir = base.join("logs");
     let kf = |label: &str| -> Option<PathBuf> {
         let p = key_file(label);
         if p.exists() { Some(p) } else { None }
     };
+    let dd = |name: &str| -> Option<PathBuf> { Some(base.join("data").join(name)) };
     let nodes_restarted = [
         spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p, &log_dir,
-            &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice")),
+            &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice"), dd("qcb1alice")),
         spawn_node("qcb1bob",   ports.bob_api,   ports.bob_p2p,   &log_dir,
-            &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob")),
+            &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob"), dd("qcb1bob")),
         spawn_node("qcb1carol", ports.carol_api, ports.carol_p2p, &log_dir,
-            &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol")),
+            &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol"), dd("qcb1carol")),
         spawn_node("qcb1dave",  ports.dave_api,  ports.dave_p2p,  &log_dir,
-            &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave")),
+            &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave"), dd("qcb1dave")),
     ];
 
     for (i, &p) in all_api.iter().enumerate() {
