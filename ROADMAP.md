@@ -232,9 +232,28 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 
 ## Phase 0.5 — Protocol Hardening and Integration
 
+> **Chain Forge vs. Qattice:** Chain Forge is the blockchain creation platform and framework. Qattice is the first independent Layer-1 blockchain being built with it. Phase 0.5 hardening work therefore has two layers: (1) the reusable Chain Forge engine — transaction atomicity, deterministic execution, state persistence, consensus interfaces — and (2) Qattice-specific validation through its own 4-node devnet, post-quantum transactions, identity system, monetary rules, and PoCD mining. Improvements to Chain Forge's engine benefit every future chain built on the platform. The acceptance tests are Qattice-specific because Qattice is the live implementation.
+
 > **Purpose:** This is a security-hardening gate, not a feature phase. Phase 0 proved that Qattice works under cooperative conditions. Phase 0.5 proves it holds under adversarial ones. This phase runs **in parallel** with selective Phase 1 work; however, the protocol blockers listed below must be resolved before any Phase 1 milestone that depends on the affected subsystem can be closed.
 >
 > **How milestones close:** Same rule as Phase 0 — implementation **and** a passing adversarial acceptance test confirmed locally on Windows/MINGW64. Passing in sandbox only is not sufficient.
+
+### Recommended Execution Order
+
+| Priority | Criterion | Rationale |
+|----------|-----------|-----------|
+| **1st** | **H0-5 — Execution rollback** | Most fundamental question about the Chain Forge state machine: can a failed transaction leave behind unauthorized state mutations? Transaction atomicity must be provably correct before building on top of it. |
+| **2nd** | **H0-7 — Supply conservation** | Verify the monetary rules: fees, burns, PoCD rewards, and transfers must follow the correct conservation law. Note: the correct invariant is `S_after = S_before + I - B` where `I` is authorized issuance and `B` is authorized burning — `S_after == S_before` is only valid for blocks with no mint or burn events. |
+| **3rd** | **H0-9 — Test harness repair** | Restore reliable large-transaction testing (needed for DIS-003D/E). Can run in parallel with H0-5 since it is a harness infrastructure problem, not a protocol change. |
+
+**H0-5 acceptance criteria (Qattice 4-node, Chain Forge atomicity gate):**
+
+1. **Mid-tx failure:** Force a failure after an earlier state mutation; verify none of that tx's intended state changes persist anywhere in the state store.
+2. **Balance protection:** Failed transfers, treasury operations, and fee sponsorship must not leave partial debits or credits on any account.
+3. **Identity protection:** Failed account-key rotation or recovery must not modify authorized keys, policy generations, or identity state.
+4. **Nonce and fee semantics:** Verify the distinction between a *rejected* tx (never included in a block — nonce not consumed) and an *included-but-failed* tx (in the block, nonce consumed, fee charged, zero other state changes). Both cases must be tested.
+5. **Cross-node determinism:** All four validators agree on the final state root after the adversarial tx sequence.
+6. **Restart persistence:** Restart all four nodes; verify no partial mutation reappears from disk.
 
 ### Exit Criteria
 
