@@ -411,7 +411,11 @@ fn build_recover_account_key(
         signature:     vec![],
         public_key:    vec![],
         pq_signatures: vec![],
-        sig_scheme:    None,
+        // Tag as MlDsa so the ingress Ed25519-sig check skips this tx.
+        // RecoverAccountKey authentication is via guardian sigs in the body,
+        // not via the outer tx signature; verify_authorization() returns Ok(())
+        // for this variant unconditionally.
+        sig_scheme:    Some(SchemeId::MlDsa),
         pq_public_key: new_kp.public_key.clone(),
     }
 }
@@ -613,7 +617,7 @@ fn dis_002b_recovery() {
         signature:     vec![],
         public_key:    vec![],
         pq_signatures: vec![],
-        sig_scheme:    None,
+        sig_scheme:    Some(SchemeId::MlDsa),
         pq_public_key: new_kp_b11.public_key.clone(),
     };
     let forged_json = serde_json::to_string(&forged_tx).unwrap();
