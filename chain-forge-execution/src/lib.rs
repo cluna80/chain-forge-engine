@@ -349,6 +349,10 @@ impl GasModel {
                     TxBody::VerifyIdentityWithProof { .. } => op_multiplier * 8,
                     // RotateAccountKey: two ML-DSA verifications (outer tx sig + PoP).
                     TxBody::RotateAccountKey { .. } => op_multiplier * 6,
+                    // EnrollRecoveryPolicy: writes guardian set to state; moderate cost.
+                    TxBody::EnrollRecoveryPolicy { .. } => op_multiplier * 5,
+                    // RecoverAccountKey: N guardian ML-DSA verifications + PoP; high cost.
+                    TxBody::RecoverAccountKey { .. } => op_multiplier * 10,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -822,6 +826,44 @@ pub enum TxBody {
         /// Compressed canonical `Fr` public inputs (IssuerRegistry Merkle root).
         public_inputs_bytes: Vec<u8>,
     },
+
+    /// DIS-002B Path 2 (R1): Enroll a threshold-guardian recovery policy.
+    /// The sender must control the account (authorized tx) and must not
+    /// already have an active policy (revoke first to replace).
+    /// On success, `account.recovery_policy` is set to the enrolled policy.
+    EnrollRecoveryPolicy {
+        /// ML-DSA-65 public keys of authorized guardians (each 1952 bytes).
+        guardians:  Vec<Vec<u8>>,
+        /// How many distinct guardian signatures are required to recover.
+        threshold:  u32,
+    },
+
+    /// DIS-002B Path 2 (R2): Replace a lost account key without the original
+    /// signing key, using the enrolled recovery policy.
+    /// The sender field must equal the account being recovered (the sender
+    /// has no signing key to authenticate with; authentication comes entirely
+    /// from the guardian signatures over the recovery domain message).
+    RecoverAccountKey {
+        /// The replacement ML-DSA-65 public key (1952 bytes).
+        new_public_key:      Vec<u8>,
+        /// Must be "ml-dsa-65".
+        new_key_scheme:      String,
+        /// Must equal account.key_version + 1.
+        key_version:         u32,
+        /// PoP: new key signs account_key_rotation_signing_bytes().
+        pop_signature:       Vec<u8>,
+        /// Guardian co-authorizations.
+        guardian_signatures: Vec<GuardianAuth>,
+    },
+}
+
+/// One guardian's authorization for a `RecoverAccountKey` transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianAuth {
+    /// The guardian's ML-DSA-65 public key (1952 bytes).
+    pub guardian_public_key: Vec<u8>,
+    /// Signature over `recovery_domain_signing_bytes(chain_id, account, key_version, new_pk)`.
+    pub signature:           Vec<u8>,
 }
 
 impl TxBody {
@@ -866,6 +908,8 @@ impl TxBody {
             TxBody::ClaimResearchReward { .. }     => "ClaimResearchReward",
             TxBody::VerifyIdentityWithProof { .. } => "VerifyIdentityWithProof",
             TxBody::RotateAccountKey { .. }         => "RotateAccountKey",
+            TxBody::EnrollRecoveryPolicy { .. }     => "EnrollRecoveryPolicy",
+            TxBody::RecoverAccountKey { .. }        => "RecoverAccountKey",
         }
     }
 }
@@ -1134,6 +1178,18 @@ impl Transaction {
             // RotateAccountKey: new_public_key (2592) + pop_signature (4595) + overhead.
             TxBody::RotateAccountKey { new_public_key, pop_signature, new_key_scheme, .. } => {
                 new_public_key.len() + pop_signature.len() + new_key_scheme.len() + 8
+            }
+            // EnrollRecoveryPolicy: guardian pubkeys (N × 1952) + threshold overhead.
+            TxBody::EnrollRecoveryPolicy { guardians, .. } => {
+                guardians.iter().map(|g| g.len()).sum::<usize>() + 16
+            }
+            // RecoverAccountKey: new pk + N guardian sigs (N × (1952+3309)) + PoP sig + scheme.
+            TxBody::RecoverAccountKey {
+                new_public_key, pop_signature, new_key_scheme, guardian_signatures, ..
+            } => {
+                new_public_key.len() + pop_signature.len() + new_key_scheme.len()
+                    + guardian_signatures.iter().map(|g| g.guardian_public_key.len() + g.signature.len()).sum::<usize>()
+                    + 16
             }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
@@ -1658,6 +1714,12 @@ impl ExecutionConfig {
 ///    Named addresses (genesis labels like "qcb1alice") are never derived,
 ///    so they are only usable when genesis bound a key to them.
 fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
+    // DIS-002B Path 2: RecoverAccountKey authenticates entirely through
+    // guardian signatures verified inside execute_recover_account_key —
+    // the account has no usable signing key by definition.
+    if matches!(tx.body, TxBody::RecoverAccountKey { .. }) {
+        return Ok(());
+    }
     if !config.require_signatures {
         return Ok(());
     }
@@ -1826,6 +1888,32 @@ pub fn account_key_rotation_signing_bytes(
     b.extend_from_slice(chain_id.as_bytes());
     b.push(b'|');
     b.extend_from_slice(sender_address.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(key_version.to_string().as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(hex_encode_bytes(new_public_key).as_bytes());
+    b
+}
+
+/// DIS-002B Path 2: Domain-separated signing bytes for guardian recovery
+/// authorization signatures.
+///
+/// Format: `b"CFREC|" || chain_id || b"|" || account_address || b"|" || key_version || b"|" || hex(new_public_key)`
+///
+/// Guardians sign this message to authorize a `RecoverAccountKey` tx.
+/// Distinct domain prefix from rotation bytes ("CFAR|") prevents cross-context
+/// replay of guardian signatures.
+pub fn recovery_domain_signing_bytes(
+    chain_id:       &str,
+    account:        &str,
+    key_version:    u32,
+    new_public_key: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFREC|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(account.as_bytes());
     b.push(b'|');
     b.extend_from_slice(key_version.to_string().as_bytes());
     b.push(b'|');
@@ -2003,6 +2091,9 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::VerifyIdentityWithProof { .. } => Some("identity"),
         // Key rotation is a core account right (always-on, like Transfer/Burn).
         TxBody::RotateAccountKey { .. }         => None,
+        // Recovery policy enrollment and execution are core account rights.
+        TxBody::EnrollRecoveryPolicy { .. }     => None,
+        TxBody::RecoverAccountKey { .. }        => None,
     }
 }
 
@@ -2282,6 +2373,236 @@ fn execute_rotate_account_key(
         "DIS-002A: account key rotated"
     );
 
+    Ok(())
+}
+
+/// DIS-002B Path 2 (R1): Execute an EnrollRecoveryPolicy transaction.
+///
+/// Authorization (outer pq_signature checks) is already done before this is
+/// called. Guards:
+///  1. threshold >= 1 and <= guardians.len()
+///  2. At least 1 guardian (and no more than 10 for Phase 0)
+///  3. Each guardian key must be a valid-length ML-DSA-65 key (1952 bytes)
+///  4. Guardian keys must be distinct (no duplicates in policy)
+fn execute_enroll_recovery_policy(
+    tx:         &Transaction,
+    state:      &mut StateStore,
+    guardians:  &[Vec<u8>],
+    threshold:  u32,
+) -> Result<(), String> {
+    const MLDSA65_PK_BYTES: usize = 1952;
+    const MAX_GUARDIANS: usize    = 10;
+
+    if guardians.is_empty() {
+        return Err("EnrollRecoveryPolicy: must specify at least 1 guardian".to_string());
+    }
+    if guardians.len() > MAX_GUARDIANS {
+        return Err(format!(
+            "EnrollRecoveryPolicy: too many guardians (max {MAX_GUARDIANS}, got {})",
+            guardians.len()
+        ));
+    }
+    if threshold == 0 || threshold as usize > guardians.len() {
+        return Err(format!(
+            "EnrollRecoveryPolicy: threshold {} out of range [1, {}]",
+            threshold, guardians.len()
+        ));
+    }
+    for (i, g) in guardians.iter().enumerate() {
+        if g.len() != MLDSA65_PK_BYTES {
+            return Err(format!(
+                "EnrollRecoveryPolicy: guardian[{i}] key must be {MLDSA65_PK_BYTES} bytes, got {}",
+                g.len()
+            ));
+        }
+    }
+    // Duplicate check.
+    for i in 0..guardians.len() {
+        for j in (i + 1)..guardians.len() {
+            if guardians[i] == guardians[j] {
+                return Err(format!(
+                    "EnrollRecoveryPolicy: guardian[{i}] and guardian[{j}] are the same key"
+                ));
+            }
+        }
+    }
+
+    let current_version = state
+        .get_account(&tx.sender)
+        .map(|a| a.key_version)
+        .unwrap_or(0);
+
+    {
+        let acct = state
+            .get_account_mut(&tx.sender)
+            .map_err(|e| format!("EnrollRecoveryPolicy: account lookup failed: {e}"))?;
+        acct.recovery_policy = Some(chain_forge_state::RecoveryPolicy {
+            guardians:               guardians.to_vec(),
+            threshold,
+            enrolled_at_key_version: current_version,
+        });
+    }
+    state.refresh_leaf(&tx.sender);
+
+    tracing::info!(
+        sender    = %tx.sender,
+        threshold,
+        guardians = guardians.len(),
+        "DIS-002B: recovery policy enrolled"
+    );
+    Ok(())
+}
+
+/// DIS-002B Path 2 (R2): Execute a RecoverAccountKey transaction.
+///
+/// Authorization does NOT use the normal pq_signature path (the account
+/// has no usable signing key). Instead, authentication comes from the
+/// guardian signatures in the tx body, verified here.
+///
+/// Guards:
+///  1. Account must have an enrolled RecoveryPolicy.
+///  2. enrolled_at_key_version == account.key_version (policy not stale).
+///  3. key_version == current + 1.
+///  4. new_key_scheme must be "ml-dsa-65".
+///  5. new_public_key must be 1952 bytes.
+///  6. At least `threshold` guardian_signatures are valid over recovery domain msg.
+///  7. Each signing guardian key must be listed in the enrolled policy.
+///  8. No duplicate guardian keys in the signatures.
+///  9. PoP from new key verifies.
+fn execute_recover_account_key(
+    config:               &ExecutionConfig,
+    tx:                   &Transaction,
+    state:                &mut StateStore,
+    new_public_key:       &[u8],
+    new_key_scheme:       &str,
+    key_version:          &u32,
+    pop_signature:        &[u8],
+    guardian_signatures:  &[GuardianAuth],
+) -> Result<(), String> {
+    use chain_forge_crypto::Signature as CfSig;
+
+    const MLDSA65_PK_BYTES: usize = 1952;
+
+    // Guard 1: policy must be enrolled.
+    let policy = state
+        .get_account(&tx.sender)
+        .ok()
+        .and_then(|a| a.recovery_policy.clone())
+        .ok_or_else(|| format!(
+            "RecoverAccountKey: {} has no enrolled recovery policy",
+            tx.sender
+        ))?;
+
+    // Guard 2: policy must not be stale (no rotation since enrollment).
+    let current_version = state
+        .get_account(&tx.sender)
+        .map(|a| a.key_version)
+        .unwrap_or(0);
+    if policy.enrolled_at_key_version != current_version {
+        return Err(format!(
+            "RecoverAccountKey: stale policy (enrolled at key_version {}, current {})",
+            policy.enrolled_at_key_version, current_version
+        ));
+    }
+
+    // Guard 3: key_version must be current + 1.
+    if *key_version != current_version + 1 {
+        return Err(format!(
+            "RecoverAccountKey: key_version mismatch: expected {}, got {}",
+            current_version + 1, key_version
+        ));
+    }
+
+    // Guard 4: scheme.
+    if new_key_scheme != "ml-dsa-65" {
+        return Err(format!(
+            "RecoverAccountKey: unsupported key scheme '{}'; only 'ml-dsa-65' is accepted",
+            new_key_scheme
+        ));
+    }
+
+    // Guard 5: new key size.
+    if new_public_key.len() != MLDSA65_PK_BYTES {
+        return Err(format!(
+            "RecoverAccountKey: new_public_key must be {MLDSA65_PK_BYTES} bytes, got {}",
+            new_public_key.len()
+        ));
+    }
+
+    // Guard 6+7+8: verify guardian signatures, check policy membership, no duplicates.
+    let recovery_msg = recovery_domain_signing_bytes(
+        &config.chain_id,
+        &tx.sender,
+        *key_version,
+        new_public_key,
+    );
+
+    let mut seen_guardian_keys: Vec<&[u8]> = Vec::new();
+    let mut valid_count: u32 = 0;
+
+    for (i, ga) in guardian_signatures.iter().enumerate() {
+        // Must be listed in the policy.
+        let in_policy = policy.guardians.iter().any(|g| g.as_slice() == ga.guardian_public_key.as_slice());
+        if !in_policy {
+            return Err(format!(
+                "RecoverAccountKey: guardian_signatures[{i}] key is not in the enrolled policy"
+            ));
+        }
+        // No duplicate signing keys.
+        if seen_guardian_keys.iter().any(|&k| k == ga.guardian_public_key.as_slice()) {
+            return Err(format!(
+                "RecoverAccountKey: duplicate guardian key at index {i}"
+            ));
+        }
+        seen_guardian_keys.push(&ga.guardian_public_key);
+
+        // Verify signature.
+        let sig = CfSig { scheme: SchemeId::MlDsa, bytes: ga.signature.clone() };
+        MlDsaScheme
+            .verify(&recovery_msg, &sig, &ga.guardian_public_key)
+            .map_err(|e| format!(
+                "RecoverAccountKey: guardian_signatures[{i}] verification failed: {e}"
+            ))?;
+        valid_count += 1;
+    }
+
+    if valid_count < policy.threshold {
+        return Err(format!(
+            "RecoverAccountKey: only {valid_count} valid guardian signature(s), need {}",
+            policy.threshold
+        ));
+    }
+
+    // Guard 9: proof-of-possession from new key.
+    let pop_message = account_key_rotation_signing_bytes(
+        &config.chain_id,
+        &tx.sender,
+        *key_version,
+        new_public_key,
+    );
+    let pop_sig = CfSig { scheme: SchemeId::MlDsa, bytes: pop_signature.to_vec() };
+    MlDsaScheme
+        .verify(&pop_message, &pop_sig, new_public_key)
+        .map_err(|e| format!("RecoverAccountKey: proof-of-possession verification failed: {e}"))?;
+
+    // All guards passed — commit the recovery.
+    {
+        let acct = state
+            .get_account_mut(&tx.sender)
+            .map_err(|e| format!("RecoverAccountKey: account lookup failed: {e}"))?;
+        acct.public_key      = Some(new_public_key.to_vec());
+        acct.key_version     = current_version + 1;
+        // Policy is consumed — must re-enroll after recovery.
+        acct.recovery_policy = None;
+    }
+    state.refresh_leaf(&tx.sender);
+
+    tracing::info!(
+        sender    = %tx.sender,
+        new_ver   = current_version + 1,
+        pk_len    = new_public_key.len(),
+        "DIS-002B: account key recovered via guardian policy"
+    );
     Ok(())
 }
 
@@ -2929,6 +3250,19 @@ impl Executor {
                 execute_rotate_account_key(
                     &self.config, tx, state,
                     new_public_key, new_key_scheme, key_version, pop_signature,
+                )
+            }
+
+            // DIS-002B: recovery policy enrollment and recovery.
+            TxBody::EnrollRecoveryPolicy { guardians, threshold } => {
+                execute_enroll_recovery_policy(tx, state, guardians, *threshold)
+            }
+            TxBody::RecoverAccountKey {
+                new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+            } => {
+                execute_recover_account_key(
+                    &self.config, tx, state,
+                    new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
                 )
             }
 
@@ -3870,6 +4204,18 @@ impl Executor {
                 execute_rotate_account_key(
                     &self.config, tx, state,
                     new_public_key, new_key_scheme, key_version, pop_signature,
+                )
+            }
+            // DIS-002B: recovery policy enrollment and recovery (no identity store needed).
+            TxBody::EnrollRecoveryPolicy { guardians, threshold } => {
+                execute_enroll_recovery_policy(tx, state, guardians, *threshold)
+            }
+            TxBody::RecoverAccountKey {
+                new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+            } => {
+                execute_recover_account_key(
+                    &self.config, tx, state,
+                    new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
                 )
             }
         };

@@ -532,6 +532,9 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::VerifyIdentityWithProof { .. }   => "verify_identity_with_proof",
         // DIS-002A: authenticated account key rotation
         TxBody::RotateAccountKey { .. }          => "rotate_account_key",
+        // DIS-002B: lost-device recovery policy enrollment and recovery
+        TxBody::EnrollRecoveryPolicy { .. }      => "enroll_recovery_policy",
+        TxBody::RecoverAccountKey { .. }         => "recover_account_key",
     }
 }
 

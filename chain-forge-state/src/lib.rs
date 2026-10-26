@@ -85,6 +85,25 @@ pub struct AccountState {
     /// Used to prevent replay of stale rotation transactions.
     #[serde(default)]
     pub key_version: u32,
+    /// DIS-002B Path 2: optional lost-device recovery policy enrolled by the
+    /// account holder while they still control the signing key.
+    #[serde(default)]
+    pub recovery_policy: Option<RecoveryPolicy>,
+}
+
+/// An enrolled threshold-guardian recovery policy for lost-device recovery.
+/// A holder who has lost their signing key can replace it if at least
+/// `threshold` of the enrolled guardians co-sign a `RecoverAccountKey` tx.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPolicy {
+    /// ML-DSA-65 public keys of authorized guardians (each 1952 bytes).
+    pub guardians:              Vec<Vec<u8>>,
+    /// How many distinct guardian signatures are required.
+    pub threshold:              u32,
+    /// key_version when this policy was enrolled.  A `RecoverAccountKey` tx
+    /// is only valid if `account.key_version == enrolled_at_key_version`,
+    /// preventing a stale policy from being used after a legitimate rotation.
+    pub enrolled_at_key_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +124,7 @@ impl AccountState {
             public_key: None,
             key_version: 0,
             escrow: None,
+            recovery_policy: None,
         }
     }
 
@@ -121,6 +141,7 @@ impl AccountState {
             public_key: None,
             key_version: 0,
             escrow: None,
+            recovery_policy: None,
         }
     }
 
@@ -219,6 +240,13 @@ impl AccountState {
         if let Some(binding) = &self.escrow {
             // JSON string escaping prevents ambiguous job/source encodings.
             parts.push(format!("escrow={}", serde_json::to_string(binding).unwrap()));
+        }
+        if let Some(rp) = &self.recovery_policy {
+            // Include a compact summary so policy enrollment/revocation affects
+            // the state root and is visible to all nodes.
+            parts.push(format!(
+                "recovery=t{}/{}/{}", rp.threshold, rp.guardians.len(), rp.enrolled_at_key_version
+            ));
         }
         parts.join("|").into_bytes()
     }
