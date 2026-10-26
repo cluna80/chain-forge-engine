@@ -230,6 +230,53 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 
 ---
 
+## Phase 0.5 — Protocol Hardening and Integration
+
+> **Purpose:** This is a security-hardening gate, not a feature phase. Phase 0 proved that Qattice works under cooperative conditions. Phase 0.5 proves it holds under adversarial ones. This phase runs **in parallel** with selective Phase 1 work; however, the protocol blockers listed below must be resolved before any Phase 1 milestone that depends on the affected subsystem can be closed.
+>
+> **How milestones close:** Same rule as Phase 0 — implementation **and** a passing adversarial acceptance test confirmed locally on Windows/MINGW64. Passing in sandbox only is not sufficient.
+
+### Exit Criteria
+
+| # | Domain | Invariant / Test required | Status |
+|---|--------|--------------------------|--------|
+| H0-1 | Consensus safety | No two nodes finalize conflicting blocks at the same height under any validator failure pattern within f=1 | 🔲 |
+| H0-2 | State determinism | All nodes produce identical state roots after processing the same tx sequence regardless of arrival order | 🔲 |
+| H0-3 | Crash recovery | Node state is consistent with the canonical chain after an unclean shutdown at any block height | 🔲 |
+| H0-4 | Nonce / replay | Nonce wrap-around and duplicate txs across blocks are rejected with zero partial state change | 🔲 |
+| H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | 🔲 |
+| H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
+| H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
+| H0-8 | Chain-ID isolation | A committed block from chain A cannot be replayed against chain B even with matching height and validator set | 🔲 |
+| H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` passes locally on Windows/MINGW64 — fix `submit_tx` returning null for ~77 KB recovery tx bodies | 🔴 Blocked (see DIS-003D entry in Phase 1) |
+| H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | 🔲 Blocked on H0-9 |
+| H0-11 | Validator eviction | Product decision on eviction policy recorded (are genesis validators exempt forever or swept on first outbid?); decision implemented and tested | 🔲 |
+| H0-12 | Governance quorum | >3% turnout for ordinary votes, >6% for constitutional changes — implemented, wired to `VoteOnProposal`, and adversarially tested | 🔲 |
+
+### Protocol Blockers
+
+The following open items in Phase 0.5 block specific Phase 1 milestones. Phase 1 work that does **not** touch these subsystems may continue in parallel.
+
+| Blocker | Blocks |
+|---|---|
+| H0-9 / H0-10 — DIS-003D/E confirmation | DIS-003E, QCB-KR-001 multisig key lifecycle |
+| H0-5 — Execution rollback guarantee | FeeSponsor live authorization (FS-03 follow-on); any multi-step tx type |
+| H0-11 — Validator eviction decision | Validator Onboarding section marked complete |
+| H0-12 — Governance quorum | `ProposeChange` / `VoteOnProposal` / `ActivateChange` in any production tx flow |
+
+### What Is NOT in Scope for Phase 0.5
+
+- ZK block proving (QCB-ZKP-001) — long-horizon research, independent of foundation hardening
+- EVM precompile layer — Phase 5+
+- Libp2p PQ transport (CS-001-L3) — follows upstream
+- QSWIP standard — proposed, not protocol-blocking
+
+### Relationship to Phase 0
+
+Phase 0 milestones remain closed. Phase 0.5 adds adversarial coverage on top of the cooperative devnet acceptance tests already confirmed in Phase 0. Nothing is reopened; the completed work is the baseline that Phase 0.5 tests against.
+
+---
+
 ## Phase 1 — Personhood-Weighted BFT + Resource Market Foundation
 
 **Goal**: Consensus power tied to verified human identity, not raw stake. Resource market hardened with provider reputation, dispute resolution skeleton, and multi-provider discovery. Charmed Agent identity/budget primitive live.
