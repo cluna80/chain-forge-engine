@@ -355,6 +355,8 @@ impl GasModel {
                     TxBody::RecoverAccountKey { .. } => op_multiplier * 10,
                     // RevokeRecoveryPolicy: simple state write.
                     TxBody::RevokeRecoveryPolicy => op_multiplier * 2,
+                    // UpdateGuardianPolicy: same cost as EnrollRecoveryPolicy (writes guardian set).
+                    TxBody::UpdateGuardianPolicy { .. } => op_multiplier * 5,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -866,6 +868,17 @@ pub enum TxBody {
     /// EnrollRecoveryPolicy). Clears `recovery_policy`; does NOT reset
     /// `policy_generation` — the generation counter is monotone forever.
     RevokeRecoveryPolicy,
+
+    /// DIS-003B: Replace the guardian set of an already-enrolled recovery policy.
+    /// Signed by the current account key. Increments `policy_generation` so
+    /// any guardian signatures collected under the old set are invalidated.
+    /// Requires an active (enrolled) policy; rejected if none exists.
+    UpdateGuardianPolicy {
+        /// New guardian ML-DSA-65 public keys (replaces the old set entirely).
+        new_guardians: Vec<Vec<u8>>,
+        /// New threshold (must satisfy 1 ≤ threshold ≤ new_guardians.len()).
+        new_threshold: u32,
+    },
 }
 
 /// One guardian's authorization for a `RecoverAccountKey` transaction.
@@ -922,6 +935,7 @@ impl TxBody {
             TxBody::EnrollRecoveryPolicy { .. }     => "EnrollRecoveryPolicy",
             TxBody::RecoverAccountKey { .. }        => "RecoverAccountKey",
             TxBody::RevokeRecoveryPolicy            => "RevokeRecoveryPolicy",
+            TxBody::UpdateGuardianPolicy { .. }     => "UpdateGuardianPolicy",
         }
     }
 }
@@ -1204,6 +1218,9 @@ impl Transaction {
                     + 16
             }
             TxBody::RevokeRecoveryPolicy => 8,
+            TxBody::UpdateGuardianPolicy { new_guardians, .. } => {
+                new_guardians.iter().map(|g| g.len()).sum::<usize>() + 16
+            }
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -2108,6 +2125,7 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::EnrollRecoveryPolicy { .. }     => None,
         TxBody::RecoverAccountKey { .. }        => None,
         TxBody::RevokeRecoveryPolicy            => None,
+        TxBody::UpdateGuardianPolicy { .. }     => None,
     }
 }
 
@@ -2660,6 +2678,101 @@ fn execute_revoke_recovery_policy(
     state.refresh_leaf(&tx.sender);
 
     tracing::info!(sender = %tx.sender, "DIS-003A: recovery policy revoked");
+    Ok(())
+}
+
+/// DIS-003B: Execute an UpdateGuardianPolicy transaction.
+///
+/// Replaces the guardian set of an **existing** enrolled recovery policy.
+/// Authorization: signed by the current account key (same as EnrollRecoveryPolicy).
+/// Effect: increments `policy_generation` and stamps a new `policy_id`, invalidating
+/// any guardian signatures collected under the old set.
+///
+/// Guards (same as EnrollRecoveryPolicy):
+///  1. An active policy must already be enrolled.
+///  2. threshold >= 1 and <= new_guardians.len()
+///  3. At least 1 guardian (and no more than 10 for Phase 0)
+///  4. Each key must be a valid ML-DSA-65 key (1952 bytes)
+///  5. Guardian keys must be distinct
+fn execute_update_guardian_policy(
+    tx:           &Transaction,
+    state:        &mut StateStore,
+    new_guardians: &[Vec<u8>],
+    new_threshold: u32,
+) -> Result<(), String> {
+    const MLDSA65_PK_BYTES: usize = 1952;
+    const MAX_GUARDIANS:    usize = 10;
+
+    // Guard 1: must have an active policy to update.
+    let has_policy = state.get_account(&tx.sender)
+        .map(|a| a.recovery_policy.is_some())
+        .unwrap_or(false);
+    if !has_policy {
+        return Err(format!(
+            "UpdateGuardianPolicy: {} has no enrolled recovery policy to update",
+            tx.sender
+        ));
+    }
+
+    if new_guardians.is_empty() {
+        return Err("UpdateGuardianPolicy: must specify at least 1 guardian".to_string());
+    }
+    if new_guardians.len() > MAX_GUARDIANS {
+        return Err(format!(
+            "UpdateGuardianPolicy: too many guardians (max {MAX_GUARDIANS}, got {})",
+            new_guardians.len()
+        ));
+    }
+    if new_threshold == 0 || new_threshold as usize > new_guardians.len() {
+        return Err(format!(
+            "UpdateGuardianPolicy: threshold {} out of range [1, {}]",
+            new_threshold, new_guardians.len()
+        ));
+    }
+    for (i, g) in new_guardians.iter().enumerate() {
+        if g.len() != MLDSA65_PK_BYTES {
+            return Err(format!(
+                "UpdateGuardianPolicy: guardian[{i}] key must be {MLDSA65_PK_BYTES} bytes, got {}",
+                g.len()
+            ));
+        }
+    }
+    for i in 0..new_guardians.len() {
+        for j in (i + 1)..new_guardians.len() {
+            if new_guardians[i] == new_guardians[j] {
+                return Err(format!(
+                    "UpdateGuardianPolicy: guardian[{i}] and guardian[{j}] are the same key"
+                ));
+            }
+        }
+    }
+
+    let (current_version, next_generation) = state
+        .get_account(&tx.sender)
+        .map(|a| (a.key_version, a.policy_generation + 1))
+        .unwrap_or((0, 1));
+
+    {
+        let acct = state
+            .get_account_mut(&tx.sender)
+            .map_err(|e| format!("UpdateGuardianPolicy: account lookup failed: {e}"))?;
+        acct.policy_generation = next_generation;
+        acct.recovery_policy = Some(chain_forge_state::RecoveryPolicy {
+            guardians:               new_guardians.to_vec(),
+            threshold:               new_threshold,
+            enrolled_at_key_version: current_version,
+            policy_id:               next_generation,
+        });
+    }
+    state.refresh_leaf(&tx.sender);
+
+    tracing::info!(
+        sender    = %tx.sender,
+        threshold = new_threshold,
+        guardians = new_guardians.len(),
+        policy_id = next_generation,
+        "DIS-003B: guardian policy updated"
+    );
     Ok(())
 }
 
@@ -3326,6 +3439,9 @@ impl Executor {
             }
             TxBody::RevokeRecoveryPolicy => {
                 execute_revoke_recovery_policy(tx, state)
+            }
+            TxBody::UpdateGuardianPolicy { new_guardians, new_threshold } => {
+                execute_update_guardian_policy(tx, state, new_guardians, *new_threshold)
             }
 
             TxBody::SponsorAgent { agent_address } => {
@@ -4284,6 +4400,9 @@ impl Executor {
             }
             TxBody::RevokeRecoveryPolicy => {
                 execute_revoke_recovery_policy(tx, state)
+            }
+            TxBody::UpdateGuardianPolicy { new_guardians, new_threshold } => {
+                execute_update_guardian_policy(tx, state, new_guardians, *new_threshold)
             }
         };
 
