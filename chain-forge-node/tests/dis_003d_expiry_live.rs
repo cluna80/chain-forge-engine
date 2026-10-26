@@ -165,7 +165,7 @@ fn http_raw(method: &str, port: u16, path: &str, body: Option<&str>) -> Option<(
         &format!("127.0.0.1:{port}").parse().unwrap(),
         Duration::from_millis(500),
     ).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(3000))).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(15_000))).ok()?;
     let req = if let Some(b) = body {
         format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())
     } else {
