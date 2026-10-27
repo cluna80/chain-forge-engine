@@ -7808,4 +7808,244 @@ mod tests {
         assert_eq!((v, t, b), (6_000, 3_000, 1_000), "6000/3000/1000 split");
         assert_eq!(v + t + b, 10_000, "conservation");
     }
+
+    // -- H0-5 execution atomicity / H0-7 fee conservation -------------------------
+    //
+    // Invariant 1 (included-but-failed): a tx that passes admission and is
+    // included but fails during execution pays the fee, consumes its nonce
+    // exactly once, and changes nothing else.
+    // Invariant 2 (rejected): a tx rejected at admission changes nothing, uses
+    // no block gas, and contributes zero to fees.
+    // Invariant 3 (fee conservation, per block): fees debited == fees_collected
+    // == validator share + treasury share + burned share.
+    // Supply: S_after = S_before + I - B (no issuance in these blocks, so I = 0).
+
+    mod h0_atomicity_fee_conservation {
+        use super::*;
+
+        const POOL: &str = "treasury:validator-pool";
+        const NETWORK: &str = "treasury:network";
+        const FEES: &str = "treasury:fees";
+        /// Pre-existing balance in the fee collector, so that paying out fees
+        /// nobody paid would be visible instead of silently failing.
+        const FEE_RESERVE: u128 = 1_000_000;
+
+        fn bal(state: &StateStore, addr: &str) -> u128 {
+            state.get_account(addr).map(|a| a.balance_of("uqcb")).unwrap_or(0)
+        }
+
+        fn nonce(state: &StateStore, addr: &str) -> u64 {
+            state.get_account(addr).map(|a| a.nonce).unwrap_or(0)
+        }
+
+        fn supply(state: &StateStore) -> u128 {
+            state.all_accounts().map(|a| a.balance_of("uqcb")).sum()
+        }
+
+        fn fund_fee_reserve(state: &mut StateStore) {
+            let mut acct = chain_forge_state::AccountState::new(FEES.into(), "treasury".into());
+            acct.credit("uqcb", FEE_RESERVE);
+            state.upsert_account(acct);
+        }
+
+        // -- Invariant 1: included-but-failed ---------------------------------
+
+        #[test]
+        fn failed_transfer_charges_fee_and_consumes_nonce_exactly_once() {
+            let (exec, mut state) = setup();
+            let alice0 = bal(&state, "qcb1alice");
+            let bob0 = bal(&state, "qcb1bob");
+            let tx = Transaction::transfer("fail1", "qcb1alice", "qcb1bob", "uqcb", 999_000_000, 0);
+            let fee = gas_for(&exec, &tx);
+
+            let r = exec.execute_tx(&tx, &mut state);
+            assert!(!r.success);
+            assert_eq!(bal(&state, "qcb1alice"), alice0 - fee, "fee charged once");
+            assert_eq!(bal(&state, "qcb1bob"), bob0, "no credit from a failed transfer");
+            assert_eq!(nonce(&state, "qcb1alice"), 1, "included-but-failed tx consumes its nonce");
+
+            // The same signed tx must not be includable again.
+            let replay = exec.execute_tx(&tx, &mut state);
+            assert!(!replay.success);
+            assert!(replay.error.as_deref().unwrap_or("").contains("nonce"), "{:?}", replay.error);
+            assert_eq!(bal(&state, "qcb1alice"), alice0 - fee, "a replay must not charge again");
+            assert_eq!(nonce(&state, "qcb1alice"), 1);
+        }
+
+        #[test]
+        fn failed_transfer_identity_path_charges_fee_and_consumes_nonce_once() {
+            let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+            let alice0 = bal(&state, "qcb1alice");
+            let tx = Transaction::transfer("fail1", "qcb1alice", "qcb1bob", "uqcb", 999_000_000, 0);
+            let fee = gas_for(&exec, &tx);
+
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+            assert!(!r.success);
+            assert_eq!(bal(&state, "qcb1alice"), alice0 - fee);
+            assert_eq!(nonce(&state, "qcb1alice"), 1);
+
+            let replay = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+            assert!(!replay.success);
+            assert_eq!(bal(&state, "qcb1alice"), alice0 - fee, "a replay must not charge again");
+        }
+
+        /// Handlers that bail out with an early `return` from inside the body
+        /// (after the fee is charged) must follow the same rule.
+        #[test]
+        fn body_early_return_failure_consumes_nonce() {
+            let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+            let tx = Transaction {
+                id: "spawn-orphan".into(), sender: "qcb1alice".into(), nonce: 0,
+                body: TxBody::SpawnChildAgent {
+                    child_agent_id: "child".into(),
+                    child_agent_address: "qcb1child".into(),
+                    parent_agent_id: "no-such-parent".into(),
+                    capabilities: vec![],
+                    spending_limits: SpendingLimits::unlimited(),
+                    description: "orphan".into(),
+                },
+                gas_limit: 1_000_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+            };
+            let alice0 = bal(&state, "qcb1alice");
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+            assert!(!r.success);
+            assert!(r.error.as_deref().unwrap_or("").contains("parent agent"), "{:?}", r.error);
+            assert_eq!(bal(&state, "qcb1alice"), alice0 - gas_for(&exec, &tx));
+            assert_eq!(nonce(&state, "qcb1alice"), 1, "early-return failure must consume the nonce");
+        }
+
+        /// A human account's failed transfer must not change anything but the
+        /// fee and nonce. The Transfer handler records a decay-exemption spend
+        /// before attempting the transfer, so this needs a real rollback.
+        #[test]
+        fn failed_transfer_leaves_no_partial_account_mutation() {
+            let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+            let mut alice = chain_forge_state::AccountState::new_human("qcb1alice".into(), "user".into(), 0);
+            alice.credit("uqcb", 5_000_000);
+            state.upsert_account(alice);
+            identity.clock.current_epoch = 7;
+
+            let charm_before = format!("{:?}", state.get_account("qcb1alice").unwrap().charm);
+            let tx = Transaction::transfer("fail1", "qcb1alice", "qcb1bob", "uqcb", 999_000_000, 0);
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents);
+            assert!(!r.success);
+            assert_eq!(format!("{:?}", state.get_account("qcb1alice").unwrap().charm), charm_before,
+                "a failed transfer must not record a decay-exemption spend");
+        }
+
+        // -- Invariant 2: rejected --------------------------------------------
+
+        fn bad_nonce_txs() -> Vec<Transaction> {
+            (0..5).map(|i| Transaction::transfer(&format!("bad{i}"), "qcb1alice", "qcb1bob", "uqcb", 1, 77)).collect()
+        }
+
+        fn assert_rejected_block_changes_nothing(r: &BlockExecutionResult, before: &[(String, u128)], state: &StateStore, supply0: u128) {
+            assert_eq!(r.fees_collected, 0, "rejected txs pay no fees");
+            assert_eq!(r.gas_used, 0, "rejected txs use no block gas");
+            assert!(r.tx_results.iter().all(|t| !t.success && t.gas_used == 0));
+            for (addr, b) in before {
+                assert_eq!(bal(state, addr), *b, "{addr} balance changed by a block of rejected txs");
+            }
+            assert_eq!(supply(state), supply0, "supply changed by a block of rejected txs");
+            assert_eq!(nonce(state, "qcb1alice"), 0);
+        }
+
+        #[test]
+        fn rejected_txs_pay_no_fees_and_move_no_treasury_funds() {
+            let (exec, mut state) = setup();
+            fund_fee_reserve(&mut state);
+            let watch: Vec<String> = ["qcb1alice", FEES, POOL, NETWORK].iter().map(|s| s.to_string()).collect();
+            let before: Vec<(String, u128)> = watch.iter().map(|a| (a.clone(), bal(&state, a))).collect();
+            let supply0 = supply(&state);
+            let r = exec.execute_block(1, bad_nonce_txs(), &mut state, 1_000);
+            assert_rejected_block_changes_nothing(&r, &before, &state, supply0);
+        }
+
+        #[test]
+        fn rejected_txs_pay_no_fees_identity_path() {
+            let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+            fund_fee_reserve(&mut state);
+            let watch: Vec<String> = ["qcb1alice", FEES, POOL, NETWORK].iter().map(|s| s.to_string()).collect();
+            let before: Vec<(String, u128)> = watch.iter().map(|a| (a.clone(), bal(&state, a))).collect();
+            let supply0 = supply(&state);
+            let r = exec.execute_block_with_identity(
+                1, bad_nonce_txs(), &mut state, &mut identity, &mut agents, 1_000, None);
+            assert_rejected_block_changes_nothing(&r, &before, &state, supply0);
+        }
+
+        // -- Invariant 3: fee conservation + supply ---------------------------
+
+        /// ok transfer, failed transfer, rejected tx, ok burn, ok transfer.
+        fn mixed_block(exec: &Executor) -> (Vec<Transaction>, u128, u128) {
+            let txs = vec![
+                Transaction::transfer("ok1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0),
+                Transaction::transfer("fail1", "qcb1alice", "qcb1bob", "uqcb", 999_000_000, 1),
+                Transaction::transfer("rej1", "qcb1bob", "qcb1alice", "uqcb", 5, 9),
+                Transaction::burn("burn1", "qcb1alice", "uqcb", 500, 2),
+                Transaction::transfer("ok2", "qcb1bob", "qcb1val", "uqcb", 10, 0),
+            ];
+            let included: u128 = txs.iter().filter(|t| t.id != "rej1").map(|t| gas_for(exec, t)).sum();
+            (txs, included, 500)
+        }
+
+        fn assert_conservation(r: &BlockExecutionResult, state: &StateStore, expected_fees: u128,
+                               burned_by_txs: u128, supply0: u128, pool0: u128, net0: u128) {
+            assert_eq!(r.fees_collected as u128, expected_fees,
+                "fees_collected must equal fees actually debited from included txs");
+            let to_pool = bal(state, POOL) - pool0;
+            let to_net = bal(state, NETWORK) - net0;
+            assert_eq!(bal(state, FEES), FEE_RESERVE, "collector must pass on exactly this block's fees");
+            let fee_burn = expected_fees - to_pool - to_net;
+            assert_eq!(supply(state), supply0 - burned_by_txs - fee_burn,
+                "S_after = S_before - burns (no issuance)");
+            assert_eq!(to_pool + to_net + fee_burn, expected_fees, "debited == collected == distributed");
+            assert!(to_pool > 0 && fee_burn > 0, "fees were actually distributed");
+        }
+
+        #[test]
+        fn block_fees_conserved_and_supply_follows_burns() {
+            let (exec, mut state) = setup();
+            fund_fee_reserve(&mut state);
+            let (txs, expected, burned) = mixed_block(&exec);
+            let (supply0, pool0, net0) = (supply(&state), bal(&state, POOL), bal(&state, NETWORK));
+            let r = exec.execute_block(1, txs, &mut state, 1_000);
+            assert_conservation(&r, &state, expected, burned, supply0, pool0, net0);
+        }
+
+        #[test]
+        fn block_fees_conserved_identity_path() {
+            let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+            fund_fee_reserve(&mut state);
+            let (txs, expected, burned) = mixed_block(&exec);
+            let (supply0, pool0, net0) = (supply(&state), bal(&state, POOL), bal(&state, NETWORK));
+            let r = exec.execute_block_with_identity(1, txs, &mut state, &mut identity, &mut agents, 1_000, None);
+            assert_conservation(&r, &state, expected, burned, supply0, pool0, net0);
+        }
+
+        /// The state root a block reports must include its fee distribution.
+        #[test]
+        fn reported_state_root_includes_fee_distribution() {
+            let (exec, mut state) = setup();
+            let txs = vec![Transaction::transfer("ok1", "qcb1alice", "qcb1bob", "uqcb", 1_000, 0)];
+            let r = exec.execute_block(1, txs, &mut state, 1_000);
+            assert!(r.fees_collected > 0);
+            assert_eq!(Some(r.state_root.as_str()), state.current_root(),
+                "execute_block must commit after distributing fees");
+        }
+
+        /// Two independent nodes executing the same adversarial block agree.
+        #[test]
+        fn independent_executions_of_adversarial_block_agree() {
+            let run = || {
+                let (exec, mut state, mut identity, mut agents) = setup_with_identity();
+                fund_fee_reserve(&mut state);
+                let (txs, _, _) = mixed_block(&exec);
+                let r = exec.execute_block_with_identity(1, txs, &mut state, &mut identity, &mut agents, 1_000, None);
+                (r.state_root, r.fees_collected,
+                 r.tx_results.iter().map(|t| (t.success, t.gas_used)).collect::<Vec<_>>())
+            };
+            assert_eq!(run(), run());
+        }
+    }
 }
