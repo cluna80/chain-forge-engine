@@ -3272,6 +3272,7 @@ mod tests {
             validator:  ValidatorId("carol".into()),
             block_hash: Some(BlockHash("block_test".into())),
             signature:  vec![],  // empty — would have bypassed old opt-in check
+            scheme:     Vote::default_scheme(),
         };
 
         let result = engine.receive_vote(spoofed_vote).await;
@@ -3347,6 +3348,7 @@ mod tests {
                     validator:  ValidatorId("alice".into()),
                     block_hash: Some(block_hash.clone()),
                     signature:  vec![],
+                    scheme:     Vote::default_scheme(),
                 },
                 Vote {
                     vote_type:  VoteType::Precommit,
@@ -3355,6 +3357,7 @@ mod tests {
                     validator:  ValidatorId("bob".into()),
                     block_hash: Some(block_hash.clone()),
                     signature:  vec![],
+                    scheme:     Vote::default_scheme(),
                 },
                 Vote {
                     vote_type:  VoteType::Precommit,
@@ -3363,6 +3366,7 @@ mod tests {
                     validator:  ValidatorId("carol".into()),
                     block_hash: Some(block_hash.clone()),
                     signature:  vec![],  // Carol has a key — this is a forgery attempt
+                    scheme:     Vote::default_scheme(),
                 },
             ],
         };
@@ -3429,6 +3433,7 @@ mod tests {
                 validator:  ValidatorId(format!("val_{i:02}")),
                 block_hash: Some(block_hash.clone()),
                 signature:  raw_sig.bytes,
+                scheme:     Vote::default_scheme(),
             }
         };
 
