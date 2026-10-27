@@ -5312,6 +5312,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- H0-1/H0-2: canonical participation evidence and state-root binding ---
+    //
+    // A block's payload (tx_data, hashed into block_hash) is a versioned
+    // envelope: { version: 1, txs, last_commit, prev_state_root }.
+    //   last_commit     -- precommits for the block committed at h-1, as the
+    //                      proposer collected them (>= 2/3+1 power required).
+    //   prev_state_root -- the proposer's state root after committing h-1.
+    // Validators check both before voting. Participation and liveness are
+    // recorded only from a committed block's last_commit -- never from the
+    // certificate a node assembled locally from whichever precommits it
+    // received first.
+
+    mod h0_participation {
+        use super::*;
+        use chain_forge_consensus::{compute_block_hash, CommitCertificate};
+
+        const CHAIN: &str = "qcb-testnet-1";
+        const VALS: [&str; 4] = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+
+        fn proposer(h: u64) -> &'static str { VALS[(h % 4) as usize] }
+
+        fn payload(last_commit: Option<&CommitCertificate>, prev_state_root: Option<&str>) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "txs": [],
+                "last_commit": last_commit,
+                "prev_state_root": prev_state_root,
+            })).unwrap()
+        }
+
+        fn proposal(h: u64, tx_data: Vec<u8>) -> BlockProposal {
+            let parent = BlockHash(format!("genesis_h{h}"));
+            BlockProposal {
+                height: h, round: 0,
+                proposer: ValidatorId(proposer(h).into()),
+                block_hash: compute_block_hash(CHAIN, h, 0, &parent, &tx_data),
+                parent_hash: parent,
+                timestamp_ms: 0,
+                tx_data,
+                signature: vec![],
+            }
+        }
+
+        fn evidence(h: u64, block_hash: &BlockHash, signers: &[&str]) -> CommitCertificate {
+            CommitCertificate {
+                height: h, round: 0, block_hash: block_hash.clone(),
+                precommits: signers.iter()
+                    .map(|v| signed_vote(CHAIN, VoteType::Precommit, h, 0, v, block_hash.clone()))
+                    .collect(),
+            }
+        }
+
+        async fn deliver(node: &mut Node, p: &BlockProposal, precommitters: &[&str]) {
+            node.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(p).unwrap())).await.unwrap();
+            for v in precommitters {
+                let vote = signed_vote(CHAIN, VoteType::Precommit, p.height, 0, v, p.block_hash.clone());
+                node.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await.unwrap();
+            }
+        }
+
+        fn participation(node: &Node) -> Vec<(String, u64, u64, Option<u64>)> {
+            VALS.iter().map(|v| {
+                let r = node.validator_registry.get(v).unwrap();
+                let active = node.identity.get(v).ok().and_then(|i| i.last_active_epoch);
+                (v.to_string(), r.epoch_counter_epoch, r.epoch_blocks_signed, active)
+            }).collect()
+        }
+
+        /// Two observers commit the same blocks but assemble different local
+        /// certificates (A: alice+bob+carol, B: alice+bob+dave). Every block
+        /// carries identical evidence for h-1; at heights 2 and 5 the
+        /// proposer omits dave (quorum-only evidence). Both nodes must record
+        /// identical participation and liveness, exactly matching the evidence.
+        #[tokio::test]
+        async fn participation_is_identical_across_nodes_with_different_local_certificates() {
+            let mut a = Node::new(GENESIS, None).await.unwrap();
+            let mut b = Node::new(GENESIS, None).await.unwrap();
+            const BLOCKS: u64 = 8;
+            let omit_dave_for = [2u64, 5];
+            let mut prev: Option<CommitCertificate> = None;
+
+            for h in 0..BLOCKS {
+                let root = a.state.current_root().map(str::to_string);
+                assert_eq!(root, b.state.current_root().map(str::to_string), "state diverged before h{h}");
+                let p = proposal(h, payload(prev.as_ref(), root.as_deref()));
+                deliver(&mut a, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+                deliver(&mut b, &p, &["qcb1alice", "qcb1bob", "qcb1dave"]).await;
+                assert_eq!(a.status.lock().unwrap().height, h, "observer A must commit h{h}");
+                assert_eq!(b.status.lock().unwrap().height, h, "observer B must commit h{h}");
+                let signers: Vec<&str> = if omit_dave_for.contains(&h) { VALS[..3].to_vec() } else { VALS.to_vec() };
+                prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+
+            assert_eq!(participation(&a), participation(&b),
+                "nodes must account participation from committed evidence, not local certificates");
+            // Evidence for heights 0..BLOCKS-2 was committed (in blocks 1..BLOCKS-1),
+            // all within epoch 0 (default epoch length is far longer than 8 blocks).
+            let committed = BLOCKS - 1;
+            for (v, _, signed, _) in participation(&a) {
+                let expected = if v == "qcb1dave" { committed - 2 } else { committed };
+                assert_eq!(signed, expected, "{v} participation must match the committed evidence");
+            }
+        }
+
+        /// Carol at height 1, having committed block 0. Returns the node and
+        /// block 0's hash.
+        async fn carol_at_height_1() -> (Node, BlockHash) {
+            let mut carol = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+            carol.signing_key = Some(ClassicalScheme.generate_keypair("qcb1carol").unwrap());
+            let root = carol.state.current_root().map(str::to_string);
+            let p0 = proposal(0, payload(None, root.as_deref()));
+            deliver(&mut carol, &p0, &["qcb1alice", "qcb1bob"]).await;
+            assert_eq!(carol.status.lock().unwrap().height, 0, "carol must commit block 0");
+            (carol, p0.block_hash)
+        }
+
+        async fn carol_accepts(tx_data: Vec<u8>) -> bool {
+            let (mut carol, _) = carol_at_height_1().await;
+            let p1 = proposal(1, tx_data);
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p1).unwrap())).await.unwrap();
+            carol.pending_proposals.contains_key(&(1, 0))
+        }
+
+        #[tokio::test]
+        async fn validators_vote_only_for_valid_participation_evidence_and_state_root() {
+            let (probe, h0) = carol_at_height_1().await;
+            let root = probe.state.current_root().map(str::to_string);
+            let root = root.as_deref();
+            let full = evidence(0, &h0, &VALS);
+            let quorum_only = evidence(0, &h0, &VALS[..3]);
+
+            // Accepted: complete evidence, and quorum-only evidence (proposer omission).
+            assert!(carol_accepts(payload(Some(&full), root)).await, "complete evidence must be accepted");
+            assert!(carol_accepts(payload(Some(&quorum_only), root)).await,
+                "quorum-only evidence (an omitted validator) is still valid");
+
+            // Rejected.
+            let below_quorum = evidence(0, &h0, &VALS[..2]);
+            assert!(!carol_accepts(payload(Some(&below_quorum), root)).await, "below-quorum evidence");
+
+            let mut forged = evidence(0, &h0, &VALS[..3]);
+            forged.precommits[2].signature = signed_vote(
+                CHAIN, VoteType::Precommit, 0, 0, "qcb1dave", h0.clone()).signature;
+            assert!(!carol_accepts(payload(Some(&forged), root)).await, "precommit signed by the wrong key");
+
+            let wrong_block = evidence(0, &BlockHash("not-block-0".into()), &VALS);
+            assert!(!carol_accepts(payload(Some(&wrong_block), root)).await, "evidence for a different block");
+
+            let mut wrong_height = evidence(0, &h0, &VALS);
+            wrong_height.height = 5;
+            assert!(!carol_accepts(payload(Some(&wrong_height), root)).await, "evidence claiming another height");
+
+            let dup = evidence(0, &h0, &["qcb1alice", "qcb1alice", "qcb1bob"]);
+            assert!(!carol_accepts(payload(Some(&dup), root)).await, "a validator counted twice");
+
+            assert!(!carol_accepts(payload(None, root)).await, "missing last_commit after height 0");
+
+            assert!(!carol_accepts(payload(Some(&full), Some("00ff"))).await, "wrong prev_state_root");
+            assert!(!carol_accepts(payload(Some(&full), None)).await, "missing prev_state_root");
+        }
+    }
+
     // -- H0 identity hardening: genesis identity parameters ------------------
 
     #[tokio::test]
