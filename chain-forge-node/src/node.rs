@@ -61,6 +61,55 @@ pub struct NodeStatus {
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
 
+// -- Canonical block payload (H0-1 / H0-2) -------------------------------------
+
+/// Current block payload format.
+pub const BLOCK_PAYLOAD_VERSION: u32 = 1;
+
+/// How long a proposer waits after a commit for late precommits, so its
+/// `last_commit` evidence includes validators slower than the first 2/3+1.
+const COMMIT_GATHER_MS: u128 = 1_000;
+
+/// What a block commits to. Serialized into `BlockProposal::tx_data`, which
+/// `compute_block_hash` hashes, so every validator votes on exactly these
+/// bytes.
+///
+/// - `last_commit`: precommits for the block committed at `height - 1`, as
+///   collected by the proposer (must carry 2/3+1 power under the validator
+///   set effective at that height). Participation and liveness are recorded
+///   only from this committed evidence, so every node accounts identically.
+///   `None` only at height 0.
+/// - `prev_state_root`: the proposer's state root after committing
+///   `height - 1`. Validators refuse to vote unless it equals their own, and a
+///   node fails-stop rather than commit on top of a different state.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BlockPayload {
+    pub version:         u32,
+    pub txs:             Vec<Transaction>,
+    pub last_commit:     Option<chain_forge_consensus::CommitCertificate>,
+    pub prev_state_root: Option<String>,
+}
+
+impl BlockPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Decode `tx_data`. Pre-H0 blocks are a bare transaction array; they
+    /// decode as version 0 with no evidence (accepted only when replaying
+    /// history, never in a new proposal).
+    pub fn decode(tx_data: &[u8]) -> Self {
+        if let Ok(p) = serde_json::from_slice::<BlockPayload>(tx_data) {
+            return p;
+        }
+        BlockPayload {
+            version: 0,
+            txs: serde_json::from_slice(tx_data).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+}
+
 // -- Explorer state (shared with the API, Section 9.1) -------------------------
 
 /// One block's summary for the explorer.
@@ -405,6 +454,13 @@ pub struct Node {
     /// Prevents clock drift or proposer rotation from producing backwards
     /// timestamps in /api/blocks.
     last_committed_timestamp_ms: u64,
+
+    /// H0-2: every valid precommit known for the last committed block -- the
+    /// local certificate plus late precommits gossiped after the commit. The
+    /// next proposer publishes it as `BlockPayload::last_commit`.
+    last_commit_evidence: Option<chain_forge_consensus::CommitCertificate>,
+    /// When the last block committed (for COMMIT_GATHER_MS).
+    last_commit_at: Option<std::time::Instant>,
 
     // ── Deterministic block-height validator-set epochs ──────────────────────
 
@@ -1245,6 +1301,8 @@ impl Node {
             peer_capacity_table: Arc::new(Mutex::new(crate::gossip_capacity::PeerCapacityTable::new())),
             last_capacity_ad_ms: 0,
             last_committed_timestamp_ms: 0,
+            last_commit_evidence: None,
+            last_commit_at: None,
             validator_epoch_blocks,
             min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
@@ -1905,6 +1963,10 @@ impl Node {
                     blocks = self.chain_store.len(),
                     "block history restored from disk"
                 );
+                // H0-2: after a restart, the next proposal's last_commit starts
+                // from the certificate stored for the last committed block.
+                self.last_commit_evidence = self.chain_store.values().next_back()
+                    .map(|(cert, _)| cert.clone());
             }
             if historical_vs_path.exists() {
                 self.historical_validator_sets =
@@ -1960,9 +2022,20 @@ impl Node {
                 // Only the last MAX_RECENT_BLOCKS entries are kept.
                 let entries: Vec<_> = self.chain_store.iter().collect();
                 let start = entries.len().saturating_sub(MAX_RECENT_BLOCKS);
+                // H0-1: the state root after block h is committed on chain as
+                // block h+1's prev_state_root; the newest block's is the live
+                // restored root. Pre-H0 (legacy) blocks fall back to the hash.
+                let live_root = self.state.current_root().map(str::to_string);
+                let last_height = entries.last().map(|(h, _)| **h);
+                let root_after = |h: u64| -> Option<String> {
+                    match self.chain_store.get(&(h + 1)) {
+                        Some((_, next)) => BlockPayload::decode(&next.tx_data).prev_state_root,
+                        None if Some(h) == last_height => live_root.clone(),
+                        None => None,
+                    }
+                };
                 for (_, (_cert, proposal)) in &entries[start..] {
-                    let txs: Vec<chain_forge_execution::Transaction> =
-                        serde_json::from_slice(&proposal.tx_data).unwrap_or_default();
+                    let txs = BlockPayload::decode(&proposal.tx_data).txs;
                     let mut tx_ids = Vec::with_capacity(txs.len());
                     for tx in &txs {
                         tx_ids.push(tx.id.clone());
@@ -1981,7 +2054,8 @@ impl Node {
                     }
                     ex.blocks.push_front(BlockSummary {
                         height:       proposal.height,
-                        state_root:   proposal.block_hash.0.clone(),
+                        state_root:   root_after(proposal.height)
+                            .unwrap_or_else(|| proposal.block_hash.0.clone()),
                         timestamp_ms: proposal.timestamp_ms,
                         tx_count:     tx_ids.len(),
                         tx_ids,
@@ -2276,6 +2350,7 @@ impl Node {
 
                         if Self::is_proposer_for(&vs, height, round, &my_id)
                             && self.last_proposed != Some(key)
+                            && self.last_commit_ready()
                             && (!self.mempool.is_empty()
                                 || self.round_watch_started
                                     .map(|t| t.elapsed().as_millis() >= 2000)
@@ -2398,6 +2473,17 @@ impl Node {
                             return Ok(());
                         }
 
+                        // H0-1/H0-2: never vote for a block whose participation
+                        // evidence or prior state root this node cannot confirm.
+                        if proposal.height == self.consensus.current_height() {
+                            if let Err(e) = self.validate_block_payload(&proposal) {
+                                warn!(height = proposal.height, round = proposal.round,
+                                      proposer = %proposal.proposer, error = %e,
+                                      "proposal rejected: invalid block payload");
+                                return Ok(());
+                            }
+                        }
+
                         if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
                             debug!(error = %e, "proposal rejected (stale height, wrong proposer, or locked)");
                             return Ok(());
@@ -2444,6 +2530,11 @@ impl Node {
                                 return Ok(());
                             }
                         };
+
+                        // H0-2: a precommit for the block we just committed that
+                        // arrived after our quorum still counts as participation
+                        // evidence for the next proposal.
+                        self.absorb_late_precommit(&vote);
 
                         debug!(
                             from = %msg.from,
@@ -3265,10 +3356,12 @@ impl Node {
             .map(|v| v.validator.0.clone())
             .collect();
 
-        // Full active validator set for this height.
+        // Validator set effective at the evidence's height (H0-2): judged
+        // against who was expected to sign then, not today's live set.
         let all_validators: Vec<String> = self
-            .consensus
-            .validator_set()
+            .historical_validator_sets
+            .get(&cert.height)
+            .unwrap_or_else(|| self.consensus.validator_set())
             .validators
             .iter()
             .map(|v| v.id.0.clone())
@@ -3338,8 +3431,23 @@ impl Node {
         self.round_watch = None;
         self.round_watch_started = None;
 
-        let txs: Vec<Transaction> = serde_json::from_slice(&proposal.tx_data)
-            .unwrap_or_default();
+        let payload = BlockPayload::decode(&proposal.tx_data);
+        // H0-1 fail-stop: a block built on a different prior state must never
+        // be applied on top of this node's state -- halting is the safe outcome.
+        if let Some(expected) = payload.prev_state_root.as_deref() {
+            let own = self.state.current_root();
+            if own != Some(expected) {
+                error!(height = cert.height, expected, own = ?own,
+                       "STATE DIVERGENCE: committed block's prev_state_root differs from this \
+                        node's state; refusing to apply it");
+                return Err(format!(
+                    "state divergence at height {}: block expects prev_state_root {expected}, \
+                     node has {own:?}", cert.height
+                ));
+            }
+        }
+        let participation = payload.last_commit.clone();
+        let txs: Vec<Transaction> = payload.txs;
         self.remove_committed_from_mempool(&txs);
         // Keep a lightweight (tx_id, sender, nonce) index before txs is consumed by
         // execute_block_with_identity so the post-execution nonce-cache update
@@ -3417,16 +3525,23 @@ impl Node {
             }
         }
 
-        // Validator participation = on-chain activity for QRC yield eligibility.
-        // Every validator who signed a precommit in this block's commit certificate
-        // gets their activity stamped for this epoch. This means validators earn
-        // QRC yield for doing their job — producing/signing blocks — without
-        // needing to submit separate Transfer or Stake txs.
-        // Also record epoch_blocks_signed for per-epoch reward eligibility.
+        // Validator participation = on-chain activity for QRC yield eligibility
+        // and epoch_blocks_signed for per-epoch reward eligibility.
+        //
+        // H0-2: recorded ONLY from the committed block's last_commit evidence
+        // (precommits for height-1, validated by every voter), attributed to
+        // height-1's epoch. Never from `cert`, which each node assembles locally
+        // from whichever precommits it received first and so differs by node.
         let current_epoch = self.identity.clock.current_epoch;
-        for vote in &cert.precommits {
-            self.identity.record_activity(&vote.validator.0);
-            self.validator_registry.record_precommit(&vote.validator.0, current_epoch);
+        if let Some(lc) = &participation {
+            let evidence_epoch = lc.height / self.validator_epoch_blocks;
+            let mut seen = std::collections::HashSet::new();
+            for vote in &lc.precommits {
+                if seen.insert(vote.validator.0.clone()) {
+                    self.identity.record_activity(&vote.validator.0);
+                    self.validator_registry.record_precommit(&vote.validator.0, evidence_epoch);
+                }
+            }
         }
 
         // ── Epoch-close: distribute validator reward pool equally among
@@ -4242,10 +4357,20 @@ impl Node {
         // behind has something to actually request and replay.
         self.chain_store.insert(committed_height, (cert.clone(), proposal.clone()));
 
+        // H0-2: the evidence the next proposer publishes starts from this
+        // node's own certificate and grows with late precommits.
+        self.last_commit_evidence = Some(cert.clone());
+        self.last_commit_at = Some(std::time::Instant::now());
+
         // Record block participation for every validator and slash any that
         // have crossed the liveness miss threshold (>20% absent in 500-block
         // sliding window → jail + 0.1% stake burn via BME, Section 8.2).
-        self.check_liveness_after_commit(&cert);
+        // H0-2: judged from the committed last_commit evidence for height-1,
+        // never from this node's locally assembled certificate -- otherwise
+        // nodes would jail and burn different validators.
+        if let Some(lc) = &participation {
+            self.check_liveness_after_commit(lc);
+        }
 
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
@@ -4276,6 +4401,85 @@ impl Node {
     /// (as of THAT set, not the live one) meets or exceeds that set's own
     /// quorum threshold. `Err` otherwise, with a string explaining which
     /// check failed.
+    /// H0-1/H0-2: check a proposal's payload before voting for it.
+    fn validate_block_payload(&self, proposal: &BlockProposal) -> Result<(), String> {
+        let payload = BlockPayload::decode(&proposal.tx_data);
+        if payload.version != BLOCK_PAYLOAD_VERSION {
+            return Err(format!(
+                "payload version {} is not the required {BLOCK_PAYLOAD_VERSION}", payload.version
+            ));
+        }
+        let own_root = self.state.current_root();
+        if payload.prev_state_root.as_deref() != own_root {
+            return Err(format!(
+                "prev_state_root {:?} does not match this node's state root {:?}",
+                payload.prev_state_root, own_root
+            ));
+        }
+        if proposal.height == 0 {
+            if payload.last_commit.is_some() {
+                return Err("a height-0 block cannot carry a last_commit".into());
+            }
+            return Ok(());
+        }
+        let lc = payload.last_commit.as_ref()
+            .ok_or("missing last_commit evidence for the previous block")?;
+        let prev = proposal.height - 1;
+        if lc.height != prev {
+            return Err(format!("last_commit is for height {}, expected {prev}", lc.height));
+        }
+        let (committed, _) = self.chain_store.get(&prev)
+            .ok_or_else(|| format!("block {prev} is not committed locally; cannot check last_commit"))?;
+        if lc.block_hash != committed.block_hash {
+            return Err(format!(
+                "last_commit names block {}, but block {prev} committed as {}",
+                lc.block_hash, committed.block_hash
+            ));
+        }
+        self.verify_certificate_against_history(lc)
+            .map_err(|e| format!("invalid last_commit: {e}"))
+    }
+
+    /// H0-2: add a late, valid precommit for the last committed block to the
+    /// evidence the next proposer will publish.
+    fn absorb_late_precommit(&mut self, vote: &Vote) {
+        let Some(evidence) = self.last_commit_evidence.as_ref() else { return };
+        if vote.vote_type != VoteType::Precommit
+            || vote.height != evidence.height
+            || vote.round != evidence.round
+            || vote.block_hash.as_ref() != Some(&evidence.block_hash)
+            || evidence.precommits.iter().any(|v| v.validator == vote.validator)
+        {
+            return;
+        }
+        let candidate = chain_forge_consensus::CommitCertificate {
+            precommits: vec![vote.clone()],
+            ..evidence.clone()
+        };
+        // Signature/power check against the set effective at that height;
+        // the single-vote quorum shortfall is the only acceptable error.
+        match self.verify_certificate_against_history(&candidate) {
+            Ok(()) => {}
+            Err(e) if e.contains("short of the") => {}
+            Err(e) => {
+                debug!(validator = %vote.validator, error = %e, "late precommit rejected");
+                return;
+            }
+        }
+        if let Some(ev) = self.last_commit_evidence.as_mut() {
+            ev.precommits.push(vote.clone());
+        }
+    }
+
+    /// The proposer waits for every validator's precommit, or COMMIT_GATHER_MS.
+    fn last_commit_ready(&self) -> bool {
+        let Some(ev) = self.last_commit_evidence.as_ref() else { return true };
+        let n = self.consensus.validator_set().validators.iter()
+            .filter(|v| v.voting_power > 0).count();
+        ev.precommits.len() >= n
+            || self.last_commit_at.map_or(true, |t| t.elapsed().as_millis() >= COMMIT_GATHER_MS)
+    }
+
     pub fn verify_certificate_against_history(
         &self,
         cert: &chain_forge_consensus::CommitCertificate,
@@ -4292,6 +4496,27 @@ impl Node {
         let mut counted_validators = std::collections::HashSet::new();
 
         for vote in &cert.precommits {
+            // Every vote must be a precommit for exactly this certificate's
+            // (height, round, block). Otherwise validly signed votes for some
+            // other block could be counted toward this one's quorum.
+            if vote.vote_type != VoteType::Precommit
+                || vote.height != cert.height
+                || vote.round != cert.round
+                || vote.block_hash.as_ref() != Some(&cert.block_hash)
+            {
+                return Err(format!(
+                    "certificate for height {} round {} contains a vote from {} that is \
+                     not a precommit for that block",
+                    cert.height, cert.round, vote.validator
+                ));
+            }
+            if vote.scheme != "classical" {
+                return Err(format!(
+                    "certificate vote from {} uses scheme {:?}; only classical \
+                     precommits can be verified as commit evidence today (fail-closed)",
+                    vote.validator, vote.scheme
+                ));
+            }
             // Equivocation/duplicate guard: only count each validator once,
             // same as a real quorum tally would.
             if !counted_validators.insert(vote.validator.clone()) {
@@ -4368,7 +4593,12 @@ impl Node {
         // when a block containing them commits (commit_block). Draining here
         // silently lost every tx in any proposal that didn't commit.
         let txs = self.mempool.clone();
-        let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
+        let tx_bytes = BlockPayload {
+            version:         BLOCK_PAYLOAD_VERSION,
+            txs:             txs.clone(),
+            last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
+            prev_state_root: self.state.current_root().map(str::to_string),
+        }.encode();
 
         let proposal = self.consensus
             .propose(height, round, parent_hash, tx_bytes)
@@ -4408,8 +4638,12 @@ impl Node {
 
         // Drain mempool into the block
         let mut txs = std::mem::take(&mut self.mempool);
+        let last_commit = if height == 0 { None } else { self.last_commit_evidence.clone() };
+        let prev_state_root = self.state.current_root().map(str::to_string);
 
-        let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
+        let tx_bytes = BlockPayload {
+            version: BLOCK_PAYLOAD_VERSION, txs: txs.clone(), last_commit, prev_state_root,
+        }.encode();
 
         // Produce a proposal
         let proposal = self.consensus
@@ -6363,7 +6597,11 @@ mod tests {
 
     // -- Multi-node gossip-to-consensus wiring tests ---------------------------
 
-    fn make_proposal(height: u64, round: u32, proposer: &str, block_hash: &str) -> BlockProposal {
+    /// A height-0 style proposal with an empty v1 payload. `prev_state_root`
+    /// must be the receiving node's current root (H0-1), so callers pass it.
+    fn make_proposal(
+        height: u64, round: u32, proposer: &str, block_hash: &str, prev_state_root: Option<&str>,
+    ) -> BlockProposal {
         BlockProposal {
             height,
             round,
@@ -6371,7 +6609,11 @@ mod tests {
             block_hash:  chain_forge_consensus::BlockHash(block_hash.to_string()),
             parent_hash: chain_forge_consensus::BlockHash("genesis_h0".to_string()),
             timestamp_ms: 0,
-            tx_data:     serde_json::to_vec(&Vec::<Transaction>::new()).unwrap(),
+            tx_data:     BlockPayload {
+                version: BLOCK_PAYLOAD_VERSION,
+                prev_state_root: prev_state_root.map(str::to_string),
+                ..Default::default()
+            }.encode(),
             signature:   vec![],
         }
     }
@@ -6534,7 +6776,7 @@ mod tests {
                 .expect("deterministic devnet keypair generation must not fail")
         );
 
-        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_test");
+        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_test", node.state.current_root());
         let payload = serde_json::to_vec(&proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
 
@@ -6589,7 +6831,7 @@ mod tests {
         // Bob is not the proposer at (0,0) -- alice is -- so Bob votes and
         // processes gossip but doesn't produce the proposal itself.
         let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
-        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_partition_test");
+        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_partition_test", node.state.current_root());
 
         // Three precommits arrive BEFORE the proposal gossip.
         // The node feeds them to receive_vote(); on the 3rd one it returns
@@ -6648,7 +6890,7 @@ mod tests {
 
         // Bob claims to be the proposer at (0,0), but alice is -- consensus
         // must reject this and the node must not register or vote on it.
-        let bad_proposal = make_proposal(0, 0, "qcb1bob", "block_h0_r0_bad");
+        let bad_proposal = make_proposal(0, 0, "qcb1bob", "block_h0_r0_bad", node.state.current_root());
         let payload = serde_json::to_vec(&bad_proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
 
@@ -7657,7 +7899,7 @@ mod tests {
         // a quorum of signed precommits from alice/bob/carol/eve.  The FBA
         // receive_vote path verifies each vote against the registered genesis key.
         // ⌈5 × 2/3⌉ = 4 precommits needed.
-        let proposal = make_proposal(0, 0, "qcb1alice", &root_a);
+        let proposal = make_proposal(0, 0, "qcb1alice", &root_a, nodes[3].state.current_root());
         let payload  = serde_json::to_vec(&proposal).unwrap();
         let _ = nodes[3].handle_event(gossip(GossipTopic::BlockProposal, payload)).await;
         for v in &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1eve"] {
