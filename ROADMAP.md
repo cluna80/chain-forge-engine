@@ -17,6 +17,50 @@
 ---
 ### The name is Qattice, changed from QCB but still uses $QCB as the token to the ecosystem.
 
+---
+
+## Qattice LLC — Business Activation (Future Milestone)
+
+> **What:** Formally activate Qattice LLC as a U.S. software engineering company. The LLC is the legal entity that owns all IP, signs government contracts, holds SBIR awards, and enters commercial agreements. The company builds three core products: **Chain Forge** (modular blockchain creation platform), **Qattice** (the first production chain built with Chain Forge), and **DIS** (post-quantum cryptographic identity enforcement for regulated contracts and high-security systems).
+>
+> **One-line description (SAM.gov / SBIR / contracts):**
+> *Qattice LLC is a software engineering company building post-quantum blockchain infrastructure, modular distributed computing platforms, and cryptographic identity systems for regulated contracts and decentralized applications.*
+>
+> **Status:** 🔲 Locked — activate when prerequisite tracks reach completion gates below.
+
+### Activation Prerequisites
+
+| # | Track | Required completion gate | Status |
+|---|-------|--------------------------|--------|
+| BIZ-PRE-1 | **Phase 0.5 — Protocol Hardening** | H0-5 (execution rollback) and H0-7 (supply conservation) confirmed locally | 🔲 |
+| BIZ-PRE-2 | **DIS — Account Security and Recovery** | DIS-003D and DIS-003E confirmed locally on Windows/MINGW64 | 🔲 |
+| BIZ-PRE-3 | **DIS Standalone Product** | Independent cryptographic review gate passed (currently marked ⚠️ return before production on DIS-CORE-001, DIS-PQ-001, DIS-PRIV-001) | 🔲 |
+| BIZ-PRE-4 | **FeeSponsor** | FS-03 live authorization complete (SponsorAuthorization wired into execution path) | 🔲 |
+| BIZ-PRE-5 | **Validator Onboarding** | Validator eviction policy decided and implemented (H0-11) | 🔲 |
+
+> All five gates do not need to close simultaneously. BIZ-PRE-1 and BIZ-PRE-2 are the minimum viable gates — the company can be formed and SAM.gov registration started in parallel with engineering, but active SBIR pursuit requires a demonstrable post-quantum identity capability (DIS-003D/E complete) and a provably correct state machine (H0-5/H0-7 confirmed).
+
+### Business Activation Checklist (when prerequisites met)
+
+| Step | Action | Notes |
+|------|--------|-------|
+| CORP-1 | Form Qattice LLC in home state | Sole member LLC; ~$50–150 state filing fee |
+| CORP-2 | Register on SAM.gov — obtain UEI | Takes 1–2 weeks; required before any federal contract or SBIR submission |
+| CORP-3 | Register on SBIR.gov using UEI | Unlocks submission to all 11 SBIR agencies including Army |
+| CORP-4 | File NAICS codes: 541511 (Custom Computer Programming), 541519 | Primary codes for software engineering company |
+| CORP-5 | Prepare technical capability statement | 1-page: Chain Forge + Qattice + DIS, framed for Army MOSA open-architecture requirement |
+| CORP-6 | Monitor Army SBIR topic releases at armysbir.army.mil | Army releases topics several times per year; Phase I window ~30–60 days |
+| CORP-7 | Submit Phase I proposal | Target: post-quantum machine/operator identity for MOSA-compliant defense platforms |
+
+### Defense Market Positioning
+
+**Primary SBIR pitch:** Post-quantum machine and operator identity for MOSA-compliant defense platforms — DIS as a drop-in ML-DSA-65 authentication module that any open-architecture defense system can integrate.
+
+**Secondary (Phase II expansion):** Chain Forge Secure Compute — private, verifiable distributed computing for defense research laboratories and contractors, with DIS authorization, PoCD verification, and signed execution receipts.
+
+**Relevant Army priorities (per Secretary Driscoll, 2026):** Modular open-system architecture software, next-gen sensors and software payloads, resilient logistics, and advanced manufacturing — Qattice targets the software and identity layer of that stack.
+
+---
 
 ## DIS Standalone Product — Keystone Identity and Authorization (Planned)
 
