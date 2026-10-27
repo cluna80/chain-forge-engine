@@ -2116,7 +2116,10 @@ impl Node {
                 self.validator_registry.build_validator_set(height)
             };
 
-            if let Err(e) = self.consensus.reset_to_height(height, vs) {
+            // `height` is the last COMMITTED block; the engine must work on the
+            // next one. Passing `height` itself made every restarted node
+            // re-decide its last committed block.
+            if let Err(e) = self.consensus.reset_to_height(height + 1, vs) {
                 tracing::warn!(
                     height,
                     error = %e,
@@ -5546,6 +5549,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A restarted node must resume at the height AFTER its last committed
+    /// block. Resuming at the committed height re-decides that block -- the
+    /// network can commit a different block at a height it already finalized.
+    #[tokio::test]
+    async fn restart_resumes_after_the_last_committed_height() {
+        let dir = std::env::temp_dir()
+            .join(format!("cf-restart-height-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let next_height = {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.propose_block(cert0.block_hash).await.unwrap();
+            node.persist_state();
+            assert_eq!(node.state.current_height(), 1, "blocks 0 and 1 committed");
+            node.consensus.current_height()
+        };
+        assert_eq!(next_height, 2);
+
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+        assert_eq!(restarted.consensus.current_height(), next_height,
+            "after restart the engine must work on height 2, not re-decide committed block 1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -- H0-1/H0-2: canonical participation evidence and state-root binding ---
     //
     // A block's payload (tx_data, hashed into block_hash) is a versioned
@@ -6312,7 +6343,8 @@ mod tests {
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
         assert!(restarted.load_persisted_state());
-        assert_eq!(restarted.consensus.current_height(), height_before);
+        // The engine resumes at the NEXT height after the last executed block.
+        assert_eq!(restarted.consensus.current_height(), height_before + 1);
 
         let vs_after = restarted.consensus.validator_set();
         let v_after = vs_after.validators.iter().find(|v| v.id.0 == addr)
@@ -8571,8 +8603,8 @@ mod tests {
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
         assert!(restarted.load_persisted_state(), "state must reload from disk");
-        assert_eq!(restarted.consensus.current_height(), height_before,
-            "height must be restored after restart");
+        assert_eq!(restarted.consensus.current_height(), height_before + 1,
+            "after restart the engine works on the height after the last executed block");
 
         let vs = restarted.consensus.validator_set();
         let v = vs.validators.iter().find(|v| v.id.0 == addr)

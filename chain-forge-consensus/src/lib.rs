@@ -2162,9 +2162,10 @@ impl ConsensusEngine for TendermintEngine {
         validator_set: ValidatorSet,
     ) -> ConsensusResult<()> {
         // Jump the height counter forward so the engine starts proposing and
-        // voting at `height + 1` rather than re-running already-committed
-        // heights.  Per-round state (votes, proposals, locks) is for the old
-        // height and is no longer valid, so clear it.
+        // voting at `height` -- the NEXT height to decide (callers pass the
+        // last committed height + 1) -- rather than re-running
+        // already-committed heights.  Per-round state (votes, proposals,
+        // locks) is for the old height and is no longer valid, so clear it.
         // CF-VAL-KEY-002 hardening: `update_validator_set()` always runs
         // every incoming set through `gate_voting_power()` before installing
         // it, so nothing upstream can hand real voting power back to a
