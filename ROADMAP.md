@@ -1472,3 +1472,37 @@ routes are unavailable in production configurations.
 revocation lifecycle test shipped (see Phase 1 → Consensus — Personhood Weighting).
 The devnet liveness and authentic adversarial test gates above remain open
 security-validation prerequisites, not completed findings.
+
+
+---
+
+## Qattice ComputeOS + PoCD Integration — Planned Initiative
+
+**Status:** 🔲 Planned / architecture definition (2026-10-26). This is a Qattice product initiative; it is not a change to the independent blockchain-creation platform. No production ComputeOS marketplace or customer-funded compute settlement is claimed.
+
+**Product thesis:** Qattice ComputeOS coordinates independently owned CPU/GPU resources, workload discovery, scheduling, isolated execution, independent result verification where feasible, and customer settlement. PoCD is its native scientific-research workload engine: both share worker registration and orchestration infrastructure, but commercial jobs do not have to generate discoveries. ComputeOS is an application/service layer integrating with Qattice L1; it is not a new consensus mechanism.
+
+**Locked architectural invariants:**
+- Preserve Qattice's personhood-bounded BFT consensus. PoCD computation, discovery, and receipts do not grant block voting power or become prerequisites for finality.
+- Preserve the fixed genesis supply of 210,000,000 QCB; no PoCD or ComputeOS token minting. Research rewards follow existing treasury/sponsor-funded Pending uQCB redemption rules; commercial jobs use separately funded customer escrow/payment paths.
+- Reuse existing PoCD task scheduler, miner, independent verifier, acceptance flow, MachineID, signed discovery/useful-work receipts, and research reward settlement wherever compatible; keep existing discovery receipt semantics.
+- A signed receipt or hash seal alone is not proof of arbitrary computational correctness. Each workload class needs explicit reproducible verification, formal proof, redundancy, or an agreed acceptance policy; unsupported workloads must not be advertised as cryptographically verified.
+- Separate accounting and anti-double-payment controls for PoCD research rewards and customer-funded jobs. Shared machines may opt into both; participation in one does not imply entitlement to the other.
+- Provider resource contribution is opt-in, policy-controlled, and permissionless where safe. Identity/authorization for machine operators, buyers, and delegated agents is distinct from QPC personhood requirements for consensus/governance.
+- Compute executes off-chain in isolated workers; Qattice stores only necessary commitments, identities/authorizations, receipts, and settlement state. Do not place raw customer workloads, sensitive data, or large outputs on-chain by default.
+- Do not revive the previously archived protocol-level resource marketplace or modify monetary rules as a prerequisite. Commercial compute marketplace functionality begins outside consensus.
+
+| Milestone | Status | Deliverable / acceptance criteria |
+|---|---|---|
+| **COS-PoCD-000 — Code and threat-model audit** | 🔲 Planned | Inventory live scheduler/miner/verifier/receipt/MachineID/settlement APIs; map reusable modules versus missing pieces; define adversaries, provider trust, workload confidentiality, resource abuse, and payout risks; reconcile docs with tested code before claiming capabilities. |
+| **COS-PoCD-001 — Shared worker registry and resource advertisement** | 🔲 Planned | Two independently operated physical machines register/advertise supported CPU/RAM/GPU capacity, availability, pricing/policy, and PoCD opt-in; signed updates, freshness/expiry, duplicate identity and spoofed-capacity defenses. |
+| **COS-PoCD-002 — Unified scheduler with distinct workload classes** | 🔲 Planned | Schedule deterministic PoCD tasks and separately funded commercial tasks on the same worker fleet; enforce provider resource limits, lease expiry/retry, task cancellation, fair resource allocation, and no double assignment/settlement. |
+| **COS-PoCD-003 — Sandboxed execution and result verification** | 🔲 Planned | Isolated, resource-limited worker execution; reproducible deterministic research task with independent verifier; workload-specific commercial acceptance rules; failure, timeout, dishonest-result, and verifier-collusion tests. |
+| **COS-PoCD-004 — Receipts, accounting, and settlement** | 🔲 Planned | Preserve existing PoCD discovery/useful-work receipt and treasury-funded reward path; introduce separately identified customer-job execution receipts, pre-funded customer payment/escrow, dispute/failure/refund rules, replay resistance, and conservation tests; no inflation or reward cross-subsidy. |
+| **COS-PoCD-005 — Two-machine end-to-end pilot** | 🔲 Planned | From an independent client, submit one PoCD task and one customer-funded deterministic compute task; schedule on independent machines, independently verify results, produce distinct signed receipts, and demonstrate correct research reward versus customer payment settlement; publish logs and repeatable test instructions. |
+| **COS-PoCD-006 — Developer API and first paying pilot** | 🔲 Future | Document job submission/status/results, provider onboarding, cost and verification guarantees; validate with at least one external customer and measure reliability, verification overhead, job economics, and payment completion. |
+| **COS-PoCD-007 — Authorized agent purchasing (optional)** | 🔲 Future | Delegated agent permissions with enforceable budgets, provider allowlists, revocation, replay protection, and independent security review before production financial use. |
+
+**First product wedge:** Verified deterministic scientific/cryptographic computation. General-purpose GPU/AI workloads are a later expansion and must not inherit unsupported PoCD verification claims.
+
+**Non-goals for initial milestone:** Replacing BFT with PoCD; requiring every paid job to produce scientific discoveries; creating a new token; modifying the fixed QCB supply; claiming general-purpose zero-knowledge proof of computation; production launch before security review and customer validation.
