@@ -18,14 +18,16 @@
 //!
 //! Additionally:
 //!
-//!   MN-7  Personhood revocation (RevokeAttestation) produces an identical
-//!         state-root change across all four nodes — the identity-store
-//!         downgrade is deterministically applied everywhere.
-//!   MN-8  A post-genesis validator (Eve) that earns rewards through normal
-//!         participation has its WoT attestation revoked; at the next epoch
-//!         boundary the reward sweep excludes Eve while eligible genesis
-//!         validators receive their correct shares.  All five nodes agree on
-//!         the resulting state root.
+//!   MN-7  Personhood attestation and revocation, with verified outcomes:
+//!         every tx is confirmed successful on every node with the fee the
+//!         genesis gas model predicts, nonces rise by exactly one per tx, and
+//!         the claimant goes Provisional -> Verified (3 attesters) ->
+//!         Provisional (2 attesters) identically on all nodes.
+//!
+//!   MN-8  (Not run here.) Reward exclusion after personhood revocation. Its
+//!         previous form never executed its transactions; it returns as its
+//!         own test once full last-commit participation (H0-1) makes epoch
+//!         rewards reachable on a multi-validator network.
 //!
 //! ## Genesis
 //!
@@ -45,6 +47,8 @@
 //!
 //! Skipped (not failed) when the binary has not been built.
 
+use chain_forge_core::GenesisConfig;
+use chain_forge_execution::{ExecutionConfig, Transaction};
 use std::{
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
@@ -76,6 +80,7 @@ const EVE_ADDR:     &str = "qcb1eve";
 const EVE_API_PORT: u16  = 18184;
 const EVE_P2P_PORT: u16  = 27104;
 /// Minimum bond for Eve — must exceed DEFAULT_MIN_BOND_UQCB (2_000_000 uqcb).
+#[allow(dead_code)] // reserved for MN-8 (pending H0-1)
 const EVE_BOND_UQCB: u64 = 3_000_000;
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -198,6 +203,87 @@ fn wait_for_height(ports: &[u16], target: u64, timeout: Duration) {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+// ── Outcome-verification helpers (MN-7) ───────────────────────────────────────
+
+/// Execution config from the same genesis the nodes run, so expected fees are
+/// computed independently of the nodes under test.
+fn exec_config(genesis: &PathBuf) -> ExecutionConfig {
+    let json = std::fs::read_to_string(genesis).expect("read genesis");
+    ExecutionConfig::from_genesis(&GenesisConfig::from_json(&json).expect("parse genesis"))
+}
+
+/// Fee the chain must charge for this tx JSON (fee in uQCB == gas).
+fn fee_of(cfg: &ExecutionConfig, tx: &serde_json::Value) -> u128 {
+    let tx: Transaction = serde_json::from_value(tx.clone()).expect("tx JSON must be a Transaction");
+    cfg.gas_model.calculate_gas(&tx) as u128
+}
+
+fn account_nonce(port: u16, addr: &str) -> u64 {
+    api_get(port, &format!("/api/accounts/{addr}"))
+        .and_then(|v| v["nonce"].as_u64())
+        .unwrap_or(0)
+}
+
+fn identity_of(port: u16, addr: &str) -> serde_json::Value {
+    api_get(port, &format!("/api/identity/{addr}")).unwrap_or(serde_json::Value::Null)
+}
+
+/// State root recorded for block `height` on the node at `port`.
+fn block_root(port: u16, height: u64) -> Option<String> {
+    api_get(port, &format!("/api/blocks/{height}"))
+        .and_then(|v| v["state_root"].as_str().map(str::to_string))
+}
+
+/// Read a value from every node; all must agree. Returns it.
+fn agreed_on<T: PartialEq + std::fmt::Debug + Clone>(
+    ports: &[u16], what: &str, read: impl Fn(u16) -> T,
+) -> T {
+    let vals: Vec<T> = ports.iter().map(|&p| read(p)).collect();
+    for (i, v) in vals.iter().enumerate().skip(1) {
+        assert_eq!(v, &vals[0], "{what} differs on {}: {vals:?}", VALIDATORS[i]);
+    }
+    vals[0].clone()
+}
+
+fn submit(port: u16, tx: &serde_json::Value, label: &str) {
+    let resp = api_post_tx(port, &tx.to_string())
+        .unwrap_or_else(|| panic!("{label}: POST {} failed (network)", tx["id"]));
+    let st = resp["status"].as_str().unwrap_or("unknown");
+    assert!(st == "queued" || st == "ok", "{label}: {} rejected at ingress: {resp}", tx["id"]);
+}
+
+/// Wait until tx `id` is in every node's committed-tx index; require that it
+/// succeeded with identical outcome everywhere and charged exactly the
+/// independently computed fee. Returns (fee, outcome).
+fn confirm_success(
+    ports: &[u16], cfg: &ExecutionConfig, tx: &serde_json::Value, timeout: Duration, label: &str,
+) -> (u128, serde_json::Value) {
+    let id = tx["id"].as_str().unwrap();
+    let deadline = Instant::now() + timeout;
+    let outcomes: Vec<serde_json::Value> = loop {
+        // Before commit the endpoint answers 404 with a JSON error body, so
+        // only a response that carries this tx's id counts as committed.
+        let seen: Vec<Option<serde_json::Value>> = ports.iter()
+            .map(|&p| api_get(p, &format!("/api/tx/{id}")).filter(|v| v["id"] == id))
+            .collect();
+        if seen.iter().all(Option::is_some) {
+            break seen.into_iter().map(Option::unwrap).collect();
+        }
+        assert!(Instant::now() < deadline, "{label}: tx {id} not committed on every node: {seen:?}");
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let fee = fee_of(cfg, tx);
+    for (i, o) in outcomes.iter().enumerate() {
+        assert_eq!(o["success"], true,
+            "{label}: tx {id} failed on {}: {}", VALIDATORS[i], o["error"]);
+        assert_eq!(o["gas_used"].as_u64().map(u128::from), Some(fee),
+            "{label}: tx {id} on {} charged {} but the genesis gas model gives {fee}",
+            VALIDATORS[i], o["gas_used"]);
+        assert_eq!(o, &outcomes[0], "{label}: tx {id} outcome differs on {}", VALIDATORS[i]);
+    }
+    (fee, outcomes[0].clone())
 }
 
 // ── RAII process guard ────────────────────────────────────────────────────────
@@ -352,6 +438,7 @@ fn spawn_all(
 
 /// Spawn Eve's node (post-genesis observer/validator).  She starts with no
 /// consensus power; that is granted only after bonding + attestation + epoch.
+#[allow(dead_code)] // reserved for MN-8 (pending H0-1)
 fn spawn_eve(
     bin:        &PathBuf,
     genesis:    &PathBuf,
@@ -791,389 +878,136 @@ fn fs03_mn001_multi_node_fee_settlement() {
         );
     }
 
-    // ── Phase 8: MN-7 — personhood revocation is deterministic across nodes ──
+    // ── Phase 8: MN-7 — personhood attestation + revocation, verified outcomes ─
     //
-    // Scenario:
-    //   1. Register a fresh identity for qcb1user1 (they have a balance from genesis
-    //      and their nonce is 2 after TX-A and TX-B).
-    //   2. Three genesis validators (Alice, Bob, Carol) each submit an Attest tx
-    //      vouching for qcb1user1.  When the third lands, the identity store
-    //      upgrades user1 to Verified (verified_via_wot=true).
-    //   3. All four nodes must agree on the state root immediately after quorum —
-    //      the WoT-upgrade must be applied identically everywhere.
-    //   4. Alice revokes her attestation.  user1's count drops 3→2, below
-    //      ATTESTATION_QUORUM=3; identity store downgrades user1 to Provisional.
-    //   5. All four nodes must still agree on the state root.
-    //   6. The state root must differ from the pre-revocation snapshot, proving
-    //      that the revocation changed state and was not silently discarded.
+    // State-root agreement alone is not evidence. Every tx below must be
+    // confirmed successful on every node (GET /api/tx), with an identical
+    // outcome everywhere, and must charge exactly the fee computed
+    // independently from the genesis gas model. Nonces come from chain state,
+    // never hard-coded.
     //
-    // This validates the multi-node invariant: QPC eligibility changes are applied
-    // deterministically on every node with no divergence.
-    println!("── Phase 8: MN-7 — personhood revocation determinism ────────────────");
+    //   1. qcb1user1 registers -> Provisional on every node.
+    //   2. Alice, Bob and Carol attest -> exactly one attestation reports the
+    //      quorum of 3; user1 is Verified with 3 attesters on every node.
+    //   3. Alice revokes -> user1 has 2 attesters and is Provisional again.
+    //   4. Exact accounting: every sender's nonce rose by exactly its tx count;
+    //      user1 (not a validator) lost exactly its fee; each validator
+    //      attester lost exactly its fees, plus any epoch reward, which must be
+    //      non-negative and identical on every node.
+    //   5. All nodes report the same state root for a pinned height.
+    println!("── Phase 8: MN-7 — personhood attestation/revocation, verified outcomes ──");
     {
+        const LABEL: &str = "MN-7 FAILED";
+        const USER: &str = "qcb1user1";
+        let cfg = exec_config(&genesis);
         let alice_api = api_ports[0];
-        let height_before_mn7 = height_of(alice_api);
-
-        // --- Step 1: RegisterIdentity for user1 (nonce = 2) ------------------
-        let tx_reg = serde_json::json!({
-            "id": format!("mn7-reg-{run_id}"),
-            "sender": "qcb1user1",
-            "nonce": 2u64,
-            "gas_limit": 100_000u64,
-            "body": "RegisterIdentity",
-            "signature": []
-        }).to_string();
-        let resp_reg = api_post_tx(alice_api, &tx_reg)
-            .expect("mn7 RegisterIdentity POST failed");
-        let st_reg = resp_reg["status"].as_str().unwrap_or("unknown");
-        assert!(
-            st_reg == "queued" || st_reg == "ok",
-            "MN-7 FAILED: RegisterIdentity rejected: {resp_reg}"
-        );
-        println!("   RegisterIdentity(user1) → {st_reg}");
-
-        // --- Step 2: three Attest txs — Alice(nonce=0), Bob(nonce=0), Carol(nonce=0)
-        //     Submitted to the same API for a single block; in multi-node consensus
-        //     all three propagate via gossip and land in the same or adjacent blocks.
-        let attesters = [
-            ("qcb1alice", 0u64, format!("mn7-att-alice-{run_id}")),
-            ("qcb1bob",   0u64, format!("mn7-att-bob-{run_id}")),
-            ("qcb1carol", 0u64, format!("mn7-att-carol-{run_id}")),
-        ];
-        for (sender, nonce, id) in &attesters {
-            let tx = serde_json::json!({
-                "id": id,
-                "sender": sender,
-                "nonce": nonce,
-                "gas_limit": 100_000u64,
-                "body": { "Attest": { "claimant_id": "qcb1user1" } },
-                "signature": []
-            }).to_string();
-            let resp = api_post_tx(alice_api, &tx)
-                .unwrap_or_else(|| panic!("Attest from {sender} POST failed"));
-            let st = resp["status"].as_str().unwrap_or("unknown");
-            assert!(
-                st == "queued" || st == "ok",
-                "MN-7 FAILED: Attest from {sender} rejected: {resp}"
-            );
-            println!("   Attest({sender} → user1) → {st}");
-        }
-
-        // Wait for all txs to commit — RegisterIdentity + 3 Attest txs may
-        // need two blocks if the mempool fills one block before they all land.
-        wait_for_height(&api_ports, height_before_mn7 + 2, timeout);
-
-        // Snapshot state root after WoT quorum was (or wasn't) reached.
-        let roots_post_attest: Vec<Option<String>> = api_ports.iter()
-            .map(|&p| state_root_of(p))
+        let senders = [USER, "qcb1alice", "qcb1bob", "qcb1carol"];
+        let pos = |s: &str| senders.iter().position(|x| *x == s).unwrap();
+        let nonce0: Vec<u64> = senders.iter()
+            .map(|s| agreed_on(&api_ports, &format!("{LABEL}: {s} nonce"), |p| account_nonce(p, s)))
             .collect();
-        let ref_post_attest = roots_post_attest[0]
-            .as_deref().expect("Alice must have state root after attestation phase");
-        for (i, r) in roots_post_attest.iter().enumerate().skip(1) {
-            assert_eq!(
-                r.as_deref(), Some(ref_post_attest),
-                "MN-7 FAILED: {}'s state root differs from Alice's after WoT attestation\n  alice={ref_post_attest}\n  {}={r:?}",
-                VALIDATORS[i], VALIDATORS[i]
-            );
-        }
-        println!("   All nodes agree on state root after WoT attestation: {ref_post_attest}");
-
-        // --- Step 3: Alice revokes her attestation (Alice nonce = 1) ----------
-        let tx_revoke = serde_json::json!({
-            "id": format!("mn7-revoke-{run_id}"),
-            "sender": "qcb1alice",
-            "nonce": 1u64,
-            "gas_limit": 100_000u64,
-            "body": { "RevokeAttestation": { "attested_id": "qcb1user1" } },
-            "signature": []
-        }).to_string();
-        let resp_rev = api_post_tx(alice_api, &tx_revoke)
-            .expect("mn7 RevokeAttestation POST failed");
-        let st_rev = resp_rev["status"].as_str().unwrap_or("unknown");
-        assert!(
-            st_rev == "queued" || st_rev == "ok",
-            "MN-7 FAILED: RevokeAttestation rejected: {resp_rev}"
-        );
-        println!("   RevokeAttestation(alice → user1) → {st_rev}");
-
-        // --- Step 4: Wait for next epoch boundary (epoch sweep fires) ---------
-        let next_epoch_height = {
-            let h = height_of(alice_api);
-            ((h / EPOCH_BLOCKS) + 1) * EPOCH_BLOCKS + 1
-        };
-        wait_for_height(&api_ports, next_epoch_height, timeout);
-
-        // --- Step 5: All nodes must agree on state root after epoch sweep ------
-        let roots_post_revoke: Vec<Option<String>> = api_ports.iter()
-            .map(|&p| state_root_of(p))
+        let bal0: Vec<u128> = senders.iter()
+            .map(|s| agreed_on(&api_ports, &format!("{LABEL}: {s} balance"), |p| balance_of(p, s)))
             .collect();
-        let ref_post_revoke = roots_post_revoke[0]
-            .as_deref().expect("Alice must have state root after revocation epoch");
-        for (i, r) in roots_post_revoke.iter().enumerate().skip(1) {
-            assert_eq!(
-                r.as_deref(), Some(ref_post_revoke),
-                "MN-7 FAILED: {}'s state root differs from Alice's after personhood revocation\n  alice={ref_post_revoke}\n  {}={r:?}",
-                VALIDATORS[i], VALIDATORS[i]
-            );
+        let mut fees = vec![0u128; senders.len()];
+        let mut sent = vec![0u64; senders.len()];
+        let tier = |p: u16| identity_of(p, USER)["tier"].as_str().map(str::to_string);
+        let attesters = |p: u16| identity_of(p, USER)["attestation_count"].as_u64();
+
+        // Step 1: register user1.
+        let reg = serde_json::json!({
+            "id": format!("mn7-reg-{run_id}"), "sender": USER, "nonce": nonce0[pos(USER)],
+            "gas_limit": 100_000u64, "body": "RegisterIdentity", "signature": []
+        });
+        submit(alice_api, &reg, LABEL);
+        let (fee, _) = confirm_success(&api_ports, &cfg, &reg, timeout, LABEL);
+        fees[pos(USER)] += fee;
+        sent[pos(USER)] += 1;
+        assert_eq!(agreed_on(&api_ports, LABEL, tier).as_deref(), Some("Provisional"),
+            "{LABEL}: user1 must be Provisional after registering");
+        println!("   RegisterIdentity(user1) ✓ fee={fee} → Provisional on all nodes");
+
+        // Step 2: three attestations, each from that attester's real nonce.
+        let atts: Vec<serde_json::Value> = ["qcb1alice", "qcb1bob", "qcb1carol"].iter()
+            .map(|a| serde_json::json!({
+                "id": format!("mn7-att-{a}-{run_id}"), "sender": a, "nonce": nonce0[pos(a)],
+                "gas_limit": 100_000u64, "body": { "Attest": { "claimant_id": USER } }, "signature": []
+            }))
+            .collect();
+        for t in &atts { submit(alice_api, t, LABEL); }
+        let mut quorum_events = 0;
+        for t in &atts {
+            let (fee, outcome) = confirm_success(&api_ports, &cfg, t, timeout, LABEL);
+            let s = t["sender"].as_str().unwrap();
+            fees[pos(s)] += fee;
+            sent[pos(s)] += 1;
+            let reached = outcome["events"].as_array().into_iter().flatten()
+                .any(|e| e.as_str().unwrap_or("").contains("now Verified"));
+            if reached { quorum_events += 1; }
+            println!("   Attest({s} → user1) ✓ fee={fee}{}", if reached { " — quorum reached" } else { "" });
+        }
+        assert_eq!(quorum_events, 1, "{LABEL}: exactly one attestation must report reaching the quorum of 3");
+        assert_eq!(agreed_on(&api_ports, LABEL, tier).as_deref(), Some("Verified"),
+            "{LABEL}: user1 must be Verified after 3 distinct attestations");
+        assert_eq!(agreed_on(&api_ports, LABEL, attesters), Some(3));
+        println!("   user1 Verified with 3 attesters on all nodes");
+
+        // Step 3: Alice revokes.
+        let revoke = serde_json::json!({
+            "id": format!("mn7-revoke-{run_id}"), "sender": "qcb1alice",
+            "nonce": nonce0[pos("qcb1alice")] + sent[pos("qcb1alice")],
+            "gas_limit": 100_000u64, "body": { "RevokeAttestation": { "attested_id": USER } },
+            "signature": []
+        });
+        submit(alice_api, &revoke, LABEL);
+        let (fee, _) = confirm_success(&api_ports, &cfg, &revoke, timeout, LABEL);
+        fees[pos("qcb1alice")] += fee;
+        sent[pos("qcb1alice")] += 1;
+        assert_eq!(agreed_on(&api_ports, LABEL, tier).as_deref(), Some("Provisional"),
+            "{LABEL}: user1 must drop back to Provisional below the quorum");
+        assert_eq!(agreed_on(&api_ports, LABEL, attesters), Some(2));
+        println!("   RevokeAttestation(alice → user1) ✓ fee={fee} → Provisional with 2 attesters on all nodes");
+
+        // Step 4: exact accounting, once every node has applied one more block.
+        let settled = api_ports.iter().map(|&p| height_of(p)).max().unwrap() + 1;
+        wait_for_height(&api_ports, settled, timeout);
+        for (i, s) in senders.iter().enumerate() {
+            let n = agreed_on(&api_ports, &format!("{LABEL}: {s} nonce"), |p| account_nonce(p, s));
+            assert_eq!(n, nonce0[i] + sent[i], "{LABEL}: {s} nonce must rise by exactly {}", sent[i]);
+            let b = agreed_on(&api_ports, &format!("{LABEL}: {s} balance"), |p| balance_of(p, s));
+            if *s == USER {
+                assert_eq!(b, bal0[i] - fees[i], "{LABEL}: user1 must lose exactly its fees");
+            } else {
+                assert!(b + fees[i] >= bal0[i],
+                    "{LABEL}: {s} lost more than its fees ({} before, {b} after, fees {})", bal0[i], fees[i]);
+            }
+            println!("   {s}: nonce {} → {n}, balance {} → {b} (fees {})", nonce0[i], bal0[i], fees[i]);
         }
 
-        // --- Step 6: The post-revocation root must differ from pre-revocation --
-        // (Revocation changed state; if roots match, the revocation was silently
-        //  dropped and the test would be vacuous.)
-        assert_ne!(
-            ref_post_revoke, ref_post_attest,
-            "MN-7 FAILED: state root is unchanged after personhood revocation — \
-             the revocation event may not have been applied"
-        );
-
-        println!("   MN-7 PASS — personhood revocation applied deterministically");
-        println!("   state root after attestation: {ref_post_attest}");
-        println!("   state root after revocation:  {ref_post_revoke}");
-        println!("   (roots differ — revocation changed state on all nodes)");
+        // Step 5: same root for a pinned height on every node.
+        let pin = api_ports.iter().map(|&p| height_of(p)).max().unwrap() + 1;
+        wait_for_height(&api_ports, pin, timeout);
+        let root = agreed_on(&api_ports, &format!("{LABEL}: state root at height {pin}"), |p| block_root(p, pin));
+        assert!(root.is_some(), "{LABEL}: no state root recorded for height {pin}");
+        println!("   MN-7 PASS — outcomes, fees, nonces and tiers verified; root@{pin}={}", root.unwrap());
     }
 
-    // ── Phase 9: MN-8 — reward exclusion after personhood revocation ─────────
-    //
-    // Scenario:
-    //   1.  Spawn Eve's node (post-genesis user account with balance in genesis).
-    //   2.  Eve registers her identity (nonce=0).
-    //   3.  Alice, Bob, Carol each Attest Eve → quorum=3 → Eve is Verified
-    //       (verified_via_wot=true, grants_consensus()=true).
-    //   4.  Eve bonds as a validator (BondValidator, nonce=1) and registers a
-    //       consensus key (RegisterValidatorKey, nonce=2).
-    //   5.  Wait for the next epoch boundary: Eve is admitted to the active set
-    //       (pop_verified=true, nonzero voting power).
-    //   6.  Wait for the following full epoch so Eve accumulates participation
-    //       (signs ≥ 95% of EPOCH_BLOCKS blocks).
-    //   7.  Record Eve's balance and each genesis validator's balance before
-    //       the next epoch close.
-    //   8.  Alice revokes her attestation → Eve's WoT count drops 3→2 < quorum
-    //       → identity downgrade to Provisional → grants_consensus()=false →
-    //       pop_verified set to false on next block refresh.
-    //   9.  Cross the next epoch boundary.
-    //  10.  Assert Eve's balance did NOT increase (excluded from reward sweep).
-    //  11.  Assert every genesis validator's balance DID increase (pool shared
-    //       among the remaining eligible validators — proves the pool was swept).
-    //  12.  Assert all five nodes (Alice through Eve) agree on state root.
-    println!("── Phase 9: MN-8 — reward exclusion after personhood revocation ───────");
-    {
-        let alice_api = api_ports[0];
-
-        // ── Step 1: Start Eve's observer node ──────────────────────────────────
-        // Collect bootstrap addresses from all four live peers so Eve connects
-        // to the full validator set immediately.
-        let mut eve_bootstraps: Vec<String> = Vec::new();
-        for peer_idx in 0..VALIDATORS.len() {
-            let peer_id = read_peer_id_from_log(&nodes[peer_idx].log_path, Duration::from_secs(5));
-            eve_bootstraps.push(format!(
-                "/ip4/127.0.0.1/tcp/{}/p2p/{}", P2P_PORTS[peer_idx], peer_id
-            ));
-        }
-        let mut eve_node = spawn_eve(&bin, &genesis, &log_dir, Some(&eve_data_dir), &eve_bootstraps);
-        assert!(
-            wait_for_port(EVE_API_PORT, Duration::from_secs(20)),
-            "Eve API port :{EVE_API_PORT} never opened"
-        );
-        println!("   Eve node up on :{EVE_API_PORT}");
-
-        // Collect all API ports (4 genesis + Eve) for consensus checks.
-        let all_api_ports: Vec<u16> = api_ports.iter().copied().chain(std::iter::once(EVE_API_PORT)).collect();
-
-        // Wait for Eve to sync to the current chain tip.
-        let tip = height_of(alice_api);
-        wait_for_height(&all_api_ports, tip, timeout);
-
-        // ── Step 2: Eve registers her identity ────────────────────────────────
-        let mn8_run_id = run_id + 1000; // distinct namespace from MN-7 nonces
-        let tx_eve_reg = serde_json::json!({
-            "id": format!("mn8-eve-reg-{mn8_run_id}"),
-            "sender": EVE_ADDR,
-            "nonce": 0u64,
-            "gas_limit": 100_000u64,
-            "body": "RegisterIdentity",
-            "signature": []
-        }).to_string();
-        let resp = api_post_tx(alice_api, &tx_eve_reg).expect("MN-8 Eve RegisterIdentity POST failed");
-        let st = resp["status"].as_str().unwrap_or("unknown");
-        assert!(st == "queued" || st == "ok", "MN-8 FAILED: Eve RegisterIdentity rejected: {resp}");
-        println!("   RegisterIdentity(eve) → {st}");
-
-        // ── Step 3: Three attestations for Eve → quorum, Eve becomes Verified ─
-        // Alice(nonce=2, after mn7-revoke nonce=1), Bob(nonce=1), Carol(nonce=1).
-        let eve_attesters = [
-            ("qcb1alice", 2u64, format!("mn8-att-alice-{mn8_run_id}")),
-            ("qcb1bob",   1u64, format!("mn8-att-bob-{mn8_run_id}")),
-            ("qcb1carol", 1u64, format!("mn8-att-carol-{mn8_run_id}")),
-        ];
-        for (sender, nonce, id) in &eve_attesters {
-            let tx = serde_json::json!({
-                "id": id,
-                "sender": sender,
-                "nonce": nonce,
-                "gas_limit": 100_000u64,
-                "body": { "Attest": { "claimant_id": EVE_ADDR } },
-                "signature": []
-            }).to_string();
-            let r = api_post_tx(alice_api, &tx).unwrap_or_else(|| panic!("MN-8 Attest from {sender} POST failed"));
-            let s = r["status"].as_str().unwrap_or("unknown");
-            assert!(s == "queued" || s == "ok", "MN-8 FAILED: Attest from {sender} rejected: {r}");
-            println!("   Attest({sender} → eve) → {s}");
-        }
-
-        // ── Step 4: Eve bonds as a validator and registers a consensus key ────
-        // BondValidator(nonce=1) and RegisterValidatorKey(nonce=2) submitted
-        // to Eve's own API so they originate from her local node.
-        let tx_bond = serde_json::json!({
-            "id": format!("mn8-eve-bond-{mn8_run_id}"),
-            "sender": EVE_ADDR,
-            "nonce": 1u64,
-            "gas_limit": 200_000u64,
-            "body": { "BondValidator": {
-                "amount": EVE_BOND_UQCB,
-                "owner_identity_id": EVE_ADDR
-            }},
-            "signature": []
-        }).to_string();
-        let r = api_post_tx(EVE_API_PORT, &tx_bond).expect("MN-8 Eve BondValidator POST failed");
-        let s = r["status"].as_str().unwrap_or("unknown");
-        assert!(s == "queued" || s == "ok", "MN-8 FAILED: Eve BondValidator rejected: {r}");
-        println!("   BondValidator(eve, {EVE_BOND_UQCB} uqcb) → {s}");
-
-        // Read Eve's consensus public key from her key file for RegisterValidatorKey.
-        let eve_key_path = key_path("eve");
-        let eve_key_json: serde_json::Value = {
-            let raw = std::fs::read_to_string(&eve_key_path)
-                .unwrap_or_else(|e| panic!("failed to read eve key file: {e}"));
-            serde_json::from_str(&raw).expect("eve key file is not valid JSON")
-        };
-        let eve_pubkey_hex = eve_key_json["public_key"]
-            .as_str()
-            .expect("eve key file missing 'public_key' field")
-            .to_string();
-
-        let tx_key = serde_json::json!({
-            "id": format!("mn8-eve-key-{mn8_run_id}"),
-            "sender": EVE_ADDR,
-            "nonce": 2u64,
-            "gas_limit": 200_000u64,
-            "body": { "RegisterValidatorKey": {
-                "consensus_pubkey": hex::decode(&eve_pubkey_hex).expect("eve pubkey not hex"),
-                "scheme": "classical",
-                "proof_of_possession": []
-            }},
-            "signature": []
-        }).to_string();
-        let r = api_post_tx(EVE_API_PORT, &tx_key).expect("MN-8 Eve RegisterValidatorKey POST failed");
-        let s = r["status"].as_str().unwrap_or("unknown");
-        assert!(s == "queued" || s == "ok", "MN-8 FAILED: Eve RegisterValidatorKey rejected: {r}");
-        println!("   RegisterValidatorKey(eve) → {s}");
-
-        // ── Step 5: Wait for next epoch — Eve is admitted to the active set ───
-        let cur_height = height_of(alice_api);
-        let admission_epoch_height = ((cur_height / EPOCH_BLOCKS) + 1) * EPOCH_BLOCKS + 1;
-        println!("   waiting for admission epoch boundary at height {admission_epoch_height}...");
-        wait_for_height(&all_api_ports, admission_epoch_height, timeout);
-        println!("   Eve admitted to active set (or promotion pending next block refresh)");
-
-        // ── Step 6: Wait for Eve to accumulate a full epoch of participation ──
-        // She needs to sign ≥ 95% of EPOCH_BLOCKS (= 5) blocks.  Give her two
-        // full epochs so even if admission slips by one block she still gets
-        // the required participation count.
-        let participation_height = admission_epoch_height + EPOCH_BLOCKS * 2 + 1;
-        println!("   waiting for Eve's participation epoch to close at height {participation_height}...");
-        wait_for_height(&all_api_ports, participation_height, timeout);
-
-        // ── Step 7: Record balances before the revocation epoch ───────────────
-        let eve_bal_before = balance_of(alice_api, EVE_ADDR);
-        let genesis_bals_before: Vec<u128> = VALIDATORS.iter()
-            .map(|v| balance_of(alice_api, v))
-            .collect();
-        println!("   Eve balance before revocation epoch: {eve_bal_before}");
-        for (i, v) in VALIDATORS.iter().enumerate() {
-            println!("   {v} balance before revocation epoch: {}", genesis_bals_before[i]);
-        }
-
-        // ── Step 8: Alice revokes her attestation of Eve ───────────────────────
-        // Alice nonce = 3 (nonce 0=MN-7-attest, 1=MN-7-revoke, 2=MN-8-attest-eve).
-        let tx_revoke_eve = serde_json::json!({
-            "id": format!("mn8-revoke-{mn8_run_id}"),
-            "sender": "qcb1alice",
-            "nonce": 3u64,
-            "gas_limit": 100_000u64,
-            "body": { "RevokeAttestation": { "attested_id": EVE_ADDR } },
-            "signature": []
-        }).to_string();
-        let r = api_post_tx(alice_api, &tx_revoke_eve).expect("MN-8 RevokeAttestation POST failed");
-        let s = r["status"].as_str().unwrap_or("unknown");
-        assert!(s == "queued" || s == "ok", "MN-8 FAILED: RevokeAttestation(eve) rejected: {r}");
-        println!("   RevokeAttestation(alice → eve) → {s}");
-
-        // ── Step 9: Cross the next epoch boundary ─────────────────────────────
-        let h = height_of(alice_api);
-        let revoke_epoch_height = ((h / EPOCH_BLOCKS) + 1) * EPOCH_BLOCKS + 1;
-        println!("   waiting for revocation epoch close at height {revoke_epoch_height}...");
-        wait_for_height(&all_api_ports, revoke_epoch_height, timeout);
-
-        // ── Step 10: Assert Eve's balance did NOT increase ─────────────────────
-        let eve_bal_after = balance_of(alice_api, EVE_ADDR);
-        // Eve may have paid gas for her txs but must NOT have received rewards.
-        // Allow that her balance decreased (gas costs) but not increased.
-        assert!(
-            eve_bal_after <= eve_bal_before,
-            "MN-8 FAILED: Eve's balance increased after personhood revocation \
-             (before={eve_bal_before}, after={eve_bal_after}) — \
-             a downgraded-to-Provisional validator must not receive epoch rewards"
-        );
-        println!("   Eve balance after revocation epoch: {eve_bal_after}  (no reward — PASS)");
-
-        // ── Step 11: Assert genesis validator balances increased ───────────────
-        let genesis_bals_after: Vec<u128> = VALIDATORS.iter()
-            .map(|v| balance_of(alice_api, v))
-            .collect();
-        for (i, v) in VALIDATORS.iter().enumerate() {
-            assert!(
-                genesis_bals_after[i] >= genesis_bals_before[i],
-                "MN-8 FAILED: {v}'s balance did not increase after epoch close \
-                 (before={}, after={}) — eligible validators must receive rewards",
-                genesis_bals_before[i], genesis_bals_after[i]
-            );
-            println!(
-                "   {v} balance after revocation epoch: {} (+{})",
-                genesis_bals_after[i],
-                genesis_bals_after[i].saturating_sub(genesis_bals_before[i])
-            );
-        }
-
-        // ── Step 12: All five nodes agree on state root ────────────────────────
-        let roots: Vec<Option<String>> = all_api_ports.iter()
-            .map(|&p| state_root_of(p))
-            .collect();
-        let ref_root = roots[0].as_deref().expect("Alice must have a state root after MN-8");
-        let all_names: Vec<&str> = VALIDATORS.iter().copied().chain(std::iter::once(EVE_ADDR)).collect();
-        for (i, r) in roots.iter().enumerate().skip(1) {
-            assert_eq!(
-                r.as_deref(), Some(ref_root),
-                "MN-8 FAILED: {}'s state root differs from Alice's\n  alice={ref_root}\n  {}={r:?}",
-                all_names[i], all_names[i]
-            );
-        }
-        println!("   All five nodes agree on state root: {ref_root}");
-        println!("   MN-8 PASS — post-revocation validator excluded from epoch reward sweep");
-
-        // Eve's RAII drop kills her node at end of scope.
-        drop(eve_node);
-    }
+    // MN-8 (reward exclusion after personhood revocation) is not run here. Its
+    // previous form never executed its transactions and asserted only
+    // `balance_after >= balance_before`. An honest MN-8 needs epoch rewards to
+    // be reachable on a multi-validator network, which depends on full
+    // last-commit participation (H0-1). It returns as its own test then.
 
     // ── Summary ───────────────────────────────────────────────────────────────
-    println!("\n── FS-03-MN-001 PASSED ─────────────────────────────────────────────");
+    println!("\n── FS-03-MN-001: MN-1..MN-7 PASSED (MN-8 pending) ──────────────────");
     println!("   MN-1  ✅  Identical state roots across all nodes");
     println!("   MN-2  ✅  Fee pool + treasury balances consistent");
     println!("   MN-3  ✅  Per-tx fee charged beyond raw transfer amounts");
     println!("   MN-4  ✅  Epoch-close validator balances agree");
     println!("   MN-5  ✅  Restarted node recovers to same state root");
     println!("   MN-6  ✅  No double-distribution after crash-restart");
-    println!("   MN-7  ✅  Personhood revocation deterministic across all nodes");
-    println!("   MN-8  ✅  Revoked validator excluded from epoch reward sweep");
+    println!("   MN-7  ✅  Attestation/revocation outcomes, fees, nonces and tiers verified");
+    println!("   MN-8  ⏳  Not run: pending full last-commit participation (H0-1)");
     println!();
 
     // NodeProc::drop() kills all children.
