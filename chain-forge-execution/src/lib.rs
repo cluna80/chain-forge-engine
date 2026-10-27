@@ -198,6 +198,20 @@ pub fn distribute_block_fees(
     native_denom:   &str,
     state:          &mut chain_forge_state::StateStore,
 ) -> FeeSettlementResult {
+    distribute_block_fees_from("treasury:fees", fees_collected, dist, native_denom, state)
+}
+
+/// Distribute this block's fees out of `fee_src` (the chain's configured fee
+/// collector). `fees_collected` must be the fees actually debited into
+/// `fee_src` this block (H0-7), so every leg should succeed; a failed leg is an
+/// invariant violation and is logged as an error rather than ignored.
+pub fn distribute_block_fees_from(
+    fee_src:        &str,
+    fees_collected: u64,
+    dist:           &FeeDistribution,
+    native_denom:   &str,
+    state:          &mut chain_forge_state::StateStore,
+) -> FeeSettlementResult {
     if fees_collected == 0 {
         return FeeSettlementResult {
             fees_total: 0, validator_share: 0, treasury_share: 0, burn_share: 0,
@@ -205,7 +219,12 @@ pub fn distribute_block_fees(
     }
 
     let (validator_share, treasury_share, burn_share) = dist.split(fees_collected);
-    let fee_src = "treasury:fees";
+    let report = |leg: &str, r: chain_forge_state::StateResult<()>| {
+        if let Err(e) = r {
+            tracing::error!(fee_src, leg, fees_collected, error = %e,
+                "H0-7 fee conservation violated: fee distribution leg failed");
+        }
+    };
 
     // Helper: credit an account, auto-creating if absent.
     let credit_account = |state: &mut chain_forge_state::StateStore, addr: &str, amount: u64| {
@@ -221,19 +240,19 @@ pub fn distribute_block_fees(
 
     // Move validator share: treasury:fees → treasury:validator-pool
     if validator_share > 0 {
-        let _ = state.transfer(fee_src, "treasury:validator-pool", native_denom, validator_share as u128);
+        report("validator", state.transfer(fee_src, "treasury:validator-pool", native_denom, validator_share as u128));
     }
 
     // Move treasury share: treasury:fees → treasury:network
     if treasury_share > 0 {
         // Ensure destination exists before transfer.
         credit_account(state, "treasury:network", 0);
-        let _ = state.transfer(fee_src, "treasury:network", native_denom, treasury_share as u128);
+        report("treasury", state.transfer(fee_src, "treasury:network", native_denom, treasury_share as u128));
     }
 
     // Burn the burn share permanently.
     if burn_share > 0 {
-        let _ = state.burn(fee_src, native_denom, burn_share as u128);
+        report("burn", state.burn(fee_src, native_denom, burn_share as u128));
     }
 
     tracing::debug!(
@@ -964,6 +983,25 @@ fn advance_nonce_if_not_already(tx: &Transaction, state: &mut StateStore) {
     state.refresh_leaf(&tx.sender);
 }
 
+/// H0-5: finish an included tx (admitted, fee already debited) whose body ran
+/// inside a `StateStore` checkpoint. Success keeps the body's writes; failure
+/// rolls every one of them back and then consumes the sender's nonce, so the
+/// same signed tx can never be included (and charged) again. Either way the
+/// result records the fee that was charged.
+fn settle_included_tx(tx: &Transaction, state: &mut StateStore, result: &mut TransactionResult, fee: u64) {
+    if result.success {
+        state.commit_checkpoint();
+    } else {
+        state.rollback_checkpoint();
+        if let Ok(acct) = state.get_account_mut(&tx.sender) {
+            acct.increment_nonce();
+        }
+        state.refresh_leaf(&tx.sender);
+    }
+    result.gas_used = fee;
+    result.fee_charged = fee;
+}
+
 /// Debit the fee for a transaction from the sender's account and credit it
 /// to the fee-collector account.
 ///
@@ -1471,15 +1509,19 @@ pub struct TransactionResult {
     pub error:     Option<String>,
     /// Events emitted (simplified -- a real chain would have structured events).
     pub events:    Vec<String>,
+    /// H0-7: fee actually debited from the sender for this tx. Non-zero only
+    /// for included txs (successful or failed); 0 for rejected txs.
+    #[serde(default)]
+    pub fee_charged: u64,
 }
 
 impl TransactionResult {
     pub fn ok(tx_id: String, gas_used: u64, gas_limit: u64, events: Vec<String>) -> Self {
-        Self { tx_id, success: true, gas_used, gas_limit, error: None, events }
+        Self { tx_id, success: true, gas_used, gas_limit, error: None, events, fee_charged: 0 }
     }
 
     pub fn err(tx_id: String, gas_used: u64, gas_limit: u64, error: String) -> Self {
-        Self { tx_id, success: false, gas_used, gas_limit, error: Some(error), events: vec![] }
+        Self { tx_id, success: false, gas_used, gas_limit, error: Some(error), events: vec![], fee_charged: 0 }
     }
 }
 
@@ -2656,7 +2698,29 @@ impl Executor {
     /// Execute a single transaction with CharmConfinement enforcement.
     /// Requires identity store, QRC engine, and agent store for identity-gated
     /// and agent-registered tx types.
+    /// Execute one tx against state, identity and agents.
+    ///
+    /// H0-5/H0-7 semantics:
+    /// - rejected at admission (gas, module, nonce, authorization, fee):
+    ///   no state change, `gas_used = 0`, `fee_charged = 0`;
+    /// - included but failed: fee charged, nonce consumed exactly once, every
+    ///   other write rolled back;
+    /// - included and successful: fee charged, body applied.
     pub fn execute_tx_with_identity(
+        &self,
+        tx:       &Transaction,
+        state:    &mut StateStore,
+        identity: &mut IdentityStore,
+        agents:   &mut AgentStore,
+    ) -> TransactionResult {
+        let mut r = self.execute_tx_with_identity_inner(tx, state, identity, agents);
+        if r.fee_charged == 0 {
+            r.gas_used = 0;
+        }
+        r
+    }
+
+    fn execute_tx_with_identity_inner(
         &self,
         tx:       &Transaction,
         state:    &mut StateStore,
@@ -2780,6 +2844,30 @@ impl Executor {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
+        // H0-5: the tx is now included (admitted, fee paid). Everything the
+        // body writes -- state, identity, agents -- is undone if it fails.
+        state.begin_checkpoint();
+        let identity_before = identity.clone();
+        let agents_before = agents.clone();
+        let mut result = self.execute_tx_with_identity_body(tx, state, identity, agents, gas_required);
+        if !result.success {
+            *identity = identity_before;
+            *agents = agents_before;
+        }
+        settle_included_tx(tx, state, &mut result, gas_required);
+        result
+    }
+
+    /// Body of `execute_tx_with_identity`, run inside a checkpoint. Early
+    /// returns here are failures of an included tx and get rolled back.
+    fn execute_tx_with_identity_body(
+        &self,
+        tx:           &Transaction,
+        state:        &mut StateStore,
+        identity:     &mut IdentityStore,
+        agents:       &mut AgentStore,
+        gas_required: u64,
+    ) -> TransactionResult {
         let mut events = Vec::new();
         let result = match &tx.body {
 
@@ -4079,9 +4167,23 @@ impl Executor {
     }
 
     /// Execute a single transaction against the state store.
-    /// Returns the result regardless of success/failure --
-    /// failed txs still consume gas and advance the nonce.
+    /// Returns the result regardless of success/failure. Same H0-5/H0-7
+    /// semantics as `execute_tx_with_identity`: a rejected tx changes nothing
+    /// and uses no gas; an included-but-failed tx pays the fee and consumes
+    /// its nonce, and nothing else changes.
     pub fn execute_tx(
+        &self,
+        tx: &Transaction,
+        state: &mut StateStore,
+    ) -> TransactionResult {
+        let mut r = self.execute_tx_inner(tx, state);
+        if r.fee_charged == 0 {
+            r.gas_used = 0;
+        }
+        r
+    }
+
+    fn execute_tx_inner(
         &self,
         tx: &Transaction,
         state: &mut StateStore,
@@ -4128,6 +4230,21 @@ impl Executor {
             return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
         }
 
+        // H0-5: the tx is now included (admitted, fee paid); undo the body's
+        // writes if it fails.
+        state.begin_checkpoint();
+        let mut result = self.execute_tx_body(tx, state, gas_required);
+        settle_included_tx(tx, state, &mut result, gas_required);
+        result
+    }
+
+    /// Body of `execute_tx`, run inside a checkpoint.
+    fn execute_tx_body(
+        &self,
+        tx:           &Transaction,
+        state:        &mut StateStore,
+        gas_required: u64,
+    ) -> TransactionResult {
         // Execute the operation
         let mut events = Vec::new();
         let result = match &tx.body {
@@ -4284,7 +4401,7 @@ impl Executor {
                 );
                 results.push(TransactionResult::err(
                     tx.id.clone(),
-                    gas_required,
+                    0,
                     tx.gas_limit,
                     format!("block gas limit would be exceeded ({total_gas} + {gas_required} > {limit})"),
                 ));
@@ -4293,13 +4410,17 @@ impl Executor {
 
             let result = self.execute_tx(tx, state);
             total_gas     += result.gas_used;
-            // FS-03: fee in uQCB == gas_used (GasModel returns uQCB directly).
-            // debit_fee() already moved this amount sender → fee_collector.
-            // Failed txs still consume the fee (EVM semantics); both success
-            // and failure cases are counted in fees_collected.
-            fees_collected += result.gas_used;
+            // H0-7: count only fees actually debited (included txs, successful
+            // or failed). Rejected txs report fee_charged = 0.
+            fees_collected += result.fee_charged;
             results.push(result);
         }
+
+        // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
+        // Operates only on fees_collected (this block) — not the collector's
+        // balance. Must run before commit so the reported root includes it.
+        distribute_block_fees_from(&self.config.fee_collector, fees_collected,
+            &self.config.fee_distribution, &self.config.native_denom, state);
 
         // Commit state after all txs -- take a snapshot every 100 blocks
         let take_snapshot = height % 100 == 0;
@@ -4313,9 +4434,6 @@ impl Executor {
             "block executed"
         );
 
-        // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
-        // Operates only on fees_collected (this block) — not the treasury:fees balance.
-        distribute_block_fees(fees_collected, &self.config.fee_distribution, &self.config.native_denom, state);
 
         BlockExecutionResult {
             height,
@@ -4363,7 +4481,7 @@ impl Executor {
                 );
                 results.push(TransactionResult::err(
                     tx.id.clone(),
-                    gas_required,
+                    0,
                     tx.gas_limit,
                     format!("block gas limit would be exceeded ({total_gas} + {gas_required} > {limit})"),
                 ));
@@ -4372,8 +4490,8 @@ impl Executor {
 
             let result = self.execute_tx_with_identity(tx, state, identity, agents);
             total_gas      += result.gas_used;
-            // FS-03: debit_fee() already moved fee amount sender → fee_collector.
-            fees_collected += result.gas_used;
+            // H0-7: count only fees actually debited (see execute_block).
+            fees_collected += result.fee_charged;
             results.push(result);
         }
 
@@ -4466,7 +4584,8 @@ impl Executor {
         }
 
         // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
-        distribute_block_fees(fees_collected, &self.config.fee_distribution, &self.config.native_denom, state);
+        distribute_block_fees_from(&self.config.fee_collector, fees_collected,
+            &self.config.fee_distribution, &self.config.native_denom, state);
 
         let take_snapshot = height % 100 == 0;
         let state_root = state.commit(height, timestamp_ms, take_snapshot);
@@ -6302,7 +6421,7 @@ mod tests {
         let both_tx = Transaction {
             id: "scope-both".to_string(),
             sender: gov.to_string(),
-            nonce: 0,
+            nonce: 1, // H0-5: the rejected tx above was included and consumed nonce 0
             body: TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme: "ed25519".to_string(),
                 replacement_scheme: "ml-dsa".to_string(),
@@ -6328,7 +6447,7 @@ mod tests {
 
         // TxSignatures scope must succeed (sanity check the guard is scoped).
         let good_tx = emergency_deprecate_tx(
-            "scope-ok", gov, 0, "ed25519", "ml-dsa",
+            "scope-ok", gov, 2, "ed25519", "ml-dsa",
             MIN_CRYPTO_GRACE_EPOCHS, "scope guard sanity",
         );
         let r = exec.execute_tx_with_identity(
@@ -6467,7 +6586,7 @@ mod tests {
         let bad_dep_tx = Transaction {
             id: "bad-dep-1".to_string(),
             sender: gov.to_string(),
-            nonce: 0,
+            nonce: 1, // H0-5: the rejected tx above was included and consumed nonce 0
             body: TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme:  "secp256k1".to_string(), // not in registry
                 replacement_scheme: "ml-dsa".to_string(),
@@ -6494,7 +6613,7 @@ mod tests {
 
         // Valid tx must still succeed after the rejects.
         let good_tx = emergency_deprecate_tx(
-            "good-scheme", gov, 0, "ed25519", "ml-dsa",
+            "good-scheme", gov, 2, "ed25519", "ml-dsa",
             MIN_CRYPTO_GRACE_EPOCHS, "valid schemes",
         );
         let r = exec.execute_tx_with_identity(
@@ -6541,7 +6660,7 @@ mod tests {
         let conflict_tx = Transaction {
             id: "conflict-mig".to_string(),
             sender: gov.to_string(),
-            nonce: 1,
+            nonce: 2, // H0-5: the failed duplicate above consumed nonce 1
             body: TxBody::EmergencyDeprecateAlgorithm {
                 deprecated_scheme:  "slh-dsa".to_string(),
                 replacement_scheme: "ml-dsa".to_string(),

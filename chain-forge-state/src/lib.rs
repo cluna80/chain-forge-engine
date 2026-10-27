@@ -366,6 +366,17 @@ pub struct StateStore {
     /// map cleanly to the account model (e.g. CryptoMigrationState, CS-001 P4).
     /// Values are serialized JSON strings.
     metadata: HashMap<String, String>,
+    /// H0-5: pre-images of every account and metadata entry written since
+    /// `begin_checkpoint`, so a failed transaction can be undone exactly.
+    checkpoint: Option<Checkpoint>,
+}
+
+/// First-write pre-images recorded while a checkpoint is open. `None` means
+/// the entry did not exist before the checkpoint.
+#[derive(Debug, Default)]
+struct Checkpoint {
+    accounts: HashMap<String, Option<AccountState>>,
+    metadata: HashMap<String, Option<String>>,
 }
 
 impl StateStore {
@@ -379,6 +390,7 @@ impl StateStore {
             snapshots:     BTreeMap::new(),
             max_snapshots: 128,
             metadata:      HashMap::new(),
+            checkpoint:    None,
         }
     }
 
@@ -392,6 +404,7 @@ impl StateStore {
     /// and insert the corresponding leaf into the Merkle tree so that the
     /// entry participates in the state root.
     pub fn set_raw(&mut self, key: &str, value: &str) {
+        self.note_metadata(key);
         self.metadata.insert(key.to_string(), value.to_string());
         self.tree.upsert(Self::metadata_leaf_key(key), value.as_bytes());
     }
@@ -404,6 +417,7 @@ impl StateStore {
     /// Remove a metadata value (e.g. after a migration completes or is
     /// cleared) and prune the corresponding Merkle leaf.
     pub fn remove_raw(&mut self, key: &str) {
+        self.note_metadata(key);
         self.metadata.remove(key);
         self.tree.remove(&Self::metadata_leaf_key(key));
     }
@@ -441,6 +455,7 @@ impl StateStore {
 
     /// Insert or replace an account state and update the Merkle tree.
     pub fn upsert_account(&mut self, account: AccountState) {
+        self.note_account(&account.address);
         let leaf_bytes = account.to_leaf_bytes();
         self.tree.upsert(account.address.clone(), &leaf_bytes);
         self.accounts.insert(account.address.clone(), account);
@@ -454,8 +469,74 @@ impl StateStore {
 
     /// Get a mutable account by address.
     pub fn get_account_mut(&mut self, address: &str) -> StateResult<&mut AccountState> {
+        self.note_account(address);
         self.accounts.get_mut(address)
             .ok_or_else(|| StateError::AccountNotFound(address.to_string()))
+    }
+
+    // -- Transaction checkpoints (H0-5) ----------------------------------------
+
+    /// Start recording pre-images so the writes that follow can be undone
+    /// with `rollback_checkpoint`. Every account and metadata write goes
+    /// through `upsert_account`, `get_account_mut`, `set_raw` or `remove_raw`,
+    /// which record the entry's prior value the first time it is touched.
+    pub fn begin_checkpoint(&mut self) {
+        debug_assert!(self.checkpoint.is_none(), "checkpoints do not nest");
+        self.checkpoint = Some(Checkpoint::default());
+    }
+
+    /// Keep every write made since `begin_checkpoint`.
+    pub fn commit_checkpoint(&mut self) {
+        self.checkpoint = None;
+    }
+
+    /// Undo every write made since `begin_checkpoint`: restore each touched
+    /// account and metadata entry (or remove it if it did not exist) together
+    /// with its Merkle leaf. The tree root is a function of its leaves, so it
+    /// returns to its pre-checkpoint value.
+    pub fn rollback_checkpoint(&mut self) {
+        let Some(cp) = self.checkpoint.take() else { return };
+        for (addr, prior) in cp.accounts {
+            match prior {
+                Some(acct) => {
+                    self.tree.upsert(addr.clone(), &acct.to_leaf_bytes());
+                    self.accounts.insert(addr, acct);
+                }
+                None => {
+                    self.accounts.remove(&addr);
+                    self.tree.remove(&addr);
+                }
+            }
+        }
+        for (key, prior) in cp.metadata {
+            let leaf_key = Self::metadata_leaf_key(&key);
+            match prior {
+                Some(value) => {
+                    self.tree.upsert(leaf_key, value.as_bytes());
+                    self.metadata.insert(key, value);
+                }
+                None => {
+                    self.metadata.remove(&key);
+                    self.tree.remove(&leaf_key);
+                }
+            }
+        }
+    }
+
+    fn note_account(&mut self, address: &str) {
+        if let Some(cp) = self.checkpoint.as_mut() {
+            if !cp.accounts.contains_key(address) {
+                cp.accounts.insert(address.to_string(), self.accounts.get(address).cloned());
+            }
+        }
+    }
+
+    fn note_metadata(&mut self, key: &str) {
+        if let Some(cp) = self.checkpoint.as_mut() {
+            if !cp.metadata.contains_key(key) {
+                cp.metadata.insert(key.to_string(), self.metadata.get(key).cloned());
+            }
+        }
     }
 
     /// Recompute an account's Merkle leaf after it was mutated in place via
@@ -639,6 +720,68 @@ impl StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- H0-5 transaction checkpoints ----------------------------------------
+
+    fn seeded() -> StateStore {
+        let mut s = StateStore::new(HashWidth::Bits256);
+        for (addr, amt) in [("qcb1a", 1_000u128), ("qcb1b", 500)] {
+            let mut a = AccountState::new(addr.into(), "user".into());
+            a.credit("uqcb", amt);
+            s.upsert_account(a);
+        }
+        s.set_raw("meta-kept", "v1");
+        s
+    }
+
+    #[test]
+    fn rollback_restores_accounts_metadata_and_root_exactly() {
+        let mut s = seeded();
+        let root0 = s.current_root().map(str::to_string);
+        let a0 = format!("{:?}", s.get_account("qcb1a").unwrap());
+
+        s.begin_checkpoint();
+        s.transfer("qcb1a", "qcb1new", "uqcb", 300).unwrap();        // creates an account
+        s.get_account_mut("qcb1b").unwrap().credit("uqcb", 7);      // in-place write
+        s.refresh_leaf("qcb1b");
+        s.set_raw("meta-kept", "v2");                                // overwrite
+        s.set_raw("meta-new", "x");                                  // create
+        s.remove_raw("meta-kept");                                   // then delete
+        assert_ne!(s.current_root().map(str::to_string), root0);
+        s.rollback_checkpoint();
+
+        assert_eq!(s.current_root().map(str::to_string), root0, "root must return to its pre-checkpoint value");
+        assert_eq!(format!("{:?}", s.get_account("qcb1a").unwrap()), a0);
+        assert_eq!(s.get_account("qcb1b").unwrap().balance_of("uqcb"), 500);
+        assert!(s.get_account("qcb1new").is_err(), "account created inside the checkpoint is removed");
+        assert_eq!(s.get_raw("meta-kept"), Some("v1"));
+        assert_eq!(s.get_raw("meta-new"), None);
+    }
+
+    #[test]
+    fn committed_checkpoint_keeps_writes_and_later_rollback_is_a_noop() {
+        let mut s = seeded();
+        s.begin_checkpoint();
+        s.transfer("qcb1a", "qcb1b", "uqcb", 100).unwrap();
+        s.commit_checkpoint();
+        let root = s.current_root().map(str::to_string);
+        s.rollback_checkpoint();
+        assert_eq!(s.current_root().map(str::to_string), root);
+        assert_eq!(s.get_account("qcb1b").unwrap().balance_of("uqcb"), 600);
+    }
+
+    #[test]
+    fn rollback_matches_a_store_that_never_saw_the_writes() {
+        // Determinism: a node that rolled back and a node that never executed
+        // the failed writes must report the same root.
+        let mut rolled = seeded();
+        rolled.begin_checkpoint();
+        rolled.transfer("qcb1a", "qcb1b", "uqcb", 250).unwrap();
+        rolled.set_raw("x", "y");
+        rolled.rollback_checkpoint();
+        assert_eq!(rolled.current_root(), seeded().current_root());
+        assert_eq!(rolled.export_snapshot().accounts.len(), seeded().export_snapshot().accounts.len());
+    }
     use chain_forge_core::{GenesisConfig, HashWidth};
 
     fn genesis_json() -> &'static str {
