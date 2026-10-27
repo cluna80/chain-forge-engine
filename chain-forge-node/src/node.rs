@@ -50,6 +50,13 @@ pub struct NodeStatus {
     pub state_root:  Option<String>,
     pub engine_version: String,
     pub is_running:  bool,
+    /// Effective web-of-trust attestation quorum (from genesis).
+    pub attestation_quorum: usize,
+    /// Effective per-attester rolling-window cap (from genesis).
+    pub attestation_cap_per_window: u32,
+    /// True when this chain runs identity parameters weaker than production
+    /// under the explicit devnet-only opt-in. Reduced Sybil resistance.
+    pub insecure_dev_identity_overrides: bool,
 }
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
@@ -623,6 +630,31 @@ impl Node {
         // engine can't honour would mean the chain behaves differently
         // from what its genesis says.
         let modules = genesis.enabled_modules().map_err(NodeError::Genesis)?;
+
+        // Hard error, in every environment: the attestation quorum and the
+        // per-attester cap decide who becomes Verified, so an invalid or
+        // unauthorized value must stop the node rather than run with a weaker
+        // identity layer. Both come only from genesis -- there is no CLI or
+        // environment override, so every node on the chain derives the same
+        // values.
+        let attestation_quorum = genesis.attestation_quorum().map_err(NodeError::Genesis)?;
+        let attestation_cap_per_window =
+            genesis.attestation_cap_per_window().map_err(NodeError::Genesis)?;
+        let insecure_identity = attestation_quorum < chain_forge_core::DEFAULT_ATTESTATION_QUORUM
+            || attestation_cap_per_window > chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW;
+        if insecure_identity {
+            warn!(
+                attestation_quorum,
+                attestation_cap_per_window,
+                production_quorum = chain_forge_core::DEFAULT_ATTESTATION_QUORUM,
+                production_cap = chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
+                "INSECURE DEVNET IDENTITY CONFIG: identity parameters are weaker than \
+                 production. Sybil resistance is reduced -- do not use this genesis \
+                 or build outside a development devnet."
+            );
+        } else {
+            info!(attestation_quorum, attestation_cap_per_window, "identity parameters");
+        }
         info!(
             staking = modules.staking, identity = modules.identity,
             agents = modules.agents,
@@ -823,6 +855,9 @@ impl Node {
             state_root:     None,
             engine_version: genesis.engine_version.clone(),
             is_running:     false,
+            attestation_quorum,
+            attestation_cap_per_window,
+            insecure_dev_identity_overrides: insecure_identity,
         }));
 
         let validator_id = validator_address.map(ValidatorId);
@@ -843,6 +878,8 @@ impl Node {
             .unwrap_or_default()
             .as_millis() as u64;
         let mut identity = IdentityStore::new(identity_genesis_ms);
+        identity.set_attestation_quorum(attestation_quorum);
+        identity.set_attestation_cap_per_window(attestation_cap_per_window);
 
         // Without this, IdentityStore::attest() has no seed to bootstrap
         // from: it requires the attester to already be Verified+, and with
@@ -1842,6 +1879,9 @@ impl Node {
 
             if id_path.exists() {
                 self.identity = serde_json::from_str(&std::fs::read_to_string(&id_path)?)?;
+                // Identity parameters are not persisted; reinstall them from genesis.
+                self.identity.set_attestation_quorum(self.executor.attestation_quorum());
+                self.identity.set_attestation_cap_per_window(self.executor.attestation_cap_per_window());
             }
             if validators_path.exists() {
                 self.validator_registry =
@@ -5268,6 +5308,99 @@ mod tests {
              must still verify successfully after the fix"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- H0 identity hardening: genesis identity parameters ------------------
+
+    #[tokio::test]
+    async fn node_uses_production_identity_params_by_default() {
+        let node = Node::new(GENESIS, None).await.unwrap();
+        assert_eq!(node.identity.attestation_quorum(), 3);
+        assert_eq!(node.identity.attestation_cap_per_window(), 3);
+        let st = node.status.lock().unwrap();
+        assert_eq!(st.attestation_quorum, 3);
+        assert_eq!(st.attestation_cap_per_window, 3);
+        assert!(!st.insecure_dev_identity_overrides);
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_reduced_quorum_without_explicit_opt_in() {
+        // GENESIS is mode "devnet": naming the network devnet is not enough.
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "identity": { "attestation_quorum": 1 },"#,
+        );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a reduced quorum without the explicit opt-in must refuse to start");
+        assert!(matches!(err, NodeError::Genesis(_)));
+        assert!(err.to_string().contains("insecure_dev_identity_overrides"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_reduced_quorum_on_testnet_even_with_opt_in() {
+        let json = GENESIS
+            .replace(r#""mode": "devnet""#, r#""mode": "testnet""#)
+            .replace(
+                r#""custom_modules": [],"#,
+                r#""custom_modules": [],
+        "identity": { "attestation_quorum": 1, "insecure_dev_identity_overrides": true },"#,
+            );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a reduced quorum outside devnet must refuse to start");
+        assert!(err.to_string().contains("environment.mode"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn node_startup_handles_reduced_quorum_with_full_opt_in_per_build() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "identity": { "attestation_quorum": 1, "attestation_cap_per_window": 10, "insecure_dev_identity_overrides": true },"#,
+        );
+        let result = Node::new(&json, None).await;
+        if cfg!(feature = "insecure-dev-quorum") {
+            let node = result.expect("devnet + opt-in + feature build may run reduced params");
+            assert_eq!(node.identity.attestation_quorum(), 1);
+            assert_eq!(node.identity.attestation_cap_per_window(), 10);
+            assert!(node.status.lock().unwrap().insecure_dev_identity_overrides,
+                "reduced params must be visible to operators via /api/status");
+        } else {
+            let err = result.err().expect("default builds must refuse reduced identity params");
+            assert!(err.to_string().contains("insecure-dev-quorum"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_params_survive_restart_from_genesis_not_disk() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "identity": { "attestation_quorum": 5, "attestation_cap_per_window": 2 },"#,
+        );
+        let dir = std::env::temp_dir()
+            .join(format!("cf-identity-params-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut node = Node::new(&json, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            node.propose_block(genesis_hash).await.unwrap();
+            node.persist_state();
+        }
+        let mut restarted = Node::new(&json, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+        assert_eq!(restarted.identity.attestation_quorum(), 5);
+        assert_eq!(restarted.identity.attestation_cap_per_window(), 2);
+
+        // Two nodes from the same genesis derive identical parameters.
+        let other = Node::new(&json, None).await.unwrap();
+        assert_eq!(other.identity.attestation_quorum(), restarted.identity.attestation_quorum());
+        assert_eq!(other.identity.attestation_cap_per_window(), restarted.identity.attestation_cap_per_window());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1675,6 +1675,13 @@ pub struct ExecutionConfig {
     /// node's IssuerRegistry root. When `None`, all `VerifyIdentityWithProof`
     /// transactions are rejected with "no pop_verifier configured" (fail-closed).
     pub pop_verifier: Option<std::sync::Arc<dyn chain_forge_identity::PopProofVerifier + Send + Sync>>,
+    /// Web-of-trust attestation quorum from genesis (`identity.attestation_quorum`).
+    /// Installed on the IdentityStore before every identity-aware tx, so the
+    /// quorum always comes from genesis, never from persisted node state.
+    pub attestation_quorum: usize,
+    /// Per-attester rolling-window cap from genesis
+    /// (`identity.attestation_cap_per_window`), installed alongside the quorum.
+    pub attestation_cap_per_window: u32,
 }
 
 impl ExecutionConfig {
@@ -1699,6 +1706,12 @@ impl ExecutionConfig {
             fee_distribution: FeeDistribution::from_genesis(genesis)
                 .unwrap_or_else(|_| FeeDistribution::default()),
             pop_verifier: None,
+            // Fail closed: an invalid identity config gets the production
+            // quorum. (The node refuses to start on one anyway.)
+            attestation_quorum: genesis.attestation_quorum()
+                .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_QUORUM),
+            attestation_cap_per_window: genesis.attestation_cap_per_window()
+                .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW),
         }
     }
 }
@@ -2630,6 +2643,16 @@ impl Executor {
         &self.config.native_denom
     }
 
+    /// Genesis attestation quorum this executor installs on the IdentityStore.
+    pub fn attestation_quorum(&self) -> usize {
+        self.config.attestation_quorum
+    }
+
+    /// Genesis per-attester cap this executor installs on the IdentityStore.
+    pub fn attestation_cap_per_window(&self) -> u32 {
+        self.config.attestation_cap_per_window
+    }
+
     /// Execute a single transaction with CharmConfinement enforcement.
     /// Requires identity store, QRC engine, and agent store for identity-gated
     /// and agent-registered tx types.
@@ -2640,6 +2663,8 @@ impl Executor {
         identity: &mut IdentityStore,
         agents:   &mut AgentStore,
     ) -> TransactionResult {
+        identity.set_attestation_quorum(self.config.attestation_quorum);
+        identity.set_attestation_cap_per_window(self.config.attestation_cap_per_window);
         let gas_required = self.config.gas_model.calculate_gas(tx);
 
         if tx.gas_limit < gas_required {
@@ -3304,7 +3329,7 @@ impl Executor {
 
             TxBody::RevokeAttestation { attested_id } => {
                 // Pre-flight: if the attested identity is currently Verified via WoT
-                // and has fewer than ATTESTATION_QUORUM+1 active attesters, this
+                // and has fewer than quorum+1 active attesters, this
                 // revocation will trigger a tier downgrade and require charm-sync.
                 // Charm-sync needs the account to exist in StateStore. Every identity
                 // that reached Verified via on-chain Attest txs must have an account
@@ -3316,7 +3341,7 @@ impl Executor {
                         .map(|r| {
                             r.charm.verified_via_wot
                                 && r.charm.tier.grants_consensus()
-                                && r.attestation_ledger.count() <= chain_forge_identity::ATTESTATION_QUORUM
+                                && r.attestation_ledger.count() <= identity.attestation_quorum()
                         })
                         .unwrap_or(false);
                     if would_downgrade && state.get_account(attested_id).is_err() {
@@ -4636,6 +4661,8 @@ mod tests {
             fee_collector:    "treasury:fees".into(),
             fee_distribution: FeeDistribution::default(),
             pop_verifier:     None,
+            attestation_quorum: chain_forge_core::DEFAULT_ATTESTATION_QUORUM,
+            attestation_cap_per_window: chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -5032,6 +5059,39 @@ mod tests {
         let acct = state.get_account("qcb1newbie").unwrap();
         assert_eq!(acct.verification_tier(),
             Some(&chain_forge_identity::VerificationTier::Provisional));
+    }
+
+    /// H0 identity hardening: the quorum and per-attester cap come from the
+    /// executor's genesis config on every identity-aware tx. A store that
+    /// carries weaker values -- set in memory, or reloaded from a persisted
+    /// identity.json after a restart -- cannot lower the bar.
+    #[test]
+    fn executor_enforces_genesis_identity_params_over_store_values() {
+        use chain_forge_identity::VerificationTier;
+
+        let (exec, mut state, identity, mut agents) = setup_with_identity();
+        assert_eq!(exec.attestation_quorum(), 3);
+        assert_eq!(exec.attestation_cap_per_window(), 3);
+
+        // Simulate restart: persist, reload, and leave weak values in memory.
+        let json = serde_json::to_string(&identity).unwrap();
+        let mut identity: IdentityStore = serde_json::from_str(&json).unwrap();
+        identity.set_attestation_quorum(1);
+        identity.set_attestation_cap_per_window(10);
+
+        let mut acct = chain_forge_state::AccountState::new("qcb1newbie".into(), "user".into());
+        acct.credit("uqcb", 10_000);
+        state.upsert_account(acct);
+        let reg = Transaction::register_identity("tx0", "qcb1newbie", 0);
+        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents).success);
+
+        let a1 = Transaction::attest("tx1", "qcb1alice", "qcb1newbie", 0);
+        let r = exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(identity.attestation_quorum(), 3, "executor reinstalls the genesis quorum");
+        assert_eq!(identity.attestation_cap_per_window(), 3, "executor reinstalls the genesis cap");
+        assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Provisional,
+            "one attestation must not verify under the genesis quorum of 3");
     }
 
     #[test]
