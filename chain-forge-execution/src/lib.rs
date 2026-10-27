@@ -7952,4 +7952,159 @@ mod tests {
         assert_eq!((v, t, b), (6_000, 3_000, 1_000), "6000/3000/1000 split");
         assert_eq!(v + t + b, 10_000, "conservation");
     }
+
+    // -- DIS-003 recovery security: replay binding and unauthenticated fee drain --
+
+    mod dis003_recovery_security {
+        use super::*;
+        use chain_forge_crypto::MlDsaScheme;
+
+        const VICTIM: &str = "qcb1alice";
+
+        fn mldsa(seed: &str) -> KeyPair {
+            MlDsaScheme.generate_keypair(seed).expect("ML-DSA keygen")
+        }
+
+        fn unsigned(id: &str, sender: &str, nonce: u64, body: TxBody) -> Transaction {
+            Transaction {
+                id: id.into(), sender: sender.into(), nonce, body,
+                gas_limit: 5_000_000,
+                signature: vec![], public_key: vec![], pq_signatures: vec![],
+                sig_scheme: Some(SchemeId::MlDsa), pq_public_key: vec![],
+            }
+        }
+
+        fn enroll(exec: &Executor, state: &mut StateStore, id: &str, nonce: u64, guardians: &[&KeyPair]) {
+            let body = TxBody::EnrollRecoveryPolicy {
+                guardians: guardians.iter().map(|g| g.public_key.clone()).collect(),
+                threshold: guardians.len() as u32,
+            };
+            let r = exec.execute_tx(&unsigned(id, VICTIM, nonce, body), state, 1);
+            assert!(r.success, "enroll {id}: {:?}", r.error);
+        }
+
+        /// Guardian authorizations exactly as a guardian would produce them
+        /// for the policy generation that was active when they signed.
+        fn guardian_auths(exec: &Executor, key_version: u32, new_kp: &KeyPair,
+                          policy_id: u64, guardians: &[&KeyPair]) -> Vec<GuardianAuth> {
+            let msg = recovery_domain_signing_bytes(
+                &exec.config.chain_id, VICTIM, key_version, &new_kp.public_key, None);
+            let _ = policy_id; // not yet bound into the signed message
+            guardians.iter().map(|g| GuardianAuth {
+                guardian_public_key: g.public_key.clone(),
+                signature: MlDsaScheme.sign(&msg, g).unwrap().bytes,
+                expires_at_height: None,
+            }).collect()
+        }
+
+        fn recover_tx(exec: &Executor, id: &str, nonce: u64, key_version: u32, new_kp: &KeyPair,
+                      policy_id: u64, auths: Vec<GuardianAuth>) -> Transaction {
+            let pop_msg = account_key_rotation_signing_bytes(
+                &exec.config.chain_id, VICTIM, key_version, &new_kp.public_key);
+            let body = TxBody::RecoverAccountKey {
+                new_public_key: new_kp.public_key.clone(),
+                new_key_scheme: "ml-dsa-65".into(),
+                key_version,
+                pop_signature: MlDsaScheme.sign(&pop_msg, new_kp).unwrap().bytes,
+                guardian_signatures: auths,
+                policy_id,
+            };
+            unsigned(id, VICTIM, nonce, body)
+        }
+
+        /// Guardian signatures collected while policy generation 1 was active
+        /// must not authorize recovery after the owner revokes and re-enrolls,
+        /// even when the new policy keeps the same guardians.
+        #[test]
+        fn guardian_signatures_do_not_replay_across_policy_generations() {
+            let (exec, mut state) = setup();
+            let (g1, g2) = (mldsa("dis003-sec-g1"), mldsa("dis003-sec-g2"));
+            let attacker = mldsa("dis003-sec-attacker");
+
+            enroll(&exec, &mut state, "enroll1", 0, &[&g1, &g2]);
+            let stockpiled = guardian_auths(&exec, 1, &attacker, 1, &[&g1, &g2]);
+
+            let r = exec.execute_tx(&unsigned("revoke", VICTIM, 1, TxBody::RevokeRecoveryPolicy), &mut state, 2);
+            assert!(r.success, "revoke: {:?}", r.error);
+            enroll(&exec, &mut state, "enroll2", 2, &[&g1, &g2]);
+            let current = state.get_account(VICTIM).unwrap().recovery_policy.clone().unwrap().policy_id;
+            assert_eq!(current, 2);
+
+            // The submitter copies the current policy_id into the tx field.
+            let replay = recover_tx(&exec, "replay", 3, 1, &attacker, current, stockpiled);
+            let r = exec.execute_tx(&replay, &mut state, 3);
+            assert!(!r.success, "generation-1 guardian signatures must not authorize recovery under generation 2");
+            assert_eq!(state.get_account(VICTIM).unwrap().key_version, 0, "key must not be replaced");
+
+            // Control: fresh signatures for the current generation still work.
+            let fresh = guardian_auths(&exec, 1, &attacker, current, &[&g1, &g2]);
+            let ok = recover_tx(&exec, "fresh", 3, 1, &attacker, current, fresh);
+            let r = exec.execute_tx(&ok, &mut state, 3);
+            assert!(r.success, "fresh generation-2 recovery should succeed: {:?}", r.error);
+        }
+
+        /// A policy loaded from pre-DIS-003 state has policy_id 0. Signatures
+        /// made for it must stop working once the owner re-enrolls.
+        #[test]
+        fn legacy_policy_signatures_do_not_replay_after_reenrollment() {
+            let (exec, mut state) = setup();
+            let (g1, g2) = (mldsa("dis003-legacy-g1"), mldsa("dis003-legacy-g2"));
+            let attacker = mldsa("dis003-legacy-attacker");
+
+            enroll(&exec, &mut state, "enroll1", 0, &[&g1, &g2]);
+            // Simulate state loaded from a pre-DIS-003 snapshot.
+            {
+                let acct = state.get_account_mut(VICTIM).unwrap();
+                acct.policy_generation = 0;
+                acct.recovery_policy.as_mut().unwrap().policy_id = 0;
+            }
+            state.refresh_leaf(VICTIM);
+            let stockpiled = guardian_auths(&exec, 1, &attacker, 0, &[&g1, &g2]);
+
+            enroll(&exec, &mut state, "enroll2", 1, &[&g1, &g2]);
+            let current = state.get_account(VICTIM).unwrap().recovery_policy.clone().unwrap().policy_id;
+            assert_eq!(current, 1, "re-enrollment after legacy load starts a fresh generation");
+
+            let replay = recover_tx(&exec, "replay", 2, 1, &attacker, current, stockpiled.clone());
+            assert!(!exec.execute_tx(&replay, &mut state, 2).success,
+                "legacy-policy signatures must not authorize recovery under the new generation");
+            let replay0 = recover_tx(&exec, "replay0", 2, 1, &attacker, 0, stockpiled);
+            assert!(!exec.execute_tx(&replay0, &mut state, 2).success,
+                "a tx claiming the legacy policy_id must be rejected once it is superseded");
+            assert_eq!(state.get_account(VICTIM).unwrap().key_version, 0);
+        }
+
+        /// RecoverAccountKey skips account-key authorization by design (the
+        /// owner has lost the key), so guardian authorization IS its
+        /// authorization. A recovery attempt with no valid guardian
+        /// authorization is an unauthorized tx: it must cost the named
+        /// account nothing, no matter how often a third party submits it.
+        #[test]
+        fn unauthorized_recovery_attempt_cannot_drain_account_fees() {
+            for with_policy in [false, true] {
+                let (exec, mut state) = setup();
+                let mut nonce = 0;
+                if with_policy {
+                    let (g1, g2) = (mldsa("dis003-drain-g1"), mldsa("dis003-drain-g2"));
+                    enroll(&exec, &mut state, "enroll", 0, &[&g1, &g2]);
+                    nonce = 1;
+                }
+                let before = state.get_account(VICTIM).unwrap().clone();
+                let junk_key = mldsa("dis003-drain-junk");
+
+                for i in 0..5 {
+                    let junk = recover_tx(&exec, &format!("junk{i}"), nonce, 1, &junk_key,
+                        if with_policy { 1 } else { 0 }, vec![]);
+                    let r = exec.execute_tx(&junk, &mut state, 10 + i);
+                    assert!(!r.success, "junk recovery must fail");
+                }
+
+                let after = state.get_account(VICTIM).unwrap();
+                assert_eq!(after.balance_of("uqcb"), before.balance_of("uqcb"),
+                    "with_policy={with_policy}: unauthorized recovery attempts must not charge the account");
+                assert_eq!(after.nonce, before.nonce,
+                    "with_policy={with_policy}: unauthorized recovery attempts must not consume the account nonce");
+            }
+        }
+    }
 }

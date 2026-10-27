@@ -1112,4 +1112,32 @@ mod tests {
             Some(r#"{"cutoff":100}"#),
             "commit snapshot must carry metadata");
     }
+
+    // DIS-003A compatibility: state persisted before DIS-003 has recovery
+    // policies without `policy_id` and accounts without `policy_generation`.
+    // Such state must still load (persist/state.json is plain serde JSON).
+    #[test]
+    fn legacy_recovery_policy_without_policy_id_deserializes() {
+        let legacy = r#"{"guardians":[[1,2,3]],"threshold":1,"enrolled_at_key_version":0}"#;
+        let p: RecoveryPolicy = serde_json::from_str(legacy)
+            .expect("pre-DIS-003 RecoveryPolicy JSON must deserialize");
+        assert_eq!(p.policy_id, 0, "legacy policy defaults to policy_id 0");
+        assert_eq!(p.threshold, 1);
+    }
+
+    #[test]
+    fn legacy_account_with_recovery_policy_roundtrips_through_snapshot_json() {
+        let mut acct = AccountState::new("qcb1legacy".into(), "user".into());
+        acct.recovery_policy = Some(RecoveryPolicy {
+            guardians: vec![vec![9; 4]], threshold: 1, enrolled_at_key_version: 0, policy_id: 0,
+        });
+        // Strip the DIS-003 fields to reproduce a pre-DIS-003 state.json entry.
+        let mut v = serde_json::to_value(&acct).unwrap();
+        v.as_object_mut().unwrap().remove("policy_generation");
+        v["recovery_policy"].as_object_mut().unwrap().remove("policy_id");
+        let restored: AccountState = serde_json::from_value(v)
+            .expect("pre-DIS-003 account JSON must deserialize");
+        assert_eq!(restored.policy_generation, 0);
+        assert_eq!(restored.recovery_policy.unwrap().policy_id, 0);
+    }
 }
