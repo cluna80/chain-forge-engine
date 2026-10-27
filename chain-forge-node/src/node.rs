@@ -3417,18 +3417,6 @@ impl Node {
             }
         }
 
-        // Validator participation = on-chain activity for QRC yield eligibility.
-        // Every validator who signed a precommit in this block's commit certificate
-        // gets their activity stamped for this epoch. This means validators earn
-        // QRC yield for doing their job — producing/signing blocks — without
-        // needing to submit separate Transfer or Stake txs.
-        // Also record epoch_blocks_signed for per-epoch reward eligibility.
-        let current_epoch = self.identity.clock.current_epoch;
-        for vote in &cert.precommits {
-            self.identity.record_activity(&vote.validator.0);
-            self.validator_registry.record_precommit(&vote.validator.0, current_epoch);
-        }
-
         // ── Epoch-close: distribute validator reward pool equally among
         //    eligible, active, personhood-verified validators (70/20/10 split
         //    already moved fees into treasury:validator-pool at block close).
@@ -3437,9 +3425,16 @@ impl Node {
         // currently jailed, participation >= VALIDATOR_REWARD_PARTICIPATION_PCT.
         // Per-human dedup: one share per unique owner_identity_id.
         // Zero eligible → pool carries forward unchanged.
+        //
+        // Judged on the epoch that just CLOSED (current_epoch - 1), and before
+        // this block's precommits are recorded: this block is the first of the
+        // new epoch, and recording it first would reset every counter and
+        // discard the closed epoch's participation (no one could ever qualify).
+        let current_epoch = self.identity.clock.current_epoch;
         if epoch_rolled {
+            let closed_epoch = current_epoch.saturating_sub(1);
             let eligible = self.validator_registry.eligible_validators_for_epoch_reward(
-                current_epoch,
+                closed_epoch,
                 self.validator_epoch_blocks,
                 VALIDATOR_REWARD_PARTICIPATION_PCT,
             );
@@ -3456,7 +3451,7 @@ impl Node {
                         );
                     }
                     info!(
-                        epoch         = current_epoch,
+                        epoch         = closed_epoch,
                         eligible      = eligible.len(),
                         share_per_val = share,
                         pool_balance  = pool_bal,
@@ -3465,10 +3460,21 @@ impl Node {
                 }
             } else {
                 debug!(
-                    epoch = current_epoch,
+                    epoch = closed_epoch,
                     "epoch-close: no eligible validators — validator reward pool carried forward"
                 );
             }
+        }
+
+        // Validator participation = on-chain activity for QRC yield eligibility.
+        // Every validator who signed a precommit in this block's commit certificate
+        // gets their activity stamped for this epoch. This means validators earn
+        // QRC yield for doing their job — producing/signing blocks — without
+        // needing to submit separate Transfer or Stake txs.
+        // Also record epoch_blocks_signed for per-epoch reward eligibility.
+        for vote in &cert.precommits {
+            self.identity.record_activity(&vote.validator.0);
+            self.validator_registry.record_precommit(&vote.validator.0, current_epoch);
         }
 
         // Snapshot Attest tx metadata before txs is consumed by execute_block.
