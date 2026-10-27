@@ -294,7 +294,7 @@ fn build_recover(
         .map(|(&gs, &exp)| {
             let gkp     = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
             let rec_msg = recovery_domain_signing_bytes(
-                CHAIN_ID, sender, key_version, &new_kp.public_key, exp,
+                CHAIN_ID, sender, key_version, &new_kp.public_key, policy_id, exp,
             );
             let sig = MlDsaScheme.sign(&rec_msg, &gkp).expect("guardian sign");
             GuardianAuth {
@@ -349,7 +349,7 @@ fn build_recover_tampered_expiry(
         let gkp     = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
         // Sign over `signed_expiry` but present `presented_expiry` in the field.
         let rec_msg = recovery_domain_signing_bytes(
-            CHAIN_ID, sender, key_version, &new_kp.public_key, signed_expiry,
+            CHAIN_ID, sender, key_version, &new_kp.public_key, policy_id, signed_expiry,
         );
         let sig = MlDsaScheme.sign(&rec_msg, &gkp).expect("guardian sign");
         GuardianAuth {

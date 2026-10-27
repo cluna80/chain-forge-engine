@@ -112,6 +112,10 @@ pub struct RecoveryPolicy {
     pub enrolled_at_key_version: u32,
     /// DIS-003A: the policy_generation value at enrollment time. A
     /// `RecoverAccountKey` tx must carry the matching policy_id.
+    /// Defaults to 0 for policies persisted before DIS-003; 0 is never issued
+    /// by enrollment (generations start at 1), so a legacy policy is replaced
+    /// by a distinct generation on the next enrollment.
+    #[serde(default)]
     pub policy_id: u64,
 }
 

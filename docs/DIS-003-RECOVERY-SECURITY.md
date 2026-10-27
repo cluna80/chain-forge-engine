@@ -66,6 +66,17 @@ pub policy_id: u64,  // monotonically incremented on every EnrollRecoveryPolicy
 `RecoverAccountKey` must carry `policy_id`; executor rejects it if
 `policy_id != account.recovery_policy.policy_id`.
 
+`policy_id` is also part of the message every guardian signs (see DIS-003C), so a
+guardian signature produced under one policy generation cannot be reused under a
+later one by copying the new `policy_id` into the tx field. Policies persisted
+before DIS-003 load with `policy_id = 0`; enrollment never issues 0, so the next
+enrollment supersedes them with a distinct generation.
+
+Guardian authorization is `RecoverAccountKey`'s only authorization (the account
+key is lost by definition), so the executor verifies it before debiting the fee.
+A recovery attempt without valid guardian authorization is rejected outright: it
+charges the named account nothing and does not consume its nonce.
+
 **Acceptance criteria:**
 
 | ID | Criterion |
@@ -108,8 +119,8 @@ account holder needing the original device.
 replayed to authorize recovery for account B or on chain Y, even if both accounts share
 the same guardian set.
 
-**Current state:** `recovery_domain_signing_bytes()` already encodes
-`CFREC|{chain_id}|{account}|{key_version}|{new_pk_hex}`. The binding is present in the
+**Current state:** `recovery_domain_signing_bytes()` encodes
+`CFREC|{chain_id}|{account}|{key_version}|{new_pk_hex}|pid{policy_id}|{expires_at_height or "none"}`. The binding is present in the
 construction but has no adversarial test coverage.
 
 **New coverage required:**

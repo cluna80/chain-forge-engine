@@ -266,7 +266,7 @@ fn build_recover(new_seed: &str, sender: &str, nonce: u64, key_version: u32,
     let new_kp = MlDsaScheme.generate_keypair(new_seed).expect("new keygen");
     let pop_msg = account_key_rotation_signing_bytes(CHAIN_ID, sender, key_version, &new_kp.public_key);
     let pop_sig = MlDsaScheme.sign(&pop_msg, &new_kp).expect("PoP sign");
-    let rec_msg = recovery_domain_signing_bytes(CHAIN_ID, sender, key_version, &new_kp.public_key, None);
+    let rec_msg = recovery_domain_signing_bytes(CHAIN_ID, sender, key_version, &new_kp.public_key, policy_id, None);
 
     let guardian_signatures: Vec<GuardianAuth> = guardian_seeds.iter().map(|&gs| {
         let gkp = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");

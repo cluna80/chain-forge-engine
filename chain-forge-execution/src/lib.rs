@@ -886,7 +886,7 @@ pub enum TxBody {
 pub struct GuardianAuth {
     /// The guardian's ML-DSA-65 public key (1952 bytes).
     pub guardian_public_key: Vec<u8>,
-    /// Signature over `recovery_domain_signing_bytes(chain_id, account, key_version, new_pk, expires_at_height)`.
+    /// Signature over `recovery_domain_signing_bytes(chain_id, account, key_version, new_pk, policy_id, expires_at_height)`.
     pub signature:           Vec<u8>,
     /// DIS-003D: optional block-height expiry bound into the guardian's signature.
     /// If `Some(h)`, the authorization is valid only while `block_height <= h`.
@@ -1946,6 +1946,7 @@ pub fn recovery_domain_signing_bytes(
     account:           &str,
     key_version:       u32,
     new_public_key:    &[u8],
+    policy_id:         u64,
     expires_at_height: Option<u64>,
 ) -> Vec<u8> {
     let mut b = Vec::new();
@@ -1957,6 +1958,11 @@ pub fn recovery_domain_signing_bytes(
     b.extend_from_slice(key_version.to_string().as_bytes());
     b.push(b'|');
     b.extend_from_slice(hex_encode_bytes(new_public_key).as_bytes());
+    b.push(b'|');
+    // DIS-003A: bind the policy generation so signatures collected under a
+    // superseded policy cannot authorize recovery under a later one.
+    b.extend_from_slice(b"pid");
+    b.extend_from_slice(policy_id.to_string().as_bytes());
     b.push(b'|');
     match expires_at_height {
         Some(h) => b.extend_from_slice(h.to_string().as_bytes()),
@@ -2518,10 +2524,10 @@ fn execute_enroll_recovery_policy(
 ///  7. Each signing guardian key must be listed in the enrolled policy.
 ///  8. No duplicate guardian keys in the signatures.
 ///  9. PoP from new key verifies.
-fn execute_recover_account_key(
+fn verify_recover_account_key(
     config:               &ExecutionConfig,
     tx:                   &Transaction,
-    state:                &mut StateStore,
+    state:                &StateStore,
     new_public_key:       &[u8],
     new_key_scheme:       &str,
     key_version:          &u32,
@@ -2529,7 +2535,7 @@ fn execute_recover_account_key(
     guardian_signatures:  &[GuardianAuth],
     policy_id:            u64,
     block_height:         u64,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     use chain_forge_crypto::Signature as CfSig;
 
     const MLDSA65_PK_BYTES: usize = 1952;
@@ -2626,6 +2632,7 @@ fn execute_recover_account_key(
             &tx.sender,
             *key_version,
             new_public_key,
+            policy.policy_id,
             ga.expires_at_height,
         );
         let sig = CfSig { scheme: SchemeId::MlDsa, bytes: ga.signature.clone() };
@@ -2655,6 +2662,48 @@ fn execute_recover_account_key(
     MlDsaScheme
         .verify(&pop_message, &pop_sig, new_public_key)
         .map_err(|e| format!("RecoverAccountKey: proof-of-possession verification failed: {e}"))?;
+    Ok(current_version)
+}
+
+/// DIS-003: guardian authorization is RecoverAccountKey's authorization,
+/// because the account-key check is skipped for it. Run it before the fee
+/// debit so a recovery attempt without valid guardian authorization is
+/// rejected outright and costs the named account nothing.
+fn precheck_recovery_authorization(
+    config:       &ExecutionConfig,
+    tx:           &Transaction,
+    state:        &StateStore,
+    block_height: u64,
+) -> Result<(), String> {
+    if let TxBody::RecoverAccountKey {
+        new_public_key, new_key_scheme, key_version, pop_signature,
+        guardian_signatures, policy_id,
+    } = &tx.body {
+        verify_recover_account_key(
+            config, tx, state, new_public_key, new_key_scheme, key_version,
+            pop_signature, guardian_signatures, *policy_id, block_height,
+        )?;
+    }
+    Ok(())
+}
+
+/// Commit a RecoverAccountKey after `verify_recover_account_key` passes.
+fn execute_recover_account_key(
+    config:               &ExecutionConfig,
+    tx:                   &Transaction,
+    state:                &mut StateStore,
+    new_public_key:       &[u8],
+    new_key_scheme:       &str,
+    key_version:          &u32,
+    pop_signature:        &[u8],
+    guardian_signatures:  &[GuardianAuth],
+    policy_id:            u64,
+    block_height:         u64,
+) -> Result<(), String> {
+    let current_version = verify_recover_account_key(
+        config, tx, state, new_public_key, new_key_scheme, key_version,
+        pop_signature, guardian_signatures, policy_id, block_height,
+    )?;
 
     // All guards passed — commit the recovery.
     {
@@ -2944,6 +2993,9 @@ impl Executor {
 
         // FS-03: Debit per-tx fee from sender before executing the body.
         // Failed txs still consume the fee (matching established EVM semantics).
+        if let Err(e) = precheck_recovery_authorization(&self.config, tx, state, block_height) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
+        }
         if let Err(e) = debit_fee(
             tx, gas_required, &self.config.native_denom,
             &self.config.fee_collector, state,
@@ -4301,6 +4353,9 @@ impl Executor {
 
         // FS-03: Debit per-tx fee from sender before executing the body.
         // Failed txs still consume the fee (matching established EVM semantics).
+        if let Err(e) = precheck_recovery_authorization(&self.config, tx, state, block_height) {
+            return TransactionResult::err(tx.id.clone(), gas_required, tx.gas_limit, e);
+        }
         if let Err(e) = debit_fee(
             tx, gas_required, &self.config.native_denom,
             &self.config.fee_collector, state,
@@ -7988,8 +8043,7 @@ mod tests {
         fn guardian_auths(exec: &Executor, key_version: u32, new_kp: &KeyPair,
                           policy_id: u64, guardians: &[&KeyPair]) -> Vec<GuardianAuth> {
             let msg = recovery_domain_signing_bytes(
-                &exec.config.chain_id, VICTIM, key_version, &new_kp.public_key, None);
-            let _ = policy_id; // not yet bound into the signed message
+                &exec.config.chain_id, VICTIM, key_version, &new_kp.public_key, policy_id, None);
             guardians.iter().map(|g| GuardianAuth {
                 guardian_public_key: g.public_key.clone(),
                 signature: MlDsaScheme.sign(&msg, g).unwrap().bytes,
