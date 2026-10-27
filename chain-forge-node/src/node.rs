@@ -7657,12 +7657,13 @@ mod tests {
 
         // A properly SIGNED classical (Ed25519) transfer must be rejected by
         // the deprecation cutoff — not by the signature check.  The tx must be
-        // signed so the executor reaches the migration gate, which fires first
-        // when the account's scheme is deprecated.  Nonce 99 avoids collision
-        // with the nonce-1 transfer committed in Phase 1.
+        // signed and carry alice's current nonce: the executor checks the
+        // nonce before the migration gate, so any other nonce would be
+        // rejected as a nonce mismatch without ever reaching the cutoff.
         let alice_kp_restart = p7_signing_key("qcb1alice");
+        let alice_nonce = restarted.state.get_account("qcb1alice").unwrap().nonce;
         let classical_tx = p7_signed_transfer(
-            "classical-post-restart", "qcb1alice", "qcb1bob", 100, 99, &alice_kp_restart,
+            "classical-post-restart", "qcb1alice", "qcb1bob", 100, alice_nonce, &alice_kp_restart,
         );
         // Execute directly through the executor (the node's internal path).
         let result = restarted.executor.execute_tx_with_identity(

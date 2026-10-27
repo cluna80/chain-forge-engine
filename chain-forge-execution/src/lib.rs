@@ -6198,26 +6198,26 @@ mod tests {
         let r = exec.execute_tx_with_identity(&dep_tx, &mut state, &mut identity, &mut agents);
         assert!(r.success, "deprecation tx must succeed: {:?}", r.error);
 
+        // Every tx below uses alice's current on-chain nonce, so a rejection
+        // can only come from the gate under test, never from a nonce mismatch.
+        let alice_nonce = |state: &StateStore| state.get_account("qcb1alice").unwrap().nonce;
+
         // Sanity: epoch 51 is the last grace epoch — transfer with Classical
         // sig_scheme should still be accepted.
         identity.clock.current_epoch = 51;
         let mut in_grace = Transaction::transfer(
-            "t-grace", "qcb1alice", "qcb1bob", "uqcb", 1, 1
+            "t-grace", "qcb1alice", "qcb1bob", "uqcb", 1, alice_nonce(&state)
         );
         in_grace.sig_scheme = Some(SchemeId::Classical);
         let r = exec.execute_tx_with_identity(&in_grace, &mut state, &mut identity, &mut agents);
-        // May fail for other reasons (balance, nonce) but must NOT fail with the
-        // cutoff message while still in the grace window.
-        if !r.success {
-            let err = r.error.unwrap_or_default();
-            assert!(!err.contains("was deprecated"),
-                "Classical scheme must still be accepted at epoch 51 (in grace window); got: {err}");
-        }
+        assert!(r.success,
+            "Classical scheme must still be accepted at epoch 51 (in grace window); got: {:?}", r.error);
 
         // Epoch 52 = one past the hard cutoff — Classical scheme must be rejected.
         identity.clock.current_epoch = 52;
+        let nonce_before_cutoff = alice_nonce(&state);
         let mut post_cutoff = Transaction::transfer(
-            "t-post-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, 2
+            "t-post-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, nonce_before_cutoff
         );
         post_cutoff.sig_scheme = Some(SchemeId::Classical);
         let r = exec.execute_tx_with_identity(&post_cutoff, &mut state, &mut identity, &mut agents);
@@ -6227,26 +6227,15 @@ mod tests {
             "error must mention deprecation; got: {err}");
         assert!(err.contains("rotate to"),
             "error must hint at replacement scheme; got: {err}");
-
-        // A transaction using the replacement scheme (ml-dsa) must NOT be
-        // blocked by the cutoff check — the cutoff is scheme-specific.
-        let mut pq_tx = Transaction::transfer(
-            "t-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, 2
-        );
-        pq_tx.sig_scheme = Some(SchemeId::MlDsa);
-        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
-        if !r.success {
-            let err = r.error.unwrap_or_default();
-            assert!(!err.contains("was deprecated"),
-                "MlDsa scheme must not be blocked by Classical cutoff; got: {err}");
-        }
+        assert_eq!(alice_nonce(&state), nonce_before_cutoff,
+            "a deprecated-scheme rejection must not consume the nonce");
 
         // CS-001-P6-G2: A transaction with sig_scheme = None (legacy classical path)
         // MUST be blocked by the cutoff after P6.  The untagged path reaches classical
         // Ed25519 verification, so it is treated as "ed25519" for cutoff purposes.
         // (This assertion was updated in P6; previously the gate did not cover None.)
         let untagged = Transaction::transfer(
-            "t-untagged", "qcb1alice", "qcb1bob", "uqcb", 1, 2
+            "t-untagged", "qcb1alice", "qcb1bob", "uqcb", 1, nonce_before_cutoff
         );
         assert!(untagged.sig_scheme.is_none());
         let r = exec.execute_tx_with_identity(&untagged, &mut state, &mut identity, &mut agents);
@@ -6254,6 +6243,16 @@ mod tests {
         let err = r.error.unwrap_or_default();
         assert!(err.contains("was deprecated") || err.contains("deprecated"),
             "Untagged classical tx must fail with deprecation error; got: {err}");
+
+        // Control: the replacement scheme (ml-dsa) at the SAME nonce is not
+        // blocked -- the cutoff is scheme-specific, and the nonce was valid,
+        // so the rejections above came from the deprecation gate.
+        let mut pq_tx = Transaction::transfer(
+            "t-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, nonce_before_cutoff
+        );
+        pq_tx.sig_scheme = Some(SchemeId::MlDsa);
+        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "MlDsa scheme must not be blocked by Classical cutoff; got: {:?}", r.error);
     }
 
     /// CS-001 P5 — Guard 0: consensus-scope deprecations are explicitly rejected.
@@ -6398,8 +6397,9 @@ mod tests {
         // 7. Hard cutoff still fires post-restore: advance past cutoff.
         use chain_forge_crypto::SchemeId;
         identity.clock.current_epoch = post_migration.hard_cutoff_epoch + 1;
+        let alice_nonce = state.get_account("qcb1alice").unwrap().nonce;
         let mut cutoff_tx = Transaction::transfer(
-            "restart-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, 1,
+            "restart-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, alice_nonce,
         );
         cutoff_tx.sig_scheme = Some(SchemeId::Classical);
         let r = exec.execute_tx_with_identity(
@@ -6410,6 +6410,15 @@ mod tests {
         let err = r.error.unwrap_or_default();
         assert!(err.contains("was deprecated"),
             "post-restart cutoff error must mention deprecation; got: {err}");
+
+        // Control: the replacement scheme at the same nonce is accepted, so
+        // the rejection above came from the restored deprecation state.
+        let mut pq_tx = Transaction::transfer(
+            "restart-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, alice_nonce,
+        );
+        pq_tx.sig_scheme = Some(SchemeId::MlDsa);
+        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "replacement scheme must be accepted post-restart; got: {:?}", r.error);
     }
 
     /// CS-001 P5 — Test 11: Invalid / unsupported replacement scheme is rejected.
