@@ -5311,6 +5311,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- Epoch-close validator rewards ---------------------------------------
+
+    /// One-validator chain: its own precommit is a full quorum, so it signs
+    /// 100% of every epoch's blocks. Rewards must be paid for the epoch that
+    /// just closed, judged on that epoch's participation.
+    #[tokio::test]
+    async fn epoch_close_pays_validator_pool_for_the_closed_epoch() {
+        let mut g: serde_json::Value = serde_json::from_str(GENESIS).unwrap();
+        g["genesis_accounts"] = serde_json::json!([g["genesis_accounts"][0].clone()]);
+        g["consensus"]["validator_set_size"] = serde_json::json!(1);
+        g["validator_bonding"] = serde_json::json!({ "validator_epoch_blocks": 3 });
+        let json = g.to_string();
+
+        let mut node = Node::new(&json, Some("qcb1alice".into())).await.unwrap();
+        node.signing_key = Some(ClassicalScheme.generate_keypair("qcb1alice").unwrap());
+
+        const POOL: &str = "treasury:validator-pool";
+        let mut pool = chain_forge_state::AccountState::new(POOL.into(), "treasury".into());
+        pool.credit("uqcb", 9_000);
+        node.state.upsert_account(pool);
+        let alice_before = node.state.get_account("qcb1alice").unwrap().balance_of("uqcb");
+
+        // Heights 0,1,2 are epoch 0; height 3 closes it.
+        for h in 0..=3u64 {
+            if h == 3 {
+                // Eligibility guard: on epoch 0's own participation, alice qualifies.
+                assert_eq!(
+                    node.validator_registry.eligible_validators_for_epoch_reward(
+                        0, 3, VALIDATOR_REWARD_PARTICIPATION_PCT),
+                    vec!["qcb1alice".to_string()],
+                    "alice signed 3/3 blocks of epoch 0");
+            }
+            let parent = chain_forge_consensus::BlockHash(format!("genesis_h{h}"));
+            node.propose_and_broadcast_multinode(parent).await.unwrap();
+            assert_eq!(node.status.lock().unwrap().height, h, "block {h} must commit");
+        }
+
+        let alice_after = node.state.get_account("qcb1alice").unwrap().balance_of("uqcb");
+        let pool_after = node.state.get_account(POOL).map(|a| a.balance_of("uqcb")).unwrap_or(0);
+        assert_eq!(alice_after - alice_before, 9_000,
+            "the only validator signed every block of epoch 0 and must receive the whole pool");
+        assert_eq!(pool_after, 0, "pool fully distributed (9000 / 1 eligible, no remainder)");
+    }
+
     // -- H0 identity hardening: genesis identity parameters ------------------
 
     #[tokio::test]
