@@ -1226,7 +1226,14 @@ impl Node {
                     // from here instead of hardcoding empty -- has it too.
                     if let Some(hex_key) = acct.public_key.as_ref() {
                         if let Some(key_bytes) = hex_decode_genesis_key(hex_key) {
-                            if let Err(e) = validator_registry.register_consensus_key(id, &key_bytes, epoch) {
+                            // An ML-DSA-65 genesis key is recorded with its
+                            // scheme (R3 gating and deprecation read it).
+                            let registered = if key_bytes.len() == chain_forge_core::MLDSA65_CONSENSUS_KEY_BYTES {
+                                validator_registry.register_consensus_key_with_scheme(id, &key_bytes, epoch, "ml-dsa-65")
+                            } else {
+                                validator_registry.register_consensus_key(id, &key_bytes, epoch)
+                            };
+                            if let Err(e) = registered {
                                 warn!(validator = id, error = %e, "failed to seed genesis validator's consensus key into registry");
                             }
                         }
@@ -1787,11 +1794,23 @@ impl Node {
             .ok_or_else(|| format!("key file {:?} missing field '{name}'", path))
             .and_then(|s| hex_decode(s)
                 .ok_or_else(|| format!("key file {:?}: '{name}' is not valid hex", path)));
+        // Older key files have no "scheme" (Ed25519).
+        let scheme = match k["scheme"].as_str().unwrap_or("ed25519") {
+            "ed25519" | "classical"   => SchemeId::Classical,
+            "ml-dsa-65" | "mldsa65"   => SchemeId::MlDsa,
+            other => return Err(format!("key file {:?}: unsupported scheme {other:?}", path)),
+        };
         let kp = KeyPair {
-            scheme:      SchemeId::Classical,
+            scheme,
             public_key:  field("public_key")?,
             private_key: field("private_key")?,
         };
+        // Possession: the private key must sign for the public key it
+        // claims, or this node would sign votes nobody can verify.
+        let probe = b"chain-forge key file possession check";
+        chain_forge_crypto::sign_consensus(probe, &kp)
+            .and_then(|sig| chain_forge_crypto::verify_consensus(probe, &sig, &kp.public_key))
+            .map_err(|e| format!("key file {:?}: private key does not match its public key ({e})", path))?;
         // Look up this validator's address from the key file to match genesis.
         let address = k["address"].as_str()
             .unwrap_or_default().to_string();
@@ -1876,6 +1895,10 @@ impl Node {
     /// `ActivatePqConsensus` governance tx has been processed (or if the
     /// activation epoch was cleared by an `EmergencyDeprecateAlgorithm` tx).
     pub fn pq_activation_epoch(&self) -> Option<u64> {
+        // An ML-DSA-only chain has ML-DSA consensus from genesis.
+        if self.genesis.mldsa_consensus_only() {
+            return Some(0);
+        }
         self.state
             .get_raw("pq_consensus_activation_epoch")
             .and_then(|s| s.parse::<u64>().ok())
@@ -10557,6 +10580,44 @@ mod tests {
             }
             parent = cert.block_hash;
         }
+    }
+
+    /// The repo's Ed25519 devnet key files say "classical-ed25519"; they
+    /// must keep loading (the Ed25519 devnet is the fallback).
+    #[tokio::test]
+    async fn repo_ed25519_devnet_key_file_still_loads() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/devnet/keys/alice.key.json");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        node.load_signing_key(&path).expect("the Ed25519 devnet key file must load");
+    }
+
+    /// A commit certificate carried as `last_commit` must verify with
+    /// ML-DSA precommits; the vote's scheme tag must match its key.
+    #[tokio::test]
+    async fn mldsa_certificate_verifies_against_history() {
+        let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        let mut hist = node.consensus.validator_set().clone();
+        hist.height = 7;
+        node.historical_validator_sets.insert(7, hist);
+        let hash = BlockHash("block7".into());
+        let precommit = |addr: &str, tag: &str| {
+            let msg = vote_signing_bytes(node.chain_id(), &VoteType::Precommit, 7, 0, Some(&hash));
+            Vote {
+                vote_type: VoteType::Precommit, height: 7, round: 0,
+                validator: chain_forge_consensus::ValidatorId(addr.into()), block_hash: Some(hash.clone()),
+                signature: chain_forge_crypto::sign_consensus(&msg, &mldsa_validator_key(addr)).unwrap(),
+                scheme: tag.into(),
+            }
+        };
+        let cert = |tag: &str| chain_forge_consensus::CommitCertificate {
+            height: 7, round: 0, block_hash: hash.clone(),
+            precommits: VALS4[..3].iter().map(|a| precommit(a, tag)).collect(),
+        };
+        node.verify_certificate_against_history(&cert("ml-dsa-65"))
+            .expect("3 of 4 ML-DSA precommits must verify as commit evidence");
+        assert!(node.verify_certificate_against_history(&cert("classical")).is_err(),
+            "a scheme tag that does not match the key must be rejected");
     }
 
     #[tokio::test]
