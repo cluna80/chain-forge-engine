@@ -3732,30 +3732,30 @@ impl Node {
             let pool_bal = self.state.get_account("treasury:validator-pool")
                 .map(|a| a.balance_of(&denom))
                 .unwrap_or(0);
-            let share = if eligible.is_empty() { 0 } else { pool_bal / eligible.len() as u128 };
-            if share > 0 {
-                for vid in &eligible {
-                    if let Err(e) = self.state.transfer("treasury:validator-pool", vid, &denom, share) {
-                        // Cannot happen: share * eligible <= pool_bal. Every
-                        // node computes the same values, so it would fail
-                        // identically everywhere; log loudly rather than halt.
-                        error!(validator = %vid, share, error = %e, "epoch-close: reward transfer failed");
-                    }
+            // Fixed pool (owner decision): split by weight 10,000 + premium
+            // bps (Model C, capped; 0 unless configured in genesis). Equal
+            // weights reproduce the equal split. Floor rounding keeps
+            // sum(shares) <= pool; the remainder carries forward.
+            let weights: Vec<u128> = eligible.iter().map(|vid| 10_000 + self.reward_premium_bps(vid)).collect();
+            let total_weight: u128 = weights.iter().sum();
+            let mut paid: u128 = 0;
+            for (vid, w) in eligible.iter().zip(&weights) {
+                let share = pool_bal * w / total_weight.max(1);
+                if share == 0 { continue; }
+                match self.state.transfer("treasury:validator-pool", vid, &denom, share) {
+                    Ok(()) => paid += share,
+                    // Cannot happen: sum(shares) <= pool_bal. Every node
+                    // computes the same values, so it would fail identically
+                    // everywhere; log loudly rather than halt.
+                    Err(e) => error!(validator = %vid, share, error = %e, "epoch-close: reward transfer failed"),
                 }
-                info!(
-                    epoch         = closed_epoch,
-                    eligible      = eligible.len(),
-                    share_per_val = share,
-                    pool_balance  = pool_bal,
-                    "epoch-close: validator reward pool distributed"
-                );
+            }
+            if paid > 0 {
+                info!(epoch = closed_epoch, eligible = eligible.len(), paid, pool_balance = pool_bal,
+                      "epoch-close: validator reward pool distributed");
             } else {
-                debug!(
-                    epoch = closed_epoch,
-                    eligible = eligible.len(),
-                    pool_balance = pool_bal,
-                    "epoch-close: no reward paid -- pool carried forward"
-                );
+                debug!(epoch = closed_epoch, eligible = eligible.len(), pool_balance = pool_bal,
+                       "epoch-close: no reward paid -- pool carried forward");
             }
         }
 
@@ -4764,6 +4764,20 @@ impl Node {
     /// reached quorum (small validator sets can do this in one round-trip).
     /// Otherwise the block commits later, from handle_event, once enough
     /// peers' votes have arrived over gossip.
+    /// Capital premium in basis points of reward weight (Model C):
+    /// `min(k × (bond − bond_min) / 1,000 QCB, cap)`, from the on-chain bond
+    /// ledger. 0 when the premium is not configured.
+    fn reward_premium_bps(&self, validator: &str) -> u128 {
+        let (k, cap) = (self.reward_params.premium_k_bps_per_kqcb as u128, self.reward_params.premium_cap_bps as u128);
+        if k == 0 || cap == 0 { return 0; }
+        let bond = self.state
+            .get_account(&format!("{}{validator}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX))
+            .map(|a| a.balance_of(self.executor.native_denom()))
+            .unwrap_or(0);
+        const KQCB_UQCB: u128 = 1_000 * 1_000_000;
+        (k * bond.saturating_sub(self.min_bond_uqcb) / KQCB_UQCB).min(cap)
+    }
+
     /// QPC-CONS-001 Phase B: keep the ValidatorRegistry in step with the live
     /// ValidatorSet. A seated validator whose personhood verifies is confirmed
     /// (pop_verified, Active) in the registry, which reward eligibility and
