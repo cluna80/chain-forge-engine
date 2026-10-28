@@ -5759,6 +5759,34 @@ mod tests {
             (carol, p0.block_hash)
         }
 
+        /// Tendermint safety: a validator may precommit a block only after it
+        /// has seen a +2/3 prevote polka for it in that round (and then locks
+        /// on it). Carol here sees a valid proposal and NO prevotes from
+        /// anyone else; she must not precommit. If she does, a validator that
+        /// times out the round can precommit a different block in the next
+        /// one, and two quorum certificates for different blocks at the same
+        /// height become reachable with zero Byzantine validators -- observed
+        /// live (MN-8 run): height 1 finalized as c6f065c3 (round 0: alice,
+        /// bob, carol) on two nodes and as 68a82c67 (round 1: alice, carol,
+        /// dave) on three.
+        #[tokio::test]
+        async fn validator_does_not_precommit_without_a_prevote_polka() {
+            let (mut carol, h0) = carol_at_height_1().await;
+            let root = carol.state.current_root().map(str::to_string);
+            let p1 = proposal(1, payload(Some(&evidence(0, &h0, &VALS)), root.as_deref()));
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p1).unwrap())).await.unwrap();
+            // Two peers' precommits arrive; no prevote from anyone but Carol.
+            for v in ["qcb1alice", "qcb1bob"] {
+                let vote = signed_vote(CHAIN, VoteType::Precommit, 1, 0, v, p1.block_hash.clone());
+                carol.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await.unwrap();
+            }
+            let carol_precommitted = carol.chain_store.get(&1)
+                .map(|(cert, _)| cert.precommits.iter().any(|v| v.validator.0 == "qcb1carol"))
+                .unwrap_or(false);
+            assert!(!carol_precommitted,
+                "carol precommitted block 1 having seen no prevote polka for it");
+        }
+
         async fn carol_accepts(tx_data: Vec<u8>) -> bool {
             let (mut carol, _) = carol_at_height_1().await;
             let p1 = proposal(1, tx_data);
