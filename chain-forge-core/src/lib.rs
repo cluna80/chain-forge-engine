@@ -571,6 +571,17 @@ pub struct GenesisRewards {
     pub premium_cap_bps: Option<u32>,
 }
 
+/// BFT engine a chain runs, resolved by `GenesisConfig::bft_variant`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BftVariant {
+    /// Tendermint (Algorithm 1): engine-driven voting with locks.
+    Tendermint,
+    /// HotStuff-style BFT.
+    HotStuff,
+    /// XRPL-inspired federated agreement.
+    Fba,
+}
+
 /// Resolved, validated reward-eligibility policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RewardParams {
@@ -1026,6 +1037,15 @@ impl GenesisConfig {
         Ok(p)
     }
 
+    /// Resolve the BFT engine selected by `consensus.bft_variant`.
+    pub fn bft_variant(&self) -> Result<BftVariant, String> {
+        Ok(match self.consensus.bft_variant.as_deref() {
+            Some("hotstuff") | Some("HotStuffStyle") => BftVariant::HotStuff,
+            Some("xrpl")     | Some("XrplInspired")  => BftVariant::Fba,
+            _                                         => BftVariant::Tendermint,
+        })
+    }
+
     /// Resolve and validate the reward-eligibility policy. Hard validation:
     /// the node refuses to start on `Err`.
     pub fn reward_params(&self) -> Result<RewardParams, String> {
@@ -1150,6 +1170,48 @@ mod tests {
             serde_json::json!({ "max_missed_pct": 0 }),
         ] {
             assert!(genesis_with_liveness(Some(bad.clone())).liveness_params().is_err(), "{bad}");
+        }
+    }
+
+    // -- BFT variant (release gate 2) -----------------------------------------
+
+    fn genesis_with_variant(mode: &str, variant: Option<&str>) -> GenesisConfig {
+        let mut g = genesis_with(mode, None);
+        g.consensus.bft_variant = variant.map(str::to_string);
+        g
+    }
+
+    #[test]
+    fn tendermint_runs_in_every_mode() {
+        for mode in ["devnet", "testnet", "mainnet"] {
+            for v in [None, Some("tendermint"), Some("TendermintStyle")] {
+                assert_eq!(genesis_with_variant(mode, v).bft_variant(), Ok(BftVariant::Tendermint), "{mode} {v:?}");
+            }
+        }
+    }
+
+    /// HotStuff and FBA have not had a safety review (no engine-driven
+    /// voting, no commit-signature checks), so they may only run on devnet.
+    #[test]
+    fn hotstuff_and_fba_refuse_to_run_off_devnet() {
+        for v in ["hotstuff", "HotStuffStyle", "xrpl", "XrplInspired"] {
+            for mode in ["testnet", "mainnet", "staging"] {
+                let err = genesis_with_variant(mode, Some(v)).bft_variant()
+                    .expect_err(&format!("{v} must not run with environment.mode = {mode}"));
+                assert!(err.contains("environment.mode") && err.contains("safety review"), "{err}");
+            }
+        }
+        assert_eq!(genesis_with_variant("devnet", Some("hotstuff")).bft_variant(), Ok(BftVariant::HotStuff));
+        assert_eq!(genesis_with_variant("devnet", Some("xrpl")).bft_variant(), Ok(BftVariant::Fba));
+    }
+
+    /// A misspelled variant must not silently select an engine.
+    #[test]
+    fn unknown_bft_variant_is_rejected() {
+        for v in ["hotstuf", "pbft", "", "Tendermint "] {
+            let err = genesis_with_variant("devnet", Some(v)).bft_variant()
+                .expect_err(&format!("{v:?} must be rejected"));
+            assert!(err.contains("bft_variant"), "{err}");
         }
     }
 

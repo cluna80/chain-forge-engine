@@ -903,10 +903,10 @@ impl Node {
         };
 
         // Read the desired variant from genesis config (default: TendermintStyle).
-        let desired_variant = match genesis.consensus.bft_variant.as_deref() {
-            Some("hotstuff") | Some("HotStuffStyle") => ConsensusVariant::HotStuffStyle,
-            Some("xrpl")    | Some("XrplInspired")   => ConsensusVariant::XrplInspired,
-            _                                          => ConsensusVariant::TendermintStyle,
+        let desired_variant = match genesis.bft_variant().map_err(NodeError::Genesis)? {
+            chain_forge_core::BftVariant::HotStuff   => ConsensusVariant::HotStuffStyle,
+            chain_forge_core::BftVariant::Fba        => ConsensusVariant::XrplInspired,
+            chain_forge_core::BftVariant::Tendermint => ConsensusVariant::TendermintStyle,
         };
 
         let consensus_cfg = ConsensusConfig {
@@ -6694,6 +6694,21 @@ mod tests {
             .err()
             .expect("a reduced quorum outside devnet must refuse to start");
         assert!(err.to_string().contains("environment.mode"), "{err}");
+    }
+
+    /// Release gate 2: HotStuff and FBA refuse to start off devnet.
+    #[tokio::test]
+    async fn node_refuses_hotstuff_or_fba_off_devnet() {
+        for variant in ["hotstuff", "xrpl"] {
+            let json = GENESIS
+                .replace(r#""mode": "devnet""#, r#""mode": "testnet""#)
+                .replace(r#""personhood_weighted": true }"#,
+                         &format!(r#""personhood_weighted": true, "bft_variant": "{variant}" }}"#));
+            assert!(json.contains(variant), "fixture must set bft_variant");
+            let err = Node::new(&json, None).await.err()
+                .unwrap_or_else(|| panic!("{variant} on testnet must refuse to start"));
+            assert!(err.to_string().contains("bft_variant"), "{err}");
+        }
     }
 
     #[tokio::test]
