@@ -217,6 +217,37 @@ impl LivenessWindow {
     pub fn missed_pct(&self) -> u32 {
         (self.missed_fraction() * 100.0).round() as u32
     }
+
+    /// Byzantine-robust miss percentage (0-100, integer, rounded half up).
+    ///
+    /// Observations are grouped by the proposer whose committed evidence
+    /// produced them. The `byzantine_f` proposers that omitted this validator
+    /// most often (ties broken by proposer id, so every node agrees) have all
+    /// of their blocks excluded, and the percentage is taken over the rest.
+    ///
+    /// Up to f malicious proposers therefore cannot push an honest validator
+    /// over the threshold on their own, while a validator that is genuinely
+    /// offline is absent from honest proposers' evidence too and is still
+    /// caught. Its extra slack is bounded by the excluded proposers' share.
+    pub fn robust_missed_pct(&self, byzantine_f: usize) -> u32 {
+        let n = self.observed();
+        let mut per_proposer: std::collections::BTreeMap<&str, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for i in 0..n {
+            let proposer = self.proposers.get(i).map(String::as_str).unwrap_or("");
+            let e = per_proposer.entry(proposer).or_insert((0, 0));
+            e.0 += 1;
+            if !self.window[i] { e.1 += 1; }
+        }
+        let mut ranked: Vec<(&str, (u64, u64))> = per_proposer.into_iter().collect();
+        // Most omissions first; deterministic tie-break on proposer id.
+        ranked.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        let (total, missed) = ranked.iter()
+            .skip(byzantine_f)
+            .fold((0u64, 0u64), |(t, m), (_, (pt, pm))| (t + pt, m + pm));
+        if total == 0 { return 0; }
+        ((missed * 200 + total) / (2 * total)) as u32
+    }
 }
 
 // -- SlashingConfig -----------------------------------------------------------
@@ -489,7 +520,6 @@ impl SlashingModule {
         epoch:          u64,
         current_height: u64,
     ) -> SlashResult<Option<u128>> {
-        let _ = byzantine_f;
         // Grace period: network hasn't formed yet — don't count any misses.
         if current_height < self.config.liveness_start_height {
             return Ok(None);
@@ -505,7 +535,7 @@ impl SlashingModule {
         // Only check after the window fills for the first time
         if !window.filled { return Ok(None); }
 
-        let missed_pct = window.missed_pct();
+        let missed_pct = window.robust_missed_pct(byzantine_f);
         if missed_pct <= self.config.liveness_miss_pct_threshold { return Ok(None); }
 
         // Liveness threshold exceeded — jail (temporary, reversible). Stake is

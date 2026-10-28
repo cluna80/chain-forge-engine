@@ -5666,6 +5666,50 @@ mod tests {
             }
         }
 
+        /// Drive an observer through `blocks` committed blocks. Each block's
+        /// last_commit evidence omits dave when `omits_dave(proposer)` holds.
+        async fn observer_after(blocks: u64, omits_dave: impl Fn(&str) -> bool) -> Node {
+            let mut obs = Node::new(GENESIS, None).await.unwrap();
+            let mut prev: Option<CommitCertificate> = None;
+            for h in 0..blocks {
+                let root = obs.state.current_root().map(str::to_string);
+                let p = proposal(h, payload(prev.as_ref(), root.as_deref()));
+                deliver(&mut obs, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+                assert_eq!(obs.status.lock().unwrap().height, h, "observer must commit h{h}");
+                // Evidence for block h is published by the proposer of h+1.
+                let signers: Vec<&str> = if omits_dave(proposer(h + 1)) { VALS[..3].to_vec() } else { VALS.to_vec() };
+                prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+            obs
+        }
+
+        /// Alice, as proposer, omits dave from every block's evidence for 600
+        /// blocks (past the 500-block window and grace period): 25% of blocks,
+        /// above the 20% threshold. One Byzantine proposer must not get an
+        /// honest validator jailed.
+        #[tokio::test]
+        async fn one_omitting_proposer_cannot_jail_an_honest_validator_over_many_epochs() {
+            let obs = observer_after(600, |p| p == "qcb1alice").await;
+            assert_eq!(obs.validator_registry.get("qcb1dave").unwrap().status,
+                chain_forge_validators::ValidatorStatus::Active,
+                "dave must stay Active: only one proposer omitted him");
+            assert_eq!(obs.validator_registry.get("qcb1dave").unwrap().bonded_uqcb,
+                Node::new(GENESIS, None).await.unwrap().validator_registry.get("qcb1dave").unwrap().bonded_uqcb,
+                "liveness accounting never burns stake");
+        }
+
+        /// Control: when every proposer's evidence lacks dave he is offline,
+        /// and he is jailed (but not burned).
+        #[tokio::test]
+        async fn validator_absent_from_all_evidence_is_jailed_not_burned() {
+            let bonded = Node::new(GENESIS, None).await.unwrap()
+                .validator_registry.get("qcb1dave").unwrap().bonded_uqcb;
+            let obs = observer_after(600, |_| true).await;
+            let dave = obs.validator_registry.get("qcb1dave").unwrap();
+            assert_eq!(dave.status, chain_forge_validators::ValidatorStatus::Jailed);
+            assert_eq!(dave.bonded_uqcb, bonded, "jailed for liveness, stake intact");
+        }
+
         /// Carol at height 1, having committed block 0. Returns the node and
         /// block 0's hash.
         async fn carol_at_height_1() -> (Node, BlockHash) {
