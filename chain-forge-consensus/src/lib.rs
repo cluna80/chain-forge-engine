@@ -1692,7 +1692,7 @@ impl HotStuffEngine {
     }
 
     /// Active quorum threshold: VCA-derived when set, otherwise 2n/3+1.
-    fn quorum(&self) -> u64 {
+    pub(crate) fn quorum(&self) -> u64 {
         self.vca_quorum.unwrap_or_else(|| self.validators.quorum_power())
     }
 
@@ -4520,5 +4520,168 @@ mod vca_integration {
                 "apply_vca_weights should set voting_power = VCA weight for {}",
                 v.id.0);
         }
+    }
+}
+
+// ── Release gate 3: VCA quorum floor ─────────────────────────────────────────
+//
+// Whatever VCA (or FBA) computes, a commit certificate must never be accepted
+// with less than ⌊2·total/3⌋+1 of the voting power of the set it is verified
+// against. Two certificates below that bound need not intersect in an honest
+// validator, so two conflicting blocks could both verify.
+
+#[cfg(test)]
+mod vca_quorum_floor {
+    use super::*;
+    use super::tendermint::TendermintEngine;
+    use chain_forge_vca_pq::{WeightConfig, AdaptiveQuorumConfig};
+
+    fn equal_vs(n: usize) -> ValidatorSet {
+        ValidatorSet {
+            height: 0,
+            validators: (0..n).map(|i| ValidatorInfo {
+                id:           ValidatorId(format!("v{i}")),
+                voting_power: 1,
+                pop_verified: true,
+                public_key:   vec![],
+            }).collect(),
+        }
+    }
+
+    fn config(variant: ConsensusVariant, quorum_config: AdaptiveQuorumConfig) -> ConsensusConfig {
+        ConsensusConfig {
+            variant,
+            chain_id:             "qcb-devnet".to_string(),
+            propose_timeout_ms:   1_000,
+            prevote_timeout_ms:   1_000,
+            precommit_timeout_ms: 1_000,
+            block_time_ms:        1_000,
+            personhood:           None,
+            vca: Some(VcaIntegrationConfig { weight_config: WeightConfig::default(), quorum_config }),
+        }
+    }
+
+    /// A misconfigured VCA quorum (50% of weight).
+    fn half_quorum() -> AdaptiveQuorumConfig {
+        AdaptiveQuorumConfig { base_fraction: 0.5, quorum_ceiling_fraction: 0.5, ..AdaptiveQuorumConfig::default() }
+    }
+
+    /// Precommits from the first `signers` validators of `vs`.
+    fn cert(vs: &ValidatorSet, signers: usize) -> CommitCertificate {
+        let block_hash = BlockHash("b".into());
+        CommitCertificate {
+            height: 0,
+            round:  0,
+            block_hash: block_hash.clone(),
+            precommits: vs.validators.iter().take(signers).map(|v| Vote {
+                vote_type:  VoteType::Precommit,
+                height:     0,
+                round:      0,
+                validator:  v.id.clone(),
+                block_hash: Some(block_hash.clone()),
+                signature:  vec![],
+                scheme:     Vote::default_scheme(),
+            }).collect(),
+        }
+    }
+
+    fn signed_power(vs: &ValidatorSet, signers: usize) -> u64 {
+        vs.validators.iter().take(signers).map(|v| v.voting_power).sum()
+    }
+
+    /// Asserts the gate for one engine: largest signer prefix below the
+    /// floor is rejected, the smallest at or above it is accepted.
+    fn assert_floor<E: ConsensusEngine>(engine: &E, vs: &ValidatorSet, label: &str) {
+        let floor = vs.quorum_power();
+        for signers in 0..=vs.validators.len() {
+            let power = signed_power(vs, signers);
+            let result = engine.verify_commit(&cert(vs, signers), vs);
+            if power < floor {
+                assert!(result.is_err(),
+                    "{label}: accepted a commit with {power} of {} power, below the floor {floor}",
+                    vs.total_power());
+            } else {
+                assert!(result.is_ok(),
+                    "{label}: rejected a commit with {power} >= floor {floor}: {result:?}");
+            }
+        }
+    }
+
+    // Default VCA config: base quorum is ceil(2·total/3), one unit short of
+    // ⌊2·total/3⌋+1 whenever total weight is divisible by 3 (3 × 1000 here).
+    #[tokio::test]
+    async fn tendermint_default_vca_quorum_is_floored() {
+        let mut e = TendermintEngine::new();
+        e.init(config(ConsensusVariant::TendermintStyle, AdaptiveQuorumConfig::default()), equal_vs(3)).await.unwrap();
+        let vs = e.validator_set().clone();
+        assert_eq!(vs.total_power() % 3, 0, "fixture needs total weight divisible by 3");
+        assert_floor(&e, &vs, "tendermint/default");
+    }
+
+    #[tokio::test]
+    async fn tendermint_misconfigured_vca_quorum_is_floored() {
+        let mut e = TendermintEngine::new();
+        e.init(config(ConsensusVariant::TendermintStyle, half_quorum()), equal_vs(4)).await.unwrap();
+        let vs = e.validator_set().clone();
+        assert_floor(&e, &vs, "tendermint/half");
+    }
+
+    #[tokio::test]
+    async fn hotstuff_vca_quorum_is_floored() {
+        for (name, qc, n) in [("default", AdaptiveQuorumConfig::default(), 3), ("half", half_quorum(), 4)] {
+            let mut e = HotStuffEngine::new();
+            e.init(config(ConsensusVariant::HotStuffStyle, qc), equal_vs(n)).await.unwrap();
+            let vs = e.validator_set().clone();
+            assert_floor(&e, &vs, &format!("hotstuff/{name}"));
+            assert!(e.quorum() >= vs.quorum_power(), "hotstuff/{name}: voting quorum below floor");
+        }
+    }
+
+    #[tokio::test]
+    async fn fba_vca_quorum_is_floored() {
+        for (name, qc, n) in [("default", AdaptiveQuorumConfig::default(), 3), ("half", half_quorum(), 4)] {
+            let mut e = FbaEngine::new();
+            e.init(config(ConsensusVariant::XrplInspired, qc), equal_vs(n)).await.unwrap();
+            let vs = e.validator_set().clone();
+            assert_floor(&e, &vs, &format!("fba/{name}"));
+            assert!(e.threshold_power() >= vs.quorum_power(), "fba/{name}: voting threshold below floor");
+        }
+    }
+
+    /// The FBA agreement threshold alone (no VCA) is floored too.
+    #[tokio::test]
+    async fn fba_agreement_threshold_is_floored() {
+        let mut e = FbaEngine::new();
+        e.fba.agreement_threshold = 0.5;
+        let mut cfg = config(ConsensusVariant::XrplInspired, AdaptiveQuorumConfig::default());
+        cfg.vca = None;
+        e.init(cfg, equal_vs(4)).await.unwrap();
+        let vs = e.validator_set().clone();
+        assert_floor(&e, &vs, "fba/threshold-0.5");
+    }
+
+    /// The floor comes from the set being verified, not from the set the
+    /// adaptive quorum was computed for (e.g. a synced block from a larger
+    /// epoch).
+    #[tokio::test]
+    async fn floor_uses_the_set_being_verified() {
+        let mut e = TendermintEngine::new();
+        e.init(config(ConsensusVariant::TendermintStyle, AdaptiveQuorumConfig::default()), equal_vs(4)).await.unwrap();
+        let larger = ValidatorSet {
+            height: 0,
+            validators: (0..9).map(|i| ValidatorInfo {
+                id: ValidatorId(format!("v{i}")), voting_power: 1000, pop_verified: true, public_key: vec![],
+            }).collect(),
+        };
+        assert_floor(&e, &larger, "tendermint/larger-set");
+    }
+
+    #[tokio::test]
+    async fn computed_vca_quorum_is_floored_at_computation() {
+        let mut e = TendermintEngine::new();
+        e.init(config(ConsensusVariant::TendermintStyle, half_quorum()), equal_vs(4)).await.unwrap();
+        let q = e.vca_quorum.expect("VCA configured");
+        assert!(q >= e.validator_set().quorum_power(),
+            "stored VCA quorum {q} is below ⌊2·total/3⌋+1 = {}", e.validator_set().quorum_power());
     }
 }
