@@ -1724,6 +1724,10 @@ pub struct ExecutionConfig {
     /// Per-attester rolling-window cap from genesis
     /// (`identity.attestation_cap_per_window`), installed alongside the quorum.
     pub attestation_cap_per_window: u32,
+    /// `cryptography.validator_scheme = "ml-dsa-65"`: only ML-DSA-65
+    /// consensus keys may register, and ML-DSA consensus cannot be
+    /// deprecated (it is the only consensus scheme the chain has).
+    pub mldsa_consensus_only: bool,
 }
 
 impl ExecutionConfig {
@@ -1754,6 +1758,7 @@ impl ExecutionConfig {
                 .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_QUORUM),
             attestation_cap_per_window: genesis.attestation_cap_per_window()
                 .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW),
+            mldsa_consensus_only: genesis.mldsa_consensus_only(),
         }
     }
 }
@@ -3164,6 +3169,14 @@ impl Executor {
                     );
                 }
 
+                if self.config.mldsa_consensus_only && effective_scheme != "ml-dsa-65" {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("this chain's consensus keys are ML-DSA-65 only; \
+                                 scheme '{effective_scheme}' cannot register"),
+                    );
+                }
+
                 // --- R2: key-length guard (fail before expensive crypto) ---
                 let expected_key_len: Option<usize> = match effective_scheme {
                     "classical"  => Some(32),   // Ed25519 public key
@@ -3830,6 +3843,16 @@ impl Executor {
                 match scope {
                     DeprecationScope::TxSignatures => { /* always allowed */ }
                     DeprecationScope::ConsensusSignatures => {
+                        // On an ML-DSA-only chain there is nothing to roll
+                        // back to: deprecating it would zero every validator.
+                        if self.config.mldsa_consensus_only {
+                            return TransactionResult::err(
+                                tx.id.clone(), gas_required, tx.gas_limit,
+                                "EmergencyDeprecateAlgorithm: ML-DSA-65 is this chain's only \
+                                 consensus scheme; deprecating it would halt the chain"
+                                    .to_string(),
+                            );
+                        }
                         // Allowed only for the PQ-VAL-002 ML-DSA rollback.
                         if deprecated_scheme != "ml-dsa-65" {
                             return TransactionResult::err(
@@ -4782,6 +4805,7 @@ mod tests {
             pop_verifier:     None,
             attestation_quorum: chain_forge_core::DEFAULT_ATTESTATION_QUORUM,
             attestation_cap_per_window: chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
+            mldsa_consensus_only: false,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();

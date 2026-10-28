@@ -571,6 +571,11 @@ pub struct GenesisRewards {
     pub premium_cap_bps: Option<u32>,
 }
 
+/// Ed25519 consensus public key length.
+pub const ED25519_CONSENSUS_KEY_BYTES: usize = 32;
+/// ML-DSA-65 (FIPS 204) consensus public key length.
+pub const MLDSA65_CONSENSUS_KEY_BYTES: usize = 1952;
+
 /// BFT engine a chain runs, resolved by `GenesisConfig::bft_variant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BftVariant {
@@ -905,10 +910,28 @@ impl GenesisConfig {
                     ));
                 }
             };
-            if bytes.len() < 32 {
+            if bytes.len() < ED25519_CONSENSUS_KEY_BYTES {
                 return Err(format!(
                     "genesis validator {:?} ({}) public_key is only {} bytes \
-                     -- too short to be a real consensus key (expected >= 32)",
+                     -- too short to be a real consensus key (expected 32 or 1952)",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+            // The key's length fixes its consensus scheme
+            // (chain_forge_crypto::consensus_key_scheme); any other length
+            // could never sign a valid vote.
+            if bytes.len() != ED25519_CONSENSUS_KEY_BYTES && bytes.len() != MLDSA65_CONSENSUS_KEY_BYTES {
+                return Err(format!(
+                    "genesis validator {:?} ({}) public_key is {} bytes -- a consensus \
+                     key must be 32 (Ed25519) or 1952 (ML-DSA-65) bytes",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+            if self.mldsa_consensus_only() && bytes.len() != MLDSA65_CONSENSUS_KEY_BYTES {
+                return Err(format!(
+                    "genesis validator {:?} ({}) has a {}-byte key, but \
+                     cryptography.validator_scheme is \"ml-dsa-65\": every consensus \
+                     key must be ML-DSA-65 (1952 bytes)",
                     acct.label, acct.address, bytes.len()
                 ));
             }
@@ -1040,7 +1063,7 @@ impl GenesisConfig {
     /// `cryptography.validator_scheme = "ml-dsa-65"`: every consensus key on
     /// this chain is ML-DSA-65, from genesis on.
     pub fn mldsa_consensus_only(&self) -> bool {
-        false
+        self.cryptography.validator_scheme == "ml-dsa-65"
     }
 
     /// Resolve and validate the BFT engine selected by `consensus.bft_variant`.

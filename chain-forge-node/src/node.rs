@@ -1796,7 +1796,7 @@ impl Node {
                 .ok_or_else(|| format!("key file {:?}: '{name}' is not valid hex", path)));
         // Older key files have no "scheme" (Ed25519).
         let scheme = match k["scheme"].as_str().unwrap_or("ed25519") {
-            "ed25519" | "classical"   => SchemeId::Classical,
+            "ed25519" | "classical" | "classical-ed25519" => SchemeId::Classical,
             "ml-dsa-65" | "mldsa65"   => SchemeId::MlDsa,
             other => return Err(format!("key file {:?}: unsupported scheme {other:?}", path)),
         };
@@ -4721,10 +4721,15 @@ impl Node {
                     cert.height, cert.round, vote.validator
                 ));
             }
-            if vote.scheme != "classical" {
+            // The tag must name the scheme of the key the vote is checked
+            // against (fail-closed on anything else).
+            let key_scheme = chain_forge_crypto::consensus_key_scheme(historical_vs.public_key_of(&vote.validator))
+                .unwrap_or(chain_forge_crypto::SchemeId::Classical);
+            let expected = chain_forge_crypto::consensus_scheme_tag(&key_scheme);
+            if vote.scheme != expected {
                 return Err(format!(
-                    "certificate vote from {} uses scheme {:?}; only classical \
-                     precommits can be verified as commit evidence today (fail-closed)",
+                    "certificate vote from {} uses scheme {:?}, but its registered key \
+                     is {expected:?} (fail-closed)",
                     vote.validator, vote.scheme
                 ));
             }

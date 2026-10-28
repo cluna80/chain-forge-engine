@@ -1,17 +1,18 @@
 /// chain-forge-keygen
 ///
-/// Generates Ed25519 signing key files for Chain Forge validators.
+/// Generates consensus signing key files for Chain Forge validators.
 ///
 /// Each key file is a JSON object:
 ///   {
 ///     "address":     "qcb1alice",          -- validator address (matches genesis)
-///     "scheme":      "ed25519",             -- always ed25519 for now
-///     "public_key":  "<64 hex chars>",      -- 32-byte Ed25519 verifying key
-///     "private_key": "<64 hex chars>"       -- 32-byte Ed25519 signing seed
+///     "scheme":      "ed25519",             -- "ed25519" (default) or "ml-dsa-65"
+///     "public_key":  "<hex>",               -- 32-byte Ed25519 / 1952-byte ML-DSA-65 key
+///     "private_key": "<hex>"                -- 32-byte Ed25519 seed / 4032-byte ML-DSA-65 key
 ///   }
 ///
 /// Usage:
 ///   chain-forge-keygen --address qcb1alice --out keys/qcb1alice.key.json
+///   chain-forge-keygen --address qcb1alice --scheme ml-dsa-65 --out keys/qcb1alice.key.json
 ///   chain-forge-keygen --address qcb1bob   --out keys/qcb1bob.key.json
 ///   chain-forge-keygen --address qcb1carol --out keys/qcb1carol.key.json
 ///
@@ -19,7 +20,7 @@
 /// "public_key" field so that peer validators can verify signatures without
 /// an out-of-band key exchange.
 
-use chain_forge_crypto::ClassicalScheme;
+use chain_forge_crypto::{ClassicalScheme, MlDsaScheme, SignatureScheme};
 use std::path::PathBuf;
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -30,6 +31,7 @@ struct Args {
     address: String,
     out:     PathBuf,
     force:   bool,
+    mldsa:   bool,
 }
 
 fn parse_args() -> Args {
@@ -37,6 +39,7 @@ fn parse_args() -> Args {
     let mut address = String::new();
     let mut out     = PathBuf::new();
     let mut force   = false;
+    let mut mldsa   = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -50,10 +53,22 @@ fn parse_args() -> Args {
                 if i < args.len() { out = PathBuf::from(&args[i]); }
             }
             "--force" | "-f" => { force = true; }
+            "--scheme" | "-s" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("ed25519")   => mldsa = false,
+                    Some("ml-dsa-65") => mldsa = true,
+                    other => {
+                        eprintln!("Error: --scheme must be ed25519 or ml-dsa-65, got {other:?}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--help" | "-h" => {
                 println!("chain-forge-keygen");
                 println!("  --address <addr>   Validator address (e.g. qcb1alice)");
                 println!("  --out <path>       Output key file path (e.g. keys/qcb1alice.key.json)");
+                println!("  --scheme <s>       ed25519 (default) or ml-dsa-65");
                 println!("  --force            Overwrite an existing key file");
                 std::process::exit(0);
             }
@@ -72,7 +87,7 @@ fn parse_args() -> Args {
         out = PathBuf::from(format!("keys/{}.key.json", address));
     }
 
-    Args { address, out, force }
+    Args { address, out, force, mldsa }
 }
 
 pub fn main() {
@@ -97,8 +112,14 @@ pub fn main() {
         }
     }
 
-    // Generate a fresh random Ed25519 keypair
-    let kp = match ClassicalScheme.generate_random() {
+    // Fresh random keypair. ML-DSA-65 keygen is randomised per call; the
+    // seed argument only names the in-process cache entry.
+    let generated = if args.mldsa {
+        MlDsaScheme.generate_keypair(&args.address)
+    } else {
+        ClassicalScheme.generate_random()
+    };
+    let kp = match generated {
         Ok(k)  => k,
         Err(e) => {
             eprintln!("Error: key generation failed: {e}");
@@ -108,7 +129,7 @@ pub fn main() {
 
     let json = serde_json::json!({
         "address":     args.address,
-        "scheme":      "ed25519",
+        "scheme":      if args.mldsa { "ml-dsa-65" } else { "ed25519" },
         "public_key":  hex_encode(&kp.public_key),
         "private_key": hex_encode(&kp.private_key),
     });
