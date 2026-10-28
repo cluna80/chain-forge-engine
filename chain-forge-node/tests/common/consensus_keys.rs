@@ -43,7 +43,12 @@ pub fn genesis(path: &Path) -> PathBuf {
     }
     let out = std::env::temp_dir().join(format!(
         "mldsa-{}-{}", std::process::id(), path.file_name().unwrap().to_string_lossy()));
-    std::fs::write(&out, g.to_string()).unwrap();
+    // Tests call this once per spawned node: write a fresh file and rename
+    // it into place, so a starting node never reads a half-written genesis.
+    let tmp = out.with_extension(format!("tmp{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::write(&tmp, g.to_string()).unwrap();
+    std::fs::rename(&tmp, &out).unwrap();
     out
 }
 

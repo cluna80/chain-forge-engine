@@ -139,8 +139,11 @@ fn node_binary() -> PathBuf {
     }
 }
 
+#[path = "common/consensus_keys.rs"]
+mod consensus_keys;
+
 fn genesis_path() -> PathBuf {
-    repo_root().join("tests").join("devnet").join("genesis-4node.json")
+    consensus_keys::genesis(&repo_root().join("tests").join("devnet").join("genesis-4node.json"))
 }
 
 // ── Node spawn / teardown ─────────────────────────────────────────────────────
@@ -164,7 +167,26 @@ fn devnet_keys_dir() -> PathBuf {
 }
 
 fn key_file_for(label: &str) -> PathBuf {
-    devnet_keys_dir().join(format!("{label}.key.json"))
+    consensus_keys::validator_key(label, devnet_keys_dir().join(format!("{label}.key.json")))
+}
+
+/// Alice's consensus key: the deterministic devnet Ed25519 key, or (with
+/// `CF_CONSENSUS_KEYS=mldsa`) her committed ML-DSA-65 key file.
+fn alice_consensus_key() -> chain_forge_crypto::KeyPair {
+    if !consensus_keys::mldsa() {
+        return ClassicalScheme.generate_keypair("qcb1alice")
+            .expect("deterministic devnet keypair generation must not fail");
+    }
+    let k: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(key_file_for("alice")).unwrap()).unwrap();
+    let hex = |f: &str| -> Vec<u8> {
+        let s = k[f].as_str().unwrap();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    };
+    chain_forge_crypto::KeyPair {
+        scheme: chain_forge_crypto::SchemeId::MlDsa,
+        public_key: hex("public_key"), private_key: hex("private_key"),
+    }
 }
 
 fn spawn_node(
@@ -477,8 +499,7 @@ async fn adversarial_equivocation_over_gossip() {
     // sign both conflicting votes with it, so the test still proves what
     // it always meant to: a validator who double-votes gets caught, now
     // under the stricter signature regime rather than around it.
-    let alice_kp = ClassicalScheme.generate_keypair("qcb1alice")
-        .expect("deterministic devnet keypair generation must not fail");
+    let alice_kp = alice_consensus_key();
     let sign = |vote_type: VoteType, block_hash: &str| -> Vote {
         let mut vote = Vote {
             vote_type,
@@ -493,8 +514,9 @@ async fn adversarial_equivocation_over_gossip() {
             "qcb-devnet-4node", &vote.vote_type, vote.height, vote.round,
             vote.block_hash.as_ref(),
         );
-        vote.signature = ClassicalScheme.sign(&bytes, &alice_kp)
-            .expect("signing must not fail").bytes;
+        vote.signature = chain_forge_crypto::sign_consensus(&bytes, &alice_kp)
+            .expect("signing must not fail");
+        vote.scheme = chain_forge_crypto::consensus_scheme_tag(&alice_kp.scheme).to_string();
         vote
     };
     let vote_a = sign(VoteType::Prevote, "block_hash_version_AAAAAAAAAAAAA");
@@ -563,21 +585,32 @@ async fn adversarial_equivocation_over_gossip() {
     println!("   PASS: equivocation detected for qcb1alice at height={attack_height} \
               (confirmed in node logs, not a startup-misfire line).");
 
-    // Slash-balance check is informational: BME burn may fail if penalty > stake
-    // (see KNOWN_ISSUES.md §1).
-    match (balance_before, balance_after) {
-        (Some(b), Some(a)) if a < b => {
-            println!("   PASS: Alice slashed ({b} → {a} uqcb, burned {}).", b - a);
-        }
-        (Some(b), Some(a)) => {
-            println!("   NOTE: balance unchanged ({b} → {a} uqcb). \
-                      BME burn likely failed (slash > stake) — tombstone still applied. \
-                      See KNOWN_ISSUES.md §1.");
-        }
-        _ => {
-            println!("   NOTE: could not read Alice's balance from API.");
-        }
+    // ── Release gate 4: the slash comes from committed evidence, so every
+    // node applies it identically and no node diverges. (Before gate 4 a
+    // node slashed locally when it saw the double vote, node states
+    // diverged and the chain halted; signed evidence also never verified.)
+    assert!(
+        poll_until_height(&ports.all_api_ports(), attack_height + 2, Duration::from_secs(20)),
+        "all 4 nodes must pass height {} after the equivocation", attack_height + 2
+    );
+    let balances: Vec<Option<u128>> = ports.all_api_ports().iter()
+        .map(|&p| balance_of(p, "qcb1alice")).collect();
+    println!("   alice balance per node after: {balances:?} (before: {balance_before:?})");
+    let before = balance_before.expect("alice balance before the attack");
+    for b in &balances {
+        let b = b.expect("alice balance readable on every node");
+        assert!(b < before, "alice must be slashed on every node: {before} -> {b}");
+        assert_eq!(Some(b), balances[0], "every node must apply the same slash: {balances:?}");
     }
+    for name in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+        let log = std::fs::read_to_string(log_dir.join(format!("{name}.log"))).unwrap_or_default();
+        assert!(!log.contains("STATE DIVERGENCE"), "{name} diverged after the equivocation");
+        assert!(log.contains("committed equivocation evidence slashed"),
+            "{name} must slash from the committed evidence");
+    }
+    println!("   PASS: alice slashed identically on 4/4 nodes from committed evidence \
+              ({before} -> {}), no divergence.", balances[0].unwrap());
+    let _ = balance_after;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
