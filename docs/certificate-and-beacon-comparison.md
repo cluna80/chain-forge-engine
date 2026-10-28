@@ -5,22 +5,23 @@ Date: 2026-10-28
 
 ## 1. Measured baseline (ML-DSA-65, FIPS 204)
 
-Measured with `dilithium-py` (pure Python, so timings are upper bounds; native libraries are much faster). Sizes match the standard.
+Measured with the native `pqcrypto` ML-DSA-65 binding (`scripts/bench_cert_mldsa65_native.py`, 500 runs each). Sizes match the standard. An earlier pure-Python run (`scripts/bench_cert_mldsa65.py`) gave verify times about 45x slower and is kept only as a cross-check.
 
 | Item | Value |
 |---|---|
 | Public key | 1,952 bytes |
 | Signature | 3,309 bytes |
-| Sign (median, 20 runs) | ~37.5 ms |
-| Verify (median, 20 runs) | ~10.1 ms |
+| Sign (median, 500 runs) | ~11.1 ms |
+| Verify (median, 500 runs) | ~0.22 ms |
 
 Naive certificate (C ML-DSA signatures concatenated):
 
-| Committee C | Certificate size | Verify time (pure Python, naive) |
+| Committee C | Certificate size | Serial verify time (native, naive) |
 |---|---|---|
-| 128 | ~414 KiB | ~1.3 s |
-| 256 | ~827 KiB | ~2.6 s |
-| 512 | ~1,654 KiB | ~5.2 s |
+| 32 | ~103 KiB | ~7 ms |
+| 128 | ~414 KiB | ~28 ms |
+| 256 | ~827 KiB | ~56 ms |
+| 512 | ~1,654 KiB | ~112 ms |
 
 Naive certificates are not acceptable at block frequency. The schemes below are compared against this baseline.
 
@@ -64,7 +65,7 @@ Falcon signatures are about 666 bytes with a 897-byte public key, roughly a fift
 
 | Option | Certificate size per block | Verification | Proving cost | Post-quantum assumption | Maturity |
 |---|---|---|---|---|---|
-| Naive ML-DSA, C = 512 | ~1.6 MiB | Linear, ~5 s (pure Python) | None | ML-DSA (lattice) | Standard, but size fails |
+| Naive ML-DSA, C = 512 | ~1.6 MiB | Linear, ~112 ms serial (native) | None | ML-DSA (lattice) | Standard, but size fails |
 | A. Hash multi-sig | Unknown until scheme chosen | Depends on scheme | None | Hash only | Aggregation not standard |
 | B. Succinct proof | Tens to hundreds of KB (to measure) | Fast | Heavy | Hash-based proof system | Research; ML-DSA circuit not established |
 | C. Smaller committee | ~3.2 KiB per 1 signature (linear) | Linear, small | None | ML-DSA (lattice) | Ready; safety analysis needed |
@@ -114,6 +115,6 @@ Start with **Option 1 (commit-reveal with threshold reveal)**. It is the simpler
 
 ## 7. Limits of this note
 
-- Pure-Python timings are upper bounds only. Native measurements are needed before any number goes into the spec.
+- Timings are from one machine (Linux sandbox) and one native binding. Re-run on the target hardware before any timing goes into the spec.
 - The Option B proving cost, Option A aggregation, and post-quantum threshold primitives are not measured or standardized. Treat those rows as hypotheses.
 - Sizes for SLH-DSA and Falcon are from memory of the standards and should be confirmed against the FIPS documents before publication.
