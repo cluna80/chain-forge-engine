@@ -387,10 +387,13 @@ impl ValidatorRecord {
         self.status == ValidatorStatus::Active
     }
 
-    pub fn is_eligible_for_active_set(&self) -> bool {
+    /// Eligible to become Active: verified personhood, a Candidate, and
+    /// bonded at least the chain's minimum bond (`bond_min`) -- the same
+    /// minimum that seats it in consensus. Stake tiers are labels only.
+    pub fn is_eligible_for_active_set(&self, min_bond_uqcb: u128) -> bool {
         self.pop_verified
             && self.status == ValidatorStatus::Candidate
-            && self.stake_tier.is_some()
+            && self.bonded_uqcb >= min_bond_uqcb
     }
 
     /// Voting power to assign in the consensus ValidatorSet.
@@ -726,6 +729,13 @@ impl ValidatorRegistry {
     ///
     /// This is a no-op if the validator is already registered (idempotent, same
     /// as `register_genesis_validator`).
+    /// Set the chain's minimum bond (genesis `validator_bonding.min_bond_amount`),
+    /// the single threshold for seating and activation. Applied by the node
+    /// from genesis at startup and after loading persisted state.
+    pub fn set_min_bond(&mut self, min_bond_uqcb: u128) {
+        self.min_stake_uqcb = min_bond_uqcb;
+    }
+
     pub fn register_bonded_validator(
         &mut self,
         id: &str,
@@ -733,7 +743,20 @@ impl ValidatorRegistry {
         owner_identity_id: Option<String>,
         epoch: u64,
     ) {
-        if self.validators.contains_key(id) {
+        if let Some(record) = self.validators.get_mut(id) {
+            // The record may predate the bond (e.g. created by key
+            // registration). Attach the authenticated owner binding once;
+            // the first binding is canonical.
+            if record.owner_identity_id.is_none() {
+                if let Some(owner) = owner_identity_id {
+                    if let Some(ids) = self.validators_by_human.get_mut(id) {
+                        ids.retain(|v| v != id);
+                    }
+                    self.validators_by_human.retain(|_, ids| !ids.is_empty());
+                    self.validators_by_human.entry(owner.clone()).or_default().push(id.to_string());
+                    record.owner_identity_id = Some(owner);
+                }
+            }
             return;
         }
         let validator_id = ValidatorId(id.to_string());
@@ -972,7 +995,7 @@ impl ValidatorRegistry {
         record.verification_tier = Some(verification_tier.clone());
 
         // Automatically activate if they are a Candidate with sufficient stake
-        if record.is_eligible_for_active_set() {
+        if record.is_eligible_for_active_set(self.min_stake_uqcb) {
             record.activate(epoch);
         }
 
@@ -1355,6 +1378,40 @@ mod tests {
             website:          None,
             owner_identity_id: None,
         }
+    }
+
+    // -- One minimum bond (seat and reward eligibility) ----------------------
+
+    /// The chain's genesis `bond_min` decides both seating and activation.
+    /// A validator seated with 2 QCB under a 1 QCB minimum must become
+    /// Active (and so reward-eligible) once its personhood is confirmed --
+    /// not wait for the old 1,000 QCB Entry tier.
+    #[test]
+    fn bonded_validator_at_the_chain_minimum_activates_on_pop() {
+        let mut reg = registry();
+        reg.set_min_bond(1_000_000);
+        reg.register_bonded_validator("v_small", 2_000_000, Some("v_small".into()), 0);
+        reg.confirm_pop("v_small", VerificationTier::Verified, 1).unwrap();
+        let r = reg.get("v_small").unwrap();
+        assert_eq!(r.status, ValidatorStatus::Active, "seated at the chain minimum -> Active");
+        assert!(r.consensus_power() > 0);
+
+        reg.register_bonded_validator("v_tiny", 500_000, None, 0);
+        reg.confirm_pop("v_tiny", VerificationTier::Verified, 1).unwrap();
+        assert_eq!(reg.get("v_tiny").unwrap().status, ValidatorStatus::Candidate,
+            "below the chain minimum stays Candidate");
+    }
+
+    #[test]
+    fn existing_record_receives_the_authenticated_owner_binding() {
+        let mut reg = registry();
+        reg.set_min_bond(1_000_000);
+        reg.register_bonded_validator("v", 2_000_000, None, 0);        // e.g. created by key registration
+        reg.register_bonded_validator("v", 2_000_000, Some("human_v".into()), 1);
+        assert_eq!(reg.get("v").unwrap().owner_identity_id.as_deref(), Some("human_v"));
+        // The first binding is canonical: a later, different owner does not replace it.
+        reg.register_bonded_validator("v", 2_000_000, Some("someone_else".into()), 2);
+        assert_eq!(reg.get("v").unwrap().owner_identity_id.as_deref(), Some("human_v"));
     }
 
     // -- StakeTier tests ------------------------------------------------------

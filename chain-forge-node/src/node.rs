@@ -1189,6 +1189,8 @@ impl Node {
         // will surface in the per-block PoP refresh. This is the intended
         // "start inactive, log loudly" policy from the integration design doc.
         let mut validator_registry = ValidatorRegistry::qcb_devnet();
+        // One minimum bond for seating and activation (reward eligibility).
+        validator_registry.set_min_bond(min_bond_uqcb);
         {
             // Only seed if the identity module is enabled — otherwise there is
             // no IdentityStore to verify against, and registering validators
@@ -2068,6 +2070,8 @@ impl Node {
             if validators_path.exists() {
                 self.validator_registry =
                     serde_json::from_str(&std::fs::read_to_string(&validators_path)?)?;
+                // The minimum bond comes from genesis, never from disk.
+                self.validator_registry.set_min_bond(self.min_bond_uqcb);
                 tracing::debug!("validator registry restored from disk");
             }
             if agents_path.exists() {

@@ -75,3 +75,10 @@ Gap: `devnet_4node_partition_recovery` is skipped on Windows (no iptables). It p
 - Crypto architecture is locked: devnet stays Ed25519; ML-DSA is mainnet/Phase 1.
 - Liveness only jails, never burns stake. Only objective faults (double-signing) burn stake.
 - Draft PRs only; no merges to `main` without your decision.
+
+## Decisions (2026-10-28, owner)
+
+- **Rewards: fixed pool.** Each epoch's validator pool is split among eligible validators. The capital premium (`k`, `premium_cap`; Model C in `docs/validator-economics-spec.md`) reweights shares within the pool and never adds to it. Both default to 0 (off) until values are chosen.
+- **One minimum bond** (`bond_min`, genesis `validator_bonding.min_bond_amount`) decides both seating and reward eligibility. Fixes MN-8: Eve was seated at 1 QCB but needed 1,000 QCB for registry Active.
+- **M0 approved** with the scope doc's goals (100 KiB at C = 512, verify ≤ 50 ms, hash-based only, 4–7 weeks gated at M2, zkVM first). The **other session** runs M0; this session finishes rewards and MN-8.
+- Local Windows repo: use `/c/Dev/chain-forge-engine`, not the nested `/c/Dev/chain-forge-engine/chain-forge-engine` clone.
