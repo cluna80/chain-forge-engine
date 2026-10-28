@@ -138,6 +138,13 @@ pub struct BlockProposal {
     /// Signature scheme is determined by the chain's genesis cryptography config.
     /// Empty during tests / before the crypto layer is wired up.
     pub signature: Vec<u8>,
+
+    /// Tendermint proof-of-lock round (`validRound`). `Some(vr)` when the
+    /// proposer re-proposes a block that received +2/3 prevotes in round
+    /// `vr < round`; receivers only prevote for it after seeing that polka
+    /// themselves. `None` for a fresh block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pol_round: Option<Round>,
 }
 
 // ── Votes ─────────────────────────────────────────────────────────────────────
@@ -191,13 +198,17 @@ impl Vote {
 // ── Signing bytes ──────────────────────────────────────────────────────────────────────
 
 /// Derive the canonical block hash from its contents: SHA3-256 over
-/// the domain tag, height, round, parent hash bytes, and tx payload.
+/// the domain tag, height, parent hash bytes, and tx payload.
+///
+/// The round is deliberately NOT included: a block is a value, and
+/// Tendermint re-proposes the same value in later rounds (the locked /
+/// valid block). Receivers recompute this hash and reject a proposal whose
+/// `block_hash` does not match its contents.
 /// Using `chain-forge-core::ChainHash` (SHA3-256) — same hash function
 /// used everywhere else on the chain.
 pub fn compute_block_hash(
     chain_id: &str,
     height: BlockHeight,
-    round: Round,
     parent_hash: &BlockHash,
     tx_data: &[u8],
 ) -> BlockHash {
@@ -206,7 +217,6 @@ pub fn compute_block_hash(
     preimage.extend_from_slice(chain_id.as_bytes());
     preimage.push(b'|');
     preimage.extend_from_slice(&height.to_le_bytes());
-    preimage.extend_from_slice(&round.to_le_bytes());
     preimage.push(b'|');
     preimage.extend_from_slice(parent_hash.0.as_bytes());
     preimage.push(b'|');
@@ -259,6 +269,53 @@ pub struct CommitCertificate {
 
     /// The pre-commit votes that form the quorum. Must cover ≥ 2/3+1 power.
     pub precommits: Vec<Vote>,
+}
+
+// ── Engine-driven consensus (Tendermint state machine) ────────────────────────
+
+/// Which Tendermint timeout fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TimeoutStep {
+    Propose,
+    Prevote,
+    Precommit,
+}
+
+/// Work an engine that decides its own votes (`drives_own_votes`) asks the
+/// node to perform. The node drains these with `next_action` after every
+/// input it feeds the engine.
+#[derive(Debug, Clone)]
+pub enum ConsensusAction {
+    /// Sign this vote (through the persisted double-sign guard), broadcast
+    /// it, and feed it back with `receive_vote`.
+    CastVote(Vote),
+    /// This validator proposes a fresh block for (height, round): the node
+    /// builds the payload and calls `propose`.
+    ProposeNew { height: BlockHeight, round: Round },
+    /// Broadcast this re-proposal of the valid block (already registered
+    /// with the engine).
+    Repropose(BlockProposal),
+    /// Call `on_step_timeout(step, height, round)` after `after_ms`.
+    ScheduleTimeout { step: TimeoutStep, height: BlockHeight, round: Round, after_ms: u64 },
+    /// Decided: +2/3 precommits for `proposal` in `certificate.round`.
+    Commit { certificate: CommitCertificate, proposal: BlockProposal },
+}
+
+/// Per-height voting state a validator must keep across restarts so it never
+/// signs a vote it would have refused before restarting: its lock, its valid
+/// block, and every vote it has signed at this height.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LockState {
+    pub height:   BlockHeight,
+    pub round:    Round,
+    /// (block, round) this validator is locked on.
+    pub locked:   Option<(BlockHash, Round)>,
+    /// (block, round) of the latest polka this validator observed.
+    pub valid:    Option<(BlockHash, Round)>,
+    /// Contents of the locked and valid blocks (for re-proposal and commit).
+    pub blocks:   Vec<BlockProposal>,
+    /// Votes this validator signed at this height.
+    pub own_votes: Vec<Vote>,
 }
 
 // ── Personhood configuration ──────────────────────────────────────────────────
@@ -592,6 +649,39 @@ pub trait ConsensusEngine: Send + Sync {
     ) -> ConsensusResult<()> {
         Ok(())
     }
+
+    // ── Engine-driven voting (Tendermint) ────────────────────────────────────
+    //
+    // An engine returning `true` from `drives_own_votes` decides every vote
+    // this validator casts and reports it as a `ConsensusAction`; the node
+    // must not construct votes itself. Defaults keep other engines unchanged.
+
+    fn drives_own_votes(&self) -> bool { false }
+
+    /// The validator this node votes as (None = observer).
+    fn set_local_validator(&mut self, _id: Option<ValidatorId>) {}
+
+    /// Begin the round state machine (timeouts, proposing) at the current
+    /// height. Idempotent.
+    fn start(&mut self) {}
+
+    /// A timeout scheduled via `ConsensusAction::ScheduleTimeout` fired.
+    fn on_step_timeout(&mut self, _step: TimeoutStep, _height: BlockHeight, _round: Round) {}
+
+    /// Next pending action, if any.
+    fn next_action(&mut self) -> Option<ConsensusAction> { None }
+
+    /// Proposals and votes held for the current height, for periodic
+    /// re-gossip: gossipsub delivers each message once, and Tendermint's
+    /// liveness needs every message to eventually reach every validator.
+    /// All are already signed by their authors; re-sending signs nothing.
+    fn gossip_messages(&self) -> (Vec<BlockProposal>, Vec<Vote>) { (vec![], vec![]) }
+
+    /// Voting state to persist before any signed vote is broadcast.
+    fn lock_state(&self) -> Option<LockState> { None }
+
+    /// Restore voting state persisted at the current height (after restart).
+    fn restore_lock_state(&mut self, _state: LockState) -> ConsensusResult<()> { Ok(()) }
 }
 
 // ── Personhood power cap enforcement ─────────────────────────────────────────
@@ -943,7 +1033,7 @@ impl ConsensusEngine for FbaEngine {
         tx_data:     Vec<u8>,
     ) -> ConsensusResult<BlockProposal> {
         // In FBA every validator proposes independently.
-        let block_hash = compute_block_hash(&self.config.chain_id, height, round, &parent_hash, &tx_data);
+        let block_hash = compute_block_hash(&self.config.chain_id, height, &parent_hash, &tx_data);
         let proposal = BlockProposal {
             height,
             round,
@@ -953,6 +1043,7 @@ impl ConsensusEngine for FbaEngine {
             timestamp_ms: 0,
             tx_data,
             signature: vec![],
+            pol_round: None,
         };
         tracing::debug!(height, round, "FBA: proposal broadcast");
         Ok(proposal)
@@ -1311,908 +1402,17 @@ pub mod tendermint {
 ///   - Evidence handling for equivocation (Open Question 13)
 
 use std::collections::BTreeMap;
-use tracing::{debug, info, warn};
-
 use crate::{
     apply_personhood_cap, BlockHash, BlockHeight, BlockProposal, CommitCertificate,
     ConsensusConfig, ConsensusEngine, ConsensusError, ConsensusResult, ConsensusVariant,
     Round, ValidatorId, ValidatorSet, Vote, VoteType,
 };
 
-// -- Internal round state -----------------------------------------------------
-
-/// All votes accumulated for one (height, round) pair.
-#[derive(Debug, Default)]
-struct RoundVotes {
-    prevotes:   BTreeMap<ValidatorId, Vote>,
-    precommits: BTreeMap<ValidatorId, Vote>,
-}
-
-impl RoundVotes {
-    /// Sum of voting power behind prevotes for a specific block hash.
-    fn prevote_power(&self, block_hash: &BlockHash, validator_set: &ValidatorSet) -> u64 {
-        self.prevotes
-            .iter()
-            .filter(|(_, v)| v.block_hash.as_ref() == Some(block_hash))
-            .map(|(id, _)| validator_set.power_of(id))
-            .sum()
-    }
-
-    /// Sum of voting power behind precommits for a specific block hash.
-    fn precommit_power(&self, block_hash: &BlockHash, validator_set: &ValidatorSet) -> u64 {
-        self.precommits
-            .iter()
-            .filter(|(_, v)| v.block_hash.as_ref() == Some(block_hash))
-            .map(|(id, _)| validator_set.power_of(id))
-            .sum()
-    }
-
-    /// Collect precommit votes for a block into a vec (for CommitCertificate).
-    fn precommit_votes_for(&self, block_hash: &BlockHash) -> Vec<Vote> {
-        self.precommits
-            .values()
-            .filter(|v| v.block_hash.as_ref() == Some(block_hash))
-            .cloned()
-            .collect()
-    }
-}
-
-// -- Engine -------------------------------------------------------------------
-
-/// Tendermint-style BFT engine.
-pub struct TendermintEngine {
-    /// This validator's Ed25519 signing keypair. None for observer nodes.
-    #[cfg(feature = "real-crypto")]
-    signing_key: Option<KeyPair>,
-    /// Chain ID for domain-separating signed messages.
-    chain_id: String,
-    config:         Option<ConsensusConfig>,
-    validator_set:  Option<ValidatorSet>,
-    height:         BlockHeight,
-    round:          Round,
-    /// Locked block: the last block we sent a precommit for.
-    /// We must prevote for this block (or nil) in future rounds.
-    locked_block:   Option<BlockHash>,
-    /// Valid block: the latest block we saw 2/3+ prevotes for.
-    valid_block:    Option<BlockHash>,
-    /// Votes indexed by round.
-    votes:          BTreeMap<Round, RoundVotes>,
-    /// The proposal we accepted for the current (height, round).
-    current_proposal: Option<BlockProposal>,
-    /// Equivocation evidence accumulated by receive_vote().
-    /// The node drains this after each vote with `drain_equivocations()`.
-    pub pending_equivocations: Vec<EquivocationDetected>,
-
-    /// VCA-derived quorum threshold for the current epoch.
-    ///
-    /// Computed by `build_vca_registry_from_validator_set` + `compute_adaptive_quorum`
-    /// at each epoch boundary. `None` when VCA is not configured or the
-    /// registry has not yet been built (genesis state).
-    ///
-    /// When `Some(q)`, `verify_commit` uses `q` as the quorum threshold instead
-    /// of `ValidatorSet::quorum_power()`. This is the primary integration point:
-    /// the adaptive quorum derived from verified-personhood fraction ρ replaces
-    /// the static 2n/3+1 threshold.
-    pub(crate) vca_quorum: Option<u64>,
-}
-
-/// Evidence of a double-sign detected by the consensus engine.
-/// Both votes are from the same validator, same height+round, same phase,
-/// but for different block hashes.
-#[derive(Debug, Clone)]
-pub struct EquivocationDetected {
-    pub validator_id:   ValidatorId,
-    pub height:         BlockHeight,
-    pub round:          Round,
-    /// 0 = Prevote, 1 = Precommit (matches vote_signing_bytes encoding).
-    pub vote_type_byte: u8,
-    pub block_hash_a:   BlockHash,
-    pub block_hash_b:   BlockHash,
-    /// Raw signature bytes from the first vote (already accepted).
-    pub signature_a:    Vec<u8>,
-    /// Raw signature bytes from the conflicting vote (just arrived).
-    pub signature_b:    Vec<u8>,
-}
-
-impl TendermintEngine {
-    pub fn new() -> Self {
-        Self {
-            #[cfg(feature = "real-crypto")]
-            signing_key:          None,
-            chain_id:             String::new(),
-            config:               None,
-            validator_set:        None,
-            height:               0,
-            round:                0,
-            locked_block:         None,
-            valid_block:          None,
-            votes:                BTreeMap::new(),
-            current_proposal:     None,
-            pending_equivocations: Vec::new(),
-            vca_quorum:           None,
-        }
-    }
-
-    /// Drain and return any equivocations detected since the last call.
-    /// The node calls this after processing each vote and forwards any
-    /// results to `Node::process_equivocation_evidence`.
-    pub fn drain_equivocations(&mut self) -> Vec<EquivocationDetected> {
-        std::mem::take(&mut self.pending_equivocations)
-    }
-
-    /// Set the signing key for this validator. Called by the node at startup
-    /// when a key file is loaded. Does nothing without the real-crypto feature.
-    #[cfg(feature = "real-crypto")]
-    pub fn set_signing_key(&mut self, key: KeyPair, chain_id: String) {
-        self.signing_key = Some(key);
-        self.chain_id = chain_id;
-    }
-    #[cfg(not(feature = "real-crypto"))]
-    pub fn set_signing_key(&mut self, _key: (), chain_id: String) {
-        self.chain_id = chain_id;
-    }
-
-    /// Determine the proposer for a given (height, round) by round-robin over
-    /// the validator set sorted by ValidatorId (deterministic, no external state).
-    fn proposer_for(&self, height: BlockHeight, round: Round) -> Option<ValidatorId> {
-        let vs = self.validator_set.as_ref()?;
-        if vs.validators.is_empty() {
-            return None;
-        }
-        let mut sorted: Vec<_> = vs.validators.iter().collect();
-        sorted.sort_by_key(|v| &v.id);
-        // Rotate by (height + round) so different heights start with different
-        // proposers, and timeouts within a height cycle through the set.
-        let idx = ((height + round as u64) as usize) % sorted.len();
-        Some(sorted[idx].id.clone())
-    }
-
-    /// Check whether a quorum of precommits has formed for any block at the
-    /// current round. Returns the winning block hash if so.
-    fn check_precommit_quorum(&self) -> Option<BlockHash> {
-        let vs = self.validator_set.as_ref()?;
-        let round_votes = self.votes.get(&self.round)?;
-        let quorum = vs.quorum_power();
-
-        // Collect candidate block hashes from precommits
-        let candidates: std::collections::HashSet<_> = round_votes
-            .precommits
-            .values()
-            .filter_map(|v| v.block_hash.as_ref())
-            .collect();
-
-        for hash in candidates {
-            if round_votes.precommit_power(hash, vs) >= quorum {
-                return Some(hash.clone());
-            }
-        }
-        None
-    }
-
-    /// Check whether a quorum of prevotes has formed for any block at the
-    /// current round. Returns the winning block hash if so.
-    fn check_prevote_quorum(&self) -> Option<BlockHash> {
-        let vs = self.validator_set.as_ref()?;
-        let round_votes = self.votes.get(&self.round)?;
-        let quorum = vs.quorum_power();
-
-        let candidates: std::collections::HashSet<_> = round_votes
-            .prevotes
-            .values()
-            .filter_map(|v| v.block_hash.as_ref())
-            .collect();
-
-        for hash in candidates {
-            if round_votes.prevote_power(hash, vs) >= quorum {
-                return Some(hash.clone());
-            }
-        }
-        None
-    }
-
-    fn require_config(&self) -> ConsensusResult<&ConsensusConfig> {
-        self.config
-            .as_ref()
-            .ok_or_else(|| ConsensusError::Internal("engine not initialised".into()))
-    }
-
-    fn require_validator_set(&self) -> ConsensusResult<&ValidatorSet> {
-        self.validator_set
-            .as_ref()
-            .ok_or_else(|| ConsensusError::Internal("validator set not loaded".into()))
-    }
-}
-
-impl Default for TendermintEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait::async_trait]
-impl ConsensusEngine for TendermintEngine {
-    fn name(&self) -> &str {
-        "Tendermint-style BFT"
-    }
-
-    fn variant(&self) -> ConsensusVariant {
-        ConsensusVariant::TendermintStyle
-    }
-
-    async fn init(
-        &mut self,
-        config: ConsensusConfig,
-        genesis_validators: ValidatorSet,
-    ) -> ConsensusResult<()> {
-        // VCA path: build registry, apply relative weight cap, rewrite
-        // voting_power with VCA-derived ConsensusWeight, compute adaptive quorum.
-        let vs = if let Some(vca_cfg) = &config.vca {
-            let registry = build_vca_registry_from_validator_set(
-                0, // genesis epoch
-                &genesis_validators,
-                vca_cfg.weight_config.clone(),
-            );
-            match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
-                Ok(q) => {
-                    self.vca_quorum = Some(q);
-                    let mut vs = genesis_validators;
-                    apply_vca_weights_to_validator_set(&mut vs, &registry);
-                    tracing::info!(
-                        epoch        = 0,
-                        validators   = vs.validators.len(),
-                        total_weight = vs.total_power(),
-                        vca_quorum   = q,
-                        "VCA-PQ-BFT genesis: weights and adaptive quorum set"
-                    );
-                    vs
-                }
-                Err(VcaError::EmergencyQuorum) => {
-                    tracing::error!("genesis VCA registry: all personhood expired — EmergencyQuorum");
-                    return Err(ConsensusError::Internal(
-                        "VCA genesis error: all validators have expired personhood".into()
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "VCA genesis quorum computation failed");
-                    return Err(ConsensusError::Internal(format!("VCA genesis error: {e}")));
-                }
-            }
-        } else if let Some(pop_cfg) = &config.personhood {
-            // Legacy path: static personhood cap.
-            apply_personhood_cap(genesis_validators, pop_cfg)
-        } else {
-            genesis_validators
-        };
-
-        // Sanity check: can we even achieve BFT safety with this set?
-        if vs.validators.len() < 4 {
-            warn!(
-                count = vs.validators.len(),
-                "validator set below 4 - BFT safety threshold cannot be met; \
-                 this is only acceptable for devnet/single-node testing"
-            );
-        }
-
-        info!(
-            variant      = %self.name(),
-            validators   = vs.validators.len(),
-            total_power  = vs.total_power(),
-            quorum_power = vs.quorum_power(),
-            vca_enabled  = config.vca.is_some(),
-            "consensus engine initialised"
-        );
-
-        self.chain_id = config.chain_id.clone();
-        self.validator_set = Some(vs);
-        self.config = Some(config);
-        self.height = 0;
-        self.round  = 0;
-        Ok(())
-    }
-
-    fn validator_set(&self) -> &ValidatorSet {
-        self.validator_set
-            .as_ref()
-            .expect("validator_set() called before init()")
-    }
-
-    fn update_validator_set(&mut self, mut vs: ValidatorSet) -> Result<(), ConsensusError> {
-        // 1. Personhood cap, if this chain has one configured.
-        if let Some(pc) = self.config.as_ref().and_then(|c| c.personhood.clone()) {
-            vs = apply_personhood_cap(vs, &pc);
-        }
-
-        // 2. Unconditional key/verification gate -- runs LAST, after the
-        // optional personhood cap, so nothing upstream can hand real
-        // voting power back to a validator missing a registered consensus
-        // key or verified personhood. Previously this engine applied no
-        // gating at all on write; every validator's raw `voting_power`
-        // (e.g. bonded stake, from stake-based admission) went straight to
-        // consensus unexamined. That gap is closed here.
-        vs = gate_voting_power(vs);
-
-        self.validator_set = Some(vs);
-        Ok(())
-    }
-
-    async fn propose(
-        &mut self,
-        height: BlockHeight,
-        round: Round,
-        parent_hash: BlockHash,
-        tx_data: Vec<u8>,
-    ) -> ConsensusResult<BlockProposal> {
-        let _cfg = self.require_config()?;
-        let _vs  = self.require_validator_set()?;
-
-        if height != self.height {
-            return Err(ConsensusError::StaleMessage(height, self.height));
-        }
-
-        let proposer = self
-            .proposer_for(height, round)
-            .ok_or_else(|| ConsensusError::Internal("empty validator set".into()))?;
-
-        let block_hash = compute_block_hash(&self.chain_id, height, round, &parent_hash, &tx_data);
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // Sign before moving parent_hash into the struct.
-        #[cfg(feature = "real-crypto")]
-        let signature = if let Some(ref kp) = self.signing_key {
-            let bytes = proposal_signing_bytes(&self.chain_id, height, round, &block_hash, &parent_hash);
-            ClassicalScheme.sign(&bytes, kp).map(|s| s.bytes).unwrap_or_default()
-        } else { vec![] };
-        #[cfg(not(feature = "real-crypto"))]
-        let signature = vec![];
-
-        let proposal = BlockProposal {
-            height,
-            round,
-            proposer,
-            block_hash: block_hash.clone(),
-            parent_hash,
-            timestamp_ms: now_ms,
-            tx_data,
-            signature,
-        };
-
-        debug!(
-            height, round,
-            block_hash = %block_hash,
-            "produced proposal"
-        );
-
-        self.current_proposal = Some(proposal.clone());
-        Ok(proposal)
-    }
-
-    async fn receive_proposal(
-        &mut self,
-        proposal: BlockProposal,
-    ) -> ConsensusResult<()> {
-        let _vs = self.require_validator_set()?;
-
-        if proposal.height != self.height {
-            return Err(ConsensusError::StaleMessage(proposal.height, self.height));
-        }
-
-        // Verify the proposer is correct for this (height, round).
-        let expected_proposer = self
-            .proposer_for(proposal.height, proposal.round)
-            .ok_or_else(|| ConsensusError::Internal("empty validator set".into()))?;
-
-        if proposal.proposer != expected_proposer {
-            return Err(ConsensusError::MalformedProposal(format!(
-                "wrong proposer: got {}, expected {}",
-                proposal.proposer, expected_proposer
-            )));
-        }
-
-        // Verify the proposer's signature if we have the crypto feature and
-        // the proposal carries a non-empty signature.
-        #[cfg(feature = "real-crypto")]
-        if !proposal.signature.is_empty() {
-            let vs = self.validator_set.as_ref()
-                .ok_or_else(|| ConsensusError::Internal("no validator set".into()))?;
-            let pub_key = vs.public_key_of(&proposal.proposer);
-            if !pub_key.is_empty() {
-                let msg = proposal_signing_bytes(
-                    &self.chain_id, proposal.height, proposal.round,
-                    &proposal.block_hash, &proposal.parent_hash,
-                );
-                let sig = Signature { scheme: SchemeId::Classical, bytes: proposal.signature.clone() };
-                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_|
-                    ConsensusError::MalformedProposal(format!(
-                        "invalid signature from proposer {}", proposal.proposer
-                    ))
-                )?;
-            }
-        }
-
-        // Locking rule: if we are locked on a block, only accept proposals
-        // for that block (or if we see a valid-block polka that unlocks us).
-        if let Some(ref locked) = self.locked_block {
-            if proposal.block_hash != *locked {
-                // In a real implementation we would check for a polka
-                // (2/3+ prevotes) for the proposed block, which would allow
-                // us to unlock. For now, reject proposals for non-locked blocks
-                // when locked. This is conservative but safe.
-                return Err(ConsensusError::MalformedProposal(format!(
-                    "locked on {locked} but proposal is for {}",
-                    proposal.block_hash
-                )));
-            }
-        }
-
-        debug!(
-            height = proposal.height,
-            round  = proposal.round,
-            block_hash = %proposal.block_hash,
-            "accepted proposal"
-        );
-
-        self.current_proposal = Some(proposal);
-        Ok(())
-    }
-
-    async fn receive_vote(&mut self, vote: Vote) -> ConsensusResult<Option<CommitCertificate>> {
-        let vs = self.require_validator_set()?;
-
-        // Reject votes for wrong height.
-        if vote.height != self.height {
-            return Err(ConsensusError::StaleMessage(vote.height, self.height));
-        }
-
-        // Reject votes from unknown validators.
-        if vs.power_of(&vote.validator) == 0 {
-            return Err(ConsensusError::UnknownValidator(vote.validator.clone()));
-        }
-
-        // Verify the vote's signature if we have the crypto feature.
-        //
-        // Fail-closed rule: when a validator has a public key registered in
-        // the ValidatorSet, an empty signature is treated as a forgery and the
-        // vote is rejected.  Phase-0 nodes (no key on file) are still allowed
-        // through so a mixed key/no-key devnet doesn't hard-break.
-        // This mirrors the identical check in chain-forge-node/src/node.rs and
-        // closes the adversarial empty-signature injection path (Test #5).
-        #[cfg(feature = "real-crypto")]
-        {
-            let vs = self.validator_set.as_ref()
-                .ok_or_else(|| ConsensusError::Internal("no validator set".into()))?;
-            let pub_key = vs.public_key_of(&vote.validator);
-            if !pub_key.is_empty() {
-                // Key is on file — signature MUST be present and valid.
-                if vote.signature.is_empty() {
-                    return Err(ConsensusError::InvalidVote {
-                        validator:  vote.validator.clone(),
-                        block_hash: vote.block_hash.clone()
-                            .unwrap_or_else(|| BlockHash("nil".into())),
-                        reason:     "validator has a registered key but vote carries \
-                                     an empty signature (possible forgery)"
-                                    .into(),
-                    });
-                }
-                let msg = vote_signing_bytes(
-                    &self.chain_id, &vote.vote_type, vote.height, vote.round,
-                    vote.block_hash.as_ref(),
-                );
-                let sig = Signature { scheme: SchemeId::Classical, bytes: vote.signature.clone() };
-                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|e|
-                    ConsensusError::InvalidVote {
-                        validator:  vote.validator.clone(),
-                        block_hash: vote.block_hash.clone()
-                            .unwrap_or_else(|| BlockHash("nil".into())),
-                        reason:     format!("invalid signature: {e}"),
-                    }
-                )?;
-            }
-        }
-
-        let round_votes = self.votes.entry(vote.round).or_default();
-
-        match vote.vote_type {
-            VoteType::Prevote | VoteType::Nil => {
-                // Check for equivocation: same validator, same round, different
-                // non-nil block hash → double-prevote.
-                //
-                // A nil prevote followed by a real-block prevote (or vice-versa)
-                // is NOT equivocation: it is standard BFT round-change behavior
-                // (lock release / polka-nil → new proposal).  Only two different
-                // non-nil block hashes at the same (height, round) constitute a
-                // double-sign.  KNOWN_ISSUES §2 root cause: the previous check
-                // treated nil-vs-real as equivocation, which tombstoned validators
-                // that simply changed their vote during the startup gossip race.
-                if let Some(existing) = round_votes.prevotes.get(&vote.validator) {
-                    let is_equivocation =
-                        existing.block_hash.is_some()
-                        && vote.block_hash.is_some()
-                        && existing.block_hash != vote.block_hash;
-                    if is_equivocation {
-                        let hash_a = existing.block_hash.clone()
-                            .unwrap_or_else(|| BlockHash("nil".into()));
-                        let hash_b = vote.block_hash.clone()
-                            .unwrap_or_else(|| BlockHash("nil".into()));
-                        warn!(
-                            validator = %vote.validator,
-                            height    = vote.height,
-                            round     = vote.round,
-                            hash_a    = %hash_a,
-                            hash_b    = %hash_b,
-                            "equivocation detected: double-prevote (two real blocks)"
-                        );
-                        self.pending_equivocations.push(EquivocationDetected {
-                            validator_id:   vote.validator.clone(),
-                            height:         vote.height,
-                            round:          vote.round,
-                            vote_type_byte: 0,
-                            block_hash_a:   hash_a,
-                            block_hash_b:   hash_b,
-                            signature_a:    existing.signature.clone(),
-                            signature_b:    vote.signature.clone(),
-                        });
-                    }
-                }
-                // Idempotent: record the first prevote; a second (equivocating)
-                // one is noted above but the slot keeps the first for quorum math.
-                round_votes.prevotes
-                    .entry(vote.validator.clone())
-                    .or_insert_with(|| vote.clone());
-
-                // Check if we now have 2/3+ prevotes for any block.
-                if let Some(valid) = self.check_prevote_quorum() {
-                    debug!(
-                        height = self.height,
-                        round  = self.round,
-                        block_hash = %valid,
-                        "prevote quorum reached - updating valid_block"
-                    );
-                    self.valid_block = Some(valid);
-                }
-            }
-
-            VoteType::Precommit => {
-                // Check for equivocation: same validator, same round, different
-                // non-nil block hash → double-precommit.
-                //
-                // Nil-vs-real is NOT equivocation (same reasoning as prevote above:
-                // standard BFT allows a precommit-nil to be superseded by a real
-                // precommit in the same round after a polka is observed).  Only two
-                // conflicting real-block precommits constitute a double-sign.
-                if let Some(existing) = round_votes.precommits.get(&vote.validator) {
-                    let is_equivocation =
-                        existing.block_hash.is_some()
-                        && vote.block_hash.is_some()
-                        && existing.block_hash != vote.block_hash;
-                    if is_equivocation {
-                        let hash_a = existing.block_hash.clone()
-                            .unwrap_or_else(|| BlockHash("nil".into()));
-                        let hash_b = vote.block_hash.clone()
-                            .unwrap_or_else(|| BlockHash("nil".into()));
-                        warn!(
-                            validator = %vote.validator,
-                            height    = vote.height,
-                            round     = vote.round,
-                            hash_a    = %hash_a,
-                            hash_b    = %hash_b,
-                            "equivocation detected: double-precommit (two real blocks)"
-                        );
-                        self.pending_equivocations.push(EquivocationDetected {
-                            validator_id:   vote.validator.clone(),
-                            height:         vote.height,
-                            round:          vote.round,
-                            vote_type_byte: 1,
-                            block_hash_a:   hash_a,
-                            block_hash_b:   hash_b,
-                            signature_a:    existing.signature.clone(),
-                            signature_b:    vote.signature.clone(),
-                        });
-                    }
-                }
-                round_votes.precommits
-                    .entry(vote.validator.clone())
-                    .or_insert_with(|| vote.clone());
-
-                // Check if we now have 2/3+ precommits for any block.
-                let winning_hash_opt = self.check_precommit_quorum();
-                if let Some(winning_hash) = winning_hash_opt {
-                    let round_votes2 = self.votes.entry(vote.round).or_default();
-                    let precommits = round_votes2.precommit_votes_for(&winning_hash);
-
-                    info!(
-                        height = self.height,
-                        round  = self.round,
-                        block_hash = %winning_hash,
-                        precommit_count = precommits.len(),
-                        "precommit quorum reached - committing block"
-                    );
-
-                    // Update locked block.
-                    self.locked_block = Some(winning_hash.clone());
-
-                    return Ok(Some(CommitCertificate {
-                        height: self.height,
-                        round: self.round,
-                        block_hash: winning_hash,
-                        precommits,
-                    }));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn on_timeout(
-        &mut self,
-        height: BlockHeight,
-        round: Round,
-    ) -> ConsensusResult<Vote> {
-        if height != self.height {
-            return Err(ConsensusError::Timeout(height, 0));
-        }
-
-        warn!(
-            height, round,
-            "round timed out - advancing to round {}",
-            round + 1
-        );
-
-        self.round = round + 1;
-        self.current_proposal = None;
-
-        // Broadcast a nil prevote for the new round to keep liveness.
-        Ok(Vote {
-            vote_type:  VoteType::Nil,
-            height:     self.height,
-            round:      self.round,
-            validator:  ValidatorId("self".into()), // replaced by node with real ID
-            block_hash: None,
-            signature:  vec![],
-            scheme:     Vote::default_scheme(),
-        })
-    }
-
-    async fn on_commit(
-        &mut self,
-        certificate: CommitCertificate,
-        new_validator_set: Option<ValidatorSet>,
-    ) -> ConsensusResult<()> {
-        info!(
-            height     = certificate.height,
-            round      = certificate.round,
-            block_hash = %certificate.block_hash,
-            "block committed - advancing height"
-        );
-
-        // Advance height, reset round state.
-        self.height           = certificate.height + 1;
-        self.round            = 0;
-        self.current_proposal = None;
-        self.valid_block      = None;
-        self.votes.clear();
-        // locked_block was missing from this reset -- once set (on reaching
-        // precommit quorum for a block), it was never cleared anywhere,
-        // meaning a node that committed even one block would permanently
-        // reject every future height's proposal forever, since a proposal's
-        // block_hash is always specific to its own height and can never
-        // match a lock left over from an earlier one. This is what made a
-        // 4-node testnet reliably commit exactly ONE block and then stall
-        // at every height after that, regardless of peering, gossip, or
-        // round-timer behavior -- the lock check in receive_proposal (see
-        // "locked on X but proposal is for Y") was correctly doing its job;
-        // it just never got told the old lock was no longer relevant. A
-        // lock only has meaning within the height it was set in.
-        self.locked_block     = None;
-
-        // Update validator set if the commit triggered an epoch change.
-        if let Some(incoming_vs) = new_validator_set {
-            let epoch = self.height; // new epoch == new height after advancing
-
-            // VCA path: rebuild registry, apply relative weight cap, rewrite
-            // voting_power, and compute the new adaptive quorum threshold.
-            let vs = if let Some(vca_cfg) = self.config.as_ref().and_then(|c| c.vca.as_ref()) {
-                let registry = build_vca_registry_from_validator_set(
-                    epoch,
-                    &incoming_vs,
-                    vca_cfg.weight_config.clone(),
-                );
-                match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
-                    Ok(q) => {
-                        self.vca_quorum = Some(q);
-                        let mut vs = incoming_vs;
-                        apply_vca_weights_to_validator_set(&mut vs, &registry);
-                        tracing::info!(
-                            epoch        = epoch,
-                            validators   = vs.validators.len(),
-                            total_weight = vs.total_power(),
-                            vca_quorum   = q,
-                            "VCA-PQ-BFT epoch rotation: weights and adaptive quorum updated"
-                        );
-                        vs
-                    }
-                    Err(VcaError::EmergencyQuorum) => {
-                        tracing::error!(
-                            epoch = epoch,
-                            "VCA epoch rotation: all personhood expired — EmergencyQuorum \
-                             (chain requires reconfiguration; keeping old validator set)"
-                        );
-                        return Err(ConsensusError::Internal(
-                            "VCA epoch error: all validators have expired personhood — \
-                             emergency reconfiguration required".into()
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::error!(epoch = epoch, error = %e, "VCA epoch quorum computation failed");
-                        return Err(ConsensusError::Internal(format!("VCA epoch error: {e}")));
-                    }
-                }
-            } else if let Some(pop_cfg) = self.config.as_ref().and_then(|c| c.personhood.as_ref()) {
-                // Legacy path: static personhood cap.
-                apply_personhood_cap(incoming_vs, &pop_cfg.clone())
-            } else {
-                incoming_vs
-            };
-
-            info!(
-                new_height          = self.height,
-                new_validator_count = vs.validators.len(),
-                "validator set rotated for new epoch"
-            );
-            self.validator_set = Some(vs);
-        }
-
-        Ok(())
-    }
-
-    fn current_height(&self) -> BlockHeight {
-        self.height
-    }
-
-    fn current_round(&self) -> Round {
-        self.round
-    }
-
-    fn verify_commit(
-        &self,
-        certificate: &CommitCertificate,
-        validator_set: &ValidatorSet,
-    ) -> ConsensusResult<()> {
-        // VCA-PQ-BFT path: use adaptive quorum derived from verified-personhood
-        // fraction ρ instead of the static 2n/3+1 threshold.
-        // Falls back to static quorum_power() when VCA is not configured.
-        let quorum = self.vca_quorum.unwrap_or_else(|| validator_set.quorum_power());
-
-        // Only consider well-formed precommits: correct type, height, and
-        // block hash. Malformed entries are ignored rather than rejected so
-        // a certificate with a few garbage entries still verifies if the
-        // good entries meet quorum (consistent with Tendermint light-client
-        // spec, which says "at least 2/3 must be valid").
-        let valid_precommits: Vec<&Vote> = certificate
-            .precommits
-            .iter()
-            .filter(|v| {
-                v.vote_type == VoteType::Precommit
-                    && v.height == certificate.height
-                    && v.block_hash.as_ref() == Some(&certificate.block_hash)
-            })
-            .collect();
-
-        // -- Phase 1: individual signature verification ----------------------
-        // Fail-closed: if a validator has a public key registered, their
-        // precommit MUST carry a valid signature.  Empty-sig precommits from
-        // validators with a registered key are rejected as potential forgeries.
-        // Validators with no key on file (Phase-0 / observer nodes) are still
-        // counted toward power without a signature check.
-        #[cfg(feature = "real-crypto")]
-        for vote in &valid_precommits {
-            let pub_key = validator_set.public_key_of(&vote.validator);
-            if pub_key.is_empty() {
-                // No registered key → Phase-0 tolerance, skip verification.
-                continue;
-            }
-
-            // Key is on file — signature MUST be present and valid.
-            if vote.signature.is_empty() {
-                return Err(ConsensusError::InvalidVote {
-                    validator:  vote.validator.clone(),
-                    block_hash: certificate.block_hash.clone(),
-                    reason:     format!(
-                        "validator {} has a registered key but precommit in commit \
-                         certificate carries an empty signature (possible forgery)",
-                        vote.validator
-                    ),
-                });
-            }
-
-            let msg = vote_signing_bytes(
-                &self.chain_id,
-                &vote.vote_type,
-                vote.height,
-                vote.round,
-                vote.block_hash.as_ref(),
-            );
-            let sig = Signature {
-                scheme: SchemeId::Classical,
-                bytes: vote.signature.clone(),
-            };
-            ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_| {
-                ConsensusError::InvalidVote {
-                    validator:  vote.validator.clone(),
-                    block_hash: certificate.block_hash.clone(),
-                    reason:     format!(
-                        "invalid precommit signature in commit certificate \
-                         at height {} round {}",
-                        vote.height, vote.round
-                    ),
-                }
-            })?;
-        }
-
-        // -- Power accumulation ----------------------------------------------
-        // Count power only from the precommits that passed structural checks
-        // (and signature checks above where applicable).
-        let signed_power: u64 = valid_precommits
-            .iter()
-            .map(|v| validator_set.power_of(&v.validator))
-            .sum();
-
-        if signed_power < quorum {
-            return Err(ConsensusError::InvalidVote {
-                validator: ValidatorId("(commit)".into()),
-                block_hash: certificate.block_hash.clone(),
-                reason: format!(
-                    "commit certificate has {signed_power} power but quorum requires {quorum}"
-                ),
-            });
-        }
-
-        Ok(())
-    }
-
-    fn drain_equivocations(&mut self) -> Vec<EquivocationDetected> {
-        std::mem::take(&mut self.pending_equivocations)
-    }
-
-    fn reset_to_height(
-        &mut self,
-        height: BlockHeight,
-        validator_set: ValidatorSet,
-    ) -> ConsensusResult<()> {
-        // Jump the height counter forward so the engine starts proposing and
-        // voting at `height` -- the NEXT height to decide (callers pass the
-        // last committed height + 1) -- rather than re-running
-        // already-committed heights.  Per-round state (votes, proposals,
-        // locks) is for the old height and is no longer valid, so clear it.
-        // CF-VAL-KEY-002 hardening: `update_validator_set()` always runs
-        // every incoming set through `gate_voting_power()` before installing
-        // it, so nothing upstream can hand real voting power back to a
-        // validator missing a registered consensus key or verified
-        // personhood (see that function's doc comment). `reset_to_height()`
-        // is a second, separate place the live validator_set gets written
-        // -- restart recovery -- and it did not go through that same gate.
-        // In practice the set handed in here should already be clean (the
-        // caller is expected to pass a correctly key-backfilled set), but
-        // defense-in-depth means this write path enforces the identical
-        // invariant rather than trusting every future caller to remember
-        // to pre-gate it themselves.
-        let validator_set = gate_voting_power(validator_set);
-
-        self.height           = height;
-        self.round            = 0;
-        self.validator_set    = Some(validator_set);
-        self.votes            = BTreeMap::new();
-        self.current_proposal = None;
-        self.locked_block     = None;
-        self.valid_block      = None;
-        tracing::info!(height, "Tendermint engine fast-forwarded to persisted height");
-        Ok(())
-    }
-}
+// -- Tendermint engine ---------------------------------------------------------
+
+// The full Tendermint state machine lives in tendermint/engine.rs.
+mod engine;
+pub use engine::{EquivocationDetected, TendermintEngine};
 
 // -- HotStuffEngine ----------------------------------------------------------
 
@@ -2671,6 +1871,7 @@ impl ConsensusEngine for HotStuffEngine {
             timestamp_ms: 0,
             tx_data,
             signature: vec![],
+            pol_round: None,
         };
 
         tracing::debug!(
@@ -2962,6 +2163,21 @@ mod tests {
         (TendermintEngine::new(), vs)
     }
 
+    /// A well-formed proposal (block hash matches its contents).
+    fn proposal_for(height: BlockHeight, round: Round, proposer: &str, tx: &[u8]) -> BlockProposal {
+        let parent = BlockHash(format!("parent_{height}"));
+        BlockProposal {
+            height, round,
+            proposer:     ValidatorId(proposer.into()),
+            block_hash:   compute_block_hash("test-chain", height, &parent, tx),
+            parent_hash:  parent,
+            timestamp_ms: 0,
+            tx_data:      tx.to_vec(),
+            signature:    vec![],
+            pol_round:    None,
+        }
+    }
+
     fn default_config() -> ConsensusConfig {
         ConsensusConfig {
             variant:             ConsensusVariant::TendermintStyle,
@@ -3099,7 +2315,10 @@ mod tests {
         let (mut engine, vs) = make_engine_and_vs(4);
         engine.init(default_config(), vs.clone()).await.unwrap();
 
-        let block_hash = BlockHash("deadbeef_block_0".into());
+        // A decision needs the block's contents: deliver the proposal first.
+        let p0 = proposal_for(0, 0, "val_00", b"block 0");
+        engine.receive_proposal(p0.clone()).await.unwrap();
+        let block_hash = p0.block_hash;
 
         // Cast 3 precommits (quorum for 4 validators with power=1 each is 3).
         let mut cert = None;
@@ -3134,8 +2353,11 @@ mod tests {
         let (mut engine, vs) = make_engine_and_vs(4);
         engine.init(default_config(), vs.clone()).await.unwrap();
 
-        // Reach precommit quorum at height 0 -- this is what sets locked_block.
-        let block_hash_0 = BlockHash("deadbeef_block_0".into());
+        // Reach precommit quorum at height 0 (proposal delivered first: a
+        // decision needs the block's contents).
+        let p0 = proposal_for(0, 0, "val_00", b"block 0");
+        engine.receive_proposal(p0.clone()).await.unwrap();
+        let block_hash_0 = p0.block_hash.clone();
         let mut cert = None;
         for i in 0..3usize {
             let vote = Vote {
@@ -3158,16 +2380,7 @@ mod tests {
         // A fresh proposal for the NEW height, with a DIFFERENT block_hash,
         // from height 1's correct deterministic proposer (val_01, since
         // proposer_for rotates by height+round over ids sorted val_00..03).
-        let proposal_1 = BlockProposal {
-            height:       1,
-            round:        0,
-            proposer:     ValidatorId("val_01".into()),
-            block_hash:   BlockHash("deadbeef_block_1".into()),
-            parent_hash:  block_hash_0,
-            timestamp_ms: 0,
-            tx_data:      vec![],
-            signature:    vec![],
-        };
+        let proposal_1 = proposal_for(1, 0, "val_01", b"block 1");
 
         // Before the fix, this failed with:
         //   "block proposal is malformed: locked on block_h0 but proposal is for block_h1"
@@ -4449,6 +3662,7 @@ mod tests {
             timestamp_ms: 0,
             tx_data:     vec![1],
             signature:   vec![],
+            pol_round: None,
         };
         engine.receive_proposal(proposal2).await.unwrap();
 
@@ -4810,6 +4024,7 @@ mod tests {
             timestamp_ms: 0,
             tx_data:     vec![],
             signature:   vec![],
+            pol_round: None,
         };
 
         let result = engine.receive_proposal(bad_proposal).await;
@@ -4854,6 +4069,7 @@ mod tests {
             timestamp_ms: 0,
             tx_data:     vec![],
             signature:   vec![],
+            pol_round: None,
         };
 
         let result = engine.receive_proposal(safe_proposal).await;

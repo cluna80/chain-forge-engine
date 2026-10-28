@@ -12,7 +12,7 @@ use chain_forge_consensus::{
     ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, BlockProposal, Vote, VoteType,
     tendermint::{TendermintEngine, EquivocationDetected},
     HotStuffEngine, FbaEngine,
-    ConsensusEngine,
+    ConsensusEngine, ConsensusAction, LockState, TimeoutStep,
 };
 use chain_forge_state::StateStore;
 use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
@@ -70,6 +70,9 @@ pub const BLOCK_PAYLOAD_VERSION: u32 = 1;
 /// `last_commit` evidence includes validators slower than the first 2/3+1.
 const COMMIT_GATHER_MS: u128 = 1_000;
 
+/// Period of the engine-driven consensus tick (timers, proposing, re-gossip).
+const CONSENSUS_TICK_MS: u64 = 100;
+
 /// What a block commits to. Serialized into `BlockProposal::tx_data`, which
 /// `compute_block_hash` hashes, so every validator votes on exactly these
 /// bytes.
@@ -82,6 +85,76 @@ const COMMIT_GATHER_MS: u128 = 1_000;
 /// - `prev_state_root`: the proposer's state root after committing
 ///   `height - 1`. Validators refuse to vote unless it equals their own, and a
 ///   node fails-stop rather than commit on top of a different state.
+/// Persisted double-sign guard (engine-driven consensus).
+///
+/// Before any vote is broadcast, the node records the vote's
+/// (height, round, step), the signed vote, and the engine's lock state, and
+/// writes them to `persist/consensus_signing.json` (atomic replace). It
+/// refuses to sign below the last recorded (height, round, step), and at the
+/// same position only re-sends the identical vote. On restart the lock state
+/// is restored before the node votes, so a restart can never let this
+/// validator sign a vote it would have refused before restarting.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SignGuard {
+    /// Highest (height, round, step) signed; step 1 = prevote, 2 = precommit.
+    pub last:  Option<(u64, u32, u8)>,
+    /// Signed votes at the height of `last`.
+    pub votes: Vec<Vote>,
+    /// Engine lock state when the last vote was signed.
+    pub lock:  Option<LockState>,
+}
+
+impl SignGuard {
+    fn step_of(vote: &Vote) -> u8 {
+        if vote.vote_type == VoteType::Precommit { 2 } else { 1 }
+    }
+
+    /// `Ok(Some(v))`: already signed exactly this vote (re-send `v`).
+    /// `Ok(None)`: safe to sign. `Err`: signing would conflict.
+    pub fn check(&self, vote: &Vote) -> Result<Option<Vote>, String> {
+        let hrs = (vote.height, vote.round, Self::step_of(vote));
+        let Some(last) = self.last else { return Ok(None) };
+        if hrs > last {
+            return Ok(None);
+        }
+        let same = self.votes.iter().find(|v| (v.height, v.round, Self::step_of(v)) == hrs);
+        match same {
+            Some(v) if v.block_hash == vote.block_hash => Ok(Some(v.clone())),
+            Some(v) => Err(format!("already signed {:?} at h{} r{} step {}; refusing {:?}",
+                                   v.block_hash, hrs.0, hrs.1, hrs.2, vote.block_hash)),
+            None => Err(format!("h{} r{} step {} is below the last signed {:?}", hrs.0, hrs.1, hrs.2, last)),
+        }
+    }
+
+    pub fn record(&mut self, vote: &Vote, lock: Option<LockState>) {
+        self.last = Some((vote.height, vote.round, Self::step_of(vote)));
+        self.votes.retain(|v| v.height == vote.height);
+        self.votes.push(vote.clone());
+        self.lock = lock;
+    }
+}
+
+/// A consensus message for the height after the one being decided.
+#[derive(Debug, Clone)]
+enum NextHeightMsg {
+    Proposal(BlockProposal),
+    Vote(Vote),
+}
+
+const MAX_NEXT_HEIGHT_MSGS: usize = 4_096;
+
+/// Write `contents` to `path` atomically: temp file, fsync, rename.
+fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BlockPayload {
     pub version:         u32,
@@ -380,6 +453,21 @@ pub struct Node {
     /// waits for real peer connections before attempting to participate in
     /// consensus. False means no peers are expected (solo devnet mode).
     has_bootstrap_peers: bool,
+
+    /// Engine-driven consensus (Tendermint): pending step timeouts.
+    consensus_timers: Vec<(std::time::Instant, TimeoutStep, u64, u32)>,
+    /// The engine asked this validator to propose a fresh block at
+    /// (height, round); built once the previous commit's evidence is ready.
+    pending_propose: Option<(u64, u32, std::time::Instant)>,
+    /// Last periodic re-gossip of the current height's consensus messages.
+    last_regossip: Option<std::time::Instant>,
+    /// Persisted double-sign guard (see `SignGuard`).
+    sign_guard: SignGuard,
+    /// Proposals/votes for the next height, replayed through the full
+    /// handlers (payload and signature checks included) after the commit.
+    next_height_msgs: Vec<NextHeightMsg>,
+    /// Rate limit for sync requests triggered by next-height traffic.
+    last_sync_request: Option<std::time::Instant>,
 
     /// Per-sender committed-nonce cache (F1 ingress guard).
     /// Updated after each block commit; exposed to the API server so it can
@@ -817,7 +905,9 @@ impl Node {
         let consensus_cfg = ConsensusConfig {
             variant:              desired_variant.clone(),
             chain_id:             genesis.chain_id.clone(),
-            propose_timeout_ms:   genesis.consensus.block_time_ms * 2,
+            // Must cover the proposer's empty-block pacing (one block time)
+            // plus the late-precommit gather (COMMIT_GATHER_MS).
+            propose_timeout_ms:   genesis.consensus.block_time_ms * 3,
             prevote_timeout_ms:   genesis.consensus.block_time_ms,
             precommit_timeout_ms: genesis.consensus.block_time_ms,
             block_time_ms:        genesis.consensus.block_time_ms,
@@ -923,6 +1013,7 @@ impl Node {
         }));
 
         let validator_id = validator_address.map(ValidatorId);
+        engine.set_local_validator(validator_id.clone());
         let explorer       = Arc::new(Mutex::new(ExplorerState::default()));
         let qrc_metrics  = Arc::new(Mutex::new(QrcMetrics::default()));
 
@@ -1303,6 +1394,12 @@ impl Node {
             validator_registry,
             tx_queue,
             has_bootstrap_peers,
+            consensus_timers: Vec::new(),
+            pending_propose: None,
+            last_regossip: None,
+            sign_guard: SignGuard::default(),
+            next_height_msgs: Vec::new(),
+            last_sync_request: None,
             pocd_config,
             pocd_registry,
             seen_gossip_receipts:       std::collections::HashSet::new(),
@@ -1732,6 +1829,7 @@ impl Node {
         // an observer. Without this, the node logs "validator=None" and never
         // votes, so the network cannot reach quorum.
         self.validator_id = Some(my_id);
+        self.consensus.set_local_validator(self.validator_id.clone());
         tracing::info!(address = %address, "validator signing key loaded and verified against genesis");
         self.signing_key = Some(kp);
         Ok(())
@@ -1745,6 +1843,10 @@ impl Node {
         std::fs::create_dir_all(&persist)
             .map_err(|e| format!("cannot create persist dir {:?}: {e}", persist))?;
         self.data_dir = Some(dir);
+        // A validator may have signed votes before its first commit (no
+        // state.json yet): restore its guard and lock now. Restored again
+        // after load_persisted_state moves the engine to its height.
+        self.restore_sign_guard();
         Ok(())
     }
 
@@ -2145,6 +2247,8 @@ impl Node {
                      some re-proposal may occur until peers catch this node up"
                 );
             }
+            // Before this validator can vote again: its lock and last signature.
+            self.restore_sign_guard();
 
             // Populate NodeStatus with the restored state root so that callers
             // that read status.state_root immediately after load_persisted_state
@@ -2238,9 +2342,21 @@ impl Node {
         let mut interval = tokio::time::interval(
             tokio::time::Duration::from_millis(block_time)
         );
+        // Engine-driven consensus: step timeouts, proposing and re-gossip.
+        let mut consensus_interval = tokio::time::interval(
+            tokio::time::Duration::from_millis(CONSENSUS_TICK_MS)
+        );
+        if self.consensus.drives_own_votes() && self.has_bootstrap_peers {
+            self.consensus.start();
+            self.drive_consensus().await;
+        }
         let mut running = true;
         while running {
             tokio::select! {
+                _ = consensus_interval.tick(), if self.consensus.drives_own_votes() && self.has_bootstrap_peers => {
+                    self.consensus_tick().await;
+                }
+
                 event_result = self.network.next_event() => {
                     match event_result {
                         Ok(event) => {
@@ -2341,6 +2457,8 @@ impl Node {
                         // Peers are configured but haven't connected yet --
                         // wait rather than racing ahead solo.
                         debug!("waiting for configured bootstrap peers to connect");
+                    } else if self.consensus.drives_own_votes() {
+                        // Engine-driven consensus runs on the consensus tick.
                     } else if let Some(my_id) = self.validator_id.clone() {
                         // Real peers connected. The deterministic proposer for
                         // this (height, round) proposes -- but critically, EVERY
@@ -2469,6 +2587,11 @@ impl Node {
                             "received block proposal"
                         );
 
+                        if self.consensus.drives_own_votes() {
+                            self.on_proposal_engine(proposal).await;
+                            return Ok(());
+                        }
+
                         if proposal.height > self.consensus.current_height() {
                             // A proposal for a height beyond ours is unambiguous
                             // evidence we've fallen behind -- trying to vote on it
@@ -2565,6 +2688,11 @@ impl Node {
                             vote_type = ?vote.vote_type,
                             "received consensus vote"
                         );
+
+                        if self.consensus.drives_own_votes() {
+                            self.on_vote_engine(vote).await;
+                            return Ok(());
+                        }
 
                         if vote.height > self.consensus.current_height() {
                             // Same reasoning as the BlockProposal branch above --
@@ -2715,6 +2843,17 @@ impl Node {
                         // further ahead than what we need next, is ignored (the
                         // latter will arrive again once we've caught up to it).
                         if resp.height != self.consensus.current_height() {
+                            return Ok(());
+                        }
+                        // The certificate is for a block hash; the proposal must
+                        // be exactly that block, at that height.
+                        let p = &resp.proposal;
+                        let computed = chain_forge_consensus::compute_block_hash(
+                            &self.genesis.chain_id, p.height, &p.parent_hash, &p.tx_data);
+                        if resp.cert.height != resp.height || p.height != resp.height
+                            || p.block_hash != resp.cert.block_hash || computed != p.block_hash
+                        {
+                            warn!(height = resp.height, "rejected sync response: proposal does not match the certificate");
                             return Ok(());
                         }
                         let vs = self.consensus.validator_set().clone();
@@ -4587,6 +4726,270 @@ impl Node {
     /// reached quorum (small validator sets can do this in one round-trip).
     /// Otherwise the block commits later, from handle_event, once enough
     /// peers' votes have arrived over gossip.
+    // ── Engine-driven consensus (Tendermint) ─────────────────────────────────
+    //
+    // The engine decides every vote this validator casts (see
+    // chain_forge_consensus::tendermint::engine). The node only signs them
+    // through the persisted double-sign guard, broadcasts, proposes when
+    // asked, runs the step timers, executes decisions, and re-gossips the
+    // current height's messages.
+
+    /// Carry out every action the engine has queued.
+    async fn drive_consensus(&mut self) {
+        let mut budget = 10_000usize;
+        while let Some(action) = self.consensus.next_action() {
+            budget -= 1;
+            if budget == 0 {
+                warn!("consensus action budget exhausted; continuing on the next tick");
+                break;
+            }
+            match action {
+                ConsensusAction::CastVote(vote) => self.cast_engine_vote(vote).await,
+                ConsensusAction::ProposeNew { height, round } => {
+                    self.pending_propose = Some((height, round, std::time::Instant::now()));
+                }
+                ConsensusAction::Repropose(proposal) => {
+                    info!(height = proposal.height, round = proposal.round, block_hash = %proposal.block_hash,
+                          pol_round = ?proposal.pol_round, "re-proposing valid block");
+                    self.pending_proposals.insert((proposal.height, proposal.round), proposal.clone());
+                    let _ = self.network.publish(OutboundMessage {
+                        topic:   GossipTopic::BlockProposal,
+                        payload: serde_json::to_vec(&proposal).unwrap_or_default(),
+                    }).await;
+                }
+                ConsensusAction::ScheduleTimeout { step, height, round, after_ms } => {
+                    let at = std::time::Instant::now() + std::time::Duration::from_millis(after_ms);
+                    self.consensus_timers.push((at, step, height, round));
+                }
+                ConsensusAction::Commit { certificate, proposal } => {
+                    let eqs = self.consensus.drain_equivocations();
+                    if !eqs.is_empty() {
+                        let epoch = self.consensus.current_height();
+                        self.handle_drained_equivocations(eqs, epoch);
+                    }
+                    if let Err(e) = self.commit_block(certificate, &proposal).await {
+                        error!(error = %e, "commit of decided block failed");
+                    }
+                    let h = self.consensus.current_height();
+                    self.consensus_timers.retain(|t| t.2 >= h);
+                }
+            }
+        }
+    }
+
+    /// Sign (through the double-sign guard), persist, broadcast, and feed
+    /// back one of this validator's own votes.
+    async fn cast_engine_vote(&mut self, mut vote: Vote) {
+        if self.signing_key.is_none() {
+            debug!("no signing key loaded: not casting");
+            return;
+        }
+        match self.sign_guard.check(&vote) {
+            Err(e) => {
+                error!(height = vote.height, round = vote.round, error = %e, "double-sign guard refused to sign");
+                return;
+            }
+            Ok(Some(signed)) => vote = signed,
+            Ok(None) => {
+                self.sign_vote(&mut vote);
+                self.sign_guard.record(&vote, self.consensus.lock_state());
+                if let Err(e) = self.persist_sign_guard() {
+                    error!(error = %e, "cannot persist signing state: vote withheld");
+                    return;
+                }
+            }
+        }
+        let _ = self.network.publish(OutboundMessage {
+            topic:   GossipTopic::ConsensusVote,
+            payload: serde_json::to_vec(&vote).unwrap_or_default(),
+        }).await;
+        if let Err(e) = self.consensus.receive_vote(vote).await {
+            debug!(error = %e, "own vote rejected locally");
+        }
+    }
+
+    /// Write the double-sign guard to disk before anything it covers is sent.
+    fn persist_sign_guard(&self) -> Result<(), String> {
+        let Some(ref dir) = self.data_dir else { return Ok(()) };
+        let json = serde_json::to_vec_pretty(&self.sign_guard).map_err(|e| e.to_string())?;
+        write_atomic(&dir.join("persist").join("consensus_signing.json"), &json).map_err(|e| e.to_string())
+    }
+
+    /// Restore the double-sign guard and the engine's lock state (restart).
+    fn restore_sign_guard(&mut self) {
+        let Some(ref dir) = self.data_dir else { return };
+        let path = dir.join("persist").join("consensus_signing.json");
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let guard: SignGuard = match serde_json::from_str(&text) {
+            Ok(g) => g,
+            Err(e) => {
+                // Refuse to guess: an unreadable guard could hide a lock.
+                panic!("consensus_signing.json is unreadable ({e}); refusing to start a validator that may be locked");
+            }
+        };
+        if let Some(mut lock) = guard.lock.clone() {
+            // Restore the signed copies of our own votes.
+            lock.own_votes = guard.votes.iter().filter(|v| v.height == lock.height).cloned().collect();
+            if let Err(e) = self.consensus.restore_lock_state(lock) {
+                panic!("cannot restore consensus lock state: {e}");
+            }
+        }
+        info!(last = ?guard.last, "double-sign guard restored");
+        self.sign_guard = guard;
+    }
+
+    fn buffer_next(&mut self, msg: NextHeightMsg) {
+        if self.next_height_msgs.len() < MAX_NEXT_HEIGHT_MSGS {
+            self.next_height_msgs.push(msg);
+        }
+    }
+
+    /// Request sync, at most once per second.
+    async fn request_sync_limited(&mut self) {
+        let due = self.last_sync_request.map(|t| t.elapsed().as_millis() >= 1_000).unwrap_or(true);
+        if due {
+            self.last_sync_request = Some(std::time::Instant::now());
+            self.request_sync().await;
+        }
+    }
+
+    async fn on_proposal_engine(&mut self, proposal: BlockProposal) {
+        let current = self.consensus.current_height();
+        if proposal.height < current { return; }
+        if proposal.height == current + 1 {
+            self.buffer_next(NextHeightMsg::Proposal(proposal));
+            self.request_sync_limited().await;
+            return;
+        }
+        if proposal.height > current + 1 {
+            self.request_sync_limited().await;
+            return;
+        }
+        // H0-1/H0-2: never accept a block whose participation evidence or
+        // prior state root this node cannot confirm.
+        if let Err(e) = self.validate_block_payload(&proposal) {
+            warn!(height = proposal.height, round = proposal.round, proposer = %proposal.proposer,
+                  error = %e, "proposal rejected: invalid block payload");
+            return;
+        }
+        if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
+            debug!(error = %e, "proposal rejected");
+            return;
+        }
+        self.pending_proposals.insert((proposal.height, proposal.round), proposal);
+        self.drive_consensus().await;
+    }
+
+    async fn on_vote_engine(&mut self, vote: Vote) {
+        let current = self.consensus.current_height();
+        if vote.height < current { return; }
+        if vote.height == current + 1 {
+            self.buffer_next(NextHeightMsg::Vote(vote));
+            self.request_sync_limited().await;
+            return;
+        }
+        if vote.height > current + 1 {
+            self.request_sync_limited().await;
+            return;
+        }
+        if let Err(reject) = self.verify_vote_signature(&vote) {
+            warn!(validator = %vote.validator, height = vote.height, round = vote.round,
+                  reason = %reject, "vote rejected: invalid signature");
+            return;
+        }
+        if let Err(e) = self.consensus.receive_vote(vote).await {
+            debug!(error = %e, "vote rejected");
+        }
+        let eqs = self.consensus.drain_equivocations();
+        if !eqs.is_empty() {
+            let epoch = self.consensus.current_height();
+            self.handle_drained_equivocations(eqs, epoch);
+        }
+        self.drive_consensus().await;
+    }
+
+    /// Engine-driven consensus tick: fire due timers, replay buffered
+    /// next-height messages, propose when asked, and re-gossip.
+    async fn consensus_tick(&mut self) {
+        let now = std::time::Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.consensus_timers)
+            .into_iter().partition(|t| t.0 <= now);
+        self.consensus_timers = later;
+        for (_, step, height, round) in due {
+            self.consensus.on_step_timeout(step, height, round);
+        }
+        self.drive_consensus().await;
+
+        let current = self.consensus.current_height();
+        if self.next_height_msgs.iter().any(|m| match m {
+            NextHeightMsg::Proposal(p) => p.height <= current,
+            NextHeightMsg::Vote(v) => v.height <= current,
+        }) {
+            let msgs = std::mem::take(&mut self.next_height_msgs);
+            for m in msgs {
+                match m {
+                    NextHeightMsg::Proposal(p) => self.on_proposal_engine(p).await,
+                    NextHeightMsg::Vote(v) => self.on_vote_engine(v).await,
+                }
+            }
+        }
+
+        let peer_count = self.status.lock().unwrap().peer_count;
+        if let Some((height, round, since)) = self.pending_propose {
+            let block_time = self.genesis.consensus.block_time_ms as u128;
+            if height != self.consensus.current_height() || round != self.consensus.current_round() {
+                self.pending_propose = None;
+            } else if peer_count > 0
+                && self.last_commit_ready()
+                && (!self.mempool.is_empty() || since.elapsed().as_millis() >= block_time)
+            {
+                self.pending_propose = None;
+                self.propose_fresh(height, round).await;
+            }
+        }
+
+        let regossip_ms = (2 * self.genesis.consensus.block_time_ms) as u128;
+        if peer_count > 0 && self.last_regossip.map(|t| t.elapsed().as_millis() >= regossip_ms).unwrap_or(true) {
+            self.last_regossip = Some(std::time::Instant::now());
+            let (proposals, votes) = self.consensus.gossip_messages();
+            for p in proposals {
+                let _ = self.network.publish(OutboundMessage {
+                    topic: GossipTopic::BlockProposal, payload: serde_json::to_vec(&p).unwrap_or_default(),
+                }).await;
+            }
+            for v in votes {
+                let _ = self.network.publish(OutboundMessage {
+                    topic: GossipTopic::ConsensusVote, payload: serde_json::to_vec(&v).unwrap_or_default(),
+                }).await;
+            }
+        }
+    }
+
+    /// Build and broadcast a fresh proposal the engine asked for.
+    async fn propose_fresh(&mut self, height: u64, round: u32) {
+        // Copy, don't drain: txs leave the mempool only when a block commits.
+        let txs = self.mempool.clone();
+        let tx_bytes = BlockPayload {
+            version:         BLOCK_PAYLOAD_VERSION,
+            txs:             txs.clone(),
+            last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
+            prev_state_root: self.state.current_root().map(str::to_string),
+        }.encode();
+        let parent = BlockHash(format!("genesis_h{height}"));
+        match self.consensus.propose(height, round, parent, tx_bytes).await {
+            Ok(proposal) => {
+                info!(height, round, block_hash = %proposal.block_hash, txs = txs.len(), "block proposed (multi-node)");
+                self.pending_proposals.insert((height, round), proposal.clone());
+                let _ = self.network.publish(OutboundMessage {
+                    topic:   GossipTopic::BlockProposal,
+                    payload: serde_json::to_vec(&proposal).unwrap_or_default(),
+                }).await;
+                self.drive_consensus().await;
+            }
+            Err(e) => debug!(error = %e, "proposal skipped"),
+        }
+    }
+
     async fn propose_and_broadcast_multinode(
         &mut self,
         parent_hash: BlockHash,
@@ -5615,11 +6018,12 @@ mod tests {
             BlockProposal {
                 height: h, round: 0,
                 proposer: ValidatorId(proposer(h).into()),
-                block_hash: compute_block_hash(CHAIN, h, 0, &parent, &tx_data),
+                block_hash: compute_block_hash(CHAIN, h, &parent, &tx_data),
                 parent_hash: parent,
                 timestamp_ms: 0,
                 tx_data,
                 signature: vec![],
+                pol_round: None,
             }
         }
 
@@ -5632,11 +6036,15 @@ mod tests {
             }
         }
 
-        async fn deliver(node: &mut Node, p: &BlockProposal, precommitters: &[&str]) {
+        /// Deliver `p`, then each voter's prevote and precommit for it (a
+        /// validator node precommits only after a +2/3 prevote polka).
+        async fn deliver(node: &mut Node, p: &BlockProposal, voters: &[&str]) {
             node.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(p).unwrap())).await.unwrap();
-            for v in precommitters {
-                let vote = signed_vote(CHAIN, VoteType::Precommit, p.height, 0, v, p.block_hash.clone());
-                node.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await.unwrap();
+            for t in [VoteType::Prevote, VoteType::Precommit] {
+                for v in voters {
+                    let vote = signed_vote(CHAIN, t.clone(), p.height, 0, v, p.block_hash.clone());
+                    node.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await.unwrap();
+                }
             }
         }
 
@@ -5785,6 +6193,70 @@ mod tests {
                 .unwrap_or(false);
             assert!(!carol_precommitted,
                 "carol precommitted block 1 having seen no prevote polka for it");
+        }
+
+        /// Carol's own signed votes the engine holds at the current height.
+        fn carol_votes(node: &Node) -> Vec<Vote> {
+            node.consensus.gossip_messages().1.into_iter().filter(|v| v.validator.0 == "qcb1carol").collect()
+        }
+
+        /// Required test 6: a validator that signed and locked, then
+        /// restarts from its data dir, keeps its lock and cannot be made to
+        /// sign a conflicting vote.
+        #[tokio::test]
+        async fn restarted_validator_keeps_its_lock_and_never_signs_conflicting_votes() {
+            let dir = std::env::temp_dir().join(format!("cf-sign-guard-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let carol_key = || ClassicalScheme.generate_keypair("qcb1carol").unwrap();
+
+            let x_hash = {
+                let mut carol = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+                carol.signing_key = Some(carol_key());
+                carol.set_data_dir(dir.clone()).unwrap();
+                let root = carol.state.current_root().map(str::to_string);
+                let x = proposal(0, payload(None, root.as_deref()));
+                carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&x).unwrap())).await.unwrap();
+                for v in ["qcb1alice", "qcb1bob"] {
+                    let pv = signed_vote(CHAIN, VoteType::Prevote, 0, 0, v, x.block_hash.clone());
+                    carol.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&pv).unwrap())).await.unwrap();
+                }
+                assert_eq!(carol.sign_guard.last, Some((0, 0, 2)), "carol prevoted and precommitted X");
+                x.block_hash
+            }; // carol stops (crash): nothing committed
+
+            let mut carol = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+            carol.signing_key = Some(carol_key());
+            carol.set_data_dir(dir.clone()).unwrap();
+            carol.load_persisted_state();
+            assert_eq!(carol.sign_guard.last, Some((0, 0, 2)), "guard restored from disk");
+            assert_eq!(carol.consensus.lock_state().unwrap().locked, Some((x_hash.clone(), 0)), "lock restored");
+
+            // The guard refuses any conflicting vote at an already-signed position.
+            let conflicting = Vote { block_hash: Some(BlockHash("other".into())),
+                ..signed_vote(CHAIN, VoteType::Prevote, 0, 0, "qcb1carol", x_hash.clone()) };
+            assert!(carol.sign_guard.check(&conflicting).is_err());
+
+            // Round 1: bob proposes a fresh, different block Y.
+            carol.consensus.on_step_timeout(TimeoutStep::Precommit, 0, 0);
+            carol.drive_consensus().await;
+            let root = carol.state.current_root().map(str::to_string);
+            let parent = BlockHash("another-parent".into());
+            let tx_data = payload(None, root.as_deref());
+            let y = BlockProposal {
+                height: 0, round: 1, proposer: ValidatorId("qcb1bob".into()),
+                block_hash: compute_block_hash(CHAIN, 0, &parent, &tx_data),
+                parent_hash: parent, timestamp_ms: 0, tx_data, signature: vec![], pol_round: None,
+            };
+            assert_ne!(y.block_hash, x_hash);
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&y).unwrap())).await.unwrap();
+
+            let votes = carol_votes(&carol);
+            let r1_prevote = votes.iter().find(|v| v.round == 1 && v.vote_type == VoteType::Prevote)
+                .expect("carol prevotes in round 1");
+            assert_eq!(r1_prevote.block_hash, None, "locked on X after restart: nil, never Y");
+            assert!(votes.iter().filter(|v| v.round == 0).all(|v| v.block_hash.as_ref() == Some(&x_hash)),
+                "round-0 votes are the original X votes only");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         async fn carol_accepts(tx_data: Vec<u8>) -> bool {
@@ -6773,22 +7245,26 @@ mod tests {
 
     /// A height-0 style proposal with an empty v1 payload. `prev_state_root`
     /// must be the receiving node's current root (H0-1), so callers pass it.
+    /// The block hash is computed from the contents (receivers verify it).
     fn make_proposal(
-        height: u64, round: u32, proposer: &str, block_hash: &str, prev_state_root: Option<&str>,
+        chain_id: &str, height: u64, round: u32, proposer: &str, prev_state_root: Option<&str>,
     ) -> BlockProposal {
+        let parent_hash = chain_forge_consensus::BlockHash("genesis_h0".to_string());
+        let tx_data = BlockPayload {
+            version: BLOCK_PAYLOAD_VERSION,
+            prev_state_root: prev_state_root.map(str::to_string),
+            ..Default::default()
+        }.encode();
         BlockProposal {
             height,
             round,
             proposer:    ValidatorId(proposer.to_string()),
-            block_hash:  chain_forge_consensus::BlockHash(block_hash.to_string()),
-            parent_hash: chain_forge_consensus::BlockHash("genesis_h0".to_string()),
+            block_hash:  chain_forge_consensus::compute_block_hash(chain_id, height, &parent_hash, &tx_data),
+            parent_hash,
             timestamp_ms: 0,
-            tx_data:     BlockPayload {
-                version: BLOCK_PAYLOAD_VERSION,
-                prev_state_root: prev_state_root.map(str::to_string),
-                ..Default::default()
-            }.encode(),
+            tx_data,
             signature:   vec![],
+            pol_round:   None,
         }
     }
 
@@ -6950,14 +7426,20 @@ mod tests {
                 .expect("deterministic devnet keypair generation must not fail")
         );
 
-        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_test", node.state.current_root());
+        let proposal = make_proposal("qcb-testnet-1", 0, 0, "qcb1alice", node.state.current_root());
         let payload = serde_json::to_vec(&proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
-
-        // Bob voted (prevote + precommit) but that is only 1 of the 3
-        // precommits needed for quorum with 4 validators -- not committed yet.
-        assert_eq!(node.status.lock().unwrap().height, 0);
         assert!(node.pending_proposals.contains_key(&(0, 0)));
+
+        // Bob prevotes; he precommits only after a +2/3 prevote polka, which
+        // carol's and dave's prevotes complete (Tendermint safety rule).
+        for v in ["qcb1carol", "qcb1dave"] {
+            let prevote = signed_vote("qcb-testnet-1", VoteType::Prevote, 0, 0, v, proposal.block_hash.clone());
+            node.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&prevote).unwrap())).await.unwrap();
+        }
+
+        // Bob's precommit is only 1 of the 3 needed -- not committed yet.
+        assert_eq!(node.status.lock().unwrap().height, 0);
 
         // Carol's precommit arrives over gossip -- still only 2 of 3.
         let carol_vote = signed_vote(
@@ -7005,11 +7487,11 @@ mod tests {
         // Bob is not the proposer at (0,0) -- alice is -- so Bob votes and
         // processes gossip but doesn't produce the proposal itself.
         let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
-        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_partition_test", node.state.current_root());
+        let proposal = make_proposal("qcb-testnet-1", 0, 0, "qcb1alice", node.state.current_root());
 
-        // Three precommits arrive BEFORE the proposal gossip.
-        // The node feeds them to receive_vote(); on the 3rd one it returns
-        // Some(cert) but there is no pending proposal, so the cert is parked.
+        // Three precommits arrive BEFORE the proposal gossip. The engine has
+        // a precommit quorum but not the block's contents, so it cannot
+        // decide yet; it decides the moment the proposal supplies them.
         for validator in &["qcb1alice", "qcb1carol", "qcb1dave"] {
             let vote = signed_vote(
                 "qcb-testnet-1", VoteType::Precommit, 0, 0, validator,
@@ -7026,20 +7508,16 @@ mod tests {
             "no commit yet -- proposal hasn't arrived");
         assert!(node.pending_proposals.is_empty(),
             "proposal body not stored yet");
-        assert!(node.pending_certs.contains_key(&(0, 0)),
-            "certificate must be parked in pending_certs");
 
         // Now the proposal gossip arrives (partition heals / reorder resolved).
         let payload = serde_json::to_vec(&proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
 
-        // The Proposal handler must detect the parked cert and commit immediately.
+        // The proposal completes the decision: commit immediately.
         assert_eq!(node.consensus.current_height(), 1,
             "consensus engine must advance to height 1 after deferred commit");
         assert_eq!(node.explorer.lock().unwrap().blocks.len(), 1,
             "block must appear in explorer after deferred commit");
-        assert!(node.pending_certs.is_empty(),
-            "parked certificate must be pruned after commit");
         assert!(!node.pending_proposals.contains_key(&(0, 0)),
             "committed proposal must be pruned");
     }
@@ -7064,7 +7542,7 @@ mod tests {
 
         // Bob claims to be the proposer at (0,0), but alice is -- consensus
         // must reject this and the node must not register or vote on it.
-        let bad_proposal = make_proposal(0, 0, "qcb1bob", "block_h0_r0_bad", node.state.current_root());
+        let bad_proposal = make_proposal("qcb-testnet-1", 0, 0, "qcb1bob", node.state.current_root());
         let payload = serde_json::to_vec(&bad_proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
 
@@ -8073,13 +8551,18 @@ mod tests {
         // a quorum of signed precommits from alice/bob/carol/eve.  The FBA
         // receive_vote path verifies each vote against the registered genesis key.
         // ⌈5 × 2/3⌉ = 4 precommits needed.
-        let proposal = make_proposal(0, 0, "qcb1alice", &root_a, nodes[3].state.current_root());
+        let proposal = make_proposal("qcb-cs001-p7", 0, 0, "qcb1alice", nodes[3].state.current_root());
         let payload  = serde_json::to_vec(&proposal).unwrap();
         let _ = nodes[3].handle_event(gossip(GossipTopic::BlockProposal, payload)).await;
+        // Prevotes first: dave precommits only after a +2/3 prevote polka.
+        for v in &["qcb1alice", "qcb1bob", "qcb1carol"] {
+            let vote = signed_vote("qcb-cs001-p7", VoteType::Prevote, 0, 0, v, proposal.block_hash.clone());
+            let _ = nodes[3].handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await;
+        }
         for v in &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1eve"] {
             let vote = signed_vote(
                 "qcb-cs001-p7", VoteType::Precommit, 0, 0, v,
-                chain_forge_consensus::BlockHash(root_a.clone()),
+                proposal.block_hash.clone(),
             );
             let _ = nodes[3].handle_event(gossip(
                 GossipTopic::ConsensusVote,
