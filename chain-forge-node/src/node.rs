@@ -6997,6 +6997,53 @@ mod tests {
         );
     }
 
+    /// MN-8 root cause. Reward eligibility reads the ValidatorRegistry, which
+    /// must agree with the live ValidatorSet: a bond-admitted validator seated
+    /// with verified personhood must be Active and pop_verified there, and
+    /// carry its authenticated owner binding. Only the solo `propose_block`
+    /// path synced this; on a real network (`commit_block`) the validator
+    /// voted with full power but stayed a Candidate and was never paid.
+    #[tokio::test]
+    async fn multi_node_commit_keeps_bonded_validator_registry_in_sync() {
+        let (kp, addr) = keyed_candidate("seed-multinode-registry-sync");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert.block_hash).await.unwrap();
+        assert!(node.consensus.validator_set().validators.iter().any(|v| v.id.0 == addr && v.pop_verified),
+            "precondition: seated with verified personhood");
+
+        // The state a multi-node validator is in: seated, registry not yet confirmed.
+        let epoch = node.identity.clock.current_epoch;
+        node.validator_registry.revoke_pop(&addr, epoch).unwrap();
+
+        // Commit one empty block through the multi-node path.
+        let h = node.consensus.current_height();
+        let parent = chain_forge_consensus::BlockHash(format!("genesis_h{h}"));
+        let tx_data = BlockPayload {
+            version: BLOCK_PAYLOAD_VERSION, txs: vec![],
+            last_commit: node.last_commit_evidence.clone(),
+            prev_state_root: node.state.current_root().map(str::to_string),
+        }.encode();
+        let proposal = BlockProposal {
+            height: h, round: 0, proposer: ValidatorId("qcb1alice".into()),
+            block_hash: chain_forge_consensus::compute_block_hash("qcb-testnet-1", h, &parent, &tx_data),
+            parent_hash: parent, timestamp_ms: 0, tx_data, signature: vec![], pol_round: None,
+        };
+        let precommits = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"].iter()
+            .map(|v| signed_vote("qcb-testnet-1", VoteType::Precommit, h, 0, v, proposal.block_hash.clone()))
+            .collect();
+        let cert = chain_forge_consensus::CommitCertificate {
+            height: h, round: 0, block_hash: proposal.block_hash.clone(), precommits,
+        };
+        node.commit_block(cert, &proposal).await.unwrap();
+
+        let rec = node.validator_registry.get(&addr).unwrap();
+        assert!(rec.pop_verified, "registry must mirror the seat's verified personhood");
+        assert_eq!(rec.status, chain_forge_validators::ValidatorStatus::Active);
+    }
+
     #[tokio::test]
     async fn bonded_validator_without_key_has_zero_voting_power() {
         // CF-VAL-KEY-002 Phase 4 test #2. Same setup as the test above --
