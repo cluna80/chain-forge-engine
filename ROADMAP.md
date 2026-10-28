@@ -85,7 +85,7 @@ Hardening the foundation before adding features. Each item is a draft PR, unmerg
 | MN-7 rewrite (verified outcomes); MN-8 removed pending rewards | #16 | 🔄 open; needs a genuine second Windows `fee_settle_live` run |
 | H0-1/H0-2 deterministic participation (committed `last_commit`), state-root binding, liveness jails without burning, Byzantine-robust miss counting, genesis liveness policy, HotStuff/FBA restart height | #17 | ✅ Windows-confirmed; awaiting merge |
 | **Consensus safety**: full Tendermint prevote/precommit/lock/unlock; persisted double-sign guard; block-hash verification and agreement | #18 | ✅ Windows-confirmed (consensus 91/91, node 231/231, devnet, restart, `consensus_safety_live` 3/3); awaiting merge |
-| Epoch rewards from committed evidence + MN-8 | `security/h0-epoch-rewards` | 🔄 in progress (see below) |
+| Epoch rewards from committed evidence + MN-8 + capital premium (fixed pool) | #20 | ✅ Windows-confirmed (MN-8 live 6/6); awaiting merge after #18 |
 
 ### Consensus safety (#18): why it was needed
 A 5-node run with only honest nodes finalized two conflicting blocks at height 1. Validators precommitted without a prevote polka and locked only at commit. The blocks were empty, so state roots matched and only block hashes revealed the fork. Fixed by the full Tendermint state machine (Buchman, Kwon & Milosevic, Algorithm 1). Covered by unit lock-rule tests, a scripted fork counterexample, a seeded model-based simulation (staggered starts, crashes, equivocators within f, fork detection beyond f), and live block-hash agreement tests. Partition recovery passed in the Linux sandbox; it can't run on Windows (no iptables).
@@ -95,13 +95,13 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 - 🔲 **HotStuff / FBA**: both still use the legacy unsafe voting path. They need a safety review plus engine-driven voting, or must refuse to run off devnet.
 - 🔲 **VCA quorum floor**: `verify_commit` must never accept less than ⌊2·total/3⌋+1 of voting power.
 
-### Epoch rewards + MN-8 (sandbox-complete; awaiting Windows)
-- ✅ (sandbox) Rewards pay the closed epoch from committed evidence only. Participation is Byzantine-robust. `consensus.rewards.min_participation_pct` is set in genesis (default 67, range 50–90). Tie-breaks are deterministic.
-- ✅ (sandbox) **One minimum bond** (genesis `validator_bonding.min_bond_amount`) decides both seating and reward eligibility (owner decision 2026-10-28).
-- ✅ (sandbox) **Capital premium, Model C, fixed pool**: weight = 10,000 + min(k·(bond − bond_min)/1,000 QCB, cap) bps. `premium_k_bps_per_kqcb` ≤ 10,000; `premium_cap_bps` ≤ 5,000. Both default to **0 (off)** until values are chosen. Voting power is unaffected.
-- ✅ (sandbox) **MN-8 live passes 6/6.** A post-genesis validator earns exactly pool/5 while voting, and 0 after personhood revocation, when the others earn exactly pool/4.
+### Epoch rewards + MN-8 (#20, Windows-confirmed)
+- ✅ Rewards pay the closed epoch from committed evidence only. Participation is Byzantine-robust. `consensus.rewards.min_participation_pct` is set in genesis (default 67, range 50–90). Tie-breaks are deterministic.
+- ✅ **One minimum bond** (genesis `validator_bonding.min_bond_amount`) decides both seating and reward eligibility (owner decision 2026-10-28).
+- ✅ **Capital premium, Model C, fixed pool**: weight = 10,000 + min(k·(bond − bond_min)/1,000 QCB, cap) bps. `premium_k_bps_per_kqcb` ≤ 10,000; `premium_cap_bps` ≤ 5,000. Both default to **0 (off)** until values are chosen. Voting power is unaffected.
+- ✅ **MN-8 live passes 6/6.** A post-genesis validator earns exactly pool/5 while voting, and 0 after personhood revocation, when the others earn exactly pool/4.
   - Root causes fixed: the registry PoP sync ran only on the solo path; the record kept a stale 0 bond and no owner binding; there were two different minimum bonds.
-- ⬜ Windows confirmation, then merge after #18.
+- ✅ Windows (MINGW64): consensus 91/91, node 239/239, MN-8 live 6/6 (state root `3ac2b684…` identical to the Linux sandbox). Merge after #18.
 - ❓ Open (economics spec): values for `bond_min`, `k`, `premium_cap`; the per-human bond limit (whitepaper §3.3).
 
 ### Other follow-ups
