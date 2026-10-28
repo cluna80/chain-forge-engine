@@ -382,7 +382,6 @@ impl SlashingModule {
         }
         #[cfg(feature = "real-crypto")]
         {
-            use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
             // Reconstruct the exact bytes the consensus engine signed via
             // vote_signing_bytes(): b"CFV|" + chain_id + b"|" + type_byte +
             // height_le + round_le + block_hash_bytes.
@@ -401,17 +400,9 @@ impl SlashingModule {
             };
             let msg_a = build_msg(&evidence.block_hash_a);
             let msg_b = build_msg(&evidence.block_hash_b);
-            let sig_a = chain_forge_crypto::Signature {
-                scheme: chain_forge_crypto::SchemeId::Classical,
-                bytes:  evidence.signature_a.clone(),
-            };
-            let sig_b = chain_forge_crypto::Signature {
-                scheme: chain_forge_crypto::SchemeId::Classical,
-                bytes:  evidence.signature_b.clone(),
-            };
-            ClassicalScheme.verify(&msg_a, &sig_a, _pub_key)
+            chain_forge_crypto::verify_consensus(&msg_a, &evidence.signature_a, _pub_key)
                 .map_err(|e| SlashError::InvalidEvidence(format!("sig_a invalid: {e}")))?;
-            ClassicalScheme.verify(&msg_b, &sig_b, _pub_key_b)
+            chain_forge_crypto::verify_consensus(&msg_b, &evidence.signature_b, _pub_key_b)
                 .map_err(|e| SlashError::InvalidEvidence(format!("sig_b invalid: {e}")))?;
             Ok(())
         }

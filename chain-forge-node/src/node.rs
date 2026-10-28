@@ -1678,8 +1678,9 @@ impl Node {
             chain_id, &vote.vote_type, vote.height, vote.round,
             vote.block_hash.as_ref(),
         );
-        if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
-            vote.signature = sig.bytes;
+        if let Ok(sig) = chain_forge_crypto::sign_consensus(&bytes, kp) {
+            vote.signature = sig;
+            vote.scheme = chain_forge_crypto::consensus_scheme_tag(&kp.scheme).to_string();
         }
     }
 
@@ -1691,8 +1692,8 @@ impl Node {
             chain_id, proposal.height, proposal.round,
             &proposal.block_hash, &proposal.parent_hash, proposal.pol_round,
         );
-        if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
-            proposal.signature = sig.bytes;
+        if let Ok(sig) = chain_forge_crypto::sign_consensus(&bytes, kp) {
+            proposal.signature = sig;
         }
     }
 
@@ -1753,12 +1754,7 @@ impl Node {
             vote.block_hash.as_ref(),
         );
 
-        let sig = chain_forge_crypto::Signature {
-            scheme: chain_forge_crypto::SchemeId::Classical,
-            bytes:  vote.signature.clone(),
-        };
-
-        ClassicalScheme.verify(&msg, &sig, &vi.public_key)
+        chain_forge_crypto::verify_consensus(&msg, &vote.signature, &vi.public_key)
             .map_err(|e| format!(
                 "signature verification failed for validator {}: {e}",
                 vote.validator
@@ -4737,11 +4733,7 @@ impl Node {
                     &self.genesis.chain_id, &vote.vote_type, vote.height, vote.round,
                     vote.block_hash.as_ref(),
                 );
-                let sig = chain_forge_crypto::Signature {
-                    scheme: chain_forge_crypto::SchemeId::Classical,
-                    bytes:  vote.signature.clone(),
-                };
-                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|e| format!(
+                chain_forge_crypto::verify_consensus(&msg, &vote.signature, pub_key).map_err(|e| format!(
                     "validator {}'s precommit signature does not verify against the \
                      key it had registered at height {}: {e}",
                     vote.validator, cert.height
@@ -5231,8 +5223,8 @@ impl Node {
                         &self.genesis.chain_id, &vote.vote_type, vote.height,
                         vote.round, vote.block_hash.as_ref(),
                     );
-                    if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
-                        vote.signature = sig.bytes;
+                    if let Ok(sig) = chain_forge_crypto::sign_consensus(&bytes, kp) {
+                        vote.signature = sig;
                     }
                 }
                 vote
@@ -10453,6 +10445,54 @@ mod tests {
     /// PQ-VAL-002 / Test 10
     /// `EmergencyDeprecateAlgorithm("ml-dsa-65")` re-zeros voting power for
     /// all ML-DSA-only validators.
+    /// An activated ML-DSA-65 validator's votes must count on the real
+    /// engine path (gossip check + engine), not only in the standalone
+    /// `verify_consensus_vote` check. Before scheme dispatch the engine
+    /// verified every vote with Ed25519, so these were all rejected.
+    #[tokio::test]
+    async fn activated_mldsa_validator_votes_count_on_the_engine_path() {
+        let (account_kp, addr) = keyed_candidate("mldsa-engine-path-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("mldsa-engine-path-key");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let next_epoch = node.current_epoch() + 1;
+        node.submit_tx(activate_pq_consensus_tx("qcb1alice", 1, next_epoch, &account_kp, node.chain_id()));
+        node.propose_block(cert.block_hash.clone()).await.unwrap();
+        node.identity.clock.current_epoch = next_epoch;
+        let cert2 = node.propose_block(cert.block_hash.clone()).await.unwrap();
+
+        let vi = node.consensus.validator_set().validators.iter()
+            .find(|v| v.id.0 == addr).cloned().expect("seated");
+        assert!(vi.voting_power > 0, "setup: activated ML-DSA validator must have power");
+        assert_eq!(vi.public_key, mldsa_kp.public_key, "setup: the set carries the ML-DSA key");
+
+        let height = node.consensus.current_height();
+        let round  = node.consensus.current_round();
+        let bytes = vote_signing_bytes(node.chain_id(), &VoteType::Prevote, height, round, Some(&cert2.block_hash));
+        let vote = Vote {
+            vote_type:  VoteType::Prevote, height, round,
+            validator:  chain_forge_consensus::ValidatorId(addr.clone()),
+            block_hash: Some(cert2.block_hash.clone()),
+            signature:  chain_forge_crypto::sign_consensus(&bytes, &mldsa_kp).unwrap(),
+            scheme:     "ml-dsa-65".into(),
+        };
+        node.verify_vote_signature(&vote).expect("gossip check must accept the ML-DSA vote");
+        node.consensus.receive_vote(vote).await.expect("engine must accept the ML-DSA vote");
+
+        // An Ed25519 signature claiming the same validator is rejected.
+        let ed = ClassicalScheme.sign(&bytes, &account_kp).unwrap().bytes;
+        let forged = Vote {
+            vote_type: VoteType::Prevote, height, round,
+            validator: chain_forge_consensus::ValidatorId(addr.clone()),
+            block_hash: Some(cert2.block_hash.clone()), signature: ed, scheme: Vote::default_scheme(),
+        };
+        assert!(node.verify_vote_signature(&forged).is_err());
+        assert!(node.consensus.receive_vote(forged).await.is_err());
+    }
+
     #[tokio::test]
     async fn emergency_deprecate_zeros_mldsa_power() {
         let (account_kp, addr) = keyed_candidate("pq002-t10-account");

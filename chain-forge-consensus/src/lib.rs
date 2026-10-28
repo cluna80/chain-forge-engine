@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use chain_forge_core::{ChainHash, HashWidth};
 
 #[cfg(feature = "real-crypto")]
-use chain_forge_crypto::{ClassicalScheme, KeyPair, Signature, SchemeId, SignatureScheme};
+use chain_forge_crypto::KeyPair;
 
 use chain_forge_vca_pq::{
     VcaRegistry, WeightConfig, AdaptiveQuorumConfig,

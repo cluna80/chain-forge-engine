@@ -529,8 +529,8 @@ impl TendermintEngine {
                                 an empty signature (possible forgery)".into()));
         }
         let msg = vote_signing_bytes(&self.chain_id, &vote.vote_type, vote.height, vote.round, vote.block_hash.as_ref());
-        let sig = Signature { scheme: SchemeId::Classical, bytes: vote.signature.clone() };
-        ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|e| invalid(format!("invalid signature: {e}")))
+        chain_forge_crypto::verify_consensus(&msg, &vote.signature, pub_key)
+            .map_err(|e| invalid(format!("invalid signature: {e}")))
     }
 
     fn record_equivocation(&mut self, existing: &Vote, vote: &Vote) {
@@ -622,8 +622,7 @@ impl TendermintEngine {
                 }
                 let msg = proposal_signing_bytes(&self.chain_id, proposal.height, proposal.round,
                     &proposal.block_hash, &proposal.parent_hash, proposal.pol_round);
-                let sig = Signature { scheme: SchemeId::Classical, bytes: proposal.signature.clone() };
-                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_|
+                chain_forge_crypto::verify_consensus(&msg, &proposal.signature, pub_key).map_err(|_|
                     ConsensusError::MalformedProposal(format!("invalid signature from proposer {}", proposal.proposer)))?;
             }
         }
@@ -808,7 +807,7 @@ impl ConsensusEngine for TendermintEngine {
         let signature = match self.signing_key {
             Some(ref kp) => {
                 let bytes = proposal_signing_bytes(&self.chain_id, height, round, &block_hash, &parent_hash, None);
-                ClassicalScheme.sign(&bytes, kp).map(|s| s.bytes).unwrap_or_default()
+                chain_forge_crypto::sign_consensus(&bytes, kp).unwrap_or_default()
             }
             None => vec![],
         };
@@ -908,8 +907,7 @@ impl ConsensusEngine for TendermintEngine {
                 });
             }
             let msg = vote_signing_bytes(&self.chain_id, &vote.vote_type, vote.height, vote.round, vote.block_hash.as_ref());
-            let sig = Signature { scheme: SchemeId::Classical, bytes: vote.signature.clone() };
-            ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_| ConsensusError::InvalidVote {
+            chain_forge_crypto::verify_consensus(&msg, &vote.signature, pub_key).map_err(|_| ConsensusError::InvalidVote {
                 validator:  vote.validator.clone(),
                 block_hash: certificate.block_hash.clone(),
                 reason:     format!("invalid precommit signature in commit certificate at height {} round {}",
