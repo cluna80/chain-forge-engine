@@ -283,17 +283,19 @@ impl SlashingConfig {
     pub fn qcb_default() -> Self {
         Self {
             equivocation_slash_bps:      500,    // 5%
-            liveness_miss_pct_threshold: 50,     // >50% missed triggers slash (devnet: tolerant of cross-machine gossip lag)
+            // Engine defaults; a chain's genesis may override them within
+            // bounds (chain_forge_core::GenesisConfig::liveness_params).
+            liveness_miss_pct_threshold: chain_forge_core::DEFAULT_LIVENESS_MAX_MISSED_PCT,
             // Restored to 500 blocks for cross-machine devnet operation.
             // At 2000ms block time this gives ~16 minutes before a genuinely
             // offline validator is jailed. Was lowered to 10 for attack testing
             // (restore to 10 for liveness-slash attack tests on a single machine).
-            liveness_window_blocks:      500,
+            liveness_window_blocks:      chain_forge_core::DEFAULT_LIVENESS_WINDOW_BLOCKS,
             min_remaining_stake:         0, // no floor -- slash the full computed amount
             // Grace period: don't start counting liveness misses until the
             // gossip mesh has had time to form (KNOWN_ISSUES §2 fix).
             // Raised to 20 to give cross-machine gossipsub mesh more time to stabilise.
-            liveness_start_height:       20,
+            liveness_start_height:       chain_forge_core::DEFAULT_LIVENESS_START_HEIGHT,
         }
     }
 
@@ -605,6 +607,12 @@ impl SlashingModule {
 
     pub fn config(&self) -> &SlashingConfig {
         &self.config
+    }
+
+    /// Replace the policy. Used after restoring persisted slashing state so
+    /// the chain's genesis-derived policy, not whatever was on disk, applies.
+    pub fn set_config(&mut self, config: SlashingConfig) {
+        self.config = config;
     }
 }
 

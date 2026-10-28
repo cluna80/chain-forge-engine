@@ -694,6 +694,12 @@ impl Node {
         // environment override, so every node on the chain derives the same
         // values.
         let attestation_quorum = genesis.attestation_quorum().map_err(NodeError::Genesis)?;
+
+        // Hard error: liveness policy out of bounds (see GenesisConfig::liveness_params).
+        let liveness = genesis.liveness_params().map_err(NodeError::Genesis)?;
+        info!(window_blocks = liveness.window_blocks, max_missed_pct = liveness.max_missed_pct,
+              start_height = liveness.start_height,
+              "liveness policy (jail only, no stake burn; Byzantine-robust miss counting)");
         let attestation_cap_per_window =
             genesis.attestation_cap_per_window().map_err(NodeError::Genesis)?;
         let insecure_identity = attestation_quorum < chain_forge_core::DEFAULT_ATTESTATION_QUORUM
@@ -1064,7 +1070,15 @@ impl Node {
             );
         }
 
-        let slasher = SlashingModule::with_qcb_defaults();
+        // Liveness policy from genesis (validated above); every node derives
+        // the same values and there is no runtime override.
+        let slasher = {
+            let mut cfg = chain_forge_slashing::SlashingConfig::qcb_default();
+            cfg.liveness_window_blocks      = liveness.window_blocks;
+            cfg.liveness_miss_pct_threshold = liveness.max_missed_pct;
+            cfg.liveness_start_height       = liveness.start_height;
+            SlashingModule::new(cfg)
+        };
 
         // Seed the ValidatorRegistry with genesis validators, gated on
         // identity verification (Point 1 of the identity integration plan).
@@ -1952,8 +1966,12 @@ impl Node {
                 tracing::debug!("agent store restored from disk");
             }
             if slashing_path.exists() {
+                // Restore windows and history, but keep the genesis-derived
+                // policy: a stale or edited slashing.json must not change it.
+                let policy = self.slasher.config().clone();
                 self.slasher =
                     serde_json::from_str(&std::fs::read_to_string(&slashing_path)?)?;
+                self.slasher.set_config(policy);
                 tracing::debug!("slashing module restored from disk");
             }
             if chain_store_path.exists() {
@@ -5858,6 +5876,54 @@ mod tests {
         let other = Node::new(&json, None).await.unwrap();
         assert_eq!(other.identity.attestation_quorum(), restarted.identity.attestation_quorum());
         assert_eq!(other.identity.attestation_cap_per_window(), restarted.identity.attestation_cap_per_window());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn node_applies_genesis_liveness_policy_and_rejects_out_of_range() {
+        let with = |liveness: &str| GENESIS.replace(
+            r#""personhood_weighted": true }"#,
+            &format!(r#""personhood_weighted": true, "liveness": {liveness} }}"#),
+        );
+        let node = Node::new(&with(r#"{ "window_blocks": 800, "max_missed_pct": 40, "start_height": 7 }"#), None)
+            .await.unwrap();
+        let cfg = node.slasher.config();
+        assert_eq!((cfg.liveness_window_blocks, cfg.liveness_miss_pct_threshold, cfg.liveness_start_height),
+                   (800, 40, 7));
+
+        let defaults = Node::new(GENESIS, None).await.unwrap();
+        assert_eq!(defaults.slasher.config().liveness_miss_pct_threshold,
+                   chain_forge_core::DEFAULT_LIVENESS_MAX_MISSED_PCT);
+
+        let err = Node::new(&with(r#"{ "max_missed_pct": 95 }"#), None).await
+            .err().expect("an out-of-range liveness threshold must refuse to start");
+        assert!(err.to_string().contains("max_missed_pct"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn liveness_policy_comes_from_genesis_not_persisted_slashing_state() {
+        let dir = std::env::temp_dir()
+            .join(format!("cf-liveness-policy-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            node.propose_block(genesis_hash).await.unwrap();
+            node.persist_state();
+        }
+        // Tamper with the persisted policy.
+        let path = dir.join("persist").join("slashing.json");
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["config"]["liveness_miss_pct_threshold"] = serde_json::json!(99);
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+        assert_eq!(restarted.slasher.config().liveness_miss_pct_threshold,
+                   chain_forge_core::DEFAULT_LIVENESS_MAX_MISSED_PCT,
+                   "the genesis policy applies after restart, not the persisted one");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
