@@ -95,15 +95,14 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 - 🔲 **HotStuff / FBA**: both still use the legacy unsafe voting path. They need a safety review plus engine-driven voting, or must refuse to run off devnet.
 - 🔲 **VCA quorum floor**: `verify_commit` must never accept less than ⌊2·total/3⌋+1 of voting power.
 
-### Epoch rewards + MN-8 (in progress)
-- ✅ Rewards pay the closed epoch from committed evidence only. Participation is Byzantine-robust (the f worst-omitting proposers are discounted). `consensus.rewards.min_participation_pct` is set in genesis (default 67, range 50–90). Tie-breaks are deterministic. Rebased onto #18; node 237/237 in the sandbox.
-- 🔄 **MN-8 root cause found**: a post-genesis validator (Eve) votes in every committed `last_commit`, but its ValidatorRegistry record stays `Candidate`/unverified, so reward eligibility never pays it. The registry PoP sync ran only on the solo `propose_block` path, never on multi-node `commit_block`. The authenticated owner binding also never reaches an existing registry record.
-- ⬜ Next:
-  1. Fix the registry-sync test fixture (bond with an owner binding).
-  2. Carry the owner binding into the registry.
-  3. Rerun MN-8 live.
-  4. Open a draft PR stacked on #18.
-  5. Windows confirmation.
+### Epoch rewards + MN-8 (sandbox-complete; awaiting Windows)
+- ✅ (sandbox) Rewards pay the closed epoch from committed evidence only. Participation is Byzantine-robust. `consensus.rewards.min_participation_pct` is set in genesis (default 67, range 50–90). Tie-breaks are deterministic.
+- ✅ (sandbox) **One minimum bond** (genesis `validator_bonding.min_bond_amount`) decides both seating and reward eligibility (owner decision 2026-10-28).
+- ✅ (sandbox) **Capital premium, Model C, fixed pool**: weight = 10,000 + min(k·(bond − bond_min)/1,000 QCB, cap) bps. `premium_k_bps_per_kqcb` ≤ 10,000; `premium_cap_bps` ≤ 5,000. Both default to **0 (off)** until values are chosen. Voting power is unaffected.
+- ✅ (sandbox) **MN-8 live passes 6/6.** A post-genesis validator earns exactly pool/5 while voting, and 0 after personhood revocation, when the others earn exactly pool/4.
+  - Root causes fixed: the registry PoP sync ran only on the solo path; the record kept a stale 0 bond and no owner binding; there were two different minimum bonds.
+- ⬜ Windows confirmation, then merge after #18.
+- ❓ Open (economics spec): values for `bond_min`, `k`, `premium_cap`; the per-human bond limit (whitepaper §3.3).
 
 ### Other follow-ups
 - ⬜ `attestation_guard_live` registers an unfunded account that ingress now rejects (test fix).

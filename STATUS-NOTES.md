@@ -82,3 +82,9 @@ Gap: `devnet_4node_partition_recovery` is skipped on Windows (no iptables). It p
 - **One minimum bond** (`bond_min`, genesis `validator_bonding.min_bond_amount`) decides both seating and reward eligibility. Fixes MN-8: Eve was seated at 1 QCB but needed 1,000 QCB for registry Active.
 - **M0 approved** with the scope doc's goals (100 KiB at C = 512, verify ≤ 50 ms, hash-based only, 4–7 weeks gated at M2, zkVM first). The **other session** runs M0; this session finishes rewards and MN-8.
 - Local Windows repo: use `/c/Dev/chain-forge-engine`, not the nested `/c/Dev/chain-forge-engine/chain-forge-engine` clone.
+
+## Update (2026-10-28, later)
+
+- MN-8 **fixed in the sandbox**: live 6/6. Causes: the registry PoP sync ran only on the solo path; the registry record had a stale 0 bond and no owner binding; and seating and activation used different minimum bonds (1 vs 1,000 QCB).
+- Capital premium (Model C) is implemented within a fixed pool, off by default.
+- Branch `security/h0-epoch-rewards-v2` has a draft PR stacked on #18. Next: Windows confirmation.
