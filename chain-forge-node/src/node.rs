@@ -6210,6 +6210,40 @@ mod tests {
         const EPOCH: u64 = 10;
         const POOL: u128 = 1_000_003;
 
+        /// Model C, fixed pool (owner decision): a validator bonded above
+        /// `bond_min` gets extra reward *weight*, capped; the pool is split by
+        /// weight and never exceeded. Alice bonds 1,000 QCB above the minimum
+        /// with k = 1,000 bps per 1,000 QCB (+10%) but the cap is 500 bps.
+        #[tokio::test]
+        async fn capital_premium_reweights_a_fixed_pool_within_its_cap() {
+            let json = GENESIS
+                .replace(r#""personhood_weighted": true }"#,
+                    r#""personhood_weighted": true, "rewards": { "premium_k_bps_per_kqcb": 1000, "premium_cap_bps": 500 } }"#)
+                .replace(r#""address": "qcb1alice", "balance": "5000000""#, r#""address": "qcb1alice", "balance": "2000000000""#)
+                .replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
+        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
+            assert!(json.contains("premium_cap_bps") && json.contains("2000000000"));
+            let mut n = Node::new(&json, None).await.unwrap();
+            n.state.transfer("qcb1alice", "treasury:validator-pool", "uqcb", POOL).unwrap();
+            let alice_bond = n.min_bond_uqcb + 1_000_000_000;
+            n.state.transfer("qcb1alice", "validator-bond:qcb1alice", "uqcb", alice_bond).unwrap();
+
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"]];
+            let mut prev = None;
+            drive(&mut [&mut n], local, 0..EPOCH, &mut prev, nobody).await;
+            let (pool, before) = (bal(&n, "treasury:validator-pool"), balances(&n));
+            drive(&mut [&mut n], local, EPOCH..EPOCH + 1, &mut prev, nobody).await;
+            let gains: Vec<u128> = balances(&n).iter().zip(&before).map(|(a, b)| a - b).collect();
+
+            let weights = [10_500u128, 10_000, 10_000, 10_000]; // alice capped at +5%
+            let total: u128 = weights.iter().sum();
+            let expected: Vec<u128> = weights.iter().map(|w| pool * w / total).collect();
+            assert_eq!(gains, expected, "shares are pool x weight / total weight");
+            assert!(gains[0] > gains[1], "the larger bond earns more");
+            assert_eq!(bal(&n, "treasury:validator-pool"), pool - expected.iter().sum::<u128>(),
+                "fixed pool: never exceeded; the remainder stays");
+        }
+
         /// Validators a block's evidence leaves out, given the proposer that
         /// published it.
         type Omit = fn(&str) -> Vec<&'static str>;
