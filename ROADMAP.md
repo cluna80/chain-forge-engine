@@ -76,7 +76,7 @@
 
 ## Phase 0.5 — Protocol Foundation Hardening (status 2026-10-28)
 
-Hardening the foundation before adding features. Each item is a draft PR, unmerged until its gates pass on Windows (MINGW64). Merge order: #16 into #14's branch, then #14, #13, #15, #17, #18.
+Hardening the foundation before adding features. Each item is a draft PR, unmerged until its gates pass on Windows (MINGW64). Merge order: #16 into #14's branch, then #14, #13, #15, #17, #18, #20, #21.
 
 | Item | PR / branch | Status |
 |---|---|---|
