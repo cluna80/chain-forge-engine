@@ -745,8 +745,11 @@ impl ValidatorRegistry {
     ) {
         if let Some(record) = self.validators.get_mut(id) {
             // The record may predate the bond (e.g. created by key
-            // registration). Attach the authenticated owner binding once;
-            // the first binding is canonical.
+            // registration): take the admitted bond from the ledger, and
+            // attach the authenticated owner binding once (the first
+            // binding is canonical).
+            record.bonded_uqcb = bonded_uqcb;
+            record.stake_tier  = StakeTier::from_bonded(bonded_uqcb);
             if record.owner_identity_id.is_none() {
                 if let Some(owner) = owner_identity_id {
                     if let Some(ids) = self.validators_by_human.get_mut(id) {
@@ -1406,9 +1409,13 @@ mod tests {
     fn existing_record_receives_the_authenticated_owner_binding() {
         let mut reg = registry();
         reg.set_min_bond(1_000_000);
-        reg.register_bonded_validator("v", 2_000_000, None, 0);        // e.g. created by key registration
+        reg.register_bonded_validator("v", 0, None, 0);                // e.g. created by key registration
         reg.register_bonded_validator("v", 2_000_000, Some("human_v".into()), 1);
         assert_eq!(reg.get("v").unwrap().owner_identity_id.as_deref(), Some("human_v"));
+        assert_eq!(reg.get("v").unwrap().bonded_uqcb, 2_000_000, "the admitted bond reaches the record");
+        // Confirmed while the record still showed no stake: re-confirming activates it.
+        reg.confirm_pop("v", VerificationTier::Verified, 1).unwrap();
+        assert_eq!(reg.get("v").unwrap().status, ValidatorStatus::Active);
         // The first binding is canonical: a later, different owner does not replace it.
         reg.register_bonded_validator("v", 2_000_000, Some("someone_else".into()), 2);
         assert_eq!(reg.get("v").unwrap().owner_identity_id.as_deref(), Some("human_v"));

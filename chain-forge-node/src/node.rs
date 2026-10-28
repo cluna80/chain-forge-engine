@@ -4109,6 +4109,12 @@ impl Node {
             // proportional to actual stake.
             for v in &mut updated_vs.validators {
                 if let Some(&bonded_uqcb) = bond_map.get(v.id.0.as_str()) {
+                    // Keep the registry's stake in step with the bond ledger.
+                    if let Err(e) = self.validator_registry.update_stake(&v.id.0, bonded_uqcb) {
+                        if !matches!(e, chain_forge_validators::ValidatorError::NotFound(_)) {
+                            warn!(validator = %v.id, error = %e, "registry stake update failed");
+                        }
+                    }
                     let new_power = bonded_uqcb.min(u64::MAX as u128) as u64;
                     if v.voting_power != new_power {
                         info!(
@@ -4773,7 +4779,10 @@ impl Node {
             .collect();
         for addr in &verified_addrs {
             let Ok(rec) = self.validator_registry.get(addr) else { continue };
-            if rec.pop_verified { continue; }
+            // Re-confirm a seated Candidate too: it may have been confirmed
+            // before its bond reached the registry. confirm_pop activates
+            // only if eligible, so this is idempotent.
+            if rec.pop_verified && rec.status != chain_forge_validators::ValidatorStatus::Candidate { continue; }
             let identity_id = if rec.is_genesis {
                 Some(addr.clone())
             } else {
