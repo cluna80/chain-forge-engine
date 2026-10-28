@@ -395,6 +395,10 @@ pub struct Node {
     data_dir: Option<std::path::PathBuf>,
     /// Ed25519 keypair for signing proposals and votes. None for observer nodes.
     signing_key: Option<KeyPair>,
+    /// Solo devnet only: consensus keys used to sign the simulated votes of
+    /// the other genesis validators, by address. Empty unless a test fills
+    /// it; the Ed25519 address-derived key is the fallback.
+    devnet_sim_keys: std::collections::BTreeMap<String, KeyPair>,
     mempool:   Vec<Transaction>,
     /// Proposals seen but not yet committed, keyed by (height, round).
     /// Needed because a CommitCertificate carries only the block_hash, not
@@ -1392,6 +1396,7 @@ impl Node {
             peers,
             data_dir: None,
             signing_key: None,
+            devnet_sim_keys: Default::default(),
             validator_id,
             mempool: Vec::new(),
             nonce_cache: Arc::new(Mutex::new(initial_nonce_cache)),
@@ -5204,8 +5209,8 @@ impl Node {
             // match and the vote is correctly left unsigned (and will then
             // be rejected, same as a real forged vote would be), rather
             // than silently trusted.
-            let devnet_sim_key = ClassicalScheme.generate_keypair(&validator.id.0)
-                .ok()
+            let devnet_sim_key = self.devnet_sim_keys.get(&validator.id.0).cloned()
+                .or_else(|| ClassicalScheme.generate_keypair(&validator.id.0).ok())
                 .filter(|kp| kp.public_key == validator.public_key);
 
             let sign_devnet_vote = |vote_type: VoteType| -> Vote {
@@ -10445,6 +10450,154 @@ mod tests {
     /// PQ-VAL-002 / Test 10
     /// `EmergencyDeprecateAlgorithm("ml-dsa-65")` re-zeros voting power for
     /// all ML-DSA-only validators.
+    // -- ML-DSA-65 genesis (owner decision 2026-10-28) ----------------------
+
+    const VALS4: [&str; 4] = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+
+    fn mldsa_validator_key(addr: &str) -> chain_forge_crypto::KeyPair {
+        use chain_forge_crypto::MlDsaScheme;
+        MlDsaScheme.generate_keypair(&format!("{addr}-mldsa-consensus")).unwrap()
+    }
+
+    /// GENESIS with every validator on an ML-DSA-65 consensus key and
+    /// `validator_scheme = "ml-dsa-65"`.
+    fn mldsa_genesis() -> String {
+        let mut g: serde_json::Value = serde_json::from_str(GENESIS).unwrap();
+        g["cryptography"]["validator_scheme"] = "ml-dsa-65".into();
+        for a in g["genesis_accounts"].as_array_mut().unwrap() {
+            let addr = a["address"].as_str().unwrap().to_string();
+            let pk: String = mldsa_validator_key(&addr).public_key.iter().map(|b| format!("{b:02x}")).collect();
+            a["public_key"] = pk.into();
+        }
+        g.to_string()
+    }
+
+    fn write_key_file(dir: &std::path::Path, addr: &str, scheme: &str, kp: &chain_forge_crypto::KeyPair) -> std::path::PathBuf {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let path = dir.join(format!("{addr}.key.json"));
+        std::fs::write(&path, serde_json::json!({
+            "address": addr, "scheme": scheme,
+            "public_key": hex(&kp.public_key), "private_key": hex(&kp.private_key),
+        }).to_string()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn mldsa_genesis_seeds_mldsa_keys_active_from_genesis() {
+        let node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        for addr in VALS4 {
+            let vi = node.consensus.validator_set().validators.iter()
+                .find(|v| v.id.0 == addr).cloned().unwrap();
+            assert_eq!(vi.public_key, mldsa_validator_key(addr).public_key, "{addr}");
+            assert!(vi.voting_power > 0, "{addr} must vote from genesis");
+            assert_eq!(node.validator_registry.consensus_key_scheme(addr), Some("ml-dsa-65"), "{addr}");
+        }
+        assert_eq!(node.pq_activation_epoch(), Some(0), "ML-DSA consensus is active from genesis");
+    }
+
+    #[tokio::test]
+    async fn mldsa_genesis_refuses_an_ed25519_validator_key() {
+        let json = mldsa_genesis();
+        let mut g: serde_json::Value = serde_json::from_str(&json).unwrap();
+        g["genesis_accounts"][1]["public_key"] =
+            "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0".into();
+        let err = Node::new(&g.to_string(), None).await.err()
+            .expect("an Ed25519 validator key on an ML-DSA-only chain must refuse to start");
+        assert!(err.to_string().contains("ml-dsa-65"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mldsa_key_file_loads_and_signs_votes_with_mldsa() {
+        let dir = std::env::temp_dir().join(format!("cf-mldsa-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kp = mldsa_validator_key("qcb1bob");
+        let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        node.load_signing_key(&write_key_file(&dir, "qcb1bob", "ml-dsa-65", &kp))
+            .expect("an ML-DSA-65 key file matching genesis must load");
+
+        let mut vote = Vote {
+            vote_type: VoteType::Prevote, height: 1, round: 0,
+            validator: chain_forge_consensus::ValidatorId("qcb1bob".into()),
+            block_hash: Some(BlockHash("b".into())), signature: vec![], scheme: Vote::default_scheme(),
+        };
+        node.sign_vote(&mut vote);
+        assert_eq!(vote.scheme, "ml-dsa-65");
+        node.verify_vote_signature(&vote).expect("own ML-DSA vote must verify");
+
+        // Right public key, wrong private key: refused.
+        let mut wrong = kp.clone();
+        wrong.private_key = mldsa_validator_key("qcb1carol").private_key;
+        let mut other = Node::new(&mldsa_genesis(), None).await.unwrap();
+        assert!(other.load_signing_key(&write_key_file(&dir, "qcb1bob", "ml-dsa-65", &wrong)).is_err(),
+            "a key file whose private key does not match its public key must be refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A solo devnet node on the ML-DSA genesis, able to sign every genesis
+    /// validator's simulated votes.
+    async fn mldsa_solo_node() -> Node {
+        let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        for addr in VALS4 {
+            node.devnet_sim_keys.insert(addr.into(), mldsa_validator_key(addr));
+        }
+        node
+    }
+
+    #[tokio::test]
+    async fn mldsa_solo_devnet_commits_blocks_with_mldsa_votes() {
+        let mut node = mldsa_solo_node().await;
+        let mut parent = BlockHash("0000000000000000".into());
+        for _ in 0..3 {
+            let cert = node.propose_block(parent).await.expect("ML-DSA-signed votes must reach quorum");
+            for v in &cert.precommits {
+                let pk = node.consensus.validator_set().public_key_of(&v.validator).to_vec();
+                assert_eq!(pk.len(), 1952);
+                let msg = vote_signing_bytes(node.chain_id(), &v.vote_type, v.height, v.round, v.block_hash.as_ref());
+                chain_forge_crypto::verify_consensus(&msg, &v.signature, &pk).expect("precommit is ML-DSA-signed");
+            }
+            parent = cert.block_hash;
+        }
+    }
+
+    #[tokio::test]
+    async fn mldsa_only_chain_refuses_ed25519_key_registration() {
+        let (kp, addr) = keyed_candidate("mldsa-chain-ed25519-joiner");
+        let mut node = mldsa_solo_node().await;
+        let genesis_hash = BlockHash("0000000000000000".into());
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert.block_hash).await.unwrap();
+        assert!(node.validator_registry.consensus_pubkey_bytes(&addr).is_none(),
+            "an Ed25519 consensus key must not register on an ML-DSA-only chain");
+    }
+
+    #[tokio::test]
+    async fn mldsa_only_chain_refuses_to_deprecate_mldsa_consensus() {
+        let mut node = mldsa_solo_node().await;
+        let alice = ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+        let mut eda = Transaction {
+            id: "eda-mldsa-only".into(), sender: "qcb1alice".into(), nonce: 0,
+            body: chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:  "ml-dsa-65".into(),
+                replacement_scheme: "ed25519".into(),
+                rationale:          "would halt an ML-DSA-only chain".into(),
+                advisory_ref:       None,
+                grace_epochs:       chain_forge_execution::MIN_CRYPTO_GRACE_EPOCHS,
+                scope:              chain_forge_execution::DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        eda.sign(&alice, node.chain_id()).unwrap();
+        node.submit_tx(eda);
+        let cert = node.propose_block(BlockHash("0000000000000000".into())).await.unwrap();
+        node.propose_block(cert.block_hash).await.unwrap();
+        for addr in VALS4 {
+            let p = node.consensus.validator_set().power_of(&chain_forge_consensus::ValidatorId(addr.into()));
+            assert!(p > 0, "{addr} lost its voting power: deprecating the only consensus scheme halts the chain");
+        }
+    }
+
     /// An activated ML-DSA-65 validator's votes must count on the real
     /// engine path (gossip check + engine), not only in the standalone
     /// `verify_consensus_vote` check. Before scheme dispatch the engine
