@@ -384,6 +384,8 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | GKR sumcheck | Efficient circuit evaluation | ✅ |
 | No BN254 / BLS12-381 pairings | Eliminated | N/A — removed |
 
+**Related research spike (not a roadmap milestone):** Committee certificate compression, scoped in [`docs/succinct-proof-prototype-scope.md`](docs/succinct-proof-prototype-scope.md) and compared in [`docs/certificate-and-beacon-comparison.md`](docs/certificate-and-beacon-comparison.md). It proves that C ML-DSA-65 committee signatures are valid, using the same hash-based proof family as this item. It does not change the Research or Prover integration rows below and does not close any status.
+
 **Rust ecosystem to track:**
 - [`stwo`](https://github.com/starkware-libs/stwo) — StarkWare's next-gen STARK prover (Circle STARKs, Rust)
 - [`plonky3`](https://github.com/Plonky3/Plonky3) — modular STARK framework (Polygon/external, Rust)
