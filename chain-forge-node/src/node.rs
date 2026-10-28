@@ -6309,6 +6309,43 @@ mod tests {
             }
         }
 
+        /// A node restarted from disk mid-epoch must pay the closed epoch
+        /// exactly as a node that never restarted. Dave is offline for the
+        /// first 6 blocks' evidence and back for the last 4 (40%): a restart
+        /// that lost the epoch's tally would see only his 4/4 and pay him.
+        #[tokio::test]
+        async fn epoch_rewards_survive_a_mid_epoch_restart() {
+            fn dave_offline(_: &str) -> Vec<&'static str> { vec!["qcb1dave"] }
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"]];
+            let dir = std::env::temp_dir().join(format!("cf-rewards-restart-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let mut steady = rewards_node(67).await;
+            let mut prev = None;
+            drive(&mut [&mut steady], local, 0..6, &mut prev, dave_offline).await;
+            drive(&mut [&mut steady], local, 6..EPOCH + 1, &mut prev, nobody).await;
+
+            let mut prev = None;
+            {
+                let mut first = rewards_node(67).await;
+                first.set_data_dir(dir.clone()).unwrap();
+                drive(&mut [&mut first], local, 0..6, &mut prev, dave_offline).await;
+                first.persist_state();
+            }
+            let json = GENESIS.replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
+        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
+            let mut restarted = Node::new(&json, None).await.unwrap();
+            restarted.set_data_dir(dir.clone()).unwrap();
+            assert!(restarted.load_persisted_state(), "must load persisted state");
+            drive(&mut [&mut restarted], local, 6..EPOCH + 1, &mut prev, nobody).await;
+
+            assert_eq!(bal(&steady, "qcb1dave"), 5_000_000, "dave at 40% earns nothing");
+            assert!(bal(&steady, "qcb1bob") > 5_000_000, "the others were paid");
+            assert_eq!(balances(&restarted), balances(&steady), "rewards must not depend on a restart");
+            assert_eq!(restarted.state.current_root(), steady.state.current_root());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[tokio::test]
         async fn node_rejects_reward_policy_outside_bounds() {
             for pct in [49, 91] {
