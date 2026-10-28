@@ -127,6 +127,8 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 
 This decision is final. Do not re-litigate it during Phase 0 or Phase 1 work.
 
+**Amendment (owner decision 2026-10-28):** the devnet moves to **ML-DSA-65 consensus keys on the Tendermint engine** (branch `devnet-mldsa-consensus-keys`). One variable changes at a time: the engine stays Tendermint (HotStuff/FBA remain devnet-only per release gate 2). The Ed25519 devnet genesis stays runnable as a fallback until the ML-DSA devnet is confirmed on Windows. Found while scoping: after an `ActivatePqConsensus` tx, ML-DSA validators receive voting power, but the engine verified every vote with Ed25519, so their votes were all rejected (a liveness hazard above 1/3 of power).
+
 **Why not change devnet validators to ML-DSA now?** `chain-forge-consensus` is hardwired to `ClassicalScheme` (Ed25519) for all BFT vote signing and verification — `ValidatorInfo.public_key` is a 32-byte Ed25519 key, votes are signed with `SchemeId::Classical`, and `ClassicalScheme.verify()` is called directly in `receive_vote` and `verify_commit`. Switching consensus keys to ML-DSA requires updating those paths, regenerating all validator key files with 1952-byte ML-DSA keys, and auditing every test that constructs `ValidatorInfo` or signs votes. That is Phase 1 / mainnet genesis work, not a devnet patch. The devnet already proves the full ML-DSA user-transaction path end-to-end (P0-3 through P0-6). That is sufficient for Phase 0.
 
 **Token model (current — single token)**:
