@@ -672,23 +672,37 @@ async fn adversarial_garbage_signature() {
     let mut garbage = vec![0u8; 64];
     for (i, b) in garbage.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(37); }
 
+    // Wait for the gossipsub mesh, then send the vote several times, each
+    // aimed at the next height and published at once: a vote for a height
+    // a node has already passed is dropped without a log line.
+    eprintln!("   [attacker] waiting 2s for gossipsub mesh...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     // Forge a vote from the real validator qcb1bob but with garbage bytes as
     // the signature.  With the genesis public key on file, every receiving node
-    // will attempt Ed25519 verification and reject it.
-    let current_height = height_of(ports.alice_api);
-    let attack_height  = current_height + 1;
-    let forged_vote = Vote {
-        vote_type:  VoteType::Prevote,
-        height:     attack_height,
-        round:      0,
-        validator:  ValidatorId("qcb1bob".to_string()),
-        block_hash: Some(BlockHash("block_h_r0_garbage_sig_00000000".to_string())),
-        signature:  garbage,
-        scheme:     Vote::default_scheme(),
-    };
-
-    eprintln!("   [attacker] sending forged vote from qcb1bob (garbage sig) at height={attack_height}...");
-    attacker_publish_vote(&attacker, &forged_vote).await;
+    // will attempt signature verification and reject it.
+    let mut attack_height = 0;
+    for _ in 0..6 {
+        attack_height = height_of(ports.alice_api) + 1;
+        let forged_vote = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     attack_height,
+            round:      0,
+            validator:  ValidatorId("qcb1bob".to_string()),
+            block_hash: Some(BlockHash("block_h_r0_garbage_sig_00000000".to_string())),
+            signature:  garbage.clone(),
+            scheme:     Vote::default_scheme(),
+        };
+        // Publish immediately: attacker_publish_vote sleeps 2s first, by
+        // which time the nodes have usually passed attack_height and drop
+        // the vote without logging (the original intermittent failure).
+        eprintln!("   [attacker] sending forged vote from qcb1bob (garbage sig) at height={attack_height}...");
+        attacker.publish(OutboundMessage {
+            topic:   GossipTopic::ConsensusVote,
+            payload: serde_json::to_vec(&forged_vote).expect("vote serialise"),
+        }).await.expect("attacker publish");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 
     // Give the nodes time to receive, attempt to verify, and log the rejection.
     tokio::time::sleep(Duration::from_secs(2)).await;
