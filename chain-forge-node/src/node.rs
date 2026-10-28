@@ -450,6 +450,8 @@ pub struct Node {
     /// Validator registry -- authoritative set of registered validators and
     /// their on-chain state (bonded stake, status, keys). Required by slasher.
     validator_registry: ValidatorRegistry,
+    /// Epoch-reward eligibility policy, from genesis only (never persisted).
+    reward_params: chain_forge_core::RewardParams,
     /// Transactions submitted via POST /api/tx, waiting to be pulled into
     /// the mempool. Drained once per heartbeat tick in run().
     tx_queue: SharedTxQueue,
@@ -643,10 +645,6 @@ pub struct Node {
 /// a separate magic number to remember.
 pub const DEFAULT_VALIDATOR_EPOCH_BLOCKS: u64 = 100;
 
-/// Minimum participation percentage (0–100) a validator must have signed
-/// within the epoch to be eligible for the epoch reward pool.
-pub const VALIDATOR_REWARD_PARTICIPATION_PCT: u8 = 95;
-
 /// Map a transaction body to a short string label for the explorer.
 ///
 /// This function is the single source of truth for the kind string used
@@ -793,6 +791,10 @@ impl Node {
         info!(window_blocks = liveness.window_blocks, max_missed_pct = liveness.max_missed_pct,
               start_height = liveness.start_height,
               "liveness policy (jail only, no stake burn; Byzantine-robust miss counting)");
+        // Hard error: reward policy out of bounds (see GenesisConfig::reward_params).
+        let reward_params = genesis.reward_params().map_err(NodeError::Genesis)?;
+        info!(min_participation_pct = reward_params.min_participation_pct,
+              "epoch-reward policy (committed evidence only; Byzantine-robust participation)");
         let attestation_cap_per_window =
             genesis.attestation_cap_per_window().map_err(NodeError::Genesis)?;
         let insecure_identity = attestation_quorum < chain_forge_core::DEFAULT_ATTESTATION_QUORUM
@@ -1396,6 +1398,7 @@ impl Node {
             identity,
             agents: AgentStore::new(),
             slasher,
+            reward_params,
             validator_registry,
             tx_queue,
             has_bootstrap_peers,
@@ -3684,7 +3687,6 @@ impl Node {
         // (precommits for height-1, validated by every voter), attributed to
         // height-1's epoch. Never from `cert`, which each node assembles locally
         // from whichever precommits it received first and so differs by node.
-        let current_epoch = self.identity.clock.current_epoch;
         if let Some(lc) = &participation {
             let evidence_epoch = lc.height / self.validator_epoch_blocks;
             let mut seen = std::collections::HashSet::new();
@@ -3694,46 +3696,61 @@ impl Node {
                     self.validator_registry.record_precommit(&vote.validator.0, evidence_epoch);
                 }
             }
+            // Reward participation, attributed to the proposer that published
+            // the evidence so omissions can be discounted (Byzantine-robust).
+            let signers: Vec<String> = lc.precommits.iter().map(|v| v.validator.0.clone()).collect();
+            self.validator_registry.record_epoch_evidence(evidence_epoch, &proposal.proposer.0, &signers);
         }
 
-        // ── Epoch-close: distribute validator reward pool equally among
-        //    eligible, active, personhood-verified validators (70/20/10 split
-        //    already moved fees into treasury:validator-pool at block close).
+        // ── Epoch-close: the first block of epoch k+1 pays closed epoch k.
         //
-        // Eligibility: Active, pop_verified, nonzero consensus power, not
-        // currently jailed, participation >= VALIDATOR_REWARD_PARTICIPATION_PCT.
-        // Per-human dedup: one share per unique owner_identity_id.
-        // Zero eligible → pool carries forward unchanged.
-        if epoch_rolled {
+        // Every block of epoch k has had its evidence committed by now: the
+        // evidence for k's last block is this block's last_commit, recorded
+        // just above. Eligibility and shares derive only from that committed
+        // evidence and registry state, so every node pays identically.
+        //
+        // Eligibility: Active, pop_verified, nonzero consensus power, and
+        // Byzantine-robust participation >= the genesis min_participation_pct
+        // (the f proposers that omitted a validator most are discounted).
+        // One share per human owner. Shares are pool / eligible (floor); the
+        // remainder, or the whole pool when nobody is eligible, carries forward.
+        if cert.height > 0 && cert.height % self.validator_epoch_blocks == 0 {
+            let closed_epoch = cert.height / self.validator_epoch_blocks - 1;
+            let n = participation.as_ref()
+                .and_then(|lc| self.historical_validator_sets.get(&lc.height))
+                .unwrap_or_else(|| self.consensus.validator_set())
+                .validators.len();
+            let byzantine_f = n.saturating_sub(1) / 3;
             let eligible = self.validator_registry.eligible_validators_for_epoch_reward(
-                current_epoch,
-                self.validator_epoch_blocks,
-                VALIDATOR_REWARD_PARTICIPATION_PCT,
+                closed_epoch, byzantine_f, self.reward_params.min_participation_pct,
             );
-            if !eligible.is_empty() {
-                let pool_bal = self.state.get_account("treasury:validator-pool")
-                    .map(|a| a.balance_of(self.executor.native_denom()))
-                    .unwrap_or(0);
-                let share = (pool_bal / eligible.len() as u128) as u64;
-                if share > 0 {
-                    for vid in &eligible {
-                        let _ = self.state.transfer(
-                            "treasury:validator-pool", vid,
-                            self.executor.native_denom(), share as u128,
-                        );
+            let denom = self.executor.native_denom().to_string();
+            let pool_bal = self.state.get_account("treasury:validator-pool")
+                .map(|a| a.balance_of(&denom))
+                .unwrap_or(0);
+            let share = if eligible.is_empty() { 0 } else { pool_bal / eligible.len() as u128 };
+            if share > 0 {
+                for vid in &eligible {
+                    if let Err(e) = self.state.transfer("treasury:validator-pool", vid, &denom, share) {
+                        // Cannot happen: share * eligible <= pool_bal. Every
+                        // node computes the same values, so it would fail
+                        // identically everywhere; log loudly rather than halt.
+                        error!(validator = %vid, share, error = %e, "epoch-close: reward transfer failed");
                     }
-                    info!(
-                        epoch         = current_epoch,
-                        eligible      = eligible.len(),
-                        share_per_val = share,
-                        pool_balance  = pool_bal,
-                        "epoch-close: validator reward pool distributed"
-                    );
                 }
+                info!(
+                    epoch         = closed_epoch,
+                    eligible      = eligible.len(),
+                    share_per_val = share,
+                    pool_balance  = pool_bal,
+                    "epoch-close: validator reward pool distributed"
+                );
             } else {
                 debug!(
-                    epoch = current_epoch,
-                    "epoch-close: no eligible validators — validator reward pool carried forward"
+                    epoch = closed_epoch,
+                    eligible = eligible.len(),
+                    pool_balance = pool_bal,
+                    "epoch-close: no reward paid -- pool carried forward"
                 );
             }
         }
@@ -6176,13 +6193,15 @@ mod tests {
         type Omit = fn(&str) -> Vec<&'static str>;
         fn nobody(_: &str) -> Vec<&'static str> { vec![] }
 
-        /// A node on a 10-block epoch with a funded validator pool.
-        async fn rewards_node() -> Node {
-            let json = GENESIS.replace(
-                r#""custom_modules": [],"#,
-                &format!(r#""custom_modules": [],
-        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#),
-            );
+        /// A node on a 10-block epoch with a funded validator pool and the
+        /// given reward threshold.
+        async fn rewards_node(min_pct: u32) -> Node {
+            let json = GENESIS
+                .replace(r#""personhood_weighted": true }"#, &format!(
+                    r#""personhood_weighted": true, "rewards": {{ "min_participation_pct": {min_pct} }} }}"#))
+                .replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
+        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
+            assert!(json.contains("min_participation_pct"));
             let mut n = Node::new(&json, None).await.unwrap();
             n.state.transfer("qcb1alice", "treasury:validator-pool", "uqcb", POOL).unwrap();
             n
@@ -6217,8 +6236,8 @@ mod tests {
 
         /// Run `epochs` full epochs on one node; returns, for each epoch
         /// close, (pool before the closing block, each validator's gain).
-        async fn closes(epochs: u64, omit: Omit) -> Vec<(u128, Vec<u128>)> {
-            let mut n = rewards_node().await;
+        async fn closes(epochs: u64, min_pct: u32, omit: Omit) -> Vec<(u128, Vec<u128>)> {
+            let mut n = rewards_node(min_pct).await;
             let mut prev = None;
             let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"]];
             drive(&mut [&mut n], local, 0..EPOCH, &mut prev, omit).await;
@@ -6238,7 +6257,7 @@ mod tests {
         /// and the remainder stays in the pool.
         #[tokio::test]
         async fn epoch_close_pays_each_participating_validator_an_exact_share() {
-            for (k, (pool, gains)) in closes(2, nobody).await.into_iter().enumerate() {
+            for (k, (pool, gains)) in closes(2, 67, nobody).await.into_iter().enumerate() {
                 assert!(pool > 0, "epoch {k}: pool must be funded");
                 assert_eq!(gains, vec![pool / 4; 4], "epoch {k}: each validator earns pool/4 of {pool}");
             }
@@ -6246,13 +6265,15 @@ mod tests {
 
         /// Alice omits dave from every block's evidence she publishes for
         /// three epochs (25% of blocks). One Byzantine proposer must not cost
-        /// an honest validator its reward.
+        /// an honest validator its reward -- even at the strictest allowed
+        /// threshold (90%), which dave's raw 75% would fail without the
+        /// Byzantine-robust discount.
         #[tokio::test]
         async fn one_omitting_proposer_cannot_deny_an_honest_validator_its_reward() {
             fn alice_omits_dave(p: &str) -> Vec<&'static str> {
                 if p == "qcb1alice" { vec!["qcb1dave"] } else { vec![] }
             }
-            for (k, (pool, gains)) in closes(3, alice_omits_dave).await.into_iter().enumerate() {
+            for (k, (pool, gains)) in closes(3, 90, alice_omits_dave).await.into_iter().enumerate() {
                 assert_eq!(gains, vec![pool / 4; 4], "epoch {k}: dave must earn the same share as everyone else");
             }
         }
@@ -6262,7 +6283,7 @@ mod tests {
         #[tokio::test]
         async fn validator_absent_from_all_evidence_earns_no_reward() {
             fn dave_offline(_: &str) -> Vec<&'static str> { vec!["qcb1dave"] }
-            let (pool, gains) = closes(1, dave_offline).await.remove(0);
+            let (pool, gains) = closes(1, 67, dave_offline).await.remove(0);
             assert_eq!(gains, vec![pool / 3, pool / 3, pool / 3, 0]);
         }
 
@@ -6274,7 +6295,7 @@ mod tests {
             fn bob_omits_dave(p: &str) -> Vec<&'static str> {
                 if p == "qcb1bob" { vec!["qcb1dave"] } else { vec![] }
             }
-            let (mut a, mut b) = (rewards_node().await, rewards_node().await);
+            let (mut a, mut b) = (rewards_node(67).await, rewards_node(67).await);
             let start = balances(&a);
             let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"], &["qcb1alice", "qcb1bob", "qcb1dave"]];
             let mut prev = None;
@@ -6285,6 +6306,17 @@ mod tests {
             assert_eq!(a.state.current_root(), b.state.current_root());
             for (i, v) in VALS.iter().enumerate() {
                 assert!(balances(&a)[i] > start[i], "{v} must have been paid");
+            }
+        }
+
+        #[tokio::test]
+        async fn node_rejects_reward_policy_outside_bounds() {
+            for pct in [49, 91] {
+                let json = GENESIS.replace(r#""personhood_weighted": true }"#, &format!(
+                    r#""personhood_weighted": true, "rewards": {{ "min_participation_pct": {pct} }} }}"#));
+                let err = Node::new(&json, None).await.err()
+                    .unwrap_or_else(|| panic!("min_participation_pct {pct} must refuse to start"));
+                assert!(err.to_string().contains("min_participation_pct"), "{err}");
             }
         }
 
