@@ -3001,6 +3001,35 @@ mod tests {
         assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
     }
 
+    /// Restart recovery: every engine must resume at the height it is told
+    /// (the next height to decide) with the supplied validator set. An engine
+    /// that ignores reset_to_height restarts from height 0 and re-decides
+    /// already-finalized blocks.
+    #[tokio::test]
+    async fn every_engine_resumes_at_the_height_passed_to_reset_to_height() {
+        let vs = ValidatorSet {
+            height: 6,
+            validators: (0..4).map(|i| ValidatorInfo {
+                id: ValidatorId(format!("v{i}")), voting_power: 10,
+                pop_verified: true, public_key: vec![i as u8 + 1; 32],
+            }).collect(),
+        };
+        let mut engines: Vec<(&str, Box<dyn ConsensusEngine>, ConsensusVariant)> = vec![
+            ("tendermint", Box::new(TendermintEngine::new()), ConsensusVariant::TendermintStyle),
+            ("hotstuff",   Box::new(HotStuffEngine::new()),   ConsensusVariant::HotStuffStyle),
+            ("fba",        Box::new(FbaEngine::new()),        ConsensusVariant::XrplInspired),
+        ];
+        for (name, engine, variant) in engines.iter_mut() {
+            let mut cfg = default_config();
+            cfg.variant = variant.clone();
+            engine.init(cfg, vs.clone()).await.unwrap();
+            engine.reset_to_height(7, vs.clone()).unwrap();
+            assert_eq!(engine.current_height(), 7, "{name} must resume at height 7");
+            assert_eq!(engine.current_round(), 0, "{name} starts the restored height at round 0");
+            assert_eq!(engine.validator_set().validators.len(), 4, "{name} keeps the restored set");
+        }
+    }
+
     #[tokio::test]
     async fn engine_initialises_cleanly() {
         let (mut engine, vs) = make_engine_and_vs(4);
