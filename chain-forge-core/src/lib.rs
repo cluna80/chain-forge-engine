@@ -536,9 +536,9 @@ pub struct GenesisConsensus {
     #[serde(default)]
     pub personhood_weighted: bool,
     /// BFT algorithm variant to use for this chain.
-    /// One of: "tendermint" (default), "hotstuff", "xrpl".
-    /// Omitting this field uses TendermintStyle, preserving backward
-    /// compatibility with all existing genesis files.
+    /// One of: "tendermint" (default), "hotstuff", "xrpl". Omitting it
+    /// selects Tendermint. "hotstuff" and "xrpl" are devnet-only (release
+    /// gate 2); see `GenesisConfig::bft_variant`.
     #[serde(default)]
     pub bft_variant: Option<String>,
     /// Liveness (missed-participation) policy. Omitted means the engine
@@ -1037,13 +1037,31 @@ impl GenesisConfig {
         Ok(p)
     }
 
-    /// Resolve the BFT engine selected by `consensus.bft_variant`.
+    /// Resolve and validate the BFT engine selected by `consensus.bft_variant`.
+    /// Hard validation: the node refuses to start on `Err`.
+    ///
+    /// Release gate 2: HotStuff and FBA have not passed a consensus safety
+    /// review (no engine-driven voting or lock persistence, and their
+    /// `verify_commit` checks no signatures), so they run only with
+    /// `environment.mode == "devnet"`. An unrecognised value is rejected
+    /// rather than silently selecting an engine.
     pub fn bft_variant(&self) -> Result<BftVariant, String> {
-        Ok(match self.consensus.bft_variant.as_deref() {
+        let variant = match self.consensus.bft_variant.as_deref() {
+            None | Some("tendermint") | Some("TendermintStyle") => BftVariant::Tendermint,
             Some("hotstuff") | Some("HotStuffStyle") => BftVariant::HotStuff,
             Some("xrpl")     | Some("XrplInspired")  => BftVariant::Fba,
-            _                                         => BftVariant::Tendermint,
-        })
+            Some(other) => return Err(format!(
+                "consensus.bft_variant {other:?} is not one of \"tendermint\", \"hotstuff\", \"xrpl\""
+            )),
+        };
+        if variant != BftVariant::Tendermint && self.environment.mode != "devnet" {
+            return Err(format!(
+                "consensus.bft_variant {variant:?} has not passed a consensus safety review and \
+                 may only run with environment.mode = \"devnet\" (this chain is {:?})",
+                self.environment.mode
+            ));
+        }
+        Ok(variant)
     }
 
     /// Resolve and validate the reward-eligibility policy. Hard validation:

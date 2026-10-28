@@ -908,6 +908,10 @@ impl Node {
             chain_forge_core::BftVariant::Fba        => ConsensusVariant::XrplInspired,
             chain_forge_core::BftVariant::Tendermint => ConsensusVariant::TendermintStyle,
         };
+        if desired_variant != ConsensusVariant::TendermintStyle {
+            tracing::warn!(variant = ?desired_variant,
+                "devnet only: this BFT variant has not passed a consensus safety review");
+        }
 
         let consensus_cfg = ConsensusConfig {
             variant:              desired_variant.clone(),
