@@ -791,6 +791,34 @@ mod tests {
         assert!(slasher.liveness_slashed_uqcb > 0);
     }
 
+    /// Missed participation is unobserved behaviour, not proven misconduct:
+    /// a single proposer can omit an honest validator's precommit. It may
+    /// jail (temporary, reversible) but must never burn stake. Burning is
+    /// reserved for objectively verifiable faults such as double-signing.
+    #[test]
+    fn liveness_failure_jails_without_burning_stake() {
+        let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
+        let mut slasher = SlashingModule::new(SlashingConfig {
+            equivocation_slash_bps:      500,
+            liveness_slash_bps:          10,
+            liveness_miss_pct_threshold: 20,
+            liveness_window_blocks:      10,
+            min_remaining_stake:         0,
+            liveness_start_height:       0,
+        });
+        let mut burned = 0u128;
+        for _ in 0..8 { burned += slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap().unwrap_or(0); }
+        for _ in 0..3 { burned += slasher.record_block("val1", false, &mut reg, 0, 100).unwrap().unwrap_or(0); }
+
+        let rec = reg.get("val1").unwrap();
+        assert_eq!(rec.status, ValidatorStatus::Jailed, "a liveness failure still jails");
+        assert!(rec.jail_records.last().unwrap().unjail_after > 0, "jail must be temporary");
+        assert_eq!(rec.bonded_uqcb, FULL_STAKE_UQCB, "liveness must not reduce bonded stake");
+        assert_eq!(burned, 0, "liveness must not return an amount to burn");
+        assert_eq!(slasher.liveness_slashed_uqcb, 0);
+        assert_eq!(slasher.total_slashed_uqcb, 0);
+    }
+
     #[test]
     fn liveness_window_resets_after_slash() {
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
