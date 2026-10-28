@@ -94,7 +94,7 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 ### Release gates (open — block any release beyond devnet)
 - ✅ **Proposal authentication** (#21): validators sign their proposals and re-proposals; the signature covers `pol_round`. Receivers fail closed when the proposer has a registered key. Windows-confirmed.
 - 🔲 **HotStuff / FBA**: both still use the legacy unsafe voting path. They need a safety review plus engine-driven voting, or must refuse to run off devnet.
-- 🔲 **VCA quorum floor**: `verify_commit` must never accept less than ⌊2·total/3⌋+1 of voting power.
+- 🔄 **VCA quorum floor** (#22, awaiting Windows): every commit quorum is floored at ⌊2·total/3⌋+1 of the set being voted on or verified, in all three engines, at computation and at use. Found: the default VCA config used ⌈2·total/3⌉ (one unit short when total is divisible by 3), and a stored quorum was applied to any set passed in (a certificate with 1/3 of a larger set's power verified).
 
 ### Epoch rewards + MN-8 (#20, Windows-confirmed)
 - ✅ Rewards pay the closed epoch from committed evidence only. Participation is Byzantine-robust. `consensus.rewards.min_participation_pct` is set in genesis (default 67, range 50–90). Tie-breaks are deterministic.
