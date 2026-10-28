@@ -3336,18 +3336,14 @@ impl Node {
         }
     }
 
-    /// Check liveness participation for every validator after a block commits
-    /// and apply slashing to any that have crossed the miss threshold.
+    /// Record liveness participation for every validator from committed
+    /// `last_commit` evidence (H0-2), against the validator set effective at
+    /// the evidence's height. A validator absent from the evidence is recorded
+    /// as a miss; once its miss rate exceeds `liveness_miss_pct_threshold`
+    /// over the sliding `liveness_window_blocks`, the slashing module jails it
+    /// (temporary, reversible). Liveness never burns stake.
     ///
-    /// Uses `cert.precommits` (the votes that formed the quorum) as the
-    /// authoritative signer set, and `consensus.validator_set()` for the full
-    /// active set. Any validator absent from the quorum is recorded as a miss.
-    /// Once a validator's miss rate exceeds `liveness_miss_pct_threshold`
-    /// (default 20%) over the sliding `liveness_window_blocks` (default 500),
-    /// `record_block` returns `Ok(Some(burn_amount))`, the validator is jailed
-    /// by the slashing module itself, and this method burns the penalty via BME.
-    ///
-    /// Whitepaper refs: Section 8.2 (liveness slashing), Section 6.3 (BME burn).
+    /// Whitepaper ref: Section 8.2 (liveness).
     fn check_liveness_after_commit(
         &mut self,
         cert: &chain_forge_consensus::CommitCertificate,
@@ -3385,26 +3381,10 @@ impl Node {
                 Ok(None) => {
                     // Window filling or threshold not yet crossed — nothing to do.
                 }
-                Ok(Some(burn_amount)) => {
-                    // Liveness threshold crossed: validator jailed by record_block,
-                    // now burn the penalty stake via BME (Section 6.3).
-                    if burn_amount > 0 {
-                        if let Err(e) = self.state.burn(vid, "uqcb", burn_amount) {
-                            warn!(
-                                validator = %vid,
-                                burn_uqcb = burn_amount,
-                                error     = %e,
-                                "liveness slash: burn failed; jail applied but tokens not burned"
-                            );
-                        } else {
-                            warn!(
-                                validator = %vid,
-                                height,
-                                burn_uqcb = burn_amount,
-                                "liveness failure: validator jailed and stake burned"
-                            );
-                        }
-                    }
+                Ok(Some(_)) => {
+                    // record_block never returns a burn amount for liveness:
+                    // missed participation jails (temporarily) but never burns
+                    // stake -- see chain_forge_slashing::SlashingModule::record_block.
                 }
                 Err(e) => {
                     // Validator already jailed / tombstoned — not an error we
@@ -4365,9 +4345,9 @@ impl Node {
         self.last_commit_evidence = Some(cert.clone());
         self.last_commit_at = Some(std::time::Instant::now());
 
-        // Record block participation for every validator and slash any that
-        // have crossed the liveness miss threshold (>20% absent in 500-block
-        // sliding window → jail + 0.1% stake burn via BME, Section 8.2).
+        // Record block participation for every validator and jail any that
+        // have crossed the liveness miss threshold in the sliding window
+        // (temporary, reversible jail; liveness never burns stake).
         // H0-2: judged from the committed last_commit evidence for height-1,
         // never from this node's locally assembled certificate -- otherwise
         // nodes would jail and burn different validators.

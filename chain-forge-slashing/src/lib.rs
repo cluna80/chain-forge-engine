@@ -217,11 +217,8 @@ pub struct SlashingConfig {
     /// Fraction of bonded stake slashed for equivocation (basis points).
     /// Default: 500 bps = 5%. Burned via BME.
     pub equivocation_slash_bps: u32,
-    /// Fraction of bonded stake slashed for liveness failure (basis points).
-    /// Default: 10 bps = 0.1%. Much lighter than equivocation.
-    pub liveness_slash_bps: u32,
-    /// Fraction of blocks a validator may miss before liveness slash.
-    /// Default: 20% — missing more than 1 in 5 blocks triggers liveness slash.
+    /// Fraction of blocks a validator may miss before it is jailed for a
+    /// liveness failure (jail only -- liveness never burns stake).
     pub liveness_miss_pct_threshold: u32,
     /// Size of the liveness observation window in blocks.
     /// Default: 500 blocks (~8 minutes at 1s blocks).
@@ -244,7 +241,6 @@ impl SlashingConfig {
     pub fn qcb_default() -> Self {
         Self {
             equivocation_slash_bps:      500,    // 5%
-            liveness_slash_bps:          10,     // 0.1%
             liveness_miss_pct_threshold: 50,     // >50% missed triggers slash (devnet: tolerant of cross-machine gossip lag)
             // Restored to 500 blocks for cross-machine devnet operation.
             // At 2000ms block time this gives ~16 minutes before a genuinely
@@ -269,10 +265,6 @@ impl SlashingConfig {
 
     pub fn equivocation_slash_amount(&self, bonded: u128) -> u128 {
         self.slash_amount(bonded, self.equivocation_slash_bps)
-    }
-
-    pub fn liveness_slash_amount(&self, bonded: u128) -> u128 {
-        self.slash_amount(bonded, self.liveness_slash_bps)
     }
 }
 
@@ -502,7 +494,11 @@ impl SlashingModule {
         let missed_pct = window.missed_pct();
         if missed_pct <= self.config.liveness_miss_pct_threshold { return Ok(None); }
 
-        // Liveness threshold exceeded — slash and jail
+        // Liveness threshold exceeded — jail (temporary, reversible). Stake is
+        // never burned for missed participation: absence from committed
+        // evidence is unobserved behaviour, not a proven fault -- a proposer
+        // can omit an honest validator's precommit. Burning is reserved for
+        // objectively verifiable faults (slash_equivocation).
         let record = match registry.get(validator_id) {
             Ok(r) => r,
             Err(_) => return Ok(None), // validator may have been removed
@@ -513,24 +509,17 @@ impl SlashingModule {
             return Ok(None);
         }
 
-        let bonded_before = record.bonded_uqcb;
-        let slash_amount  = self.config.liveness_slash_amount(bonded_before);
-        let bonded_after  = bonded_before.saturating_sub(slash_amount);
+        let bonded = record.bonded_uqcb;
 
-        registry.update_stake(validator_id, bonded_after)
-            .map_err(|e| SlashError::Registry(e.to_string()))?;
         registry.jail(validator_id, "liveness failure", epoch)
             .map_err(|e| SlashError::Registry(e.to_string()))?;
 
-        // Reset the window after slashing so the validator isn't
-        // immediately re-slashed when they come back online
+        // Reset the window after jailing so the validator isn't
+        // immediately re-jailed when they come back online
         self.liveness_windows.insert(
             validator_id.to_string(),
             LivenessWindow::new(window_size),
         );
-
-        self.total_slashed_uqcb    += slash_amount;
-        self.liveness_slashed_uqcb += slash_amount;
 
         self.history.push(SlashRecord {
             validator_id:  validator_id.to_string(),
@@ -539,20 +528,19 @@ impl SlashingModule {
                 window: window_size as u64,
             },
             epoch,
-            bonded_before,
-            slashed_uqcb:  slash_amount,
-            bonded_after,
+            bonded_before: bonded,
+            slashed_uqcb:  0,
+            bonded_after:  bonded,
             tombstoned:    false,
         });
 
         tracing::warn!(
             validator   = validator_id,
             missed_pct,
-            slashed     = slash_amount,
-            "liveness failure — validator jailed"
+            "liveness failure — validator jailed (no stake burned)"
         );
 
-        Ok(Some(slash_amount))
+        Ok(None)
     }
 
     // -- History and lookups --------------------------------------------------
@@ -633,20 +621,11 @@ mod tests {
     }
 
     #[test]
-    fn liveness_slash_rate_is_point_1_percent() {
-        let cfg = SlashingConfig::qcb_default();
-        assert_eq!(cfg.liveness_slash_bps, 10);
-        let slash = cfg.liveness_slash_amount(10_000_000);
-        assert_eq!(slash, 10_000); // 0.1% of 10 QCB
-    }
-
-    #[test]
     fn slash_cannot_drop_below_minimum_remaining() {
         // With min_remaining_stake = 0 (default), the full computed slash applies.
         // To test the floor, use a custom config with a floor set.
         let cfg = SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      500,
             min_remaining_stake:         ENTRY_STAKE_UQCB, // floor at 1k QCB
@@ -770,7 +749,6 @@ mod tests {
         // liveness_start_height=0 so the grace period doesn't block these unit tests.
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
@@ -788,7 +766,7 @@ mod tests {
         slasher.record_block("val1", false, &mut reg, 0, 100).unwrap();
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Jailed,
             "exceeding threshold must jail");
-        assert!(slasher.liveness_slashed_uqcb > 0);
+        assert_eq!(slasher.liveness_slashed_uqcb, 0, "liveness never burns stake");
     }
 
     /// Missed participation is unobserved behaviour, not proven misconduct:
@@ -800,7 +778,6 @@ mod tests {
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
@@ -824,7 +801,6 @@ mod tests {
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
@@ -845,7 +821,6 @@ mod tests {
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
@@ -925,18 +900,6 @@ mod tests {
             "validator status must be unchanged after rejected evidence");
         assert_eq!(rec.bonded_uqcb, FULL_STAKE_UQCB,
             "stake must be unchanged after rejected evidence");
-    }
-
-    #[test]
-    fn liveness_slash_is_much_smaller_than_equivocation() {
-        let cfg = SlashingConfig::qcb_default();
-        let bonded = FULL_STAKE_UQCB;
-        let liveness_slash   = cfg.liveness_slash_amount(bonded);
-        let equivocation_slash = cfg.equivocation_slash_amount(bonded);
-        // liveness = 0.1%, equivocation = 5% -- ratio is exactly 50x
-        // assert strictly less with 49x to avoid floating-point equality edge
-        assert!(liveness_slash * 49 < equivocation_slash,
-            "liveness penalty must be much lighter than equivocation penalty");
     }
 }
 
