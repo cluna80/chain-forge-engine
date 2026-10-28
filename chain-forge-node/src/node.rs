@@ -6531,6 +6531,67 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        // ── Release gate 1: proposal authentication ──────────────────────────
+
+        /// Sign `p` as its proposer, with the deterministic devnet key that
+        /// matches the test genesis.
+        fn sign_as_proposer(mut p: BlockProposal) -> BlockProposal {
+            let kp = ClassicalScheme.generate_keypair(&p.proposer.0).unwrap();
+            let bytes = chain_forge_consensus::proposal_signing_bytes(
+                CHAIN, p.height, p.round, &p.block_hash, &p.parent_hash);
+            p.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+            p
+        }
+
+        async fn carol_takes(p: BlockProposal) -> bool {
+            let (mut carol, _) = carol_at_height_1().await;
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p).unwrap())).await.unwrap();
+            carol.pending_proposals.contains_key(&(p.height, p.round))
+        }
+
+        async fn valid_height_1_proposal() -> BlockProposal {
+            let (probe, h0) = carol_at_height_1().await;
+            let root = probe.state.current_root().map(str::to_string);
+            proposal(1, payload(Some(&evidence(0, &h0, &VALS)), root.as_deref()))
+        }
+
+        #[tokio::test]
+        async fn proposals_must_be_signed_by_their_proposer() {
+            let p = valid_height_1_proposal().await;
+            assert!(carol_takes(sign_as_proposer(p.clone())).await, "a correctly signed proposal is accepted");
+            assert!(!carol_takes(p.clone()).await, "an unsigned proposal from a keyed proposer is rejected");
+            let mut forged = sign_as_proposer(p.clone());
+            let kp = ClassicalScheme.generate_keypair("qcb1dave").unwrap();
+            let bytes = chain_forge_consensus::proposal_signing_bytes(CHAIN, 1, 0, &p.block_hash, &p.parent_hash);
+            forged.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+            assert!(!carol_takes(forged).await, "a proposal signed by another validator's key is rejected");
+        }
+
+        /// pol_round changes how validators vote, so the proposer's
+        /// signature must cover it: a relay must not be able to add or
+        /// change it.
+        #[tokio::test]
+        async fn proposal_signature_covers_pol_round() {
+            let p = sign_as_proposer(valid_height_1_proposal().await);
+            let tampered = BlockProposal { round: 1, proposer: ValidatorId("qcb1carol".into()), ..p.clone() };
+            let tampered = BlockProposal { pol_round: Some(0), ..sign_as_proposer(tampered) };
+            assert!(!carol_takes(tampered).await, "pol_round added after signing must be rejected");
+        }
+
+        /// A validator signs the proposals it makes, and re-gossips signed copies.
+        #[tokio::test]
+        async fn validators_sign_their_own_proposals() {
+            let mut alice = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            alice.signing_key = Some(ClassicalScheme.generate_keypair("qcb1alice").unwrap());
+            alice.propose_fresh(0, 0).await;
+            let (proposals, _) = alice.consensus.gossip_messages();
+            let p = proposals.into_iter().find(|p| p.round == 0).expect("alice proposed at height 0");
+            assert!(!p.signature.is_empty(), "the proposal alice holds (and re-gossips) is signed");
+            let mut bob = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+            bob.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p).unwrap())).await.unwrap();
+            assert!(bob.pending_proposals.contains_key(&(0, 0)), "peers accept alice's signed proposal");
+        }
+
         async fn carol_accepts(tx_data: Vec<u8>) -> bool {
             let (mut carol, _) = carol_at_height_1().await;
             let p1 = proposal(1, tx_data);
