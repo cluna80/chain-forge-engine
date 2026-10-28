@@ -1,6 +1,6 @@
 # PQ-HOTSTUFF-001 — PQ-HotStuff Consensus: Protocol Specification
 
-Status: **Draft for owner review.** Implements the locked direction of 2026-10-28 ("Qattice PQ-HotStuff Consensus Specification"). No code yet.
+Status: **Decisions D1–D5 locked (owner, 2026-10-28).** Implements the locked direction of 2026-10-28 ("Qattice PQ-HotStuff Consensus Specification"). No code yet.
 Date: 2026-10-28
 Scope: Qattice mainnet consensus; a selectable Chain Forge `ConsensusEngine`.
 
@@ -224,7 +224,7 @@ The Tendermint devnet stays the default until Phase 2 passes on Windows.
 
 ---
 
-## 13. Decisions needed
+## 13. Decisions (locked by the owner, 2026-10-28: all five as recommended)
 
 | # | Decision | Recommendation |
 |---|---|---|
