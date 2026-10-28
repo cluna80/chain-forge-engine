@@ -4741,3 +4741,109 @@ mod vca_quorum_floor {
         assert!(fba.vca_quorum.unwrap() >= fba.validator_set().quorum_power(), "fba stored quorum below floor");
     }
 }
+
+// ── ML-DSA-65 consensus keys (owner decision 2026-10-28) ─────────────────────
+//
+// A validator whose registered consensus key is ML-DSA-65 must be able to
+// vote, propose and appear in commit certificates. Forged or wrong-scheme
+// signatures must still be rejected.
+
+#[cfg(all(test, feature = "real-crypto"))]
+mod mldsa_consensus {
+    use super::*;
+    use super::tendermint::TendermintEngine;
+    use chain_forge_crypto::{MlDsaScheme, SignatureScheme};
+
+    const CHAIN: &str = "mldsa-chain";
+
+    fn keys() -> Vec<KeyPair> {
+        (0..4).map(|i| MlDsaScheme.generate_keypair(&format!("mldsa-consensus-{i}")).unwrap()).collect()
+    }
+
+    fn set(keys: &[KeyPair]) -> ValidatorSet {
+        ValidatorSet {
+            height: 0,
+            validators: keys.iter().enumerate().map(|(i, kp)| ValidatorInfo {
+                id: ValidatorId(format!("v{i}")), voting_power: 1, pop_verified: true,
+                public_key: kp.public_key.clone(),
+            }).collect(),
+        }
+    }
+
+    fn cfg() -> ConsensusConfig {
+        ConsensusConfig {
+            variant: ConsensusVariant::TendermintStyle, chain_id: CHAIN.into(),
+            propose_timeout_ms: 1_000, prevote_timeout_ms: 1_000, precommit_timeout_ms: 1_000,
+            block_time_ms: 1_000, personhood: None, vca: None,
+        }
+    }
+
+    async fn engine(keys: &[KeyPair]) -> TendermintEngine {
+        let mut e = TendermintEngine::new();
+        e.set_signing_key(keys[0].clone(), CHAIN.into());
+        e.init(cfg(), set(keys)).await.unwrap();
+        e
+    }
+
+    fn mldsa_vote(h: BlockHeight, i: usize, kp: &KeyPair, vote_type: VoteType, hash: &BlockHash) -> Vote {
+        let msg = vote_signing_bytes(CHAIN, &vote_type, h, 0, Some(hash));
+        Vote {
+            vote_type, height: h, round: 0, validator: ValidatorId(format!("v{i}")),
+            block_hash: Some(hash.clone()),
+            signature: MlDsaScheme.sign(&msg, kp).unwrap().bytes,
+            scheme: "ml-dsa-65".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mldsa_signed_vote_is_accepted_and_a_forgery_rejected() {
+        let k = keys();
+        let mut e = engine(&k).await;
+        let h = e.current_height();
+        let hash = BlockHash("b".into());
+        let vote = mldsa_vote(h, 1, &k[1], VoteType::Prevote, &hash);
+        e.receive_vote(vote.clone()).await.expect("a valid ML-DSA prevote must be accepted");
+
+        // Signed by v2's key but claimed by v3.
+        let mut forged = mldsa_vote(h, 2, &k[2], VoteType::Prevote, &hash);
+        forged.validator = ValidatorId("v3".into());
+        assert!(e.receive_vote(forged).await.is_err(), "ML-DSA vote signed by the wrong key must be rejected");
+    }
+
+    #[tokio::test]
+    async fn verify_commit_accepts_mldsa_precommits_and_rejects_tampering() {
+        let k = keys();
+        let e = engine(&k).await;
+        let vs = set(&k);
+        let h = e.current_height();
+        let hash = BlockHash("b".into());
+        let precommits: Vec<Vote> = (0..3).map(|i| mldsa_vote(h, i, &k[i], VoteType::Precommit, &hash)).collect();
+        let cert = CommitCertificate { height: h, round: 0, block_hash: hash.clone(), precommits };
+        e.verify_commit(&cert, &vs).expect("3 of 4 valid ML-DSA precommits must verify");
+
+        let mut bad = cert.clone();
+        bad.precommits[1].signature[10] ^= 0xff;
+        assert!(e.verify_commit(&bad, &vs).is_err(), "a tampered ML-DSA precommit must be rejected");
+    }
+
+    #[tokio::test]
+    async fn mldsa_signed_proposal_is_accepted() {
+        let k = keys();
+        let mut e = engine(&k).await;
+        let h = e.current_height();
+        let proposer = e.proposer_for(h, 0).expect("proposer");
+        let idx: usize = proposer.0[1..].parse().unwrap();
+        let parent = BlockHash("p".into());
+        let hash = compute_block_hash(CHAIN, h, &parent, &[]);
+        let msg = proposal_signing_bytes(CHAIN, h, 0, &hash, &parent, None);
+        let mut proposal = BlockProposal {
+            height: h, round: 0, proposer, block_hash: hash, parent_hash: parent, timestamp_ms: 0,
+            tx_data: vec![], signature: MlDsaScheme.sign(&msg, &k[idx]).unwrap().bytes, pol_round: None,
+        };
+        let mut forged = proposal.clone();
+        forged.signature[10] ^= 0xff;
+        assert!(e.receive_proposal(forged).await.is_err(), "a tampered ML-DSA proposal must be rejected");
+        proposal.timestamp_ms = 1;
+        e.receive_proposal(proposal).await.expect("an ML-DSA-signed proposal must be accepted");
+    }
+}
