@@ -1685,7 +1685,7 @@ impl Node {
         let chain_id = self.genesis.chain_id.as_str();
         let bytes = proposal_signing_bytes(
             chain_id, proposal.height, proposal.round,
-            &proposal.block_hash, &proposal.parent_hash,
+            &proposal.block_hash, &proposal.parent_hash, proposal.pol_round,
         );
         if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
             proposal.signature = sig.bytes;
@@ -4838,6 +4838,7 @@ impl Node {
                 ConsensusAction::Repropose(proposal) => {
                     info!(height = proposal.height, round = proposal.round, block_hash = %proposal.block_hash,
                           pol_round = ?proposal.pol_round, "re-proposing valid block");
+                    let proposal = self.sign_and_register_own_proposal(proposal).await;
                     self.pending_proposals.insert((proposal.height, proposal.round), proposal.clone());
                     let _ = self.network.publish(OutboundMessage {
                         topic:   GossipTopic::BlockProposal,
@@ -5052,6 +5053,16 @@ impl Node {
         }
     }
 
+    /// Sign one of our own proposals and hand the signed copy to the engine
+    /// (it replaces the unsigned one, so re-gossip is verifiable too).
+    async fn sign_and_register_own_proposal(&mut self, mut proposal: BlockProposal) -> BlockProposal {
+        self.sign_proposal(&mut proposal);
+        if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
+            warn!(error = %e, "own signed proposal not accepted by the engine");
+        }
+        proposal
+    }
+
     /// Build and broadcast a fresh proposal the engine asked for.
     async fn propose_fresh(&mut self, height: u64, round: u32) {
         // Copy, don't drain: txs leave the mempool only when a block commits.
@@ -5065,6 +5076,7 @@ impl Node {
         let parent = BlockHash(format!("genesis_h{height}"));
         match self.consensus.propose(height, round, parent, tx_bytes).await {
             Ok(proposal) => {
+                let proposal = self.sign_and_register_own_proposal(proposal).await;
                 info!(height, round, block_hash = %proposal.block_hash, txs = txs.len(), "block proposed (multi-node)");
                 self.pending_proposals.insert((height, round), proposal.clone());
                 let _ = self.network.publish(OutboundMessage {
@@ -6077,9 +6089,10 @@ mod tests {
             })).unwrap()
         }
 
+        /// A proposal for height h, round 0, signed by its proposer.
         fn proposal(h: u64, tx_data: Vec<u8>) -> BlockProposal {
             let parent = BlockHash(format!("genesis_h{h}"));
-            BlockProposal {
+            sign_as_proposer(BlockProposal {
                 height: h, round: 0,
                 proposer: ValidatorId(proposer(h).into()),
                 block_hash: compute_block_hash(CHAIN, h, &parent, &tx_data),
@@ -6088,7 +6101,7 @@ mod tests {
                 tx_data,
                 signature: vec![],
                 pol_round: None,
-            }
+            })
         }
 
         fn evidence(h: u64, block_hash: &BlockHash, signers: &[&str]) -> CommitCertificate {
@@ -6519,6 +6532,7 @@ mod tests {
                 block_hash: compute_block_hash(CHAIN, 0, &parent, &tx_data),
                 parent_hash: parent, timestamp_ms: 0, tx_data, signature: vec![], pol_round: None,
             };
+            let y = sign_as_proposer(y);
             assert_ne!(y.block_hash, x_hash);
             carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&y).unwrap())).await.unwrap();
 
@@ -6538,7 +6552,7 @@ mod tests {
         fn sign_as_proposer(mut p: BlockProposal) -> BlockProposal {
             let kp = ClassicalScheme.generate_keypair(&p.proposer.0).unwrap();
             let bytes = chain_forge_consensus::proposal_signing_bytes(
-                CHAIN, p.height, p.round, &p.block_hash, &p.parent_hash);
+                CHAIN, p.height, p.round, &p.block_hash, &p.parent_hash, p.pol_round);
             p.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
             p
         }
@@ -6558,11 +6572,12 @@ mod tests {
         #[tokio::test]
         async fn proposals_must_be_signed_by_their_proposer() {
             let p = valid_height_1_proposal().await;
-            assert!(carol_takes(sign_as_proposer(p.clone())).await, "a correctly signed proposal is accepted");
-            assert!(!carol_takes(p.clone()).await, "an unsigned proposal from a keyed proposer is rejected");
-            let mut forged = sign_as_proposer(p.clone());
+            assert!(carol_takes(p.clone()).await, "a correctly signed proposal is accepted");
+            let unsigned = BlockProposal { signature: vec![], ..p.clone() };
+            assert!(!carol_takes(unsigned).await, "an unsigned proposal from a keyed proposer is rejected");
+            let mut forged = p.clone();
             let kp = ClassicalScheme.generate_keypair("qcb1dave").unwrap();
-            let bytes = chain_forge_consensus::proposal_signing_bytes(CHAIN, 1, 0, &p.block_hash, &p.parent_hash);
+            let bytes = chain_forge_consensus::proposal_signing_bytes(CHAIN, 1, 0, &p.block_hash, &p.parent_hash, None);
             forged.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
             assert!(!carol_takes(forged).await, "a proposal signed by another validator's key is rejected");
         }
@@ -7662,7 +7677,7 @@ mod tests {
             prev_state_root: prev_state_root.map(str::to_string),
             ..Default::default()
         }.encode();
-        BlockProposal {
+        let mut p = BlockProposal {
             height,
             round,
             proposer:    ValidatorId(proposer.to_string()),
@@ -7672,7 +7687,12 @@ mod tests {
             tx_data,
             signature:   vec![],
             pol_round:   None,
-        }
+        };
+        // Signed by the proposer's deterministic devnet key (matches genesis).
+        let kp = ClassicalScheme.generate_keypair(proposer).unwrap();
+        let bytes = proposal_signing_bytes(chain_id, height, round, &p.block_hash, &p.parent_hash, None);
+        p.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+        p
     }
 
     /// Build a Vote signed by `validator`'s deterministic devnet keypair

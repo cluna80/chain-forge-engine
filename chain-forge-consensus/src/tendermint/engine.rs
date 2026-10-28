@@ -608,13 +608,19 @@ impl TendermintEngine {
                     "pol_round {vr} must be below the proposal round {}", proposal.round)));
             }
         }
+        // Fail closed (release gate 1): a proposer with a registered key
+        // must sign, over the content including pol_round.
         #[cfg(feature = "real-crypto")]
-        if !proposal.signature.is_empty() {
+        {
             let vs = self.require_validator_set()?;
             let pub_key = vs.public_key_of(&proposal.proposer);
             if !pub_key.is_empty() {
+                if proposal.signature.is_empty() {
+                    return Err(ConsensusError::MalformedProposal(format!(
+                        "unsigned proposal from {}, who has a registered key", proposal.proposer)));
+                }
                 let msg = proposal_signing_bytes(&self.chain_id, proposal.height, proposal.round,
-                    &proposal.block_hash, &proposal.parent_hash);
+                    &proposal.block_hash, &proposal.parent_hash, proposal.pol_round);
                 let sig = Signature { scheme: SchemeId::Classical, bytes: proposal.signature.clone() };
                 ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|_|
                     ConsensusError::MalformedProposal(format!("invalid signature from proposer {}", proposal.proposer)))?;
@@ -622,6 +628,13 @@ impl TendermintEngine {
         }
         if let Some(existing) = self.proposals.get(&proposal.round) {
             if existing.block_hash == proposal.block_hash {
+                // Our own unsigned copy is replaced by the signed one the
+                // node produced, so re-gossip sends a verifiable proposal.
+                if existing.signature.is_empty() && !proposal.signature.is_empty()
+                    && existing.pol_round == proposal.pol_round
+                {
+                    self.proposals.insert(proposal.round, proposal);
+                }
                 return Ok(()); // duplicate
             }
             return Err(ConsensusError::MalformedProposal(format!(
@@ -792,7 +805,7 @@ impl ConsensusEngine for TendermintEngine {
         #[cfg(feature = "real-crypto")]
         let signature = match self.signing_key {
             Some(ref kp) => {
-                let bytes = proposal_signing_bytes(&self.chain_id, height, round, &block_hash, &parent_hash);
+                let bytes = proposal_signing_bytes(&self.chain_id, height, round, &block_hash, &parent_hash, None);
                 ClassicalScheme.sign(&bytes, kp).map(|s| s.bytes).unwrap_or_default()
             }
             None => vec![],
