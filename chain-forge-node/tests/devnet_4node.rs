@@ -234,8 +234,40 @@ impl Drop for NodeProcess {
 
 // ── Shared: spawn + wait for APIs ────────────────────────────────────────────
 
+/// Alice's libp2p peer id, read from her log ("P2P listening ... peer=<id>").
+/// tests/devnet/genesis-4node.json uses bootstrap-only discovery (745ceab,
+/// so test nodes never peer with a physical devnet over mDNS), which means
+/// the other three nodes must be told whom to dial.
+fn read_peer_id(log_path: &PathBuf, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(log_path).unwrap_or_default();
+        let clean: String = {
+            let mut out = String::with_capacity(text.len());
+            let mut in_esc = false;
+            for c in text.chars() {
+                if c == '\x1b' { in_esc = true; continue; }
+                if in_esc { if c == 'm' { in_esc = false; } continue; }
+                out.push(c);
+            }
+            out
+        };
+        if let Some(id) = clean.lines()
+            .filter(|l| l.contains("P2P listening"))
+            .find_map(|l| l.split("peer=").nth(1))
+            .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+            .filter(|id| id.starts_with("12D3"))
+        {
+            return id;
+        }
+        assert!(Instant::now() < deadline, "no libp2p peer id in {log_path:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeProcess> {
     let mut nodes: Vec<NodeProcess> = Vec::new();
+    let mut bootstrap: Option<String> = None;
 
     for (i, &validator) in VALIDATORS.iter().enumerate() {
         let api_port = API_PORTS[i];
@@ -252,14 +284,18 @@ fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeP
             .join("tests").join("devnet").join("keys")
             .join(format!("{short_name}.key.json"));
 
-        let child = Command::new(bin)
-            .args([
+        let mut cmd = Command::new(bin);
+        cmd.args([
                 "--genesis",   genesis.to_str().unwrap(),
                 "--validator", validator,
                 "--key-file",  key_file.to_str().unwrap(),
                 "--api-port",  &api_port.to_string(),
                 "--p2p-port",  &p2p_port.to_string(),
-            ])
+            ]);
+        if let Some(b) = &bootstrap {
+            cmd.args(["--bootstrap", b]);
+        }
+        let child = cmd
             .stdout(log_file.try_clone().unwrap())
             .stderr(log_file)
             .stdin(Stdio::null())
@@ -267,6 +303,13 @@ fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeP
             .unwrap_or_else(|e| panic!("failed to spawn {validator}: {e}"));
 
         nodes.push(NodeProcess { validator, child, api_port });
+
+        if i == 0 {
+            // Everyone else bootstraps against the first node.
+            let peer = read_peer_id(&log_path, Duration::from_secs(15));
+            bootstrap = Some(format!("/ip4/127.0.0.1/tcp/{p2p_port}/p2p/{peer}"));
+            println!("   bootstrap: {}", bootstrap.as_deref().unwrap());
+        }
     }
 
     // Wait for every API port to bind.
