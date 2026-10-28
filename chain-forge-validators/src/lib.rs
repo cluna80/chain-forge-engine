@@ -22,7 +22,7 @@
 ///
 /// Whitepaper refs: Sections 3, 3.3, 6.3, Q6 (slashing), Q14 (liveness).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use chain_forge_consensus::{ValidatorId, ValidatorInfo, ValidatorSet, PersonhoodConfig};
 use chain_forge_identity::VerificationTier;
@@ -347,6 +347,13 @@ pub struct ValidatorRecord {
     /// Epoch in which epoch_blocks_signed was last reset.
     #[serde(default)]
     pub epoch_counter_epoch: u64,
+    /// Reward participation (H0-1): for epoch `epoch_included_epoch`, the
+    /// number of committed evidence blocks, per publishing proposer, that
+    /// include this validator's precommit.
+    #[serde(default)]
+    pub epoch_included: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub epoch_included_epoch: u64,
     /// Jail history (slashing prerequisite, Q6).
     pub jail_records:     Vec<JailRecord>,
     /// Human-readable moniker (display name).
@@ -515,6 +522,12 @@ pub struct ValidatorRegistry {
     /// Monotonically increasing counter for registration order.
     /// Incremented on every successful `register()` or `register_genesis()` call.
     next_registration_seq: u64,
+    /// Committed evidence blocks of epoch `epoch_evidence_epoch`, per
+    /// publishing proposer: the denominator for reward participation.
+    #[serde(default)]
+    epoch_evidence: BTreeMap<String, u64>,
+    #[serde(default)]
+    epoch_evidence_epoch: u64,
 }
 
 impl ValidatorRegistry {
@@ -529,6 +542,8 @@ impl ValidatorRegistry {
             liveness_threshold:     0.05, // >5% missed blocks triggers jail warning
             jail_duration_epochs:   10,
             next_registration_seq:  0,
+            epoch_evidence:         BTreeMap::new(),
+            epoch_evidence_epoch:   0,
         }
     }
 
@@ -594,6 +609,8 @@ impl ValidatorRegistry {
             blocks_missed:     0,
             epoch_blocks_signed: 0,
             epoch_counter_epoch: 0,
+            epoch_included: BTreeMap::new(),
+            epoch_included_epoch: 0,
             jail_records:      Vec::new(),
             moniker:           req.moniker,
             website:           req.website,
@@ -682,6 +699,8 @@ impl ValidatorRegistry {
             blocks_missed:     0,
             epoch_blocks_signed: 0,
             epoch_counter_epoch: 0,
+            epoch_included: BTreeMap::new(),
+            epoch_included_epoch: 0,
             jail_records:      Vec::new(),
             moniker:           id.to_string(),
             website:           None,
@@ -745,6 +764,8 @@ impl ValidatorRegistry {
             blocks_missed:     0,
             epoch_blocks_signed: 0,
             epoch_counter_epoch: 0,
+            epoch_included: BTreeMap::new(),
+            epoch_included_epoch: 0,
             jail_records:      Vec::new(),
             moniker:           id.to_string(),
             website:           None,
@@ -865,6 +886,8 @@ impl ValidatorRegistry {
                     blocks_missed:     0,
             epoch_blocks_signed: 0,
             epoch_counter_epoch: 0,
+            epoch_included: BTreeMap::new(),
+            epoch_included_epoch: 0,
                     jail_records:      Vec::new(),
                     moniker:           validator_id.to_string(),
                     website:           None,
@@ -1084,61 +1107,101 @@ impl ValidatorRegistry {
         }
     }
 
-    /// Determine which validators are eligible for epoch rewards and
-    /// distribute the validator pool equally among them.
+    /// Record one block's committed `last_commit` evidence for reward
+    /// participation (H0-1). `epoch` is the epoch of the evidence's height,
+    /// `proposer` the validator that published it, `signers` the validators
+    /// whose precommits it carries. Only committed evidence -- identical on
+    /// every node -- may be passed here, never a locally assembled certificate.
+    pub fn record_epoch_evidence(&mut self, epoch: u64, proposer: &str, signers: &[String]) {
+        if self.epoch_evidence_epoch != epoch {
+            self.epoch_evidence.clear();
+            self.epoch_evidence_epoch = epoch;
+        }
+        *self.epoch_evidence.entry(proposer.to_string()).or_insert(0) += 1;
+        let unique: BTreeSet<&String> = signers.iter().collect();
+        for vid in unique {
+            if let Some(record) = self.validators.get_mut(vid) {
+                if record.epoch_included_epoch != epoch {
+                    record.epoch_included.clear();
+                    record.epoch_included_epoch = epoch;
+                }
+                *record.epoch_included.entry(proposer.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Byzantine-robust reward participation of `validator_id` in `epoch`,
+    /// in whole percent (floor). The blocks published by the `byzantine_f`
+    /// proposers that omitted this validator most (ties: lowest proposer id)
+    /// are discounted, so up to f malicious proposers cannot cost an honest
+    /// validator its reward. A validator absent from the active set for part
+    /// of the epoch counts those blocks as missed. At least one proposer is
+    /// always kept, so an epoch whose evidence came from f or fewer proposers
+    /// is still measured. Returns 0 when no evidence for `epoch` was recorded.
+    pub fn robust_reward_participation_pct(&self, validator_id: &str, epoch: u64, byzantine_f: usize) -> u64 {
+        if self.epoch_evidence_epoch != epoch { return 0; }
+        let none = BTreeMap::new();
+        let included = match self.validators.get(validator_id) {
+            Some(r) if r.epoch_included_epoch == epoch => &r.epoch_included,
+            Some(_) => &none,
+            None    => return 0,
+        };
+        // (omissions, proposer, published, included)
+        let mut per_proposer: Vec<(u64, &String, u64, u64)> = self.epoch_evidence.iter()
+            .map(|(p, &total)| {
+                let inc = included.get(p).copied().unwrap_or(0).min(total);
+                (total - inc, p, total, inc)
+            })
+            .collect();
+        per_proposer.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        let discounted = byzantine_f.min(per_proposer.len().saturating_sub(1));
+        let (total, inc) = per_proposer.iter().skip(discounted)
+            .fold((0u64, 0u64), |(t, i), &(_, _, pt, pi)| (t + pt, i + pi));
+        if total == 0 { 0 } else { inc * 100 / total }
+    }
+
+    /// Validators that earn a share of closed epoch `epoch`'s reward pool,
+    /// sorted by id. Deterministic: depends only on committed evidence and
+    /// registry state, never on hash-map iteration order.
     ///
     /// Eligibility (all must hold):
     /// - `Active` status, `pop_verified=true`, nonzero `consensus_power()`
-    /// - Not jailed (no active jail record)
-    /// - `epoch_blocks_signed / validator_epoch_blocks >= participation_threshold_pct / 100`
-    /// - Owner identity unique per human (one share per human owner)
+    ///   (a jailed validator is not `Active`)
+    /// - `robust_reward_participation_pct(epoch, byzantine_f) >= min_participation_pct`
+    /// - one share per human owner: the owner's validator with the highest
+    ///   participation, ties to the lowest validator id
     ///
-    /// Distribution:
-    /// - Pool amount split equally among eligible count (integer floor).
-    /// - Remainder stays in `treasury:validator-pool` for the next epoch.
-    /// - Zero eligible validators → no distribution, pool untouched.
-    ///
-    /// Returns the list of (validator_id, reward_amount) pairs that were credited.
+    /// Zero eligible validators -> empty list; the caller leaves the pool untouched.
     pub fn eligible_validators_for_epoch_reward(
         &self,
-        current_epoch:            u64,
-        validator_epoch_blocks:   u64,
-        participation_threshold:  u8, // 0–100 (percentage, e.g. 95)
+        epoch:                 u64,
+        byzantine_f:           usize,
+        min_participation_pct: u32,
     ) -> Vec<String> {
-        use std::collections::HashMap;
+        let mut ids: Vec<&String> = self.validators.keys().collect();
+        ids.sort();
 
-        // Collect candidates: one per human owner, best participation wins.
-        // Map: owner_key → (validator_id, signed_blocks)
-        let mut best_per_human: HashMap<String, (String, u64)> = HashMap::new();
-
-        for (id, record) in &self.validators {
+        // owner -> (validator_id, participation); ascending-id iteration with
+        // a strict `>` keeps the lowest id on ties.
+        let mut best_per_human: BTreeMap<String, (String, u64)> = BTreeMap::new();
+        for id in ids {
+            let record = &self.validators[id];
             if !record.pop_verified { continue; }
             if record.status != ValidatorStatus::Active { continue; }
             if record.consensus_power() == 0 { continue; }
-            // Jailed: any jail record where unjail_after epoch hasn't passed.
-            if record.jail_records.iter().any(|j| j.unjail_after >= current_epoch) { continue; }
+            let pct = self.robust_reward_participation_pct(id, epoch, byzantine_f);
+            if pct < min_participation_pct as u64 { continue; }
 
-            // Epoch participation check.
-            let signed = if record.epoch_counter_epoch == current_epoch {
-                record.epoch_blocks_signed
-            } else {
-                0
-            };
-            if validator_epoch_blocks > 0 {
-                let pct = (signed * 100) / validator_epoch_blocks;
-                if pct < participation_threshold as u64 { continue; }
-            }
-
-            // Per-human dedup: keep the one with the highest signed count.
-            let owner_key = record.owner_identity_id.clone()
-                .unwrap_or_else(|| id.clone());
-            let entry = best_per_human.entry(owner_key).or_insert((id.clone(), 0));
-            if signed > entry.1 {
-                *entry = (id.clone(), signed);
+            let owner_key = record.owner_identity_id.clone().unwrap_or_else(|| id.clone());
+            match best_per_human.get(&owner_key) {
+                Some((_, best)) if pct <= *best => {}
+                _ => { best_per_human.insert(owner_key, (id.clone(), pct)); }
             }
         }
 
-        best_per_human.into_values().map(|(id, _)| id).collect()
+        let mut out: Vec<String> = best_per_human.into_values().map(|(id, _)| id).collect();
+        out.sort();
+        out
     }
 
     /// Check if a validator's liveness is below threshold and should be warned.
@@ -2195,22 +2258,20 @@ mod tests {
 
     // ── FS-03 epoch-reward acceptance tests ────────────────────────────────────
 
-    /// Build a registry with `n` active, pop_verified validators.
-    /// Each validator signs `signed` out of `epoch_blocks` in epoch 1.
-    /// Returns (registry, vec of validator ids).
-    fn make_active_validators(n: usize, signed: u64, epoch_blocks: u64) -> (ValidatorRegistry, Vec<String>) {
+    /// Record `count` committed evidence blocks of `epoch` published by
+    /// `proposer`, each carrying precommits from `signers`.
+    fn evidence_blocks(reg: &mut ValidatorRegistry, epoch: u64, proposer: &str, count: u64, signers: &[&str]) {
+        let signers: Vec<String> = signers.iter().map(|s| s.to_string()).collect();
+        for _ in 0..count { reg.record_epoch_evidence(epoch, proposer, &signers); }
+    }
+
+    /// `n` active, pop_verified validators v0..v{n-1}.
+    fn make_active_validators(n: usize) -> (ValidatorRegistry, Vec<String>) {
         let mut reg = registry();
         let ids: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
         for id in &ids {
             reg.register_genesis_validator(id, 0);
             reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
-            // Simulate precommits in epoch 1.
-            for _ in 0..signed {
-                reg.record_precommit(id, 1);
-            }
-        }
-        // Confirm all are Active after confirm_pop.
-        for id in &ids {
             assert_eq!(reg.get(id).unwrap().status, ValidatorStatus::Active);
         }
         (reg, ids)
@@ -2218,71 +2279,60 @@ mod tests {
 
     #[test]
     fn fs03_epoch_all_eligible_at_full_participation() {
-        let epoch_blocks: u64 = 100;
-        let (reg, ids) = make_active_validators(4, epoch_blocks, epoch_blocks);
-        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
-        assert_eq!(eligible.len(), 4, "all 4 fully-participating validators must be eligible");
-        let mut sorted = eligible.clone();
-        sorted.sort();
-        let mut expected: Vec<_> = ids.clone();
-        expected.sort();
-        assert_eq!(sorted, expected, "eligible set must match the registered validators");
+        let (mut reg, ids) = make_active_validators(4);
+        let all: Vec<&str> = ids.iter().map(String::as_str).collect();
+        // One proposer only: the f = 1 discount must not discard all evidence.
+        evidence_blocks(&mut reg, 1, "v0", 100, &all);
+        assert_eq!(reg.eligible_validators_for_epoch_reward(1, 1, 67), ids,
+            "all 4 fully-participating validators are eligible, sorted by id");
     }
 
     #[test]
     fn fs03_epoch_below_threshold_excluded() {
-        let epoch_blocks: u64 = 100;
-        // v0..v2 sign 95/100 (exactly at threshold), v3 signs only 50/100.
-        let (mut reg, _) = make_active_validators(3, 95, epoch_blocks);
-        reg.register_genesis_validator("v3", 0);
-        reg.confirm_pop("v3", VerificationTier::Verified, 1).unwrap();
-        for _ in 0..50 { reg.record_precommit("v3", 1); }
-
-        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
-        assert_eq!(eligible.len(), 3, "v3 at 50% must be excluded (threshold 95%)");
-        assert!(!eligible.contains(&"v3".to_string()), "v3 must not appear in eligible list");
+        // Every proposer's evidence leaves v3 out of half its blocks.
+        let (mut reg, _) = make_active_validators(4);
+        for p in ["v0", "v1", "v2", "v3"] {
+            evidence_blocks(&mut reg, 1, p, 25, &["v0", "v1", "v2", "v3"]);
+            evidence_blocks(&mut reg, 1, p, 25, &["v0", "v1", "v2"]);
+        }
+        assert_eq!(reg.robust_reward_participation_pct("v3", 1, 1), 50);
+        let eligible = reg.eligible_validators_for_epoch_reward(1, 1, 67);
+        assert_eq!(eligible, vec!["v0", "v1", "v2"], "v3 at 50% must be excluded (threshold 67%)");
     }
 
     #[test]
     fn fs03_epoch_zero_eligible_when_none_participate() {
-        let epoch_blocks: u64 = 100;
-        // Register two validators but never call record_precommit — 0% participation.
-        let mut reg = registry();
-        for id in ["v0", "v1"] {
-            reg.register_genesis_validator(id, 0);
-            reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
-        }
-        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
-        assert!(eligible.is_empty(),
+        let (mut reg, _) = make_active_validators(2);
+        evidence_blocks(&mut reg, 1, "v0", 100, &[]);
+        assert!(reg.eligible_validators_for_epoch_reward(1, 0, 67).is_empty(),
             "zero eligible validators must produce empty list, not panic or partial list");
+        let (fresh, _) = make_active_validators(2);
+        assert!(fresh.eligible_validators_for_epoch_reward(1, 0, 67).is_empty(),
+            "an epoch with no committed evidence pays nobody");
     }
 
     #[test]
     fn fs03_epoch_per_human_dedup_one_share_per_human() {
         // Two validators with the same owner_identity_id represent the same human.
         // Only the one with higher participation should appear in the eligible list.
-        let epoch_blocks: u64 = 100;
         let mut reg = registry();
-
-        // Register two validators under the same owner using the full registration path.
         let mut req_high = req("v_high", "qcb1high", ENTRY_STAKE_UQCB);
         req_high.owner_identity_id = Some("human1".to_string());
         let mut req_low  = req("v_low",  "qcb1low",  ENTRY_STAKE_UQCB);
         req_low.owner_identity_id  = Some("human1".to_string());
-
         reg.register(req_high, 0).unwrap();
         reg.register(req_low,  0).unwrap();
         reg.confirm_pop("v_high", VerificationTier::Verified, 1).unwrap();
         reg.confirm_pop("v_low",  VerificationTier::Verified, 1).unwrap();
 
-        // v_high signs 98 blocks, v_low signs 96 blocks (both above 95% threshold).
-        for _ in 0..98 { reg.record_precommit("v_high", 1); }
-        for _ in 0..96 { reg.record_precommit("v_low",  1); }
+        // v_high in 98/100 blocks, v_low in 96/100 (both above threshold).
+        evidence_blocks(&mut reg, 1, "p", 96, &["v_high", "v_low"]);
+        evidence_blocks(&mut reg, 1, "p", 2, &["v_high"]);
+        evidence_blocks(&mut reg, 1, "p", 2, &[]);
 
-        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
-        assert_eq!(eligible.len(), 1, "one human must get exactly one reward share");
-        assert_eq!(eligible[0], "v_high",
-            "the node with higher participation (v_high=98) must win the dedup");
+        let eligible = reg.eligible_validators_for_epoch_reward(1, 0, 67);
+        assert_eq!(eligible, vec!["v_high"],
+            "one share per human, to the validator with higher participation");
     }
 
     /// Two validators of one human with equal participation: every node must
@@ -2290,7 +2340,6 @@ mod tests {
     /// iteration-order tie-breaks differ between registries (and nodes).
     #[test]
     fn fs03_epoch_per_human_tie_is_broken_identically_on_every_node() {
-        let epoch_blocks: u64 = 100;
         let picks: std::collections::BTreeSet<Vec<String>> = (0..32).map(|_| {
             let mut reg = registry();
             for (id, addr) in [("v_a", "qcb1a"), ("v_b", "qcb1b"), ("v_c", "qcb1c")] {
@@ -2298,9 +2347,9 @@ mod tests {
                 r.owner_identity_id = Some("human1".to_string());
                 reg.register(r, 0).unwrap();
                 reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
-                for _ in 0..epoch_blocks { reg.record_precommit(id, 1); }
             }
-            reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95)
+            evidence_blocks(&mut reg, 1, "p", 100, &["v_a", "v_b", "v_c"]);
+            reg.eligible_validators_for_epoch_reward(1, 0, 67)
         }).collect();
         assert_eq!(picks.len(), 1, "tie-break must not depend on hash order: {picks:?}");
         assert_eq!(picks.into_iter().next().unwrap(), vec!["v_a".to_string()],
@@ -2308,50 +2357,71 @@ mod tests {
     }
 
     #[test]
-    fn fs03_epoch_boundary_uses_completed_epoch_counters() {
-        // This test verifies that epoch N's participation counters are read
-        // BEFORE record_precommit resets them for epoch N+1.
-        //
-        // Correct ordering: reward eligibility is checked at epoch close for
-        // epoch N.  If the node calls record_precommit with epoch N+1 BEFORE
-        // calling eligible_validators_for_epoch_reward, the counters reset to 0
-        // and no validator appears eligible (off-by-one epoch bug).
-        let epoch_blocks: u64 = 100;
-        let (mut reg, ids) = make_active_validators(2, epoch_blocks, epoch_blocks);
-
-        // At epoch close of epoch 1, query BEFORE advancing to epoch 2.
-        let eligible_epoch1 = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
-        assert_eq!(eligible_epoch1.len(), 2, "both validators eligible at epoch 1 close");
-
-        // Simulate epoch 2 starting: record_precommit with epoch=2 resets counters.
-        reg.record_precommit(&ids[0], 2);
-        reg.record_precommit(&ids[1], 2);
-
-        // Now query for epoch 1 again — counters are epoch 2, so epoch 1 query
-        // returns 0 signed (counters reset).  This documents the invariant:
-        // always query eligible_validators_for_epoch_reward(N, ...) BEFORE
-        // issuing record_precommit calls for epoch N+1.
-        let eligible_after_reset = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
-        assert!(eligible_after_reset.is_empty(),
-            "after epoch counters reset for epoch 2, epoch 1 query must return empty — \
-             reward distribution MUST precede record_precommit for the new epoch");
-
-        // But epoch 2 query works (only 1 block signed so far — below 95%):
-        let eligible_epoch2_partial = reg.eligible_validators_for_epoch_reward(2, epoch_blocks, 95);
-        assert!(eligible_epoch2_partial.is_empty(),
-            "epoch 2 with only 1 signed block (< 95% of 100) must have no eligible validators");
+    fn fs03_epoch_close_reads_the_closed_epochs_evidence() {
+        // Rewards for epoch 1 are computed at the first block of epoch 2,
+        // after the last evidence of epoch 1 is recorded and before any
+        // evidence of epoch 2 exists. Evidence of a later epoch replaces it.
+        let (mut reg, ids) = make_active_validators(2);
+        evidence_blocks(&mut reg, 1, "v0", 10, &["v0", "v1"]);
+        assert_eq!(reg.eligible_validators_for_epoch_reward(1, 0, 67), ids);
+        assert!(reg.eligible_validators_for_epoch_reward(2, 0, 67).is_empty(),
+            "epoch 2 has no evidence yet");
+        evidence_blocks(&mut reg, 2, "v1", 1, &["v0"]);
+        assert!(reg.eligible_validators_for_epoch_reward(1, 0, 67).is_empty(),
+            "epoch 1 is no longer measurable once epoch 2 evidence starts");
+        assert_eq!(reg.eligible_validators_for_epoch_reward(2, 0, 67), vec!["v0"]);
     }
 
     #[test]
     fn fs03_epoch_not_eligible_when_not_pop_verified() {
-        let epoch_blocks: u64 = 100;
         let mut reg = registry();
         reg.register_genesis_validator("v_unverified", 0);
         // Do NOT call confirm_pop — pop_verified stays false.
-        for _ in 0..100 { reg.record_precommit("v_unverified", 1); }
-
-        let eligible = reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95);
-        assert!(eligible.is_empty(),
+        evidence_blocks(&mut reg, 1, "p", 100, &["v_unverified"]);
+        assert!(reg.eligible_validators_for_epoch_reward(1, 0, 67).is_empty(),
             "validator without personhood verification must not receive epoch rewards");
+    }
+
+    // ── Byzantine-robust reward participation ──────────────────────────────────
+
+    #[test]
+    fn robust_participation_discounts_the_f_worst_omitting_proposers() {
+        // Four proposers, 25 blocks each. p0 omits v3 every time.
+        let (mut reg, _) = make_active_validators(4);
+        for p in ["v1", "v2", "v3"] { evidence_blocks(&mut reg, 1, p, 25, &["v0", "v1", "v2", "v3"]); }
+        evidence_blocks(&mut reg, 1, "v0", 25, &["v0", "v1", "v2"]);
+        assert_eq!(reg.robust_reward_participation_pct("v3", 1, 0), 75, "raw: 75/100");
+        assert_eq!(reg.robust_reward_participation_pct("v3", 1, 1), 100, "p0's blocks discounted");
+        assert_eq!(reg.eligible_validators_for_epoch_reward(1, 1, 90),
+            vec!["v0", "v1", "v2", "v3"], "one omitting proposer cannot deny v3 its reward");
+    }
+
+    #[test]
+    fn robust_participation_is_bounded_by_f() {
+        // Two of four proposers omit v3: with f = 1 only one is discounted.
+        let (mut reg, _) = make_active_validators(4);
+        for p in ["v2", "v3"] { evidence_blocks(&mut reg, 1, p, 25, &["v0", "v1", "v2", "v3"]); }
+        for p in ["v0", "v1"] { evidence_blocks(&mut reg, 1, p, 25, &["v0", "v1", "v2"]); }
+        assert_eq!(reg.robust_reward_participation_pct("v3", 1, 1), 66, "25 of the remaining 75");
+        assert!(!reg.eligible_validators_for_epoch_reward(1, 1, 67).contains(&"v3".to_string()));
+    }
+
+    #[test]
+    fn validator_absent_for_part_of_the_epoch_counts_those_blocks_as_missed() {
+        // v3 (e.g. jailed, then unjailed) appears only in the last 20 of 100 blocks.
+        let (mut reg, _) = make_active_validators(4);
+        for p in ["v0", "v1", "v2", "v3"] {
+            evidence_blocks(&mut reg, 1, p, 20, &["v0", "v1", "v2"]);
+            evidence_blocks(&mut reg, 1, p, 5, &["v0", "v1", "v2", "v3"]);
+        }
+        assert_eq!(reg.robust_reward_participation_pct("v3", 1, 1), 20);
+    }
+
+    #[test]
+    fn duplicate_signers_in_evidence_count_once() {
+        let (mut reg, _) = make_active_validators(2);
+        evidence_blocks(&mut reg, 1, "v0", 4, &["v0", "v0", "v1"]);
+        assert_eq!(reg.robust_reward_participation_pct("v0", 1, 0), 100);
+        assert_eq!(reg.get("v0").unwrap().epoch_included["v0"], 4);
     }
 }
