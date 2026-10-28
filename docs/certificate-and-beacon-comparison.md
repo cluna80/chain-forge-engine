@@ -23,6 +23,17 @@ Naive certificate (C ML-DSA signatures concatenated):
 | 256 | ~827 KiB | ~56 ms |
 | 512 | ~1,654 KiB | ~112 ms |
 
+Second machine (Windows 11, MINGW64, Python with `pqcrypto` 1.0.0 wheel, same script, 500 runs each):
+
+| Item | Linux sandbox | Windows (second machine) |
+|---|---|---|
+| Sign (median) | ~11.1 ms | ~10.2 ms |
+| Verify (median) | ~0.22 ms | ~0.24 ms |
+| Serial verify, C = 128 | ~28 ms | ~30 ms |
+| Serial verify, C = 512 | ~112 ms | ~121 ms |
+
+Sizes are identical on both machines. The two machines agree within about 10%, so the timings are stable enough for planning. They are still two data points, not a benchmark suite.
+
 Naive certificates are not acceptable at block frequency. The schemes below are compared against this baseline.
 
 ## 2. Certificate scheme options
