@@ -2285,6 +2285,28 @@ mod tests {
             "the node with higher participation (v_high=98) must win the dedup");
     }
 
+    /// Two validators of one human with equal participation: every node must
+    /// pick the same one. Each registry gets its own HashMap hash seed, so
+    /// iteration-order tie-breaks differ between registries (and nodes).
+    #[test]
+    fn fs03_epoch_per_human_tie_is_broken_identically_on_every_node() {
+        let epoch_blocks: u64 = 100;
+        let picks: std::collections::BTreeSet<Vec<String>> = (0..32).map(|_| {
+            let mut reg = registry();
+            for (id, addr) in [("v_a", "qcb1a"), ("v_b", "qcb1b"), ("v_c", "qcb1c")] {
+                let mut r = req(id, addr, ENTRY_STAKE_UQCB);
+                r.owner_identity_id = Some("human1".to_string());
+                reg.register(r, 0).unwrap();
+                reg.confirm_pop(id, VerificationTier::Verified, 1).unwrap();
+                for _ in 0..epoch_blocks { reg.record_precommit(id, 1); }
+            }
+            reg.eligible_validators_for_epoch_reward(1, epoch_blocks, 95)
+        }).collect();
+        assert_eq!(picks.len(), 1, "tie-break must not depend on hash order: {picks:?}");
+        assert_eq!(picks.into_iter().next().unwrap(), vec!["v_a".to_string()],
+            "ties go to the lowest validator id");
+    }
+
     #[test]
     fn fs03_epoch_boundary_uses_completed_epoch_counters() {
         // This test verifies that epoch N's participation counters are read
