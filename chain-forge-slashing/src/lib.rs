@@ -980,6 +980,8 @@ mod tests {
     /// signed evidence).
     #[cfg(feature = "real-crypto")]
     #[test]
+    #[ignore = "release gate 4: verifying signed evidence needs committed-evidence slashing first \
+                (local slashing diverges node state; see ROADMAP)"]
     fn forged_evidence_does_not_block_genuine_evidence() {
         use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
         let kp = ClassicalScheme.generate_keypair("val1-consensus").unwrap();

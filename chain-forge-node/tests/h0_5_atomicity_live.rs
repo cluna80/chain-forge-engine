@@ -76,15 +76,18 @@ fn node_binary() -> PathBuf {
     }
 }
 
+#[path = "common/consensus_keys.rs"]
+mod consensus_keys;
+
 fn genesis_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests").join("devnet").join("genesis-fee-settle.json")
+    consensus_keys::genesis(&PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests").join("devnet").join("genesis-fee-settle.json"))
 }
 
 fn key_path(short_name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    consensus_keys::validator_key(short_name, PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests").join("devnet").join("keys")
-        .join(format!("{short_name}.key.json"))
+        .join(format!("{short_name}.key.json")))
 }
 
 // ── Network helpers ───────────────────────────────────────────────────────────

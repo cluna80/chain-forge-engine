@@ -10625,12 +10625,11 @@ mod tests {
             "a scheme tag that does not match the key must be rejected");
     }
 
-    /// Equivocation with ML-DSA-signed votes is detected by the engine and
-    /// verified by slashing (which used to check evidence with Ed25519
-    /// only); tampered evidence does not tombstone anyone.
+    /// Equivocation with ML-DSA-signed votes is detected by the engine, and
+    /// the evidence carries both ML-DSA signatures. (Applying it is release
+    /// gate 4: slashing must come from committed evidence.)
     #[tokio::test]
-    async fn mldsa_equivocation_is_detected_and_slashed() {
-        use chain_forge_validators::ValidatorStatus;
+    async fn mldsa_equivocation_is_detected_with_verifiable_evidence() {
         let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
         let h = node.consensus.current_height();
         let bob = mldsa_validator_key("qcb1bob");
@@ -10649,15 +10648,12 @@ mod tests {
         let evidence = node.consensus.drain_equivocations();
         assert_eq!(evidence.len(), 1, "the engine must detect bob's double prevote");
 
-        let mut tampered = evidence.clone();
-        tampered[0].signature_b[10] ^= 0xff;
-        node.handle_drained_equivocations(tampered, h);
-        assert_ne!(node.validator_registry.get("qcb1bob").unwrap().status, ValidatorStatus::Tombstoned,
-            "tampered ML-DSA evidence must not tombstone");
-
-        node.handle_drained_equivocations(evidence, h);
-        assert_eq!(node.validator_registry.get("qcb1bob").unwrap().status, ValidatorStatus::Tombstoned,
-            "verified ML-DSA equivocation must tombstone bob");
+        let e = &evidence[0];
+        for (hash, sig) in [(&e.block_hash_a, &e.signature_a), (&e.block_hash_b, &e.signature_b)] {
+            let msg = vote_signing_bytes(node.chain_id(), &VoteType::Prevote, h, 0, Some(hash));
+            chain_forge_crypto::verify_consensus(&msg, sig, &bob.public_key)
+                .expect("each half of the evidence is a valid ML-DSA signature by bob");
+        }
     }
 
     #[tokio::test]
