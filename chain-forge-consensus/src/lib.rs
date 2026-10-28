@@ -1066,6 +1066,28 @@ impl ConsensusEngine for FbaEngine {
         Ok(())
     }
 
+    /// Restart recovery: resume at `height` (the next height to decide) with
+    /// the restored validator set, clearing per-height state exactly as
+    /// on_commit does. Without this the trait's no-op default left a
+    /// restarted node at height 0.
+    fn reset_to_height(
+        &mut self,
+        height:        BlockHeight,
+        validator_set: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        self.height = height;
+        self.round  = 0;
+        self.phase  = FbaPhase::Open;
+        self.votes.clear();
+        self.vote_index.clear();
+        self.pending = None;
+        self.pending_equivocations.clear();
+        self.update_validator_set(validator_set)
+            .map_err(|e| ConsensusError::Internal(e.to_string()))?;
+        tracing::info!(height, "FBA engine fast-forwarded to persisted height");
+        Ok(())
+    }
+
     fn verify_commit(
         &self,
         certificate:   &CommitCertificate,
@@ -2829,6 +2851,25 @@ impl ConsensusEngine for HotStuffEngine {
             height = self.height,
             "HotStuff: committed, advancing to next height"
         );
+        Ok(())
+    }
+
+    /// Restart recovery: resume at `height` (the next height to decide) with
+    /// the restored validator set, clearing per-height state exactly as
+    /// on_commit does (including the height lock). Without this the trait's
+    /// no-op default left a restarted node at height 0.
+    fn reset_to_height(
+        &mut self,
+        height:        BlockHeight,
+        validator_set: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        self.height    = height;
+        self.round     = 0;
+        self.locked_qc = None;
+        self.reset_round_state();
+        self.update_validator_set(validator_set)
+            .map_err(|e| ConsensusError::Internal(e.to_string()))?;
+        tracing::info!(height, "HotStuff engine fast-forwarded to persisted height");
         Ok(())
     }
 
