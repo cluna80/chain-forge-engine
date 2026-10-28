@@ -189,6 +189,11 @@ impl BlockPayload {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockSummary {
     pub height:     u64,
+    /// The finalized block's hash. Nodes must agree on it, not merely on
+    /// the state root: different empty blocks execute to the same root.
+    pub block_hash: String,
+    /// Round in which the block was decided.
+    pub round:      u32,
     pub state_root: String,
     pub timestamp_ms: u64,
     pub tx_count:   usize,
@@ -2154,7 +2159,7 @@ impl Node {
                         None => None,
                     }
                 };
-                for (_, (_cert, proposal)) in &entries[start..] {
+                for (_, (cert, proposal)) in &entries[start..] {
                     let txs = BlockPayload::decode(&proposal.tx_data).txs;
                     let mut tx_ids = Vec::with_capacity(txs.len());
                     for tx in &txs {
@@ -2174,6 +2179,8 @@ impl Node {
                     }
                     ex.blocks.push_front(BlockSummary {
                         height:       proposal.height,
+                        block_hash:   cert.block_hash.0.clone(),
+                        round:        cert.round,
                         state_root:   root_after(proposal.height)
                             .unwrap_or_else(|| proposal.block_hash.0.clone()),
                         timestamp_ms: proposal.timestamp_ms,
@@ -4445,6 +4452,8 @@ impl Node {
                 .max(self.last_committed_timestamp_ms.saturating_add(1));
             ex.blocks.push_front(BlockSummary {
                 height:       exec_result.height,
+                block_hash:   cert.block_hash.0.clone(),
+                round:        cert.round,
                 state_root:   exec_result.state_root.clone(),
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
@@ -5598,6 +5607,8 @@ impl Node {
                 .max(self.last_committed_timestamp_ms.saturating_add(1));
             ex.blocks.push_front(BlockSummary {
                 height:       exec_result.height,
+                block_hash:   cert.block_hash.0.clone(),
+                round:        cert.round,
                 state_root:   exec_result.state_root.clone(),
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
