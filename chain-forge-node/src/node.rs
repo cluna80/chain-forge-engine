@@ -155,6 +155,11 @@ fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> 
     std::fs::rename(&tmp, path)
 }
 
+/// Release gate 4: most evidence items one block may carry.
+const MAX_EVIDENCE_PER_BLOCK: usize = 16;
+/// Release gate 4: evidence older than this many blocks is not accepted.
+const EVIDENCE_MAX_AGE_BLOCKS: u64 = 1_000;
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BlockPayload {
     pub version:         u32,
@@ -3506,10 +3511,13 @@ impl Node {
         Ok(actual_burn)
     }
 
-    /// Drain equivocations detected by the consensus engine and route each
-    /// one through `process_equivocation_evidence`. Called after every
-    /// `receive_vote` so double-signs are punished immediately.
-    fn handle_drained_equivocations(&mut self, equivocations: Vec<EquivocationDetected>, epoch: u64) {
+    /// Queue equivocations detected by the consensus engine as evidence for
+    /// the next block this node proposes. Called after every `receive_vote`.
+    fn handle_drained_equivocations(&mut self, equivocations: Vec<EquivocationDetected>, _epoch: u64) {
+        // Release gate 4: never slash on local observation. Which nodes see a
+        // double vote, and when, differs, so applying it here diverges node
+        // state. Verify it and queue it; it is slashed when a block carrying
+        // it commits (`apply_committed_evidence`), identically everywhere.
         for eq in equivocations {
             let evidence = EquivocationEvidence {
                 validator_id:   eq.validator_id.0.clone(),
@@ -3521,27 +3529,91 @@ impl Node {
                 signature_b:    eq.signature_b,
                 vote_type_byte: eq.vote_type_byte,
             };
-            match self.process_equivocation_evidence(&evidence, epoch) {
-                Ok(burned) => {
-                    info!(
-                        validator = %eq.validator_id,
-                        height    = eq.height,
-                        round     = eq.round,
-                        burned_uqcb = burned,
-                        "equivocation detected and slashed"
-                    );
-                }
-                Err(e) => {
-                    // Already slashed or validator absent — not an error we
-                    // need to propagate; just log.
-                    warn!(
-                        validator = %eq.validator_id,
-                        error     = %e,
-                        "equivocation evidence rejected"
-                    );
-                }
+            let vs = self.historical_validator_sets.get(&evidence.height)
+                .unwrap_or_else(|| self.consensus.validator_set());
+            if let Err(e) = self.check_evidence_signatures(&evidence, vs) {
+                warn!(validator = %evidence.validator_id, error = %e, "equivocation evidence not queued");
+                continue;
+            }
+            if self.pending_evidence.iter().any(|p| p.validator_id == evidence.validator_id) {
+                continue;
+            }
+            warn!(validator = %evidence.validator_id, height = evidence.height, round = evidence.round,
+                  "equivocation detected; evidence queued for the next block");
+            self.pending_evidence.push(evidence);
+        }
+    }
+
+    /// Release gate 4: both signatures are by the offender's key in `vs`,
+    /// over two different blocks of the same (height, round, phase).
+    fn check_evidence_signatures(&self, ev: &EquivocationEvidence, vs: &chain_forge_consensus::ValidatorSet) -> Result<(), String> {
+        if ev.signature_a.is_empty() || ev.signature_b.is_empty() {
+            return Err("evidence must carry both signatures".into());
+        }
+        if ev.block_hash_a == ev.block_hash_b {
+            return Err("evidence names the same block twice".into());
+        }
+        let vote_type = match ev.vote_type_byte {
+            0 => VoteType::Prevote,
+            1 => VoteType::Precommit,
+            b => return Err(format!("unknown vote type byte {b}")),
+        };
+        let round = u32::try_from(ev.round).map_err(|_| format!("round {} out of range", ev.round))?;
+        let key = vs.public_key_of(&ValidatorId(ev.validator_id.clone()));
+        if key.is_empty() {
+            return Err(format!("{} has no consensus key in the set at height {}", ev.validator_id, ev.height));
+        }
+        for (hash, sig) in [(&ev.block_hash_a, &ev.signature_a), (&ev.block_hash_b, &ev.signature_b)] {
+            let msg = vote_signing_bytes(&self.genesis.chain_id, &vote_type, ev.height, round,
+                                         Some(&BlockHash(hash.clone())));
+            chain_forge_crypto::verify_consensus(&msg, sig, key)
+                .map_err(|e| format!("evidence signature does not verify: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Release gate 4: whether `ev` may be committed in a block at `height`.
+    /// Deterministic: it reads only committed state.
+    fn check_evidence(&self, ev: &EquivocationEvidence, height: u64) -> Result<(), String> {
+        if ev.height >= height {
+            return Err(format!("evidence height {} is not below the block height {height}", ev.height));
+        }
+        if ev.height + EVIDENCE_MAX_AGE_BLOCKS < height {
+            return Err(format!("evidence from height {} is older than {EVIDENCE_MAX_AGE_BLOCKS} blocks", ev.height));
+        }
+        let vs = self.historical_validator_sets.get(&ev.height)
+            .ok_or_else(|| format!("no validator set recorded for height {}", ev.height))?;
+        self.check_evidence_signatures(ev, vs)?;
+        let tombstoned = self.validator_registry.get(&ev.validator_id)
+            .map(|r| r.status == chain_forge_validators::ValidatorStatus::Tombstoned)
+            .unwrap_or(false);
+        if tombstoned {
+            return Err(format!("{} is already slashed", ev.validator_id));
+        }
+        Ok(())
+    }
+
+    /// Release gate 4: the queued evidence a block at `height` will carry.
+    fn evidence_for_proposal(&self, height: u64) -> Vec<EquivocationEvidence> {
+        self.pending_evidence.iter()
+            .filter(|ev| self.check_evidence(ev, height).is_ok())
+            .take(MAX_EVIDENCE_PER_BLOCK)
+            .cloned()
+            .collect()
+    }
+
+    /// Release gate 4: slash the evidence a committed block carries. Runs
+    /// before execution on every node, so it lands in the state root.
+    fn apply_committed_evidence(&mut self, evidence: &[EquivocationEvidence], height: u64) {
+        for ev in evidence {
+            match self.process_equivocation_evidence(ev, height) {
+                Ok(burned) => info!(validator = %ev.validator_id, height = ev.height, round = ev.round,
+                                    burned_uqcb = burned, "committed equivocation evidence slashed"),
+                // Unreachable for evidence that passed check_evidence; logged, not fatal.
+                Err(e) => error!(validator = %ev.validator_id, error = %e, "committed evidence not applied"),
             }
         }
+        self.pending_evidence.retain(|p| !evidence.iter().any(|ev| ev.validator_id == p.validator_id));
     }
 
     /// Record liveness participation for every validator from committed
@@ -3742,6 +3814,10 @@ impl Node {
             let signers: Vec<String> = lc.precommits.iter().map(|v| v.validator.0.clone()).collect();
             self.validator_registry.record_epoch_evidence(evidence_epoch, &proposal.proposer.0, &signers);
         }
+
+        // Release gate 4: committed equivocation evidence is slashed here,
+        // before execution, identically on every node.
+        self.apply_committed_evidence(&payload.evidence, cert.height);
 
         // ── Epoch-close: the first block of epoch k+1 pays closed epoch k.
         //
@@ -4636,6 +4712,18 @@ impl Node {
                 payload.prev_state_root, own_root
             ));
         }
+        // Release gate 4: every evidence item must be valid, at most one per
+        // validator, and within the per-block limit.
+        if payload.evidence.len() > MAX_EVIDENCE_PER_BLOCK {
+            return Err(format!("{} evidence items exceed the limit of {MAX_EVIDENCE_PER_BLOCK}", payload.evidence.len()));
+        }
+        let mut offenders = std::collections::HashSet::new();
+        for ev in &payload.evidence {
+            if !offenders.insert(ev.validator_id.as_str()) {
+                return Err(format!("duplicate evidence for {}", ev.validator_id));
+            }
+            self.check_evidence(ev, proposal.height).map_err(|e| format!("invalid evidence: {e}"))?;
+        }
         if proposal.height == 0 {
             if payload.last_commit.is_some() {
                 return Err("a height-0 block cannot carry a last_commit".into());
@@ -5110,7 +5198,7 @@ impl Node {
             txs:             txs.clone(),
             last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
             prev_state_root: self.state.current_root().map(str::to_string),
-            evidence:        Vec::new(),
+            evidence:        self.evidence_for_proposal(height),
         }.encode();
         let parent = BlockHash(format!("genesis_h{height}"));
         match self.consensus.propose(height, round, parent, tx_bytes).await {
@@ -5145,7 +5233,7 @@ impl Node {
             txs:             txs.clone(),
             last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
             prev_state_root: self.state.current_root().map(str::to_string),
-            evidence:        Vec::new(),
+            evidence:        self.evidence_for_proposal(height),
         }.encode();
 
         let proposal = self.consensus
@@ -5189,9 +5277,10 @@ impl Node {
         let last_commit = if height == 0 { None } else { self.last_commit_evidence.clone() };
         let prev_state_root = self.state.current_root().map(str::to_string);
 
+        let evidence = self.evidence_for_proposal(height);
         let tx_bytes = BlockPayload {
             version: BLOCK_PAYLOAD_VERSION, txs: txs.clone(), last_commit, prev_state_root,
-            evidence: Vec::new(),
+            evidence: evidence.clone(),
         }.encode();
 
         // Produce a proposal
@@ -5383,6 +5472,9 @@ impl Node {
                 }
             }
         }
+
+        // Release gate 4: same as commit_block.
+        self.apply_committed_evidence(&evidence, height);
 
         // Pass the PoCD registry (if enabled) so the executor can distribute
         // epoch rewards directly from the in-memory DiscoveryRegistry.
@@ -8339,8 +8431,6 @@ mod tests {
     /// verify the slashing side effects (tombstone + stake burn + QRC metrics).
     #[tokio::test]
     async fn double_vote_triggers_slashing_and_tombstone() {
-        use chain_forge_consensus::tendermint::EquivocationDetected;
-        use chain_forge_consensus::{BlockHash, ValidatorId};
 
         let mut node = Node::new(GENESIS, None).await.unwrap();
 
@@ -8362,26 +8452,24 @@ mod tests {
         // Construct a synthetic EquivocationDetected for Alice at height 0, round 0.
         // The two conflicting block hashes represent a double-prevote.
         //
-        // NOTE: signatures are empty here on purpose. Genesis validators are
-        // registered with an empty consensus_pubkey ("genesis-stub" scheme), so
-        // decode_hex("") in slash_equivocation would fail. Passing empty sigs
-        // triggers the "skipped when both sigs are empty" branch and lets the
-        // tombstone + burn logic run without real key material.
-        let eq_evidence = EquivocationDetected {
-            validator_id:   ValidatorId("qcb1alice".into()),
+        // Release gate 4: slashing happens when a block carrying the evidence
+        // commits (apply_committed_evidence), never on detection. This drives
+        // that commit-time path directly; evidence validity is covered by the
+        // h0_participation gate-4 tests. Empty signatures take the slasher's
+        // unsigned branch, which committed evidence can never reach
+        // (check_evidence requires both signatures).
+        let eq_evidence = EquivocationEvidence {
+            validator_id:   "qcb1alice".into(),
             height:         0,
             round:          0,
-            vote_type_byte: 1, // PREVOTE
-            block_hash_a:   BlockHash("hash_A_00000000".into()),
-            block_hash_b:   BlockHash("hash_B_11111111".into()),
+            block_hash_a:   "hash_A_00000000".into(),
+            block_hash_b:   "hash_B_11111111".into(),
             signature_a:    vec![],
             signature_b:    vec![],
+            vote_type_byte: 1,
         };
-
-        // Drive the slashing pipeline directly: this is the same code path that
-        // handle_event() → receive_vote() → drain_equivocations() invokes.
         let epoch = node.consensus.current_height();
-        node.handle_drained_equivocations(vec![eq_evidence], epoch);
+        node.apply_committed_evidence(&[eq_evidence], epoch);
 
         // ── Assert tombstone ─────────────────────────────────────────────────
         assert!(

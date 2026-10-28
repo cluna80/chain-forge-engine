@@ -382,22 +382,20 @@ impl SlashingModule {
         }
         #[cfg(feature = "real-crypto")]
         {
-            // Reconstruct the exact bytes the consensus engine signed via
-            // vote_signing_bytes(): b"CFV|" + chain_id + b"|" + type_byte +
-            // height_le + round_le + block_hash_bytes.
-            // Both votes are from the same phase (same vote_type_byte) but
-            // different block hashes, which is the definition of equivocation.
-            let build_msg = |block_hash: &str| -> Vec<u8> {
-                let mut b = Vec::new();
-                b.extend_from_slice(b"CFV|");
-                b.extend_from_slice(chain_id.as_bytes());
-                b.push(b'|');
-                b.push(evidence.vote_type_byte);
-                b.extend_from_slice(&evidence.height.to_le_bytes());
-                b.extend_from_slice(&evidence.round.to_le_bytes());
-                b.extend_from_slice(block_hash.as_bytes());
-                b
+            // The exact bytes the engine signed: vote_signing_bytes, whose
+            // round is a consensus Round (u32). Rebuilding it as the
+            // evidence's u64 rejected every signed evidence. Both votes are
+            // from the same phase but name different blocks.
+            let vote_type = match evidence.vote_type_byte {
+                0 => chain_forge_consensus::VoteType::Prevote,
+                1 => chain_forge_consensus::VoteType::Precommit,
+                b => return Err(SlashError::InvalidEvidence(format!("unknown vote type byte {b}"))),
             };
+            let round = chain_forge_consensus::Round::try_from(evidence.round)
+                .map_err(|_| SlashError::InvalidEvidence(format!("round {} out of range", evidence.round)))?;
+            let build_msg = |block_hash: &str| chain_forge_consensus::vote_signing_bytes(
+                chain_id, &vote_type, evidence.height, round,
+                Some(&chain_forge_consensus::BlockHash(block_hash.to_string())));
             let msg_a = build_msg(&evidence.block_hash_a);
             let msg_b = build_msg(&evidence.block_hash_b);
             chain_forge_crypto::verify_consensus(&msg_a, &evidence.signature_a, _pub_key)
