@@ -5747,6 +5747,128 @@ mod tests {
             assert!(obs.last_commit_evidence.is_none(), "no evidence derived from a refused block");
         }
 
+        // ── Epoch rewards from committed evidence ───────────────────────────
+
+        const EPOCH: u64 = 10;
+        const POOL: u128 = 1_000_003;
+
+        /// Validators a block's evidence leaves out, given the proposer that
+        /// published it.
+        type Omit = fn(&str) -> Vec<&'static str>;
+        fn nobody(_: &str) -> Vec<&'static str> { vec![] }
+
+        /// A node on a 10-block epoch with a funded validator pool.
+        async fn rewards_node() -> Node {
+            let json = GENESIS.replace(
+                r#""custom_modules": [],"#,
+                &format!(r#""custom_modules": [],
+        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#),
+            );
+            let mut n = Node::new(&json, None).await.unwrap();
+            n.state.transfer("qcb1alice", "treasury:validator-pool", "uqcb", POOL).unwrap();
+            n
+        }
+
+        fn bal(n: &Node, addr: &str) -> u128 {
+            n.state.get_account(addr).map(|a| a.balance_of("uqcb")).unwrap_or(0)
+        }
+
+        fn balances(n: &Node) -> Vec<u128> { VALS.iter().map(|v| bal(n, v)).collect() }
+
+        /// Commit `heights` on every node. Node i's local certificate uses
+        /// `local[i]`; the evidence for h (published in h+1) leaves out
+        /// `omit(proposer of h+1)`.
+        async fn drive(
+            nodes: &mut [&mut Node], local: &[&[&str]], heights: std::ops::Range<u64>,
+            prev: &mut Option<CommitCertificate>, omit: Omit,
+        ) {
+            for h in heights {
+                let root = nodes[0].state.current_root().map(str::to_string);
+                let p = proposal(h, payload(prev.as_ref(), root.as_deref()));
+                for (i, n) in nodes.iter_mut().enumerate() {
+                    assert_eq!(n.state.current_root().map(str::to_string), root, "node {i} diverged before h{h}");
+                    deliver(n, &p, local[i]).await;
+                    assert_eq!(n.status.lock().unwrap().height, h, "node {i} must commit h{h}");
+                }
+                let left_out = omit(proposer(h + 1));
+                let signers: Vec<&str> = VALS.iter().copied().filter(|v| !left_out.contains(v)).collect();
+                *prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+        }
+
+        /// Run `epochs` full epochs on one node; returns, for each epoch
+        /// close, (pool before the closing block, each validator's gain).
+        async fn closes(epochs: u64, omit: Omit) -> Vec<(u128, Vec<u128>)> {
+            let mut n = rewards_node().await;
+            let mut prev = None;
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"]];
+            drive(&mut [&mut n], local, 0..EPOCH, &mut prev, omit).await;
+            let mut out = vec![];
+            for k in 1..=epochs {
+                let (pool, before) = (bal(&n, "treasury:validator-pool"), balances(&n));
+                drive(&mut [&mut n], local, k * EPOCH..k * EPOCH + 1, &mut prev, omit).await;
+                let gains = balances(&n).iter().zip(&before).map(|(a, b)| a - b).collect();
+                out.push((pool, gains));
+                drive(&mut [&mut n], local, k * EPOCH + 1..(k + 1) * EPOCH, &mut prev, omit).await;
+            }
+            out
+        }
+
+        /// The first block of epoch k+1 pays the closed epoch k: every
+        /// validator present in its evidence gets exactly pool / eligible,
+        /// and the remainder stays in the pool.
+        #[tokio::test]
+        async fn epoch_close_pays_each_participating_validator_an_exact_share() {
+            for (k, (pool, gains)) in closes(2, nobody).await.into_iter().enumerate() {
+                assert!(pool > 0, "epoch {k}: pool must be funded");
+                assert_eq!(gains, vec![pool / 4; 4], "epoch {k}: each validator earns pool/4 of {pool}");
+            }
+        }
+
+        /// Alice omits dave from every block's evidence she publishes for
+        /// three epochs (25% of blocks). One Byzantine proposer must not cost
+        /// an honest validator its reward.
+        #[tokio::test]
+        async fn one_omitting_proposer_cannot_deny_an_honest_validator_its_reward() {
+            fn alice_omits_dave(p: &str) -> Vec<&'static str> {
+                if p == "qcb1alice" { vec!["qcb1dave"] } else { vec![] }
+            }
+            for (k, (pool, gains)) in closes(3, alice_omits_dave).await.into_iter().enumerate() {
+                assert_eq!(gains, vec![pool / 4; 4], "epoch {k}: dave must earn the same share as everyone else");
+            }
+        }
+
+        /// Control: a validator missing from every proposer's evidence did
+        /// not participate and earns nothing; the others split the pool.
+        #[tokio::test]
+        async fn validator_absent_from_all_evidence_earns_no_reward() {
+            fn dave_offline(_: &str) -> Vec<&'static str> { vec!["qcb1dave"] }
+            let (pool, gains) = closes(1, dave_offline).await.remove(0);
+            assert_eq!(gains, vec![pool / 3, pool / 3, pool / 3, 0]);
+        }
+
+        /// Two nodes assembling different local certificates, with one
+        /// proposer omitting dave, must pay identical rewards and agree on
+        /// every balance and state root across several epochs.
+        #[tokio::test]
+        async fn epoch_rewards_are_identical_across_nodes_with_different_local_certificates() {
+            fn bob_omits_dave(p: &str) -> Vec<&'static str> {
+                if p == "qcb1bob" { vec!["qcb1dave"] } else { vec![] }
+            }
+            let (mut a, mut b) = (rewards_node().await, rewards_node().await);
+            let start = balances(&a);
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"], &["qcb1alice", "qcb1bob", "qcb1dave"]];
+            let mut prev = None;
+            drive(&mut [&mut a, &mut b], local, 0..3 * EPOCH + 1, &mut prev, bob_omits_dave).await;
+
+            assert_eq!(balances(&a), balances(&b), "validator balances must match");
+            assert_eq!(bal(&a, "treasury:validator-pool"), bal(&b, "treasury:validator-pool"));
+            assert_eq!(a.state.current_root(), b.state.current_root());
+            for (i, v) in VALS.iter().enumerate() {
+                assert!(balances(&a)[i] > start[i], "{v} must have been paid");
+            }
+        }
+
         /// Carol at height 1, having committed block 0. Returns the node and
         /// block 0's hash.
         async fn carol_at_height_1() -> (Node, BlockHash) {
