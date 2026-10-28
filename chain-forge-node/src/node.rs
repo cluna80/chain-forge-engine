@@ -3347,6 +3347,7 @@ impl Node {
     fn check_liveness_after_commit(
         &mut self,
         cert: &chain_forge_consensus::CommitCertificate,
+        evidence_proposer: &str,
     ) {
         // Build the set of validator ids that actually signed this block.
         let signers: std::collections::HashSet<String> = cert
@@ -3365,6 +3366,8 @@ impl Node {
             .iter()
             .map(|v| v.id.0.clone())
             .collect();
+        // BFT fault tolerance for this set: f = floor((n - 1) / 3).
+        let byzantine_f = all_validators.len().saturating_sub(1) / 3;
 
         let height = cert.height;
         let epoch  = height; // epoch == height until per-epoch batching is wired
@@ -3374,6 +3377,8 @@ impl Node {
             match self.slasher.record_block(
                 vid,
                 signed,
+                evidence_proposer,
+                byzantine_f,
                 &mut self.validator_registry,
                 epoch,
                 height,
@@ -4352,7 +4357,7 @@ impl Node {
         // never from this node's locally assembled certificate -- otherwise
         // nodes would jail and burn different validators.
         if let Some(lc) = &participation {
-            self.check_liveness_after_commit(lc);
+            self.check_liveness_after_commit(lc, &proposal.proposer.0);
         }
 
         // Write state to disk so a restarted node resumes from this height

@@ -170,6 +170,11 @@ pub struct LivenessWindow {
     pub size:     usize,
     pub position: usize,
     pub filled:   bool,
+    /// Parallel ring buffer: the proposer whose committed evidence produced
+    /// each observation (H0-2). Empty for windows persisted before this field
+    /// existed; such entries are attributed to "".
+    #[serde(default)]
+    pub proposers: Vec<String>,
 }
 
 impl LivenessWindow {
@@ -179,11 +184,17 @@ impl LivenessWindow {
             size,
             position: 0,
             filled:   false,
+            proposers: vec![String::new(); size],
         }
     }
 
-    /// Record a block outcome for this validator.
-    pub fn record(&mut self, proposed: bool) {
+    /// Record a block outcome for this validator, attributed to the proposer
+    /// whose committed evidence it came from.
+    pub fn record(&mut self, proposed: bool, proposer: &str) {
+        if self.proposers.len() != self.size {
+            self.proposers = vec![String::new(); self.size];
+        }
+        self.proposers[self.position] = proposer.to_string();
         self.window[self.position] = proposed;
         self.position = (self.position + 1) % self.size;
         if self.position == 0 { self.filled = true; }
@@ -472,10 +483,13 @@ impl SlashingModule {
         &mut self,
         validator_id:   &str,
         proposed:       bool,
+        proposer:       &str,
+        byzantine_f:    usize,
         registry:       &mut ValidatorRegistry,
         epoch:          u64,
         current_height: u64,
     ) -> SlashResult<Option<u128>> {
+        let _ = byzantine_f;
         // Grace period: network hasn't formed yet — don't count any misses.
         if current_height < self.config.liveness_start_height {
             return Ok(None);
@@ -486,7 +500,7 @@ impl SlashingModule {
             .entry(validator_id.to_string())
             .or_insert_with(|| LivenessWindow::new(window_size));
 
-        window.record(proposed);
+        window.record(proposed, proposer);
 
         // Only check after the window fills for the first time
         if !window.filled { return Ok(None); }
@@ -662,8 +676,8 @@ mod tests {
     #[test]
     fn liveness_window_tracks_missed_blocks() {
         let mut w = LivenessWindow::new(10);
-        for _ in 0..8 { w.record(true);  }
-        for _ in 0..2 { w.record(false); }
+        for _ in 0..8 { w.record(true, "p0");  }
+        for _ in 0..2 { w.record(false, "p0"); }
         assert!(w.filled);
         assert_eq!(w.missed_pct(), 20);
     }
@@ -672,17 +686,17 @@ mod tests {
     fn liveness_window_rings_correctly() {
         let mut w = LivenessWindow::new(5);
         // Fill with 5 misses
-        for _ in 0..5 { w.record(false); }
+        for _ in 0..5 { w.record(false, "p0"); }
         assert_eq!(w.missed_pct(), 100);
         // Overwrite with 5 proposals
-        for _ in 0..5 { w.record(true); }
+        for _ in 0..5 { w.record(true, "p0"); }
         assert_eq!(w.missed_pct(), 0);
     }
 
     #[test]
     fn all_proposed_is_zero_miss_rate() {
         let mut w = LivenessWindow::new(100);
-        for _ in 0..100 { w.record(true); }
+        for _ in 0..100 { w.record(true, "p0"); }
         assert_eq!(w.missed_fraction(), 0.0);
     }
 
@@ -757,13 +771,13 @@ mod tests {
 
         // Fill window: 8 proposed + 2 missed = 20% -- at threshold, not triggered.
         // current_height=100 so we're well past any grace period.
-        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap(); }
-        for _ in 0..2 { slasher.record_block("val1", false, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..8 { slasher.record_block("val1", true, "p0", 0, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..2 { slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap(); }
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Active,
             "exactly at threshold should not trigger");
 
         // One more miss replaces a 'true': 7 proposed + 3 missed = 30% > 20% -> triggers
-        slasher.record_block("val1", false, &mut reg, 0, 100).unwrap();
+        slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap();
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Jailed,
             "exceeding threshold must jail");
         assert_eq!(slasher.liveness_slashed_uqcb, 0, "liveness never burns stake");
@@ -784,8 +798,8 @@ mod tests {
             liveness_start_height:       0,
         });
         let mut burned = 0u128;
-        for _ in 0..8 { burned += slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap().unwrap_or(0); }
-        for _ in 0..3 { burned += slasher.record_block("val1", false, &mut reg, 0, 100).unwrap().unwrap_or(0); }
+        for _ in 0..8 { burned += slasher.record_block("val1", true, "p0", 0, &mut reg, 0, 100).unwrap().unwrap_or(0); }
+        for _ in 0..3 { burned += slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap().unwrap_or(0); }
 
         let rec = reg.get("val1").unwrap();
         assert_eq!(rec.status, ValidatorStatus::Jailed, "a liveness failure still jails");
@@ -794,6 +808,66 @@ mod tests {
         assert_eq!(burned, 0, "liveness must not return an amount to burn");
         assert_eq!(slasher.liveness_slashed_uqcb, 0);
         assert_eq!(slasher.total_slashed_uqcb, 0);
+    }
+
+    // -- Byzantine-robust liveness (proposer omission) ------------------------
+
+    /// Drive one validator ("v") through `blocks` heights with proposers
+    /// rotating through `proposers`. `v`'s precommit is absent from the
+    /// committed evidence when it is offline or when the block's proposer is
+    /// in `omitted_by`. Returns its final status.
+    fn simulate(
+        blocks: u64, proposers: &[&str], omitted_by: &[&str], offline: bool,
+        miss_every: Option<u64>, byzantine_f: usize,
+    ) -> ValidatorStatus {
+        let mut reg = registry_with_validator("v", FULL_STAKE_UQCB);
+        let mut slasher = SlashingModule::new(SlashingConfig {
+            equivocation_slash_bps:      500,
+            liveness_miss_pct_threshold: 20,
+            liveness_window_blocks:      100,
+            min_remaining_stake:         0,
+            liveness_start_height:       0,
+        });
+        for h in 0..blocks {
+            let proposer = proposers[(h as usize) % proposers.len()];
+            let honest_miss = miss_every.map_or(false, |k| h % k == 0);
+            let signed = !offline && !honest_miss && !omitted_by.contains(&proposer);
+            slasher.record_block("v", signed, proposer, byzantine_f, &mut reg, h / 100, h).unwrap();
+            if reg.get("v").unwrap().status != ValidatorStatus::Active {
+                break;
+            }
+        }
+        reg.get("v").unwrap().status.clone()
+    }
+
+    const FOUR: [&str; 4] = ["a", "b", "c", "d"];
+
+    /// One malicious proposer omits an honest validator from every block it
+    /// proposes, for 50 windows: 25% raw "misses", above the 20% threshold.
+    /// With f = 1 that proposer's evidence must not be able to jail it.
+    #[test]
+    fn one_malicious_proposer_cannot_get_an_honest_validator_jailed() {
+        assert_eq!(simulate(5_000, &FOUR, &["a"], false, None, 1), ValidatorStatus::Active);
+    }
+
+    /// A validator that is really offline is missing from every proposer's
+    /// evidence, so discounting the f most hostile proposers still jails it.
+    #[test]
+    fn offline_validator_is_still_jailed_with_byzantine_discount() {
+        assert_eq!(simulate(5_000, &FOUR, &[], true, None, 1), ValidatorStatus::Jailed);
+    }
+
+    /// The tolerance is bounded: more colluding proposers than f can still
+    /// cause a jailing (two of four omitting with f = 1 leaves 1/3 missed).
+    #[test]
+    fn omission_tolerance_is_bounded_by_f() {
+        assert_eq!(simulate(5_000, &FOUR, &["a", "b"], false, None, 1), ValidatorStatus::Jailed);
+    }
+
+    /// Intermittent honest misses below the threshold do not jail.
+    #[test]
+    fn intermittent_misses_below_threshold_do_not_jail() {
+        assert_eq!(simulate(5_000, &FOUR, &[], false, Some(10), 1), ValidatorStatus::Active);
     }
 
     #[test]
@@ -808,8 +882,8 @@ mod tests {
         });
 
         // Fill window and exceed threshold to trigger slash
-        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap(); }
-        for _ in 0..3 { slasher.record_block("val1", false, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..8 { slasher.record_block("val1", true, "p0", 0, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..3 { slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap(); }
 
         // Window should have reset after the slash
         let window = slasher.liveness_window("val1").unwrap();
@@ -830,7 +904,7 @@ mod tests {
         // Record 10 misses at heights 0..9 — all within the grace period.
         // None should trigger a slash even though the window would be 100% missed.
         for h in 0..10u64 {
-            let result = slasher.record_block("val1", false, &mut reg, 0, h).unwrap();
+            let result = slasher.record_block("val1", false, "p0", 0, &mut reg, 0, h).unwrap();
             assert!(result.is_none(), "grace period must suppress slash at height {h}");
         }
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Active,
@@ -850,7 +924,7 @@ mod tests {
 
         // Block records for a tombstoned validator should be silently ignored.
         // Use height=100 to clear the default grace period.
-        for _ in 0..501 { slasher.record_block("val1", false, &mut reg, 2, 100).unwrap(); }
+        for _ in 0..501 { slasher.record_block("val1", false, "p0", 0, &mut reg, 2, 100).unwrap(); }
         assert_eq!(slasher.total_slashed_uqcb, slash_count_before,
             "inactive validator must not be slashed again via liveness");
     }
