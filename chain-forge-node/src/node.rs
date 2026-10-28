@@ -6979,6 +6979,33 @@ mod tests {
         node.propose_block(cert1.block_hash).await.unwrap()
     }
 
+    /// Production order for a post-genesis validator: fund, verified
+    /// personhood, then a BondValidator naming itself as owner (the
+    /// authenticated owner binding the multi-node PoP refresh requires),
+    /// then the epoch boundary that seats it.
+    async fn fund_verify_and_bond_with_owner(
+        node: &mut Node, addr: &str, amount: u128, parent_hash: chain_forge_consensus::BlockHash,
+    ) -> chain_forge_consensus::CommitCertificate {
+        node.validator_epoch_blocks = 2;
+        node.submit_tx(Transaction::transfer("fund", "qcb1alice", addr, "uqcb", amount + 10_000, 0));
+        let cert0 = node.propose_block(parent_hash).await.unwrap();
+
+        let epoch = node.identity.clock.current_epoch;
+        let att = chain_forge_identity::PopAttestation::genesis(addr, epoch);
+        let _ = node.identity.register(addr.to_string(), addr.to_string(), att.clone());
+        node.identity.verify_identity(addr, att, None).unwrap();
+
+        let mut bond = Transaction::bond_validator("bond", addr, amount, 0);
+        bond.body = chain_forge_execution::TxBody::BondValidator {
+            amount, owner_identity_id: Some(addr.to_string()),
+        };
+        node.submit_tx(bond);
+        let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
+        assert_eq!(node.bond_owner_bindings.get(addr).map(String::as_str), Some(addr),
+            "fixture: the bond must record an authenticated owner binding");
+        node.propose_block(cert1.block_hash).await.unwrap()
+    }
+
     #[tokio::test]
     async fn bonded_validator_with_key_and_personhood_becomes_eligible() {
         // CF-VAL-KEY-002 Phase 4 test #1.
@@ -7017,7 +7044,7 @@ mod tests {
         let (kp, addr) = keyed_candidate("seed-multinode-registry-sync");
         let mut node = Node::new(GENESIS, None).await.unwrap();
         let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
-        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        let cert = fund_verify_and_bond_with_owner(&mut node, &addr, 2_000_000, genesis_hash).await;
         node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
         node.propose_block(cert.block_hash).await.unwrap();
         assert!(node.consensus.validator_set().validators.iter().any(|v| v.id.0 == addr && v.pop_verified),
