@@ -161,6 +161,11 @@ pub struct BlockPayload {
     pub txs:             Vec<Transaction>,
     pub last_commit:     Option<chain_forge_consensus::CommitCertificate>,
     pub prev_state_root: Option<String>,
+    /// Release gate 4: equivocation evidence, slashed when this block
+    /// commits. Omitted when empty, so blocks without evidence encode
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence:        Vec<EquivocationEvidence>,
 }
 
 impl BlockPayload {
@@ -399,6 +404,9 @@ pub struct Node {
     /// the other genesis validators, by address. Empty unless a test fills
     /// it; the Ed25519 address-derived key is the fallback.
     devnet_sim_keys: std::collections::BTreeMap<String, KeyPair>,
+    /// Release gate 4: verified equivocation evidence this node detected,
+    /// waiting to be included in a block it proposes.
+    pending_evidence: Vec<EquivocationEvidence>,
     mempool:   Vec<Transaction>,
     /// Proposals seen but not yet committed, keyed by (height, round).
     /// Needed because a CommitCertificate carries only the block_hash, not
@@ -1404,6 +1412,7 @@ impl Node {
             data_dir: None,
             signing_key: None,
             devnet_sim_keys: Default::default(),
+            pending_evidence: Vec::new(),
             validator_id,
             mempool: Vec::new(),
             nonce_cache: Arc::new(Mutex::new(initial_nonce_cache)),
@@ -5101,6 +5110,7 @@ impl Node {
             txs:             txs.clone(),
             last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
             prev_state_root: self.state.current_root().map(str::to_string),
+            evidence:        Vec::new(),
         }.encode();
         let parent = BlockHash(format!("genesis_h{height}"));
         match self.consensus.propose(height, round, parent, tx_bytes).await {
@@ -5135,6 +5145,7 @@ impl Node {
             txs:             txs.clone(),
             last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
             prev_state_root: self.state.current_root().map(str::to_string),
+            evidence:        Vec::new(),
         }.encode();
 
         let proposal = self.consensus
@@ -5180,6 +5191,7 @@ impl Node {
 
         let tx_bytes = BlockPayload {
             version: BLOCK_PAYLOAD_VERSION, txs: txs.clone(), last_commit, prev_state_root,
+            evidence: Vec::new(),
         }.encode();
 
         // Produce a proposal
@@ -6586,6 +6598,105 @@ mod tests {
             p
         }
 
+        // -- Release gate 4: equivocation slashing from committed evidence --
+
+        /// `who` signed two different prevotes at (h, round 0).
+        fn double_prevote(h: u64, who: &str) -> EquivocationEvidence {
+            let a = signed_vote(CHAIN, VoteType::Prevote, h, 0, who, BlockHash("hash_A".into()));
+            let b = signed_vote(CHAIN, VoteType::Prevote, h, 0, who, BlockHash("hash_B".into()));
+            EquivocationEvidence {
+                validator_id: who.into(), height: h, round: 0,
+                block_hash_a: "hash_A".into(), block_hash_b: "hash_B".into(),
+                signature_a: a.signature, signature_b: b.signature, vote_type_byte: 0,
+            }
+        }
+
+        fn payload_with_evidence(lc: Option<&CommitCertificate>, root: Option<&str>, ev: &[EquivocationEvidence]) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "txs": [], "last_commit": lc, "prev_state_root": root, "evidence": ev,
+            })).unwrap()
+        }
+
+        fn tombstoned(node: &Node, who: &str) -> bool {
+            node.validator_registry.get(who).unwrap().status == chain_forge_validators::ValidatorStatus::Tombstoned
+        }
+
+        /// Height-1 proposal (proposer bob) carrying `ev`, on top of carol's block 0.
+        fn height_1_with(carol: &Node, h0: &BlockHash, ev: &[EquivocationEvidence]) -> BlockProposal {
+            let lc = evidence(0, h0, &["qcb1alice", "qcb1bob", "qcb1carol"]);
+            proposal(1, payload_with_evidence(Some(&lc), carol.state.current_root(), ev))
+        }
+
+        /// A node that sees a double vote must not slash on its own: which
+        /// nodes see it, and when, differs, so local slashing diverges state
+        /// (observed live: STATE DIVERGENCE, chain halted). It verifies the
+        /// evidence and queues it for a block.
+        #[tokio::test]
+        async fn a_detected_equivocation_is_queued_not_applied_locally() {
+            let (mut carol, _) = carol_at_height_1().await;
+            let root = carol.state.current_root().map(str::to_string);
+            for hash in ["hash_A", "hash_B"] {
+                let v = signed_vote(CHAIN, VoteType::Prevote, 1, 0, "qcb1dave", BlockHash(hash.into()));
+                carol.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&v).unwrap())).await.unwrap();
+            }
+            assert!(!tombstoned(&carol, "qcb1dave"), "detection alone must not slash");
+            assert_eq!(carol.state.current_root().map(str::to_string), root, "state must not change on detection");
+            assert_eq!(carol.pending_evidence.len(), 1, "the verified evidence is queued for a block");
+            assert_eq!(carol.pending_evidence[0].validator_id, "qcb1dave");
+        }
+
+        /// Evidence committed in a block slashes on every node identically,
+        /// including nodes that never saw the double vote themselves.
+        #[tokio::test]
+        async fn committed_evidence_slashes_every_node_identically() {
+            let (mut a, h0) = carol_at_height_1().await;
+            let (mut b, _)  = carol_at_height_1().await;
+            let p1 = height_1_with(&a, &h0, &[double_prevote(0, "qcb1dave")]);
+            for node in [&mut a, &mut b] {
+                deliver(node, &p1, &["qcb1alice", "qcb1bob"]).await;
+                assert_eq!(node.status.lock().unwrap().height, 1, "block 1 must commit");
+                assert!(tombstoned(node, "qcb1dave"), "committed evidence must tombstone dave");
+            }
+            assert_eq!(a.state.current_root(), b.state.current_root(), "slashing must be deterministic");
+            assert!(bal(&a, "qcb1dave") < 5_000_000, "dave's stake was burned");
+        }
+
+        /// Every voter checks the evidence: a block carrying invalid
+        /// evidence is not voted for.
+        #[tokio::test]
+        async fn a_block_with_invalid_evidence_is_rejected() {
+            let good = double_prevote(0, "qcb1dave");
+            let mut tampered = good.clone(); tampered.signature_b[0] ^= 0xff;
+            let mut same_block = good.clone(); same_block.block_hash_b = same_block.block_hash_a.clone();
+            same_block.signature_b = same_block.signature_a.clone();
+            let mut unsigned = good.clone(); unsigned.signature_a.clear(); unsigned.signature_b.clear();
+            let mut stranger = good.clone(); stranger.validator_id = "qcb1mallory".into();
+            let future = double_prevote(5, "qcb1dave");
+            for (label, ev) in [("tampered", tampered), ("same block", same_block), ("unsigned", unsigned),
+                                ("not a validator", stranger), ("future height", future)] {
+                let (carol, h0) = carol_at_height_1().await;
+                let p1 = height_1_with(&carol, &h0, &[ev]);
+                assert!(!carol_takes(p1).await, "{label}: a block with invalid evidence must be rejected");
+            }
+            let (carol, h0) = carol_at_height_1().await;
+            assert!(carol_takes(height_1_with(&carol, &h0, &[good])).await, "control: valid evidence is accepted");
+        }
+
+        /// The same evidence cannot be committed (and slashed) twice.
+        #[tokio::test]
+        async fn committed_evidence_cannot_be_included_again() {
+            let (mut carol, h0) = carol_at_height_1().await;
+            let ev = double_prevote(0, "qcb1dave");
+            let p1 = height_1_with(&carol, &h0, &[ev.clone()]);
+            deliver(&mut carol, &p1, &["qcb1alice", "qcb1bob"]).await;
+            assert!(tombstoned(&carol, "qcb1dave"));
+            let lc = evidence(1, &p1.block_hash, &["qcb1alice", "qcb1bob", "qcb1carol"]);
+            let root = carol.state.current_root().map(str::to_string);
+            let again = proposal(2, payload_with_evidence(Some(&lc), root.as_deref(), &[ev]));
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&again).unwrap())).await.unwrap();
+            assert!(!carol.pending_proposals.contains_key(&(2, 0)), "already-applied evidence must be rejected");
+        }
+
         async fn carol_takes(p: BlockProposal) -> bool {
             let (mut carol, _) = carol_at_height_1().await;
             carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p).unwrap())).await.unwrap();
@@ -7242,6 +7353,7 @@ mod tests {
             version: BLOCK_PAYLOAD_VERSION, txs: vec![],
             last_commit: node.last_commit_evidence.clone(),
             prev_state_root: node.state.current_root().map(str::to_string),
+            evidence: vec![],
         }.encode();
         let proposal = BlockProposal {
             height: h, round: 0, proposer: ValidatorId("qcb1alice".into()),
