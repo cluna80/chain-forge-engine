@@ -546,7 +546,37 @@ pub struct GenesisConsensus {
     /// every node derives the same values and there is no runtime override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness: Option<GenesisLiveness>,
+    /// Epoch-reward eligibility policy, measured separately from liveness.
+    /// Omitted means the engine defaults. Resolved and validated by
+    /// `GenesisConfig::reward_params`; no runtime override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewards: Option<GenesisRewards>,
 }
+
+/// See `GenesisConsensus::rewards`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenesisRewards {
+    /// A validator earns the closed epoch's reward share only if it appears
+    /// in at least this percentage of that epoch's committed evidence, after
+    /// the Byzantine-robust discount for omitting proposers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_participation_pct: Option<u32>,
+}
+
+/// Resolved, validated reward-eligibility policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewardParams {
+    pub min_participation_pct: u32,
+}
+
+/// Conservative initial policy: with the Byzantine-robust discount, an
+/// honest validator loses its share only when it is itself absent from a
+/// third of the evidence (late precommits, restarts), not because up to f
+/// proposers omit it.
+pub const DEFAULT_REWARD_MIN_PARTICIPATION_PCT: u32 = 67;
+/// Bounds: below half, an absent validator earns as much as a present one;
+/// near 100%, ordinary vote latency costs honest validators their reward.
+pub const REWARD_MIN_PARTICIPATION_PCT_RANGE: (u32, u32) = (50, 90);
 
 /// See `GenesisConsensus::liveness`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -979,6 +1009,23 @@ impl GenesisConfig {
         Ok(p)
     }
 
+    /// Resolve and validate the reward-eligibility policy. Hard validation:
+    /// the node refuses to start on `Err`.
+    pub fn reward_params(&self) -> Result<RewardParams, String> {
+        let cfg = self.consensus.rewards.clone().unwrap_or_default();
+        let p = RewardParams {
+            min_participation_pct: cfg.min_participation_pct.unwrap_or(DEFAULT_REWARD_MIN_PARTICIPATION_PCT),
+        };
+        let (min, max) = REWARD_MIN_PARTICIPATION_PCT_RANGE;
+        if !(min..=max).contains(&p.min_participation_pct) {
+            return Err(format!(
+                "consensus.rewards.min_participation_pct {} is outside [{min}, {max}]",
+                p.min_participation_pct
+            ));
+        }
+        Ok(p)
+    }
+
     pub fn validate_validator_bonding(&self) -> Result<(), String> {
         let Some(ref vb) = self.validator_bonding else { return Ok(()); };
 
@@ -1013,6 +1060,30 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
         if let Some(l) = liveness { v["consensus"]["liveness"] = l; }
         serde_json::from_value(v).unwrap()
+    }
+
+    // -- Reward-eligibility policy (genesis-governed) ----------------------
+
+    fn genesis_with_rewards(rewards: serde_json::Value) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["consensus"]["rewards"] = rewards;
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn reward_params_default_to_two_thirds_and_accept_in_range_overrides() {
+        assert_eq!(genesis_with_liveness(None).reward_params(),
+            Ok(RewardParams { min_participation_pct: 67 }));
+        assert_eq!(genesis_with_rewards(serde_json::json!({ "min_participation_pct": 80 })).reward_params(),
+            Ok(RewardParams { min_participation_pct: 80 }));
+    }
+
+    #[test]
+    fn reward_params_reject_out_of_range_values() {
+        for pct in [0, 49, 91, 95, 100] {
+            let g = genesis_with_rewards(serde_json::json!({ "min_participation_pct": pct }));
+            assert!(g.reward_params().is_err(), "min_participation_pct {pct} must be rejected");
+        }
     }
 
     #[test]
