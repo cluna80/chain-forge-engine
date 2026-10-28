@@ -89,13 +89,15 @@ Hardening the foundation before adding features. Each item is a draft PR, unmerg
 | **Release gate 1**: proposal authentication (signed proposals incl. `pol_round`, fail-closed) | #21 | ✅ Windows-confirmed (node 242/242, devnet, `consensus_safety_live` 3/3, MN-8 6/6); awaiting merge after #20 |
 | **Release gate 3**: VCA quorum floor (every commit quorum ≥ ⌊2·total/3⌋+1, all engines) | #22 | ✅ Windows-confirmed (node 242/242, devnet 2/2, `consensus_safety_live` 3/3); awaiting merge after #21 |
 | **Release gate 2**: HotStuff/FBA devnet-only; unknown `bft_variant` rejected | #23 | ✅ Windows-confirmed (core 55/55, node 243/243, devnet 2/2); awaiting merge after #22 |
+| **ML-DSA-65 consensus keys on Tendermint** (devnet; owner decision 2026-10-28) | #24 | 🔄 sandbox-passing (live: liveness, partition, safety + restart, H0-5 restart, ML-DSA user txs); awaiting Windows |
 
 ### Consensus safety (#18): why it was needed
 A 5-node run with only honest nodes finalized two conflicting blocks at height 1. Validators precommitted without a prevote polka and locked only at commit. The blocks were empty, so state roots matched and only block hashes revealed the fork. Fixed by the full Tendermint state machine (Buchman, Kwon & Milosevic, Algorithm 1). Covered by unit lock-rule tests, a scripted fork counterexample, a seeded model-based simulation (staggered starts, crashes, equivocators within f, fork detection beyond f), and live block-hash agreement tests. Partition recovery passed in the Linux sandbox; it can't run on Windows (no iptables).
 
-### Release gates (all three closed; Windows-confirmed)
+### Release gates (1–3 closed and Windows-confirmed; 4 open)
 - ✅ **Proposal authentication** (#21): validators sign their proposals and re-proposals; the signature covers `pol_round`. Receivers fail closed when the proposer has a registered key. Windows-confirmed.
 - ✅ **HotStuff / FBA** (#23, Windows-confirmed): `consensus.bft_variant` "hotstuff"/"xrpl" now refuse to start unless `environment.mode = "devnet"`, and an unknown value is rejected instead of silently selecting Tendermint. Neither engine has engine-driven voting, persisted locks or commit-signature checks; a full safety review is needed before they run anywhere else. The chain itself runs Tendermint.
+- 🔲 **Equivocation slashing from committed evidence** (gate 4, found 2026-10-28 on #24): `slash_equivocation` rebuilds the signed vote bytes with a u64 round (votes sign a u32), so every signed evidence is rejected and double-signers are detected but never slashed. Fixing only that was tried live: each node then slashes locally when its own engine sees the double vote, node states diverge and the devnet halts (STATE DIVERGENCE at the equivocation height). Evidence must be committed in a block and applied during execution on every node (the H0-2 pattern), then the round fix lands with it.
 - ✅ **VCA quorum floor** (#22, Windows-confirmed): every commit quorum is floored at ⌊2·total/3⌋+1 of the set being voted on or verified, in all three engines, at computation and at use. Found: the default VCA config used ⌈2·total/3⌉ (one unit short when total is divisible by 3), and a stored quorum was applied to any set passed in (a certificate with 1/3 of a larger set's power verified).
 
 ### Epoch rewards + MN-8 (#20, Windows-confirmed)
