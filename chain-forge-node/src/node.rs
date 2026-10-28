@@ -4437,6 +4437,8 @@ impl Node {
             }
         }
 
+        self.sync_registry_pop_from_validator_set();
+
         self.consensus.on_commit(cert.clone(), None).await
             .map_err(|e| e.to_string())?;
 
@@ -4752,6 +4754,38 @@ impl Node {
     /// reached quorum (small validator sets can do this in one round-trip).
     /// Otherwise the block commits later, from handle_event, once enough
     /// peers' votes have arrived over gossip.
+    /// QPC-CONS-001 Phase B: keep the ValidatorRegistry in step with the live
+    /// ValidatorSet. A seated validator whose personhood verifies is confirmed
+    /// (pop_verified, Active) in the registry, which reward eligibility and
+    /// revocation read. Personhood resolves exactly as the set's PoP refresh
+    /// does: a genesis validator's own identity, a bonded validator's
+    /// authenticated owner. Integration Point 3 handles the other direction.
+    /// Runs on every commit path (multi-node and solo).
+    fn sync_registry_pop_from_validator_set(&mut self) {
+        let epoch = self.identity.clock.current_epoch;
+        let verified_addrs: Vec<String> = self.consensus.validator_set().validators.iter()
+            .filter(|v| v.pop_verified)
+            .map(|v| v.id.0.clone())
+            .collect();
+        for addr in &verified_addrs {
+            let Ok(rec) = self.validator_registry.get(addr) else { continue };
+            if rec.pop_verified { continue; }
+            let identity_id = if rec.is_genesis {
+                Some(addr.clone())
+            } else {
+                self.bond_owner_bindings.get(addr).cloned()
+            };
+            let tier = identity_id
+                .and_then(|id| self.identity.get(&id).ok().map(|r| r.charm.tier.clone()))
+                .filter(|t| t.grants_consensus());
+            if let Some(tier) = tier {
+                if let Err(e) = self.validator_registry.confirm_pop(addr, tier, epoch) {
+                    warn!(validator = %addr, error = %e, "registry PoP sync failed");
+                }
+            }
+        }
+    }
+
     // ── Engine-driven consensus (Tendermint) ─────────────────────────────────
     //
     // The engine decides every vote this validator casts (see
@@ -5560,32 +5594,7 @@ impl Node {
             }
         }
 
-        // QPC-CONS-001 Phase B: sync pop_verified=true into the ValidatorRegistry
-        // for any bond-admitted validator whose identity now grants consensus.
-        // Integration Point 3 (above) handles pop_verified=false; this block
-        // handles the true direction so registry.pop_verified stays in sync with
-        // the consensus ValidatorSet.
-        {
-            let epoch = self.identity.clock.current_epoch;
-            let vs = self.consensus.validator_set();
-            let verified_addrs: Vec<String> = vs.validators.iter()
-                .filter(|v| v.pop_verified)
-                .map(|v| v.id.0.clone())
-                .collect();
-            drop(vs);
-            for addr in &verified_addrs {
-                if let Ok(rec) = self.validator_registry.get(addr) {
-                    if !rec.pop_verified {
-                        if let Some(tier) = self.identity.get(addr).ok()
-                            .map(|r| r.charm.tier.clone())
-                            .filter(|t| t.grants_consensus())
-                        {
-                            let _ = self.validator_registry.confirm_pop(addr, tier, epoch);
-                        }
-                    }
-                }
-            }
-        }
+        self.sync_registry_pop_from_validator_set();
 
         // Advance consensus to next height
         self.consensus.on_commit(cert.clone(), None).await
