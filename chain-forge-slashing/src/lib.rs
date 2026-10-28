@@ -971,6 +971,43 @@ mod tests {
         assert_eq!(slasher.history().len(), 2);
     }
 
+    /// Forged evidence must not use up the (validator, height, round) slot:
+    /// otherwise anyone who sends a bad copy first makes the real
+    /// equivocation unslashable.
+    #[cfg(feature = "real-crypto")]
+    #[test]
+    fn forged_evidence_does_not_block_genuine_evidence() {
+        use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
+        let kp = ClassicalScheme.generate_keypair("val1-consensus").unwrap();
+        let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
+        reg.register_consensus_key("val1", &kp.public_key, 1).unwrap();
+        let msg = |hash: &str| {
+            let mut b = b"CFV|test-chain|".to_vec();
+            b.push(1);
+            b.extend_from_slice(&42u64.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(hash.as_bytes());
+            b
+        };
+        let genuine = EquivocationEvidence {
+            validator_id: "val1".into(), height: 42, round: 0,
+            block_hash_a: "blockA".into(), block_hash_b: "blockB".into(),
+            signature_a: chain_forge_crypto::sign_consensus(&msg("blockA"), &kp).unwrap(),
+            signature_b: chain_forge_crypto::sign_consensus(&msg("blockB"), &kp).unwrap(),
+            vote_type_byte: 1,
+        };
+        let mut forged = genuine.clone();
+        forged.signature_b[0] ^= 0xff;
+
+        let mut slasher = SlashingModule::with_qcb_defaults();
+        assert!(matches!(slasher.slash_equivocation(&forged, &mut reg, 5, "test-chain"),
+            Err(SlashError::InvalidEvidence(..))));
+        slasher.slash_equivocation(&genuine, &mut reg, 5, "test-chain")
+            .expect("genuine evidence must still slash after a forged copy was rejected");
+        assert!(matches!(slasher.slash_equivocation(&genuine, &mut reg, 5, "test-chain"),
+            Err(SlashError::EquivocationAlreadyRecorded(..))), "replay is still refused");
+    }
+
     #[test]
     fn fake_evidence_with_non_empty_signatures_is_rejected() {
         // A validator with a 32-byte all-zero pubkey (valid even-length hex)
