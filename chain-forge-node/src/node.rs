@@ -5728,6 +5728,25 @@ mod tests {
             assert_eq!(dave.bonded_uqcb, bonded, "jailed for liveness, stake intact");
         }
 
+        /// H0-1 fail-stop: a block that reached quorum elsewhere (partition
+        /// recovery, sync) but was built on a different prior state must never
+        /// be applied on top of this node's state.
+        #[tokio::test]
+        async fn commit_refuses_a_block_built_on_a_different_state() {
+            let mut obs = Node::new(GENESIS, None).await.unwrap();
+            let root_before = obs.state.current_root().map(str::to_string);
+            let p0 = proposal(0, payload(None, Some("00ff-not-this-nodes-root")));
+            let cert = evidence(0, &p0.block_hash, &VALS[..3]);
+
+            let err = obs.commit_block(cert, &p0).await
+                .expect_err("a block built on a different state must not be applied");
+            assert!(err.contains("state divergence"), "{err}");
+            assert_eq!(obs.state.current_root().map(str::to_string), root_before, "state unchanged");
+            assert_eq!(obs.consensus.current_height(), 0, "height unchanged");
+            assert!(obs.chain_store.is_empty(), "block not recorded");
+            assert!(obs.last_commit_evidence.is_none(), "no evidence derived from a refused block");
+        }
+
         /// Carol at height 1, having committed block 0. Returns the node and
         /// block 0's hash.
         async fn carol_at_height_1() -> (Node, BlockHash) {
