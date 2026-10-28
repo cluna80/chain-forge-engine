@@ -94,7 +94,7 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 
 ### Release gates (open — block any release beyond devnet)
 - ✅ **Proposal authentication** (#21): validators sign their proposals and re-proposals; the signature covers `pol_round`. Receivers fail closed when the proposer has a registered key. Windows-confirmed.
-- 🔲 **HotStuff / FBA**: both still use the legacy unsafe voting path. They need a safety review plus engine-driven voting, or must refuse to run off devnet.
+- 🔄 **HotStuff / FBA** (#23, awaiting Windows): `consensus.bft_variant` "hotstuff"/"xrpl" now refuse to start unless `environment.mode = "devnet"`, and an unknown value is rejected instead of silently selecting Tendermint. Neither engine has engine-driven voting, persisted locks or commit-signature checks; a full safety review is needed before they run anywhere else. The chain itself runs Tendermint.
 - ✅ **VCA quorum floor** (#22, Windows-confirmed): every commit quorum is floored at ⌊2·total/3⌋+1 of the set being voted on or verified, in all three engines, at computation and at use. Found: the default VCA config used ⌈2·total/3⌉ (one unit short when total is divisible by 3), and a stored quorum was applied to any set passed in (a certificate with 1/3 of a larger set's power verified).
 
 ### Epoch rewards + MN-8 (#20, Windows-confirmed)
