@@ -430,8 +430,9 @@ impl SlashingModule {
             evidence.round,
         );
 
-        // Idempotent: write the key BEFORE fallible registry lookup so replay
-        // attacks are blocked even when the validator is transiently absent.
+        // Idempotent: verified evidence for a slot is applied once. The slot
+        // is recorded only after the evidence verifies (below), so a forged
+        // copy cannot use it up and make the real equivocation unslashable.
         if self.equivocation_set.contains(&key) {
             return Err(SlashError::EquivocationAlreadyRecorded(
                 evidence.validator_id.clone(),
@@ -439,7 +440,6 @@ impl SlashingModule {
                 evidence.round,
             ));
         }
-        self.equivocation_set.insert(key.clone());
 
         let record = registry.get(&evidence.validator_id)
             .map_err(|_| SlashError::ValidatorNotFound(evidence.validator_id.clone()))?;
@@ -456,6 +456,7 @@ impl SlashingModule {
                 ))?;
             Self::verify_evidence(chain_id, evidence, &pub_key, &pub_key)?;
         }
+        self.equivocation_set.insert(key.clone());
 
         let bonded_before = record.bonded_uqcb;
         let slash_amount  = self.config.equivocation_slash_amount(bonded_before);
@@ -973,7 +974,10 @@ mod tests {
 
     /// Forged evidence must not use up the (validator, height, round) slot:
     /// otherwise anyone who sends a bad copy first makes the real
-    /// equivocation unslashable.
+    /// equivocation unslashable. The genuine evidence is signed with
+    /// `vote_signing_bytes`, exactly as the engine signs votes (the round
+    /// is a u32 there; reconstructing it as a u64 rejected every real
+    /// signed evidence).
     #[cfg(feature = "real-crypto")]
     #[test]
     fn forged_evidence_does_not_block_genuine_evidence() {
@@ -981,14 +985,10 @@ mod tests {
         let kp = ClassicalScheme.generate_keypair("val1-consensus").unwrap();
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
         reg.register_consensus_key("val1", &kp.public_key, 1).unwrap();
-        let msg = |hash: &str| {
-            let mut b = b"CFV|test-chain|".to_vec();
-            b.push(1);
-            b.extend_from_slice(&42u64.to_le_bytes());
-            b.extend_from_slice(&0u64.to_le_bytes());
-            b.extend_from_slice(hash.as_bytes());
-            b
-        };
+        // Signed exactly as the consensus engine signs a precommit.
+        let msg = |hash: &str| chain_forge_consensus::vote_signing_bytes(
+            "test-chain", &chain_forge_consensus::VoteType::Precommit, 42, 0,
+            Some(&chain_forge_consensus::BlockHash(hash.into())));
         let genuine = EquivocationEvidence {
             validator_id: "val1".into(), height: 42, round: 0,
             block_hash_a: "blockA".into(), block_hash_b: "blockB".into(),
