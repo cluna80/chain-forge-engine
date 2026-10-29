@@ -262,6 +262,15 @@ fn state_root_of(port: u16) -> String {
         .unwrap_or_default()
 }
 
+/// The sender's next nonce, read from the chain. Hard-coding nonces broke
+/// under H0-5: an included-but-failed tx (the P0-9-B replay) consumes its
+/// nonce, where before it did not.
+fn nonce_of(port: u16, addr: &str) -> u64 {
+    api_get(port, &format!("/api/accounts/{addr}"))
+        .and_then(|v| v["nonce"].as_u64())
+        .unwrap_or(0)
+}
+
 fn balance_of(port: u16, addr: &str) -> u128 {
     api_get(port, &format!("/api/accounts/{addr}"))
         .and_then(|v| {
@@ -480,7 +489,8 @@ fn p0_9_pocd_reward_settlement() {
     eprintln!("   Submitting P0-9-B (replay of same claim_id)…");
     // Same claim_id_a, different tx_id so it passes the mempool dedup,
     // but the claim key in state already exists → must fail at execution.
-    let tx_b = build_claim_tx("p09-tx-b", OPERATOR, 1, claim_id_a, RECIPIENT, REWARD_AMOUNT);
+    let nonce_b = nonce_of(alice_api, OPERATOR);
+    let tx_b = build_claim_tx("p09-tx-b", OPERATOR, nonce_b, claim_id_a, RECIPIENT, REWARD_AMOUNT);
     let (_, resp_b) = api_post(alice_api, "/api/tx", &tx_b)
         .expect("P0-9-B: POST failed");
     let status_b = resp_b["status"].as_str().unwrap_or("?");
@@ -513,6 +523,11 @@ fn p0_9_pocd_reward_settlement() {
         "P0-9-B FAIL: recipient balance changed after replay"
     );
     eprintln!("   P0-9-B balances unchanged ✓");
+    // H0-5: the replay was included and failed, so it consumed its nonce
+    // (a failed tx cannot be replayed with the same nonce).
+    assert_eq!(nonce_of(alice_api, OPERATOR), nonce_b + 1,
+        "P0-9-B FAIL: an included-but-failed tx must consume its nonce (H0-5)");
+    eprintln!("   P0-9-B consumed its nonce (H0-5) ✓");
 
     // ── P0-9-C: unauthorized operator rejected ────────────────────────────────
     eprintln!("   Submitting P0-9-C (unauthorized sender qcb1bob)…");
@@ -550,7 +565,7 @@ fn p0_9_pocd_reward_settlement() {
     eprintln!("   Submitting P0-9-D (amount > treasury balance)…");
     let claim_id_d  = "p09-claim-d-001";
     let overdrawn   = treasury_after_b + 999_999_999; // definitely more than treasury holds
-    let tx_d = build_claim_tx("p09-tx-d", OPERATOR, 1, claim_id_d, RECIPIENT, overdrawn as u64);
+    let tx_d = build_claim_tx("p09-tx-d", OPERATOR, nonce_of(alice_api, OPERATOR), claim_id_d, RECIPIENT, overdrawn as u64);
     let (_, resp_d) = api_post(alice_api, "/api/tx", &tx_d)
         .expect("P0-9-D: POST failed");
     let ingress_d = resp_d["status"].as_str().unwrap_or("?");
@@ -577,15 +592,15 @@ fn p0_9_pocd_reward_settlement() {
     );
     eprintln!("   P0-9-D insolvent treasury rejected ✓  error=\"{err_d}\"");
 
-    // After A (success nonce 0→1), B (fail, nonce stays 1), D (fail, nonce stays 1):
-    // OPERATOR nonce = 1. Next valid nonce = 1.
+    // Next nonces are read from the chain (failed-but-included txs consume one).
 
     // ── P0-9-E: concurrent claims ─────────────────────────────────────────────
     eprintln!("   Submitting P0-9-E (two claim_ids in flight simultaneously)…");
     let claim_id_e1 = "p09-claim-e1-001";
     let claim_id_e2 = "p09-claim-e2-001";
-    let tx_e1 = build_claim_tx("p09-tx-e1", OPERATOR, 1, claim_id_e1, RECIPIENT, REWARD_AMOUNT);
-    let tx_e2 = build_claim_tx("p09-tx-e2", OPERATOR, 2, claim_id_e2, RECIPIENT, REWARD_AMOUNT);
+    let nonce_e = nonce_of(alice_api, OPERATOR);
+    let tx_e1 = build_claim_tx("p09-tx-e1", OPERATOR, nonce_e, claim_id_e1, RECIPIENT, REWARD_AMOUNT);
+    let tx_e2 = build_claim_tx("p09-tx-e2", OPERATOR, nonce_e + 1, claim_id_e2, RECIPIENT, REWARD_AMOUNT);
 
     // Submit both before waiting for either — they are now in the mempool concurrently.
     let (_, resp_e1) = api_post(alice_api, "/api/tx", &tx_e1).expect("P0-9-E1: POST failed");
@@ -626,13 +641,12 @@ fn p0_9_pocd_reward_settlement() {
     );
     eprintln!("   P0-9-E concurrent claims both settled ✓  treasury={treasury_after_e} recipient={recipient_after_e}");
 
-    // After E: both txs succeeded → OPERATOR nonce = 3.
 
     // ── P0-9-F: unknown objective_id / task_id (trusted operator — accepted) ──
     eprintln!("   Submitting P0-9-F (unknown objective_id + task_id)…");
     let claim_id_f = "p09-claim-f-001";
     let tx_f = build_claim_tx_full(
-        "p09-tx-f", OPERATOR, 3, claim_id_f, RECIPIENT, REWARD_AMOUNT,
+        "p09-tx-f", OPERATOR, nonce_of(alice_api, OPERATOR), claim_id_f, RECIPIENT, REWARD_AMOUNT,
         "obj-does-not-exist-9999", "task-nonexistent-9999",
     );
     let (_, resp_f) = api_post(alice_api, "/api/tx", &tx_f).expect("P0-9-F: POST failed");
@@ -656,7 +670,6 @@ fn p0_9_pocd_reward_settlement() {
     );
     eprintln!("   P0-9-F unknown IDs accepted by trusted operator ✓");
 
-    // After F: success → OPERATOR nonce = 4.
 
     // ── P0-9-G: multi-block persistence ──────────────────────────────────────
     eprintln!("   Submitting P0-9-G (multi-block persistence check)…");
@@ -664,7 +677,7 @@ fn p0_9_pocd_reward_settlement() {
     let treasury_before_g = balance_of(alice_api, TREASURY);
 
     let claim_id_g = "p09-claim-g-001";
-    let tx_g = build_claim_tx("p09-tx-g", OPERATOR, 4, claim_id_g, RECIPIENT, REWARD_AMOUNT);
+    let tx_g = build_claim_tx("p09-tx-g", OPERATOR, nonce_of(alice_api, OPERATOR), claim_id_g, RECIPIENT, REWARD_AMOUNT);
     let (_, resp_g) = api_post(alice_api, "/api/tx", &tx_g).expect("P0-9-G: POST failed");
     eprintln!("   P0-9-G ingress → {}", resp_g["status"].as_str().unwrap_or("?"));
 
