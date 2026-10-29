@@ -1,7 +1,7 @@
 # Devnet upgrade: Phase 0.5 security stack
 
 Status: **procedure for review.** Nothing in it has been run against the live devnet.
-Applies to: merging the Phase 0.5 stack (#14 → #29, plus #16 and #19) into `main`.
+Applies to: merging the Phase 0.5 stack (#14 → #30, plus #16 and #19) into `main`.
 Principle (owner, 2026-10-29): **preserve the existing devnet.** The upgraded network runs as a separate, new chain next to it. Nothing is deleted, and pilot identities are re-enrolled only with each owner's explicit confirmation.
 
 ---
