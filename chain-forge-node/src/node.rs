@@ -252,6 +252,11 @@ pub struct AccountSummary {
     /// Incremented by RotateAccountKey and RecoverAccountKey.
     #[serde(default)]
     pub key_version: u32,
+    /// DIS-003A/B: monotone recovery-policy generation counter.
+    /// Incremented by EnrollRecoveryPolicy, RevokeRecoveryPolicy (via re-enroll),
+    /// and UpdateGuardianPolicy. Never reset to zero.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// Voting-power snapshot for one validator.
@@ -710,6 +715,9 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         // DIS-002B: lost-device recovery policy enrollment and recovery
         TxBody::EnrollRecoveryPolicy { .. }      => "enroll_recovery_policy",
         TxBody::RecoverAccountKey { .. }         => "recover_account_key",
+        TxBody::RevokeRecoveryPolicy             => "revoke_recovery_policy",
+        // DIS-003B: guardian set replacement
+        TxBody::UpdateGuardianPolicy { .. }      => "update_guardian_policy",
     }
 }
 
@@ -1400,6 +1408,7 @@ impl Node {
                     attestation_count: 0,
                     attested_by:       vec![],
                     key_version:    acct.key_version,
+                    policy_generation: acct.policy_generation,
                 });
             }
         }
@@ -2176,6 +2185,7 @@ impl Node {
                         attestation_count: att_count,
                         attested_by:       att_by,
                         key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                     });
                 }
 
@@ -4621,6 +4631,7 @@ impl Node {
                     attestation_count: att_count,
                     attested_by:       att_by,
                     key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                 });
             }
 
@@ -5834,6 +5845,7 @@ impl Node {
                     attestation_count: att_count,
                     attested_by:       att_by,
                     key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                 });
             }
 
@@ -9400,7 +9412,7 @@ mod tests {
         );
         // Execute directly through the executor (the node's internal path).
         let result = restarted.executor.execute_tx_with_identity(
-            &classical_tx, &mut restarted.state, &mut restarted.identity, &mut restarted.agents,
+            &classical_tx, &mut restarted.state, &mut restarted.identity, &mut restarted.agents, 0,
         );
         assert!(
             !result.success,
@@ -9462,7 +9474,7 @@ mod tests {
         node.identity.clock.current_epoch = 55;
         let mldsa_tx = p7_mldsa_transfer_with_kp("mldsa-grace", "qcb1pquser", 0, &pquser_kp);
         let r = node.executor.execute_tx_with_identity(
-            &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents,
+            &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
         assert!(
             r.success,
@@ -9476,7 +9488,7 @@ mod tests {
         node.identity.clock.current_epoch = 61;
         let mldsa_tx2 = p7_mldsa_transfer_with_kp("mldsa-post-cutoff", "qcb1pquser", 1, &pquser_kp);
         let r2 = node.executor.execute_tx_with_identity(
-            &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents,
+            &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
         assert!(
             r2.success,
