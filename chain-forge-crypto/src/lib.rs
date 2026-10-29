@@ -226,7 +226,11 @@ pub trait SignatureScheme: Send + Sync {
         public_key: &[u8],
     ) -> CryptoResult<()>;
 
-    /// Generate a keypair. Phase 0: stub. Phase 1: real keygen.
+    /// Seeded keypair for **tests and devnet fixtures only**. The same seed
+    /// gives the same key: Ed25519 derives it from SHA-256(seed), and ML-DSA
+    /// caches one key per seed for the life of the process. Never use it
+    /// for keys that must be secret or distinct; production keys come from
+    /// `ClassicalScheme::generate_random` / `MlDsaScheme::generate_random`.
     fn generate_keypair(&self, seed: &str) -> CryptoResult<KeyPair>;
 
     /// Size report for this scheme (Section 10.3).
@@ -538,9 +542,27 @@ impl SignatureScheme for MlDsaScheme {
 }
 
 impl MlDsaScheme {
-    /// A fresh ML-DSA-65 keypair for production use (wallets, key files).
+    /// A fresh ML-DSA-65 keypair from the OS RNG, never cached: every call
+    /// returns a new key. Use this for wallets and key files, never the
+    /// seeded `generate_keypair`.
+    #[cfg(feature = "real-pqc")]
     pub fn generate_random(&self) -> CryptoResult<KeyPair> {
-        self.generate_keypair("random")
+        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+        let (pk, sk) = dilithium3::keypair();
+        Ok(KeyPair {
+            scheme:      SchemeId::MlDsa,
+            public_key:  pk.as_bytes().to_vec(),
+            private_key: sk.as_bytes().to_vec(),
+        })
+    }
+
+    /// Without real ML-DSA there is no secret key to generate: the stub key
+    /// is a public function of its seed. Fail closed.
+    #[cfg(not(feature = "real-pqc"))]
+    pub fn generate_random(&self) -> CryptoResult<KeyPair> {
+        Err(CryptoError::NotAvailable(
+            "ML-DSA-65 key generation needs the real-pqc feature".into()))
     }
 
     /// Whether this build uses real ML-DSA or the stub.

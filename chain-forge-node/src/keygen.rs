@@ -20,7 +20,7 @@
 /// "public_key" field so that peer validators can verify signatures without
 /// an out-of-band key exchange.
 
-use chain_forge_crypto::{ClassicalScheme, MlDsaScheme, SignatureScheme};
+use chain_forge_crypto::{ClassicalScheme, MlDsaScheme};
 use std::path::PathBuf;
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -112,10 +112,9 @@ pub fn main() {
         }
     }
 
-    // Fresh random keypair. ML-DSA-65 keygen is randomised per call; the
-    // seed argument only names the in-process cache entry.
+    // Fresh keypair from the OS RNG (never the seeded generate_keypair).
     let generated = if args.mldsa {
-        MlDsaScheme.generate_keypair(&args.address)
+        MlDsaScheme.generate_random()
     } else {
         ClassicalScheme.generate_random()
     };

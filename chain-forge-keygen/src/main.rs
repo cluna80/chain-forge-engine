@@ -7,7 +7,7 @@
 //! Output: JSON to stdout, save to a file:
 //!   qcb-keygen mldsa alice-settlement > alice-mldsa.key.json
 
-use chain_forge_crypto::{ClassicalScheme, MlDsaScheme, SignatureScheme};
+use chain_forge_crypto::{ClassicalScheme, MlDsaScheme};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -21,10 +21,8 @@ fn main() {
 
     match scheme_name.as_str() {
         "mldsa" => {
-            // generate_keypair with real-pqc calls dilithium3::keypair() — OS-random
-            let kp = MlDsaScheme
-                .generate_keypair(&format!("{label}-mldsa"))
-                .expect("ML-DSA keygen failed");
+            // Fresh OS-random key; the label is only a name.
+            let kp = MlDsaScheme.generate_random().expect("ML-DSA keygen failed");
 
             let out = serde_json::json!({
                 "label":       label,
@@ -38,9 +36,9 @@ fn main() {
         }
 
         "ed25519" => {
-            let kp = ClassicalScheme
-                .generate_keypair(&format!("{label}-ed25519"))
-                .expect("Ed25519 keygen failed");
+            // Fresh OS-random key. (It used to be SHA-256 of the label, so
+            // anyone who knew the label could recompute the private key.)
+            let kp = ClassicalScheme.generate_random().expect("Ed25519 keygen failed");
 
             let out = serde_json::json!({
                 "label":      label,

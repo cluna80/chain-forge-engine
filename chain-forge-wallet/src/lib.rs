@@ -199,8 +199,9 @@ pub fn generate_wallet(
     }
 
     // Generate ML-DSA-65 key pair
-    let scheme = MlDsaScheme;
-    let kp = scheme.generate_keypair("random")?; // pqcrypto ignores seed; uses OS RNG
+    // A fresh key from the OS RNG. (The seeded generate_keypair caches per
+    // seed: with a constant seed every wallet in a process got one key.)
+    let kp = MlDsaScheme.generate_random()?;
 
     // Derive address from public key (QCB bech32 prefix)
     let address = derive_address_from_pq_key(&kp.public_key);
