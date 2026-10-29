@@ -140,6 +140,19 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 ### PQ-HotStuff (locked direction, owner 2026-10-28)
 PQ-HotStuff (personhood-weighted, ML-DSA-only, two-chain HotStuff) is the target consensus for Qattice mainnet and a selectable Chain Forge engine. Protocol spec: `docs/pq-hotstuff-001-spec.md`. Decisions locked 2026-10-28: D1 two-chain commit; D2 versioned QC (v1 signature list now, mainnet ceiling after M0); D3 round-robin leaders; D4 revocation effective the block after it commits; D5 gate 4 first. The hardened Tendermint devnet (ML-DSA keys, #24) stays the default until PQ-HotStuff passes its Phase 2 gate on Windows. Order: release gate 4 (committed-evidence slashing) first, then PQ-HotStuff Phase 0. The legacy `HotStuffEngine` is not a base and stays devnet-only.
 
+### Integration before merging to `main` (owner decision 2026-10-29)
+Nothing merges until these pass and the owner reviews the combined tree. All PRs stay draft.
+| Item | PR | Status |
+|---|---|---|
+| **Security: production keys from the OS RNG.** Wallets generated in one process shared one ML-DSA private key; `qcb-keygen ed25519` keys were SHA-256 of the label (treat as compromised) | #27 | 🔄 sandbox-passing; awaiting Windows |
+| DIS-003 (#13) integrated onto the stack (merging #13 directly does not compile) | #28 | 🔄 sandbox-passing (DIS-003A/B/C live pass); awaiting Windows |
+| Deterministic equivocation live test (confirm the evidence reached validation; retry) | #29 | 🔄 6/6 sandbox; awaiting Windows |
+| `pocd_reward_live` follows H0-5 nonce semantics (found by the candidate run) | #30 | 🔄 sandbox-passing; awaiting Windows |
+| Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30 + #16 + #19 | — | 🔄 full sandbox suite run; awaiting Windows |
+| Devnet upgrade procedure (preserve the legacy devnet; new chain side by side) | `docs/devnet-upgrade-phase-0-5.md` | draft for review |
+
+Known failing live tests that **also fail on `main`** (not caused by the stack): `attestation_guard_live` (unfunded account), `dis_auth_live` (1 test; 2 on `main`), `validator_key_live::post_genesis_validator_admission` (2 on `main`), `dis_003d_expiry_live` (the 70 KB ML-DSA recovery tx exceeds the API's hard-coded 64 KiB read limit, and the API resets the connection instead of answering; needs an owner decision on limits/encoding). `chain-forge-intelligence` tests do not compile on `main` either.
+
 ### Release gates (all four closed; Windows-confirmed)
 - ✅ **Proposal authentication** (#21): validators sign their proposals and re-proposals; the signature covers `pol_round`. Receivers fail closed when the proposer has a registered key. Windows-confirmed.
 - ✅ **HotStuff / FBA** (#23, Windows-confirmed): `consensus.bft_variant` "hotstuff"/"xrpl" now refuse to start unless `environment.mode = "devnet"`, and an unknown value is rejected instead of silently selecting Tendermint. Neither engine has engine-driven voting, persisted locks or commit-signature checks; a full safety review is needed before they run anywhere else. The chain itself runs Tendermint.
