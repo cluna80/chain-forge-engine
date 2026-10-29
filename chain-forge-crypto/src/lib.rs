@@ -538,6 +538,11 @@ impl SignatureScheme for MlDsaScheme {
 }
 
 impl MlDsaScheme {
+    /// A fresh ML-DSA-65 keypair for production use (wallets, key files).
+    pub fn generate_random(&self) -> CryptoResult<KeyPair> {
+        self.generate_keypair("random")
+    }
+
     /// Whether this build uses real ML-DSA or the stub.
     pub fn is_real_pqc(&self) -> bool {
         cfg!(feature = "real-pqc")
@@ -1051,6 +1056,23 @@ pub fn mldsa_tx_prehash(chain_id: &str, body_json: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+
+    /// Production keygen must never hand two callers the same key. Seeded
+    /// `generate_keypair` caches per seed within a process (tests rely on
+    /// that); `generate_random` must not.
+    #[cfg(all(feature = "real-crypto", feature = "real-pqc"))]
+    #[test]
+    fn mldsa_generate_random_never_repeats_a_key() {
+        let a = MlDsaScheme.generate_random().unwrap();
+        let b = MlDsaScheme.generate_random().unwrap();
+        assert_ne!(a.public_key, b.public_key, "two random keypairs must differ");
+        assert_ne!(a.private_key, b.private_key);
+        let sig = sign_consensus(b"m", &a).unwrap();
+        assert!(verify_consensus(b"m", &sig, &b.public_key).is_err(), "a's signature must not verify under b");
+        // The seeded generator keeps its documented per-process behaviour.
+        assert_eq!(MlDsaScheme.generate_keypair("same-seed").unwrap().public_key,
+                   MlDsaScheme.generate_keypair("same-seed").unwrap().public_key);
+    }
 
     #[test]
     fn consensus_scheme_is_fixed_by_key_length() {
