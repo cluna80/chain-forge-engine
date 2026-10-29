@@ -477,11 +477,6 @@ async fn adversarial_equivocation_over_gossip() {
     eprintln!("   [attacker] waiting 2s for gossipsub mesh...");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Read the CURRENT committed height, equivocate on current+1 (open for voting).
-    let current_height = height_of(ports.alice_api);
-    let attack_height  = current_height + 1;
-    eprintln!("   [attacker] current={current_height} → equivocating on height={attack_height}");
-
     let balance_before = balance_of(ports.alice_api, "qcb1alice");
     eprintln!("   alice balance before: {balance_before:?} uqcb");
 
@@ -500,10 +495,10 @@ async fn adversarial_equivocation_over_gossip() {
     // it always meant to: a validator who double-votes gets caught, now
     // under the stricter signature regime rather than around it.
     let alice_kp = alice_consensus_key();
-    let sign = |vote_type: VoteType, block_hash: &str| -> Vote {
+    let sign = |vote_type: VoteType, block_hash: &str, height: u64| -> Vote {
         let mut vote = Vote {
             vote_type,
-            height:     attack_height,
+            height,
             round:      0,
             validator:  ValidatorId("qcb1alice".to_string()),
             block_hash: Some(BlockHash(block_hash.to_string())),
@@ -519,22 +514,64 @@ async fn adversarial_equivocation_over_gossip() {
         vote.scheme = chain_forge_crypto::consensus_scheme_tag(&alice_kp.scheme).to_string();
         vote
     };
-    let vote_a = sign(VoteType::Prevote, "block_hash_version_AAAAAAAAAAAAA");
-    let vote_b = sign(VoteType::Prevote, "block_hash_version_BBBBBBBBBBBBB");
 
-    eprintln!("   [attacker] sending equivocating prevotes A then B...");
-    attacker.publish(OutboundMessage {
-        topic:   GossipTopic::ConsensusVote,
-        payload: serde_json::to_vec(&vote_a).unwrap(),
-    }).await.expect("publish vote A");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    attacker.publish(OutboundMessage {
-        topic:   GossipTopic::ConsensusVote,
-        payload: serde_json::to_vec(&vote_b).unwrap(),
-    }).await.expect("publish vote B");
-
-    // Give nodes time to detect, drain, and slash.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Deterministic delivery. A vote for a height the nodes have already
+    // passed is dropped without a log line, so a single send aimed at
+    // "current + 1" raced block production and failed intermittently.
+    // Instead: (1) wait for a block to commit, so the next height has just
+    // opened; (2) send both conflicting votes for that open height at once;
+    // (3) confirm from the node logs that the evidence reached the
+    // validation point ("evidence queued"); (4) otherwise retry at the next
+    // height. Evidence is one per validator and an already-slashed
+    // validator is refused, so retries cannot slash twice.
+    // Node logs carry ANSI colour codes between a field name and its value.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() { if c.is_ascii_alphabetic() { break; } }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+    let queued_at = |h: u64| -> bool {
+        ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"].iter().any(|n| {
+            strip_ansi(&std::fs::read_to_string(log_dir.join(format!("{n}.log"))).unwrap_or_default())
+                .lines().any(|l| l.contains("evidence queued") && l.contains("validator=qcb1alice")
+                                 && l.contains(&format!("height={h} ")))
+        })
+    };
+    let mut attack_height = 0;
+    let mut confirmed = false;
+    for attempt in 1..=5 {
+        let committed = height_of(ports.alice_api);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while height_of(ports.alice_api) == committed && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        attack_height = height_of(ports.alice_api) + 1;
+        eprintln!("   [attacker] attempt {attempt}: height {} just committed -> equivocating on open height {attack_height}",
+                  attack_height - 1);
+        for hash in ["block_hash_version_AAAAAAAAAAAAA", "block_hash_version_BBBBBBBBBBBBB"] {
+            attacker.publish(OutboundMessage {
+                topic:   GossipTopic::ConsensusVote,
+                payload: serde_json::to_vec(&sign(VoteType::Prevote, hash, attack_height)).unwrap(),
+            }).await.expect("publish equivocating vote");
+        }
+        let confirm_by = Instant::now() + Duration::from_secs(3);
+        while !confirmed && Instant::now() < confirm_by {
+            confirmed = queued_at(attack_height);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if confirmed {
+            eprintln!("   [attacker] evidence for height {attack_height} reached validation (queued) on attempt {attempt}");
+            break;
+        }
+    }
+    assert!(confirmed, "equivocating votes never reached evidence validation in 5 synchronized attempts");
 
     println!("   [phase2] Verifying chain advanced past height {}...", attack_height + 2);
     let advanced = poll_until_height(
