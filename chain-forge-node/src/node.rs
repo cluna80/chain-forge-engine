@@ -817,6 +817,7 @@ impl Node {
         // chain-forge-consensus), so refuse to start at all rather than
         // boot into a validator set that can never vote.
         genesis.validate_validator_keys().map_err(NodeError::Genesis)?;
+        genesis.account_signature_policy().map_err(NodeError::Genesis)?;
 
         // Hard error, in every environment: an accepted-but-nonsensical
         // `validator_bonding` override (zero minimum bond, zero epoch
@@ -1526,6 +1527,13 @@ impl Node {
     /// Returns an empty Vec for chains that do not configure settlement_operators.
     pub fn settlement_operators(&self) -> Vec<String> {
         self.genesis.settlement_operators.clone()
+    }
+
+    /// Genesis `cryptography.signature_scheme` as a policy; Node::new
+    /// refuses a genesis on which this fails, so the fallback is unreachable.
+    pub fn account_signature_policy(&self) -> chain_forge_core::AccountSignaturePolicy {
+        self.genesis.account_signature_policy()
+            .unwrap_or(chain_forge_core::AccountSignaturePolicy::MlDsaOnly)
     }
 
     pub fn max_tx_bytes(&self) -> usize {
@@ -2386,6 +2394,13 @@ impl Node {
     /// execute it a second time, fail on nonce, and overwrite the explorer's
     /// record of the original success.
     pub fn submit_tx(&mut self, tx: Transaction) -> bool {
+        // The account signature policy, applied here exactly as in execution,
+        // so a tx refused there never occupies the mempool (API and gossip
+        // both come through here).
+        if let Err(e) = chain_forge_execution::check_account_signature_policy(&tx, self.account_signature_policy()) {
+            debug!(tx_id = %tx.id, error = %e, "transaction refused by the account signature policy");
+            return false;
+        }
         if self.mempool.iter().any(|t| t.id == tx.id) {
             return false;
         }
@@ -8415,6 +8430,42 @@ mod tests {
         node.handle_event(gossip(GossipTopic::Transaction, payload)).await.unwrap();
         assert_eq!(node.mempool.len(), 1);
         assert_eq!(node.mempool[0].id, "gossip-tx-1");
+    }
+
+    // -- Account signature policy (cryptography.signature_scheme) ------------
+
+    fn genesis_with_signature_scheme(scheme: &str) -> String {
+        let mut g: serde_json::Value = serde_json::from_str(GENESIS).unwrap();
+        g["cryptography"]["signature_scheme"] = scheme.into();
+        g.to_string()
+    }
+
+    #[tokio::test]
+    async fn node_refuses_an_unknown_account_signature_scheme() {
+        assert!(Node::new(&genesis_with_signature_scheme("pqc-only"), None).await.is_err());
+    }
+
+    /// Gossip must apply the same policy as API admission and execution: an
+    /// Ed25519 or unsigned tx from a peer never enters an ML-DSA-only mempool.
+    #[tokio::test]
+    async fn ml_dsa_only_node_keeps_ed25519_and_unsigned_gossip_out_of_the_mempool() {
+        let mut node = Node::new(&genesis_with_signature_scheme("pqc-native"), None).await.unwrap();
+        let kp = ClassicalScheme.generate_keypair("policy-gossip").unwrap();
+        let mut ed = Transaction::transfer("gossip-ed25519", "qcb1alice", "qcb1bob", "uqcb", 1, 0);
+        ed.sign(&kp, "qcb-testnet-1").unwrap();
+        let unsigned = Transaction::transfer("gossip-unsigned", "qcb1alice", "qcb1bob", "uqcb", 1, 0);
+        for tx in [ed, unsigned] {
+            node.handle_event(gossip(GossipTopic::Transaction, serde_json::to_vec(&tx).unwrap())).await.unwrap();
+        }
+        assert!(node.mempool.is_empty(), "{:?}", node.mempool.iter().map(|t| &t.id).collect::<Vec<_>>());
+
+        let kp = chain_forge_crypto::MlDsaScheme.generate_keypair("policy-gossip-pq").unwrap();
+        let mut pq = Transaction::transfer("gossip-mldsa", "qcb1alice", "qcb1bob", "uqcb", 1, 0);
+        pq.sig_scheme = Some(SchemeId::MlDsa);
+        pq.pq_public_key = kp.public_key.clone();
+        pq.pq_signatures = vec!["mldsa65:00".into()]; // scheme check only; execution verifies
+        node.handle_event(gossip(GossipTopic::Transaction, serde_json::to_vec(&pq).unwrap())).await.unwrap();
+        assert_eq!(node.mempool.len(), 1, "an ML-DSA tx must still be admitted");
     }
 
     // -- 4-node devnet integration scenario (Option A) -------------------------

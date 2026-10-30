@@ -101,6 +101,9 @@ pub struct TxPrecheck {
     /// Addresses authorised to submit governance transactions (ActivatePqConsensus).
     /// Populated from genesis validator accounts. Empty list = all senders blocked.
     pub governance_authorities: Vec<String>,
+    /// Genesis `cryptography.signature_scheme`: which schemes user accounts
+    /// may sign with. Checked by the same function execution uses.
+    pub account_signature_policy: chain_forge_core::AccountSignaturePolicy,
 }
 
 /// Maximum nonce gap the mempool accepts for an account's next tx.
@@ -267,6 +270,17 @@ pub async fn serve(
                             // visit_none fallback (→ empty Vec) cannot silently accept it.
                             http_400_json(r#"{"status":"rejected","message":"malformed signature: null is not a valid signature value"}"#)
                         } else { match serde_json::from_str::<Transaction>(body) {
+                            Ok(tx) if chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy).is_err() => {
+                                let reason = chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy)
+                                    .unwrap_err();
+                                tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at ingress (account signature policy)");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
                             Ok(tx) if chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes, precheck.block_gas_limit).is_err() => {
                                 let reason = chain_forge_execution::check_tx(&tx, precheck.max_tx_bytes, precheck.block_gas_limit)
                                     .unwrap_err();

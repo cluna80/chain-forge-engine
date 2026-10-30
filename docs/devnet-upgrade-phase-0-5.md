@@ -87,6 +87,7 @@ Steps:
    - set the new `chain_id`, `network_id` and ports;
    - put each machine's new public key in its validator account;
    - keep `validator_scheme: "ml-dsa-65"`.
+   - keep `signature_scheme: "pqc-native"` (ML-DSA-only user accounts): Ed25519-signed and unsigned user txs are refused, even with `require_signatures: false`. Re-enrolled pilot identities must sign with their ML-DSA-65 keys.
    - keep `limits.max_tx_bytes: 262144` (owner decision 2026-10-30, #33): ML-DSA guardian recovery needs it. It is not the mainnet value.
 3. Start each node with `--genesis`, `--key-file`, `--data-dir`, `--api-port`, `--p2p-port` and `--bootstrap` pointing at the **new** values.
 4. Acceptance on the upgraded devnet:

@@ -28,7 +28,7 @@
     "require_signatures": false
   },
   "cryptography": {
-    "signature_scheme": "hybrid",
+    "signature_scheme": "pqc-native",
     "pqc_algorithm": "ml-dsa",
     "migration_trigger": "nist-guidance",
     "hash_width": 256,
