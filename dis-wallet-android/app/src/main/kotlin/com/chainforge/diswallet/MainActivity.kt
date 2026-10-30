@@ -17,6 +17,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var viewModel: WalletViewModel
+    private var pendingChallenge: ConsentReview.Challenge? = null
+    private var pendingServer: WalletViewModel.ServerChallenge? = null
 
     private val requestCameraPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -58,14 +60,18 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        binding.btnSign.setOnClickListener {
-            val challenge = binding.etChallenge.text.toString().trim()
-            val vendorId = binding.etVendorId.text.toString().trim()
-            if (challenge.isEmpty()) {
-                binding.tvResult.text = "Please scan a QR code or paste a challenge"
-                return@setOnClickListener
-            }
-            signChallenge(vendorId, challenge)
+        binding.btnReview.setOnClickListener {
+            pendingServer = null
+            present(binding.etChallenge.text.toString())
+        }
+
+        binding.btnApprove.setOnClickListener { approvePending() }
+
+        binding.btnRefuse.setOnClickListener {
+            pendingChallenge = null
+            pendingServer = null
+            binding.cardReview.visibility = View.GONE
+            binding.tvStatus.text = "Refused. Nothing was signed."
         }
 
         binding.btnTest.setOnClickListener {
@@ -86,11 +92,21 @@ class MainActivity : AppCompatActivity() {
             val resourceId = binding.etResourceId.text.toString().trim()
             lifecycleScope.launch {
                 binding.progressBar.visibility = View.VISIBLE
-                binding.tvStatus.text = "Authenticating with server..."
-                val result = viewModel.serverAuth(serverUrl, vendorId, resourceId, "read")
-                binding.progressBar.visibility = View.GONE
-                binding.tvResult.text = result
-                binding.tvStatus.text = if (result.startsWith("✅")) "✅ Verified!" else "❌ Failed"
+                binding.tvStatus.text = "Fetching a challenge..."
+                try {
+                    val prepared = viewModel.fetchServerChallenge(serverUrl, vendorId, resourceId, "read")
+                    pendingServer = prepared
+                    val raw = prepared.challenge.toString()
+                    binding.etChallenge.setText(raw)
+                    present(raw)
+                    binding.tvStatus.text = "Read the card. Nothing is signed until you approve."
+                } catch (e: Exception) {
+                    pendingServer = null
+                    binding.tvResult.text = "ERROR: ${e.message}"
+                    binding.tvStatus.text = "❌ Failed"
+                } finally {
+                    binding.progressBar.visibility = View.GONE
+                }
             }
         }
 
@@ -121,23 +137,112 @@ class MainActivity : AppCompatActivity() {
         if (result != null && result.contents != null) {
             val scannedJson = result.contents
             binding.etChallenge.setText(scannedJson)
-            binding.tvStatus.text = "✅ QR scanned! Tap Sign to proceed."
-            // Auto-sign after scan
-            val vendorId = binding.etVendorId.text.toString().trim()
-            signChallenge(vendorId, scannedJson)
+            binding.tvStatus.text = "QR scanned. Review it before you sign."
+            pendingServer = null
+            present(scannedJson)
         } else {
             super.onActivityResult(requestCode, resultCode, data)
         }
     }
 
-    private fun signChallenge(vendorId: String, challenge: String) {
+    private fun present(raw: String) {
+        val vendorId = binding.etVendorId.text.toString().trim()
+        when (val review = ConsentReview.parse(raw, vendorId, viewModel.vendorOrigin(vendorId), System.currentTimeMillis())) {
+            is ConsentReview.Challenge -> {
+                pendingChallenge = review
+                val scopes = if (review.scopes.isEmpty()) "—" else review.scopes.joinToString(", ")
+                val expiry = if (review.expiresAtSec <= 0) {
+                    "No expiry"
+                } else {
+                    val left = review.expiresAtSec - System.currentTimeMillis() / 1000
+                    if (left <= 0) "Expired" else "${left / 60}m ${left % 60}s left"
+                }
+                binding.tvReviewTitle.text = "CHALLENGE"
+                binding.tvReviewBody.text = buildString {
+                    append(review.action)
+                    append(" · ")
+                    append(review.resource)
+                    append("\nAudience  ")
+                    append(review.origin)
+                    append("\nScopes  ")
+                    append(scopes)
+                    append("\nExpires  ")
+                    append(expiry)
+                    append("\nKey  ")
+                    append(review.vendorId.ifBlank { "—" })
+                    append("\n\nA signature here does not send QCB.")
+                }
+                showWarning(review.blockReason)
+                binding.btnApprove.visibility = if (review.blockReason == null) View.VISIBLE else View.GONE
+                binding.cardReview.visibility = View.VISIBLE
+            }
+            is ConsentReview.Transfer -> {
+                pendingChallenge = null
+                binding.tvReviewTitle.text = "SIGNED TX ENVELOPE"
+                binding.tvReviewBody.text = buildString {
+                    append("chain_id  ")
+                    append(review.chainId)
+                    append("\nsender  ")
+                    append(review.sender)
+                    append("\nnonce  ")
+                    append(review.nonce)
+                    append("\ngas_limit  ")
+                    append(review.gasLimit)
+                    append("\nto  ")
+                    append(review.to)
+                    append("\namount  ")
+                    append(review.amount)
+                    append(" ")
+                    append(review.denom)
+                    append("\n\n")
+                    append(review.preimage)
+                    append("\n\nThe vendor key cannot sign this. Chain signing is not in this build.")
+                }
+                showWarning(null)
+                binding.btnApprove.visibility = View.GONE
+                binding.cardReview.visibility = View.VISIBLE
+            }
+            is ConsentReview.Invalid -> {
+                pendingChallenge = null
+                binding.tvReviewTitle.text = "NOT SIGNED"
+                binding.tvReviewBody.text = review.reason
+                showWarning(null)
+                binding.btnApprove.visibility = View.GONE
+                binding.cardReview.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun showWarning(reason: String?) {
+        if (reason.isNullOrBlank()) {
+            binding.tvReviewWarn.visibility = View.GONE
+            binding.tvReviewWarn.text = ""
+        } else {
+            binding.tvReviewWarn.visibility = View.VISIBLE
+            binding.tvReviewWarn.text = reason
+        }
+    }
+
+    private fun approvePending() {
+        val challenge = pendingChallenge ?: return
+        if (challenge.blockReason != null) return
+        val server = pendingServer
         lifecycleScope.launch {
             binding.progressBar.visibility = View.VISIBLE
             binding.tvStatus.text = "Signing..."
-            val result = viewModel.sign(vendorId, challenge)
+            val proof = viewModel.sign(challenge.vendorId, challenge.raw)
+            val result = if (server != null && proof.startsWith("✅")) {
+                val rawProof = proof.removePrefix("✅ DIS Proof:\n")
+                viewModel.submitServerProof(server.serverUrl, server.vendorId, server.challenge, rawProof)
+            } else {
+                proof
+            }
             binding.progressBar.visibility = View.GONE
             binding.tvResult.text = result
-            binding.tvStatus.text = if (result.startsWith("✅")) "✅ Signed!" else "❌ Error"
+            binding.tvStatus.text = if (result.startsWith("✅")) "✅ Signed" else "❌ Error"
+            binding.cardReview.visibility = View.GONE
+            pendingChallenge = null
+            pendingServer = null
         }
     }
 }
