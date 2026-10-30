@@ -869,7 +869,7 @@ async fn a04_revocation_propagation() {
              ports.alice_api, ports.bob_api, ports.carol_api, ports.dave_api);
 
     let scheme = MlDsaScheme;
-    let kp_c   = SignatureScheme::generate_keypair(&scheme, "random")
+    let kp_c   = scheme.generate_random()
         .expect("keypair C generation failed");
     let addr_c = derive_address_from_pq_key(&kp_c.public_key);
     let pub_c  = kp_c.public_key_hex();
