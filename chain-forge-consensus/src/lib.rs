@@ -225,13 +225,14 @@ pub fn compute_block_hash(
 }
 
 /// Bytes a proposer signs for `BlockProposal::signature`.
-/// Domain-separated with chain_id to prevent cross-chain replay.
+/// Domain-separated with chain_id to prevent cross-chain replay. Covers
+/// `pol_round`, which changes how validators vote on a re-proposal.
 pub fn proposal_signing_bytes(
     chain_id: &str, height: BlockHeight, round: Round,
-    block_hash: &BlockHash, parent_hash: &BlockHash,
+    block_hash: &BlockHash, parent_hash: &BlockHash, pol_round: Option<Round>,
 ) -> Vec<u8> {
     let mut b = Vec::new();
-    b.extend_from_slice(b"CFP|");
+    b.extend_from_slice(b"CFP2|");
     b.extend_from_slice(chain_id.as_bytes());
     b.push(b'|');
     b.extend_from_slice(&height.to_le_bytes());
@@ -239,6 +240,11 @@ pub fn proposal_signing_bytes(
     b.extend_from_slice(block_hash.0.as_bytes());
     b.push(b'|');
     b.extend_from_slice(parent_hash.0.as_bytes());
+    b.push(b'|');
+    match pol_round {
+        None     => b.push(0),
+        Some(vr) => { b.push(1); b.extend_from_slice(&vr.to_le_bytes()); }
+    }
     b
 }
 
