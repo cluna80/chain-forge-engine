@@ -149,12 +149,13 @@ Nothing merges until these pass and the owner reviews the combined tree. All PRs
 | Deterministic equivocation live test (confirm the evidence reached validation; retry) | #29 | ✅ Windows-confirmed (adversarial_gossip 3/3 ×3) |
 | `pocd_reward_live` follows H0-5 nonce semantics (found by the candidate run) | #30 | ✅ Windows-confirmed |
 | API: explicit 413 for oversized requests; body limit = genesis `max_tx_bytes`; DIS-003D test genesis 256 KiB; `dis_003d_expiry_live` F-00..F-08 | #32 | ✅ Windows-confirmed (2026-10-30) |
+| ML-DSA devnet genesis `max_tx_bytes` 262144 (owner decision 2026-10-30) + 10-guardian recovery size test | #33 | Sandbox ✅; Windows pending |
 | Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30 + #16 + #19 | #31 | ✅ Windows-confirmed: 24/24 crates, node 257, all live acceptance tests (2026-10-30); ready for owner review |
 | Devnet upgrade procedure (preserve the legacy devnet; new chain side by side) | `docs/devnet-upgrade-phase-0-5.md` | draft for review |
 
 **First follow-up after the merge: P2P reconnection.** With `peer_discovery: "bootstrap"` a node dials its bootstrap peers once and never reconnects; failed dials and unparseable bootstrap addresses are silently ignored (unchanged from `main`). Found while explaining one ML-DSA `consensus_safety_live` stall during a ~99-minute machine suspend (rerun 3/3; sandbox 15/15; a 5–10 minute sleep test recovered).
 
-Known failing live tests that **also fail on `main`** (not caused by the stack): `attestation_guard_live` (unfunded account), `dis_auth_live` (1 test; 2 on `main`), `validator_key_live::post_genesis_validator_admission` (2 on `main`). (`dis_003d_expiry_live` is fixed by #32.) Open owner decision: `tests/devnet/genesis-4node-mldsa.json` (the upgraded-devnet template) still has `max_tx_bytes: 65536`, too small for ML-DSA guardian recovery; recommended 262144. `chain-forge-intelligence` tests do not compile on `main` either.
+Known failing live tests that **also fail on `main`** (not caused by the stack): `attestation_guard_live` (unfunded account), `dis_auth_live` (1 test; 2 on `main`), `validator_key_live::post_genesis_validator_admission` (2 on `main`). (`dis_003d_expiry_live` is fixed by #32.) Owner decision 2026-10-30: the upgraded ML-DSA devnet uses `max_tx_bytes` 262144 (#33; a 10-guardian ML-DSA recovery is ~221 KB). The mainnet transaction limit is not final (review mempool admission, block capacity, execution cost, resource exhaustion); `max_block_bytes` is reviewed separately. `chain-forge-intelligence` tests do not compile on `main` either.
 
 ### Release gates (all four closed; Windows-confirmed)
 - ✅ **Proposal authentication** (#21): validators sign their proposals and re-proposals; the signature covers `pol_round`. Receivers fail closed when the proposer has a registered key. Windows-confirmed.
