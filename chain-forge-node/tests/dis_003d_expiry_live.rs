@@ -9,6 +9,7 @@
 //!
 //! | ID   | Scenario |
 //! |------|----------|
+//! | F-00 | A body above genesis `max_tx_bytes` gets an explicit 413, not a reset |
 //! | F-01 | Recovery with `expires_at_height: None` on all guardians succeeds (baseline) |
 //! | F-02 | Recovery with future expiry succeeds |
 //! | F-03 | Exact boundary: recovery accepted when block_height == expires_at_height |
@@ -406,6 +407,17 @@ fn dis_003d_expiry_live() {
     let h0 = current_height(port);
     println!("Devnet ready — current height: {h0}");
 
+    // ── F-00: a body above max_tx_bytes gets an explicit 413 ──────────────────
+    // The API used to stop reading at a fixed 64 KiB and close the connection
+    // with the rest unread, so the client saw a reset instead of an answer.
+    let max_tx_bytes = 262_144;
+    let oversized = "x".repeat(max_tx_bytes + 1);
+    let (status, body) = api_post(port, "/api/tx", &oversized);
+    assert_eq!(status, 413, "F-00: oversized body must get 413, got {status}: {body}");
+    assert!(body["message"].as_str().unwrap_or("").contains("too large"),
+        "F-00: 413 must say why: {body}");
+    println!("✓ F-00 passed (413 for {} bytes)", max_tx_bytes + 1);
+
     // ── Derive guardian public keys ───────────────────────────────────────────
     let g1_pk = MlDsaScheme.generate_keypair(SEED_G1).expect("g1").public_key;
     let g2_pk = MlDsaScheme.generate_keypair(SEED_G2).expect("g2").public_key;
@@ -427,7 +439,7 @@ fn dis_003d_expiry_live() {
 
     // Read policy_id from account state.
     let acct = account_of(port, PILOT_ADDR).expect("pilot account");
-    let policy_id = acct["policy_id"].as_u64().unwrap_or(0);
+    let policy_id = acct["policy_generation"].as_u64().unwrap_or(0);
     println!("enrolled policy_id = {policy_id}");
 
     // ── F-01: Recovery with expires_at_height: None on all guardians succeeds ─
@@ -463,7 +475,7 @@ fn dis_003d_expiry_live() {
     assert!(enroll2_r["success"].as_bool().unwrap_or(false),
         "re-enroll must succeed: {enroll2_r}");
     let acct2   = account_of(port, PILOT_ADDR).expect("pilot account 2");
-    let policy_id2 = acct2["policy_id"].as_u64().unwrap_or(0);
+    let policy_id2 = acct2["policy_generation"].as_u64().unwrap_or(0);
 
     // ── F-02: Recovery with future expiry succeeds ────────────────────────────
     println!("\n── F-02: Recovery with future expiry ───────────────────────────────");
@@ -499,7 +511,7 @@ fn dis_003d_expiry_live() {
     assert!(enroll3_r["success"].as_bool().unwrap_or(false),
         "re-enroll-3 must succeed: {enroll3_r}");
     let acct3   = account_of(port, PILOT_ADDR).expect("pilot account 3");
-    let policy_id3 = acct3["policy_id"].as_u64().unwrap_or(0);
+    let policy_id3 = acct3["policy_generation"].as_u64().unwrap_or(0);
     let kv4      = acct3["key_version"].as_u64().unwrap_or(0) as u32 + 1;
 
     // ── F-03: Exact boundary — accepted when block_height == expires_at_height ─
@@ -539,7 +551,7 @@ fn dis_003d_expiry_live() {
     assert!(enroll4_r["success"].as_bool().unwrap_or(false),
         "re-enroll-4 must succeed: {enroll4_r}");
     let acct4      = account_of(port, PILOT_ADDR).expect("pilot account 4");
-    let policy_id4 = acct4["policy_id"].as_u64().unwrap_or(0);
+    let policy_id4 = acct4["policy_generation"].as_u64().unwrap_or(0);
     let kv5        = acct4["key_version"].as_u64().unwrap_or(0) as u32 + 1;
 
     // ── F-04: Recovery rejected when expiry < current height ─────────────────

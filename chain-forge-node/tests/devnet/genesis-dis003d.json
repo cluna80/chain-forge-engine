@@ -44,7 +44,7 @@
   },
   "limits": {
     "max_block_bytes": 1048576,
-    "max_tx_bytes": 65536,
+    "max_tx_bytes": 262144,
     "block_gas_limit": 10000000,
     "mempool_size": 100,
     "mempool_ttl_seconds": 60
