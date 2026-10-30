@@ -25,6 +25,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# JSON helpers (no python3 needed; works in Git Bash on Windows).
+. "$SCRIPT_DIR/json.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
 GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
@@ -63,7 +66,9 @@ mkdir -p "$ALICE_DATA_DIR" "$BOB_DATA_DIR" "$LOG_DIR"
 # ── Helpers ──────────────────────────────────────────────────────────────────
 get_height() {
     local url="$1/api/status"
-    curl -sf "$url" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('height', -1))" 2>/dev/null || echo "-1"
+    local h
+    h=$(curl -sf "$url" 2>/dev/null | json_field height)
+    echo "${h:--1}"
 }
 
 wait_for_height() {

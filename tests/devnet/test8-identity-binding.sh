@@ -27,6 +27,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# JSON helpers (no python3 needed; works in Git Bash on Windows).
+. "$SCRIPT_DIR/json.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
 GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
@@ -41,26 +44,10 @@ echo ""
 # ── Part A: Key file → address derivation (offline check) ────────────────────
 echo "--- Part A: Key file identity (offline) ---"
 
-ALICE_KEY_ADDR=$(python3 -c "
-import json, sys
-k = json.load(open('$KEY_DIR/alice.key.json'))
-print(k['address'])
-")
-BOB_KEY_ADDR=$(python3 -c "
-import json
-k = json.load(open('$KEY_DIR/bob.key.json'))
-print(k['address'])
-")
-CAROL_KEY_ADDR=$(python3 -c "
-import json
-k = json.load(open('$KEY_DIR/carol.key.json'))
-print(k['address'])
-")
-DAVE_KEY_ADDR=$(python3 -c "
-import json
-k = json.load(open('$KEY_DIR/dave.key.json'))
-print(k['address'])
-")
+ALICE_KEY_ADDR=$(json_field address < "$KEY_DIR/alice.key.json")
+BOB_KEY_ADDR=$(json_field address < "$KEY_DIR/bob.key.json")
+CAROL_KEY_ADDR=$(json_field address < "$KEY_DIR/carol.key.json")
+DAVE_KEY_ADDR=$(json_field address < "$KEY_DIR/dave.key.json")
 
 echo "  alice.key.json → address: $ALICE_KEY_ADDR"
 echo "  bob.key.json   → address: $BOB_KEY_ADDR"
@@ -144,12 +131,11 @@ else
     done
 
     # Query actual validator identity from API
-    REPORTED_ADDR=$(curl -sf "$ALICE_API/api/status" | python3 -c "
-import sys, json
-s = json.load(sys.stdin)
-# Try 'validator_address' or 'validator_id' field
-print(s.get('validator_address') or s.get('validator_id') or s.get('node_id', 'unknown'))
-" 2>/dev/null || echo "unknown")
+    STATUS_JSON=$(curl -sf "$ALICE_API/api/status" 2>/dev/null || true)
+    REPORTED_ADDR=$(printf '%s' "$STATUS_JSON" | json_field validator_address)
+    [[ -n "$REPORTED_ADDR" ]] || REPORTED_ADDR=$(printf '%s' "$STATUS_JSON" | json_field validator_id)
+    [[ -n "$REPORTED_ADDR" ]] || REPORTED_ADDR=$(printf '%s' "$STATUS_JSON" | json_field node_id)
+    REPORTED_ADDR="${REPORTED_ADDR:-unknown}"
 
     kill "$ALICE_PID" 2>/dev/null || true
     sleep 1
@@ -215,7 +201,7 @@ else
     echo "  Waiting for height >= 3 ..."
     attempts=0
     while true; do
-        H=$(curl -sf "$ALICE_API/api/status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('height',-1))" 2>/dev/null || echo -1)
+        H=$(curl -sf "$ALICE_API/api/status" 2>/dev/null | json_field height); H="${H:--1}"
         [[ "$H" -ge 3 ]] && break
         attempts=$((attempts + 1)); [[ $attempts -ge 30 ]] && { echo "  ERROR: timeout waiting for height 3"; break; }
         sleep 2
@@ -223,7 +209,7 @@ else
 
     # Query block 2 proposer
     BLOCK2=$(curl -sf "$ALICE_API/api/blocks/2" 2>/dev/null || echo "{}")
-    PROPOSER=$(echo "$BLOCK2" | python3 -c "import sys,json; b=json.load(sys.stdin); print(b.get('proposer','unknown'))" 2>/dev/null || echo "unknown")
+    PROPOSER=$(printf '%s' "$BLOCK2" | json_field proposer); PROPOSER="${PROPOSER:-unknown}"
     echo "  Block 2 proposer: $PROPOSER"
 
     # Proposer must be one of the expected validator addresses

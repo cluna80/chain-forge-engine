@@ -11,6 +11,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# JSON helpers (no python3 needed; works in Git Bash on Windows).
+. "$SCRIPT_DIR/json.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
 GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
@@ -72,18 +75,12 @@ get_height() {
     local api="$1"
     # Try /api/blocks first (authoritative: includes persisted chain)
     local h
-    h=$(curl -sf "$api/api/blocks" 2>/dev/null \
-        | python3 -c "
-import sys, json
-try:
-    blocks = json.load(sys.stdin)
-    if blocks:
-        print(max(b.get('height', 0) for b in blocks))
-    else:
-        print(0)
-except Exception:
-    print(-1)
-" 2>/dev/null || echo "-1")
+    local body
+    if body=$(curl -sf "$api/api/blocks" 2>/dev/null); then
+        h=$(printf '%s' "$body" | json_max_height)
+    else
+        h=-1
+    fi
     echo "$h"
 }
 
