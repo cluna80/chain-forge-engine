@@ -4,6 +4,20 @@
 
 ---
 
+## Locked Working Plan — what to do next (owner, 2026-10-30)
+
+Protocol first; applications (PoCD, marketplace, research apps) come after the protocol acceptance gates. Order: **Phase 0 → Phase 0.5 → repository separation → PQ-HotStuff**. Status detail and audit findings: issue #37.
+
+| # | Step | Done when |
+|---|---|---|
+| 1 | **P0 security: ML-DSA account ownership** (branch `security/mldsa-account-ownership`). On first use, the sender must be the address derived from its ML-DSA key. The key is bound whenever signatures are verified. Named accounts get their key bound in genesis. | Node and live tests pass (incl. `mldsa_only_accounts_live` A-01..A-09), draft PR, Windows ✅, merged. **The upgraded devnet is not deployed before this.** |
+| 2 | **#36: retire the Ed25519 fallback devnet** (scripts, README, local launchers on the ML-DSA devnet) | Owner review and merge (Windows ✅ already) |
+| 3 | **Test fixes:** `attestation_guard_live` (fund a key-derived account), `dis_auth_live` (`generate_random()` instead of the seed `"random"`), `dis_003b` D-09 (poll instead of one read) | Pass on Linux and Windows; gives P0-2 its automated evidence |
+| 4 | **Phase 0 closeout:** finish the audit sweep on current `main`; write `docs/PHASE-0-CLOSEOUT.md`. For each of P0-1..P0-9: Implementation, Verification (Linux and Windows), Evidence (test, result, commit). P0-1 needs a two-machine run on the ML-DSA devnet. P0-9 (PoCD) is classed as application layer. | Every Phase 0 criterion has current evidence. 100% = all defined acceptance criteria pass. Tag `v0.1.0-phase0` and branch `devnet-legacy-2026-10` stay untouched. |
+| 5 | **Phase 0.5 blockers:** <br>• H0-3: atomic state persistence; fail safely, never silently restart from genesis. <br>• H0-8: genesis-hash peer check; cross-chain block-replay test. <br>• H0-10: recovery timelock and cancellation. <br>• H0-12: governance proposals and votes with quorum. <br>• H0-11: after the owner's eviction-policy decision. <br>• P2P reconnection, with a Linux partition test. | Each: failing tests first, then sandbox, then Windows ✅ |
+| 6 | **Repository separation** (CF-QAT-REPO-001, below) | Its go/no-go gates pass |
+| 7 | **PQ-HotStuff** (`docs/pq-hotstuff-001-spec.md`), in the Chain Forge repo as a new engine module: <br>• **Phase 0:** start with a short design step that makes block commit evidence generic over the certificate type, so participation and rewards don't depend on the engine. Then the engine, the safety rules and simulations. <br>• **Phase 1:** persistence and personhood weighting. <br>• **Phase 2:** devnet candidate; only then a new genesis, `genesis-4node-pq-hotstuff.json`: a copy of the ML-DSA devnet genesis with `bft_variant: "pq-hotstuff"`, `personhood_weighted: true`, a new `chain_id` / `network_id`, and its own ports and data. <br>• **Phases 3–4:** hardening and review, then a fresh mainnet genesis. | Per the spec's gates. Tendermint stays the devnet default until PQ-HotStuff passes Phase 2 on Windows. Existing chains are not converted; the PQ-HotStuff devnet runs alongside them. |
+
 ## Planned Repository Separation — CF-QAT-REPO-001
 
 **Status: PLANNED / NOT AUTHORIZED FOR EXECUTION.** Chain Forge and Qattice will become separate, independently versioned repositories. The existing Chain Forge frontend repository is the intended home of the reusable Rust backend; Qattice will have its own chain-specific repository with a pinned dependency on Chain Forge.
