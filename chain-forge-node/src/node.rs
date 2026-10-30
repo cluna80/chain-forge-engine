@@ -193,6 +193,35 @@ impl BlockPayload {
     }
 }
 
+/// Transactions for a new block: the longest mempool prefix whose encoded
+/// payload stays within `max_block_bytes` (0 = no limit). A prefix, so a
+/// sender's later nonces never go in without the earlier ones; the rest wait
+/// for the next block. Without this a proposal carried the whole mempool and
+/// could outgrow the gossip message limit, so no validator ever received it.
+pub fn select_block_txs(mempool: &[Transaction], base: &BlockPayload, max_block_bytes: usize) -> Vec<Transaction> {
+    if max_block_bytes == 0 {
+        return mempool.to_vec();
+    }
+    // Each tx adds its own JSON plus a separating comma.
+    let mut size = base.encode().len();
+    let mut n = 0;
+    for tx in mempool {
+        let tx_len = serde_json::to_vec(tx).map(|v| v.len()).unwrap_or(usize::MAX);
+        match size.checked_add(tx_len + 1) {
+            Some(next) if next <= max_block_bytes => { size = next; n += 1; }
+            _ => break,
+        }
+    }
+    let mut txs = mempool[..n].to_vec();
+    // Exact check on the real encoding.
+    loop {
+        let len = BlockPayload { txs: txs.clone(), ..base.clone() }.encode().len();
+        if len <= max_block_bytes || txs.is_empty() { break; }
+        txs.pop();
+    }
+    txs
+}
+
 // -- Explorer state (shared with the API, Section 9.1) -------------------------
 
 /// One block's summary for the explorer.
@@ -4710,6 +4739,12 @@ impl Node {
     /// check failed.
     /// H0-1/H0-2: check a proposal's payload before voting for it.
     fn validate_block_payload(&self, proposal: &BlockProposal) -> Result<(), String> {
+        let max_block_bytes = self.genesis.limits.max_block_bytes as usize;
+        if max_block_bytes > 0 && proposal.tx_data.len() > max_block_bytes {
+            return Err(format!(
+                "block payload is {} bytes, limit max_block_bytes {max_block_bytes}", proposal.tx_data.len()
+            ));
+        }
         let payload = BlockPayload::decode(&proposal.tx_data);
         if payload.version != BLOCK_PAYLOAD_VERSION {
             return Err(format!(
@@ -5200,17 +5235,26 @@ impl Node {
         proposal
     }
 
-    /// Build and broadcast a fresh proposal the engine asked for.
-    async fn propose_fresh(&mut self, height: u64, round: u32) {
-        // Copy, don't drain: txs leave the mempool only when a block commits.
-        let txs = self.mempool.clone();
-        let tx_bytes = BlockPayload {
+    /// The payload for a new block at `height`: evidence for h-1, this node's
+    /// state root, and as many mempool txs as fit in `max_block_bytes`.
+    fn block_payload(&self, height: u64) -> BlockPayload {
+        let mut payload = BlockPayload {
             version:         BLOCK_PAYLOAD_VERSION,
-            txs:             txs.clone(),
+            txs:             vec![],
             last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
             prev_state_root: self.state.current_root().map(str::to_string),
             evidence:        self.evidence_for_proposal(height),
-        }.encode();
+        };
+        payload.txs = select_block_txs(&self.mempool, &payload, self.genesis.limits.max_block_bytes as usize);
+        payload
+    }
+
+    /// Build and broadcast a fresh proposal the engine asked for.
+    async fn propose_fresh(&mut self, height: u64, round: u32) {
+        // Copy, don't drain: txs leave the mempool only when a block commits.
+        let payload = self.block_payload(height);
+        let txs = payload.txs.clone();
+        let tx_bytes = payload.encode();
         let parent = BlockHash(format!("genesis_h{height}"));
         match self.consensus.propose(height, round, parent, tx_bytes).await {
             Ok(proposal) => {
@@ -5238,14 +5282,9 @@ impl Node {
         // still be here for the next proposer; they leave the mempool only
         // when a block containing them commits (commit_block). Draining here
         // silently lost every tx in any proposal that didn't commit.
-        let txs = self.mempool.clone();
-        let tx_bytes = BlockPayload {
-            version:         BLOCK_PAYLOAD_VERSION,
-            txs:             txs.clone(),
-            last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
-            prev_state_root: self.state.current_root().map(str::to_string),
-            evidence:        self.evidence_for_proposal(height),
-        }.encode();
+        let payload = self.block_payload(height);
+        let txs = payload.txs.clone();
+        let tx_bytes = payload.encode();
 
         let proposal = self.consensus
             .propose(height, round, parent_hash, tx_bytes)
@@ -5283,16 +5322,11 @@ impl Node {
         let height = self.consensus.current_height();
         let round  = self.consensus.current_round();
 
-        // Drain mempool into the block
-        let mut txs = std::mem::take(&mut self.mempool);
-        let last_commit = if height == 0 { None } else { self.last_commit_evidence.clone() };
-        let prev_state_root = self.state.current_root().map(str::to_string);
-
-        let evidence = self.evidence_for_proposal(height);
-        let tx_bytes = BlockPayload {
-            version: BLOCK_PAYLOAD_VERSION, txs: txs.clone(), last_commit, prev_state_root,
-            evidence: evidence.clone(),
-        }.encode();
+        // Move the txs that fit into the block; the rest stay for the next one.
+        let payload = self.block_payload(height);
+        let mut txs: Vec<Transaction> = self.mempool.drain(..payload.txs.len()).collect();
+        let evidence = payload.evidence.clone();
+        let tx_bytes = payload.encode();
 
         // Produce a proposal
         let proposal = self.consensus
@@ -6256,6 +6290,61 @@ mod tests {
                     .map(|v| signed_vote(CHAIN, VoteType::Precommit, h, 0, v, block_hash.clone()))
                     .collect(),
             }
+        }
+
+        // -- Block size: proposals stay within max_block_bytes ---------------
+
+        /// A ~240 KB transaction (ML-DSA keys and signatures are this large).
+        fn big_tx(i: u64) -> Transaction {
+            Transaction {
+                id: format!("big-{i}"), sender: "qcb1alice".into(), nonce: i,
+                body: chain_forge_execution::TxBody::Transfer {
+                    to: "qcb1bob".into(), amount: 1, denom: "uqcb".into(),
+                },
+                gas_limit: 21_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None,
+                pq_public_key: vec![200u8; 60_000],
+            }
+        }
+
+        #[tokio::test]
+        async fn proposer_includes_only_the_txs_that_fit_in_max_block_bytes() {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let max = node.genesis.limits.max_block_bytes as usize;
+            node.mempool = (0..30).map(big_tx).collect();
+            let payload = node.block_payload(0);
+            let len = payload.encode().len();
+            let n = payload.txs.len();
+            assert!(len <= max, "payload {len} bytes exceeds max_block_bytes {max}");
+            assert!(n > 0 && n < 30, "expected a prefix of the mempool, got {n} txs");
+            let ids: Vec<_> = payload.txs.iter().map(|t| t.id.clone()).collect();
+            let expected: Vec<_> = (0..n as u64).map(|i| format!("big-{i}")).collect();
+            assert_eq!(ids, expected, "txs must be a prefix, in mempool order");
+            let one_more = BlockPayload { txs: node.mempool[..=n].to_vec(), ..payload.clone() };
+            assert!(one_more.encode().len() > max, "the next tx would have fit");
+        }
+
+        #[test]
+        fn zero_max_block_bytes_means_no_limit() {
+            let mempool: Vec<_> = (0..5).map(big_tx).collect();
+            assert_eq!(select_block_txs(&mempool, &BlockPayload::default(), 0).len(), 5);
+        }
+
+        #[tokio::test]
+        async fn proposal_above_max_block_bytes_is_not_committed() {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let max = node.genesis.limits.max_block_bytes as usize;
+            let root = node.state.current_root().map(str::to_string);
+            let mut oversized: serde_json::Value = serde_json::from_slice(&payload(None, root.as_deref())).unwrap();
+            oversized["pad"] = "x".repeat(max).into();
+            let p = proposal(0, serde_json::to_vec(&oversized).unwrap());
+            deliver(&mut node, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert!(node.chain_store.get(&0).is_none(), "a proposal over max_block_bytes must not commit");
+
+            // Control: the same payload without padding commits.
+            let p = proposal(0, payload(None, root.as_deref()));
+            deliver(&mut node, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert!(node.chain_store.get(&0).is_some(), "the control proposal must commit");
         }
 
         /// Deliver `p`, then each voter's prevote and precommit for it (a
