@@ -76,7 +76,7 @@
 
 ## Phase 0.5 — Protocol Foundation Hardening (status 2026-10-28)
 
-Hardening the foundation before adding features. Each item is a draft PR, unmerged until its gates pass on Windows (MINGW64). Merge order: #16 into #14's branch, then #14, #13, #15, #17, #18, #20, #21.
+Hardening the foundation before adding features. Each item is a draft PR, unmerged until its gates pass on Windows (MINGW64). Merge order: #16 into #14's branch, then #14, #13, #15, #17, #18, #20, #21, #22.
 
 | Item | PR / branch | Status |
 |---|---|---|
@@ -87,6 +87,7 @@ Hardening the foundation before adding features. Each item is a draft PR, unmerg
 | **Consensus safety**: full Tendermint prevote/precommit/lock/unlock; persisted double-sign guard; block-hash verification and agreement | #18 | ✅ Windows-confirmed (consensus 91/91, node 231/231, devnet, restart, `consensus_safety_live` 3/3); awaiting merge |
 | Epoch rewards from committed evidence + MN-8 + capital premium (fixed pool) | #20 | ✅ Windows-confirmed (MN-8 live 6/6); awaiting merge after #18 |
 | **Release gate 1**: proposal authentication (signed proposals incl. `pol_round`, fail-closed) | #21 | ✅ Windows-confirmed (node 242/242, devnet, `consensus_safety_live` 3/3, MN-8 6/6); awaiting merge after #20 |
+| **Release gate 3**: VCA quorum floor (every commit quorum ≥ ⌊2·total/3⌋+1, all engines) | #22 | ✅ Windows-confirmed (node 242/242, devnet 2/2, `consensus_safety_live` 3/3); awaiting merge after #21 |
 
 ### Consensus safety (#18): why it was needed
 A 5-node run with only honest nodes finalized two conflicting blocks at height 1. Validators precommitted without a prevote polka and locked only at commit. The blocks were empty, so state roots matched and only block hashes revealed the fork. Fixed by the full Tendermint state machine (Buchman, Kwon & Milosevic, Algorithm 1). Covered by unit lock-rule tests, a scripted fork counterexample, a seeded model-based simulation (staggered starts, crashes, equivocators within f, fork detection beyond f), and live block-hash agreement tests. Partition recovery passed in the Linux sandbox; it can't run on Windows (no iptables).
@@ -94,7 +95,7 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 ### Release gates (open — block any release beyond devnet)
 - ✅ **Proposal authentication** (#21): validators sign their proposals and re-proposals; the signature covers `pol_round`. Receivers fail closed when the proposer has a registered key. Windows-confirmed.
 - 🔲 **HotStuff / FBA**: both still use the legacy unsafe voting path. They need a safety review plus engine-driven voting, or must refuse to run off devnet.
-- 🔲 **VCA quorum floor**: `verify_commit` must never accept less than ⌊2·total/3⌋+1 of voting power.
+- ✅ **VCA quorum floor** (#22, Windows-confirmed): every commit quorum is floored at ⌊2·total/3⌋+1 of the set being voted on or verified, in all three engines, at computation and at use. Found: the default VCA config used ⌈2·total/3⌉ (one unit short when total is divisible by 3), and a stored quorum was applied to any set passed in (a certificate with 1/3 of a larger set's power verified).
 
 ### Epoch rewards + MN-8 (#20, Windows-confirmed)
 - ✅ Rewards pay the closed epoch from committed evidence only. Participation is Byzantine-robust. `consensus.rewards.min_participation_pct` is set in genesis (default 67, range 50–90). Tie-breaks are deterministic.

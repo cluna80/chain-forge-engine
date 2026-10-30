@@ -557,9 +557,10 @@ impl TendermintEngine {
             let registry = build_vca_registry_from_validator_set(epoch, &incoming_vs, vca_cfg.weight_config.clone());
             return match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
                 Ok(q) => {
-                    self.vca_quorum = Some(q);
                     let mut vs = incoming_vs;
                     apply_vca_weights_to_validator_set(&mut vs, &registry);
+                    let q = floored_quorum(Some(q), &vs);
+                    self.vca_quorum = Some(q);
                     tracing::info!(epoch, validators = vs.validators.len(), total_weight = vs.total_power(),
                         vca_quorum = q, "VCA-PQ-BFT epoch rotation: weights and adaptive quorum updated");
                     Ok(vs)
@@ -725,9 +726,10 @@ impl ConsensusEngine for TendermintEngine {
             let registry = build_vca_registry_from_validator_set(0, &genesis_validators, vca_cfg.weight_config.clone());
             match compute_adaptive_quorum(&registry, &vca_cfg.quorum_config) {
                 Ok(q) => {
-                    self.vca_quorum = Some(q);
                     let mut vs = genesis_validators;
                     apply_vca_weights_to_validator_set(&mut vs, &registry);
+                    let q = floored_quorum(Some(q), &vs);
+                    self.vca_quorum = Some(q);
                     tracing::info!(epoch = 0, validators = vs.validators.len(), total_weight = vs.total_power(),
                         vca_quorum = q, "VCA-PQ-BFT genesis: weights and adaptive quorum set");
                     vs
@@ -878,7 +880,8 @@ impl ConsensusEngine for TendermintEngine {
     }
 
     fn verify_commit(&self, certificate: &CommitCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
-        let quorum = self.vca_quorum.unwrap_or_else(|| validator_set.quorum_power());
+        // Never below ⌊2·total/3⌋+1 of the set being verified (gate 3).
+        let quorum = floored_quorum(self.vca_quorum, validator_set);
 
         // Only precommits for exactly this (height, round, block) count, and
         // each validator at most once.
