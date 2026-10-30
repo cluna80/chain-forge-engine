@@ -208,7 +208,7 @@ Known failing live tests that **also fail on `main`** (not caused by the stack):
 - ⬜ A failed proposal publish is silently ignored (`let _ = network.publish`); log it (found with #34).
 - ⬜ Mainnet `max_tx_bytes` / `max_block_bytes`: not decided. Review mempool admission, block capacity, execution cost and resource exhaustion first.
 - ✅ **ML-DSA-only user accounts** (owner, 2026-10-30; #35, ✅ Windows-confirmed 2026-10-30: node 270/270, mldsa_only_accounts_live A-01..A-05, mldsa_tx_live, devnet_4node 6/6). Genesis `cryptography.signature_scheme = "pqc-native"` (with `pqc_algorithm = "ml-dsa"`) refuses Ed25519-signed and unsigned user txs, whatever `require_signatures` says; `"classical"`/`"hybrid"` explicitly allow Ed25519. One function, `check_account_signature_policy`, is applied at API admission, gossip intake and execution. An unknown scheme stops the node. The upgraded-devnet template `genesis-4node-mldsa.json` is now `pqc-native`. Live: `mldsa_only_accounts_live` A-01..A-05.
-- ⬜ Retire the Ed25519 fallback devnet once nothing depends on it; mark the superseded Ed25519 devnet sections below.
+- 🔄 **Retire the Ed25519 fallback devnet** (owner, 2026-10-30; this PR, sandbox ✅, Windows pending). The devnet scripts (`run_4node_devnet.sh`, `run_machine1.sh`, `run_machine2.sh`) and the README quick start now run the ML-DSA devnet (`genesis-4node-mldsa.json`, `keys/mldsa/`) on ports 19080+/28000+, clear of the legacy devnet. Ed25519 genesis files and keys remain as classical-compatibility fixtures (`tests/devnet/README.md`). The legacy pilot devnet (`genesis-4node.json` at the repo root, `qcb-testnet-4node`) is untouched and runs from branch `devnet-legacy-2026-10`. The README's single-node quick start never produced blocks (one of four validators cannot reach quorum); replaced. The local launchers `scripts/start-devnet-local.sh` and `scripts/start-testnet.ps1` also run the 4-node ML-DSA devnet now (owner, 2026-10-30), with their own data folders. The devnet test scripts no longer need `python3` (`tests/devnet/json.sh`); `test7` had failed on Windows because of it.
 - ⬜ ML-DSA signatures are verified at execution, not at API admission: a tx with a bad ML-DSA signature is admitted to the mempool, then refused deterministically at execution (no fee, no nonce). Verify at admission too, to keep junk out of the mempool.
 - ⬜ Partition recovery is only exercised where iptables is available (skipped on Windows); run it on Linux with the P2P work.
 
@@ -222,6 +222,8 @@ Known failing live tests that **also fail on `main`** (not caused by the stack):
 
 ### Cryptographic Architecture Decision (locked 2026-10-25)
 
+> **Superseded (2026-10-30):** the devnet now runs ML-DSA-65 consensus keys and ML-DSA-only user accounts (see the amendment below, #24 and #35). Kept for history.
+
 **Devnet (Phase 0 / testnet):** Hybrid — Ed25519 validator consensus keys, ML-DSA-65 user account keys. Ed25519 was baked into genesis from the start; validators can rotate to ML-DSA consensus keys post-genesis once the BFT vote-signing layer supports it. This is the correct intermediate state: ML-DSA user-account enforcement is proven end-to-end while consensus remains on a well-audited classical scheme.
 
 **Mainnet:** Full ML-DSA-65 from block 1. A new chain is generated with ML-DSA-65 genesis keys for all validators. No Ed25519 anywhere in the signing paths. Quantum resistance from the first block, not retrofitted. There is no migration from devnet state to mainnet — mainnet is a fresh genesis.
@@ -229,6 +231,8 @@ Known failing live tests that **also fail on `main`** (not caused by the stack):
 This decision is final. Do not re-litigate it during Phase 0 or Phase 1 work.
 
 **Amendment (owner decision 2026-10-28):** the devnet moves to **ML-DSA-65 consensus keys on the Tendermint engine** (branch `devnet-mldsa-consensus-keys`). One variable changes at a time: the engine stays Tendermint (HotStuff/FBA remain devnet-only per release gate 2). The Ed25519 devnet genesis stays runnable as a fallback until the ML-DSA devnet is confirmed on Windows. Found while scoping: after an `ActivatePqConsensus` tx, ML-DSA validators receive voting power, but the engine verified every vote with Ed25519, so their votes were all rejected (a liveness hazard above 1/3 of power).
+
+> **Superseded (2026-10-28):** done in #24; consensus signing is scheme-agnostic. Kept for history.
 
 **Why not change devnet validators to ML-DSA now?** `chain-forge-consensus` is hardwired to `ClassicalScheme` (Ed25519) for all BFT vote signing and verification — `ValidatorInfo.public_key` is a 32-byte Ed25519 key, votes are signed with `SchemeId::Classical`, and `ClassicalScheme.verify()` is called directly in `receive_vote` and `verify_commit`. Switching consensus keys to ML-DSA requires updating those paths, regenerating all validator key files with 1952-byte ML-DSA keys, and auditing every test that constructs `ValidatorInfo` or signs votes. That is Phase 1 / mainnet genesis work, not a devnet patch. The devnet already proves the full ML-DSA user-transaction path end-to-end (P0-3 through P0-6). That is sufficient for Phase 0.
 

@@ -29,23 +29,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# JSON helpers (no python3 needed; works in Git Bash on Windows).
+. "$SCRIPT_DIR/json.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
-GENESIS="$SCRIPT_DIR/genesis-4node.json"
-KEY_DIR="$SCRIPT_DIR/keys"
+GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
+KEY_DIR="$SCRIPT_DIR/keys/mldsa"
 LOG_DIR="${LOG_DIR:-/tmp/qcb-devnet-test9-logs}"
 
-ALICE_API="http://127.0.0.1:18080"
-BOB_API="http://127.0.0.1:18081"
-CAROL_API="http://127.0.0.1:18082"
-DAVE_API="http://127.0.0.1:18083"
+ALICE_API="http://127.0.0.1:19080"
+BOB_API="http://127.0.0.1:19081"
+CAROL_API="http://127.0.0.1:19082"
+DAVE_API="http://127.0.0.1:19083"
 
-# For local simulation Carol is on 27002, Dave on 27003
+# For local simulation Carol is on 28002, Dave on 28003
 # (avoid collisions with test7/test8 if they left anything running)
-CAROL_P2P=27002
-DAVE_P2P=27003
-ALICE_P2P=27000
-BOB_P2P=27001
+CAROL_P2P=28002
+DAVE_P2P=28003
+ALICE_P2P=28000
+BOB_P2P=28001
 
 CAROL_PEER="/ip4/127.0.0.1/tcp/$CAROL_P2P"
 DAVE_PEER="/ip4/127.0.0.1/tcp/$DAVE_P2P"
@@ -80,9 +83,9 @@ mkdir -p "$LOG_DIR"
 
 get_height() {
     local url="$1/api/status"
-    curl -sf "$url" 2>/dev/null \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('height', -1))" 2>/dev/null \
-        || echo "-1"
+    local h
+    h=$(curl -sf "$url" 2>/dev/null | json_field height)
+    echo "${h:--1}"
 }
 
 wait_for_api() {
@@ -106,7 +109,7 @@ echo "--- Phase 1: Start Alice + Bob (Machine 2 NOT yet running) ---"
     --genesis "$GENESIS" \
     --validator qcb1alice \
     --key-file "$KEY_DIR/alice.key.json" \
-    --api-port 18080 \
+    --api-port 19080 \
     --p2p-port "$ALICE_P2P" \
     --bootstrap "$CAROL_PEER" \
     --bootstrap "$DAVE_PEER" \
@@ -118,7 +121,7 @@ ALICE_PID=${PIDS[-1]}
     --genesis "$GENESIS" \
     --validator qcb1bob \
     --key-file "$KEY_DIR/bob.key.json" \
-    --api-port 18081 \
+    --api-port 19081 \
     --p2p-port "$BOB_P2P" \
     --bootstrap "$CAROL_PEER" \
     --bootstrap "$DAVE_PEER" \
@@ -149,7 +152,7 @@ echo "--- Phase 2: Bring Carol + Dave online (Machine 2 arrives) ---"
     --genesis "$GENESIS" \
     --validator qcb1carol \
     --key-file "$KEY_DIR/carol.key.json" \
-    --api-port 18082 \
+    --api-port 19082 \
     --p2p-port "$CAROL_P2P" \
     --bootstrap "$ALICE_PEER" \
     --bootstrap "$BOB_PEER" \
@@ -161,7 +164,7 @@ CAROL_PID=${PIDS[-1]}
     --genesis "$GENESIS" \
     --validator qcb1dave \
     --key-file "$KEY_DIR/dave.key.json" \
-    --api-port 18083 \
+    --api-port 19083 \
     --p2p-port "$DAVE_P2P" \
     --bootstrap "$ALICE_PEER" \
     --bootstrap "$BOB_PEER" \

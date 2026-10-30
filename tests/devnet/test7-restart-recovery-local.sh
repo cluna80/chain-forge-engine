@@ -2,8 +2,8 @@
 # Acceptance Test #7 — Restart Recovery (local 4-node simulation)
 #
 # Same as test7-restart-recovery.sh but runs all 4 validators locally
-# (no MACHINE2_IP required). Carol and Dave run on ports 27002/27003,
-# api 18082/18083. Alice and Bob are the nodes being restarted.
+# (no MACHINE2_IP required). Carol and Dave run on ports 28002/28003,
+# api 19082/19083. Alice and Bob are the nodes being restarted.
 #
 # Usage:
 #   bash tests/devnet/test7-restart-recovery-local.sh
@@ -11,25 +11,28 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# JSON helpers (no python3 needed; works in Git Bash on Windows).
+. "$SCRIPT_DIR/json.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
-GENESIS="$SCRIPT_DIR/genesis-4node.json"
-KEY_DIR="$SCRIPT_DIR/keys"
+GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
+KEY_DIR="$SCRIPT_DIR/keys/mldsa"
 DATA_DIR="${DATA_DIR:-/tmp/qcb-devnet-test7-data}"
 LOG_DIR="${LOG_DIR:-/tmp/qcb-devnet-test7-logs}"
 
-ALICE_API="http://127.0.0.1:18080"
-BOB_API="http://127.0.0.1:18081"
-CAROL_API="http://127.0.0.1:18082"
-DAVE_API="http://127.0.0.1:18083"
+ALICE_API="http://127.0.0.1:19080"
+BOB_API="http://127.0.0.1:19081"
+CAROL_API="http://127.0.0.1:19082"
+DAVE_API="http://127.0.0.1:19083"
 
 ALICE_DATA_DIR="$DATA_DIR/alice"
 BOB_DATA_DIR="$DATA_DIR/bob"
 
-CAROL_PEER="/ip4/127.0.0.1/tcp/27002"
-DAVE_PEER="/ip4/127.0.0.1/tcp/27003"
-ALICE_PEER="/ip4/127.0.0.1/tcp/27000"
-BOB_PEER="/ip4/127.0.0.1/tcp/27001"
+CAROL_PEER="/ip4/127.0.0.1/tcp/28002"
+DAVE_PEER="/ip4/127.0.0.1/tcp/28003"
+ALICE_PEER="/ip4/127.0.0.1/tcp/28000"
+BOB_PEER="/ip4/127.0.0.1/tcp/28001"
 
 CAROL_PID=0
 DAVE_PID=0
@@ -72,18 +75,12 @@ get_height() {
     local api="$1"
     # Try /api/blocks first (authoritative: includes persisted chain)
     local h
-    h=$(curl -sf "$api/api/blocks" 2>/dev/null \
-        | python3 -c "
-import sys, json
-try:
-    blocks = json.load(sys.stdin)
-    if blocks:
-        print(max(b.get('height', 0) for b in blocks))
-    else:
-        print(0)
-except Exception:
-    print(-1)
-" 2>/dev/null || echo "-1")
+    local body
+    if body=$(curl -sf "$api/api/blocks" 2>/dev/null); then
+        h=$(printf '%s' "$body" | json_max_height)
+    else
+        h=-1
+    fi
     echo "$h"
 }
 
@@ -126,8 +123,8 @@ echo "--- Starting Carol + Dave (stay up throughout) ---"
     --genesis "$GENESIS" \
     --validator qcb1carol \
     --key-file "$KEY_DIR/carol.key.json" \
-    --api-port 18082 \
-    --p2p-port 27002 \
+    --api-port 19082 \
+    --p2p-port 28002 \
     --bootstrap "$ALICE_PEER" \
     --bootstrap "$BOB_PEER" \
     > "$LOG_DIR/carol.log" 2>&1 &
@@ -137,8 +134,8 @@ CAROL_PID=$!
     --genesis "$GENESIS" \
     --validator qcb1dave \
     --key-file "$KEY_DIR/dave.key.json" \
-    --api-port 18083 \
-    --p2p-port 27003 \
+    --api-port 19083 \
+    --p2p-port 28003 \
     --bootstrap "$ALICE_PEER" \
     --bootstrap "$BOB_PEER" \
     > "$LOG_DIR/dave.log" 2>&1 &
@@ -154,8 +151,8 @@ echo "--- Phase 1: Start Alice + Bob ---"
     --genesis "$GENESIS" \
     --validator qcb1alice \
     --key-file "$KEY_DIR/alice.key.json" \
-    --api-port 18080 \
-    --p2p-port 27000 \
+    --api-port 19080 \
+    --p2p-port 28000 \
     --data-dir "$ALICE_DATA_DIR" \
     --bootstrap "$CAROL_PEER" \
     --bootstrap "$DAVE_PEER" \
@@ -166,8 +163,8 @@ ALICE_PID=$!
     --genesis "$GENESIS" \
     --validator qcb1bob \
     --key-file "$KEY_DIR/bob.key.json" \
-    --api-port 18081 \
-    --p2p-port 27001 \
+    --api-port 19081 \
+    --p2p-port 28001 \
     --data-dir "$BOB_DATA_DIR" \
     --bootstrap "$CAROL_PEER" \
     --bootstrap "$DAVE_PEER" \
@@ -201,8 +198,8 @@ echo "--- Phase 3: Restart Alice + Bob from disk ---"
     --genesis "$GENESIS" \
     --validator qcb1alice \
     --key-file "$KEY_DIR/alice.key.json" \
-    --api-port 18080 \
-    --p2p-port 27000 \
+    --api-port 19080 \
+    --p2p-port 28000 \
     --data-dir "$ALICE_DATA_DIR" \
     --bootstrap "$CAROL_PEER" \
     --bootstrap "$DAVE_PEER" \
@@ -213,8 +210,8 @@ ALICE_PID=$!
     --genesis "$GENESIS" \
     --validator qcb1bob \
     --key-file "$KEY_DIR/bob.key.json" \
-    --api-port 18081 \
-    --p2p-port 27001 \
+    --api-port 19081 \
+    --p2p-port 28001 \
     --data-dir "$BOB_DATA_DIR" \
     --bootstrap "$CAROL_PEER" \
     --bootstrap "$DAVE_PEER" \

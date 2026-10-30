@@ -1,28 +1,32 @@
 # start-testnet.ps1
 #
-# Launches a 3-node QCB testnet (alice / bob / carol) in separate Windows
-# Terminal tabs or PowerShell windows.
+# Launches the local 4-node ML-DSA devnet (alice / bob / carol / dave) in
+# separate PowerShell windows.
+#
+# Uses tests\devnet\genesis-4node-mldsa.json (ML-DSA-65 consensus keys,
+# ML-DSA-only user accounts) and the public test keys in
+# tests\devnet\keys\mldsa\. Ports API 19080-19083 / P2P 28000-28003 and the
+# data folders C:\tmp\qcb-mldsa-* never touch the legacy devnet's ports or
+# data. The keys are public: test use only. For a devnet anyone relies on,
+# generate fresh keys (docs\devnet-upgrade-phase-0-5.md).
 #
 # Usage:
-#   .\scripts\start-testnet.ps1              # fresh start (clears data dirs)
+#   .\scripts\start-testnet.ps1              # fresh start (clears its own data dirs)
 #   .\scripts\start-testnet.ps1 -Resume      # restart from persisted state
 #   .\scripts\start-testnet.ps1 -LogLevel debug
-#   .\scripts\start-testnet.ps1 -NoKeys      # run unsigned (devnet only)
 #
 # Requirements:
-#   - Run from the repo root: cd C:\Dev\chain-forge-engine\chain-forge-engine
-#   - Binaries must be built: cargo build --release -p chain-forge-node
-#   - Windows Terminal is recommended (wt.exe); falls back to Start-Process
+#   - Run from the repo root: cd C:\Dev\chain-forge-engine
+#   - Binary must be built: cargo build --release -p chain-forge-node
+#     (or pass -Binary .\target\debug\chain-forge-node.exe)
 
 param(
     [switch]$Resume,
-    [switch]$NoKeys,
     [string]$LogLevel  = "info",
-    [string]$Genesis   = "genesis-3node.json",
-    [string]$KeysDir   = "keys",
+    [string]$Genesis   = "tests\devnet\genesis-4node-mldsa.json",
+    [string]$KeysDir   = "tests\devnet\keys\mldsa",
     [string]$DataRoot  = "C:\tmp",
-    [string]$Binary    = ".\target\release\chain-forge-node.exe",
-    [string]$Keygen    = ".\target\release\chain-forge-keygen.exe"
+    [string]$Binary    = ".\target\release\chain-forge-node.exe"
 )
 
 Set-StrictMode -Version Latest
@@ -33,7 +37,6 @@ $ErrorActionPreference = "Stop"
 if (-not (Test-Path $Binary)) {
     Write-Error "Binary not found: $Binary`nRun: cargo build --release -p chain-forge-node"
 }
-
 if (-not (Test-Path $Genesis)) {
     Write-Error "Genesis file not found: $Genesis`nRun from the repo root."
 }
@@ -41,52 +44,22 @@ if (-not (Test-Path $Genesis)) {
 # --- Node definitions --------------------------------------------------------
 
 $nodes = @(
-    @{ Name = "alice"; Validator = "qcb1alice"; ApiPort = 8080; DataDir = "$DataRoot\qcb-alice" },
-    @{ Name = "bob";   Validator = "qcb1bob";   ApiPort = 8081; DataDir = "$DataRoot\qcb-bob"   },
-    @{ Name = "carol"; Validator = "qcb1carol"; ApiPort = 8082; DataDir = "$DataRoot\qcb-carol" }
+    @{ Name = "alice"; ApiPort = 19080; P2pPort = 28000 },
+    @{ Name = "bob";   ApiPort = 19081; P2pPort = 28001 },
+    @{ Name = "carol"; ApiPort = 19082; P2pPort = 28002 },
+    @{ Name = "dave";  ApiPort = 19083; P2pPort = 28003 }
 )
-
-# --- Key generation ----------------------------------------------------------
-
-if (-not $NoKeys) {
-    if (-not (Test-Path $Keygen)) {
-        Write-Warning "Keygen binary not found: $Keygen -- running unsigned (no --key-file)"
-        $NoKeys = $true
-    } else {
-        $anyMissing = $false
-        foreach ($n in $nodes) {
-            $keyPath = "$KeysDir\$($n.Validator).key.json"
-            if (-not (Test-Path $keyPath)) {
-                $anyMissing = $true
-            }
-        }
-
-        if ($anyMissing) {
-            Write-Host "Generating validator signing keys..." -ForegroundColor Yellow
-            New-Item -ItemType Directory -Force -Path $KeysDir | Out-Null
-            foreach ($n in $nodes) {
-                $keyPath = "$KeysDir\$($n.Validator).key.json"
-                if (-not (Test-Path $keyPath)) {
-                    & $Keygen --address $n.Validator --out $keyPath
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Error "Key generation failed for $($n.Validator)"
-                    }
-                } else {
-                    Write-Host "  Key already exists for $($n.Validator) -- skipping"
-                }
-            }
-            Write-Host ""
-            Write-Host "IMPORTANT: Copy the public_key values above into genesis-3node.json" -ForegroundColor Magenta
-            Write-Host "           (genesis_accounts[*].public_key) before running this again." -ForegroundColor Magenta
-            Write-Host "           Keys are in: $KeysDir\" -ForegroundColor Magenta
-            Write-Host ""
-            Write-Host "Exiting so you can update genesis first." -ForegroundColor Yellow
-            exit 0
-        }
+foreach ($n in $nodes) {
+    $n.Validator = "qcb1$($n.Name)"
+    $n.DataDir   = "$DataRoot\qcb-mldsa-$($n.Name)"
+    $n.KeyFile   = "$KeysDir\$($n.Name).key.json"
+    if (-not (Test-Path $n.KeyFile)) {
+        Write-Error "Key file not found: $($n.KeyFile)"
     }
 }
+$bootstrap = "/ip4/127.0.0.1/tcp/$($nodes[0].P2pPort)"
 
-# --- Clear data dirs unless resuming -----------------------------------------
+# --- Clear this devnet's data dirs unless resuming ---------------------------
 
 if (-not $Resume) {
     Write-Host "Clearing data directories..." -ForegroundColor Yellow
@@ -99,42 +72,36 @@ if (-not $Resume) {
 }
 
 # --- Write per-node launcher scripts -----------------------------------------
-# wt.exe cannot safely pass complex PowerShell expressions as inline commands,
-# so we write a small .ps1 per node into the temp dir and tell wt/PS to run it.
+# Start-Process passes -File verbatim, so each node gets a small .ps1.
 
-$tmpDir = "$env:TEMP\qcb-testnet"
+$tmpDir = "$env:TEMP\qcb-testnet-mldsa"
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
 $bin = (Resolve-Path $Binary).Path
 $gen = (Resolve-Path $Genesis).Path
 
 foreach ($node in $nodes) {
+    $key = (Resolve-Path $node.KeyFile).Path
     $lines = @()
     $lines += "`$env:RUST_LOG = '$LogLevel'"
     $lines += "& '$bin' ``"
     $lines += "  --genesis '$gen' ``"
     $lines += "  --validator $($node.Validator) ``"
+    $lines += "  --key-file '$key' ``"
     $lines += "  --api-port $($node.ApiPort) ``"
+    $lines += "  --p2p-port $($node.P2pPort) ``"
+    if ($node.Name -ne "alice") {
+        $lines += "  --bootstrap '$bootstrap' ``"
+    }
     $lines += "  --data-dir '$($node.DataDir)'"
 
-    if (-not $NoKeys) {
-        $keyPath = (Resolve-Path "$KeysDir\$($node.Validator).key.json").Path
-        # Append --key-file to the last real arg line (replace trailing single-quote on data-dir line)
-        $lines[-1] = "  --data-dir '$($node.DataDir)' ``"
-        $lines     += "  --key-file '$keyPath'"
-    }
-
-    $script = $lines -join "`n"
-    $scriptPath = "$tmpDir\run-$($node.Name).ps1"
-    Set-Content -Path $scriptPath -Value $script -Encoding UTF8
+    Set-Content -Path "$tmpDir\run-$($node.Name).ps1" -Value ($lines -join "`n") -Encoding UTF8
 }
 
 # --- Launch each node --------------------------------------------------------
 
-$signed = if ($NoKeys) { "UNSIGNED (devnet)" } else { "SIGNED (ed25519)" }
-
 Write-Host ""
-Write-Host "Starting 3-node QCB testnet  [$signed]" -ForegroundColor Cyan
+Write-Host "Starting the local 4-node ML-DSA devnet" -ForegroundColor Cyan
 Write-Host "  Genesis : $gen"
 Write-Host "  Binary  : $bin"
 Write-Host "  LogLevel: $LogLevel"
@@ -142,29 +109,21 @@ Write-Host "  Resume  : $Resume"
 Write-Host ""
 
 foreach ($node in $nodes) {
-    $scriptPath = "$tmpDir\run-$($node.Name).ps1"
-    $title      = "QCB-$($node.Name.ToUpper()) | api=:$($node.ApiPort)"
-
-    # Use Start-Process powershell.exe -File directly.
-    # wt.exe new-tab re-quotes the argument list and appends stray characters
-    # regardless of quoting style, so we skip it entirely. When Windows
-    # Terminal is the default terminal, new PowerShell windows open as WT tabs
-    # automatically. -File takes the path verbatim with no shell expansion.
     Start-Process powershell.exe `
-        -ArgumentList "-NoExit", "-File", $scriptPath `
+        -ArgumentList "-NoExit", "-File", "$tmpDir\run-$($node.Name).ps1" `
         -WindowStyle Normal
-    Write-Host "  Launched $($node.Name) (api=:$($node.ApiPort))" -ForegroundColor Green
+    Write-Host "  Launched $($node.Name) (api=:$($node.ApiPort) p2p=:$($node.P2pPort))" -ForegroundColor Green
 
-    # Small delay so alice is up before bob/carol try to peer
+    # Alice is everyone's bootstrap peer: give her a head start.
     if ($node.Name -eq "alice") { Start-Sleep -Milliseconds 500 }
 }
 
 Write-Host ""
-Write-Host "All nodes launched  [$signed]" -ForegroundColor Cyan
+Write-Host "All nodes launched" -ForegroundColor Cyan
 Write-Host "API endpoints:"
 foreach ($node in $nodes) {
-    Write-Host "  $($node.Name.PadRight(6)) http://localhost:$($node.ApiPort)/status"
+    Write-Host "  $($node.Name.PadRight(6)) http://localhost:$($node.ApiPort)/api/status"
 }
 Write-Host ""
-Write-Host "To stop: close the node windows, then run:" -ForegroundColor Yellow
-Write-Host "  Remove-Item -Recurse -Force C:\tmp\qcb-alice, C:\tmp\qcb-bob, C:\tmp\qcb-carol"
+Write-Host "To stop: close the node windows. To wipe this devnet's data:" -ForegroundColor Yellow
+Write-Host "  Remove-Item -Recurse -Force $(($nodes | ForEach-Object { $_.DataDir }) -join ', ')"

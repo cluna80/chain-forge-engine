@@ -10,6 +10,11 @@
 #   - Key:     $HOME/qcb1carol.key.json
 #   - Genesis: $HOME/genesis-4node.json    (copy of tests/devnet/genesis-4node.json)
 #
+# LEGACY PILOT DEVNET ONLY (qcb-testnet-4node, Ed25519 consensus keys).
+# Run it from a build of branch devnet-legacy-2026-10, never from main;
+# see docs/devnet-upgrade-phase-0-5.md. The supported devnet is the ML-DSA
+# one: tests/devnet/run_machine1.sh / run_machine2.sh.
+#
 # Usage: ./start-carol.sh [--clean]
 #   --clean   wipes Carol's data dir before starting
 # ─────────────────────────────────────────────────────────────────

@@ -23,6 +23,12 @@
 //! The partition test is skipped (not failed) if `iptables` is not available
 //! or cannot insert rules (no root / no CAP_NET_ADMIN).
 //!
+//! ## Variants
+//! The `*_mldsa_*` tests run the supported devnet: `genesis-4node-mldsa.json`
+//! (ML-DSA-65 consensus keys, ML-DSA-only user accounts). The other two run
+//! `genesis-4node.json` with Ed25519 consensus keys as a classical-compatibility
+//! check; the Ed25519 fallback devnet itself is retired (owner, 2026-10-30).
+//!
 //! ## Run
 //! ```
 //! cargo test --test devnet_4node -- --nocapture
