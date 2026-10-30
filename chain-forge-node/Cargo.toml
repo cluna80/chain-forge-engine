@@ -58,6 +58,10 @@ real-network = []
 # Without this feature, VerifyIdentityWithProof txs are accepted as a tx type
 # but execution fails closed ("no pop_verifier configured").
 zk-vrc = ["chain-forge-personhood"]
+# Devnet bootstrap only: lets a devnet genesis opt into identity parameters
+# weaker than production (identity.insecure_dev_identity_overrides).
+# Never enable for testnet or mainnet builds.
+insecure-dev-quorum = ["chain-forge-core/insecure-dev-quorum"]
 default = ["real-network"]
 
 [dev-dependencies]

@@ -170,6 +170,11 @@ pub struct LivenessWindow {
     pub size:     usize,
     pub position: usize,
     pub filled:   bool,
+    /// Parallel ring buffer: the proposer whose committed evidence produced
+    /// each observation (H0-2). Empty for windows persisted before this field
+    /// existed; such entries are attributed to "".
+    #[serde(default)]
+    pub proposers: Vec<String>,
 }
 
 impl LivenessWindow {
@@ -179,11 +184,17 @@ impl LivenessWindow {
             size,
             position: 0,
             filled:   false,
+            proposers: vec![String::new(); size],
         }
     }
 
-    /// Record a block outcome for this validator.
-    pub fn record(&mut self, proposed: bool) {
+    /// Record a block outcome for this validator, attributed to the proposer
+    /// whose committed evidence it came from.
+    pub fn record(&mut self, proposed: bool, proposer: &str) {
+        if self.proposers.len() != self.size {
+            self.proposers = vec![String::new(); self.size];
+        }
+        self.proposers[self.position] = proposer.to_string();
         self.window[self.position] = proposed;
         self.position = (self.position + 1) % self.size;
         if self.position == 0 { self.filled = true; }
@@ -206,6 +217,37 @@ impl LivenessWindow {
     pub fn missed_pct(&self) -> u32 {
         (self.missed_fraction() * 100.0).round() as u32
     }
+
+    /// Byzantine-robust miss percentage (0-100, integer, rounded half up).
+    ///
+    /// Observations are grouped by the proposer whose committed evidence
+    /// produced them. The `byzantine_f` proposers that omitted this validator
+    /// most often (ties broken by proposer id, so every node agrees) have all
+    /// of their blocks excluded, and the percentage is taken over the rest.
+    ///
+    /// Up to f malicious proposers therefore cannot push an honest validator
+    /// over the threshold on their own, while a validator that is genuinely
+    /// offline is absent from honest proposers' evidence too and is still
+    /// caught. Its extra slack is bounded by the excluded proposers' share.
+    pub fn robust_missed_pct(&self, byzantine_f: usize) -> u32 {
+        let n = self.observed();
+        let mut per_proposer: std::collections::BTreeMap<&str, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for i in 0..n {
+            let proposer = self.proposers.get(i).map(String::as_str).unwrap_or("");
+            let e = per_proposer.entry(proposer).or_insert((0, 0));
+            e.0 += 1;
+            if !self.window[i] { e.1 += 1; }
+        }
+        let mut ranked: Vec<(&str, (u64, u64))> = per_proposer.into_iter().collect();
+        // Most omissions first; deterministic tie-break on proposer id.
+        ranked.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        let (total, missed) = ranked.iter()
+            .skip(byzantine_f)
+            .fold((0u64, 0u64), |(t, m), (_, (pt, pm))| (t + pt, m + pm));
+        if total == 0 { return 0; }
+        ((missed * 200 + total) / (2 * total)) as u32
+    }
 }
 
 // -- SlashingConfig -----------------------------------------------------------
@@ -217,11 +259,8 @@ pub struct SlashingConfig {
     /// Fraction of bonded stake slashed for equivocation (basis points).
     /// Default: 500 bps = 5%. Burned via BME.
     pub equivocation_slash_bps: u32,
-    /// Fraction of bonded stake slashed for liveness failure (basis points).
-    /// Default: 10 bps = 0.1%. Much lighter than equivocation.
-    pub liveness_slash_bps: u32,
-    /// Fraction of blocks a validator may miss before liveness slash.
-    /// Default: 20% — missing more than 1 in 5 blocks triggers liveness slash.
+    /// Fraction of blocks a validator may miss before it is jailed for a
+    /// liveness failure (jail only -- liveness never burns stake).
     pub liveness_miss_pct_threshold: u32,
     /// Size of the liveness observation window in blocks.
     /// Default: 500 blocks (~8 minutes at 1s blocks).
@@ -244,18 +283,19 @@ impl SlashingConfig {
     pub fn qcb_default() -> Self {
         Self {
             equivocation_slash_bps:      500,    // 5%
-            liveness_slash_bps:          10,     // 0.1%
-            liveness_miss_pct_threshold: 50,     // >50% missed triggers slash (devnet: tolerant of cross-machine gossip lag)
+            // Engine defaults; a chain's genesis may override them within
+            // bounds (chain_forge_core::GenesisConfig::liveness_params).
+            liveness_miss_pct_threshold: chain_forge_core::DEFAULT_LIVENESS_MAX_MISSED_PCT,
             // Restored to 500 blocks for cross-machine devnet operation.
             // At 2000ms block time this gives ~16 minutes before a genuinely
             // offline validator is jailed. Was lowered to 10 for attack testing
             // (restore to 10 for liveness-slash attack tests on a single machine).
-            liveness_window_blocks:      500,
+            liveness_window_blocks:      chain_forge_core::DEFAULT_LIVENESS_WINDOW_BLOCKS,
             min_remaining_stake:         0, // no floor -- slash the full computed amount
             // Grace period: don't start counting liveness misses until the
             // gossip mesh has had time to form (KNOWN_ISSUES §2 fix).
             // Raised to 20 to give cross-machine gossipsub mesh more time to stabilise.
-            liveness_start_height:       20,
+            liveness_start_height:       chain_forge_core::DEFAULT_LIVENESS_START_HEIGHT,
         }
     }
 
@@ -269,10 +309,6 @@ impl SlashingConfig {
 
     pub fn equivocation_slash_amount(&self, bonded: u128) -> u128 {
         self.slash_amount(bonded, self.equivocation_slash_bps)
-    }
-
-    pub fn liveness_slash_amount(&self, bonded: u128) -> u128 {
-        self.slash_amount(bonded, self.liveness_slash_bps)
     }
 }
 
@@ -346,36 +382,25 @@ impl SlashingModule {
         }
         #[cfg(feature = "real-crypto")]
         {
-            use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
-            // Reconstruct the exact bytes the consensus engine signed via
-            // vote_signing_bytes(): b"CFV|" + chain_id + b"|" + type_byte +
-            // height_le + round_le + block_hash_bytes.
-            // Both votes are from the same phase (same vote_type_byte) but
-            // different block hashes, which is the definition of equivocation.
-            let build_msg = |block_hash: &str| -> Vec<u8> {
-                let mut b = Vec::new();
-                b.extend_from_slice(b"CFV|");
-                b.extend_from_slice(chain_id.as_bytes());
-                b.push(b'|');
-                b.push(evidence.vote_type_byte);
-                b.extend_from_slice(&evidence.height.to_le_bytes());
-                b.extend_from_slice(&evidence.round.to_le_bytes());
-                b.extend_from_slice(block_hash.as_bytes());
-                b
+            // The exact bytes the engine signed: vote_signing_bytes, whose
+            // round is a consensus Round (u32). Rebuilding it as the
+            // evidence's u64 rejected every signed evidence. Both votes are
+            // from the same phase but name different blocks.
+            let vote_type = match evidence.vote_type_byte {
+                0 => chain_forge_consensus::VoteType::Prevote,
+                1 => chain_forge_consensus::VoteType::Precommit,
+                b => return Err(SlashError::InvalidEvidence(format!("unknown vote type byte {b}"))),
             };
+            let round = chain_forge_consensus::Round::try_from(evidence.round)
+                .map_err(|_| SlashError::InvalidEvidence(format!("round {} out of range", evidence.round)))?;
+            let build_msg = |block_hash: &str| chain_forge_consensus::vote_signing_bytes(
+                chain_id, &vote_type, evidence.height, round,
+                Some(&chain_forge_consensus::BlockHash(block_hash.to_string())));
             let msg_a = build_msg(&evidence.block_hash_a);
             let msg_b = build_msg(&evidence.block_hash_b);
-            let sig_a = chain_forge_crypto::Signature {
-                scheme: chain_forge_crypto::SchemeId::Classical,
-                bytes:  evidence.signature_a.clone(),
-            };
-            let sig_b = chain_forge_crypto::Signature {
-                scheme: chain_forge_crypto::SchemeId::Classical,
-                bytes:  evidence.signature_b.clone(),
-            };
-            ClassicalScheme.verify(&msg_a, &sig_a, _pub_key)
+            chain_forge_crypto::verify_consensus(&msg_a, &evidence.signature_a, _pub_key)
                 .map_err(|e| SlashError::InvalidEvidence(format!("sig_a invalid: {e}")))?;
-            ClassicalScheme.verify(&msg_b, &sig_b, _pub_key_b)
+            chain_forge_crypto::verify_consensus(&msg_b, &evidence.signature_b, _pub_key_b)
                 .map_err(|e| SlashError::InvalidEvidence(format!("sig_b invalid: {e}")))?;
             Ok(())
         }
@@ -403,8 +428,9 @@ impl SlashingModule {
             evidence.round,
         );
 
-        // Idempotent: write the key BEFORE fallible registry lookup so replay
-        // attacks are blocked even when the validator is transiently absent.
+        // Idempotent: verified evidence for a slot is applied once. The slot
+        // is recorded only after the evidence verifies (below), so a forged
+        // copy cannot use it up and make the real equivocation unslashable.
         if self.equivocation_set.contains(&key) {
             return Err(SlashError::EquivocationAlreadyRecorded(
                 evidence.validator_id.clone(),
@@ -412,7 +438,6 @@ impl SlashingModule {
                 evidence.round,
             ));
         }
-        self.equivocation_set.insert(key.clone());
 
         let record = registry.get(&evidence.validator_id)
             .map_err(|_| SlashError::ValidatorNotFound(evidence.validator_id.clone()))?;
@@ -429,6 +454,7 @@ impl SlashingModule {
                 ))?;
             Self::verify_evidence(chain_id, evidence, &pub_key, &pub_key)?;
         }
+        self.equivocation_set.insert(key.clone());
 
         let bonded_before = record.bonded_uqcb;
         let slash_amount  = self.config.equivocation_slash_amount(bonded_before);
@@ -480,6 +506,8 @@ impl SlashingModule {
         &mut self,
         validator_id:   &str,
         proposed:       bool,
+        proposer:       &str,
+        byzantine_f:    usize,
         registry:       &mut ValidatorRegistry,
         epoch:          u64,
         current_height: u64,
@@ -494,15 +522,19 @@ impl SlashingModule {
             .entry(validator_id.to_string())
             .or_insert_with(|| LivenessWindow::new(window_size));
 
-        window.record(proposed);
+        window.record(proposed, proposer);
 
         // Only check after the window fills for the first time
         if !window.filled { return Ok(None); }
 
-        let missed_pct = window.missed_pct();
+        let missed_pct = window.robust_missed_pct(byzantine_f);
         if missed_pct <= self.config.liveness_miss_pct_threshold { return Ok(None); }
 
-        // Liveness threshold exceeded — slash and jail
+        // Liveness threshold exceeded — jail (temporary, reversible). Stake is
+        // never burned for missed participation: absence from committed
+        // evidence is unobserved behaviour, not a proven fault -- a proposer
+        // can omit an honest validator's precommit. Burning is reserved for
+        // objectively verifiable faults (slash_equivocation).
         let record = match registry.get(validator_id) {
             Ok(r) => r,
             Err(_) => return Ok(None), // validator may have been removed
@@ -513,24 +545,17 @@ impl SlashingModule {
             return Ok(None);
         }
 
-        let bonded_before = record.bonded_uqcb;
-        let slash_amount  = self.config.liveness_slash_amount(bonded_before);
-        let bonded_after  = bonded_before.saturating_sub(slash_amount);
+        let bonded = record.bonded_uqcb;
 
-        registry.update_stake(validator_id, bonded_after)
-            .map_err(|e| SlashError::Registry(e.to_string()))?;
         registry.jail(validator_id, "liveness failure", epoch)
             .map_err(|e| SlashError::Registry(e.to_string()))?;
 
-        // Reset the window after slashing so the validator isn't
-        // immediately re-slashed when they come back online
+        // Reset the window after jailing so the validator isn't
+        // immediately re-jailed when they come back online
         self.liveness_windows.insert(
             validator_id.to_string(),
             LivenessWindow::new(window_size),
         );
-
-        self.total_slashed_uqcb    += slash_amount;
-        self.liveness_slashed_uqcb += slash_amount;
 
         self.history.push(SlashRecord {
             validator_id:  validator_id.to_string(),
@@ -539,20 +564,19 @@ impl SlashingModule {
                 window: window_size as u64,
             },
             epoch,
-            bonded_before,
-            slashed_uqcb:  slash_amount,
-            bonded_after,
+            bonded_before: bonded,
+            slashed_uqcb:  0,
+            bonded_after:  bonded,
             tombstoned:    false,
         });
 
         tracing::warn!(
             validator   = validator_id,
             missed_pct,
-            slashed     = slash_amount,
-            "liveness failure — validator jailed"
+            "liveness failure — validator jailed (no stake burned)"
         );
 
-        Ok(Some(slash_amount))
+        Ok(None)
     }
 
     // -- History and lookups --------------------------------------------------
@@ -573,6 +597,12 @@ impl SlashingModule {
 
     pub fn config(&self) -> &SlashingConfig {
         &self.config
+    }
+
+    /// Replace the policy. Used after restoring persisted slashing state so
+    /// the chain's genesis-derived policy, not whatever was on disk, applies.
+    pub fn set_config(&mut self, config: SlashingConfig) {
+        self.config = config;
     }
 }
 
@@ -633,20 +663,11 @@ mod tests {
     }
 
     #[test]
-    fn liveness_slash_rate_is_point_1_percent() {
-        let cfg = SlashingConfig::qcb_default();
-        assert_eq!(cfg.liveness_slash_bps, 10);
-        let slash = cfg.liveness_slash_amount(10_000_000);
-        assert_eq!(slash, 10_000); // 0.1% of 10 QCB
-    }
-
-    #[test]
     fn slash_cannot_drop_below_minimum_remaining() {
         // With min_remaining_stake = 0 (default), the full computed slash applies.
         // To test the floor, use a custom config with a floor set.
         let cfg = SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      500,
             min_remaining_stake:         ENTRY_STAKE_UQCB, // floor at 1k QCB
@@ -683,8 +704,8 @@ mod tests {
     #[test]
     fn liveness_window_tracks_missed_blocks() {
         let mut w = LivenessWindow::new(10);
-        for _ in 0..8 { w.record(true);  }
-        for _ in 0..2 { w.record(false); }
+        for _ in 0..8 { w.record(true, "p0");  }
+        for _ in 0..2 { w.record(false, "p0"); }
         assert!(w.filled);
         assert_eq!(w.missed_pct(), 20);
     }
@@ -693,17 +714,17 @@ mod tests {
     fn liveness_window_rings_correctly() {
         let mut w = LivenessWindow::new(5);
         // Fill with 5 misses
-        for _ in 0..5 { w.record(false); }
+        for _ in 0..5 { w.record(false, "p0"); }
         assert_eq!(w.missed_pct(), 100);
         // Overwrite with 5 proposals
-        for _ in 0..5 { w.record(true); }
+        for _ in 0..5 { w.record(true, "p0"); }
         assert_eq!(w.missed_pct(), 0);
     }
 
     #[test]
     fn all_proposed_is_zero_miss_rate() {
         let mut w = LivenessWindow::new(100);
-        for _ in 0..100 { w.record(true); }
+        for _ in 0..100 { w.record(true, "p0"); }
         assert_eq!(w.missed_fraction(), 0.0);
     }
 
@@ -770,7 +791,6 @@ mod tests {
         // liveness_start_height=0 so the grace period doesn't block these unit tests.
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
@@ -779,16 +799,103 @@ mod tests {
 
         // Fill window: 8 proposed + 2 missed = 20% -- at threshold, not triggered.
         // current_height=100 so we're well past any grace period.
-        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap(); }
-        for _ in 0..2 { slasher.record_block("val1", false, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..8 { slasher.record_block("val1", true, "p0", 0, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..2 { slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap(); }
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Active,
             "exactly at threshold should not trigger");
 
         // One more miss replaces a 'true': 7 proposed + 3 missed = 30% > 20% -> triggers
-        slasher.record_block("val1", false, &mut reg, 0, 100).unwrap();
+        slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap();
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Jailed,
             "exceeding threshold must jail");
-        assert!(slasher.liveness_slashed_uqcb > 0);
+        assert_eq!(slasher.liveness_slashed_uqcb, 0, "liveness never burns stake");
+    }
+
+    /// Missed participation is unobserved behaviour, not proven misconduct:
+    /// a single proposer can omit an honest validator's precommit. It may
+    /// jail (temporary, reversible) but must never burn stake. Burning is
+    /// reserved for objectively verifiable faults such as double-signing.
+    #[test]
+    fn liveness_failure_jails_without_burning_stake() {
+        let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
+        let mut slasher = SlashingModule::new(SlashingConfig {
+            equivocation_slash_bps:      500,
+            liveness_miss_pct_threshold: 20,
+            liveness_window_blocks:      10,
+            min_remaining_stake:         0,
+            liveness_start_height:       0,
+        });
+        let mut burned = 0u128;
+        for _ in 0..8 { burned += slasher.record_block("val1", true, "p0", 0, &mut reg, 0, 100).unwrap().unwrap_or(0); }
+        for _ in 0..3 { burned += slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap().unwrap_or(0); }
+
+        let rec = reg.get("val1").unwrap();
+        assert_eq!(rec.status, ValidatorStatus::Jailed, "a liveness failure still jails");
+        assert!(rec.jail_records.last().unwrap().unjail_after > 0, "jail must be temporary");
+        assert_eq!(rec.bonded_uqcb, FULL_STAKE_UQCB, "liveness must not reduce bonded stake");
+        assert_eq!(burned, 0, "liveness must not return an amount to burn");
+        assert_eq!(slasher.liveness_slashed_uqcb, 0);
+        assert_eq!(slasher.total_slashed_uqcb, 0);
+    }
+
+    // -- Byzantine-robust liveness (proposer omission) ------------------------
+
+    /// Drive one validator ("v") through `blocks` heights with proposers
+    /// rotating through `proposers`. `v`'s precommit is absent from the
+    /// committed evidence when it is offline or when the block's proposer is
+    /// in `omitted_by`. Returns its final status.
+    fn simulate(
+        blocks: u64, proposers: &[&str], omitted_by: &[&str], offline: bool,
+        miss_every: Option<u64>, byzantine_f: usize,
+    ) -> ValidatorStatus {
+        let mut reg = registry_with_validator("v", FULL_STAKE_UQCB);
+        let mut slasher = SlashingModule::new(SlashingConfig {
+            equivocation_slash_bps:      500,
+            liveness_miss_pct_threshold: 20,
+            liveness_window_blocks:      100,
+            min_remaining_stake:         0,
+            liveness_start_height:       0,
+        });
+        for h in 0..blocks {
+            let proposer = proposers[(h as usize) % proposers.len()];
+            let honest_miss = miss_every.map_or(false, |k| h % k == 0);
+            let signed = !offline && !honest_miss && !omitted_by.contains(&proposer);
+            slasher.record_block("v", signed, proposer, byzantine_f, &mut reg, h / 100, h).unwrap();
+            if reg.get("v").unwrap().status != ValidatorStatus::Active {
+                break;
+            }
+        }
+        reg.get("v").unwrap().status.clone()
+    }
+
+    const FOUR: [&str; 4] = ["a", "b", "c", "d"];
+
+    /// One malicious proposer omits an honest validator from every block it
+    /// proposes, for 50 windows: 25% raw "misses", above the 20% threshold.
+    /// With f = 1 that proposer's evidence must not be able to jail it.
+    #[test]
+    fn one_malicious_proposer_cannot_get_an_honest_validator_jailed() {
+        assert_eq!(simulate(5_000, &FOUR, &["a"], false, None, 1), ValidatorStatus::Active);
+    }
+
+    /// A validator that is really offline is missing from every proposer's
+    /// evidence, so discounting the f most hostile proposers still jails it.
+    #[test]
+    fn offline_validator_is_still_jailed_with_byzantine_discount() {
+        assert_eq!(simulate(5_000, &FOUR, &[], true, None, 1), ValidatorStatus::Jailed);
+    }
+
+    /// The tolerance is bounded: more colluding proposers than f can still
+    /// cause a jailing (two of four omitting with f = 1 leaves 1/3 missed).
+    #[test]
+    fn omission_tolerance_is_bounded_by_f() {
+        assert_eq!(simulate(5_000, &FOUR, &["a", "b"], false, None, 1), ValidatorStatus::Jailed);
+    }
+
+    /// Intermittent honest misses below the threshold do not jail.
+    #[test]
+    fn intermittent_misses_below_threshold_do_not_jail() {
+        assert_eq!(simulate(5_000, &FOUR, &[], false, Some(10), 1), ValidatorStatus::Active);
     }
 
     #[test]
@@ -796,7 +903,6 @@ mod tests {
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
@@ -804,8 +910,8 @@ mod tests {
         });
 
         // Fill window and exceed threshold to trigger slash
-        for _ in 0..8 { slasher.record_block("val1", true,  &mut reg, 0, 100).unwrap(); }
-        for _ in 0..3 { slasher.record_block("val1", false, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..8 { slasher.record_block("val1", true, "p0", 0, &mut reg, 0, 100).unwrap(); }
+        for _ in 0..3 { slasher.record_block("val1", false, "p0", 0, &mut reg, 0, 100).unwrap(); }
 
         // Window should have reset after the slash
         let window = slasher.liveness_window("val1").unwrap();
@@ -817,7 +923,6 @@ mod tests {
         let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
         let mut slasher = SlashingModule::new(SlashingConfig {
             equivocation_slash_bps:      500,
-            liveness_slash_bps:          10,
             liveness_miss_pct_threshold: 20,
             liveness_window_blocks:      10,
             min_remaining_stake:         0,
@@ -827,7 +932,7 @@ mod tests {
         // Record 10 misses at heights 0..9 — all within the grace period.
         // None should trigger a slash even though the window would be 100% missed.
         for h in 0..10u64 {
-            let result = slasher.record_block("val1", false, &mut reg, 0, h).unwrap();
+            let result = slasher.record_block("val1", false, "p0", 0, &mut reg, 0, h).unwrap();
             assert!(result.is_none(), "grace period must suppress slash at height {h}");
         }
         assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Active,
@@ -847,7 +952,7 @@ mod tests {
 
         // Block records for a tombstoned validator should be silently ignored.
         // Use height=100 to clear the default grace period.
-        for _ in 0..501 { slasher.record_block("val1", false, &mut reg, 2, 100).unwrap(); }
+        for _ in 0..501 { slasher.record_block("val1", false, "p0", 0, &mut reg, 2, 100).unwrap(); }
         assert_eq!(slasher.total_slashed_uqcb, slash_count_before,
             "inactive validator must not be slashed again via liveness");
     }
@@ -863,6 +968,42 @@ mod tests {
 
         assert_eq!(slasher.total_slashed_uqcb, burned1 + burned2);
         assert_eq!(slasher.history().len(), 2);
+    }
+
+    /// Forged evidence must not use up the (validator, height, round) slot:
+    /// otherwise anyone who sends a bad copy first makes the real
+    /// equivocation unslashable. The genuine evidence is signed with
+    /// `vote_signing_bytes`, exactly as the engine signs votes (the round
+    /// is a u32 there; reconstructing it as a u64 rejected every real
+    /// signed evidence).
+    #[cfg(feature = "real-crypto")]
+    #[test]
+    fn forged_evidence_does_not_block_genuine_evidence() {
+        use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
+        let kp = ClassicalScheme.generate_keypair("val1-consensus").unwrap();
+        let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
+        reg.register_consensus_key("val1", &kp.public_key, 1).unwrap();
+        // Signed exactly as the consensus engine signs a precommit.
+        let msg = |hash: &str| chain_forge_consensus::vote_signing_bytes(
+            "test-chain", &chain_forge_consensus::VoteType::Precommit, 42, 0,
+            Some(&chain_forge_consensus::BlockHash(hash.into())));
+        let genuine = EquivocationEvidence {
+            validator_id: "val1".into(), height: 42, round: 0,
+            block_hash_a: "blockA".into(), block_hash_b: "blockB".into(),
+            signature_a: chain_forge_crypto::sign_consensus(&msg("blockA"), &kp).unwrap(),
+            signature_b: chain_forge_crypto::sign_consensus(&msg("blockB"), &kp).unwrap(),
+            vote_type_byte: 1,
+        };
+        let mut forged = genuine.clone();
+        forged.signature_b[0] ^= 0xff;
+
+        let mut slasher = SlashingModule::with_qcb_defaults();
+        assert!(matches!(slasher.slash_equivocation(&forged, &mut reg, 5, "test-chain"),
+            Err(SlashError::InvalidEvidence(..))));
+        slasher.slash_equivocation(&genuine, &mut reg, 5, "test-chain")
+            .expect("genuine evidence must still slash after a forged copy was rejected");
+        assert!(matches!(slasher.slash_equivocation(&genuine, &mut reg, 5, "test-chain"),
+            Err(SlashError::EquivocationAlreadyRecorded(..))), "replay is still refused");
     }
 
     #[test]
@@ -897,18 +1038,6 @@ mod tests {
             "validator status must be unchanged after rejected evidence");
         assert_eq!(rec.bonded_uqcb, FULL_STAKE_UQCB,
             "stake must be unchanged after rejected evidence");
-    }
-
-    #[test]
-    fn liveness_slash_is_much_smaller_than_equivocation() {
-        let cfg = SlashingConfig::qcb_default();
-        let bonded = FULL_STAKE_UQCB;
-        let liveness_slash   = cfg.liveness_slash_amount(bonded);
-        let equivocation_slash = cfg.equivocation_slash_amount(bonded);
-        // liveness = 0.1%, equivocation = 5% -- ratio is exactly 50x
-        // assert strictly less with 49x to avoid floating-point equality edge
-        assert!(liveness_slash * 49 < equivocation_slash,
-            "liveness penalty must be much lighter than equivocation penalty");
     }
 }
 

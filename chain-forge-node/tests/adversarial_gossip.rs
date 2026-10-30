@@ -139,8 +139,11 @@ fn node_binary() -> PathBuf {
     }
 }
 
+#[path = "common/consensus_keys.rs"]
+mod consensus_keys;
+
 fn genesis_path() -> PathBuf {
-    repo_root().join("tests").join("devnet").join("genesis-4node.json")
+    consensus_keys::genesis(&repo_root().join("tests").join("devnet").join("genesis-4node.json"))
 }
 
 // ── Node spawn / teardown ─────────────────────────────────────────────────────
@@ -164,7 +167,26 @@ fn devnet_keys_dir() -> PathBuf {
 }
 
 fn key_file_for(label: &str) -> PathBuf {
-    devnet_keys_dir().join(format!("{label}.key.json"))
+    consensus_keys::validator_key(label, devnet_keys_dir().join(format!("{label}.key.json")))
+}
+
+/// Alice's consensus key: the deterministic devnet Ed25519 key, or (with
+/// `CF_CONSENSUS_KEYS=mldsa`) her committed ML-DSA-65 key file.
+fn alice_consensus_key() -> chain_forge_crypto::KeyPair {
+    if !consensus_keys::mldsa() {
+        return ClassicalScheme.generate_keypair("qcb1alice")
+            .expect("deterministic devnet keypair generation must not fail");
+    }
+    let k: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(key_file_for("alice")).unwrap()).unwrap();
+    let hex = |f: &str| -> Vec<u8> {
+        let s = k[f].as_str().unwrap();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    };
+    chain_forge_crypto::KeyPair {
+        scheme: chain_forge_crypto::SchemeId::MlDsa,
+        public_key: hex("public_key"), private_key: hex("private_key"),
+    }
 }
 
 fn spawn_node(
@@ -455,11 +477,6 @@ async fn adversarial_equivocation_over_gossip() {
     eprintln!("   [attacker] waiting 2s for gossipsub mesh...");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Read the CURRENT committed height, equivocate on current+1 (open for voting).
-    let current_height = height_of(ports.alice_api);
-    let attack_height  = current_height + 1;
-    eprintln!("   [attacker] current={current_height} → equivocating on height={attack_height}");
-
     let balance_before = balance_of(ports.alice_api, "qcb1alice");
     eprintln!("   alice balance before: {balance_before:?} uqcb");
 
@@ -477,12 +494,11 @@ async fn adversarial_equivocation_over_gossip() {
     // sign both conflicting votes with it, so the test still proves what
     // it always meant to: a validator who double-votes gets caught, now
     // under the stricter signature regime rather than around it.
-    let alice_kp = ClassicalScheme.generate_keypair("qcb1alice")
-        .expect("deterministic devnet keypair generation must not fail");
-    let sign = |vote_type: VoteType, block_hash: &str| -> Vote {
+    let alice_kp = alice_consensus_key();
+    let sign = |vote_type: VoteType, block_hash: &str, height: u64| -> Vote {
         let mut vote = Vote {
             vote_type,
-            height:     attack_height,
+            height,
             round:      0,
             validator:  ValidatorId("qcb1alice".to_string()),
             block_hash: Some(BlockHash(block_hash.to_string())),
@@ -493,26 +509,69 @@ async fn adversarial_equivocation_over_gossip() {
             "qcb-devnet-4node", &vote.vote_type, vote.height, vote.round,
             vote.block_hash.as_ref(),
         );
-        vote.signature = ClassicalScheme.sign(&bytes, &alice_kp)
-            .expect("signing must not fail").bytes;
+        vote.signature = chain_forge_crypto::sign_consensus(&bytes, &alice_kp)
+            .expect("signing must not fail");
+        vote.scheme = chain_forge_crypto::consensus_scheme_tag(&alice_kp.scheme).to_string();
         vote
     };
-    let vote_a = sign(VoteType::Prevote, "block_hash_version_AAAAAAAAAAAAA");
-    let vote_b = sign(VoteType::Prevote, "block_hash_version_BBBBBBBBBBBBB");
 
-    eprintln!("   [attacker] sending equivocating prevotes A then B...");
-    attacker.publish(OutboundMessage {
-        topic:   GossipTopic::ConsensusVote,
-        payload: serde_json::to_vec(&vote_a).unwrap(),
-    }).await.expect("publish vote A");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    attacker.publish(OutboundMessage {
-        topic:   GossipTopic::ConsensusVote,
-        payload: serde_json::to_vec(&vote_b).unwrap(),
-    }).await.expect("publish vote B");
-
-    // Give nodes time to detect, drain, and slash.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Deterministic delivery. A vote for a height the nodes have already
+    // passed is dropped without a log line, so a single send aimed at
+    // "current + 1" raced block production and failed intermittently.
+    // Instead: (1) wait for a block to commit, so the next height has just
+    // opened; (2) send both conflicting votes for that open height at once;
+    // (3) confirm from the node logs that the evidence reached the
+    // validation point ("evidence queued"); (4) otherwise retry at the next
+    // height. Evidence is one per validator and an already-slashed
+    // validator is refused, so retries cannot slash twice.
+    // Node logs carry ANSI colour codes between a field name and its value.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() { if c.is_ascii_alphabetic() { break; } }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+    let queued_at = |h: u64| -> bool {
+        ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"].iter().any(|n| {
+            strip_ansi(&std::fs::read_to_string(log_dir.join(format!("{n}.log"))).unwrap_or_default())
+                .lines().any(|l| l.contains("evidence queued") && l.contains("validator=qcb1alice")
+                                 && l.contains(&format!("height={h} ")))
+        })
+    };
+    let mut attack_height = 0;
+    let mut confirmed = false;
+    for attempt in 1..=5 {
+        let committed = height_of(ports.alice_api);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while height_of(ports.alice_api) == committed && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        attack_height = height_of(ports.alice_api) + 1;
+        eprintln!("   [attacker] attempt {attempt}: height {} just committed -> equivocating on open height {attack_height}",
+                  attack_height - 1);
+        for hash in ["block_hash_version_AAAAAAAAAAAAA", "block_hash_version_BBBBBBBBBBBBB"] {
+            attacker.publish(OutboundMessage {
+                topic:   GossipTopic::ConsensusVote,
+                payload: serde_json::to_vec(&sign(VoteType::Prevote, hash, attack_height)).unwrap(),
+            }).await.expect("publish equivocating vote");
+        }
+        let confirm_by = Instant::now() + Duration::from_secs(3);
+        while !confirmed && Instant::now() < confirm_by {
+            confirmed = queued_at(attack_height);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if confirmed {
+            eprintln!("   [attacker] evidence for height {attack_height} reached validation (queued) on attempt {attempt}");
+            break;
+        }
+    }
+    assert!(confirmed, "equivocating votes never reached evidence validation in 5 synchronized attempts");
 
     println!("   [phase2] Verifying chain advanced past height {}...", attack_height + 2);
     let advanced = poll_until_height(
@@ -563,21 +622,32 @@ async fn adversarial_equivocation_over_gossip() {
     println!("   PASS: equivocation detected for qcb1alice at height={attack_height} \
               (confirmed in node logs, not a startup-misfire line).");
 
-    // Slash-balance check is informational: BME burn may fail if penalty > stake
-    // (see KNOWN_ISSUES.md §1).
-    match (balance_before, balance_after) {
-        (Some(b), Some(a)) if a < b => {
-            println!("   PASS: Alice slashed ({b} → {a} uqcb, burned {}).", b - a);
-        }
-        (Some(b), Some(a)) => {
-            println!("   NOTE: balance unchanged ({b} → {a} uqcb). \
-                      BME burn likely failed (slash > stake) — tombstone still applied. \
-                      See KNOWN_ISSUES.md §1.");
-        }
-        _ => {
-            println!("   NOTE: could not read Alice's balance from API.");
-        }
+    // ── Release gate 4: the slash comes from committed evidence, so every
+    // node applies it identically and no node diverges. (Before gate 4 a
+    // node slashed locally when it saw the double vote, node states
+    // diverged and the chain halted; signed evidence also never verified.)
+    assert!(
+        poll_until_height(&ports.all_api_ports(), attack_height + 2, Duration::from_secs(20)),
+        "all 4 nodes must pass height {} after the equivocation", attack_height + 2
+    );
+    let balances: Vec<Option<u128>> = ports.all_api_ports().iter()
+        .map(|&p| balance_of(p, "qcb1alice")).collect();
+    println!("   alice balance per node after: {balances:?} (before: {balance_before:?})");
+    let before = balance_before.expect("alice balance before the attack");
+    for b in &balances {
+        let b = b.expect("alice balance readable on every node");
+        assert!(b < before, "alice must be slashed on every node: {before} -> {b}");
+        assert_eq!(Some(b), balances[0], "every node must apply the same slash: {balances:?}");
     }
+    for name in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+        let log = std::fs::read_to_string(log_dir.join(format!("{name}.log"))).unwrap_or_default();
+        assert!(!log.contains("STATE DIVERGENCE"), "{name} diverged after the equivocation");
+        assert!(log.contains("committed equivocation evidence slashed"),
+            "{name} must slash from the committed evidence");
+    }
+    println!("   PASS: alice slashed identically on 4/4 nodes from committed evidence \
+              ({before} -> {}), no divergence.", balances[0].unwrap());
+    let _ = balance_after;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -639,23 +709,37 @@ async fn adversarial_garbage_signature() {
     let mut garbage = vec![0u8; 64];
     for (i, b) in garbage.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(37); }
 
+    // Wait for the gossipsub mesh, then send the vote several times, each
+    // aimed at the next height and published at once: a vote for a height
+    // a node has already passed is dropped without a log line.
+    eprintln!("   [attacker] waiting 2s for gossipsub mesh...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     // Forge a vote from the real validator qcb1bob but with garbage bytes as
     // the signature.  With the genesis public key on file, every receiving node
-    // will attempt Ed25519 verification and reject it.
-    let current_height = height_of(ports.alice_api);
-    let attack_height  = current_height + 1;
-    let forged_vote = Vote {
-        vote_type:  VoteType::Prevote,
-        height:     attack_height,
-        round:      0,
-        validator:  ValidatorId("qcb1bob".to_string()),
-        block_hash: Some(BlockHash("block_h_r0_garbage_sig_00000000".to_string())),
-        signature:  garbage,
-        scheme:     Vote::default_scheme(),
-    };
-
-    eprintln!("   [attacker] sending forged vote from qcb1bob (garbage sig) at height={attack_height}...");
-    attacker_publish_vote(&attacker, &forged_vote).await;
+    // will attempt signature verification and reject it.
+    let mut attack_height = 0;
+    for _ in 0..6 {
+        attack_height = height_of(ports.alice_api) + 1;
+        let forged_vote = Vote {
+            vote_type:  VoteType::Prevote,
+            height:     attack_height,
+            round:      0,
+            validator:  ValidatorId("qcb1bob".to_string()),
+            block_hash: Some(BlockHash("block_h_r0_garbage_sig_00000000".to_string())),
+            signature:  garbage.clone(),
+            scheme:     Vote::default_scheme(),
+        };
+        // Publish immediately: attacker_publish_vote sleeps 2s first, by
+        // which time the nodes have usually passed attack_height and drop
+        // the vote without logging (the original intermittent failure).
+        eprintln!("   [attacker] sending forged vote from qcb1bob (garbage sig) at height={attack_height}...");
+        attacker.publish(OutboundMessage {
+            topic:   GossipTopic::ConsensusVote,
+            payload: serde_json::to_vec(&forged_vote).expect("vote serialise"),
+        }).await.expect("attacker publish");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 
     // Give the nodes time to receive, attempt to verify, and log the rejection.
     tokio::time::sleep(Duration::from_secs(2)).await;

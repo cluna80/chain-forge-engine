@@ -115,8 +115,11 @@ fn node_binary() -> PathBuf {
     }
 }
 
+#[path = "common/consensus_keys.rs"]
+mod consensus_keys;
+
 fn genesis_path() -> PathBuf {
-    repo_root().join("tests").join("devnet").join("genesis-mldsa.json")
+    consensus_keys::genesis(&repo_root().join("tests").join("devnet").join("genesis-mldsa.json"))
 }
 
 fn key_file(label: &str) -> PathBuf {
@@ -205,7 +208,7 @@ fn spawn_node(
 }
 
 fn spawn_devnet(ports: &DevnetPorts, log_dir: &PathBuf) -> Vec<NodeHandle> {
-    let kf = |label: &str| Some(key_file(label));
+    let kf = |label: &str| Some(consensus_keys::validator_key(label, key_file(label)));
     vec![
         spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p, log_dir,
                    &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice"), None),

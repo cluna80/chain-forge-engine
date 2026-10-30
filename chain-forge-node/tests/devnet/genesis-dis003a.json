@@ -1,0 +1,99 @@
+{
+  "chain_id": "qcb-devnet-dis003a",
+  "chain_name": "QuarkCharmBit DIS-003A Recovery Policy Security Devnet",
+  "engine_version": "0.1.0",
+  "genesis_time": "2026-10-26T00:00:00Z",
+  "environment": {
+    "mode": "testnet",
+    "faucet_enabled": true,
+    "relaxed_limits": true
+  },
+  "native_token": {
+    "name": "QuarkCharm",
+    "symbol": "QCB",
+    "denom": "uqcb",
+    "max_supply": "210000000"
+  },
+  "address_prefix": "qcb",
+  "consensus": {
+    "type": "proof-of-stake",
+    "validator_set_size": 4,
+    "block_time_ms": 2000,
+    "personhood_weighted": true
+  },
+  "execution": {
+    "state_model": "account",
+    "parallel_execution": false,
+    "gas_model": "dynamic",
+    "require_signatures": true
+  },
+  "cryptography": {
+    "signature_scheme": "hybrid",
+    "pqc_algorithm": "ml-dsa",
+    "migration_trigger": "nist-guidance",
+    "hash_width": 256,
+    "validator_scheme": "pqc-native"
+  },
+  "network": {
+    "network_id": "qcb-devnet-dis003a",
+    "p2p_port": 27000,
+    "rpc_port": 27001,
+    "bootstrap_nodes": [],
+    "peer_discovery": "bootstrap",
+    "max_peers": 10
+  },
+  "limits": {
+    "max_block_bytes": 1048576,
+    "max_tx_bytes": 65536,
+    "block_gas_limit": 10000000,
+    "mempool_size": 100,
+    "mempool_ttl_seconds": 60
+  },
+  "modules": [
+    "bank",
+    "staking",
+    "identity",
+    "agents"
+  ],
+  "custom_modules": [],
+  "genesis_accounts": [
+    {
+      "label": "Alice",
+      "address": "qcb1alice",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "e1cb252a0db0514e8e639a5d20755a66af385deae8f1b44932c97845d5cc856e"
+    },
+    {
+      "label": "Bob",
+      "address": "qcb1bob",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "92eb29af99ec7629c13d4b9e15a588434783ba97a7ff1a7f18eb31c6d077e856"
+    },
+    {
+      "label": "Carol",
+      "address": "qcb1carol",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "318e1213c8da2c7b01d31d55d1239ff0518e5811ba57e4077925dcbf35a5600a"
+    },
+    {
+      "label": "Dave",
+      "address": "qcb1dave",
+      "balance": "500000000",
+      "role": "validator",
+      "public_key": "ae1c44b845f7309694870b923926dd3db641e4e5a5ec7fb75180b74cc8aabc1d"
+    },
+    {
+      "label": "Pilot",
+      "address": "qcb1pilot",
+      "balance": "50000000",
+      "role": "user"
+    }
+  ],
+  "attestation_coordinator": "qcb1alice",
+  "settlement_operators": [
+    "qcb1alice"
+  ]
+}

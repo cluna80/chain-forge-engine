@@ -16,7 +16,7 @@ async-trait = { workspace = true }
 tracing     = { workspace = true }
 
 [features]
-real-crypto = ["chain-forge-crypto"]
+real-crypto = ["chain-forge-crypto", "chain-forge-crypto/real-pqc"]
 
 [dev-dependencies]
 tokio = { workspace = true }

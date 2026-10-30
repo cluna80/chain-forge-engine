@@ -31,7 +31,7 @@ license.workspace = true
 # Section 3.3 (personhood-weighted BFT security), Section 6.3 (burn).
 
 [features]
-real-crypto = ["chain-forge-crypto"]
+real-crypto = ["chain-forge-crypto", "chain-forge-crypto/real-pqc"]
 
 [dependencies]
 chain-forge-core       = { path = "../chain-forge-core" }

@@ -95,8 +95,13 @@ fn node_binary() -> PathBuf {
     }
 }
 
-fn genesis_path() -> PathBuf {
-    repo_root().join("tests").join("devnet").join("genesis-4node.json")
+/// Ed25519 consensus keys (the fallback devnet).
+const ED25519: (&str, &str) = ("genesis-4node.json", "keys");
+/// ML-DSA-65 consensus keys (owner decision 2026-10-28).
+const MLDSA: (&str, &str) = ("genesis-4node-mldsa.json", "keys/mldsa");
+
+fn genesis_path(file: &str) -> PathBuf {
+    repo_root().join("tests").join("devnet").join(file)
 }
 
 // ── Network helpers ───────────────────────────────────────────────────────────
@@ -143,6 +148,37 @@ fn poll_height(api_port: u16) -> Option<u64> {
         .nth(1)
         .and_then(|s| s.split([',', '}']).next())
         .and_then(|s| s.trim().parse().ok())
+}
+
+/// (block_hash, state_root) of block `height` as reported by the node.
+fn block_at(api_port: u16, height: u64) -> Option<(String, String)> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{api_port}")).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    let request = format!(
+        "GET /api/blocks/{height} HTTP/1.0\r\nHost: 127.0.0.1:{api_port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok()?;
+    let v: serde_json::Value = serde_json::from_str(buf.split("\r\n\r\n").nth(1)?).ok()?;
+    Some((v["block_hash"].as_str()?.to_string(), v["state_root"].as_str()?.to_string()))
+}
+
+/// Every node must report the same block hash (not merely the same state
+/// root: two different empty blocks execute to the same root) for every
+/// height up to `upto`.
+fn assert_block_agreement(label: &str, upto: u64) {
+    for h in 1..=upto {
+        let seen: Vec<Option<(String, String)>> = API_PORTS.iter().map(|&p| block_at(p, h)).collect();
+        assert!(seen.iter().all(Option::is_some), "[{label}] block {h} missing on some node: {seen:?}");
+        for (i, b) in seen.iter().enumerate().skip(1) {
+            assert_eq!(b, &seen[0],
+                "[{label}] CONFLICTING FINALIZATION at height {h}: {} has {b:?}, {} has {:?}",
+                VALIDATORS[i], VALIDATORS[0], seen[0]);
+        }
+    }
+    println!("── [{label}] all 4 nodes agree on block hash and state root for heights 1..={upto}");
 }
 
 /// Ensure a port is free before we try to bind it.
@@ -234,8 +270,40 @@ impl Drop for NodeProcess {
 
 // ── Shared: spawn + wait for APIs ────────────────────────────────────────────
 
-fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeProcess> {
+/// Alice's libp2p peer id, read from her log ("P2P listening ... peer=<id>").
+/// tests/devnet/genesis-4node.json uses bootstrap-only discovery (745ceab,
+/// so test nodes never peer with a physical devnet over mDNS), which means
+/// the other three nodes must be told whom to dial.
+fn read_peer_id(log_path: &PathBuf, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(log_path).unwrap_or_default();
+        let clean: String = {
+            let mut out = String::with_capacity(text.len());
+            let mut in_esc = false;
+            for c in text.chars() {
+                if c == '\x1b' { in_esc = true; continue; }
+                if in_esc { if c == 'm' { in_esc = false; } continue; }
+                out.push(c);
+            }
+            out
+        };
+        if let Some(id) = clean.lines()
+            .filter(|l| l.contains("P2P listening"))
+            .find_map(|l| l.split("peer=").nth(1))
+            .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+            .filter(|id| id.starts_with("12D3"))
+        {
+            return id;
+        }
+        assert!(Instant::now() < deadline, "no libp2p peer id in {log_path:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, key_dir: &str, log_dir: &PathBuf) -> Vec<NodeProcess> {
     let mut nodes: Vec<NodeProcess> = Vec::new();
+    let mut bootstrap: Option<String> = None;
 
     for (i, &validator) in VALIDATORS.iter().enumerate() {
         let api_port = API_PORTS[i];
@@ -249,17 +317,21 @@ fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeP
         // Derive key file from validator name: "qcb1alice" -> "alice.key.json"
         let short_name = validator.strip_prefix("qcb1").unwrap_or(validator);
         let key_file = repo_root()
-            .join("tests").join("devnet").join("keys")
+            .join("tests").join("devnet").join(key_dir)
             .join(format!("{short_name}.key.json"));
 
-        let child = Command::new(bin)
-            .args([
+        let mut cmd = Command::new(bin);
+        cmd.args([
                 "--genesis",   genesis.to_str().unwrap(),
                 "--validator", validator,
                 "--key-file",  key_file.to_str().unwrap(),
                 "--api-port",  &api_port.to_string(),
                 "--p2p-port",  &p2p_port.to_string(),
-            ])
+            ]);
+        if let Some(b) = &bootstrap {
+            cmd.args(["--bootstrap", b]);
+        }
+        let child = cmd
             .stdout(log_file.try_clone().unwrap())
             .stderr(log_file)
             .stdin(Stdio::null())
@@ -267,6 +339,13 @@ fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeP
             .unwrap_or_else(|e| panic!("failed to spawn {validator}: {e}"));
 
         nodes.push(NodeProcess { validator, child, api_port });
+
+        if i == 0 {
+            // Everyone else bootstraps against the first node.
+            let peer = read_peer_id(&log_path, Duration::from_secs(15));
+            bootstrap = Some(format!("/ip4/127.0.0.1/tcp/{p2p_port}/p2p/{peer}"));
+            println!("   bootstrap: {}", bootstrap.as_deref().unwrap());
+        }
     }
 
     // Wait for every API port to bind.
@@ -364,6 +443,17 @@ fn poll_until_height(
 
 #[test]
 fn devnet_4node_reaches_target_height() {
+    liveness(ED25519, "qcb-devnet-4node");
+}
+
+/// Same run with every validator on an ML-DSA-65 consensus key: no
+/// Ed25519 key exists in this genesis, so every counted vote is ML-DSA.
+#[test]
+fn devnet_4node_mldsa_reaches_target_height() {
+    liveness(MLDSA, "qcb-devnet-4node-mldsa");
+}
+
+fn liveness((genesis_file, key_dir): (&str, &str), log_name: &str) {
     let bin = node_binary();
     if !bin.exists() {
         println!(
@@ -373,7 +463,7 @@ fn devnet_4node_reaches_target_height() {
         return;
     }
 
-    let genesis = genesis_path();
+    let genesis = genesis_path(genesis_file);
     assert!(genesis.exists(), "genesis file not found: {genesis:?}");
 
     for port in API_PORTS.iter().chain(P2P_PORTS.iter()) {
@@ -400,11 +490,12 @@ fn devnet_4node_reaches_target_height() {
            timeout:       {timeout:?}\n"
     );
 
-    let log_dir = std::env::temp_dir().join("qcb-devnet-4node");
+    let log_dir = std::env::temp_dir().join(log_name);
     std::fs::create_dir_all(&log_dir).unwrap();
 
-    let mut nodes = spawn_nodes(&bin, &genesis, &log_dir);
+    let mut nodes = spawn_nodes(&bin, &genesis, key_dir, &log_dir);
     poll_until_height(&mut nodes, target_height, timeout, &log_dir, "liveness");
+    assert_block_agreement("liveness", target_height);
     // NodeProcess::drop() kills the children.
 }
 
@@ -422,6 +513,15 @@ fn devnet_4node_reaches_target_height() {
 /// Skipped (not failed) when iptables is unavailable or unprivileged.
 #[test]
 fn devnet_4node_partition_recovery() {
+    partition_recovery(ED25519, "qcb-devnet-4node-partition");
+}
+
+#[test]
+fn devnet_4node_mldsa_partition_recovery() {
+    partition_recovery(MLDSA, "qcb-devnet-4node-mldsa-partition");
+}
+
+fn partition_recovery((genesis_file, key_dir): (&str, &str), log_name: &str) {
     let bin = node_binary();
     if !bin.exists() {
         println!(
@@ -439,7 +539,7 @@ fn devnet_4node_partition_recovery() {
         return;
     }
 
-    let genesis = genesis_path();
+    let genesis = genesis_path(genesis_file);
     assert!(genesis.exists(), "genesis file not found: {genesis:?}");
 
     for port in API_PORTS.iter().chain(P2P_PORTS.iter()) {
@@ -477,7 +577,7 @@ fn devnet_4node_partition_recovery() {
            alice_p2p_port:  {alice_p2p_port}\n"
     );
 
-    let log_dir = std::env::temp_dir().join("qcb-devnet-4node-partition");
+    let log_dir = std::env::temp_dir().join(log_name);
     std::fs::create_dir_all(&log_dir).unwrap();
 
     // Pre-emptively remove any stale DROP rules left over from a crashed
@@ -487,7 +587,7 @@ fn devnet_4node_partition_recovery() {
 
     // ── Phase 1: steady-state liveness ───────────────────────────────────────
     println!("── Phase 1: steady state ────────────────────────────────────────────");
-    let mut nodes = spawn_nodes(&bin, &genesis, &log_dir);
+    let mut nodes = spawn_nodes(&bin, &genesis, key_dir, &log_dir);
     poll_until_height(&mut nodes, phase1_target, timeout, &log_dir, "phase1/steady-state");
 
     // ── Phase 2: partition (DROP Alice's P2P port) ────────────────────────────
@@ -516,9 +616,96 @@ fn devnet_4node_partition_recovery() {
     guard.active = false; // disarm the guard — we already cleaned up
 
     poll_until_height(&mut nodes, phase3_target, timeout, &log_dir, "phase3/recovery");
+    assert_block_agreement("phase3/recovery", phase3_target);
 
     println!("── Partition recovery PASSED ────────────────────────────────────────");
     println!("   Alice re-joined the network and all 4 nodes reached height {phase3_target}.");
     println!();
     // NodeProcess::drop() kills the children.
+}
+
+/// The node's keygen produces a fresh key per run, for both schemes.
+#[test]
+fn keygen_never_repeats_a_key() {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_chain-forge-keygen"));
+    let dir = std::env::temp_dir().join(format!("cf-keygen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for scheme in ["ed25519", "ml-dsa-65"] {
+        let keys: Vec<serde_json::Value> = (0..2).map(|i| {
+            let out = dir.join(format!("{scheme}-{i}.key.json"));
+            let st = Command::new(&bin)
+                .args(["--address", "qcb1alice", "--scheme", scheme, "--out", out.to_str().unwrap()])
+                .stdout(Stdio::null()).status().unwrap();
+            assert!(st.success());
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap()
+        }).collect();
+        assert_ne!(keys[0]["private_key"], keys[1]["private_key"], "{scheme}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The ML-DSA devnet must accept the largest guardian recovery the protocol
+/// allows: 10 guardians (MAX_GUARDIANS), each an ML-DSA key plus signature,
+/// in today's JSON transaction encoding. Owner decision 2026-10-30:
+/// `max_tx_bytes` 262144 on the upgraded ML-DSA devnet (mainnet not final).
+#[test]
+fn mldsa_genesis_fits_a_ten_guardian_recovery() {
+    use chain_forge_crypto::{mldsa_tx_prehash, MlDsaScheme, SchemeId, SignatureScheme};
+    use chain_forge_execution::{
+        account_key_rotation_signing_bytes, check_tx, recovery_domain_signing_bytes,
+        GuardianAuth, Transaction, TxBody,
+    };
+
+    let genesis: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(genesis_path(MLDSA.0)).unwrap(),
+    ).unwrap();
+    let chain_id = genesis["chain_id"].as_str().unwrap();
+    let max_tx_bytes = genesis["limits"]["max_tx_bytes"].as_u64().unwrap() as usize;
+    let block_gas_limit = genesis["limits"]["block_gas_limit"].as_u64().unwrap();
+
+    let account = "qcb1alice";
+    let key_version = 1;
+    let policy_id = 1;
+    let new_kp = MlDsaScheme.generate_keypair("recovery-size-new").unwrap();
+    let pop = MlDsaScheme.sign(
+        &account_key_rotation_signing_bytes(chain_id, account, key_version, &new_kp.public_key),
+        &new_kp,
+    ).unwrap();
+    let guardian_signatures: Vec<GuardianAuth> = (0..10).map(|i| {
+        let g = MlDsaScheme.generate_keypair(&format!("recovery-size-guardian-{i}")).unwrap();
+        let msg = recovery_domain_signing_bytes(
+            chain_id, account, key_version, &new_kp.public_key, policy_id, Some(u64::MAX),
+        );
+        GuardianAuth {
+            guardian_public_key: g.public_key.clone(),
+            signature:           MlDsaScheme.sign(&msg, &g).unwrap().bytes,
+            expires_at_height:   Some(u64::MAX),
+        }
+    }).collect();
+    let body = TxBody::RecoverAccountKey {
+        new_public_key: new_kp.public_key.clone(),
+        new_key_scheme: "ml-dsa-65".into(),
+        key_version,
+        pop_signature: pop.bytes,
+        guardian_signatures,
+        policy_id,
+    };
+    let sender = MlDsaScheme.generate_keypair("recovery-size-sender").unwrap();
+    let body_json = serde_json::to_string(&body).unwrap();
+    let sig = MlDsaScheme.sign(&mldsa_tx_prehash(chain_id, body_json.as_bytes()), &sender).unwrap();
+    let tx = Transaction {
+        id: "recovery-size".into(), sender: account.into(), nonce: 1, body,
+        gas_limit: 800_000,
+        signature: vec![], public_key: vec![],
+        pq_signatures: vec![format!("mldsa65:{}",
+            sig.bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())],
+        sig_scheme: Some(SchemeId::MlDsa),
+        pq_public_key: sender.public_key.clone(),
+    };
+
+    let size = serde_json::to_vec(&tx).unwrap().len();
+    println!("10-guardian ML-DSA recovery: {size} bytes; genesis max_tx_bytes {max_tx_bytes}");
+    assert!(size > 65_536, "the old 64 KiB limit is what this guards against");
+    check_tx(&tx, max_tx_bytes, block_gas_limit)
+        .unwrap_or_else(|e| panic!("{} must fit a 10-guardian recovery: {e}", MLDSA.0));
 }

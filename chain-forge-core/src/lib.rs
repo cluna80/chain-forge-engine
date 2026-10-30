@@ -393,7 +393,55 @@ pub struct GenesisConfig {
     /// job (see `chain-forge-node::Node::new_with_config`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_bonding: Option<GenesisValidatorBonding>,
+
+    /// Optional identity-layer parameters. Omitted means the engine
+    /// defaults (`DEFAULT_ATTESTATION_QUORUM`). The effective values are
+    /// resolved and validated by `GenesisConfig::attestation_quorum`; every
+    /// node that loads the same genesis computes the same quorum, and no
+    /// runtime flag or environment variable can override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<GenesisIdentity>,
 }
+
+/// See `GenesisConfig::identity`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenesisIdentity {
+    /// Distinct eligible (Verified or Established) attesters a Provisional
+    /// identity needs before it becomes Verified. `None` means
+    /// `DEFAULT_ATTESTATION_QUORUM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_quorum: Option<usize>,
+
+    /// Maximum active outbound attestations one attester may hold within
+    /// the rolling attestation-cap window. `None` means
+    /// `DEFAULT_ATTESTATION_CAP_PER_WINDOW`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_cap_per_window: Option<u32>,
+
+    /// Explicit opt-in for identity parameters weaker than production: a
+    /// quorum below `DEFAULT_ATTESTATION_QUORUM` or a per-attester cap above
+    /// `DEFAULT_ATTESTATION_CAP_PER_WINDOW`. Honoured only when
+    /// `environment.mode == "devnet"` AND the engine was built with the
+    /// `insecure-dev-quorum` cargo feature. Both weaken Sybil resistance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_dev_identity_overrides: bool,
+}
+
+/// Production web-of-trust quorum: distinct eligible attesters required
+/// before a Provisional identity becomes Verified. Whitepaper Section 4 /
+/// Identity Pilot Design Section 3.1: "provisional target: 3 attestations."
+/// Also the minimum any non-devnet genesis may configure.
+pub const DEFAULT_ATTESTATION_QUORUM: usize = 3;
+
+/// Upper bound on a configured quorum. A larger value is almost certainly a
+/// typo and would make Verified unreachable.
+pub const MAX_ATTESTATION_QUORUM: usize = 64;
+
+/// Production per-attester cap: active outbound attestations one attester
+/// may hold within the rolling window. Bounds how fast a single compromised
+/// Verified identity can vouch for a cohort of fake claimants. Also the
+/// maximum any non-devnet genesis may configure.
+pub const DEFAULT_ATTESTATION_CAP_PER_WINDOW: u32 = 3;
 
 /// See `GenesisConfig::validator_bonding`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,12 +536,114 @@ pub struct GenesisConsensus {
     #[serde(default)]
     pub personhood_weighted: bool,
     /// BFT algorithm variant to use for this chain.
-    /// One of: "tendermint" (default), "hotstuff", "xrpl".
-    /// Omitting this field uses TendermintStyle, preserving backward
-    /// compatibility with all existing genesis files.
+    /// One of: "tendermint" (default), "hotstuff", "xrpl". Omitting it
+    /// selects Tendermint. "hotstuff" and "xrpl" are devnet-only (release
+    /// gate 2); see `GenesisConfig::bft_variant`.
     #[serde(default)]
     pub bft_variant: Option<String>,
+    /// Liveness (missed-participation) policy. Omitted means the engine
+    /// defaults. Resolved and validated by `GenesisConfig::liveness_params`;
+    /// every node derives the same values and there is no runtime override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<GenesisLiveness>,
+    /// Epoch-reward eligibility policy, measured separately from liveness.
+    /// Omitted means the engine defaults. Resolved and validated by
+    /// `GenesisConfig::reward_params`; no runtime override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewards: Option<GenesisRewards>,
 }
+
+/// See `GenesisConsensus::rewards`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenesisRewards {
+    /// A validator earns the closed epoch's reward share only if it appears
+    /// in at least this percentage of that epoch's committed evidence, after
+    /// the Byzantine-robust discount for omitting proposers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_participation_pct: Option<u32>,
+    /// Capital premium slope (Model C, docs/validator-economics-spec.md):
+    /// basis points of reward weight per 1,000 QCB bonded above `bond_min`.
+    /// 0 (default) disables the premium.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premium_k_bps_per_kqcb: Option<u32>,
+    /// Hard cap on the premium, in basis points of reward weight (0 = off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premium_cap_bps: Option<u32>,
+}
+
+/// Ed25519 consensus public key length.
+pub const ED25519_CONSENSUS_KEY_BYTES: usize = 32;
+/// ML-DSA-65 (FIPS 204) consensus public key length.
+pub const MLDSA65_CONSENSUS_KEY_BYTES: usize = 1952;
+
+/// BFT engine a chain runs, resolved by `GenesisConfig::bft_variant`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BftVariant {
+    /// Tendermint (Algorithm 1): engine-driven voting with locks.
+    Tendermint,
+    /// HotStuff-style BFT.
+    HotStuff,
+    /// XRPL-inspired federated agreement.
+    Fba,
+}
+
+/// Resolved, validated reward-eligibility policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewardParams {
+    pub min_participation_pct: u32,
+    /// Premium slope: bps of weight per 1,000 QCB above `bond_min`.
+    pub premium_k_bps_per_kqcb: u32,
+    /// Premium cap in bps of weight.
+    pub premium_cap_bps:        u32,
+}
+
+/// Capital premium bounds: the cap can add at most +50% reward weight; the
+/// slope at most +100% per 1,000 QCB (the cap still applies).
+pub const REWARD_PREMIUM_CAP_BPS_MAX: u32 = 5_000;
+pub const REWARD_PREMIUM_K_BPS_PER_KQCB_MAX: u32 = 10_000;
+
+/// Conservative initial policy: with the Byzantine-robust discount, an
+/// honest validator loses its share only when it is itself absent from a
+/// third of the evidence (late precommits, restarts), not because up to f
+/// proposers omit it.
+pub const DEFAULT_REWARD_MIN_PARTICIPATION_PCT: u32 = 67;
+/// Bounds: below half, an absent validator earns as much as a present one;
+/// near 100%, ordinary vote latency costs honest validators their reward.
+pub const REWARD_MIN_PARTICIPATION_PCT_RANGE: (u32, u32) = (50, 90);
+
+/// See `GenesisConsensus::liveness`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenesisLiveness {
+    /// Sliding window, in blocks, over which participation is measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_blocks: Option<usize>,
+    /// A validator missing more than this percentage of the window (after the
+    /// Byzantine-robust discount) is jailed. Jail is temporary; liveness never
+    /// burns stake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_missed_pct: Option<u32>,
+    /// No liveness enforcement before this height (lets the network form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_height: Option<u64>,
+}
+
+/// Resolved, validated liveness policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LivenessParams {
+    pub window_blocks:  usize,
+    pub max_missed_pct: u32,
+    pub start_height:   u64,
+}
+
+pub const DEFAULT_LIVENESS_WINDOW_BLOCKS: usize = 500;
+/// Conservative initial policy: with the Byzantine-robust discount, an
+/// honest validator must still miss over half of the remaining blocks.
+pub const DEFAULT_LIVENESS_MAX_MISSED_PCT: u32 = 50;
+pub const DEFAULT_LIVENESS_START_HEIGHT: u64 = 20;
+/// Bounds: windows too short make liveness noisy; a threshold near 100%
+/// would let validators stay largely inactive without consequence.
+pub const LIVENESS_WINDOW_BLOCKS_RANGE: (usize, usize) = (100, 100_000);
+pub const LIVENESS_MAX_MISSED_PCT_RANGE: (u32, u32) = (10, 90);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisExecution {
@@ -760,10 +910,28 @@ impl GenesisConfig {
                     ));
                 }
             };
-            if bytes.len() < 32 {
+            if bytes.len() < ED25519_CONSENSUS_KEY_BYTES {
                 return Err(format!(
                     "genesis validator {:?} ({}) public_key is only {} bytes \
-                     -- too short to be a real consensus key (expected >= 32)",
+                     -- too short to be a real consensus key (expected 32 or 1952)",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+            // The key's length fixes its consensus scheme
+            // (chain_forge_crypto::consensus_key_scheme); any other length
+            // could never sign a valid vote.
+            if bytes.len() != ED25519_CONSENSUS_KEY_BYTES && bytes.len() != MLDSA65_CONSENSUS_KEY_BYTES {
+                return Err(format!(
+                    "genesis validator {:?} ({}) public_key is {} bytes -- a consensus \
+                     key must be 32 (Ed25519) or 1952 (ML-DSA-65) bytes",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+            if self.mldsa_consensus_only() && bytes.len() != MLDSA65_CONSENSUS_KEY_BYTES {
+                return Err(format!(
+                    "genesis validator {:?} ({}) has a {}-byte key, but \
+                     cryptography.validator_scheme is \"ml-dsa-65\": every consensus \
+                     key must be ML-DSA-65 (1952 bytes)",
                     acct.label, acct.address, bytes.len()
                 ));
             }
@@ -788,6 +956,170 @@ impl GenesisConfig {
     /// `None` for either field is always valid (falls back to the engine
     /// default), so a genesis file that omits `validator_bonding` entirely
     /// always passes this check.
+    /// What is missing for this genesis to use identity parameters weaker
+    /// than production. Empty means a weaker value is authorized.
+    fn missing_insecure_identity_authorization(&self) -> Vec<&'static str> {
+        let flag = self.identity.as_ref().map_or(false, |i| i.insecure_dev_identity_overrides);
+        let mut missing = Vec::new();
+        if !flag {
+            missing.push("identity.insecure_dev_identity_overrides = true");
+        }
+        if self.environment.mode != "devnet" {
+            missing.push("environment.mode = \"devnet\"");
+        }
+        if !cfg!(feature = "insecure-dev-quorum") {
+            missing.push("an engine built with --features insecure-dev-quorum");
+        }
+        missing
+    }
+
+    /// Resolve and validate the web-of-trust attestation quorum. Hard
+    /// validation: `chain-forge-node::Node::new` refuses to start on `Err`.
+    ///
+    /// A quorum below `DEFAULT_ATTESTATION_QUORUM` requires all three of:
+    /// `identity.insecure_dev_identity_overrides = true`,
+    /// `environment.mode == "devnet"`, and an engine built with the
+    /// `insecure-dev-quorum` feature. A chain cannot reach a reduced quorum
+    /// by renaming itself "devnet", by omitting the flag, or on a default
+    /// build.
+    pub fn attestation_quorum(&self) -> Result<usize, String> {
+        let quorum = self.identity.as_ref()
+            .and_then(|i| i.attestation_quorum)
+            .unwrap_or(DEFAULT_ATTESTATION_QUORUM);
+
+        if quorum == 0 {
+            return Err("identity.attestation_quorum is 0 -- every Provisional \
+                        identity would be Verified with no attestations".into());
+        }
+        if quorum > MAX_ATTESTATION_QUORUM {
+            return Err(format!(
+                "identity.attestation_quorum is {quorum}, above the maximum \
+                 {MAX_ATTESTATION_QUORUM} -- Verified would be unreachable"
+            ));
+        }
+        if quorum < DEFAULT_ATTESTATION_QUORUM {
+            let missing = self.missing_insecure_identity_authorization();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "identity.attestation_quorum {quorum} is below the production \
+                     minimum {DEFAULT_ATTESTATION_QUORUM}; a reduced quorum requires {}",
+                    missing.join(", ")
+                ));
+            }
+        }
+        Ok(quorum)
+    }
+
+    /// Resolve and validate the per-attester rolling-window cap. Hard
+    /// validation, like `attestation_quorum`. A cap above
+    /// `DEFAULT_ATTESTATION_CAP_PER_WINDOW` needs the same three-part
+    /// devnet authorization; a lower (stricter) cap is always allowed.
+    pub fn attestation_cap_per_window(&self) -> Result<u32, String> {
+        let cap = self.identity.as_ref()
+            .and_then(|i| i.attestation_cap_per_window)
+            .unwrap_or(DEFAULT_ATTESTATION_CAP_PER_WINDOW);
+
+        if cap == 0 {
+            return Err("identity.attestation_cap_per_window is 0 -- no identity \
+                        could ever attest, so nobody could become Verified".into());
+        }
+        if cap > DEFAULT_ATTESTATION_CAP_PER_WINDOW {
+            let missing = self.missing_insecure_identity_authorization();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "identity.attestation_cap_per_window {cap} is above the production \
+                     maximum {DEFAULT_ATTESTATION_CAP_PER_WINDOW}; a raised cap requires {}",
+                    missing.join(", ")
+                ));
+            }
+        }
+        Ok(cap)
+    }
+
+    /// Resolve and validate the liveness policy. Hard validation: the node
+    /// refuses to start on `Err`.
+    pub fn liveness_params(&self) -> Result<LivenessParams, String> {
+        let cfg = self.consensus.liveness.clone().unwrap_or_default();
+        let p = LivenessParams {
+            window_blocks:  cfg.window_blocks.unwrap_or(DEFAULT_LIVENESS_WINDOW_BLOCKS),
+            max_missed_pct: cfg.max_missed_pct.unwrap_or(DEFAULT_LIVENESS_MAX_MISSED_PCT),
+            start_height:   cfg.start_height.unwrap_or(DEFAULT_LIVENESS_START_HEIGHT),
+        };
+        let (wmin, wmax) = LIVENESS_WINDOW_BLOCKS_RANGE;
+        if !(wmin..=wmax).contains(&p.window_blocks) {
+            return Err(format!(
+                "consensus.liveness.window_blocks {} is outside [{wmin}, {wmax}]", p.window_blocks
+            ));
+        }
+        let (pmin, pmax) = LIVENESS_MAX_MISSED_PCT_RANGE;
+        if !(pmin..=pmax).contains(&p.max_missed_pct) {
+            return Err(format!(
+                "consensus.liveness.max_missed_pct {} is outside [{pmin}, {pmax}]", p.max_missed_pct
+            ));
+        }
+        Ok(p)
+    }
+
+    /// `cryptography.validator_scheme = "ml-dsa-65"`: every consensus key on
+    /// this chain is ML-DSA-65, from genesis on.
+    pub fn mldsa_consensus_only(&self) -> bool {
+        self.cryptography.validator_scheme == "ml-dsa-65"
+    }
+
+    /// Resolve and validate the BFT engine selected by `consensus.bft_variant`.
+    /// Hard validation: the node refuses to start on `Err`.
+    ///
+    /// Release gate 2: HotStuff and FBA have not passed a consensus safety
+    /// review (no engine-driven voting or lock persistence, and their
+    /// `verify_commit` checks no signatures), so they run only with
+    /// `environment.mode == "devnet"`. An unrecognised value is rejected
+    /// rather than silently selecting an engine.
+    pub fn bft_variant(&self) -> Result<BftVariant, String> {
+        let variant = match self.consensus.bft_variant.as_deref() {
+            None | Some("tendermint") | Some("TendermintStyle") => BftVariant::Tendermint,
+            Some("hotstuff") | Some("HotStuffStyle") => BftVariant::HotStuff,
+            Some("xrpl")     | Some("XrplInspired")  => BftVariant::Fba,
+            Some(other) => return Err(format!(
+                "consensus.bft_variant {other:?} is not one of \"tendermint\", \"hotstuff\", \"xrpl\""
+            )),
+        };
+        if variant != BftVariant::Tendermint && self.environment.mode != "devnet" {
+            return Err(format!(
+                "consensus.bft_variant {variant:?} has not passed a consensus safety review and \
+                 may only run with environment.mode = \"devnet\" (this chain is {:?})",
+                self.environment.mode
+            ));
+        }
+        Ok(variant)
+    }
+
+    /// Resolve and validate the reward-eligibility policy. Hard validation:
+    /// the node refuses to start on `Err`.
+    pub fn reward_params(&self) -> Result<RewardParams, String> {
+        let cfg = self.consensus.rewards.clone().unwrap_or_default();
+        let p = RewardParams {
+            min_participation_pct:  cfg.min_participation_pct.unwrap_or(DEFAULT_REWARD_MIN_PARTICIPATION_PCT),
+            premium_k_bps_per_kqcb: cfg.premium_k_bps_per_kqcb.unwrap_or(0),
+            premium_cap_bps:        cfg.premium_cap_bps.unwrap_or(0),
+        };
+        if p.premium_cap_bps > REWARD_PREMIUM_CAP_BPS_MAX {
+            return Err(format!("consensus.rewards.premium_cap_bps {} exceeds {REWARD_PREMIUM_CAP_BPS_MAX}",
+                p.premium_cap_bps));
+        }
+        if p.premium_k_bps_per_kqcb > REWARD_PREMIUM_K_BPS_PER_KQCB_MAX {
+            return Err(format!("consensus.rewards.premium_k_bps_per_kqcb {} exceeds {REWARD_PREMIUM_K_BPS_PER_KQCB_MAX}",
+                p.premium_k_bps_per_kqcb));
+        }
+        let (min, max) = REWARD_MIN_PARTICIPATION_PCT_RANGE;
+        if !(min..=max).contains(&p.min_participation_pct) {
+            return Err(format!(
+                "consensus.rewards.min_participation_pct {} is outside [{min}, {max}]",
+                p.min_participation_pct
+            ));
+        }
+        Ok(p)
+    }
+
     pub fn validate_validator_bonding(&self) -> Result<(), String> {
         let Some(ref vb) = self.validator_bonding else { return Ok(()); };
 
@@ -815,6 +1147,280 @@ impl GenesisConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Liveness policy (genesis-governed) --------------------------------
+
+    fn genesis_with_liveness(liveness: Option<serde_json::Value>) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        if let Some(l) = liveness { v["consensus"]["liveness"] = l; }
+        serde_json::from_value(v).unwrap()
+    }
+
+    // -- Reward-eligibility policy (genesis-governed) ----------------------
+
+    fn genesis_with_rewards(rewards: serde_json::Value) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["consensus"]["rewards"] = rewards;
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn reward_params_default_to_two_thirds_and_accept_in_range_overrides() {
+        assert_eq!(genesis_with_liveness(None).reward_params(),
+            Ok(RewardParams { min_participation_pct: 67, premium_k_bps_per_kqcb: 0, premium_cap_bps: 0 }),
+            "the capital premium is off by default");
+        assert_eq!(genesis_with_rewards(serde_json::json!({ "min_participation_pct": 80 })).reward_params(),
+            Ok(RewardParams { min_participation_pct: 80, premium_k_bps_per_kqcb: 0, premium_cap_bps: 0 }));
+    }
+
+    #[test]
+    fn reward_premium_params_are_bounded() {
+        let g = genesis_with_rewards(serde_json::json!({ "premium_k_bps_per_kqcb": 10, "premium_cap_bps": 2_500 }));
+        assert_eq!(g.reward_params(), Ok(RewardParams {
+            min_participation_pct: 67, premium_k_bps_per_kqcb: 10, premium_cap_bps: 2_500 }));
+        for bad in [serde_json::json!({ "premium_cap_bps": 5_001 }),
+                    serde_json::json!({ "premium_k_bps_per_kqcb": 10_001 })] {
+            assert!(genesis_with_rewards(bad.clone()).reward_params().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn reward_params_reject_out_of_range_values() {
+        for pct in [0, 49, 91, 95, 100] {
+            let g = genesis_with_rewards(serde_json::json!({ "min_participation_pct": pct }));
+            assert!(g.reward_params().is_err(), "min_participation_pct {pct} must be rejected");
+        }
+    }
+
+    #[test]
+    fn liveness_params_default_to_the_conservative_policy() {
+        assert_eq!(genesis_with_liveness(None).liveness_params(), Ok(LivenessParams {
+            window_blocks: 500, max_missed_pct: 50, start_height: 20,
+        }));
+    }
+
+    #[test]
+    fn liveness_params_accept_in_range_overrides() {
+        let g = genesis_with_liveness(Some(serde_json::json!({
+            "window_blocks": 1000, "max_missed_pct": 30, "start_height": 5 })));
+        assert_eq!(g.liveness_params(), Ok(LivenessParams {
+            window_blocks: 1000, max_missed_pct: 30, start_height: 5,
+        }));
+    }
+
+    #[test]
+    fn liveness_params_reject_out_of_range_values() {
+        for bad in [
+            serde_json::json!({ "window_blocks": 10 }),
+            serde_json::json!({ "window_blocks": 1_000_000 }),
+            serde_json::json!({ "max_missed_pct": 95 }),
+            serde_json::json!({ "max_missed_pct": 0 }),
+        ] {
+            assert!(genesis_with_liveness(Some(bad.clone())).liveness_params().is_err(), "{bad}");
+        }
+    }
+
+    // -- Consensus key schemes (ML-DSA-65 devnet) ------------------------------
+
+    fn genesis_with_validator_key(scheme: &str, key_bytes: usize) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["cryptography"]["validator_scheme"] = serde_json::Value::String(scheme.into());
+        for a in v["genesis_accounts"].as_array_mut().unwrap() {
+            if a["role"] == "validator" {
+                a["public_key"] = serde_json::Value::String("ab".repeat(key_bytes));
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn genesis_consensus_keys_must_be_ed25519_or_mldsa65_sized() {
+        for ok in [32, 1952] {
+            genesis_with_validator_key("pqc-native", ok).validate_validator_keys()
+                .unwrap_or_else(|e| panic!("{ok}-byte key must be accepted: {e}"));
+        }
+        for bad in [33, 64, 897, 1951, 1953] {
+            let err = genesis_with_validator_key("pqc-native", bad).validate_validator_keys()
+                .expect_err(&format!("{bad}-byte key has no consensus scheme"));
+            assert!(err.contains("32") && err.contains("1952"), "{err}");
+        }
+    }
+
+    #[test]
+    fn mldsa_only_genesis_requires_mldsa_validator_keys() {
+        let g = genesis_with_validator_key("ml-dsa-65", 1952);
+        assert!(g.mldsa_consensus_only());
+        g.validate_validator_keys().unwrap();
+        let err = genesis_with_validator_key("ml-dsa-65", 32).validate_validator_keys()
+            .expect_err("an Ed25519 key on an ML-DSA-only chain must be rejected");
+        assert!(err.contains("ml-dsa-65"), "{err}");
+        assert!(!genesis_with_validator_key("pqc-native", 32).mldsa_consensus_only());
+    }
+
+    // -- BFT variant (release gate 2) -----------------------------------------
+
+    fn genesis_with_variant(mode: &str, variant: Option<&str>) -> GenesisConfig {
+        let mut g = genesis_with(mode, None);
+        g.consensus.bft_variant = variant.map(str::to_string);
+        g
+    }
+
+    #[test]
+    fn tendermint_runs_in_every_mode() {
+        for mode in ["devnet", "testnet", "mainnet"] {
+            for v in [None, Some("tendermint"), Some("TendermintStyle")] {
+                assert_eq!(genesis_with_variant(mode, v).bft_variant(), Ok(BftVariant::Tendermint), "{mode} {v:?}");
+            }
+        }
+    }
+
+    /// HotStuff and FBA have not had a safety review (no engine-driven
+    /// voting, no commit-signature checks), so they may only run on devnet.
+    #[test]
+    fn hotstuff_and_fba_refuse_to_run_off_devnet() {
+        for v in ["hotstuff", "HotStuffStyle", "xrpl", "XrplInspired"] {
+            for mode in ["testnet", "mainnet", "staging"] {
+                let err = genesis_with_variant(mode, Some(v)).bft_variant()
+                    .expect_err(&format!("{v} must not run with environment.mode = {mode}"));
+                assert!(err.contains("environment.mode") && err.contains("safety review"), "{err}");
+            }
+        }
+        assert_eq!(genesis_with_variant("devnet", Some("hotstuff")).bft_variant(), Ok(BftVariant::HotStuff));
+        assert_eq!(genesis_with_variant("devnet", Some("xrpl")).bft_variant(), Ok(BftVariant::Fba));
+    }
+
+    /// A misspelled variant must not silently select an engine.
+    #[test]
+    fn unknown_bft_variant_is_rejected() {
+        for v in ["hotstuf", "pbft", "", "Tendermint "] {
+            let err = genesis_with_variant("devnet", Some(v)).bft_variant()
+                .expect_err(&format!("{v:?} must be rejected"));
+            assert!(err.contains("bft_variant"), "{err}");
+        }
+    }
+
+    // -- Attestation quorum (H0 identity hardening) ---------------------------
+
+    fn genesis_with(mode: &str, identity: Option<serde_json::Value>) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["environment"]["mode"] = serde_json::Value::String(mode.into());
+        if let Some(id) = identity {
+            v["identity"] = id;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn attestation_quorum_defaults_to_production_value() {
+        for mode in ["devnet", "testnet", "mainnet"] {
+            let g = genesis_with(mode, None);
+            assert_eq!(g.attestation_quorum(), Ok(DEFAULT_ATTESTATION_QUORUM), "{mode}");
+            assert_eq!(DEFAULT_ATTESTATION_QUORUM, 3);
+        }
+    }
+
+    #[test]
+    fn attestation_quorum_at_or_above_default_is_accepted_everywhere() {
+        for mode in ["devnet", "testnet", "mainnet"] {
+            for q in [3usize, 5, MAX_ATTESTATION_QUORUM] {
+                let g = genesis_with(mode, Some(serde_json::json!({ "attestation_quorum": q })));
+                assert_eq!(g.attestation_quorum(), Ok(q), "{mode} q={q}");
+            }
+        }
+    }
+
+    #[test]
+    fn attestation_quorum_zero_and_oversized_are_rejected() {
+        let zero = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_quorum": 0, "insecure_dev_identity_overrides": true })));
+        assert!(zero.attestation_quorum().unwrap_err().contains("is 0"));
+        let big = genesis_with("mainnet", Some(serde_json::json!({
+            "attestation_quorum": MAX_ATTESTATION_QUORUM + 1 })));
+        assert!(big.attestation_quorum().unwrap_err().contains("above the maximum"));
+    }
+
+    #[test]
+    fn reduced_quorum_without_explicit_opt_in_is_rejected_even_on_devnet() {
+        // Calling the network "devnet" is not enough on its own.
+        for q in [1usize, 2] {
+            let g = genesis_with("devnet", Some(serde_json::json!({ "attestation_quorum": q })));
+            let err = g.attestation_quorum().unwrap_err();
+            assert!(err.contains("insecure_dev_identity_overrides"), "{err}");
+        }
+    }
+
+    #[test]
+    fn reduced_quorum_is_rejected_outside_devnet_even_with_opt_in() {
+        for mode in ["testnet", "mainnet", "Devnet", "devnet-prod", ""] {
+            let g = genesis_with(mode, Some(serde_json::json!({
+                "attestation_quorum": 1, "insecure_dev_identity_overrides": true })));
+            let err = g.attestation_quorum().unwrap_err();
+            assert!(err.contains("environment.mode"), "{mode}: {err}");
+        }
+    }
+
+    #[cfg(not(feature = "insecure-dev-quorum"))]
+    #[test]
+    fn reduced_quorum_is_rejected_on_default_builds() {
+        let g = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_quorum": 1, "insecure_dev_identity_overrides": true })));
+        let err = g.attestation_quorum().unwrap_err();
+        assert!(err.contains("insecure-dev-quorum"), "{err}");
+    }
+
+    #[cfg(feature = "insecure-dev-quorum")]
+    #[test]
+    fn reduced_quorum_is_accepted_only_with_flag_devnet_and_feature() {
+        let g = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_quorum": 1, "insecure_dev_identity_overrides": true })));
+        assert_eq!(g.attestation_quorum(), Ok(1));
+    }
+
+    #[test]
+    fn attestation_cap_defaults_to_production_value_and_may_be_stricter() {
+        assert_eq!(genesis_with("mainnet", None).attestation_cap_per_window(), Ok(3));
+        for cap in [1u32, 2, 3] {
+            let g = genesis_with("mainnet", Some(serde_json::json!({ "attestation_cap_per_window": cap })));
+            assert_eq!(g.attestation_cap_per_window(), Ok(cap));
+        }
+        let zero = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_cap_per_window": 0, "insecure_dev_identity_overrides": true })));
+        assert!(zero.attestation_cap_per_window().is_err());
+    }
+
+    #[test]
+    fn raised_attestation_cap_needs_the_same_devnet_authorization() {
+        let no_flag = genesis_with("devnet", Some(serde_json::json!({ "attestation_cap_per_window": 10 })));
+        assert!(no_flag.attestation_cap_per_window().unwrap_err().contains("insecure_dev_identity_overrides"));
+        let testnet = genesis_with("testnet", Some(serde_json::json!({
+            "attestation_cap_per_window": 10, "insecure_dev_identity_overrides": true })));
+        assert!(testnet.attestation_cap_per_window().unwrap_err().contains("environment.mode"));
+        let devnet = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_cap_per_window": 10, "insecure_dev_identity_overrides": true })));
+        if cfg!(feature = "insecure-dev-quorum") {
+            assert_eq!(devnet.attestation_cap_per_window(), Ok(10));
+        } else {
+            assert!(devnet.attestation_cap_per_window().unwrap_err().contains("insecure-dev-quorum"));
+        }
+    }
+
+    #[test]
+    fn pilot_devnet_genesis_is_authorized_only_on_feature_builds() {
+        let g = GenesisConfig::from_json(include_str!("../../genesis-4node.json")).unwrap();
+        if cfg!(feature = "insecure-dev-quorum") {
+            assert_eq!(g.attestation_quorum(), Ok(1));
+            assert_eq!(g.attestation_cap_per_window(), Ok(10));
+        } else {
+            assert!(g.attestation_quorum().is_err());
+            assert!(g.attestation_cap_per_window().is_err());
+        }
+    }
+
+    #[test]
+    fn opt_in_flag_alone_does_not_lower_the_quorum() {
+        let g = genesis_with("devnet", Some(serde_json::json!({ "insecure_dev_identity_overrides": true })));
+        assert_eq!(g.attestation_quorum(), Ok(DEFAULT_ATTESTATION_QUORUM));
+    }
 
     // Minimal valid genesis JSON matching the Chain Forge wizard output schema.
     fn minimal_genesis_json() -> &'static str {

@@ -12,7 +12,7 @@ use chain_forge_consensus::{
     ValidatorId, ValidatorInfo, ValidatorSet, BlockHash, BlockProposal, Vote, VoteType,
     tendermint::{TendermintEngine, EquivocationDetected},
     HotStuffEngine, FbaEngine,
-    ConsensusEngine,
+    ConsensusEngine, ConsensusAction, LockState, TimeoutStep,
 };
 use chain_forge_state::StateStore;
 use chain_forge_execution::{Executor, ExecutionConfig, Transaction};
@@ -50,9 +50,185 @@ pub struct NodeStatus {
     pub state_root:  Option<String>,
     pub engine_version: String,
     pub is_running:  bool,
+    /// Effective web-of-trust attestation quorum (from genesis).
+    pub attestation_quorum: usize,
+    /// Effective per-attester rolling-window cap (from genesis).
+    pub attestation_cap_per_window: u32,
+    /// True when this chain runs identity parameters weaker than production
+    /// under the explicit devnet-only opt-in. Reduced Sybil resistance.
+    pub insecure_dev_identity_overrides: bool,
 }
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
+
+// -- Canonical block payload (H0-1 / H0-2) -------------------------------------
+
+/// Current block payload format.
+pub const BLOCK_PAYLOAD_VERSION: u32 = 1;
+
+/// How long a proposer waits after a commit for late precommits, so its
+/// `last_commit` evidence includes validators slower than the first 2/3+1.
+const COMMIT_GATHER_MS: u128 = 1_000;
+
+/// Period of the engine-driven consensus tick (timers, proposing, re-gossip).
+const CONSENSUS_TICK_MS: u64 = 100;
+
+/// What a block commits to. Serialized into `BlockProposal::tx_data`, which
+/// `compute_block_hash` hashes, so every validator votes on exactly these
+/// bytes.
+///
+/// - `last_commit`: precommits for the block committed at `height - 1`, as
+///   collected by the proposer (must carry 2/3+1 power under the validator
+///   set effective at that height). Participation and liveness are recorded
+///   only from this committed evidence, so every node accounts identically.
+///   `None` only at height 0.
+/// - `prev_state_root`: the proposer's state root after committing
+///   `height - 1`. Validators refuse to vote unless it equals their own, and a
+///   node fails-stop rather than commit on top of a different state.
+/// Persisted double-sign guard (engine-driven consensus).
+///
+/// Before any vote is broadcast, the node records the vote's
+/// (height, round, step), the signed vote, and the engine's lock state, and
+/// writes them to `persist/consensus_signing.json` (atomic replace). It
+/// refuses to sign below the last recorded (height, round, step), and at the
+/// same position only re-sends the identical vote. On restart the lock state
+/// is restored before the node votes, so a restart can never let this
+/// validator sign a vote it would have refused before restarting.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SignGuard {
+    /// Highest (height, round, step) signed; step 1 = prevote, 2 = precommit.
+    pub last:  Option<(u64, u32, u8)>,
+    /// Signed votes at the height of `last`.
+    pub votes: Vec<Vote>,
+    /// Engine lock state when the last vote was signed.
+    pub lock:  Option<LockState>,
+}
+
+impl SignGuard {
+    fn step_of(vote: &Vote) -> u8 {
+        if vote.vote_type == VoteType::Precommit { 2 } else { 1 }
+    }
+
+    /// `Ok(Some(v))`: already signed exactly this vote (re-send `v`).
+    /// `Ok(None)`: safe to sign. `Err`: signing would conflict.
+    pub fn check(&self, vote: &Vote) -> Result<Option<Vote>, String> {
+        let hrs = (vote.height, vote.round, Self::step_of(vote));
+        let Some(last) = self.last else { return Ok(None) };
+        if hrs > last {
+            return Ok(None);
+        }
+        let same = self.votes.iter().find(|v| (v.height, v.round, Self::step_of(v)) == hrs);
+        match same {
+            Some(v) if v.block_hash == vote.block_hash => Ok(Some(v.clone())),
+            Some(v) => Err(format!("already signed {:?} at h{} r{} step {}; refusing {:?}",
+                                   v.block_hash, hrs.0, hrs.1, hrs.2, vote.block_hash)),
+            None => Err(format!("h{} r{} step {} is below the last signed {:?}", hrs.0, hrs.1, hrs.2, last)),
+        }
+    }
+
+    pub fn record(&mut self, vote: &Vote, lock: Option<LockState>) {
+        self.last = Some((vote.height, vote.round, Self::step_of(vote)));
+        self.votes.retain(|v| v.height == vote.height);
+        self.votes.push(vote.clone());
+        self.lock = lock;
+    }
+}
+
+/// A consensus message for the height after the one being decided.
+#[derive(Debug, Clone)]
+enum NextHeightMsg {
+    Proposal(BlockProposal),
+    Vote(Vote),
+}
+
+const MAX_NEXT_HEIGHT_MSGS: usize = 4_096;
+
+/// Write `contents` to `path` atomically: temp file, fsync, rename.
+fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Release gate 4: most evidence items one block may carry.
+const MAX_EVIDENCE_PER_BLOCK: usize = 16;
+/// Release gate 4: evidence older than this many blocks is not accepted.
+const EVIDENCE_MAX_AGE_BLOCKS: u64 = 1_000;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BlockPayload {
+    pub version:         u32,
+    pub txs:             Vec<Transaction>,
+    pub last_commit:     Option<chain_forge_consensus::CommitCertificate>,
+    pub prev_state_root: Option<String>,
+    /// Release gate 4: equivocation evidence, slashed when this block
+    /// commits. Omitted when empty, so blocks without evidence encode
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence:        Vec<EquivocationEvidence>,
+}
+
+impl BlockPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Decode `tx_data`. Pre-H0 blocks are a bare transaction array; they
+    /// decode as version 0 with no evidence (accepted only when replaying
+    /// history, never in a new proposal).
+    pub fn decode(tx_data: &[u8]) -> Self {
+        if let Ok(p) = serde_json::from_slice::<BlockPayload>(tx_data) {
+            return p;
+        }
+        BlockPayload {
+            version: 0,
+            txs: serde_json::from_slice(tx_data).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Transactions for a new block, in mempool order, while the encoded payload
+/// stays within `max_block_bytes` (0 = no limit). A tx that doesn't fit is
+/// skipped together with its sender's later txs, so a sender's nonces never
+/// go in out of order, while other senders' txs still go in. Without a limit
+/// a proposal carried the whole mempool and could outgrow the gossip message
+/// limit, so no validator ever received it.
+pub fn select_block_txs(
+    mempool: &[Transaction],
+    base: &BlockPayload,
+    max_block_bytes: usize,
+    tx_bytes: impl Fn(&Transaction) -> usize,
+) -> Vec<Transaction> {
+    if max_block_bytes == 0 {
+        return mempool.to_vec();
+    }
+    // Each tx adds its own JSON plus a separating comma.
+    let mut size = base.encode().len();
+    let mut held = std::collections::HashSet::new();
+    let mut txs = Vec::new();
+    for tx in mempool {
+        if held.contains(tx.sender.as_str()) {
+            continue;
+        }
+        match size.checked_add(tx_bytes(tx).saturating_add(1)) {
+            Some(next) if next <= max_block_bytes => { size = next; txs.push(tx.clone()); }
+            _ => { held.insert(tx.sender.as_str()); }
+        }
+    }
+    // Exact check on the real encoding.
+    loop {
+        let len = BlockPayload { txs: txs.clone(), ..base.clone() }.encode().len();
+        if len <= max_block_bytes || txs.is_empty() { break; }
+        txs.pop();
+    }
+    txs
+}
 
 // -- Explorer state (shared with the API, Section 9.1) -------------------------
 
@@ -60,6 +236,11 @@ pub type SharedStatus = Arc<Mutex<NodeStatus>>;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockSummary {
     pub height:     u64,
+    /// The finalized block's hash. Nodes must agree on it, not merely on
+    /// the state root: different empty blocks execute to the same root.
+    pub block_hash: String,
+    /// Round in which the block was decided.
+    pub round:      u32,
     pub state_root: String,
     pub timestamp_ms: u64,
     pub tx_count:   usize,
@@ -108,6 +289,11 @@ pub struct AccountSummary {
     /// Incremented by RotateAccountKey and RecoverAccountKey.
     #[serde(default)]
     pub key_version: u32,
+    /// DIS-003A/B: monotone recovery-policy generation counter.
+    /// Incremented by EnrollRecoveryPolicy, RevokeRecoveryPolicy (via re-enroll),
+    /// and UpdateGuardianPolicy. Never reset to zero.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// Voting-power snapshot for one validator.
@@ -261,7 +447,17 @@ pub struct Node {
     data_dir: Option<std::path::PathBuf>,
     /// Ed25519 keypair for signing proposals and votes. None for observer nodes.
     signing_key: Option<KeyPair>,
+    /// Solo devnet only: consensus keys used to sign the simulated votes of
+    /// the other genesis validators, by address. Empty unless a test fills
+    /// it; the Ed25519 address-derived key is the fallback.
+    devnet_sim_keys: std::collections::BTreeMap<String, KeyPair>,
+    /// Release gate 4: verified equivocation evidence this node detected,
+    /// waiting to be included in a block it proposes.
+    pending_evidence: Vec<EquivocationEvidence>,
     mempool:   Vec<Transaction>,
+    /// Encoded size of each mempool tx, by id: computed once per tx, used
+    /// to fill blocks without re-serializing the whole mempool per proposal.
+    mempool_tx_bytes: std::collections::HashMap<String, usize>,
     /// Proposals seen but not yet committed, keyed by (height, round).
     /// Needed because a CommitCertificate carries only the block_hash, not
     /// the transactions -- when quorum is reached (locally or via a gossiped
@@ -316,6 +512,8 @@ pub struct Node {
     /// Validator registry -- authoritative set of registered validators and
     /// their on-chain state (bonded stake, status, keys). Required by slasher.
     validator_registry: ValidatorRegistry,
+    /// Epoch-reward eligibility policy, from genesis only (never persisted).
+    reward_params: chain_forge_core::RewardParams,
     /// Transactions submitted via POST /api/tx, waiting to be pulled into
     /// the mempool. Drained once per heartbeat tick in run().
     tx_queue: SharedTxQueue,
@@ -324,6 +522,21 @@ pub struct Node {
     /// waits for real peer connections before attempting to participate in
     /// consensus. False means no peers are expected (solo devnet mode).
     has_bootstrap_peers: bool,
+
+    /// Engine-driven consensus (Tendermint): pending step timeouts.
+    consensus_timers: Vec<(std::time::Instant, TimeoutStep, u64, u32)>,
+    /// The engine asked this validator to propose a fresh block at
+    /// (height, round); built once the previous commit's evidence is ready.
+    pending_propose: Option<(u64, u32, std::time::Instant)>,
+    /// Last periodic re-gossip of the current height's consensus messages.
+    last_regossip: Option<std::time::Instant>,
+    /// Persisted double-sign guard (see `SignGuard`).
+    sign_guard: SignGuard,
+    /// Proposals/votes for the next height, replayed through the full
+    /// handlers (payload and signature checks included) after the commit.
+    next_height_msgs: Vec<NextHeightMsg>,
+    /// Rate limit for sync requests triggered by next-height traffic.
+    last_sync_request: Option<std::time::Instant>,
 
     /// Per-sender committed-nonce cache (F1 ingress guard).
     /// Updated after each block commit; exposed to the API server so it can
@@ -398,6 +611,13 @@ pub struct Node {
     /// Prevents clock drift or proposer rotation from producing backwards
     /// timestamps in /api/blocks.
     last_committed_timestamp_ms: u64,
+
+    /// H0-2: every valid precommit known for the last committed block -- the
+    /// local certificate plus late precommits gossiped after the commit. The
+    /// next proposer publishes it as `BlockPayload::last_commit`.
+    last_commit_evidence: Option<chain_forge_consensus::CommitCertificate>,
+    /// When the last block committed (for COMMIT_GATHER_MS).
+    last_commit_at: Option<std::time::Instant>,
 
     // ── Deterministic block-height validator-set epochs ──────────────────────
 
@@ -487,10 +707,6 @@ pub struct Node {
 /// a separate magic number to remember.
 pub const DEFAULT_VALIDATOR_EPOCH_BLOCKS: u64 = 100;
 
-/// Minimum participation percentage (0–100) a validator must have signed
-/// within the epoch to be eligible for the epoch reward pool.
-pub const VALIDATOR_REWARD_PARTICIPATION_PCT: u8 = 95;
-
 /// Map a transaction body to a short string label for the explorer.
 ///
 /// This function is the single source of truth for the kind string used
@@ -539,6 +755,9 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         // DIS-002B: lost-device recovery policy enrollment and recovery
         TxBody::EnrollRecoveryPolicy { .. }      => "enroll_recovery_policy",
         TxBody::RecoverAccountKey { .. }         => "recover_account_key",
+        TxBody::RevokeRecoveryPolicy             => "revoke_recovery_policy",
+        // DIS-003B: guardian set replacement
+        TxBody::UpdateGuardianPolicy { .. }      => "update_guardian_policy",
     }
 }
 
@@ -623,6 +842,41 @@ impl Node {
         // engine can't honour would mean the chain behaves differently
         // from what its genesis says.
         let modules = genesis.enabled_modules().map_err(NodeError::Genesis)?;
+
+        // Hard error, in every environment: the attestation quorum and the
+        // per-attester cap decide who becomes Verified, so an invalid or
+        // unauthorized value must stop the node rather than run with a weaker
+        // identity layer. Both come only from genesis -- there is no CLI or
+        // environment override, so every node on the chain derives the same
+        // values.
+        let attestation_quorum = genesis.attestation_quorum().map_err(NodeError::Genesis)?;
+
+        // Hard error: liveness policy out of bounds (see GenesisConfig::liveness_params).
+        let liveness = genesis.liveness_params().map_err(NodeError::Genesis)?;
+        info!(window_blocks = liveness.window_blocks, max_missed_pct = liveness.max_missed_pct,
+              start_height = liveness.start_height,
+              "liveness policy (jail only, no stake burn; Byzantine-robust miss counting)");
+        // Hard error: reward policy out of bounds (see GenesisConfig::reward_params).
+        let reward_params = genesis.reward_params().map_err(NodeError::Genesis)?;
+        info!(min_participation_pct = reward_params.min_participation_pct,
+              "epoch-reward policy (committed evidence only; Byzantine-robust participation)");
+        let attestation_cap_per_window =
+            genesis.attestation_cap_per_window().map_err(NodeError::Genesis)?;
+        let insecure_identity = attestation_quorum < chain_forge_core::DEFAULT_ATTESTATION_QUORUM
+            || attestation_cap_per_window > chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW;
+        if insecure_identity {
+            warn!(
+                attestation_quorum,
+                attestation_cap_per_window,
+                production_quorum = chain_forge_core::DEFAULT_ATTESTATION_QUORUM,
+                production_cap = chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
+                "INSECURE DEVNET IDENTITY CONFIG: identity parameters are weaker than \
+                 production. Sybil resistance is reduced -- do not use this genesis \
+                 or build outside a development devnet."
+            );
+        } else {
+            info!(attestation_quorum, attestation_cap_per_window, "identity parameters");
+        }
         info!(
             staking = modules.staking, identity = modules.identity,
             agents = modules.agents,
@@ -714,16 +968,22 @@ impl Node {
         };
 
         // Read the desired variant from genesis config (default: TendermintStyle).
-        let desired_variant = match genesis.consensus.bft_variant.as_deref() {
-            Some("hotstuff") | Some("HotStuffStyle") => ConsensusVariant::HotStuffStyle,
-            Some("xrpl")    | Some("XrplInspired")   => ConsensusVariant::XrplInspired,
-            _                                          => ConsensusVariant::TendermintStyle,
+        let desired_variant = match genesis.bft_variant().map_err(NodeError::Genesis)? {
+            chain_forge_core::BftVariant::HotStuff   => ConsensusVariant::HotStuffStyle,
+            chain_forge_core::BftVariant::Fba        => ConsensusVariant::XrplInspired,
+            chain_forge_core::BftVariant::Tendermint => ConsensusVariant::TendermintStyle,
         };
+        if desired_variant != ConsensusVariant::TendermintStyle {
+            tracing::warn!(variant = ?desired_variant,
+                "devnet only: this BFT variant has not passed a consensus safety review");
+        }
 
         let consensus_cfg = ConsensusConfig {
             variant:              desired_variant.clone(),
             chain_id:             genesis.chain_id.clone(),
-            propose_timeout_ms:   genesis.consensus.block_time_ms * 2,
+            // Must cover the proposer's empty-block pacing (one block time)
+            // plus the late-precommit gather (COMMIT_GATHER_MS).
+            propose_timeout_ms:   genesis.consensus.block_time_ms * 3,
             prevote_timeout_ms:   genesis.consensus.block_time_ms,
             precommit_timeout_ms: genesis.consensus.block_time_ms,
             block_time_ms:        genesis.consensus.block_time_ms,
@@ -823,9 +1083,13 @@ impl Node {
             state_root:     None,
             engine_version: genesis.engine_version.clone(),
             is_running:     false,
+            attestation_quorum,
+            attestation_cap_per_window,
+            insecure_dev_identity_overrides: insecure_identity,
         }));
 
         let validator_id = validator_address.map(ValidatorId);
+        engine.set_local_validator(validator_id.clone());
         let explorer       = Arc::new(Mutex::new(ExplorerState::default()));
         let qrc_metrics  = Arc::new(Mutex::new(QrcMetrics::default()));
 
@@ -843,6 +1107,8 @@ impl Node {
             .unwrap_or_default()
             .as_millis() as u64;
         let mut identity = IdentityStore::new(identity_genesis_ms);
+        identity.set_attestation_quorum(attestation_quorum);
+        identity.set_attestation_cap_per_window(attestation_cap_per_window);
 
         // Without this, IdentityStore::attest() has no seed to bootstrap
         // from: it requires the attester to already be Verified+, and with
@@ -971,7 +1237,15 @@ impl Node {
             );
         }
 
-        let slasher = SlashingModule::with_qcb_defaults();
+        // Liveness policy from genesis (validated above); every node derives
+        // the same values and there is no runtime override.
+        let slasher = {
+            let mut cfg = chain_forge_slashing::SlashingConfig::qcb_default();
+            cfg.liveness_window_blocks      = liveness.window_blocks;
+            cfg.liveness_miss_pct_threshold = liveness.max_missed_pct;
+            cfg.liveness_start_height       = liveness.start_height;
+            SlashingModule::new(cfg)
+        };
 
         // Seed the ValidatorRegistry with genesis validators, gated on
         // identity verification (Point 1 of the identity integration plan).
@@ -984,6 +1258,8 @@ impl Node {
         // will surface in the per-block PoP refresh. This is the intended
         // "start inactive, log loudly" policy from the integration design doc.
         let mut validator_registry = ValidatorRegistry::qcb_devnet();
+        // One minimum bond for seating and activation (reward eligibility).
+        validator_registry.set_min_bond(min_bond_uqcb);
         {
             // Only seed if the identity module is enabled — otherwise there is
             // no IdentityStore to verify against, and registering validators
@@ -1011,7 +1287,14 @@ impl Node {
                     // from here instead of hardcoding empty -- has it too.
                     if let Some(hex_key) = acct.public_key.as_ref() {
                         if let Some(key_bytes) = hex_decode_genesis_key(hex_key) {
-                            if let Err(e) = validator_registry.register_consensus_key(id, &key_bytes, epoch) {
+                            // An ML-DSA-65 genesis key is recorded with its
+                            // scheme (R3 gating and deprecation read it).
+                            let registered = if key_bytes.len() == chain_forge_core::MLDSA65_CONSENSUS_KEY_BYTES {
+                                validator_registry.register_consensus_key_with_scheme(id, &key_bytes, epoch, "ml-dsa-65")
+                            } else {
+                                validator_registry.register_consensus_key(id, &key_bytes, epoch)
+                            };
+                            if let Err(e) = registered {
                                 warn!(validator = id, error = %e, "failed to seed genesis validator's consensus key into registry");
                             }
                         }
@@ -1165,6 +1448,7 @@ impl Node {
                     attestation_count: 0,
                     attested_by:       vec![],
                     key_version:    acct.key_version,
+                    policy_generation: acct.policy_generation,
                 });
             }
         }
@@ -1181,8 +1465,11 @@ impl Node {
             peers,
             data_dir: None,
             signing_key: None,
+            devnet_sim_keys: Default::default(),
+            pending_evidence: Vec::new(),
             validator_id,
             mempool: Vec::new(),
+            mempool_tx_bytes: std::collections::HashMap::new(),
             nonce_cache: Arc::new(Mutex::new(initial_nonce_cache)),
             pending_proposals: std::collections::HashMap::new(),
             pending_certs:     std::collections::HashMap::new(),
@@ -1193,9 +1480,16 @@ impl Node {
             identity,
             agents: AgentStore::new(),
             slasher,
+            reward_params,
             validator_registry,
             tx_queue,
             has_bootstrap_peers,
+            consensus_timers: Vec::new(),
+            pending_propose: None,
+            last_regossip: None,
+            sign_guard: SignGuard::default(),
+            next_height_msgs: Vec::new(),
+            last_sync_request: None,
             pocd_config,
             pocd_registry,
             seen_gossip_receipts:       std::collections::HashSet::new(),
@@ -1208,6 +1502,8 @@ impl Node {
             peer_capacity_table: Arc::new(Mutex::new(crate::gossip_capacity::PeerCapacityTable::new())),
             last_capacity_ad_ms: 0,
             last_committed_timestamp_ms: 0,
+            last_commit_evidence: None,
+            last_commit_at: None,
             validator_epoch_blocks,
             min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
@@ -1458,8 +1754,9 @@ impl Node {
             chain_id, &vote.vote_type, vote.height, vote.round,
             vote.block_hash.as_ref(),
         );
-        if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
-            vote.signature = sig.bytes;
+        if let Ok(sig) = chain_forge_crypto::sign_consensus(&bytes, kp) {
+            vote.signature = sig;
+            vote.scheme = chain_forge_crypto::consensus_scheme_tag(&kp.scheme).to_string();
         }
     }
 
@@ -1469,10 +1766,10 @@ impl Node {
         let chain_id = self.genesis.chain_id.as_str();
         let bytes = proposal_signing_bytes(
             chain_id, proposal.height, proposal.round,
-            &proposal.block_hash, &proposal.parent_hash,
+            &proposal.block_hash, &proposal.parent_hash, proposal.pol_round,
         );
-        if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
-            proposal.signature = sig.bytes;
+        if let Ok(sig) = chain_forge_crypto::sign_consensus(&bytes, kp) {
+            proposal.signature = sig;
         }
     }
 
@@ -1533,12 +1830,7 @@ impl Node {
             vote.block_hash.as_ref(),
         );
 
-        let sig = chain_forge_crypto::Signature {
-            scheme: chain_forge_crypto::SchemeId::Classical,
-            bytes:  vote.signature.clone(),
-        };
-
-        ClassicalScheme.verify(&msg, &sig, &vi.public_key)
+        chain_forge_crypto::verify_consensus(&msg, &vote.signature, &vi.public_key)
             .map_err(|e| format!(
                 "signature verification failed for validator {}: {e}",
                 vote.validator
@@ -1566,11 +1858,23 @@ impl Node {
             .ok_or_else(|| format!("key file {:?} missing field '{name}'", path))
             .and_then(|s| hex_decode(s)
                 .ok_or_else(|| format!("key file {:?}: '{name}' is not valid hex", path)));
+        // Older key files have no "scheme" (Ed25519).
+        let scheme = match k["scheme"].as_str().unwrap_or("ed25519") {
+            "ed25519" | "classical" | "classical-ed25519" => SchemeId::Classical,
+            "ml-dsa-65" | "mldsa65"   => SchemeId::MlDsa,
+            other => return Err(format!("key file {:?}: unsupported scheme {other:?}", path)),
+        };
         let kp = KeyPair {
-            scheme:      SchemeId::Classical,
+            scheme,
             public_key:  field("public_key")?,
             private_key: field("private_key")?,
         };
+        // Possession: the private key must sign for the public key it
+        // claims, or this node would sign votes nobody can verify.
+        let probe = b"chain-forge key file possession check";
+        chain_forge_crypto::sign_consensus(probe, &kp)
+            .and_then(|sig| chain_forge_crypto::verify_consensus(probe, &sig, &kp.public_key))
+            .map_err(|e| format!("key file {:?}: private key does not match its public key ({e})", path))?;
         // Look up this validator's address from the key file to match genesis.
         let address = k["address"].as_str()
             .unwrap_or_default().to_string();
@@ -1623,6 +1927,7 @@ impl Node {
         // an observer. Without this, the node logs "validator=None" and never
         // votes, so the network cannot reach quorum.
         self.validator_id = Some(my_id);
+        self.consensus.set_local_validator(self.validator_id.clone());
         tracing::info!(address = %address, "validator signing key loaded and verified against genesis");
         self.signing_key = Some(kp);
         Ok(())
@@ -1636,6 +1941,10 @@ impl Node {
         std::fs::create_dir_all(&persist)
             .map_err(|e| format!("cannot create persist dir {:?}: {e}", persist))?;
         self.data_dir = Some(dir);
+        // A validator may have signed votes before its first commit (no
+        // state.json yet): restore its guard and lock now. Restored again
+        // after load_persisted_state moves the engine to its height.
+        self.restore_sign_guard();
         Ok(())
     }
 
@@ -1650,6 +1959,10 @@ impl Node {
     /// `ActivatePqConsensus` governance tx has been processed (or if the
     /// activation epoch was cleared by an `EmergencyDeprecateAlgorithm` tx).
     pub fn pq_activation_epoch(&self) -> Option<u64> {
+        // An ML-DSA-only chain has ML-DSA consensus from genesis.
+        if self.genesis.mldsa_consensus_only() {
+            return Some(0);
+        }
         self.state
             .get_raw("pq_consensus_activation_epoch")
             .and_then(|s| s.parse::<u64>().ok())
@@ -1842,10 +2155,15 @@ impl Node {
 
             if id_path.exists() {
                 self.identity = serde_json::from_str(&std::fs::read_to_string(&id_path)?)?;
+                // Identity parameters are not persisted; reinstall them from genesis.
+                self.identity.set_attestation_quorum(self.executor.attestation_quorum());
+                self.identity.set_attestation_cap_per_window(self.executor.attestation_cap_per_window());
             }
             if validators_path.exists() {
                 self.validator_registry =
                     serde_json::from_str(&std::fs::read_to_string(&validators_path)?)?;
+                // The minimum bond comes from genesis, never from disk.
+                self.validator_registry.set_min_bond(self.min_bond_uqcb);
                 tracing::debug!("validator registry restored from disk");
             }
             if agents_path.exists() {
@@ -1854,8 +2172,12 @@ impl Node {
                 tracing::debug!("agent store restored from disk");
             }
             if slashing_path.exists() {
+                // Restore windows and history, but keep the genesis-derived
+                // policy: a stale or edited slashing.json must not change it.
+                let policy = self.slasher.config().clone();
                 self.slasher =
                     serde_json::from_str(&std::fs::read_to_string(&slashing_path)?)?;
+                self.slasher.set_config(policy);
                 tracing::debug!("slashing module restored from disk");
             }
             if chain_store_path.exists() {
@@ -1865,6 +2187,10 @@ impl Node {
                     blocks = self.chain_store.len(),
                     "block history restored from disk"
                 );
+                // H0-2: after a restart, the next proposal's last_commit starts
+                // from the certificate stored for the last committed block.
+                self.last_commit_evidence = self.chain_store.values().next_back()
+                    .map(|(cert, _)| cert.clone());
             }
             if historical_vs_path.exists() {
                 self.historical_validator_sets =
@@ -1900,6 +2226,7 @@ impl Node {
                         attestation_count: att_count,
                         attested_by:       att_by,
                         key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                     });
                 }
 
@@ -1920,9 +2247,20 @@ impl Node {
                 // Only the last MAX_RECENT_BLOCKS entries are kept.
                 let entries: Vec<_> = self.chain_store.iter().collect();
                 let start = entries.len().saturating_sub(MAX_RECENT_BLOCKS);
-                for (_, (_cert, proposal)) in &entries[start..] {
-                    let txs: Vec<chain_forge_execution::Transaction> =
-                        serde_json::from_slice(&proposal.tx_data).unwrap_or_default();
+                // H0-1: the state root after block h is committed on chain as
+                // block h+1's prev_state_root; the newest block's is the live
+                // restored root. Pre-H0 (legacy) blocks fall back to the hash.
+                let live_root = self.state.current_root().map(str::to_string);
+                let last_height = entries.last().map(|(h, _)| **h);
+                let root_after = |h: u64| -> Option<String> {
+                    match self.chain_store.get(&(h + 1)) {
+                        Some((_, next)) => BlockPayload::decode(&next.tx_data).prev_state_root,
+                        None if Some(h) == last_height => live_root.clone(),
+                        None => None,
+                    }
+                };
+                for (_, (cert, proposal)) in &entries[start..] {
+                    let txs = BlockPayload::decode(&proposal.tx_data).txs;
                     let mut tx_ids = Vec::with_capacity(txs.len());
                     for tx in &txs {
                         tx_ids.push(tx.id.clone());
@@ -1941,7 +2279,10 @@ impl Node {
                     }
                     ex.blocks.push_front(BlockSummary {
                         height:       proposal.height,
-                        state_root:   proposal.block_hash.0.clone(),
+                        block_hash:   cert.block_hash.0.clone(),
+                        round:        cert.round,
+                        state_root:   root_after(proposal.height)
+                            .unwrap_or_else(|| proposal.block_hash.0.clone()),
                         timestamp_ms: proposal.timestamp_ms,
                         tx_count:     tx_ids.len(),
                         tx_ids,
@@ -2002,7 +2343,10 @@ impl Node {
                 self.validator_registry.build_validator_set(height)
             };
 
-            if let Err(e) = self.consensus.reset_to_height(height, vs) {
+            // `height` is the last COMMITTED block; the engine must work on the
+            // next one. Passing `height` itself made every restarted node
+            // re-decide its last committed block.
+            if let Err(e) = self.consensus.reset_to_height(height + 1, vs) {
                 tracing::warn!(
                     height,
                     error = %e,
@@ -2010,6 +2354,8 @@ impl Node {
                      some re-proposal may occur until peers catch this node up"
                 );
             }
+            // Before this validator can vote again: its lock and last signature.
+            self.restore_sign_guard();
 
             // Populate NodeStatus with the restored state root so that callers
             // that read status.state_root immediately after load_persisted_state
@@ -2103,9 +2449,21 @@ impl Node {
         let mut interval = tokio::time::interval(
             tokio::time::Duration::from_millis(block_time)
         );
+        // Engine-driven consensus: step timeouts, proposing and re-gossip.
+        let mut consensus_interval = tokio::time::interval(
+            tokio::time::Duration::from_millis(CONSENSUS_TICK_MS)
+        );
+        if self.consensus.drives_own_votes() && self.has_bootstrap_peers {
+            self.consensus.start();
+            self.drive_consensus().await;
+        }
         let mut running = true;
         while running {
             tokio::select! {
+                _ = consensus_interval.tick(), if self.consensus.drives_own_votes() && self.has_bootstrap_peers => {
+                    self.consensus_tick().await;
+                }
+
                 event_result = self.network.next_event() => {
                     match event_result {
                         Ok(event) => {
@@ -2206,6 +2564,8 @@ impl Node {
                         // Peers are configured but haven't connected yet --
                         // wait rather than racing ahead solo.
                         debug!("waiting for configured bootstrap peers to connect");
+                    } else if self.consensus.drives_own_votes() {
+                        // Engine-driven consensus runs on the consensus tick.
                     } else if let Some(my_id) = self.validator_id.clone() {
                         // Real peers connected. The deterministic proposer for
                         // this (height, round) proposes -- but critically, EVERY
@@ -2236,6 +2596,7 @@ impl Node {
 
                         if Self::is_proposer_for(&vs, height, round, &my_id)
                             && self.last_proposed != Some(key)
+                            && self.last_commit_ready()
                             && (!self.mempool.is_empty()
                                 || self.round_watch_started
                                     .map(|t| t.elapsed().as_millis() >= 2000)
@@ -2333,6 +2694,11 @@ impl Node {
                             "received block proposal"
                         );
 
+                        if self.consensus.drives_own_votes() {
+                            self.on_proposal_engine(proposal).await;
+                            return Ok(());
+                        }
+
                         if proposal.height > self.consensus.current_height() {
                             // A proposal for a height beyond ours is unambiguous
                             // evidence we've fallen behind -- trying to vote on it
@@ -2356,6 +2722,17 @@ impl Node {
                             && self.validator_id.as_ref() == Some(&proposal.proposer);
                         if is_own {
                             return Ok(());
+                        }
+
+                        // H0-1/H0-2: never vote for a block whose participation
+                        // evidence or prior state root this node cannot confirm.
+                        if proposal.height == self.consensus.current_height() {
+                            if let Err(e) = self.validate_block_payload(&proposal) {
+                                warn!(height = proposal.height, round = proposal.round,
+                                      proposer = %proposal.proposer, error = %e,
+                                      "proposal rejected: invalid block payload");
+                                return Ok(());
+                            }
                         }
 
                         if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
@@ -2405,6 +2782,11 @@ impl Node {
                             }
                         };
 
+                        // H0-2: a precommit for the block we just committed that
+                        // arrived after our quorum still counts as participation
+                        // evidence for the next proposal.
+                        self.absorb_late_precommit(&vote);
+
                         debug!(
                             from = %msg.from,
                             height = vote.height,
@@ -2413,6 +2795,11 @@ impl Node {
                             vote_type = ?vote.vote_type,
                             "received consensus vote"
                         );
+
+                        if self.consensus.drives_own_votes() {
+                            self.on_vote_engine(vote).await;
+                            return Ok(());
+                        }
 
                         if vote.height > self.consensus.current_height() {
                             // Same reasoning as the BlockProposal branch above --
@@ -2563,6 +2950,17 @@ impl Node {
                         // further ahead than what we need next, is ignored (the
                         // latter will arrive again once we've caught up to it).
                         if resp.height != self.consensus.current_height() {
+                            return Ok(());
+                        }
+                        // The certificate is for a block hash; the proposal must
+                        // be exactly that block, at that height.
+                        let p = &resp.proposal;
+                        let computed = chain_forge_consensus::compute_block_hash(
+                            &self.genesis.chain_id, p.height, &p.parent_hash, &p.tx_data);
+                        if resp.cert.height != resp.height || p.height != resp.height
+                            || p.block_hash != resp.cert.block_hash || computed != p.block_hash
+                        {
+                            warn!(height = resp.height, "rejected sync response: proposal does not match the certificate");
                             return Ok(());
                         }
                         let vs = self.consensus.validator_set().clone();
@@ -3164,10 +3562,13 @@ impl Node {
         Ok(actual_burn)
     }
 
-    /// Drain equivocations detected by the consensus engine and route each
-    /// one through `process_equivocation_evidence`. Called after every
-    /// `receive_vote` so double-signs are punished immediately.
-    fn handle_drained_equivocations(&mut self, equivocations: Vec<EquivocationDetected>, epoch: u64) {
+    /// Queue equivocations detected by the consensus engine as evidence for
+    /// the next block this node proposes. Called after every `receive_vote`.
+    fn handle_drained_equivocations(&mut self, equivocations: Vec<EquivocationDetected>, _epoch: u64) {
+        // Release gate 4: never slash on local observation. Which nodes see a
+        // double vote, and when, differs, so applying it here diverges node
+        // state. Verify it and queue it; it is slashed when a block carrying
+        // it commits (`apply_committed_evidence`), identically everywhere.
         for eq in equivocations {
             let evidence = EquivocationEvidence {
                 validator_id:   eq.validator_id.0.clone(),
@@ -3179,44 +3580,105 @@ impl Node {
                 signature_b:    eq.signature_b,
                 vote_type_byte: eq.vote_type_byte,
             };
-            match self.process_equivocation_evidence(&evidence, epoch) {
-                Ok(burned) => {
-                    info!(
-                        validator = %eq.validator_id,
-                        height    = eq.height,
-                        round     = eq.round,
-                        burned_uqcb = burned,
-                        "equivocation detected and slashed"
-                    );
-                }
-                Err(e) => {
-                    // Already slashed or validator absent — not an error we
-                    // need to propagate; just log.
-                    warn!(
-                        validator = %eq.validator_id,
-                        error     = %e,
-                        "equivocation evidence rejected"
-                    );
-                }
+            let vs = self.historical_validator_sets.get(&evidence.height)
+                .unwrap_or_else(|| self.consensus.validator_set());
+            if let Err(e) = self.check_evidence_signatures(&evidence, vs) {
+                warn!(validator = %evidence.validator_id, error = %e, "equivocation evidence not queued");
+                continue;
             }
+            if self.pending_evidence.iter().any(|p| p.validator_id == evidence.validator_id) {
+                continue;
+            }
+            warn!(validator = %evidence.validator_id, height = evidence.height, round = evidence.round,
+                  "equivocation detected; evidence queued for the next block");
+            self.pending_evidence.push(evidence);
         }
     }
 
-    /// Check liveness participation for every validator after a block commits
-    /// and apply slashing to any that have crossed the miss threshold.
+    /// Release gate 4: both signatures are by the offender's key in `vs`,
+    /// over two different blocks of the same (height, round, phase).
+    fn check_evidence_signatures(&self, ev: &EquivocationEvidence, vs: &chain_forge_consensus::ValidatorSet) -> Result<(), String> {
+        if ev.signature_a.is_empty() || ev.signature_b.is_empty() {
+            return Err("evidence must carry both signatures".into());
+        }
+        if ev.block_hash_a == ev.block_hash_b {
+            return Err("evidence names the same block twice".into());
+        }
+        let vote_type = match ev.vote_type_byte {
+            0 => VoteType::Prevote,
+            1 => VoteType::Precommit,
+            b => return Err(format!("unknown vote type byte {b}")),
+        };
+        let round = u32::try_from(ev.round).map_err(|_| format!("round {} out of range", ev.round))?;
+        let key = vs.public_key_of(&ValidatorId(ev.validator_id.clone()));
+        if key.is_empty() {
+            return Err(format!("{} has no consensus key in the set at height {}", ev.validator_id, ev.height));
+        }
+        for (hash, sig) in [(&ev.block_hash_a, &ev.signature_a), (&ev.block_hash_b, &ev.signature_b)] {
+            let msg = vote_signing_bytes(&self.genesis.chain_id, &vote_type, ev.height, round,
+                                         Some(&BlockHash(hash.clone())));
+            chain_forge_crypto::verify_consensus(&msg, sig, key)
+                .map_err(|e| format!("evidence signature does not verify: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Release gate 4: whether `ev` may be committed in a block at `height`.
+    /// Deterministic: it reads only committed state.
+    fn check_evidence(&self, ev: &EquivocationEvidence, height: u64) -> Result<(), String> {
+        if ev.height >= height {
+            return Err(format!("evidence height {} is not below the block height {height}", ev.height));
+        }
+        if ev.height + EVIDENCE_MAX_AGE_BLOCKS < height {
+            return Err(format!("evidence from height {} is older than {EVIDENCE_MAX_AGE_BLOCKS} blocks", ev.height));
+        }
+        let vs = self.historical_validator_sets.get(&ev.height)
+            .ok_or_else(|| format!("no validator set recorded for height {}", ev.height))?;
+        self.check_evidence_signatures(ev, vs)?;
+        let tombstoned = self.validator_registry.get(&ev.validator_id)
+            .map(|r| r.status == chain_forge_validators::ValidatorStatus::Tombstoned)
+            .unwrap_or(false);
+        if tombstoned {
+            return Err(format!("{} is already slashed", ev.validator_id));
+        }
+        Ok(())
+    }
+
+    /// Release gate 4: the queued evidence a block at `height` will carry.
+    fn evidence_for_proposal(&self, height: u64) -> Vec<EquivocationEvidence> {
+        self.pending_evidence.iter()
+            .filter(|ev| self.check_evidence(ev, height).is_ok())
+            .take(MAX_EVIDENCE_PER_BLOCK)
+            .cloned()
+            .collect()
+    }
+
+    /// Release gate 4: slash the evidence a committed block carries. Runs
+    /// before execution on every node, so it lands in the state root.
+    fn apply_committed_evidence(&mut self, evidence: &[EquivocationEvidence], height: u64) {
+        for ev in evidence {
+            match self.process_equivocation_evidence(ev, height) {
+                Ok(burned) => info!(validator = %ev.validator_id, height = ev.height, round = ev.round,
+                                    burned_uqcb = burned, "committed equivocation evidence slashed"),
+                // Unreachable for evidence that passed check_evidence; logged, not fatal.
+                Err(e) => error!(validator = %ev.validator_id, error = %e, "committed evidence not applied"),
+            }
+        }
+        self.pending_evidence.retain(|p| !evidence.iter().any(|ev| ev.validator_id == p.validator_id));
+    }
+
+    /// Record liveness participation for every validator from committed
+    /// `last_commit` evidence (H0-2), against the validator set effective at
+    /// the evidence's height. A validator absent from the evidence is recorded
+    /// as a miss; once its miss rate exceeds `liveness_miss_pct_threshold`
+    /// over the sliding `liveness_window_blocks`, the slashing module jails it
+    /// (temporary, reversible). Liveness never burns stake.
     ///
-    /// Uses `cert.precommits` (the votes that formed the quorum) as the
-    /// authoritative signer set, and `consensus.validator_set()` for the full
-    /// active set. Any validator absent from the quorum is recorded as a miss.
-    /// Once a validator's miss rate exceeds `liveness_miss_pct_threshold`
-    /// (default 20%) over the sliding `liveness_window_blocks` (default 500),
-    /// `record_block` returns `Ok(Some(burn_amount))`, the validator is jailed
-    /// by the slashing module itself, and this method burns the penalty via BME.
-    ///
-    /// Whitepaper refs: Section 8.2 (liveness slashing), Section 6.3 (BME burn).
+    /// Whitepaper ref: Section 8.2 (liveness).
     fn check_liveness_after_commit(
         &mut self,
         cert: &chain_forge_consensus::CommitCertificate,
+        evidence_proposer: &str,
     ) {
         // Build the set of validator ids that actually signed this block.
         let signers: std::collections::HashSet<String> = cert
@@ -3225,14 +3687,18 @@ impl Node {
             .map(|v| v.validator.0.clone())
             .collect();
 
-        // Full active validator set for this height.
+        // Validator set effective at the evidence's height (H0-2): judged
+        // against who was expected to sign then, not today's live set.
         let all_validators: Vec<String> = self
-            .consensus
-            .validator_set()
+            .historical_validator_sets
+            .get(&cert.height)
+            .unwrap_or_else(|| self.consensus.validator_set())
             .validators
             .iter()
             .map(|v| v.id.0.clone())
             .collect();
+        // BFT fault tolerance for this set: f = floor((n - 1) / 3).
+        let byzantine_f = all_validators.len().saturating_sub(1) / 3;
 
         let height = cert.height;
         let epoch  = height; // epoch == height until per-epoch batching is wired
@@ -3242,6 +3708,8 @@ impl Node {
             match self.slasher.record_block(
                 vid,
                 signed,
+                evidence_proposer,
+                byzantine_f,
                 &mut self.validator_registry,
                 epoch,
                 height,
@@ -3249,26 +3717,10 @@ impl Node {
                 Ok(None) => {
                     // Window filling or threshold not yet crossed — nothing to do.
                 }
-                Ok(Some(burn_amount)) => {
-                    // Liveness threshold crossed: validator jailed by record_block,
-                    // now burn the penalty stake via BME (Section 6.3).
-                    if burn_amount > 0 {
-                        if let Err(e) = self.state.burn(vid, "uqcb", burn_amount) {
-                            warn!(
-                                validator = %vid,
-                                burn_uqcb = burn_amount,
-                                error     = %e,
-                                "liveness slash: burn failed; jail applied but tokens not burned"
-                            );
-                        } else {
-                            warn!(
-                                validator = %vid,
-                                height,
-                                burn_uqcb = burn_amount,
-                                "liveness failure: validator jailed and stake burned"
-                            );
-                        }
-                    }
+                Ok(Some(_)) => {
+                    // record_block never returns a burn amount for liveness:
+                    // missed participation jails (temporarily) but never burns
+                    // stake -- see chain_forge_slashing::SlashingModule::record_block.
                 }
                 Err(e) => {
                     // Validator already jailed / tombstoned — not an error we
@@ -3298,8 +3750,23 @@ impl Node {
         self.round_watch = None;
         self.round_watch_started = None;
 
-        let txs: Vec<Transaction> = serde_json::from_slice(&proposal.tx_data)
-            .unwrap_or_default();
+        let payload = BlockPayload::decode(&proposal.tx_data);
+        // H0-1 fail-stop: a block built on a different prior state must never
+        // be applied on top of this node's state -- halting is the safe outcome.
+        if let Some(expected) = payload.prev_state_root.as_deref() {
+            let own = self.state.current_root();
+            if own != Some(expected) {
+                error!(height = cert.height, expected, own = ?own,
+                       "STATE DIVERGENCE: committed block's prev_state_root differs from this \
+                        node's state; refusing to apply it");
+                return Err(format!(
+                    "state divergence at height {}: block expects prev_state_root {expected}, \
+                     node has {own:?}", cert.height
+                ));
+            }
+        }
+        let participation = payload.last_commit.clone();
+        let txs: Vec<Transaction> = payload.txs;
         self.remove_committed_from_mempool(&txs);
         // Keep a lightweight (tx_id, sender, nonce) index before txs is consumed by
         // execute_block_with_identity so the post-execution nonce-cache update
@@ -3377,57 +3844,82 @@ impl Node {
             }
         }
 
-        // Validator participation = on-chain activity for QRC yield eligibility.
-        // Every validator who signed a precommit in this block's commit certificate
-        // gets their activity stamped for this epoch. This means validators earn
-        // QRC yield for doing their job — producing/signing blocks — without
-        // needing to submit separate Transfer or Stake txs.
-        // Also record epoch_blocks_signed for per-epoch reward eligibility.
-        let current_epoch = self.identity.clock.current_epoch;
-        for vote in &cert.precommits {
-            self.identity.record_activity(&vote.validator.0);
-            self.validator_registry.record_precommit(&vote.validator.0, current_epoch);
+        // Validator participation = on-chain activity for QRC yield eligibility
+        // and epoch_blocks_signed for per-epoch reward eligibility.
+        //
+        // H0-2: recorded ONLY from the committed block's last_commit evidence
+        // (precommits for height-1, validated by every voter), attributed to
+        // height-1's epoch. Never from `cert`, which each node assembles locally
+        // from whichever precommits it received first and so differs by node.
+        if let Some(lc) = &participation {
+            let evidence_epoch = lc.height / self.validator_epoch_blocks;
+            let mut seen = std::collections::HashSet::new();
+            for vote in &lc.precommits {
+                if seen.insert(vote.validator.0.clone()) {
+                    self.identity.record_activity(&vote.validator.0);
+                    self.validator_registry.record_precommit(&vote.validator.0, evidence_epoch);
+                }
+            }
+            // Reward participation, attributed to the proposer that published
+            // the evidence so omissions can be discounted (Byzantine-robust).
+            let signers: Vec<String> = lc.precommits.iter().map(|v| v.validator.0.clone()).collect();
+            self.validator_registry.record_epoch_evidence(evidence_epoch, &proposal.proposer.0, &signers);
         }
 
-        // ── Epoch-close: distribute validator reward pool equally among
-        //    eligible, active, personhood-verified validators (70/20/10 split
-        //    already moved fees into treasury:validator-pool at block close).
+        // Release gate 4: committed equivocation evidence is slashed here,
+        // before execution, identically on every node.
+        self.apply_committed_evidence(&payload.evidence, cert.height);
+
+        // ── Epoch-close: the first block of epoch k+1 pays closed epoch k.
         //
-        // Eligibility: Active, pop_verified, nonzero consensus power, not
-        // currently jailed, participation >= VALIDATOR_REWARD_PARTICIPATION_PCT.
-        // Per-human dedup: one share per unique owner_identity_id.
-        // Zero eligible → pool carries forward unchanged.
-        if epoch_rolled {
+        // Every block of epoch k has had its evidence committed by now: the
+        // evidence for k's last block is this block's last_commit, recorded
+        // just above. Eligibility and shares derive only from that committed
+        // evidence and registry state, so every node pays identically.
+        //
+        // Eligibility: Active, pop_verified, nonzero consensus power, and
+        // Byzantine-robust participation >= the genesis min_participation_pct
+        // (the f proposers that omitted a validator most are discounted).
+        // One share per human owner. Shares are pool / eligible (floor); the
+        // remainder, or the whole pool when nobody is eligible, carries forward.
+        if cert.height > 0 && cert.height % self.validator_epoch_blocks == 0 {
+            let closed_epoch = cert.height / self.validator_epoch_blocks - 1;
+            let n = participation.as_ref()
+                .and_then(|lc| self.historical_validator_sets.get(&lc.height))
+                .unwrap_or_else(|| self.consensus.validator_set())
+                .validators.len();
+            let byzantine_f = n.saturating_sub(1) / 3;
             let eligible = self.validator_registry.eligible_validators_for_epoch_reward(
-                current_epoch,
-                self.validator_epoch_blocks,
-                VALIDATOR_REWARD_PARTICIPATION_PCT,
+                closed_epoch, byzantine_f, self.reward_params.min_participation_pct,
             );
-            if !eligible.is_empty() {
-                let pool_bal = self.state.get_account("treasury:validator-pool")
-                    .map(|a| a.balance_of(self.executor.native_denom()))
-                    .unwrap_or(0);
-                let share = (pool_bal / eligible.len() as u128) as u64;
-                if share > 0 {
-                    for vid in &eligible {
-                        let _ = self.state.transfer(
-                            "treasury:validator-pool", vid,
-                            self.executor.native_denom(), share as u128,
-                        );
-                    }
-                    info!(
-                        epoch         = current_epoch,
-                        eligible      = eligible.len(),
-                        share_per_val = share,
-                        pool_balance  = pool_bal,
-                        "epoch-close: validator reward pool distributed"
-                    );
+            let denom = self.executor.native_denom().to_string();
+            let pool_bal = self.state.get_account("treasury:validator-pool")
+                .map(|a| a.balance_of(&denom))
+                .unwrap_or(0);
+            // Fixed pool (owner decision): split by weight 10,000 + premium
+            // bps (Model C, capped; 0 unless configured in genesis). Equal
+            // weights reproduce the equal split. Floor rounding keeps
+            // sum(shares) <= pool; the remainder carries forward.
+            let weights: Vec<u128> = eligible.iter().map(|vid| 10_000 + self.reward_premium_bps(vid)).collect();
+            let total_weight: u128 = weights.iter().sum();
+            let mut paid: u128 = 0;
+            for (vid, w) in eligible.iter().zip(&weights) {
+                let share = pool_bal * w / total_weight.max(1);
+                if share == 0 { continue; }
+                match self.state.transfer("treasury:validator-pool", vid, &denom, share) {
+                    Ok(()) => paid += share,
+                    // Cannot happen: sum(shares) <= pool_bal. Every node
+                    // computes the same values, so it would fail identically
+                    // everywhere; log loudly rather than halt.
+                    Err(e) => error!(validator = %vid, share, error = %e, "epoch-close: reward transfer failed"),
                 }
+            }
+            if paid > 0 {
+                info!(epoch = closed_epoch, eligible = eligible.len(), paid, pool_balance = pool_bal,
+                      "epoch-close: validator reward pool distributed");
             } else {
-                debug!(
-                    epoch = current_epoch,
-                    "epoch-close: no eligible validators — validator reward pool carried forward"
-                );
+                debug!(epoch = closed_epoch, eligible = eligible.len(), pool_balance = pool_bal,
+                       "epoch-close: no reward paid -- pool carried forward");
             }
         }
 
@@ -3508,14 +4000,15 @@ impl Node {
         };
 
         // F1: update per-sender nonce cache AFTER execution, from the tx.nonce of each
-        // successfully committed transaction. The API check rejects tx.nonce <= cache,
-        // so cache must store the last committed tx.nonce (not state.nonce, which is
+        // INCLUDED transaction. The API check rejects tx.nonce <= cache, so cache
+        // must store the last consumed tx.nonce (not state.nonce, which is
         // post-increment and would block the immediately following valid submission).
-        // Updating before execution caused the cache to advance even for txs that
-        // failed, making it impossible to submit a corrected tx on the same sender.
+        // H0-5: an included-but-failed tx (fee_charged > 0) consumes its nonce on
+        // chain just like a successful one, so it advances the cache too; a
+        // rejected tx (fee_charged == 0) consumed nothing and leaves it alone.
         {
             let mut cache = self.nonce_cache.lock().unwrap();
-            for r in exec_result.tx_results.iter().filter(|r| r.success) {
+            for r in exec_result.tx_results.iter().filter(|r| r.fee_charged > 0) {
                 // TransactionResult has no sender field; look up (sender, nonce) from
                 // the index captured before txs was consumed by execute_block_with_identity.
                 if let Some((_, sender, tx_nonce)) = txs_for_cache.iter().find(|(id, _, _)| id == &r.tx_id) {
@@ -3780,6 +4273,12 @@ impl Node {
             // proportional to actual stake.
             for v in &mut updated_vs.validators {
                 if let Some(&bonded_uqcb) = bond_map.get(v.id.0.as_str()) {
+                    // Keep the registry's stake in step with the bond ledger.
+                    if let Err(e) = self.validator_registry.update_stake(&v.id.0, bonded_uqcb) {
+                        if !matches!(e, chain_forge_validators::ValidatorError::NotFound(_)) {
+                            warn!(validator = %v.id, error = %e, "registry stake update failed");
+                        }
+                    }
                     let new_power = bonded_uqcb.min(u64::MAX as u128) as u64;
                     if v.voting_power != new_power {
                         info!(
@@ -4112,6 +4611,8 @@ impl Node {
             }
         }
 
+        self.sync_registry_pop_from_validator_set();
+
         self.consensus.on_commit(cert.clone(), None).await
             .map_err(|e| e.to_string())?;
 
@@ -4144,6 +4645,8 @@ impl Node {
                 .max(self.last_committed_timestamp_ms.saturating_add(1));
             ex.blocks.push_front(BlockSummary {
                 height:       exec_result.height,
+                block_hash:   cert.block_hash.0.clone(),
+                round:        cert.round,
                 state_root:   exec_result.state_root.clone(),
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
@@ -4169,6 +4672,7 @@ impl Node {
                     attestation_count: att_count,
                     attested_by:       att_by,
                     key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                 });
             }
 
@@ -4201,10 +4705,20 @@ impl Node {
         // behind has something to actually request and replay.
         self.chain_store.insert(committed_height, (cert.clone(), proposal.clone()));
 
-        // Record block participation for every validator and slash any that
-        // have crossed the liveness miss threshold (>20% absent in 500-block
-        // sliding window → jail + 0.1% stake burn via BME, Section 8.2).
-        self.check_liveness_after_commit(&cert);
+        // H0-2: the evidence the next proposer publishes starts from this
+        // node's own certificate and grows with late precommits.
+        self.last_commit_evidence = Some(cert.clone());
+        self.last_commit_at = Some(std::time::Instant::now());
+
+        // Record block participation for every validator and jail any that
+        // have crossed the liveness miss threshold in the sliding window
+        // (temporary, reversible jail; liveness never burns stake).
+        // H0-2: judged from the committed last_commit evidence for height-1,
+        // never from this node's locally assembled certificate -- otherwise
+        // nodes would jail and burn different validators.
+        if let Some(lc) = &participation {
+            self.check_liveness_after_commit(lc, &proposal.proposer.0);
+        }
 
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
@@ -4235,6 +4749,103 @@ impl Node {
     /// (as of THAT set, not the live one) meets or exceeds that set's own
     /// quorum threshold. `Err` otherwise, with a string explaining which
     /// check failed.
+    /// H0-1/H0-2: check a proposal's payload before voting for it.
+    fn validate_block_payload(&self, proposal: &BlockProposal) -> Result<(), String> {
+        let max_block_bytes = self.genesis.limits.max_block_bytes as usize;
+        if max_block_bytes > 0 && proposal.tx_data.len() > max_block_bytes {
+            return Err(format!(
+                "block payload is {} bytes, limit max_block_bytes {max_block_bytes}", proposal.tx_data.len()
+            ));
+        }
+        let payload = BlockPayload::decode(&proposal.tx_data);
+        if payload.version != BLOCK_PAYLOAD_VERSION {
+            return Err(format!(
+                "payload version {} is not the required {BLOCK_PAYLOAD_VERSION}", payload.version
+            ));
+        }
+        let own_root = self.state.current_root();
+        if payload.prev_state_root.as_deref() != own_root {
+            return Err(format!(
+                "prev_state_root {:?} does not match this node's state root {:?}",
+                payload.prev_state_root, own_root
+            ));
+        }
+        // Release gate 4: every evidence item must be valid, at most one per
+        // validator, and within the per-block limit.
+        if payload.evidence.len() > MAX_EVIDENCE_PER_BLOCK {
+            return Err(format!("{} evidence items exceed the limit of {MAX_EVIDENCE_PER_BLOCK}", payload.evidence.len()));
+        }
+        let mut offenders = std::collections::HashSet::new();
+        for ev in &payload.evidence {
+            if !offenders.insert(ev.validator_id.as_str()) {
+                return Err(format!("duplicate evidence for {}", ev.validator_id));
+            }
+            self.check_evidence(ev, proposal.height).map_err(|e| format!("invalid evidence: {e}"))?;
+        }
+        if proposal.height == 0 {
+            if payload.last_commit.is_some() {
+                return Err("a height-0 block cannot carry a last_commit".into());
+            }
+            return Ok(());
+        }
+        let lc = payload.last_commit.as_ref()
+            .ok_or("missing last_commit evidence for the previous block")?;
+        let prev = proposal.height - 1;
+        if lc.height != prev {
+            return Err(format!("last_commit is for height {}, expected {prev}", lc.height));
+        }
+        let (committed, _) = self.chain_store.get(&prev)
+            .ok_or_else(|| format!("block {prev} is not committed locally; cannot check last_commit"))?;
+        if lc.block_hash != committed.block_hash {
+            return Err(format!(
+                "last_commit names block {}, but block {prev} committed as {}",
+                lc.block_hash, committed.block_hash
+            ));
+        }
+        self.verify_certificate_against_history(lc)
+            .map_err(|e| format!("invalid last_commit: {e}"))
+    }
+
+    /// H0-2: add a late, valid precommit for the last committed block to the
+    /// evidence the next proposer will publish.
+    fn absorb_late_precommit(&mut self, vote: &Vote) {
+        let Some(evidence) = self.last_commit_evidence.as_ref() else { return };
+        if vote.vote_type != VoteType::Precommit
+            || vote.height != evidence.height
+            || vote.round != evidence.round
+            || vote.block_hash.as_ref() != Some(&evidence.block_hash)
+            || evidence.precommits.iter().any(|v| v.validator == vote.validator)
+        {
+            return;
+        }
+        let candidate = chain_forge_consensus::CommitCertificate {
+            precommits: vec![vote.clone()],
+            ..evidence.clone()
+        };
+        // Signature/power check against the set effective at that height;
+        // the single-vote quorum shortfall is the only acceptable error.
+        match self.verify_certificate_against_history(&candidate) {
+            Ok(()) => {}
+            Err(e) if e.contains("short of the") => {}
+            Err(e) => {
+                debug!(validator = %vote.validator, error = %e, "late precommit rejected");
+                return;
+            }
+        }
+        if let Some(ev) = self.last_commit_evidence.as_mut() {
+            ev.precommits.push(vote.clone());
+        }
+    }
+
+    /// The proposer waits for every validator's precommit, or COMMIT_GATHER_MS.
+    fn last_commit_ready(&self) -> bool {
+        let Some(ev) = self.last_commit_evidence.as_ref() else { return true };
+        let n = self.consensus.validator_set().validators.iter()
+            .filter(|v| v.voting_power > 0).count();
+        ev.precommits.len() >= n
+            || self.last_commit_at.map_or(true, |t| t.elapsed().as_millis() >= COMMIT_GATHER_MS)
+    }
+
     pub fn verify_certificate_against_history(
         &self,
         cert: &chain_forge_consensus::CommitCertificate,
@@ -4251,6 +4862,32 @@ impl Node {
         let mut counted_validators = std::collections::HashSet::new();
 
         for vote in &cert.precommits {
+            // Every vote must be a precommit for exactly this certificate's
+            // (height, round, block). Otherwise validly signed votes for some
+            // other block could be counted toward this one's quorum.
+            if vote.vote_type != VoteType::Precommit
+                || vote.height != cert.height
+                || vote.round != cert.round
+                || vote.block_hash.as_ref() != Some(&cert.block_hash)
+            {
+                return Err(format!(
+                    "certificate for height {} round {} contains a vote from {} that is \
+                     not a precommit for that block",
+                    cert.height, cert.round, vote.validator
+                ));
+            }
+            // The tag must name the scheme of the key the vote is checked
+            // against (fail-closed on anything else).
+            let key_scheme = chain_forge_crypto::consensus_key_scheme(historical_vs.public_key_of(&vote.validator))
+                .unwrap_or(chain_forge_crypto::SchemeId::Classical);
+            let expected = chain_forge_crypto::consensus_scheme_tag(&key_scheme);
+            if vote.scheme != expected {
+                return Err(format!(
+                    "certificate vote from {} uses scheme {:?}, but its registered key \
+                     is {expected:?} (fail-closed)",
+                    vote.validator, vote.scheme
+                ));
+            }
             // Equivocation/duplicate guard: only count each validator once,
             // same as a real quorum tally would.
             if !counted_validators.insert(vote.validator.clone()) {
@@ -4284,11 +4921,7 @@ impl Node {
                     &self.genesis.chain_id, &vote.vote_type, vote.height, vote.round,
                     vote.block_hash.as_ref(),
                 );
-                let sig = chain_forge_crypto::Signature {
-                    scheme: chain_forge_crypto::SchemeId::Classical,
-                    bytes:  vote.signature.clone(),
-                };
-                ClassicalScheme.verify(&msg, &sig, pub_key).map_err(|e| format!(
+                chain_forge_crypto::verify_consensus(&msg, &vote.signature, pub_key).map_err(|e| format!(
                     "validator {}'s precommit signature does not verify against the \
                      key it had registered at height {}: {e}",
                     vote.validator, cert.height
@@ -4315,6 +4948,367 @@ impl Node {
     /// reached quorum (small validator sets can do this in one round-trip).
     /// Otherwise the block commits later, from handle_event, once enough
     /// peers' votes have arrived over gossip.
+    /// Capital premium in basis points of reward weight (Model C):
+    /// `min(k × (bond − bond_min) / 1,000 QCB, cap)`, from the on-chain bond
+    /// ledger. 0 when the premium is not configured.
+    fn reward_premium_bps(&self, validator: &str) -> u128 {
+        let (k, cap) = (self.reward_params.premium_k_bps_per_kqcb as u128, self.reward_params.premium_cap_bps as u128);
+        if k == 0 || cap == 0 { return 0; }
+        let bond = self.state
+            .get_account(&format!("{}{validator}", chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX))
+            .map(|a| a.balance_of(self.executor.native_denom()))
+            .unwrap_or(0);
+        const KQCB_UQCB: u128 = 1_000 * 1_000_000;
+        (k * bond.saturating_sub(self.min_bond_uqcb) / KQCB_UQCB).min(cap)
+    }
+
+    /// QPC-CONS-001 Phase B: keep the ValidatorRegistry in step with the live
+    /// ValidatorSet. A seated validator whose personhood verifies is confirmed
+    /// (pop_verified, Active) in the registry, which reward eligibility and
+    /// revocation read. Personhood resolves exactly as the set's PoP refresh
+    /// does: a genesis validator's own identity, a bonded validator's
+    /// authenticated owner. Integration Point 3 handles the other direction.
+    /// Runs on every commit path (multi-node and solo).
+    fn sync_registry_pop_from_validator_set(&mut self) {
+        let epoch = self.identity.clock.current_epoch;
+        let verified_addrs: Vec<String> = self.consensus.validator_set().validators.iter()
+            .filter(|v| v.pop_verified)
+            .map(|v| v.id.0.clone())
+            .collect();
+        for addr in &verified_addrs {
+            let Ok(rec) = self.validator_registry.get(addr) else { continue };
+            // Re-confirm a seated Candidate too: it may have been confirmed
+            // before its bond reached the registry. confirm_pop activates
+            // only if eligible, so this is idempotent.
+            if rec.pop_verified && rec.status != chain_forge_validators::ValidatorStatus::Candidate { continue; }
+            let identity_id = if rec.is_genesis {
+                Some(addr.clone())
+            } else {
+                self.bond_owner_bindings.get(addr).cloned()
+            };
+            let tier = identity_id
+                .and_then(|id| self.identity.get(&id).ok().map(|r| r.charm.tier.clone()))
+                .filter(|t| t.grants_consensus());
+            if let Some(tier) = tier {
+                if let Err(e) = self.validator_registry.confirm_pop(addr, tier, epoch) {
+                    warn!(validator = %addr, error = %e, "registry PoP sync failed");
+                }
+            }
+        }
+    }
+
+    // ── Engine-driven consensus (Tendermint) ─────────────────────────────────
+    //
+    // The engine decides every vote this validator casts (see
+    // chain_forge_consensus::tendermint::engine). The node only signs them
+    // through the persisted double-sign guard, broadcasts, proposes when
+    // asked, runs the step timers, executes decisions, and re-gossips the
+    // current height's messages.
+
+    /// Carry out every action the engine has queued.
+    async fn drive_consensus(&mut self) {
+        let mut budget = 10_000usize;
+        while let Some(action) = self.consensus.next_action() {
+            budget -= 1;
+            if budget == 0 {
+                warn!("consensus action budget exhausted; continuing on the next tick");
+                break;
+            }
+            match action {
+                ConsensusAction::CastVote(vote) => self.cast_engine_vote(vote).await,
+                ConsensusAction::ProposeNew { height, round } => {
+                    self.pending_propose = Some((height, round, std::time::Instant::now()));
+                }
+                ConsensusAction::Repropose(proposal) => {
+                    info!(height = proposal.height, round = proposal.round, block_hash = %proposal.block_hash,
+                          pol_round = ?proposal.pol_round, "re-proposing valid block");
+                    let proposal = self.sign_and_register_own_proposal(proposal).await;
+                    self.pending_proposals.insert((proposal.height, proposal.round), proposal.clone());
+                    let _ = self.network.publish(OutboundMessage {
+                        topic:   GossipTopic::BlockProposal,
+                        payload: serde_json::to_vec(&proposal).unwrap_or_default(),
+                    }).await;
+                }
+                ConsensusAction::ScheduleTimeout { step, height, round, after_ms } => {
+                    let at = std::time::Instant::now() + std::time::Duration::from_millis(after_ms);
+                    self.consensus_timers.push((at, step, height, round));
+                }
+                ConsensusAction::Commit { certificate, proposal } => {
+                    let eqs = self.consensus.drain_equivocations();
+                    if !eqs.is_empty() {
+                        let epoch = self.consensus.current_height();
+                        self.handle_drained_equivocations(eqs, epoch);
+                    }
+                    if let Err(e) = self.commit_block(certificate, &proposal).await {
+                        error!(error = %e, "commit of decided block failed");
+                    }
+                    let h = self.consensus.current_height();
+                    self.consensus_timers.retain(|t| t.2 >= h);
+                }
+            }
+        }
+    }
+
+    /// Sign (through the double-sign guard), persist, broadcast, and feed
+    /// back one of this validator's own votes.
+    async fn cast_engine_vote(&mut self, mut vote: Vote) {
+        if self.signing_key.is_none() {
+            debug!("no signing key loaded: not casting");
+            return;
+        }
+        match self.sign_guard.check(&vote) {
+            Err(e) => {
+                error!(height = vote.height, round = vote.round, error = %e, "double-sign guard refused to sign");
+                return;
+            }
+            Ok(Some(signed)) => vote = signed,
+            Ok(None) => {
+                self.sign_vote(&mut vote);
+                self.sign_guard.record(&vote, self.consensus.lock_state());
+                if let Err(e) = self.persist_sign_guard() {
+                    error!(error = %e, "cannot persist signing state: vote withheld");
+                    return;
+                }
+            }
+        }
+        let _ = self.network.publish(OutboundMessage {
+            topic:   GossipTopic::ConsensusVote,
+            payload: serde_json::to_vec(&vote).unwrap_or_default(),
+        }).await;
+        if let Err(e) = self.consensus.receive_vote(vote).await {
+            debug!(error = %e, "own vote rejected locally");
+        }
+    }
+
+    /// Write the double-sign guard to disk before anything it covers is sent.
+    fn persist_sign_guard(&self) -> Result<(), String> {
+        let Some(ref dir) = self.data_dir else { return Ok(()) };
+        let json = serde_json::to_vec_pretty(&self.sign_guard).map_err(|e| e.to_string())?;
+        write_atomic(&dir.join("persist").join("consensus_signing.json"), &json).map_err(|e| e.to_string())
+    }
+
+    /// Restore the double-sign guard and the engine's lock state (restart).
+    fn restore_sign_guard(&mut self) {
+        let Some(ref dir) = self.data_dir else { return };
+        let path = dir.join("persist").join("consensus_signing.json");
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let guard: SignGuard = match serde_json::from_str(&text) {
+            Ok(g) => g,
+            Err(e) => {
+                // Refuse to guess: an unreadable guard could hide a lock.
+                panic!("consensus_signing.json is unreadable ({e}); refusing to start a validator that may be locked");
+            }
+        };
+        if let Some(mut lock) = guard.lock.clone() {
+            // Restore the signed copies of our own votes.
+            lock.own_votes = guard.votes.iter().filter(|v| v.height == lock.height).cloned().collect();
+            if let Err(e) = self.consensus.restore_lock_state(lock) {
+                panic!("cannot restore consensus lock state: {e}");
+            }
+        }
+        info!(last = ?guard.last, "double-sign guard restored");
+        self.sign_guard = guard;
+    }
+
+    fn buffer_next(&mut self, msg: NextHeightMsg) {
+        if self.next_height_msgs.len() < MAX_NEXT_HEIGHT_MSGS {
+            self.next_height_msgs.push(msg);
+        }
+    }
+
+    /// Request sync, at most once per second.
+    async fn request_sync_limited(&mut self) {
+        let due = self.last_sync_request.map(|t| t.elapsed().as_millis() >= 1_000).unwrap_or(true);
+        if due {
+            self.last_sync_request = Some(std::time::Instant::now());
+            self.request_sync().await;
+        }
+    }
+
+    async fn on_proposal_engine(&mut self, proposal: BlockProposal) {
+        let current = self.consensus.current_height();
+        if proposal.height < current { return; }
+        if proposal.height == current + 1 {
+            self.buffer_next(NextHeightMsg::Proposal(proposal));
+            self.request_sync_limited().await;
+            return;
+        }
+        if proposal.height > current + 1 {
+            self.request_sync_limited().await;
+            return;
+        }
+        // H0-1/H0-2: never accept a block whose participation evidence or
+        // prior state root this node cannot confirm.
+        if let Err(e) = self.validate_block_payload(&proposal) {
+            warn!(height = proposal.height, round = proposal.round, proposer = %proposal.proposer,
+                  error = %e, "proposal rejected: invalid block payload");
+            return;
+        }
+        if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
+            debug!(error = %e, "proposal rejected");
+            return;
+        }
+        self.pending_proposals.insert((proposal.height, proposal.round), proposal);
+        self.drive_consensus().await;
+    }
+
+    async fn on_vote_engine(&mut self, vote: Vote) {
+        let current = self.consensus.current_height();
+        if vote.height < current { return; }
+        if vote.height == current + 1 {
+            self.buffer_next(NextHeightMsg::Vote(vote));
+            self.request_sync_limited().await;
+            return;
+        }
+        if vote.height > current + 1 {
+            self.request_sync_limited().await;
+            return;
+        }
+        if let Err(reject) = self.verify_vote_signature(&vote) {
+            warn!(validator = %vote.validator, height = vote.height, round = vote.round,
+                  reason = %reject, "vote rejected: invalid signature");
+            return;
+        }
+        if let Err(e) = self.consensus.receive_vote(vote).await {
+            debug!(error = %e, "vote rejected");
+        }
+        let eqs = self.consensus.drain_equivocations();
+        if !eqs.is_empty() {
+            let epoch = self.consensus.current_height();
+            self.handle_drained_equivocations(eqs, epoch);
+        }
+        self.drive_consensus().await;
+    }
+
+    /// Engine-driven consensus tick: fire due timers, replay buffered
+    /// next-height messages, propose when asked, and re-gossip.
+    async fn consensus_tick(&mut self) {
+        let now = std::time::Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.consensus_timers)
+            .into_iter().partition(|t| t.0 <= now);
+        self.consensus_timers = later;
+        for (_, step, height, round) in due {
+            self.consensus.on_step_timeout(step, height, round);
+        }
+        self.drive_consensus().await;
+
+        let current = self.consensus.current_height();
+        if self.next_height_msgs.iter().any(|m| match m {
+            NextHeightMsg::Proposal(p) => p.height <= current,
+            NextHeightMsg::Vote(v) => v.height <= current,
+        }) {
+            let msgs = std::mem::take(&mut self.next_height_msgs);
+            for m in msgs {
+                match m {
+                    NextHeightMsg::Proposal(p) => self.on_proposal_engine(p).await,
+                    NextHeightMsg::Vote(v) => self.on_vote_engine(v).await,
+                }
+            }
+        }
+
+        let peer_count = self.status.lock().unwrap().peer_count;
+        if let Some((height, round, since)) = self.pending_propose {
+            let block_time = self.genesis.consensus.block_time_ms as u128;
+            if height != self.consensus.current_height() || round != self.consensus.current_round() {
+                self.pending_propose = None;
+            } else if peer_count > 0
+                && self.last_commit_ready()
+                && (!self.mempool.is_empty() || since.elapsed().as_millis() >= block_time)
+            {
+                self.pending_propose = None;
+                self.propose_fresh(height, round).await;
+            }
+        }
+
+        let regossip_ms = (2 * self.genesis.consensus.block_time_ms) as u128;
+        if peer_count > 0 && self.last_regossip.map(|t| t.elapsed().as_millis() >= regossip_ms).unwrap_or(true) {
+            self.last_regossip = Some(std::time::Instant::now());
+            let (proposals, votes) = self.consensus.gossip_messages();
+            for p in proposals {
+                let _ = self.network.publish(OutboundMessage {
+                    topic: GossipTopic::BlockProposal, payload: serde_json::to_vec(&p).unwrap_or_default(),
+                }).await;
+            }
+            for v in votes {
+                let _ = self.network.publish(OutboundMessage {
+                    topic: GossipTopic::ConsensusVote, payload: serde_json::to_vec(&v).unwrap_or_default(),
+                }).await;
+            }
+        }
+    }
+
+    /// Sign one of our own proposals and hand the signed copy to the engine
+    /// (it replaces the unsigned one, so re-gossip is verifiable too).
+    async fn sign_and_register_own_proposal(&mut self, mut proposal: BlockProposal) -> BlockProposal {
+        self.sign_proposal(&mut proposal);
+        if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
+            warn!(error = %e, "own signed proposal not accepted by the engine");
+        }
+        proposal
+    }
+
+    /// The payload for a new block at `height`: evidence for h-1, this node's
+    /// state root, and the mempool txs that fit in `max_block_bytes`.
+    /// A tx too large even for a block without evidence can never be
+    /// included; it is evicted so it doesn't hold its sender's later txs.
+    fn block_payload(&mut self, height: u64) -> BlockPayload {
+        let max_block_bytes = self.genesis.limits.max_block_bytes as usize;
+        let mut payload = BlockPayload {
+            version:         BLOCK_PAYLOAD_VERSION,
+            txs:             vec![],
+            last_commit:     if height == 0 { None } else { self.last_commit_evidence.clone() },
+            prev_state_root: self.state.current_root().map(str::to_string),
+            evidence:        vec![],
+        };
+        let sizes = &mut self.mempool_tx_bytes;
+        let ids: std::collections::HashSet<&str> = self.mempool.iter().map(|t| t.id.as_str()).collect();
+        sizes.retain(|id, _| ids.contains(id.as_str()));
+        for tx in &self.mempool {
+            sizes.entry(tx.id.clone()).or_insert_with(||
+                serde_json::to_vec(tx).map(|v| v.len()).unwrap_or(usize::MAX));
+        }
+        if max_block_bytes > 0 {
+            let room = max_block_bytes.saturating_sub(payload.encode().len());
+            let sizes = &self.mempool_tx_bytes;
+            self.mempool.retain(|tx| {
+                let tx_len = sizes[&tx.id];
+                let fits = tx_len.saturating_add(1) <= room;
+                if !fits {
+                    warn!(tx_id = %tx.id, tx_bytes = tx_len, max_block_bytes,
+                          "transaction can never fit in a block; evicted from the mempool");
+                }
+                fits
+            });
+        }
+        payload.evidence = self.evidence_for_proposal(height);
+        let sizes = &self.mempool_tx_bytes;
+        payload.txs = select_block_txs(&self.mempool, &payload, max_block_bytes,
+            |tx| sizes.get(&tx.id).copied().unwrap_or(usize::MAX));
+        payload
+    }
+
+    /// Build and broadcast a fresh proposal the engine asked for.
+    async fn propose_fresh(&mut self, height: u64, round: u32) {
+        // Copy, don't drain: txs leave the mempool only when a block commits.
+        let payload = self.block_payload(height);
+        let txs = payload.txs.clone();
+        let tx_bytes = payload.encode();
+        let parent = BlockHash(format!("genesis_h{height}"));
+        match self.consensus.propose(height, round, parent, tx_bytes).await {
+            Ok(proposal) => {
+                let proposal = self.sign_and_register_own_proposal(proposal).await;
+                info!(height, round, block_hash = %proposal.block_hash, txs = txs.len(), "block proposed (multi-node)");
+                self.pending_proposals.insert((height, round), proposal.clone());
+                let _ = self.network.publish(OutboundMessage {
+                    topic:   GossipTopic::BlockProposal,
+                    payload: serde_json::to_vec(&proposal).unwrap_or_default(),
+                }).await;
+                self.drive_consensus().await;
+            }
+            Err(e) => debug!(error = %e, "proposal skipped"),
+        }
+    }
+
     async fn propose_and_broadcast_multinode(
         &mut self,
         parent_hash: BlockHash,
@@ -4326,8 +5320,9 @@ impl Node {
         // still be here for the next proposer; they leave the mempool only
         // when a block containing them commits (commit_block). Draining here
         // silently lost every tx in any proposal that didn't commit.
-        let txs = self.mempool.clone();
-        let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
+        let payload = self.block_payload(height);
+        let txs = payload.txs.clone();
+        let tx_bytes = payload.encode();
 
         let proposal = self.consensus
             .propose(height, round, parent_hash, tx_bytes)
@@ -4365,10 +5360,13 @@ impl Node {
         let height = self.consensus.current_height();
         let round  = self.consensus.current_round();
 
-        // Drain mempool into the block
-        let mut txs = std::mem::take(&mut self.mempool);
-
-        let tx_bytes = serde_json::to_vec(&txs).unwrap_or_default();
+        // Move the txs that fit into the block; the rest stay for the next one.
+        let payload = self.block_payload(height);
+        let ids: std::collections::HashSet<&str> = payload.txs.iter().map(|t| t.id.as_str()).collect();
+        self.mempool.retain(|t| !ids.contains(t.id.as_str()));
+        let mut txs = payload.txs.clone();
+        let evidence = payload.evidence.clone();
+        let tx_bytes = payload.encode();
 
         // Produce a proposal
         let proposal = self.consensus
@@ -4425,8 +5423,8 @@ impl Node {
             // match and the vote is correctly left unsigned (and will then
             // be rejected, same as a real forged vote would be), rather
             // than silently trusted.
-            let devnet_sim_key = ClassicalScheme.generate_keypair(&validator.id.0)
-                .ok()
+            let devnet_sim_key = self.devnet_sim_keys.get(&validator.id.0).cloned()
+                .or_else(|| ClassicalScheme.generate_keypair(&validator.id.0).ok())
                 .filter(|kp| kp.public_key == validator.public_key);
 
             let sign_devnet_vote = |vote_type: VoteType| -> Vote {
@@ -4444,8 +5442,8 @@ impl Node {
                         &self.genesis.chain_id, &vote.vote_type, vote.height,
                         vote.round, vote.block_hash.as_ref(),
                     );
-                    if let Ok(sig) = ClassicalScheme.sign(&bytes, kp) {
-                        vote.signature = sig.bytes;
+                    if let Ok(sig) = chain_forge_crypto::sign_consensus(&bytes, kp) {
+                        vote.signature = sig;
                     }
                 }
                 vote
@@ -4559,6 +5557,9 @@ impl Node {
                 }
             }
         }
+
+        // Release gate 4: same as commit_block.
+        self.apply_committed_evidence(&evidence, height);
 
         // Pass the PoCD registry (if enabled) so the executor can distribute
         // epoch rewards directly from the in-memory DiscoveryRegistry.
@@ -4850,32 +5851,7 @@ impl Node {
             }
         }
 
-        // QPC-CONS-001 Phase B: sync pop_verified=true into the ValidatorRegistry
-        // for any bond-admitted validator whose identity now grants consensus.
-        // Integration Point 3 (above) handles pop_verified=false; this block
-        // handles the true direction so registry.pop_verified stays in sync with
-        // the consensus ValidatorSet.
-        {
-            let epoch = self.identity.clock.current_epoch;
-            let vs = self.consensus.validator_set();
-            let verified_addrs: Vec<String> = vs.validators.iter()
-                .filter(|v| v.pop_verified)
-                .map(|v| v.id.0.clone())
-                .collect();
-            drop(vs);
-            for addr in &verified_addrs {
-                if let Ok(rec) = self.validator_registry.get(addr) {
-                    if !rec.pop_verified {
-                        if let Some(tier) = self.identity.get(addr).ok()
-                            .map(|r| r.charm.tier.clone())
-                            .filter(|t| t.grants_consensus())
-                        {
-                            let _ = self.validator_registry.confirm_pop(addr, tier, epoch);
-                        }
-                    }
-                }
-            }
-        }
+        self.sync_registry_pop_from_validator_set();
 
         // Advance consensus to next height
         self.consensus.on_commit(cert.clone(), None).await
@@ -4914,6 +5890,8 @@ impl Node {
                 .max(self.last_committed_timestamp_ms.saturating_add(1));
             ex.blocks.push_front(BlockSummary {
                 height:       exec_result.height,
+                block_hash:   cert.block_hash.0.clone(),
+                round:        cert.round,
                 state_root:   exec_result.state_root.clone(),
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
@@ -4941,6 +5919,7 @@ impl Node {
                     attestation_count: att_count,
                     attested_by:       att_by,
                     key_version:    a.key_version,
+                    policy_generation: a.policy_generation,
                 });
             }
 
@@ -5271,6 +6250,977 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A restarted node must resume at the height AFTER its last committed
+    /// block. Resuming at the committed height re-decides that block -- the
+    /// network can commit a different block at a height it already finalized.
+    #[tokio::test]
+    async fn restart_resumes_after_the_last_committed_height() {
+        let dir = std::env::temp_dir()
+            .join(format!("cf-restart-height-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let next_height = {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let cert0 = node.propose_block(genesis_hash).await.unwrap();
+            node.propose_block(cert0.block_hash).await.unwrap();
+            node.persist_state();
+            assert_eq!(node.state.current_height(), 1, "blocks 0 and 1 committed");
+            node.consensus.current_height()
+        };
+        assert_eq!(next_height, 2);
+
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+        assert_eq!(restarted.consensus.current_height(), next_height,
+            "after restart the engine must work on height 2, not re-decide committed block 1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- H0-1/H0-2: canonical participation evidence and state-root binding ---
+    //
+    // A block's payload (tx_data, hashed into block_hash) is a versioned
+    // envelope: { version: 1, txs, last_commit, prev_state_root }.
+    //   last_commit     -- precommits for the block committed at h-1, as the
+    //                      proposer collected them (>= 2/3+1 power required).
+    //   prev_state_root -- the proposer's state root after committing h-1.
+    // Validators check both before voting. Participation and liveness are
+    // recorded only from a committed block's last_commit -- never from the
+    // certificate a node assembled locally from whichever precommits it
+    // received first.
+
+    mod h0_participation {
+        use super::*;
+        use chain_forge_consensus::{compute_block_hash, CommitCertificate};
+
+        const CHAIN: &str = "qcb-testnet-1";
+        const VALS: [&str; 4] = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+
+        fn proposer(h: u64) -> &'static str { VALS[(h % 4) as usize] }
+
+        fn payload(last_commit: Option<&CommitCertificate>, prev_state_root: Option<&str>) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "txs": [],
+                "last_commit": last_commit,
+                "prev_state_root": prev_state_root,
+            })).unwrap()
+        }
+
+        /// A proposal for height h, round 0, signed by its proposer.
+        fn proposal(h: u64, tx_data: Vec<u8>) -> BlockProposal {
+            let parent = BlockHash(format!("genesis_h{h}"));
+            sign_as_proposer(BlockProposal {
+                height: h, round: 0,
+                proposer: ValidatorId(proposer(h).into()),
+                block_hash: compute_block_hash(CHAIN, h, &parent, &tx_data),
+                parent_hash: parent,
+                timestamp_ms: 0,
+                tx_data,
+                signature: vec![],
+                pol_round: None,
+            })
+        }
+
+        fn evidence(h: u64, block_hash: &BlockHash, signers: &[&str]) -> CommitCertificate {
+            CommitCertificate {
+                height: h, round: 0, block_hash: block_hash.clone(),
+                precommits: signers.iter()
+                    .map(|v| signed_vote(CHAIN, VoteType::Precommit, h, 0, v, block_hash.clone()))
+                    .collect(),
+            }
+        }
+
+        // -- Block size: proposals stay within max_block_bytes ---------------
+
+        /// A ~240 KB transaction (ML-DSA keys and signatures are this large).
+        fn big_tx(i: u64) -> Transaction {
+            Transaction {
+                id: format!("big-{i}"), sender: "qcb1alice".into(), nonce: i,
+                body: chain_forge_execution::TxBody::Transfer {
+                    to: "qcb1bob".into(), amount: 1, denom: "uqcb".into(),
+                },
+                gas_limit: 21_000, signature: vec![], public_key: vec![],
+                pq_signatures: vec![], sig_scheme: None,
+                pq_public_key: vec![200u8; 60_000],
+            }
+        }
+
+        #[tokio::test]
+        async fn proposer_includes_only_the_txs_that_fit_in_max_block_bytes() {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let max = node.genesis.limits.max_block_bytes as usize;
+            node.mempool = (0..30).map(big_tx).collect();
+            let payload = node.block_payload(0);
+            let len = payload.encode().len();
+            let n = payload.txs.len();
+            assert!(len <= max, "payload {len} bytes exceeds max_block_bytes {max}");
+            assert!(n > 0 && n < 30, "expected a prefix of the mempool, got {n} txs");
+            let ids: Vec<_> = payload.txs.iter().map(|t| t.id.clone()).collect();
+            let expected: Vec<_> = (0..n as u64).map(|i| format!("big-{i}")).collect();
+            assert_eq!(ids, expected, "txs must be a prefix, in mempool order");
+            let one_more = BlockPayload { txs: node.mempool[..=n].to_vec(), ..payload.clone() };
+            assert!(one_more.encode().len() > max, "the next tx would have fit");
+            assert_eq!(node.mempool.len(), 30, "txs that fit a later block stay in the mempool");
+        }
+
+        #[test]
+        fn zero_max_block_bytes_means_no_limit() {
+            let mempool: Vec<_> = (0..5).map(big_tx).collect();
+            assert_eq!(select_block_txs(&mempool, &BlockPayload::default(), 0, encoded_len).len(), 5);
+        }
+
+        fn encoded_len(tx: &Transaction) -> usize { serde_json::to_vec(tx).unwrap().len() }
+
+        fn tx_from(sender: &str, nonce: u64, pad: usize) -> Transaction {
+            Transaction { id: format!("{sender}-{nonce}"), sender: sender.into(), nonce,
+                          pq_public_key: vec![200u8; pad], ..big_tx(0) }
+        }
+
+        /// A tx too large for this block must not hold back other senders'
+        /// txs behind it; its own sender's later nonces wait with it.
+        #[test]
+        fn an_oversized_head_tx_does_not_block_other_senders() {
+            let max = 300_000;
+            let base = BlockPayload::default();
+            let mempool = vec![
+                tx_from("qcb1alice", 0, 100_000), // ~360 KB: never fits in 300 KB
+                tx_from("qcb1alice", 1, 1_000),
+                tx_from("qcb1bob", 0, 1_000),
+                tx_from("qcb1carol", 0, 1_000),
+            ];
+            let ids: Vec<_> = select_block_txs(&mempool, &base, max, encoded_len).iter().map(|t| t.id.clone()).collect();
+            assert_eq!(ids, ["qcb1bob-0", "qcb1carol-0"],
+                "bob and carol must be included; alice's later nonce must wait behind her first tx");
+        }
+
+        /// A tx that cannot fit in any block (not even one without evidence)
+        /// is evicted from the mempool instead of waiting forever.
+        #[tokio::test]
+        async fn a_tx_that_fits_no_block_is_evicted() {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let max = node.genesis.limits.max_block_bytes as usize;
+            node.mempool = vec![tx_from("qcb1alice", 0, max / 3), tx_from("qcb1bob", 0, 1_000)];
+            let payload = node.block_payload(0);
+            let ids: Vec<_> = payload.txs.iter().map(|t| t.id.clone()).collect();
+            assert_eq!(ids, ["qcb1bob-0"]);
+            let left: Vec<_> = node.mempool.iter().map(|t| t.id.clone()).collect();
+            assert_eq!(left, ["qcb1bob-0"], "the unfittable tx must leave the mempool");
+        }
+
+        #[tokio::test]
+        async fn proposal_above_max_block_bytes_is_not_committed() {
+            let mut node = Node::new(GENESIS, None).await.unwrap();
+            let max = node.genesis.limits.max_block_bytes as usize;
+            let root = node.state.current_root().map(str::to_string);
+            let mut oversized: serde_json::Value = serde_json::from_slice(&payload(None, root.as_deref())).unwrap();
+            oversized["pad"] = "x".repeat(max).into();
+            let p = proposal(0, serde_json::to_vec(&oversized).unwrap());
+            deliver(&mut node, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert!(node.chain_store.get(&0).is_none(), "a proposal over max_block_bytes must not commit");
+
+            // Control: the same payload without padding commits.
+            let p = proposal(0, payload(None, root.as_deref()));
+            deliver(&mut node, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert!(node.chain_store.get(&0).is_some(), "the control proposal must commit");
+        }
+
+        /// Deliver `p`, then each voter's prevote and precommit for it (a
+        /// validator node precommits only after a +2/3 prevote polka).
+        async fn deliver(node: &mut Node, p: &BlockProposal, voters: &[&str]) {
+            node.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(p).unwrap())).await.unwrap();
+            for t in [VoteType::Prevote, VoteType::Precommit] {
+                for v in voters {
+                    let vote = signed_vote(CHAIN, t.clone(), p.height, 0, v, p.block_hash.clone());
+                    node.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await.unwrap();
+                }
+            }
+        }
+
+        fn participation(node: &Node) -> Vec<(String, u64, u64, Option<u64>)> {
+            VALS.iter().map(|v| {
+                let r = node.validator_registry.get(v).unwrap();
+                let active = node.identity.get(v).ok().and_then(|i| i.last_active_epoch);
+                (v.to_string(), r.epoch_counter_epoch, r.epoch_blocks_signed, active)
+            }).collect()
+        }
+
+        /// Two observers commit the same blocks but assemble different local
+        /// certificates (A: alice+bob+carol, B: alice+bob+dave). Every block
+        /// carries identical evidence for h-1; at heights 2 and 5 the
+        /// proposer omits dave (quorum-only evidence). Both nodes must record
+        /// identical participation and liveness, exactly matching the evidence.
+        #[tokio::test]
+        async fn participation_is_identical_across_nodes_with_different_local_certificates() {
+            let mut a = Node::new(GENESIS, None).await.unwrap();
+            let mut b = Node::new(GENESIS, None).await.unwrap();
+            const BLOCKS: u64 = 8;
+            let omit_dave_for = [2u64, 5];
+            let mut prev: Option<CommitCertificate> = None;
+
+            for h in 0..BLOCKS {
+                let root = a.state.current_root().map(str::to_string);
+                assert_eq!(root, b.state.current_root().map(str::to_string), "state diverged before h{h}");
+                let p = proposal(h, payload(prev.as_ref(), root.as_deref()));
+                deliver(&mut a, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+                deliver(&mut b, &p, &["qcb1alice", "qcb1bob", "qcb1dave"]).await;
+                assert_eq!(a.status.lock().unwrap().height, h, "observer A must commit h{h}");
+                assert_eq!(b.status.lock().unwrap().height, h, "observer B must commit h{h}");
+                let signers: Vec<&str> = if omit_dave_for.contains(&h) { VALS[..3].to_vec() } else { VALS.to_vec() };
+                prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+
+            assert_eq!(participation(&a), participation(&b),
+                "nodes must account participation from committed evidence, not local certificates");
+            // Evidence for heights 0..BLOCKS-2 was committed (in blocks 1..BLOCKS-1),
+            // all within epoch 0 (default epoch length is far longer than 8 blocks).
+            let committed = BLOCKS - 1;
+            for (v, _, signed, _) in participation(&a) {
+                let expected = if v == "qcb1dave" { committed - 2 } else { committed };
+                assert_eq!(signed, expected, "{v} participation must match the committed evidence");
+            }
+        }
+
+        /// Drive an observer through `blocks` committed blocks. Each block's
+        /// last_commit evidence omits dave when `omits_dave(proposer)` holds.
+        async fn observer_after(blocks: u64, omits_dave: impl Fn(&str) -> bool) -> Node {
+            let mut obs = Node::new(GENESIS, None).await.unwrap();
+            let mut prev: Option<CommitCertificate> = None;
+            for h in 0..blocks {
+                let root = obs.state.current_root().map(str::to_string);
+                let p = proposal(h, payload(prev.as_ref(), root.as_deref()));
+                deliver(&mut obs, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+                assert_eq!(obs.status.lock().unwrap().height, h, "observer must commit h{h}");
+                // Evidence for block h is published by the proposer of h+1.
+                let signers: Vec<&str> = if omits_dave(proposer(h + 1)) { VALS[..3].to_vec() } else { VALS.to_vec() };
+                prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+            obs
+        }
+
+        /// Alice, as proposer, omits dave from every block's evidence for 600
+        /// blocks (past the 500-block window and grace period): 25% of blocks,
+        /// above the 20% threshold. One Byzantine proposer must not get an
+        /// honest validator jailed.
+        #[tokio::test]
+        async fn one_omitting_proposer_cannot_jail_an_honest_validator_over_many_epochs() {
+            let obs = observer_after(600, |p| p == "qcb1alice").await;
+            assert_eq!(obs.validator_registry.get("qcb1dave").unwrap().status,
+                chain_forge_validators::ValidatorStatus::Active,
+                "dave must stay Active: only one proposer omitted him");
+            assert_eq!(obs.validator_registry.get("qcb1dave").unwrap().bonded_uqcb,
+                Node::new(GENESIS, None).await.unwrap().validator_registry.get("qcb1dave").unwrap().bonded_uqcb,
+                "liveness accounting never burns stake");
+        }
+
+        /// Control: when every proposer's evidence lacks dave he is offline,
+        /// and he is jailed (but not burned).
+        #[tokio::test]
+        async fn validator_absent_from_all_evidence_is_jailed_not_burned() {
+            let bonded = Node::new(GENESIS, None).await.unwrap()
+                .validator_registry.get("qcb1dave").unwrap().bonded_uqcb;
+            let obs = observer_after(600, |_| true).await;
+            let dave = obs.validator_registry.get("qcb1dave").unwrap();
+            assert_eq!(dave.status, chain_forge_validators::ValidatorStatus::Jailed);
+            assert_eq!(dave.bonded_uqcb, bonded, "jailed for liveness, stake intact");
+        }
+
+        /// H0-1 fail-stop: a block that reached quorum elsewhere (partition
+        /// recovery, sync) but was built on a different prior state must never
+        /// be applied on top of this node's state.
+        #[tokio::test]
+        async fn commit_refuses_a_block_built_on_a_different_state() {
+            let mut obs = Node::new(GENESIS, None).await.unwrap();
+            let root_before = obs.state.current_root().map(str::to_string);
+            let p0 = proposal(0, payload(None, Some("00ff-not-this-nodes-root")));
+            let cert = evidence(0, &p0.block_hash, &VALS[..3]);
+
+            let err = obs.commit_block(cert, &p0).await
+                .expect_err("a block built on a different state must not be applied");
+            assert!(err.contains("state divergence"), "{err}");
+            assert_eq!(obs.state.current_root().map(str::to_string), root_before, "state unchanged");
+            assert_eq!(obs.consensus.current_height(), 0, "height unchanged");
+            assert!(obs.chain_store.is_empty(), "block not recorded");
+            assert!(obs.last_commit_evidence.is_none(), "no evidence derived from a refused block");
+        }
+
+        // ── Epoch rewards from committed evidence ───────────────────────────
+
+        const EPOCH: u64 = 10;
+        const POOL: u128 = 1_000_003;
+
+        /// Model C, fixed pool (owner decision): a validator bonded above
+        /// `bond_min` gets extra reward *weight*, capped; the pool is split by
+        /// weight and never exceeded. Alice bonds 1,000 QCB above the minimum
+        /// with k = 1,000 bps per 1,000 QCB (+10%) but the cap is 500 bps.
+        #[tokio::test]
+        async fn capital_premium_reweights_a_fixed_pool_within_its_cap() {
+            let json = GENESIS
+                .replace(r#""personhood_weighted": true }"#,
+                    r#""personhood_weighted": true, "rewards": { "premium_k_bps_per_kqcb": 1000, "premium_cap_bps": 500 } }"#)
+                .replace(r#""address": "qcb1alice", "balance": "5000000""#, r#""address": "qcb1alice", "balance": "2000000000""#)
+                .replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
+        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
+            assert!(json.contains("premium_cap_bps") && json.contains("2000000000"));
+            let mut n = Node::new(&json, None).await.unwrap();
+            n.state.transfer("qcb1alice", "treasury:validator-pool", "uqcb", POOL).unwrap();
+            let alice_bond = n.min_bond_uqcb + 1_000_000_000;
+            n.state.transfer("qcb1alice", "validator-bond:qcb1alice", "uqcb", alice_bond).unwrap();
+
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"]];
+            let mut prev = None;
+            drive(&mut [&mut n], local, 0..EPOCH, &mut prev, nobody).await;
+            let (pool, before) = (bal(&n, "treasury:validator-pool"), balances(&n));
+            drive(&mut [&mut n], local, EPOCH..EPOCH + 1, &mut prev, nobody).await;
+            let gains: Vec<u128> = balances(&n).iter().zip(&before).map(|(a, b)| a - b).collect();
+
+            let weights = [10_500u128, 10_000, 10_000, 10_000]; // alice capped at +5%
+            let total: u128 = weights.iter().sum();
+            let expected: Vec<u128> = weights.iter().map(|w| pool * w / total).collect();
+            assert_eq!(gains, expected, "shares are pool x weight / total weight");
+            assert!(gains[0] > gains[1], "the larger bond earns more");
+            assert_eq!(bal(&n, "treasury:validator-pool"), pool - expected.iter().sum::<u128>(),
+                "fixed pool: never exceeded; the remainder stays");
+        }
+
+        /// Validators a block's evidence leaves out, given the proposer that
+        /// published it.
+        type Omit = fn(&str) -> Vec<&'static str>;
+        fn nobody(_: &str) -> Vec<&'static str> { vec![] }
+
+        /// A node on a 10-block epoch with a funded validator pool and the
+        /// given reward threshold.
+        async fn rewards_node(min_pct: u32) -> Node {
+            let json = GENESIS
+                .replace(r#""personhood_weighted": true }"#, &format!(
+                    r#""personhood_weighted": true, "rewards": {{ "min_participation_pct": {min_pct} }} }}"#))
+                .replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
+        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
+            assert!(json.contains("min_participation_pct"));
+            let mut n = Node::new(&json, None).await.unwrap();
+            n.state.transfer("qcb1alice", "treasury:validator-pool", "uqcb", POOL).unwrap();
+            n
+        }
+
+        fn bal(n: &Node, addr: &str) -> u128 {
+            n.state.get_account(addr).map(|a| a.balance_of("uqcb")).unwrap_or(0)
+        }
+
+        fn balances(n: &Node) -> Vec<u128> { VALS.iter().map(|v| bal(n, v)).collect() }
+
+        /// Commit `heights` on every node. Node i's local certificate uses
+        /// `local[i]`; the evidence for h (published in h+1) leaves out
+        /// `omit(proposer of h+1)`.
+        async fn drive(
+            nodes: &mut [&mut Node], local: &[&[&str]], heights: std::ops::Range<u64>,
+            prev: &mut Option<CommitCertificate>, omit: Omit,
+        ) {
+            for h in heights {
+                let root = nodes[0].state.current_root().map(str::to_string);
+                let p = proposal(h, payload(prev.as_ref(), root.as_deref()));
+                for (i, n) in nodes.iter_mut().enumerate() {
+                    assert_eq!(n.state.current_root().map(str::to_string), root, "node {i} diverged before h{h}");
+                    deliver(n, &p, local[i]).await;
+                    assert_eq!(n.status.lock().unwrap().height, h, "node {i} must commit h{h}");
+                }
+                let left_out = omit(proposer(h + 1));
+                let signers: Vec<&str> = VALS.iter().copied().filter(|v| !left_out.contains(v)).collect();
+                *prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+        }
+
+        /// Run `epochs` full epochs on one node; returns, for each epoch
+        /// close, (pool before the closing block, each validator's gain).
+        async fn closes(epochs: u64, min_pct: u32, omit: Omit) -> Vec<(u128, Vec<u128>)> {
+            let mut n = rewards_node(min_pct).await;
+            let mut prev = None;
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"]];
+            drive(&mut [&mut n], local, 0..EPOCH, &mut prev, omit).await;
+            let mut out = vec![];
+            for k in 1..=epochs {
+                let (pool, before) = (bal(&n, "treasury:validator-pool"), balances(&n));
+                drive(&mut [&mut n], local, k * EPOCH..k * EPOCH + 1, &mut prev, omit).await;
+                let gains = balances(&n).iter().zip(&before).map(|(a, b)| a - b).collect();
+                out.push((pool, gains));
+                drive(&mut [&mut n], local, k * EPOCH + 1..(k + 1) * EPOCH, &mut prev, omit).await;
+            }
+            out
+        }
+
+        /// The first block of epoch k+1 pays the closed epoch k: every
+        /// validator present in its evidence gets exactly pool / eligible,
+        /// and the remainder stays in the pool.
+        #[tokio::test]
+        async fn epoch_close_pays_each_participating_validator_an_exact_share() {
+            for (k, (pool, gains)) in closes(2, 67, nobody).await.into_iter().enumerate() {
+                assert!(pool > 0, "epoch {k}: pool must be funded");
+                assert_eq!(gains, vec![pool / 4; 4], "epoch {k}: each validator earns pool/4 of {pool}");
+            }
+        }
+
+        /// Alice omits dave from every block's evidence she publishes for
+        /// three epochs (25% of blocks). One Byzantine proposer must not cost
+        /// an honest validator its reward -- even at the strictest allowed
+        /// threshold (90%), which dave's raw 75% would fail without the
+        /// Byzantine-robust discount.
+        #[tokio::test]
+        async fn one_omitting_proposer_cannot_deny_an_honest_validator_its_reward() {
+            fn alice_omits_dave(p: &str) -> Vec<&'static str> {
+                if p == "qcb1alice" { vec!["qcb1dave"] } else { vec![] }
+            }
+            for (k, (pool, gains)) in closes(3, 90, alice_omits_dave).await.into_iter().enumerate() {
+                assert_eq!(gains, vec![pool / 4; 4], "epoch {k}: dave must earn the same share as everyone else");
+            }
+        }
+
+        /// Control: a validator missing from every proposer's evidence did
+        /// not participate and earns nothing; the others split the pool.
+        #[tokio::test]
+        async fn validator_absent_from_all_evidence_earns_no_reward() {
+            fn dave_offline(_: &str) -> Vec<&'static str> { vec!["qcb1dave"] }
+            let (pool, gains) = closes(1, 67, dave_offline).await.remove(0);
+            assert_eq!(gains, vec![pool / 3, pool / 3, pool / 3, 0]);
+        }
+
+        /// Two nodes assembling different local certificates, with one
+        /// proposer omitting dave, must pay identical rewards and agree on
+        /// every balance and state root across several epochs.
+        #[tokio::test]
+        async fn epoch_rewards_are_identical_across_nodes_with_different_local_certificates() {
+            fn bob_omits_dave(p: &str) -> Vec<&'static str> {
+                if p == "qcb1bob" { vec!["qcb1dave"] } else { vec![] }
+            }
+            let (mut a, mut b) = (rewards_node(67).await, rewards_node(67).await);
+            let start = balances(&a);
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"], &["qcb1alice", "qcb1bob", "qcb1dave"]];
+            let mut prev = None;
+            drive(&mut [&mut a, &mut b], local, 0..3 * EPOCH + 1, &mut prev, bob_omits_dave).await;
+
+            assert_eq!(balances(&a), balances(&b), "validator balances must match");
+            assert_eq!(bal(&a, "treasury:validator-pool"), bal(&b, "treasury:validator-pool"));
+            assert_eq!(a.state.current_root(), b.state.current_root());
+            for (i, v) in VALS.iter().enumerate() {
+                assert!(balances(&a)[i] > start[i], "{v} must have been paid");
+            }
+        }
+
+        /// A node restarted from disk mid-epoch must pay the closed epoch
+        /// exactly as a node that never restarted. Dave is offline for the
+        /// first 6 blocks' evidence and back for the last 4 (40%): a restart
+        /// that lost the epoch's tally would see only his 4/4 and pay him.
+        #[tokio::test]
+        async fn epoch_rewards_survive_a_mid_epoch_restart() {
+            fn dave_offline(_: &str) -> Vec<&'static str> { vec!["qcb1dave"] }
+            let local: &[&[&str]] = &[&["qcb1alice", "qcb1bob", "qcb1carol"]];
+            let dir = std::env::temp_dir().join(format!("cf-rewards-restart-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let mut steady = rewards_node(67).await;
+            let mut prev = None;
+            drive(&mut [&mut steady], local, 0..6, &mut prev, dave_offline).await;
+            drive(&mut [&mut steady], local, 6..EPOCH + 1, &mut prev, nobody).await;
+
+            let mut prev = None;
+            {
+                let mut first = rewards_node(67).await;
+                first.set_data_dir(dir.clone()).unwrap();
+                drive(&mut [&mut first], local, 0..6, &mut prev, dave_offline).await;
+                first.persist_state();
+            }
+            let json = GENESIS.replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
+        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
+            let mut restarted = Node::new(&json, None).await.unwrap();
+            restarted.set_data_dir(dir.clone()).unwrap();
+            assert!(restarted.load_persisted_state(), "must load persisted state");
+            drive(&mut [&mut restarted], local, 6..EPOCH + 1, &mut prev, nobody).await;
+
+            assert_eq!(bal(&steady, "qcb1dave"), 5_000_000, "dave at 40% earns nothing");
+            assert!(bal(&steady, "qcb1bob") > 5_000_000, "the others were paid");
+            assert_eq!(balances(&restarted), balances(&steady), "rewards must not depend on a restart");
+            assert_eq!(restarted.state.current_root(), steady.state.current_root());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn node_rejects_reward_policy_outside_bounds() {
+            for pct in [49, 91] {
+                let json = GENESIS.replace(r#""personhood_weighted": true }"#, &format!(
+                    r#""personhood_weighted": true, "rewards": {{ "min_participation_pct": {pct} }} }}"#));
+                let err = Node::new(&json, None).await.err()
+                    .unwrap_or_else(|| panic!("min_participation_pct {pct} must refuse to start"));
+                assert!(err.to_string().contains("min_participation_pct"), "{err}");
+            }
+        }
+
+        /// Carol at height 1, having committed block 0. Returns the node and
+        /// block 0's hash.
+        async fn carol_at_height_1() -> (Node, BlockHash) {
+            let mut carol = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+            carol.signing_key = Some(ClassicalScheme.generate_keypair("qcb1carol").unwrap());
+            let root = carol.state.current_root().map(str::to_string);
+            let p0 = proposal(0, payload(None, root.as_deref()));
+            deliver(&mut carol, &p0, &["qcb1alice", "qcb1bob"]).await;
+            assert_eq!(carol.status.lock().unwrap().height, 0, "carol must commit block 0");
+            (carol, p0.block_hash)
+        }
+
+        /// Tendermint safety: a validator may precommit a block only after it
+        /// has seen a +2/3 prevote polka for it in that round (and then locks
+        /// on it). Carol here sees a valid proposal and NO prevotes from
+        /// anyone else; she must not precommit. If she does, a validator that
+        /// times out the round can precommit a different block in the next
+        /// one, and two quorum certificates for different blocks at the same
+        /// height become reachable with zero Byzantine validators -- observed
+        /// live (MN-8 run): height 1 finalized as c6f065c3 (round 0: alice,
+        /// bob, carol) on two nodes and as 68a82c67 (round 1: alice, carol,
+        /// dave) on three.
+        #[tokio::test]
+        async fn validator_does_not_precommit_without_a_prevote_polka() {
+            let (mut carol, h0) = carol_at_height_1().await;
+            let root = carol.state.current_root().map(str::to_string);
+            let p1 = proposal(1, payload(Some(&evidence(0, &h0, &VALS)), root.as_deref()));
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p1).unwrap())).await.unwrap();
+            // Two peers' precommits arrive; no prevote from anyone but Carol.
+            for v in ["qcb1alice", "qcb1bob"] {
+                let vote = signed_vote(CHAIN, VoteType::Precommit, 1, 0, v, p1.block_hash.clone());
+                carol.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await.unwrap();
+            }
+            let carol_precommitted = carol.chain_store.get(&1)
+                .map(|(cert, _)| cert.precommits.iter().any(|v| v.validator.0 == "qcb1carol"))
+                .unwrap_or(false);
+            assert!(!carol_precommitted,
+                "carol precommitted block 1 having seen no prevote polka for it");
+        }
+
+        /// Carol's own signed votes the engine holds at the current height.
+        fn carol_votes(node: &Node) -> Vec<Vote> {
+            node.consensus.gossip_messages().1.into_iter().filter(|v| v.validator.0 == "qcb1carol").collect()
+        }
+
+        /// Required test 6: a validator that signed and locked, then
+        /// restarts from its data dir, keeps its lock and cannot be made to
+        /// sign a conflicting vote.
+        #[tokio::test]
+        async fn restarted_validator_keeps_its_lock_and_never_signs_conflicting_votes() {
+            let dir = std::env::temp_dir().join(format!("cf-sign-guard-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let carol_key = || ClassicalScheme.generate_keypair("qcb1carol").unwrap();
+
+            let x_hash = {
+                let mut carol = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+                carol.signing_key = Some(carol_key());
+                carol.set_data_dir(dir.clone()).unwrap();
+                let root = carol.state.current_root().map(str::to_string);
+                let x = proposal(0, payload(None, root.as_deref()));
+                carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&x).unwrap())).await.unwrap();
+                for v in ["qcb1alice", "qcb1bob"] {
+                    let pv = signed_vote(CHAIN, VoteType::Prevote, 0, 0, v, x.block_hash.clone());
+                    carol.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&pv).unwrap())).await.unwrap();
+                }
+                assert_eq!(carol.sign_guard.last, Some((0, 0, 2)), "carol prevoted and precommitted X");
+                x.block_hash
+            }; // carol stops (crash): nothing committed
+
+            let mut carol = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+            carol.signing_key = Some(carol_key());
+            carol.set_data_dir(dir.clone()).unwrap();
+            carol.load_persisted_state();
+            assert_eq!(carol.sign_guard.last, Some((0, 0, 2)), "guard restored from disk");
+            assert_eq!(carol.consensus.lock_state().unwrap().locked, Some((x_hash.clone(), 0)), "lock restored");
+
+            // The guard refuses any conflicting vote at an already-signed position.
+            let conflicting = Vote { block_hash: Some(BlockHash("other".into())),
+                ..signed_vote(CHAIN, VoteType::Prevote, 0, 0, "qcb1carol", x_hash.clone()) };
+            assert!(carol.sign_guard.check(&conflicting).is_err());
+
+            // Round 1: bob proposes a fresh, different block Y.
+            carol.consensus.on_step_timeout(TimeoutStep::Precommit, 0, 0);
+            carol.drive_consensus().await;
+            let root = carol.state.current_root().map(str::to_string);
+            let parent = BlockHash("another-parent".into());
+            let tx_data = payload(None, root.as_deref());
+            let y = BlockProposal {
+                height: 0, round: 1, proposer: ValidatorId("qcb1bob".into()),
+                block_hash: compute_block_hash(CHAIN, 0, &parent, &tx_data),
+                parent_hash: parent, timestamp_ms: 0, tx_data, signature: vec![], pol_round: None,
+            };
+            let y = sign_as_proposer(y);
+            assert_ne!(y.block_hash, x_hash);
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&y).unwrap())).await.unwrap();
+
+            let votes = carol_votes(&carol);
+            let r1_prevote = votes.iter().find(|v| v.round == 1 && v.vote_type == VoteType::Prevote)
+                .expect("carol prevotes in round 1");
+            assert_eq!(r1_prevote.block_hash, None, "locked on X after restart: nil, never Y");
+            assert!(votes.iter().filter(|v| v.round == 0).all(|v| v.block_hash.as_ref() == Some(&x_hash)),
+                "round-0 votes are the original X votes only");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ── Release gate 1: proposal authentication ──────────────────────────
+
+        /// Sign `p` as its proposer, with the deterministic devnet key that
+        /// matches the test genesis.
+        fn sign_as_proposer(mut p: BlockProposal) -> BlockProposal {
+            let kp = ClassicalScheme.generate_keypair(&p.proposer.0).unwrap();
+            let bytes = chain_forge_consensus::proposal_signing_bytes(
+                CHAIN, p.height, p.round, &p.block_hash, &p.parent_hash, p.pol_round);
+            p.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+            p
+        }
+
+        // -- Release gate 4: equivocation slashing from committed evidence --
+
+        /// `who` signed two different prevotes at (h, round 0).
+        fn double_prevote(h: u64, who: &str) -> EquivocationEvidence {
+            let a = signed_vote(CHAIN, VoteType::Prevote, h, 0, who, BlockHash("hash_A".into()));
+            let b = signed_vote(CHAIN, VoteType::Prevote, h, 0, who, BlockHash("hash_B".into()));
+            EquivocationEvidence {
+                validator_id: who.into(), height: h, round: 0,
+                block_hash_a: "hash_A".into(), block_hash_b: "hash_B".into(),
+                signature_a: a.signature, signature_b: b.signature, vote_type_byte: 0,
+            }
+        }
+
+        fn payload_with_evidence(lc: Option<&CommitCertificate>, root: Option<&str>, ev: &[EquivocationEvidence]) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "txs": [], "last_commit": lc, "prev_state_root": root, "evidence": ev,
+            })).unwrap()
+        }
+
+        fn tombstoned(node: &Node, who: &str) -> bool {
+            node.validator_registry.get(who).unwrap().status == chain_forge_validators::ValidatorStatus::Tombstoned
+        }
+
+        /// Height-1 proposal (proposer bob) carrying `ev`, on top of carol's block 0.
+        fn height_1_with(carol: &Node, h0: &BlockHash, ev: &[EquivocationEvidence]) -> BlockProposal {
+            let lc = evidence(0, h0, &["qcb1alice", "qcb1bob", "qcb1carol"]);
+            proposal(1, payload_with_evidence(Some(&lc), carol.state.current_root(), ev))
+        }
+
+        /// A node that sees a double vote must not slash on its own: which
+        /// nodes see it, and when, differs, so local slashing diverges state
+        /// (observed live: STATE DIVERGENCE, chain halted). It verifies the
+        /// evidence and queues it for a block.
+        #[tokio::test]
+        async fn a_detected_equivocation_is_queued_not_applied_locally() {
+            let (mut carol, _) = carol_at_height_1().await;
+            let root = carol.state.current_root().map(str::to_string);
+            for hash in ["hash_A", "hash_B"] {
+                let v = signed_vote(CHAIN, VoteType::Prevote, 1, 0, "qcb1dave", BlockHash(hash.into()));
+                carol.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&v).unwrap())).await.unwrap();
+            }
+            assert!(!tombstoned(&carol, "qcb1dave"), "detection alone must not slash");
+            assert_eq!(carol.state.current_root().map(str::to_string), root, "state must not change on detection");
+            assert_eq!(carol.pending_evidence.len(), 1, "the verified evidence is queued for a block");
+            assert_eq!(carol.pending_evidence[0].validator_id, "qcb1dave");
+        }
+
+        /// Evidence committed in a block slashes on every node identically,
+        /// including nodes that never saw the double vote themselves.
+        #[tokio::test]
+        async fn committed_evidence_slashes_every_node_identically() {
+            let (mut a, h0) = carol_at_height_1().await;
+            let (mut b, _)  = carol_at_height_1().await;
+            let p1 = height_1_with(&a, &h0, &[double_prevote(0, "qcb1dave")]);
+            for node in [&mut a, &mut b] {
+                deliver(node, &p1, &["qcb1alice", "qcb1bob"]).await;
+                assert_eq!(node.status.lock().unwrap().height, 1, "block 1 must commit");
+                assert!(tombstoned(node, "qcb1dave"), "committed evidence must tombstone dave");
+            }
+            assert_eq!(a.state.current_root(), b.state.current_root(), "slashing must be deterministic");
+            assert!(bal(&a, "qcb1dave") < 5_000_000, "dave's stake was burned");
+        }
+
+        /// Every voter checks the evidence: a block carrying invalid
+        /// evidence is not voted for.
+        #[tokio::test]
+        async fn a_block_with_invalid_evidence_is_rejected() {
+            let good = double_prevote(0, "qcb1dave");
+            let mut tampered = good.clone(); tampered.signature_b[0] ^= 0xff;
+            let mut same_block = good.clone(); same_block.block_hash_b = same_block.block_hash_a.clone();
+            same_block.signature_b = same_block.signature_a.clone();
+            let mut unsigned = good.clone(); unsigned.signature_a.clear(); unsigned.signature_b.clear();
+            let mut stranger = good.clone(); stranger.validator_id = "qcb1mallory".into();
+            let future = double_prevote(5, "qcb1dave");
+            for (label, ev) in [("tampered", tampered), ("same block", same_block), ("unsigned", unsigned),
+                                ("not a validator", stranger), ("future height", future)] {
+                let (carol, h0) = carol_at_height_1().await;
+                let p1 = height_1_with(&carol, &h0, &[ev]);
+                assert!(!carol_takes(p1).await, "{label}: a block with invalid evidence must be rejected");
+            }
+            let (carol, h0) = carol_at_height_1().await;
+            assert!(carol_takes(height_1_with(&carol, &h0, &[good])).await, "control: valid evidence is accepted");
+        }
+
+        /// The same evidence cannot be committed (and slashed) twice.
+        #[tokio::test]
+        async fn committed_evidence_cannot_be_included_again() {
+            let (mut carol, h0) = carol_at_height_1().await;
+            let ev = double_prevote(0, "qcb1dave");
+            let p1 = height_1_with(&carol, &h0, &[ev.clone()]);
+            deliver(&mut carol, &p1, &["qcb1alice", "qcb1bob"]).await;
+            assert!(tombstoned(&carol, "qcb1dave"));
+            let lc = evidence(1, &p1.block_hash, &["qcb1alice", "qcb1bob", "qcb1carol"]);
+            let root = carol.state.current_root().map(str::to_string);
+            let again = proposal(2, payload_with_evidence(Some(&lc), root.as_deref(), &[ev]));
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&again).unwrap())).await.unwrap();
+            assert!(!carol.pending_proposals.contains_key(&(2, 0)), "already-applied evidence must be rejected");
+        }
+
+        async fn carol_takes(p: BlockProposal) -> bool {
+            let (mut carol, _) = carol_at_height_1().await;
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p).unwrap())).await.unwrap();
+            carol.pending_proposals.contains_key(&(p.height, p.round))
+        }
+
+        async fn valid_height_1_proposal() -> BlockProposal {
+            let (probe, h0) = carol_at_height_1().await;
+            let root = probe.state.current_root().map(str::to_string);
+            proposal(1, payload(Some(&evidence(0, &h0, &VALS)), root.as_deref()))
+        }
+
+        #[tokio::test]
+        async fn proposals_must_be_signed_by_their_proposer() {
+            let p = valid_height_1_proposal().await;
+            assert!(carol_takes(p.clone()).await, "a correctly signed proposal is accepted");
+            let unsigned = BlockProposal { signature: vec![], ..p.clone() };
+            assert!(!carol_takes(unsigned).await, "an unsigned proposal from a keyed proposer is rejected");
+            let mut forged = p.clone();
+            let kp = ClassicalScheme.generate_keypair("qcb1dave").unwrap();
+            let bytes = chain_forge_consensus::proposal_signing_bytes(CHAIN, 1, 0, &p.block_hash, &p.parent_hash, None);
+            forged.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+            assert!(!carol_takes(forged).await, "a proposal signed by another validator's key is rejected");
+        }
+
+        /// pol_round changes how validators vote, so the proposer's
+        /// signature must cover it: a relay must not be able to add or
+        /// change it.
+        #[tokio::test]
+        async fn proposal_signature_covers_pol_round() {
+            let p = sign_as_proposer(valid_height_1_proposal().await);
+            let tampered = BlockProposal { round: 1, proposer: ValidatorId("qcb1carol".into()), ..p.clone() };
+            let tampered = BlockProposal { pol_round: Some(0), ..sign_as_proposer(tampered) };
+            assert!(!carol_takes(tampered).await, "pol_round added after signing must be rejected");
+        }
+
+        /// A validator signs the proposals it makes, and re-gossips signed copies.
+        #[tokio::test]
+        async fn validators_sign_their_own_proposals() {
+            let mut alice = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            alice.signing_key = Some(ClassicalScheme.generate_keypair("qcb1alice").unwrap());
+            alice.propose_fresh(0, 0).await;
+            let (proposals, _) = alice.consensus.gossip_messages();
+            let p = proposals.into_iter().find(|p| p.round == 0).expect("alice proposed at height 0");
+            assert!(!p.signature.is_empty(), "the proposal alice holds (and re-gossips) is signed");
+            let mut bob = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
+            bob.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p).unwrap())).await.unwrap();
+            assert!(bob.pending_proposals.contains_key(&(0, 0)), "peers accept alice's signed proposal");
+        }
+
+        async fn carol_accepts(tx_data: Vec<u8>) -> bool {
+            let (mut carol, _) = carol_at_height_1().await;
+            let p1 = proposal(1, tx_data);
+            carol.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p1).unwrap())).await.unwrap();
+            carol.pending_proposals.contains_key(&(1, 0))
+        }
+
+        #[tokio::test]
+        async fn validators_vote_only_for_valid_participation_evidence_and_state_root() {
+            let (probe, h0) = carol_at_height_1().await;
+            let root = probe.state.current_root().map(str::to_string);
+            let root = root.as_deref();
+            let full = evidence(0, &h0, &VALS);
+            let quorum_only = evidence(0, &h0, &VALS[..3]);
+
+            // Accepted: complete evidence, and quorum-only evidence (proposer omission).
+            assert!(carol_accepts(payload(Some(&full), root)).await, "complete evidence must be accepted");
+            assert!(carol_accepts(payload(Some(&quorum_only), root)).await,
+                "quorum-only evidence (an omitted validator) is still valid");
+
+            // Rejected.
+            let below_quorum = evidence(0, &h0, &VALS[..2]);
+            assert!(!carol_accepts(payload(Some(&below_quorum), root)).await, "below-quorum evidence");
+
+            let mut forged = evidence(0, &h0, &VALS[..3]);
+            forged.precommits[2].signature = signed_vote(
+                CHAIN, VoteType::Precommit, 0, 0, "qcb1dave", h0.clone()).signature;
+            assert!(!carol_accepts(payload(Some(&forged), root)).await, "precommit signed by the wrong key");
+
+            let wrong_block = evidence(0, &BlockHash("not-block-0".into()), &VALS);
+            assert!(!carol_accepts(payload(Some(&wrong_block), root)).await, "evidence for a different block");
+
+            let mut wrong_height = evidence(0, &h0, &VALS);
+            wrong_height.height = 5;
+            assert!(!carol_accepts(payload(Some(&wrong_height), root)).await, "evidence claiming another height");
+
+            let dup = evidence(0, &h0, &["qcb1alice", "qcb1alice", "qcb1bob"]);
+            assert!(!carol_accepts(payload(Some(&dup), root)).await, "a validator counted twice");
+
+            assert!(!carol_accepts(payload(None, root)).await, "missing last_commit after height 0");
+
+            assert!(!carol_accepts(payload(Some(&full), Some("00ff"))).await, "wrong prev_state_root");
+            assert!(!carol_accepts(payload(Some(&full), None)).await, "missing prev_state_root");
+        }
+    }
+
+    // -- H0 identity hardening: genesis identity parameters ------------------
+
+    #[tokio::test]
+    async fn node_uses_production_identity_params_by_default() {
+        let node = Node::new(GENESIS, None).await.unwrap();
+        assert_eq!(node.identity.attestation_quorum(), 3);
+        assert_eq!(node.identity.attestation_cap_per_window(), 3);
+        let st = node.status.lock().unwrap();
+        assert_eq!(st.attestation_quorum, 3);
+        assert_eq!(st.attestation_cap_per_window, 3);
+        assert!(!st.insecure_dev_identity_overrides);
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_reduced_quorum_without_explicit_opt_in() {
+        // GENESIS is mode "devnet": naming the network devnet is not enough.
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "identity": { "attestation_quorum": 1 },"#,
+        );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a reduced quorum without the explicit opt-in must refuse to start");
+        assert!(matches!(err, NodeError::Genesis(_)));
+        assert!(err.to_string().contains("insecure_dev_identity_overrides"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn node_startup_rejects_reduced_quorum_on_testnet_even_with_opt_in() {
+        let json = GENESIS
+            .replace(r#""mode": "devnet""#, r#""mode": "testnet""#)
+            .replace(
+                r#""custom_modules": [],"#,
+                r#""custom_modules": [],
+        "identity": { "attestation_quorum": 1, "insecure_dev_identity_overrides": true },"#,
+            );
+        let err = Node::new(&json, None).await
+            .err()
+            .expect("a reduced quorum outside devnet must refuse to start");
+        assert!(err.to_string().contains("environment.mode"), "{err}");
+    }
+
+    /// Release gate 2: HotStuff and FBA refuse to start off devnet.
+    #[tokio::test]
+    async fn node_refuses_hotstuff_or_fba_off_devnet() {
+        for variant in ["hotstuff", "xrpl"] {
+            let json = GENESIS
+                .replace(r#""mode": "devnet""#, r#""mode": "testnet""#)
+                .replace(r#""personhood_weighted": true }"#,
+                         &format!(r#""personhood_weighted": true, "bft_variant": "{variant}" }}"#));
+            assert!(json.contains(variant), "fixture must set bft_variant");
+            let err = Node::new(&json, None).await.err()
+                .unwrap_or_else(|| panic!("{variant} on testnet must refuse to start"));
+            assert!(err.to_string().contains("bft_variant"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn node_startup_handles_reduced_quorum_with_full_opt_in_per_build() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "identity": { "attestation_quorum": 1, "attestation_cap_per_window": 10, "insecure_dev_identity_overrides": true },"#,
+        );
+        let result = Node::new(&json, None).await;
+        if cfg!(feature = "insecure-dev-quorum") {
+            let node = result.expect("devnet + opt-in + feature build may run reduced params");
+            assert_eq!(node.identity.attestation_quorum(), 1);
+            assert_eq!(node.identity.attestation_cap_per_window(), 10);
+            assert!(node.status.lock().unwrap().insecure_dev_identity_overrides,
+                "reduced params must be visible to operators via /api/status");
+        } else {
+            let err = result.err().expect("default builds must refuse reduced identity params");
+            assert!(err.to_string().contains("insecure-dev-quorum"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_params_survive_restart_from_genesis_not_disk() {
+        let json = GENESIS.replace(
+            r#""custom_modules": [],"#,
+            r#""custom_modules": [],
+        "identity": { "attestation_quorum": 5, "attestation_cap_per_window": 2 },"#,
+        );
+        let dir = std::env::temp_dir()
+            .join(format!("cf-identity-params-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut node = Node::new(&json, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            node.propose_block(genesis_hash).await.unwrap();
+            node.persist_state();
+        }
+        let mut restarted = Node::new(&json, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+        assert_eq!(restarted.identity.attestation_quorum(), 5);
+        assert_eq!(restarted.identity.attestation_cap_per_window(), 2);
+
+        // Two nodes from the same genesis derive identical parameters.
+        let other = Node::new(&json, None).await.unwrap();
+        assert_eq!(other.identity.attestation_quorum(), restarted.identity.attestation_quorum());
+        assert_eq!(other.identity.attestation_cap_per_window(), restarted.identity.attestation_cap_per_window());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn node_applies_genesis_liveness_policy_and_rejects_out_of_range() {
+        let with = |liveness: &str| GENESIS.replace(
+            r#""personhood_weighted": true }"#,
+            &format!(r#""personhood_weighted": true, "liveness": {liveness} }}"#),
+        );
+        let node = Node::new(&with(r#"{ "window_blocks": 800, "max_missed_pct": 40, "start_height": 7 }"#), None)
+            .await.unwrap();
+        let cfg = node.slasher.config();
+        assert_eq!((cfg.liveness_window_blocks, cfg.liveness_miss_pct_threshold, cfg.liveness_start_height),
+                   (800, 40, 7));
+
+        let defaults = Node::new(GENESIS, None).await.unwrap();
+        assert_eq!(defaults.slasher.config().liveness_miss_pct_threshold,
+                   chain_forge_core::DEFAULT_LIVENESS_MAX_MISSED_PCT);
+
+        let err = Node::new(&with(r#"{ "max_missed_pct": 95 }"#), None).await
+            .err().expect("an out-of-range liveness threshold must refuse to start");
+        assert!(err.to_string().contains("max_missed_pct"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn liveness_policy_comes_from_genesis_not_persisted_slashing_state() {
+        let dir = std::env::temp_dir()
+            .join(format!("cf-liveness-policy-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            node.set_data_dir(dir.clone()).unwrap();
+            let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+            node.propose_block(genesis_hash).await.unwrap();
+            node.persist_state();
+        }
+        // Tamper with the persisted policy.
+        let path = dir.join("persist").join("slashing.json");
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["config"]["liveness_miss_pct_threshold"] = serde_json::json!(99);
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        restarted.set_data_dir(dir.clone()).unwrap();
+        assert!(restarted.load_persisted_state());
+        assert_eq!(restarted.slasher.config().liveness_miss_pct_threshold,
+                   chain_forge_core::DEFAULT_LIVENESS_MAX_MISSED_PCT,
+                   "the genesis policy applies after restart, not the persisted one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn node_startup_rejects_zero_min_bond_amount_in_genesis() {
         let json = GENESIS.replace(
@@ -5593,6 +7543,33 @@ mod tests {
         node.propose_block(cert1.block_hash).await.unwrap()
     }
 
+    /// Production order for a post-genesis validator: fund, verified
+    /// personhood, then a BondValidator naming itself as owner (the
+    /// authenticated owner binding the multi-node PoP refresh requires),
+    /// then the epoch boundary that seats it.
+    async fn fund_verify_and_bond_with_owner(
+        node: &mut Node, addr: &str, amount: u128, parent_hash: chain_forge_consensus::BlockHash,
+    ) -> chain_forge_consensus::CommitCertificate {
+        node.validator_epoch_blocks = 2;
+        node.submit_tx(Transaction::transfer("fund", "qcb1alice", addr, "uqcb", amount + 10_000, 0));
+        let cert0 = node.propose_block(parent_hash).await.unwrap();
+
+        let epoch = node.identity.clock.current_epoch;
+        let att = chain_forge_identity::PopAttestation::genesis(addr, epoch);
+        let _ = node.identity.register(addr.to_string(), addr.to_string(), att.clone());
+        node.identity.verify_identity(addr, att, None).unwrap();
+
+        let mut bond = Transaction::bond_validator("bond", addr, amount, 0);
+        bond.body = chain_forge_execution::TxBody::BondValidator {
+            amount, owner_identity_id: Some(addr.to_string()),
+        };
+        node.submit_tx(bond);
+        let cert1 = node.propose_block(cert0.block_hash).await.unwrap();
+        assert_eq!(node.bond_owner_bindings.get(addr).map(String::as_str), Some(addr),
+            "fixture: the bond must record an authenticated owner binding");
+        node.propose_block(cert1.block_hash).await.unwrap()
+    }
+
     #[tokio::test]
     async fn bonded_validator_with_key_and_personhood_becomes_eligible() {
         // CF-VAL-KEY-002 Phase 4 test #1.
@@ -5618,6 +7595,54 @@ mod tests {
             "a validator with BOTH a registered key AND verified personhood \
              must carry real voting power"
         );
+    }
+
+    /// MN-8 root cause. Reward eligibility reads the ValidatorRegistry, which
+    /// must agree with the live ValidatorSet: a bond-admitted validator seated
+    /// with verified personhood must be Active and pop_verified there, and
+    /// carry its authenticated owner binding. Only the solo `propose_block`
+    /// path synced this; on a real network (`commit_block`) the validator
+    /// voted with full power but stayed a Candidate and was never paid.
+    #[tokio::test]
+    async fn multi_node_commit_keeps_bonded_validator_registry_in_sync() {
+        let (kp, addr) = keyed_candidate("seed-multinode-registry-sync");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+        let cert = fund_verify_and_bond_with_owner(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert.block_hash).await.unwrap();
+        assert!(node.consensus.validator_set().validators.iter().any(|v| v.id.0 == addr && v.pop_verified),
+            "precondition: seated with verified personhood");
+
+        // The state a multi-node validator is in: seated, registry not yet confirmed.
+        let epoch = node.identity.clock.current_epoch;
+        node.validator_registry.revoke_pop(&addr, epoch).unwrap();
+
+        // Commit one empty block through the multi-node path.
+        let h = node.consensus.current_height();
+        let parent = chain_forge_consensus::BlockHash(format!("genesis_h{h}"));
+        let tx_data = BlockPayload {
+            version: BLOCK_PAYLOAD_VERSION, txs: vec![],
+            last_commit: node.last_commit_evidence.clone(),
+            prev_state_root: node.state.current_root().map(str::to_string),
+            evidence: vec![],
+        }.encode();
+        let proposal = BlockProposal {
+            height: h, round: 0, proposer: ValidatorId("qcb1alice".into()),
+            block_hash: chain_forge_consensus::compute_block_hash("qcb-testnet-1", h, &parent, &tx_data),
+            parent_hash: parent, timestamp_ms: 0, tx_data, signature: vec![], pol_round: None,
+        };
+        let precommits = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"].iter()
+            .map(|v| signed_vote("qcb-testnet-1", VoteType::Precommit, h, 0, v, proposal.block_hash.clone()))
+            .collect();
+        let cert = chain_forge_consensus::CommitCertificate {
+            height: h, round: 0, block_hash: proposal.block_hash.clone(), precommits,
+        };
+        node.commit_block(cert, &proposal).await.unwrap();
+
+        let rec = node.validator_registry.get(&addr).unwrap();
+        assert!(rec.pop_verified, "registry must mirror the seat's verified personhood");
+        assert_eq!(rec.status, chain_forge_validators::ValidatorStatus::Active);
     }
 
     #[tokio::test]
@@ -5782,7 +7807,8 @@ mod tests {
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
         assert!(restarted.load_persisted_state());
-        assert_eq!(restarted.consensus.current_height(), height_before);
+        // The engine resumes at the NEXT height after the last executed block.
+        assert_eq!(restarted.consensus.current_height(), height_before + 1);
 
         let vs_after = restarted.consensus.validator_set();
         let v_after = vs_after.validators.iter().find(|v| v.id.0 == addr)
@@ -6067,17 +8093,34 @@ mod tests {
 
     // -- Multi-node gossip-to-consensus wiring tests ---------------------------
 
-    fn make_proposal(height: u64, round: u32, proposer: &str, block_hash: &str) -> BlockProposal {
-        BlockProposal {
+    /// A height-0 style proposal with an empty v1 payload. `prev_state_root`
+    /// must be the receiving node's current root (H0-1), so callers pass it.
+    /// The block hash is computed from the contents (receivers verify it).
+    fn make_proposal(
+        chain_id: &str, height: u64, round: u32, proposer: &str, prev_state_root: Option<&str>,
+    ) -> BlockProposal {
+        let parent_hash = chain_forge_consensus::BlockHash("genesis_h0".to_string());
+        let tx_data = BlockPayload {
+            version: BLOCK_PAYLOAD_VERSION,
+            prev_state_root: prev_state_root.map(str::to_string),
+            ..Default::default()
+        }.encode();
+        let mut p = BlockProposal {
             height,
             round,
             proposer:    ValidatorId(proposer.to_string()),
-            block_hash:  chain_forge_consensus::BlockHash(block_hash.to_string()),
-            parent_hash: chain_forge_consensus::BlockHash("genesis_h0".to_string()),
+            block_hash:  chain_forge_consensus::compute_block_hash(chain_id, height, &parent_hash, &tx_data),
+            parent_hash,
             timestamp_ms: 0,
-            tx_data:     serde_json::to_vec(&Vec::<Transaction>::new()).unwrap(),
+            tx_data,
             signature:   vec![],
-        }
+            pol_round:   None,
+        };
+        // Signed by the proposer's deterministic devnet key (matches genesis).
+        let kp = ClassicalScheme.generate_keypair(proposer).unwrap();
+        let bytes = proposal_signing_bytes(chain_id, height, round, &p.block_hash, &p.parent_hash, None);
+        p.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+        p
     }
 
     /// Build a Vote signed by `validator`'s deterministic devnet keypair
@@ -6238,14 +8281,20 @@ mod tests {
                 .expect("deterministic devnet keypair generation must not fail")
         );
 
-        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_test");
+        let proposal = make_proposal("qcb-testnet-1", 0, 0, "qcb1alice", node.state.current_root());
         let payload = serde_json::to_vec(&proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
-
-        // Bob voted (prevote + precommit) but that is only 1 of the 3
-        // precommits needed for quorum with 4 validators -- not committed yet.
-        assert_eq!(node.status.lock().unwrap().height, 0);
         assert!(node.pending_proposals.contains_key(&(0, 0)));
+
+        // Bob prevotes; he precommits only after a +2/3 prevote polka, which
+        // carol's and dave's prevotes complete (Tendermint safety rule).
+        for v in ["qcb1carol", "qcb1dave"] {
+            let prevote = signed_vote("qcb-testnet-1", VoteType::Prevote, 0, 0, v, proposal.block_hash.clone());
+            node.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&prevote).unwrap())).await.unwrap();
+        }
+
+        // Bob's precommit is only 1 of the 3 needed -- not committed yet.
+        assert_eq!(node.status.lock().unwrap().height, 0);
 
         // Carol's precommit arrives over gossip -- still only 2 of 3.
         let carol_vote = signed_vote(
@@ -6293,11 +8342,11 @@ mod tests {
         // Bob is not the proposer at (0,0) -- alice is -- so Bob votes and
         // processes gossip but doesn't produce the proposal itself.
         let mut node = Node::new(GENESIS, Some("qcb1bob".into())).await.unwrap();
-        let proposal = make_proposal(0, 0, "qcb1alice", "block_h0_r0_partition_test");
+        let proposal = make_proposal("qcb-testnet-1", 0, 0, "qcb1alice", node.state.current_root());
 
-        // Three precommits arrive BEFORE the proposal gossip.
-        // The node feeds them to receive_vote(); on the 3rd one it returns
-        // Some(cert) but there is no pending proposal, so the cert is parked.
+        // Three precommits arrive BEFORE the proposal gossip. The engine has
+        // a precommit quorum but not the block's contents, so it cannot
+        // decide yet; it decides the moment the proposal supplies them.
         for validator in &["qcb1alice", "qcb1carol", "qcb1dave"] {
             let vote = signed_vote(
                 "qcb-testnet-1", VoteType::Precommit, 0, 0, validator,
@@ -6314,20 +8363,16 @@ mod tests {
             "no commit yet -- proposal hasn't arrived");
         assert!(node.pending_proposals.is_empty(),
             "proposal body not stored yet");
-        assert!(node.pending_certs.contains_key(&(0, 0)),
-            "certificate must be parked in pending_certs");
 
         // Now the proposal gossip arrives (partition heals / reorder resolved).
         let payload = serde_json::to_vec(&proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
 
-        // The Proposal handler must detect the parked cert and commit immediately.
+        // The proposal completes the decision: commit immediately.
         assert_eq!(node.consensus.current_height(), 1,
             "consensus engine must advance to height 1 after deferred commit");
         assert_eq!(node.explorer.lock().unwrap().blocks.len(), 1,
             "block must appear in explorer after deferred commit");
-        assert!(node.pending_certs.is_empty(),
-            "parked certificate must be pruned after commit");
         assert!(!node.pending_proposals.contains_key(&(0, 0)),
             "committed proposal must be pruned");
     }
@@ -6352,7 +8397,7 @@ mod tests {
 
         // Bob claims to be the proposer at (0,0), but alice is -- consensus
         // must reject this and the node must not register or vote on it.
-        let bad_proposal = make_proposal(0, 0, "qcb1bob", "block_h0_r0_bad");
+        let bad_proposal = make_proposal("qcb-testnet-1", 0, 0, "qcb1bob", node.state.current_root());
         let payload = serde_json::to_vec(&bad_proposal).unwrap();
         node.handle_event(gossip(GossipTopic::BlockProposal, payload)).await.unwrap();
 
@@ -6566,8 +8611,6 @@ mod tests {
     /// verify the slashing side effects (tombstone + stake burn + QRC metrics).
     #[tokio::test]
     async fn double_vote_triggers_slashing_and_tombstone() {
-        use chain_forge_consensus::tendermint::EquivocationDetected;
-        use chain_forge_consensus::{BlockHash, ValidatorId};
 
         let mut node = Node::new(GENESIS, None).await.unwrap();
 
@@ -6589,26 +8632,24 @@ mod tests {
         // Construct a synthetic EquivocationDetected for Alice at height 0, round 0.
         // The two conflicting block hashes represent a double-prevote.
         //
-        // NOTE: signatures are empty here on purpose. Genesis validators are
-        // registered with an empty consensus_pubkey ("genesis-stub" scheme), so
-        // decode_hex("") in slash_equivocation would fail. Passing empty sigs
-        // triggers the "skipped when both sigs are empty" branch and lets the
-        // tombstone + burn logic run without real key material.
-        let eq_evidence = EquivocationDetected {
-            validator_id:   ValidatorId("qcb1alice".into()),
+        // Release gate 4: slashing happens when a block carrying the evidence
+        // commits (apply_committed_evidence), never on detection. This drives
+        // that commit-time path directly; evidence validity is covered by the
+        // h0_participation gate-4 tests. Empty signatures take the slasher's
+        // unsigned branch, which committed evidence can never reach
+        // (check_evidence requires both signatures).
+        let eq_evidence = EquivocationEvidence {
+            validator_id:   "qcb1alice".into(),
             height:         0,
             round:          0,
-            vote_type_byte: 1, // PREVOTE
-            block_hash_a:   BlockHash("hash_A_00000000".into()),
-            block_hash_b:   BlockHash("hash_B_11111111".into()),
+            block_hash_a:   "hash_A_00000000".into(),
+            block_hash_b:   "hash_B_11111111".into(),
             signature_a:    vec![],
             signature_b:    vec![],
+            vote_type_byte: 1,
         };
-
-        // Drive the slashing pipeline directly: this is the same code path that
-        // handle_event() → receive_vote() → drain_equivocations() invokes.
         let epoch = node.consensus.current_height();
-        node.handle_drained_equivocations(vec![eq_evidence], epoch);
+        node.apply_committed_evidence(&[eq_evidence], epoch);
 
         // ── Assert tombstone ─────────────────────────────────────────────────
         assert!(
@@ -7361,13 +9402,18 @@ mod tests {
         // a quorum of signed precommits from alice/bob/carol/eve.  The FBA
         // receive_vote path verifies each vote against the registered genesis key.
         // ⌈5 × 2/3⌉ = 4 precommits needed.
-        let proposal = make_proposal(0, 0, "qcb1alice", &root_a);
+        let proposal = make_proposal("qcb-cs001-p7", 0, 0, "qcb1alice", nodes[3].state.current_root());
         let payload  = serde_json::to_vec(&proposal).unwrap();
         let _ = nodes[3].handle_event(gossip(GossipTopic::BlockProposal, payload)).await;
+        // Prevotes first: dave precommits only after a +2/3 prevote polka.
+        for v in &["qcb1alice", "qcb1bob", "qcb1carol"] {
+            let vote = signed_vote("qcb-cs001-p7", VoteType::Prevote, 0, 0, v, proposal.block_hash.clone());
+            let _ = nodes[3].handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await;
+        }
         for v in &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1eve"] {
             let vote = signed_vote(
                 "qcb-cs001-p7", VoteType::Precommit, 0, 0, v,
-                chain_forge_consensus::BlockHash(root_a.clone()),
+                proposal.block_hash.clone(),
             );
             let _ = nodes[3].handle_event(gossip(
                 GossipTopic::ConsensusVote,
@@ -7524,16 +9570,17 @@ mod tests {
 
         // A properly SIGNED classical (Ed25519) transfer must be rejected by
         // the deprecation cutoff — not by the signature check.  The tx must be
-        // signed so the executor reaches the migration gate, which fires first
-        // when the account's scheme is deprecated.  Nonce 99 avoids collision
-        // with the nonce-1 transfer committed in Phase 1.
+        // signed and carry alice's current nonce: the executor checks the
+        // nonce before the migration gate, so any other nonce would be
+        // rejected as a nonce mismatch without ever reaching the cutoff.
         let alice_kp_restart = p7_signing_key("qcb1alice");
+        let alice_nonce = restarted.state.get_account("qcb1alice").unwrap().nonce;
         let classical_tx = p7_signed_transfer(
-            "classical-post-restart", "qcb1alice", "qcb1bob", 100, 99, &alice_kp_restart,
+            "classical-post-restart", "qcb1alice", "qcb1bob", 100, alice_nonce, &alice_kp_restart,
         );
         // Execute directly through the executor (the node's internal path).
         let result = restarted.executor.execute_tx_with_identity(
-            &classical_tx, &mut restarted.state, &mut restarted.identity, &mut restarted.agents,
+            &classical_tx, &mut restarted.state, &mut restarted.identity, &mut restarted.agents, 0,
         );
         assert!(
             !result.success,
@@ -7595,7 +9642,7 @@ mod tests {
         node.identity.clock.current_epoch = 55;
         let mldsa_tx = p7_mldsa_transfer_with_kp("mldsa-grace", "qcb1pquser", 0, &pquser_kp);
         let r = node.executor.execute_tx_with_identity(
-            &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents,
+            &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
         assert!(
             r.success,
@@ -7609,7 +9656,7 @@ mod tests {
         node.identity.clock.current_epoch = 61;
         let mldsa_tx2 = p7_mldsa_transfer_with_kp("mldsa-post-cutoff", "qcb1pquser", 1, &pquser_kp);
         let r2 = node.executor.execute_tx_with_identity(
-            &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents,
+            &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
         assert!(
             r2.success,
@@ -8032,8 +10079,8 @@ mod tests {
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
         assert!(restarted.load_persisted_state(), "state must reload from disk");
-        assert_eq!(restarted.consensus.current_height(), height_before,
-            "height must be restored after restart");
+        assert_eq!(restarted.consensus.current_height(), height_before + 1,
+            "after restart the engine works on the height after the last executed block");
 
         let vs = restarted.consensus.validator_set();
         let v = vs.validators.iter().find(|v| v.id.0 == addr)
@@ -8811,6 +10858,271 @@ mod tests {
     /// PQ-VAL-002 / Test 10
     /// `EmergencyDeprecateAlgorithm("ml-dsa-65")` re-zeros voting power for
     /// all ML-DSA-only validators.
+    // -- ML-DSA-65 genesis (owner decision 2026-10-28) ----------------------
+
+    const VALS4: [&str; 4] = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+
+    fn mldsa_validator_key(addr: &str) -> chain_forge_crypto::KeyPair {
+        use chain_forge_crypto::MlDsaScheme;
+        MlDsaScheme.generate_keypair(&format!("{addr}-mldsa-consensus")).unwrap()
+    }
+
+    /// GENESIS with every validator on an ML-DSA-65 consensus key and
+    /// `validator_scheme = "ml-dsa-65"`.
+    fn mldsa_genesis() -> String {
+        let mut g: serde_json::Value = serde_json::from_str(GENESIS).unwrap();
+        g["cryptography"]["validator_scheme"] = "ml-dsa-65".into();
+        for a in g["genesis_accounts"].as_array_mut().unwrap() {
+            let addr = a["address"].as_str().unwrap().to_string();
+            let pk: String = mldsa_validator_key(&addr).public_key.iter().map(|b| format!("{b:02x}")).collect();
+            a["public_key"] = pk.into();
+        }
+        g.to_string()
+    }
+
+    fn write_key_file(dir: &std::path::Path, addr: &str, scheme: &str, kp: &chain_forge_crypto::KeyPair) -> std::path::PathBuf {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let path = dir.join(format!("{addr}.key.json"));
+        std::fs::write(&path, serde_json::json!({
+            "address": addr, "scheme": scheme,
+            "public_key": hex(&kp.public_key), "private_key": hex(&kp.private_key),
+        }).to_string()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn mldsa_genesis_seeds_mldsa_keys_active_from_genesis() {
+        let node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        for addr in VALS4 {
+            let vi = node.consensus.validator_set().validators.iter()
+                .find(|v| v.id.0 == addr).cloned().unwrap();
+            assert_eq!(vi.public_key, mldsa_validator_key(addr).public_key, "{addr}");
+            assert!(vi.voting_power > 0, "{addr} must vote from genesis");
+            assert_eq!(node.validator_registry.consensus_key_scheme(addr), Some("ml-dsa-65"), "{addr}");
+        }
+        assert_eq!(node.pq_activation_epoch(), Some(0), "ML-DSA consensus is active from genesis");
+    }
+
+    #[tokio::test]
+    async fn mldsa_genesis_refuses_an_ed25519_validator_key() {
+        let json = mldsa_genesis();
+        let mut g: serde_json::Value = serde_json::from_str(&json).unwrap();
+        g["genesis_accounts"][1]["public_key"] =
+            "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0".into();
+        let err = Node::new(&g.to_string(), None).await.err()
+            .expect("an Ed25519 validator key on an ML-DSA-only chain must refuse to start");
+        assert!(err.to_string().contains("ml-dsa-65"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mldsa_key_file_loads_and_signs_votes_with_mldsa() {
+        let dir = std::env::temp_dir().join(format!("cf-mldsa-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kp = mldsa_validator_key("qcb1bob");
+        let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        node.load_signing_key(&write_key_file(&dir, "qcb1bob", "ml-dsa-65", &kp))
+            .expect("an ML-DSA-65 key file matching genesis must load");
+
+        let mut vote = Vote {
+            vote_type: VoteType::Prevote, height: 1, round: 0,
+            validator: chain_forge_consensus::ValidatorId("qcb1bob".into()),
+            block_hash: Some(BlockHash("b".into())), signature: vec![], scheme: Vote::default_scheme(),
+        };
+        node.sign_vote(&mut vote);
+        assert_eq!(vote.scheme, "ml-dsa-65");
+        node.verify_vote_signature(&vote).expect("own ML-DSA vote must verify");
+
+        // Right public key, wrong private key: refused.
+        let mut wrong = kp.clone();
+        wrong.private_key = mldsa_validator_key("qcb1carol").private_key;
+        let mut other = Node::new(&mldsa_genesis(), None).await.unwrap();
+        assert!(other.load_signing_key(&write_key_file(&dir, "qcb1bob", "ml-dsa-65", &wrong)).is_err(),
+            "a key file whose private key does not match its public key must be refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A solo devnet node on the ML-DSA genesis, able to sign every genesis
+    /// validator's simulated votes.
+    async fn mldsa_solo_node() -> Node {
+        let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        for addr in VALS4 {
+            node.devnet_sim_keys.insert(addr.into(), mldsa_validator_key(addr));
+        }
+        node
+    }
+
+    #[tokio::test]
+    async fn mldsa_solo_devnet_commits_blocks_with_mldsa_votes() {
+        let mut node = mldsa_solo_node().await;
+        let mut parent = BlockHash("0000000000000000".into());
+        for _ in 0..3 {
+            let cert = node.propose_block(parent).await.expect("ML-DSA-signed votes must reach quorum");
+            for v in &cert.precommits {
+                let pk = node.consensus.validator_set().public_key_of(&v.validator).to_vec();
+                assert_eq!(pk.len(), 1952);
+                let msg = vote_signing_bytes(node.chain_id(), &v.vote_type, v.height, v.round, v.block_hash.as_ref());
+                chain_forge_crypto::verify_consensus(&msg, &v.signature, &pk).expect("precommit is ML-DSA-signed");
+            }
+            parent = cert.block_hash;
+        }
+    }
+
+    /// The repo's Ed25519 devnet key files say "classical-ed25519"; they
+    /// must keep loading (the Ed25519 devnet is the fallback).
+    #[tokio::test]
+    async fn repo_ed25519_devnet_key_file_still_loads() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/devnet/keys/alice.key.json");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        node.load_signing_key(&path).expect("the Ed25519 devnet key file must load");
+    }
+
+    /// A commit certificate carried as `last_commit` must verify with
+    /// ML-DSA precommits; the vote's scheme tag must match its key.
+    #[tokio::test]
+    async fn mldsa_certificate_verifies_against_history() {
+        let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        let mut hist = node.consensus.validator_set().clone();
+        hist.height = 7;
+        node.historical_validator_sets.insert(7, hist);
+        let hash = BlockHash("block7".into());
+        let precommit = |addr: &str, tag: &str| {
+            let msg = vote_signing_bytes(node.chain_id(), &VoteType::Precommit, 7, 0, Some(&hash));
+            Vote {
+                vote_type: VoteType::Precommit, height: 7, round: 0,
+                validator: chain_forge_consensus::ValidatorId(addr.into()), block_hash: Some(hash.clone()),
+                signature: chain_forge_crypto::sign_consensus(&msg, &mldsa_validator_key(addr)).unwrap(),
+                scheme: tag.into(),
+            }
+        };
+        let cert = |tag: &str| chain_forge_consensus::CommitCertificate {
+            height: 7, round: 0, block_hash: hash.clone(),
+            precommits: VALS4[..3].iter().map(|a| precommit(a, tag)).collect(),
+        };
+        node.verify_certificate_against_history(&cert("ml-dsa-65"))
+            .expect("3 of 4 ML-DSA precommits must verify as commit evidence");
+        assert!(node.verify_certificate_against_history(&cert("classical")).is_err(),
+            "a scheme tag that does not match the key must be rejected");
+    }
+
+    /// Equivocation with ML-DSA-signed votes is detected by the engine, and
+    /// the evidence carries both ML-DSA signatures. (Applying it is release
+    /// gate 4: slashing must come from committed evidence.)
+    #[tokio::test]
+    async fn mldsa_equivocation_is_detected_with_verifiable_evidence() {
+        let mut node = Node::new(&mldsa_genesis(), None).await.unwrap();
+        let h = node.consensus.current_height();
+        let bob = mldsa_validator_key("qcb1bob");
+        let prevote = |hash: &str| {
+            let hash = BlockHash(hash.into());
+            let msg = vote_signing_bytes(node.chain_id(), &VoteType::Prevote, h, 0, Some(&hash));
+            Vote {
+                vote_type: VoteType::Prevote, height: h, round: 0,
+                validator: chain_forge_consensus::ValidatorId("qcb1bob".into()), block_hash: Some(hash),
+                signature: chain_forge_crypto::sign_consensus(&msg, &bob).unwrap(), scheme: "ml-dsa-65".into(),
+            }
+        };
+        let (a, b) = (prevote("hash_A"), prevote("hash_B"));
+        let _ = node.consensus.receive_vote(a).await;
+        let _ = node.consensus.receive_vote(b).await;
+        let evidence = node.consensus.drain_equivocations();
+        assert_eq!(evidence.len(), 1, "the engine must detect bob's double prevote");
+
+        let e = &evidence[0];
+        for (hash, sig) in [(&e.block_hash_a, &e.signature_a), (&e.block_hash_b, &e.signature_b)] {
+            let msg = vote_signing_bytes(node.chain_id(), &VoteType::Prevote, h, 0, Some(hash));
+            chain_forge_crypto::verify_consensus(&msg, sig, &bob.public_key)
+                .expect("each half of the evidence is a valid ML-DSA signature by bob");
+        }
+    }
+
+    #[tokio::test]
+    async fn mldsa_only_chain_refuses_ed25519_key_registration() {
+        let (kp, addr) = keyed_candidate("mldsa-chain-ed25519-joiner");
+        let mut node = mldsa_solo_node().await;
+        let genesis_hash = BlockHash("0000000000000000".into());
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
+        node.propose_block(cert.block_hash).await.unwrap();
+        assert!(node.validator_registry.consensus_pubkey_bytes(&addr).is_none(),
+            "an Ed25519 consensus key must not register on an ML-DSA-only chain");
+    }
+
+    #[tokio::test]
+    async fn mldsa_only_chain_refuses_to_deprecate_mldsa_consensus() {
+        let mut node = mldsa_solo_node().await;
+        let alice = ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+        let mut eda = Transaction {
+            id: "eda-mldsa-only".into(), sender: "qcb1alice".into(), nonce: 0,
+            body: chain_forge_execution::TxBody::EmergencyDeprecateAlgorithm {
+                deprecated_scheme:  "ml-dsa-65".into(),
+                replacement_scheme: "ed25519".into(),
+                rationale:          "would halt an ML-DSA-only chain".into(),
+                advisory_ref:       None,
+                grace_epochs:       chain_forge_execution::MIN_CRYPTO_GRACE_EPOCHS,
+                scope:              chain_forge_execution::DeprecationScope::ConsensusSignatures,
+            },
+            gas_limit: 50_000, signature: vec![], public_key: vec![],
+            pq_signatures: vec![], sig_scheme: None, pq_public_key: vec![],
+        };
+        eda.sign(&alice, node.chain_id()).unwrap();
+        node.submit_tx(eda);
+        let cert = node.propose_block(BlockHash("0000000000000000".into())).await.unwrap();
+        node.propose_block(cert.block_hash).await.unwrap();
+        for addr in VALS4 {
+            let p = node.consensus.validator_set().power_of(&chain_forge_consensus::ValidatorId(addr.into()));
+            assert!(p > 0, "{addr} lost its voting power: deprecating the only consensus scheme halts the chain");
+        }
+    }
+
+    /// An activated ML-DSA-65 validator's votes must count on the real
+    /// engine path (gossip check + engine), not only in the standalone
+    /// `verify_consensus_vote` check. Before scheme dispatch the engine
+    /// verified every vote with Ed25519, so these were all rejected.
+    #[tokio::test]
+    async fn activated_mldsa_validator_votes_count_on_the_engine_path() {
+        let (account_kp, addr) = keyed_candidate("mldsa-engine-path-account");
+        let (mldsa_kp, _)      = mldsa_keyed_candidate("mldsa-engine-path-key");
+        let mut node = Node::new(GENESIS, None).await.unwrap();
+        let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
+
+        let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
+        node.submit_tx(mldsa_register_key_tx(&addr, 1, &mldsa_kp, node.chain_id(), &account_kp));
+        let next_epoch = node.current_epoch() + 1;
+        node.submit_tx(activate_pq_consensus_tx("qcb1alice", 1, next_epoch, &account_kp, node.chain_id()));
+        node.propose_block(cert.block_hash.clone()).await.unwrap();
+        node.identity.clock.current_epoch = next_epoch;
+        let cert2 = node.propose_block(cert.block_hash.clone()).await.unwrap();
+
+        let vi = node.consensus.validator_set().validators.iter()
+            .find(|v| v.id.0 == addr).cloned().expect("seated");
+        assert!(vi.voting_power > 0, "setup: activated ML-DSA validator must have power");
+        assert_eq!(vi.public_key, mldsa_kp.public_key, "setup: the set carries the ML-DSA key");
+
+        let height = node.consensus.current_height();
+        let round  = node.consensus.current_round();
+        let bytes = vote_signing_bytes(node.chain_id(), &VoteType::Prevote, height, round, Some(&cert2.block_hash));
+        let vote = Vote {
+            vote_type:  VoteType::Prevote, height, round,
+            validator:  chain_forge_consensus::ValidatorId(addr.clone()),
+            block_hash: Some(cert2.block_hash.clone()),
+            signature:  chain_forge_crypto::sign_consensus(&bytes, &mldsa_kp).unwrap(),
+            scheme:     "ml-dsa-65".into(),
+        };
+        node.verify_vote_signature(&vote).expect("gossip check must accept the ML-DSA vote");
+        node.consensus.receive_vote(vote).await.expect("engine must accept the ML-DSA vote");
+
+        // An Ed25519 signature claiming the same validator is rejected.
+        let ed = ClassicalScheme.sign(&bytes, &account_kp).unwrap().bytes;
+        let forged = Vote {
+            vote_type: VoteType::Prevote, height, round,
+            validator: chain_forge_consensus::ValidatorId(addr.clone()),
+            block_hash: Some(cert2.block_hash.clone()), signature: ed, scheme: Vote::default_scheme(),
+        };
+        assert!(node.verify_vote_signature(&forged).is_err());
+        assert!(node.consensus.receive_vote(forged).await.is_err());
+    }
+
     #[tokio::test]
     async fn emergency_deprecate_zeros_mldsa_power() {
         let (account_kp, addr) = keyed_candidate("pq002-t10-account");
