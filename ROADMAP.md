@@ -144,12 +144,14 @@ PQ-HotStuff (personhood-weighted, ML-DSA-only, two-chain HotStuff) is the target
 Nothing merges until these pass and the owner reviews the combined tree. All PRs stay draft.
 | Item | PR | Status |
 |---|---|---|
-| **Security: production keys from the OS RNG.** Wallets generated in one process shared one ML-DSA private key; `qcb-keygen ed25519` keys were SHA-256 of the label (treat as compromised) | #27 | 🔄 sandbox-passing; awaiting Windows |
-| DIS-003 (#13) integrated onto the stack (merging #13 directly does not compile) | #28 | 🔄 sandbox-passing (DIS-003A/B/C live pass); awaiting Windows |
-| Deterministic equivocation live test (confirm the evidence reached validation; retry) | #29 | 🔄 6/6 sandbox; awaiting Windows |
-| `pocd_reward_live` follows H0-5 nonce semantics (found by the candidate run) | #30 | 🔄 sandbox-passing; awaiting Windows |
-| Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30 + #16 + #19 | — | 🔄 full sandbox suite run; awaiting Windows |
+| **Security: production keys from the OS RNG.** Wallets generated in one process shared one ML-DSA private key; `qcb-keygen ed25519` keys were SHA-256 of the label (treat as compromised) | #27 | ✅ Windows-confirmed (crypto 47, wallet 14, keygen) |
+| DIS-003 (#13) integrated onto the stack (merging #13 directly does not compile) | #28 | ✅ Windows-confirmed (DIS-003A/B/C, DIS-002B live) |
+| Deterministic equivocation live test (confirm the evidence reached validation; retry) | #29 | ✅ Windows-confirmed (adversarial_gossip 3/3 ×3) |
+| `pocd_reward_live` follows H0-5 nonce semantics (found by the candidate run) | #30 | ✅ Windows-confirmed |
+| Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30 + #16 + #19 | #31 | ✅ Windows-confirmed: 24/24 crates, node 257, all live acceptance tests (2026-10-30); ready for owner review |
 | Devnet upgrade procedure (preserve the legacy devnet; new chain side by side) | `docs/devnet-upgrade-phase-0-5.md` | draft for review |
+
+**First follow-up after the merge: P2P reconnection.** With `peer_discovery: "bootstrap"` a node dials its bootstrap peers once and never reconnects; failed dials and unparseable bootstrap addresses are silently ignored (unchanged from `main`). Found while explaining one ML-DSA `consensus_safety_live` stall during a ~99-minute machine suspend (rerun 3/3; sandbox 15/15; a 5–10 minute sleep test recovered).
 
 Known failing live tests that **also fail on `main`** (not caused by the stack): `attestation_guard_live` (unfunded account), `dis_auth_live` (1 test; 2 on `main`), `validator_key_live::post_genesis_validator_admission` (2 on `main`), `dis_003d_expiry_live` (the 70 KB ML-DSA recovery tx exceeds the API's hard-coded 64 KiB read limit, and the API resets the connection instead of answering; needs an owner decision on limits/encoding). `chain-forge-intelligence` tests do not compile on `main` either.
 
