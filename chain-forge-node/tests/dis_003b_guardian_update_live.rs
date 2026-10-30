@@ -528,15 +528,34 @@ fn dis_003b_guardian_update() {
     // ── D-09: Four-node convergence ───────────────────────────────────────────
 
     eprintln!("\n--- D-09: Cross-node convergence after restart ---");
-    std::thread::sleep(Duration::from_secs(2));
 
-    let roots: Vec<String> = all2.iter().map(|&p| state_root(p)).collect();
-    eprintln!("  state roots:");
-    for (i, r) in roots.iter().enumerate() { eprintln!("    node{i}: {r}"); }
-    let root_ref = &roots[0];
-    for (i, r) in roots.iter().enumerate() {
-        assert_eq!(r, root_ref, "D-09: node{i} state root differs from node0");
-    }
+    // Poll until all 4 nodes agree on a non-empty state root (up to 30 s).
+    // A single read immediately after restart can catch nodes still replaying
+    // committed blocks, so we wait for consensus.
+    let root_ref = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last_roots: Vec<String> = vec![];
+        loop {
+            let roots: Vec<String> = all2.iter().map(|&p| state_root(p)).collect();
+            let first = &roots[0];
+            let all_same   = roots.iter().all(|r| r == first);
+            let all_nonempty = roots.iter().all(|r| !r.is_empty());
+            if all_same && all_nonempty {
+                eprintln!("  state roots (converged):");
+                for (i, r) in roots.iter().enumerate() { eprintln!("    node{i}: {r}"); }
+                last_roots = roots;
+                break;
+            }
+            if Instant::now() >= deadline {
+                eprintln!("  state roots at timeout:");
+                for (i, r) in roots.iter().enumerate() { eprintln!("    node{i}: {r}"); }
+                panic!("D-09: nodes did not agree on state root within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        last_roots.into_iter().next().unwrap_or_default()
+    };
+
     assert!(!root_ref.is_empty(), "D-09: state root must not be empty");
 
     let pgen_all: Vec<u64> = all2.iter().map(|&p| {

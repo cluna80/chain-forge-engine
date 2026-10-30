@@ -452,12 +452,12 @@ async fn dis_auth_live() {
     // ── Generate two fresh ML-DSA-65 keypairs in-process ──────────────────
     let scheme = MlDsaScheme;
 
-    let kp_a = SignatureScheme::generate_keypair(&scheme, "random")
+    let kp_a = scheme.generate_random()
         .expect("keypair A generation failed");
     let addr_a = derive_address_from_pq_key(&kp_a.public_key);
     let pub_a  = kp_a.public_key_hex();
 
-    let kp_b = SignatureScheme::generate_keypair(&scheme, "random")
+    let kp_b = scheme.generate_random()
         .expect("keypair B generation failed");
     let addr_b = derive_address_from_pq_key(&kp_b.public_key);
     let pub_b  = kp_b.public_key_hex();

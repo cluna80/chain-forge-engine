@@ -362,6 +362,42 @@ async fn attestation_guard_live() {
         "chain did not reach height 3 within 60s"
     );
 
+    // ── Phase 1.5: Fund the claimant from qcb1alice ───────────────────────
+    // After the account-ownership fix (PR #39), `debit_fee` runs before the tx
+    // body and the claimant address has no genesis balance.  Transfer a small
+    // amount from the genesis-funded qcb1alice so the claimant can pay gas.
+    println!("   [phase1.5] Funding claimant {claimant} from qcb1alice...");
+    let fund_tx = serde_json::json!({
+        "id":         format!("fund-{claimant}"),
+        "sender":     "qcb1alice",
+        "nonce":      0u64,
+        "body":       { "Transfer": { "to": &claimant, "denom": "uqcb", "amount": 10_000u64 } },
+        "gas_limit":  100_000u64,
+        "signature":  [],
+        "public_key": []
+    }).to_string();
+    let fund_resp = api_post_tx(ports.alice_api, &fund_tx)
+        .expect("fund claimant POST failed (network error)");
+    println!("   Fund claimant response: {fund_resp}");
+    assert!(
+        fund_resp["status"].as_str().unwrap_or("") == "queued"
+            || fund_resp["status"].as_str().unwrap_or("") == "ok",
+        "fund claimant was not queued: {fund_resp}"
+    );
+    // Wait for the fund tx to settle (alice nonce must reach 1).
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let nonce: u64 = api_get(ports.alice_api, "/api/accounts/qcb1alice")
+                .and_then(|v| v["nonce"].as_u64())
+                .unwrap_or(0);
+            if nonce >= 1 { break; }
+            assert!(Instant::now() < deadline, "fund claimant tx did not settle within 30s");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    println!("   Claimant funded.");
+
     // ── Phase 2: RegisterIdentity for the claimant ────────────────────────
     // Submit to Alice's API. Signature is empty (require_signatures: false in genesis).
     println!("   [phase2] Submitting RegisterIdentity for {claimant}...");
