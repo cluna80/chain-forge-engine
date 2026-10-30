@@ -571,6 +571,11 @@ pub struct GenesisRewards {
     pub premium_cap_bps: Option<u32>,
 }
 
+/// Ed25519 consensus public key length.
+pub const ED25519_CONSENSUS_KEY_BYTES: usize = 32;
+/// ML-DSA-65 (FIPS 204) consensus public key length.
+pub const MLDSA65_CONSENSUS_KEY_BYTES: usize = 1952;
+
 /// BFT engine a chain runs, resolved by `GenesisConfig::bft_variant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BftVariant {
@@ -905,10 +910,28 @@ impl GenesisConfig {
                     ));
                 }
             };
-            if bytes.len() < 32 {
+            if bytes.len() < ED25519_CONSENSUS_KEY_BYTES {
                 return Err(format!(
                     "genesis validator {:?} ({}) public_key is only {} bytes \
-                     -- too short to be a real consensus key (expected >= 32)",
+                     -- too short to be a real consensus key (expected 32 or 1952)",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+            // The key's length fixes its consensus scheme
+            // (chain_forge_crypto::consensus_key_scheme); any other length
+            // could never sign a valid vote.
+            if bytes.len() != ED25519_CONSENSUS_KEY_BYTES && bytes.len() != MLDSA65_CONSENSUS_KEY_BYTES {
+                return Err(format!(
+                    "genesis validator {:?} ({}) public_key is {} bytes -- a consensus \
+                     key must be 32 (Ed25519) or 1952 (ML-DSA-65) bytes",
+                    acct.label, acct.address, bytes.len()
+                ));
+            }
+            if self.mldsa_consensus_only() && bytes.len() != MLDSA65_CONSENSUS_KEY_BYTES {
+                return Err(format!(
+                    "genesis validator {:?} ({}) has a {}-byte key, but \
+                     cryptography.validator_scheme is \"ml-dsa-65\": every consensus \
+                     key must be ML-DSA-65 (1952 bytes)",
                     acct.label, acct.address, bytes.len()
                 ));
             }
@@ -1035,6 +1058,12 @@ impl GenesisConfig {
             ));
         }
         Ok(p)
+    }
+
+    /// `cryptography.validator_scheme = "ml-dsa-65"`: every consensus key on
+    /// this chain is ML-DSA-65, from genesis on.
+    pub fn mldsa_consensus_only(&self) -> bool {
+        self.cryptography.validator_scheme == "ml-dsa-65"
     }
 
     /// Resolve and validate the BFT engine selected by `consensus.bft_variant`.
@@ -1189,6 +1218,43 @@ mod tests {
         ] {
             assert!(genesis_with_liveness(Some(bad.clone())).liveness_params().is_err(), "{bad}");
         }
+    }
+
+    // -- Consensus key schemes (ML-DSA-65 devnet) ------------------------------
+
+    fn genesis_with_validator_key(scheme: &str, key_bytes: usize) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["cryptography"]["validator_scheme"] = serde_json::Value::String(scheme.into());
+        for a in v["genesis_accounts"].as_array_mut().unwrap() {
+            if a["role"] == "validator" {
+                a["public_key"] = serde_json::Value::String("ab".repeat(key_bytes));
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn genesis_consensus_keys_must_be_ed25519_or_mldsa65_sized() {
+        for ok in [32, 1952] {
+            genesis_with_validator_key("pqc-native", ok).validate_validator_keys()
+                .unwrap_or_else(|e| panic!("{ok}-byte key must be accepted: {e}"));
+        }
+        for bad in [33, 64, 897, 1951, 1953] {
+            let err = genesis_with_validator_key("pqc-native", bad).validate_validator_keys()
+                .expect_err(&format!("{bad}-byte key has no consensus scheme"));
+            assert!(err.contains("32") && err.contains("1952"), "{err}");
+        }
+    }
+
+    #[test]
+    fn mldsa_only_genesis_requires_mldsa_validator_keys() {
+        let g = genesis_with_validator_key("ml-dsa-65", 1952);
+        assert!(g.mldsa_consensus_only());
+        g.validate_validator_keys().unwrap();
+        let err = genesis_with_validator_key("ml-dsa-65", 32).validate_validator_keys()
+            .expect_err("an Ed25519 key on an ML-DSA-only chain must be rejected");
+        assert!(err.contains("ml-dsa-65"), "{err}");
+        assert!(!genesis_with_validator_key("pqc-native", 32).mldsa_consensus_only());
     }
 
     // -- BFT variant (release gate 2) -----------------------------------------

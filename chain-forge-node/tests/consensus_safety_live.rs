@@ -51,13 +51,17 @@ fn node_binary() -> PathBuf {
     }
 }
 
+#[path = "common/consensus_keys.rs"]
+mod consensus_keys;
+
 fn genesis_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("devnet").join("genesis-fee-settle.json")
+    consensus_keys::genesis(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("devnet").join("genesis-fee-settle.json"))
 }
 
 fn key_path(name: &str) -> PathBuf {
     let short = name.strip_prefix("qcb1").unwrap_or(name);
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("devnet").join("keys").join(format!("{short}.key.json"))
+    consensus_keys::validator_key(short,
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("devnet").join("keys").join(format!("{short}.key.json")))
 }
 
 fn port_is_free(port: u16) -> bool {

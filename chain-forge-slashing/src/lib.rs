@@ -382,7 +382,6 @@ impl SlashingModule {
         }
         #[cfg(feature = "real-crypto")]
         {
-            use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
             // Reconstruct the exact bytes the consensus engine signed via
             // vote_signing_bytes(): b"CFV|" + chain_id + b"|" + type_byte +
             // height_le + round_le + block_hash_bytes.
@@ -401,17 +400,9 @@ impl SlashingModule {
             };
             let msg_a = build_msg(&evidence.block_hash_a);
             let msg_b = build_msg(&evidence.block_hash_b);
-            let sig_a = chain_forge_crypto::Signature {
-                scheme: chain_forge_crypto::SchemeId::Classical,
-                bytes:  evidence.signature_a.clone(),
-            };
-            let sig_b = chain_forge_crypto::Signature {
-                scheme: chain_forge_crypto::SchemeId::Classical,
-                bytes:  evidence.signature_b.clone(),
-            };
-            ClassicalScheme.verify(&msg_a, &sig_a, _pub_key)
+            chain_forge_crypto::verify_consensus(&msg_a, &evidence.signature_a, _pub_key)
                 .map_err(|e| SlashError::InvalidEvidence(format!("sig_a invalid: {e}")))?;
-            ClassicalScheme.verify(&msg_b, &sig_b, _pub_key_b)
+            chain_forge_crypto::verify_consensus(&msg_b, &evidence.signature_b, _pub_key_b)
                 .map_err(|e| SlashError::InvalidEvidence(format!("sig_b invalid: {e}")))?;
             Ok(())
         }
@@ -439,8 +430,9 @@ impl SlashingModule {
             evidence.round,
         );
 
-        // Idempotent: write the key BEFORE fallible registry lookup so replay
-        // attacks are blocked even when the validator is transiently absent.
+        // Idempotent: verified evidence for a slot is applied once. The slot
+        // is recorded only after the evidence verifies (below), so a forged
+        // copy cannot use it up and make the real equivocation unslashable.
         if self.equivocation_set.contains(&key) {
             return Err(SlashError::EquivocationAlreadyRecorded(
                 evidence.validator_id.clone(),
@@ -448,7 +440,6 @@ impl SlashingModule {
                 evidence.round,
             ));
         }
-        self.equivocation_set.insert(key.clone());
 
         let record = registry.get(&evidence.validator_id)
             .map_err(|_| SlashError::ValidatorNotFound(evidence.validator_id.clone()))?;
@@ -465,6 +456,7 @@ impl SlashingModule {
                 ))?;
             Self::verify_evidence(chain_id, evidence, &pub_key, &pub_key)?;
         }
+        self.equivocation_set.insert(key.clone());
 
         let bonded_before = record.bonded_uqcb;
         let slash_amount  = self.config.equivocation_slash_amount(bonded_before);
@@ -978,6 +970,44 @@ mod tests {
 
         assert_eq!(slasher.total_slashed_uqcb, burned1 + burned2);
         assert_eq!(slasher.history().len(), 2);
+    }
+
+    /// Forged evidence must not use up the (validator, height, round) slot:
+    /// otherwise anyone who sends a bad copy first makes the real
+    /// equivocation unslashable. The genuine evidence is signed with
+    /// `vote_signing_bytes`, exactly as the engine signs votes (the round
+    /// is a u32 there; reconstructing it as a u64 rejected every real
+    /// signed evidence).
+    #[cfg(feature = "real-crypto")]
+    #[test]
+    #[ignore = "release gate 4: verifying signed evidence needs committed-evidence slashing first \
+                (local slashing diverges node state; see ROADMAP)"]
+    fn forged_evidence_does_not_block_genuine_evidence() {
+        use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
+        let kp = ClassicalScheme.generate_keypair("val1-consensus").unwrap();
+        let mut reg = registry_with_validator("val1", FULL_STAKE_UQCB);
+        reg.register_consensus_key("val1", &kp.public_key, 1).unwrap();
+        // Signed exactly as the consensus engine signs a precommit.
+        let msg = |hash: &str| chain_forge_consensus::vote_signing_bytes(
+            "test-chain", &chain_forge_consensus::VoteType::Precommit, 42, 0,
+            Some(&chain_forge_consensus::BlockHash(hash.into())));
+        let genuine = EquivocationEvidence {
+            validator_id: "val1".into(), height: 42, round: 0,
+            block_hash_a: "blockA".into(), block_hash_b: "blockB".into(),
+            signature_a: chain_forge_crypto::sign_consensus(&msg("blockA"), &kp).unwrap(),
+            signature_b: chain_forge_crypto::sign_consensus(&msg("blockB"), &kp).unwrap(),
+            vote_type_byte: 1,
+        };
+        let mut forged = genuine.clone();
+        forged.signature_b[0] ^= 0xff;
+
+        let mut slasher = SlashingModule::with_qcb_defaults();
+        assert!(matches!(slasher.slash_equivocation(&forged, &mut reg, 5, "test-chain"),
+            Err(SlashError::InvalidEvidence(..))));
+        slasher.slash_equivocation(&genuine, &mut reg, 5, "test-chain")
+            .expect("genuine evidence must still slash after a forged copy was rejected");
+        assert!(matches!(slasher.slash_equivocation(&genuine, &mut reg, 5, "test-chain"),
+            Err(SlashError::EquivocationAlreadyRecorded(..))), "replay is still refused");
     }
 
     #[test]

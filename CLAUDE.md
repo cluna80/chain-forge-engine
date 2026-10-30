@@ -19,4 +19,9 @@ the discrepancy before closing the milestone.
 ## Cryptographic architecture (locked)
 
 See ROADMAP.md § "Cryptographic Architecture Decision". Do not re-litigate during Phase 0/1.
-Short answer: devnet validators stay Ed25519, full ML-DSA is mainnet/Phase 1.
+
+Owner decision 2026-10-28 (supersedes the earlier "devnet validators stay Ed25519"):
+the devnet moves to **ML-DSA-65 consensus keys on the Tendermint engine**. The
+Ed25519 devnet genesis stays runnable as a fallback until the ML-DSA devnet passes
+on Windows. HotStuff/FBA stay devnet-only (release gate 2); the consensus engine is
+not changing. Mainnet is still a fresh all-ML-DSA genesis.

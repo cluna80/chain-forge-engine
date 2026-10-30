@@ -955,6 +955,68 @@ pub const MLDSA_TX_DOMAIN_V1: &[u8] = b"chain-forge/pq-tx/v1\n";
 /// Used by: chain-forge-execution (Transaction::signing_bytes).
 pub const ED25519_TX_DOMAIN_V1: &[u8] = b"chain-forge/tx/v1\n";
 
+// -- Consensus-key signatures --------------------------------------------------
+
+/// The scheme of a registered consensus public key, fixed by its length:
+/// 32 bytes is Ed25519, 1952 bytes is ML-DSA-65. Any other length has no
+/// scheme and every signature against it is rejected.
+pub fn consensus_key_scheme(public_key: &[u8]) -> Option<SchemeId> {
+    if public_key.len() == SchemeId::Classical.public_key_size_bytes() {
+        Some(SchemeId::Classical)
+    } else if public_key.len() == SchemeId::MlDsa.public_key_size_bytes() {
+        Some(SchemeId::MlDsa)
+    } else {
+        None
+    }
+}
+
+/// Wire tag carried in `Vote.scheme` for a consensus key's scheme.
+pub fn consensus_scheme_tag(scheme: &SchemeId) -> &'static str {
+    match scheme {
+        SchemeId::MlDsa => "ml-dsa-65",
+        _               => "classical",
+    }
+}
+
+/// Sign consensus bytes (votes, proposals) with a validator's consensus key.
+pub fn sign_consensus(message: &[u8], keypair: &KeyPair) -> CryptoResult<Vec<u8>> {
+    match keypair.scheme {
+        SchemeId::Classical => ClassicalScheme.sign(message, keypair).map(|s| s.bytes),
+        SchemeId::MlDsa     => {
+            require_real_pqc()?;
+            MlDsaScheme.sign(message, keypair).map(|s| s.bytes)
+        }
+        ref other => Err(CryptoError::NotAvailable(other.display_name().to_string())),
+    }
+}
+
+/// Verify a consensus signature against a registered consensus key. The
+/// scheme comes from the key (`consensus_key_scheme`), never from the
+/// message, so a signer cannot choose a weaker scheme.
+pub fn verify_consensus(message: &[u8], signature: &[u8], public_key: &[u8]) -> CryptoResult<()> {
+    match consensus_key_scheme(public_key) {
+        Some(SchemeId::Classical) => ClassicalScheme.verify(
+            message, &Signature { scheme: SchemeId::Classical, bytes: signature.to_vec() }, public_key),
+        Some(SchemeId::MlDsa) => {
+            require_real_pqc()?;
+            MlDsaScheme.verify(
+                message, &Signature { scheme: SchemeId::MlDsa, bytes: signature.to_vec() }, public_key)
+        }
+        _ => Err(CryptoError::VerificationFailed { key_hint: hex_prefix(public_key) }),
+    }
+}
+
+/// The ML-DSA stub signature is a public function of message and key, so
+/// it proves nothing: consensus fails closed without real ML-DSA.
+fn require_real_pqc() -> CryptoResult<()> {
+    if cfg!(feature = "real-pqc") {
+        Ok(())
+    } else {
+        Err(CryptoError::NotAvailable(
+            "ML-DSA-65 consensus signatures need the real-pqc feature".into()))
+    }
+}
+
 /// **CS-001-M2** — Compute the ML-DSA-65 transaction pre-hash.
 ///
 /// This is the single place where the pre-hash algorithm for PQ transaction
@@ -989,6 +1051,42 @@ pub fn mldsa_tx_prehash(chain_id: &str, body_json: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn consensus_scheme_is_fixed_by_key_length() {
+        assert_eq!(consensus_key_scheme(&[0u8; 32]), Some(SchemeId::Classical));
+        assert_eq!(consensus_key_scheme(&[0u8; 1952]), Some(SchemeId::MlDsa));
+        for len in [0, 31, 33, 897, 1951, 1953, 1984] {
+            assert_eq!(consensus_key_scheme(&vec![0u8; len]), None, "{len}");
+        }
+    }
+
+    #[cfg(all(feature = "real-crypto", feature = "real-pqc"))]
+    #[test]
+    fn consensus_signatures_round_trip_for_both_schemes_and_never_cross() {
+        let ed = ClassicalScheme.generate_keypair("cs-ed").unwrap();
+        let pq = MlDsaScheme.generate_keypair("cs-pq").unwrap();
+        let msg = b"vote";
+        for kp in [&ed, &pq] {
+            let sig = sign_consensus(msg, kp).unwrap();
+            verify_consensus(msg, &sig, &kp.public_key).unwrap();
+            assert!(verify_consensus(b"other", &sig, &kp.public_key).is_err());
+        }
+        let ed_sig = sign_consensus(msg, &ed).unwrap();
+        let pq_sig = sign_consensus(msg, &pq).unwrap();
+        assert!(verify_consensus(msg, &ed_sig, &pq.public_key).is_err());
+        assert!(verify_consensus(msg, &pq_sig, &ed.public_key).is_err());
+        assert!(verify_consensus(msg, &pq_sig, &pq.public_key[..1951]).is_err(), "truncated key");
+    }
+
+    #[cfg(not(feature = "real-pqc"))]
+    #[test]
+    fn mldsa_consensus_signatures_fail_closed_without_real_pqc() {
+        let pq = KeyPair::generate_stub(SchemeId::MlDsa, "cs-stub");
+        assert!(sign_consensus(b"m", &pq).is_err());
+        let forged = MlDsaScheme.sign(b"m", &pq).unwrap().bytes;
+        assert!(verify_consensus(b"m", &forged, &pq.public_key).is_err());
+    }
     use super::*;
 
     // -- SchemeId tests -------------------------------------------------------

@@ -95,8 +95,13 @@ fn node_binary() -> PathBuf {
     }
 }
 
-fn genesis_path() -> PathBuf {
-    repo_root().join("tests").join("devnet").join("genesis-4node.json")
+/// Ed25519 consensus keys (the fallback devnet).
+const ED25519: (&str, &str) = ("genesis-4node.json", "keys");
+/// ML-DSA-65 consensus keys (owner decision 2026-10-28).
+const MLDSA: (&str, &str) = ("genesis-4node-mldsa.json", "keys/mldsa");
+
+fn genesis_path(file: &str) -> PathBuf {
+    repo_root().join("tests").join("devnet").join(file)
 }
 
 // ── Network helpers ───────────────────────────────────────────────────────────
@@ -296,7 +301,7 @@ fn read_peer_id(log_path: &PathBuf, timeout: Duration) -> String {
     }
 }
 
-fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeProcess> {
+fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, key_dir: &str, log_dir: &PathBuf) -> Vec<NodeProcess> {
     let mut nodes: Vec<NodeProcess> = Vec::new();
     let mut bootstrap: Option<String> = None;
 
@@ -312,7 +317,7 @@ fn spawn_nodes(bin: &PathBuf, genesis: &PathBuf, log_dir: &PathBuf) -> Vec<NodeP
         // Derive key file from validator name: "qcb1alice" -> "alice.key.json"
         let short_name = validator.strip_prefix("qcb1").unwrap_or(validator);
         let key_file = repo_root()
-            .join("tests").join("devnet").join("keys")
+            .join("tests").join("devnet").join(key_dir)
             .join(format!("{short_name}.key.json"));
 
         let mut cmd = Command::new(bin);
@@ -438,6 +443,17 @@ fn poll_until_height(
 
 #[test]
 fn devnet_4node_reaches_target_height() {
+    liveness(ED25519, "qcb-devnet-4node");
+}
+
+/// Same run with every validator on an ML-DSA-65 consensus key: no
+/// Ed25519 key exists in this genesis, so every counted vote is ML-DSA.
+#[test]
+fn devnet_4node_mldsa_reaches_target_height() {
+    liveness(MLDSA, "qcb-devnet-4node-mldsa");
+}
+
+fn liveness((genesis_file, key_dir): (&str, &str), log_name: &str) {
     let bin = node_binary();
     if !bin.exists() {
         println!(
@@ -447,7 +463,7 @@ fn devnet_4node_reaches_target_height() {
         return;
     }
 
-    let genesis = genesis_path();
+    let genesis = genesis_path(genesis_file);
     assert!(genesis.exists(), "genesis file not found: {genesis:?}");
 
     for port in API_PORTS.iter().chain(P2P_PORTS.iter()) {
@@ -474,10 +490,10 @@ fn devnet_4node_reaches_target_height() {
            timeout:       {timeout:?}\n"
     );
 
-    let log_dir = std::env::temp_dir().join("qcb-devnet-4node");
+    let log_dir = std::env::temp_dir().join(log_name);
     std::fs::create_dir_all(&log_dir).unwrap();
 
-    let mut nodes = spawn_nodes(&bin, &genesis, &log_dir);
+    let mut nodes = spawn_nodes(&bin, &genesis, key_dir, &log_dir);
     poll_until_height(&mut nodes, target_height, timeout, &log_dir, "liveness");
     assert_block_agreement("liveness", target_height);
     // NodeProcess::drop() kills the children.
@@ -497,6 +513,15 @@ fn devnet_4node_reaches_target_height() {
 /// Skipped (not failed) when iptables is unavailable or unprivileged.
 #[test]
 fn devnet_4node_partition_recovery() {
+    partition_recovery(ED25519, "qcb-devnet-4node-partition");
+}
+
+#[test]
+fn devnet_4node_mldsa_partition_recovery() {
+    partition_recovery(MLDSA, "qcb-devnet-4node-mldsa-partition");
+}
+
+fn partition_recovery((genesis_file, key_dir): (&str, &str), log_name: &str) {
     let bin = node_binary();
     if !bin.exists() {
         println!(
@@ -514,7 +539,7 @@ fn devnet_4node_partition_recovery() {
         return;
     }
 
-    let genesis = genesis_path();
+    let genesis = genesis_path(genesis_file);
     assert!(genesis.exists(), "genesis file not found: {genesis:?}");
 
     for port in API_PORTS.iter().chain(P2P_PORTS.iter()) {
@@ -552,7 +577,7 @@ fn devnet_4node_partition_recovery() {
            alice_p2p_port:  {alice_p2p_port}\n"
     );
 
-    let log_dir = std::env::temp_dir().join("qcb-devnet-4node-partition");
+    let log_dir = std::env::temp_dir().join(log_name);
     std::fs::create_dir_all(&log_dir).unwrap();
 
     // Pre-emptively remove any stale DROP rules left over from a crashed
@@ -562,7 +587,7 @@ fn devnet_4node_partition_recovery() {
 
     // ── Phase 1: steady-state liveness ───────────────────────────────────────
     println!("── Phase 1: steady state ────────────────────────────────────────────");
-    let mut nodes = spawn_nodes(&bin, &genesis, &log_dir);
+    let mut nodes = spawn_nodes(&bin, &genesis, key_dir, &log_dir);
     poll_until_height(&mut nodes, phase1_target, timeout, &log_dir, "phase1/steady-state");
 
     // ── Phase 2: partition (DROP Alice's P2P port) ────────────────────────────
