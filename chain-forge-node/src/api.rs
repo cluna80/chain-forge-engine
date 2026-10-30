@@ -140,7 +140,7 @@ pub async fn serve(
     delegation_usage: SharedDelegationUsage,
 ) {
     use tokio::net::TcpListener;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
@@ -177,25 +177,33 @@ pub async fn serve(
                     // client writes them separately from the body. Replying
                     // and closing with body bytes still unread makes Windows
                     // reset the connection (os error 10054 on the client).
-                    let mut buf: Vec<u8> = Vec::with_capacity(8192);
-                    let mut chunk = [0u8; 8192];
-                    let read_all = tokio::time::timeout(
+                    let max_body = max_body_bytes(precheck.max_tx_bytes);
+                    let read = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        async {
-                            loop {
-                                let n = stream.read(&mut chunk).await?;
-                                if n == 0 { break; }
-                                buf.extend_from_slice(&chunk[..n]);
-                                if request_complete(&buf) || buf.len() >= MAX_REQUEST_BYTES {
-                                    break;
-                                }
-                            }
-                            Ok::<(), std::io::Error>(())
-                        },
+                        read_request(&mut stream, max_body),
                     ).await;
-                    if !matches!(read_all, Ok(Ok(()))) || buf.is_empty() {
-                        return;
-                    }
+                    let buf = match read {
+                        Ok(Ok(RequestRead::Complete(buf))) if !buf.is_empty() => buf,
+                        Ok(Ok(RequestRead::TooLarge { declared, limit })) => {
+                            // Answer explicitly instead of dropping the
+                            // connection, then drain what the client is still
+                            // sending so the close doesn't reset it.
+                            tracing::info!(declared, limit, "request body too large");
+                            let body = serde_json::json!({
+                                "status": "rejected",
+                                "message": format!("request body too large: {declared} bytes, limit {limit}")
+                            }).to_string();
+                            let _ = stream.write_all(http_413_json(&body).as_bytes()).await;
+                            drain(&mut stream, declared).await;
+                            return;
+                        }
+                        Ok(Ok(RequestRead::HeadersTooLarge)) => {
+                            let body = r#"{"status":"rejected","message":"request headers too large"}"#;
+                            let _ = stream.write_all(http_431_json(body).as_bytes()).await;
+                            return;
+                        }
+                        _ => return,
+                    };
 
                     let request = String::from_utf8_lossy(&buf);
                     let first_line = request.lines().next().unwrap_or("");
@@ -241,7 +249,7 @@ pub async fn serve(
                             }
                             max_d
                         };
-                        if body.len() >= raw_limit {
+                        if body.len() > raw_limit {
                             let resp = serde_json::json!({
                                 "status": "rejected",
                                 "message": format!("request body too large: {} bytes, limit {}", body.len(), raw_limit)
@@ -1595,9 +1603,77 @@ pub async fn serve(
     }
 }
 
-/// Largest request the API will buffer. Transactions are far smaller;
-/// this only bounds memory if a client sends something huge.
-const MAX_REQUEST_BYTES: usize = 65536;
+/// Largest header block the API will buffer.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// Body limit when genesis sets no `max_tx_bytes` (0 = unlimited).
+const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
+/// Most bytes read and discarded after a 413, so a huge upload can't hold
+/// the task open.
+const MAX_DRAIN_BYTES: usize = 8 * 1_048_576;
+
+/// Largest request body the API accepts: the genesis transaction limit, so
+/// any transaction the chain accepts can also be submitted.
+fn max_body_bytes(max_tx_bytes: usize) -> usize {
+    if max_tx_bytes > 0 { max_tx_bytes } else { DEFAULT_MAX_BODY_BYTES }
+}
+
+enum RequestRead {
+    /// Headers and the full Content-Length body (or whatever arrived before
+    /// the client closed).
+    Complete(Vec<u8>),
+    /// Content-Length exceeds the body limit; the body was not read.
+    TooLarge { declared: usize, limit: usize },
+    /// No end of headers within MAX_HEADER_BYTES.
+    HeadersTooLarge,
+}
+
+/// Reads one request, never buffering more than MAX_HEADER_BYTES + max_body.
+async fn read_request<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    max_body: usize,
+) -> std::io::Result<RequestRead> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match header_end(&buf) {
+            Some(end) => {
+                let declared = content_length(&buf[..end]);
+                if declared > max_body {
+                    return Ok(RequestRead::TooLarge { declared, limit: max_body });
+                }
+                if buf.len() >= end + declared {
+                    return Ok(RequestRead::Complete(buf));
+                }
+            }
+            None if buf.len() > MAX_HEADER_BYTES => return Ok(RequestRead::HeadersTooLarge),
+            None => {}
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(RequestRead::Complete(buf));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Reads and discards up to `declared` bytes (capped at MAX_DRAIN_BYTES, two
+/// seconds at most), so closing after an early reply doesn't reset the
+/// connection before the client has read the reply.
+async fn drain<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, declared: usize) {
+    use tokio::io::AsyncReadExt;
+    let budget = declared.min(MAX_DRAIN_BYTES);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut chunk = [0u8; 8192];
+        let mut seen = 0usize;
+        while seen < budget {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen += n,
+            }
+        }
+    }).await;
+}
 
 /// Byte offset just past the blank line ending the headers, if present.
 fn header_end(buf: &[u8]) -> Option<usize> {
@@ -1617,6 +1693,7 @@ fn content_length(headers: &[u8]) -> usize {
 }
 
 /// True once the headers and the full Content-Length body have arrived.
+#[cfg(test)]
 fn request_complete(buf: &[u8]) -> bool {
     match header_end(buf) {
         Some(end) => buf.len() >= end + content_length(&buf[..end]),
@@ -1650,6 +1727,20 @@ fn http_400_json(body: &str) -> String {
     )
 }
 
+fn http_413_json(body: &str) -> String {
+    format!(
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    )
+}
+
+fn http_431_json(body: &str) -> String {
+    format!(
+        "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    )
+}
+
 fn http_403_json(body: &str) -> String {
     format!(
         "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
@@ -1675,6 +1766,86 @@ mod tests {
         assert_eq!(content_length(b"POST / HTTP/1.1\r\ncontent-length: 42\r\n"), 42);
         assert_eq!(content_length(b"GET /api/status HTTP/1.1\r\n"), 0);
         assert!(request_complete(b"GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n"));
+    }
+
+    fn post(body_len: usize) -> Vec<u8> {
+        let mut req = format!("POST /api/tx HTTP/1.1\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
+        req.resize(req.len() + body_len, b'x');
+        req
+    }
+
+    #[tokio::test]
+    async fn body_above_64_kib_is_read_when_genesis_allows_it() {
+        // DIS-003D: an ML-DSA recovery tx is ~70 KB of JSON. The API used to
+        // stop reading at a fixed 64 KiB.
+        let req = post(70_274);
+        let mut src: &[u8] = &req;
+        match read_request(&mut src, max_body_bytes(262_144)).await.unwrap() {
+            RequestRead::Complete(buf) => assert_eq!(buf.len(), req.len()),
+            _ => panic!("a body within max_tx_bytes must be read whole"),
+        }
+    }
+
+    #[tokio::test]
+    async fn body_at_the_limit_is_accepted_and_one_byte_more_is_not() {
+        let at = post(65_536);
+        let mut src: &[u8] = &at;
+        assert!(matches!(read_request(&mut src, 65_536).await.unwrap(), RequestRead::Complete(_)));
+        let over = post(65_537);
+        let mut src: &[u8] = &over;
+        match read_request(&mut src, 65_536).await.unwrap() {
+            RequestRead::TooLarge { declared, limit } => assert_eq!((declared, limit), (65_537, 65_536)),
+            _ => panic!("an oversized Content-Length must be refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_refused_before_it_is_read() {
+        // Only the headers arrive; the reader must decide without the body.
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        use tokio::io::AsyncWriteExt;
+        client.write_all(b"POST /api/tx HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n").await.unwrap();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), read_request(&mut server, 65_536))
+            .await.expect("must not wait for the body");
+        assert!(matches!(read.unwrap(), RequestRead::TooLarge { declared: 999_999_999, .. }));
+    }
+
+    #[tokio::test]
+    async fn endless_headers_are_refused() {
+        let mut req = b"GET /api/status HTTP/1.1\r\n".to_vec();
+        req.resize(MAX_HEADER_BYTES + 10_000, b'a');
+        let mut src: &[u8] = &req;
+        assert!(matches!(read_request(&mut src, 65_536).await.unwrap(), RequestRead::HeadersTooLarge));
+    }
+
+    #[test]
+    fn zero_max_tx_bytes_means_the_default_body_limit() {
+        assert_eq!(max_body_bytes(0), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(max_body_bytes(200_000), 200_000);
+    }
+
+    #[tokio::test]
+    async fn client_gets_413_for_an_oversized_post() {
+        // Over a real socket: the client sends the whole oversized request
+        // and must read a 413, not a reset connection.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if let RequestRead::TooLarge { declared, limit } = read_request(&mut stream, 65_536).await.unwrap() {
+                let _ = stream.write_all(http_413_json(&format!("{declared}/{limit}")).as_bytes()).await;
+                drain(&mut stream, declared).await;
+            }
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&post(200_000)).await.unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.expect("response, not a reset");
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.starts_with("HTTP/1.1 413 "), "got: {resp}");
+        assert!(resp.ends_with("200000/65536"));
+        server.await.unwrap();
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //!
 //! | ID   | Scenario |
 //! |------|----------|
+//! | F-00 | A body above genesis `max_tx_bytes` gets an explicit 413, not a reset |
 //! | F-01 | Recovery with `expires_at_height: None` on all guardians succeeds (baseline) |
 //! | F-02 | Recovery with future expiry succeeds |
 //! | F-03 | Exact boundary: recovery accepted when block_height == expires_at_height |
@@ -405,6 +406,17 @@ fn dis_003d_expiry_live() {
     }
     let h0 = current_height(port);
     println!("Devnet ready — current height: {h0}");
+
+    // ── F-00: a body above max_tx_bytes gets an explicit 413 ──────────────────
+    // The API used to stop reading at a fixed 64 KiB and close the connection
+    // with the rest unread, so the client saw a reset instead of an answer.
+    let max_tx_bytes = 262_144;
+    let oversized = "x".repeat(max_tx_bytes + 1);
+    let (status, body) = api_post(port, "/api/tx", &oversized);
+    assert_eq!(status, 413, "F-00: oversized body must get 413, got {status}: {body}");
+    assert!(body["message"].as_str().unwrap_or("").contains("too large"),
+        "F-00: 413 must say why: {body}");
+    println!("✓ F-00 passed (413 for {} bytes)", max_tx_bytes + 1);
 
     // ── Derive guardian public keys ───────────────────────────────────────────
     let g1_pk = MlDsaScheme.generate_keypair(SEED_G1).expect("g1").public_key;
