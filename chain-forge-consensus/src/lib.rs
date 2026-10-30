@@ -1066,6 +1066,28 @@ impl ConsensusEngine for FbaEngine {
         Ok(())
     }
 
+    /// Restart recovery: resume at `height` (the next height to decide) with
+    /// the restored validator set, clearing per-height state exactly as
+    /// on_commit does. Without this the trait's no-op default left a
+    /// restarted node at height 0.
+    fn reset_to_height(
+        &mut self,
+        height:        BlockHeight,
+        validator_set: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        self.height = height;
+        self.round  = 0;
+        self.phase  = FbaPhase::Open;
+        self.votes.clear();
+        self.vote_index.clear();
+        self.pending = None;
+        self.pending_equivocations.clear();
+        self.update_validator_set(validator_set)
+            .map_err(|e| ConsensusError::Internal(e.to_string()))?;
+        tracing::info!(height, "FBA engine fast-forwarded to persisted height");
+        Ok(())
+    }
+
     fn verify_commit(
         &self,
         certificate:   &CommitCertificate,
@@ -2162,9 +2184,10 @@ impl ConsensusEngine for TendermintEngine {
         validator_set: ValidatorSet,
     ) -> ConsensusResult<()> {
         // Jump the height counter forward so the engine starts proposing and
-        // voting at `height + 1` rather than re-running already-committed
-        // heights.  Per-round state (votes, proposals, locks) is for the old
-        // height and is no longer valid, so clear it.
+        // voting at `height` -- the NEXT height to decide (callers pass the
+        // last committed height + 1) -- rather than re-running
+        // already-committed heights.  Per-round state (votes, proposals,
+        // locks) is for the old height and is no longer valid, so clear it.
         // CF-VAL-KEY-002 hardening: `update_validator_set()` always runs
         // every incoming set through `gate_voting_power()` before installing
         // it, so nothing upstream can hand real voting power back to a
@@ -2831,6 +2854,25 @@ impl ConsensusEngine for HotStuffEngine {
         Ok(())
     }
 
+    /// Restart recovery: resume at `height` (the next height to decide) with
+    /// the restored validator set, clearing per-height state exactly as
+    /// on_commit does (including the height lock). Without this the trait's
+    /// no-op default left a restarted node at height 0.
+    fn reset_to_height(
+        &mut self,
+        height:        BlockHeight,
+        validator_set: ValidatorSet,
+    ) -> ConsensusResult<()> {
+        self.height    = height;
+        self.round     = 0;
+        self.locked_qc = None;
+        self.reset_round_state();
+        self.update_validator_set(validator_set)
+            .map_err(|e| ConsensusError::Internal(e.to_string()))?;
+        tracing::info!(height, "HotStuff engine fast-forwarded to persisted height");
+        Ok(())
+    }
+
     fn verify_commit(
         &self,
         certificate:   &CommitCertificate,
@@ -2998,6 +3040,35 @@ mod tests {
         assert_eq!(vs.power_of(&ValidatorId("eligible".into())), 10);
         assert_eq!(vs.power_of(&ValidatorId("no-key".into())), 0);
         assert_eq!(vs.power_of(&ValidatorId("no-personhood".into())), 0);
+    }
+
+    /// Restart recovery: every engine must resume at the height it is told
+    /// (the next height to decide) with the supplied validator set. An engine
+    /// that ignores reset_to_height restarts from height 0 and re-decides
+    /// already-finalized blocks.
+    #[tokio::test]
+    async fn every_engine_resumes_at_the_height_passed_to_reset_to_height() {
+        let vs = ValidatorSet {
+            height: 6,
+            validators: (0..4).map(|i| ValidatorInfo {
+                id: ValidatorId(format!("v{i}")), voting_power: 10,
+                pop_verified: true, public_key: vec![i as u8 + 1; 32],
+            }).collect(),
+        };
+        let mut engines: Vec<(&str, Box<dyn ConsensusEngine>, ConsensusVariant)> = vec![
+            ("tendermint", Box::new(TendermintEngine::new()), ConsensusVariant::TendermintStyle),
+            ("hotstuff",   Box::new(HotStuffEngine::new()),   ConsensusVariant::HotStuffStyle),
+            ("fba",        Box::new(FbaEngine::new()),        ConsensusVariant::XrplInspired),
+        ];
+        for (name, engine, variant) in engines.iter_mut() {
+            let mut cfg = default_config();
+            cfg.variant = variant.clone();
+            engine.init(cfg, vs.clone()).await.unwrap();
+            engine.reset_to_height(7, vs.clone()).unwrap();
+            assert_eq!(engine.current_height(), 7, "{name} must resume at height 7");
+            assert_eq!(engine.current_round(), 0, "{name} starts the restored height at round 0");
+            assert_eq!(engine.validator_set().validators.len(), 4, "{name} keeps the restored set");
+        }
     }
 
     #[tokio::test]
@@ -3272,6 +3343,7 @@ mod tests {
             validator:  ValidatorId("carol".into()),
             block_hash: Some(BlockHash("block_test".into())),
             signature:  vec![],  // empty — would have bypassed old opt-in check
+            scheme:     Vote::default_scheme(),
         };
 
         let result = engine.receive_vote(spoofed_vote).await;
@@ -3347,6 +3419,7 @@ mod tests {
                     validator:  ValidatorId("alice".into()),
                     block_hash: Some(block_hash.clone()),
                     signature:  vec![],
+                    scheme:     Vote::default_scheme(),
                 },
                 Vote {
                     vote_type:  VoteType::Precommit,
@@ -3355,6 +3428,7 @@ mod tests {
                     validator:  ValidatorId("bob".into()),
                     block_hash: Some(block_hash.clone()),
                     signature:  vec![],
+                    scheme:     Vote::default_scheme(),
                 },
                 Vote {
                     vote_type:  VoteType::Precommit,
@@ -3363,6 +3437,7 @@ mod tests {
                     validator:  ValidatorId("carol".into()),
                     block_hash: Some(block_hash.clone()),
                     signature:  vec![],  // Carol has a key — this is a forgery attempt
+                    scheme:     Vote::default_scheme(),
                 },
             ],
         };
@@ -3429,6 +3504,7 @@ mod tests {
                 validator:  ValidatorId(format!("val_{i:02}")),
                 block_hash: Some(block_hash.clone()),
                 signature:  raw_sig.bytes,
+                scheme:     Vote::default_scheme(),
             }
         };
 
