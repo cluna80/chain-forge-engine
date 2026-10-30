@@ -140,6 +140,24 @@ A 5-node run with only honest nodes finalized two conflicting blocks at height 1
 ### PQ-HotStuff (locked direction, owner 2026-10-28)
 PQ-HotStuff (personhood-weighted, ML-DSA-only, two-chain HotStuff) is the target consensus for Qattice mainnet and a selectable Chain Forge engine. Protocol spec: `docs/pq-hotstuff-001-spec.md`. Decisions locked 2026-10-28: D1 two-chain commit; D2 versioned QC (v1 signature list now, mainnet ceiling after M0); D3 round-robin leaders; D4 revocation effective the block after it commits; D5 gate 4 first. The hardened Tendermint devnet (ML-DSA keys, #24) stays the default until PQ-HotStuff passes its Phase 2 gate on Windows. Order: release gate 4 (committed-evidence slashing) first, then PQ-HotStuff Phase 0. The legacy `HotStuffEngine` is not a base and stays devnet-only.
 
+### Integration before merging to `main` (owner decision 2026-10-29)
+Nothing merges until these pass and the owner reviews the combined tree. All PRs stay draft.
+| Item | PR | Status |
+|---|---|---|
+| **Security: production keys from the OS RNG.** Wallets generated in one process shared one ML-DSA private key; `qcb-keygen ed25519` keys were SHA-256 of the label (treat as compromised) | #27 | ✅ Windows-confirmed (crypto 47, wallet 14, keygen) |
+| DIS-003 (#13) integrated onto the stack (merging #13 directly does not compile) | #28 | ✅ Windows-confirmed (DIS-003A/B/C, DIS-002B live) |
+| Deterministic equivocation live test (confirm the evidence reached validation; retry) | #29 | ✅ Windows-confirmed (adversarial_gossip 3/3 ×3) |
+| `pocd_reward_live` follows H0-5 nonce semantics (found by the candidate run) | #30 | ✅ Windows-confirmed |
+| API: explicit 413 for oversized requests; body limit = genesis `max_tx_bytes`; DIS-003D test genesis 256 KiB; `dis_003d_expiry_live` F-00..F-08 | #32 | ✅ Windows-confirmed (2026-10-30) |
+| ML-DSA devnet genesis `max_tx_bytes` 262144 (owner decision 2026-10-30) + 10-guardian recovery size test | #33 | ✅ Windows-confirmed (2026-10-30): devnet_4node 6/6 (10-guardian recovery 221,105 bytes; partition tests skip without iptables) |
+| **Security (liveness): proposals stay within `max_block_bytes`.** Every proposal carried the whole mempool; a burst of large txs outgrew the 16 MB gossip limit and stalled finality (reproduced: 25 × 221 KB recoveries stalled a 4-node devnet at height 3). Proposer takes the fitting mempool prefix; validators reject oversized payloads. Live `max_block_live` M-01..M-05 | #34 | ✅ Windows-confirmed (2026-10-30): unit 3/3; max_block_live M-01..M-05 on Ed25519 and ML-DSA keys (25 txs over 8 blocks). Head-of-line follow-up (owner review): an oversized tx no longer blocks other senders; a tx that can't fit any block is evicted. ✅ Windows-confirmed (2026-10-30): h0_participation 26/26; max_block_live 4/4 (2 Ed25519, 2 ML-DSA), no node crash |
+| Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30, #32→#34 + #16 + #19 | #31 | ✅ Windows-confirmed: 24/24 crates, node 257, all live acceptance tests (2026-10-30); ready for owner review |
+| Devnet upgrade procedure (preserve the legacy devnet; new chain side by side) | `docs/devnet-upgrade-phase-0-5.md` | draft for review |
+
+**First follow-up after the merge: P2P reconnection.** With `peer_discovery: "bootstrap"` a node dials its bootstrap peers once and never reconnects; failed dials and unparseable bootstrap addresses are silently ignored (unchanged from `main`). Found while explaining one ML-DSA `consensus_safety_live` stall during a ~99-minute machine suspend (rerun 3/3; sandbox 15/15; a 5–10 minute sleep test recovered).
+
+Known failing live tests that **also fail on `main`** (not caused by the stack): `attestation_guard_live` (unfunded account), `dis_auth_live` (1 test; 2 on `main`), `validator_key_live::post_genesis_validator_admission` (2 on `main`). (`dis_003d_expiry_live` is fixed by #32.) Owner decision 2026-10-30: the upgraded ML-DSA devnet uses `max_tx_bytes` 262144 (#33; a 10-guardian ML-DSA recovery is ~221 KB). The mainnet transaction limit is not final (review mempool admission, block capacity, execution cost, resource exhaustion); `max_block_bytes` is reviewed separately. `chain-forge-intelligence` tests do not compile on `main` either.
+
 ### Release gates (all four closed; Windows-confirmed)
 - ✅ **Proposal authentication** (#21): validators sign their proposals and re-proposals; the signature covers `pol_round`. Receivers fail closed when the proposer has a registered key. Windows-confirmed.
 - ✅ **HotStuff / FBA** (#23, Windows-confirmed): `consensus.bft_variant` "hotstuff"/"xrpl" now refuse to start unless `environment.mode = "devnet"`, and an unknown value is rejected instead of silently selecting Tendermint. Neither engine has engine-driven voting, persisted locks or commit-signature checks; a full safety review is needed before they run anywhere else. The chain itself runs Tendermint.
@@ -158,6 +176,13 @@ PQ-HotStuff (personhood-weighted, ML-DSA-only, two-chain HotStuff) is the target
 ### Other follow-ups
 - ⬜ `attestation_guard_live` registers an unfunded account that ingress now rejects (test fix).
 - ⬜ Genesis-hash peer agreement (H0-8); per-tx identity/agent clone performance.
+- ⬜ `block_gas_limit` is enforced per tx at ingress but not per block (found with #34).
+- ⬜ `mempool_ttl_seconds` is not enforced (found with #34).
+- ⬜ **Investigate:** a node process aborted twice in the sandbox (`max_block_live`, 2 of ~14 runs, debug build) on a tokio-internal `debug_assert!` in the timer driver (`AtomicWaker::take_waker`, tokio 1.54.0). There were no Chain Forge frames in the backtrace, and 6/6 A/B reruns (3 with #34's head-of-line fix, 3 without) passed. Next steps: rerun under a release build and with `RUST_BACKTRACE=full`; check for unsafe or FFI memory errors (pqcrypto, libp2p).
+- ⬜ A failed proposal publish is silently ignored (`let _ = network.publish`); log it (found with #34).
+- ⬜ Mainnet `max_tx_bytes` / `max_block_bytes`: not decided. Review mempool admission, block capacity, execution cost and resource exhaustion first.
+- ⬜ After the merge (owner, 2026-10-30): enforce ML-DSA-only user tx authentication on ML-DSA-only chains; retire the Ed25519 fallback devnet once nothing depends on it; mark the superseded Ed25519 devnet sections below.
+- ⬜ Partition recovery is only exercised where iptables is available (skipped on Windows); run it on Linux with the P2P work.
 
 ---
 
