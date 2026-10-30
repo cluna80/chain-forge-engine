@@ -11,3 +11,11 @@ serde_json = { workspace = true }
 sha3       = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
+
+[features]
+# Allows a devnet genesis to opt into identity parameters weaker than
+# production (identity.insecure_dev_identity_overrides): an attestation quorum
+# below DEFAULT_ATTESTATION_QUORUM or a per-attester cap above
+# DEFAULT_ATTESTATION_CAP_PER_WINDOW. Devnet bootstrap only; never enable for
+# testnet or mainnet builds. See GenesisConfig::attestation_quorum.
+insecure-dev-quorum = []

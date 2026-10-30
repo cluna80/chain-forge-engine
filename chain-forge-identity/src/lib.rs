@@ -320,13 +320,16 @@ impl PopAttestation {
 
 // -- Web-of-trust quorum -------------------------------------------------------
 
-/// Minimum number of distinct Verified-or-Established attesters a
-/// Provisional identity needs before it graduates to Verified.
-/// Whitepaper Section 4 / Identity Pilot Design Section 3.1: "provisional
-/// target: 3 attestations." Provisional here means governance-adjustable,
-/// not fixed at the protocol layer -- Section 6.6 governs QRC-adjacent
-/// parameters like this one the same way it governs decay rates.
-pub const ATTESTATION_QUORUM: usize = 1;
+/// Production web-of-trust quorum. The effective quorum is per-chain:
+/// genesis `identity.attestation_quorum`, validated by
+/// `GenesisConfig::attestation_quorum` and installed on the store with
+/// `IdentityStore::set_attestation_quorum`. A store that was never
+/// configured uses this value, so a missed setup step fails safe.
+pub use chain_forge_core::DEFAULT_ATTESTATION_QUORUM;
+
+fn default_attestation_quorum() -> usize {
+    DEFAULT_ATTESTATION_QUORUM
+}
 
 /// Maximum number of distinct claimants one identity can vouch for within
 /// a single epoch. Named in the Identity Pilot Design (Section 3.1) as a
@@ -344,7 +347,15 @@ pub const MAX_ATTESTATIONS_PER_EPOCH: u32 = 5;
 /// Pilot value: 3. Governance-tunable. The cap is enforced on the derived
 /// count from attestation_records, not from a separate ring buffer — at pilot
 /// scale this is acceptable; add a ring buffer index if count grows past ~50k.
-pub const ATTESTATION_CAP_PER_WINDOW: u32 = 10;
+/// The effective cap is per-chain (genesis `identity.attestation_cap_per_window`,
+/// validated by `GenesisConfig::attestation_cap_per_window` and installed
+/// with `IdentityStore::set_attestation_cap_per_window`); an unconfigured
+/// store uses this production value.
+pub use chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW;
+
+fn default_attestation_cap_per_window() -> u32 {
+    DEFAULT_ATTESTATION_CAP_PER_WINDOW
+}
 
 /// Rolling window size in epochs for the attestation cap (Phase B).
 ///
@@ -411,7 +422,7 @@ pub struct RevocationCost {
     /// from this attestation. 1000 = 10%.
     pub cost_bps: u32,
     /// True when the revocation dropped the attested identity's active
-    /// attestation count below ATTESTATION_QUORUM and their tier was
+    /// attestation count below the attestation quorum and their tier was
     /// consequently downgraded from Verified/Established to Provisional.
     /// The execution layer must sync the updated charm to account state
     /// and refresh the Merkle leaf when this is true (Phase C).
@@ -435,7 +446,7 @@ pub struct SybilReport {
 }
 
 /// Tracks which distinct identities have vouched for a Provisional
-/// claimant so far, on the way to reaching ATTESTATION_QUORUM.
+/// claimant so far, on the way to reaching the attestation quorum.
 ///
 /// Kept as a Vec rather than a HashSet so serialization order is
 /// deterministic (matters for state-root determinism across nodes,
@@ -704,7 +715,7 @@ impl IntrinsicCharm {
 
     /// Upgrade to Verified via web-of-trust quorum (attest path).
     /// Sets verified_via_wot so Phase C revocation propagation can downgrade
-    /// the tier if attestations later drop below ATTESTATION_QUORUM.
+    /// the tier if attestations later drop below the attestation quorum.
     pub fn verify_wot(&mut self, epoch: u64) {
         self.tier = VerificationTier::Verified;
         self.verified_since_epoch = Some(epoch);
@@ -713,7 +724,7 @@ impl IntrinsicCharm {
     }
 
     /// Downgrade a WoT-verified identity to Provisional when attestations drop
-    /// below ATTESTATION_QUORUM. Only called by revoke_attestation (Phase C).
+    /// below the attestation quorum. Only called by revoke_attestation (Phase C).
     pub fn downgrade_to_provisional(&mut self) {
         self.tier = VerificationTier::Provisional;
         self.verified_since_epoch = None;
@@ -784,7 +795,7 @@ pub struct IdentityRecord {
     /// Agents sponsored by this identity (agent address -> authorized).
     pub sponsored_agents: Vec<String>,
     /// Distinct Verified+ identities who have vouched for THIS identity
-    /// while it was Provisional, on the way to ATTESTATION_QUORUM.
+    /// while it was Provisional, on the way to the attestation quorum.
     pub attestation_ledger: AttestationLedger,
     /// The epoch this identity last gave an attestation to someone else --
     /// used to reset attestations_given_count when a new epoch begins.
@@ -1018,6 +1029,17 @@ pub struct IdentityStore {
     /// successful registrations consume quota.
     #[serde(default)]
     epoch_reg_count: HashMap<u64, u32>,
+
+    /// Effective web-of-trust quorum. Never persisted: it comes from
+    /// genesis on every start (see `set_attestation_quorum`), so a stale or
+    /// edited identity.json cannot change it.
+    #[serde(skip, default = "default_attestation_quorum")]
+    attestation_quorum: usize,
+
+    /// Effective per-attester rolling-window cap. Never persisted, for the
+    /// same reason as `attestation_quorum`.
+    #[serde(skip, default = "default_attestation_cap_per_window")]
+    attestation_cap_per_window: u32,
 }
 
 impl IdentityStore {
@@ -1031,6 +1053,8 @@ impl IdentityStore {
             sybil_confirmations: HashMap::new(),
             pending_sybil_reports: HashMap::new(),
             epoch_reg_count: HashMap::new(),
+            attestation_quorum: DEFAULT_ATTESTATION_QUORUM,
+            attestation_cap_per_window: DEFAULT_ATTESTATION_CAP_PER_WINDOW,
         }
     }
 
@@ -1045,7 +1069,32 @@ impl IdentityStore {
             sybil_confirmations: HashMap::new(),
             pending_sybil_reports: HashMap::new(),
             epoch_reg_count: HashMap::new(),
+            attestation_quorum: DEFAULT_ATTESTATION_QUORUM,
+            attestation_cap_per_window: DEFAULT_ATTESTATION_CAP_PER_WINDOW,
         }
+    }
+
+    /// Install the chain's validated attestation quorum (from
+    /// `GenesisConfig::attestation_quorum`). Values below 1 are clamped to 1:
+    /// a zero quorum would verify claimants with no attestations at all.
+    pub fn set_attestation_quorum(&mut self, quorum: usize) {
+        self.attestation_quorum = quorum.max(1);
+    }
+
+    /// Effective web-of-trust quorum for this chain.
+    pub fn attestation_quorum(&self) -> usize {
+        self.attestation_quorum
+    }
+
+    /// Install the chain's validated per-attester cap (from
+    /// `GenesisConfig::attestation_cap_per_window`). Clamped to at least 1.
+    pub fn set_attestation_cap_per_window(&mut self, cap: u32) {
+        self.attestation_cap_per_window = cap.max(1);
+    }
+
+    /// Effective per-attester rolling-window cap for this chain.
+    pub fn attestation_cap_per_window(&self) -> u32 {
+        self.attestation_cap_per_window
     }
 
     // -- Registration and verification ----------------------------------------
@@ -1120,12 +1169,12 @@ impl IdentityStore {
     ///   identities don't need more attestations)
     /// - the attester can only vouch for a given claimant once (repeat
     ///   attestations from the same attester don't inflate the count)
-    /// - the attester is rate-limited to ATTESTATION_CAP_PER_WINDOW
+    /// - the attester is rate-limited to the per-attester cap
     ///   active attestations in a rolling ATTESTATION_CAP_WINDOW_EPOCHS window;
     ///   revoked attestations free their slot back
     ///
     /// Once the claimant's distinct-attester count reaches
-    /// ATTESTATION_QUORUM, the claimant is upgraded to Verified as a
+    /// the attestation quorum, the claimant is upgraded to Verified as a
     /// side effect of this call.
     pub fn attest(
         &mut self,
@@ -1189,7 +1238,7 @@ impl IdentityStore {
             .filter(|r| r.is_active() && r.epoch >= window_start)
             .count() as u32;
 
-        if active_in_window >= ATTESTATION_CAP_PER_WINDOW {
+        if active_in_window >= self.attestation_cap_per_window {
             return Err(IdentityError::AttestationCapExceeded(
                 attester_id.to_string(),
                 active_in_window,
@@ -1213,7 +1262,7 @@ impl IdentityStore {
             record,
         );
 
-        if count >= ATTESTATION_QUORUM {
+        if count >= self.attestation_quorum {
             claimant.charm.verify_wot(epoch);
             tracing::info!(
                 claimant_id, attester_count = count,
@@ -1221,7 +1270,7 @@ impl IdentityStore {
             );
             Ok(AttestationOutcome::QuorumReachedVerified)
         } else {
-            Ok(AttestationOutcome::Recorded { attester_count: count, quorum: ATTESTATION_QUORUM })
+            Ok(AttestationOutcome::Recorded { attester_count: count, quorum: self.attestation_quorum })
         }
     }
 
@@ -1289,20 +1338,21 @@ impl IdentityStore {
         // confirm_sybil does that (Phase C sybil path).
         //
         // Phase C revocation propagation: if removing this attestation drops
-        // the active count below ATTESTATION_QUORUM and the identity reached
+        // the active count below the attestation quorum and the identity reached
         // Verified solely via the web-of-trust path (charm.verified_via_wot),
         // downgrade them back to Provisional. Identities verified via
         // verify_identity() (PoP proof path, verified_via_wot=false) hold an
         // independent credential and are not affected.
         let mut tier_downgraded = false;
+        let quorum = self.attestation_quorum;
         if let Some(identity) = self.records.get_mut(attested_id) {
             identity.attestation_ledger.attesters.retain(|a| a != attester_id);
             let count = identity.attestation_ledger.count();
-            if count < ATTESTATION_QUORUM && identity.charm.verified_via_wot {
+            if count < quorum && identity.charm.verified_via_wot {
                 identity.charm.downgrade_to_provisional();
                 tier_downgraded = true;
                 tracing::info!(
-                    attested_id, count, quorum = ATTESTATION_QUORUM,
+                    attested_id, count, quorum,
                     "attestation count dropped below quorum — identity downgraded \
                      Verified/Established -> Provisional (Phase C revocation propagation)"
                 );
@@ -2099,6 +2149,99 @@ mod tests {
         store.register(id.to_string(), address.to_string(), genesis_attestation(id)).unwrap();
     }
 
+    // -- Genesis-configured quorum (H0 identity hardening) ---------------------
+
+    #[test]
+    fn default_store_quorum_is_the_production_value() {
+        assert_eq!(make_store().attestation_quorum(), DEFAULT_ATTESTATION_QUORUM);
+        assert_eq!(DEFAULT_ATTESTATION_QUORUM, 3);
+    }
+
+    #[test]
+    fn quorum_three_counts_only_distinct_eligible_attesters() {
+        let mut store = make_store();
+        for a in ["v1", "v2", "v3"] {
+            register_and_verify(&mut store, a, &format!("qcb1{a}"));
+        }
+        register_provisional(&mut store, "unverified", "qcb1unverified");
+        register_provisional(&mut store, "claimant", "qcb1claimant");
+
+        // An ineligible (Provisional) attester is refused and does not count.
+        assert!(matches!(store.attest("claimant", "unverified"),
+            Err(IdentityError::AttesterNotVerified(_))));
+        // A repeat attestation from the same attester does not count twice.
+        store.attest("claimant", "v1").unwrap();
+        assert!(matches!(store.attest("claimant", "v1"),
+            Err(IdentityError::AlreadyAttested(_))));
+        // Self-attestation is refused.
+        assert!(matches!(store.attest("claimant", "claimant"),
+            Err(IdentityError::SelfAttestation(_))));
+        store.attest("claimant", "v2").unwrap();
+        assert_eq!(store.get("claimant").unwrap().tier(), &VerificationTier::Provisional,
+            "two distinct eligible attesters must not reach a quorum of 3");
+
+        assert_eq!(store.attest("claimant", "v3").unwrap(), AttestationOutcome::QuorumReachedVerified);
+        assert_eq!(store.get("claimant").unwrap().tier(), &VerificationTier::Verified);
+    }
+
+    #[test]
+    fn configured_quorum_one_verifies_on_first_eligible_attestation() {
+        let mut store = make_store();
+        store.set_attestation_quorum(1);
+        register_and_verify(&mut store, "v1", "qcb1v1");
+        register_provisional(&mut store, "claimant", "qcb1claimant");
+        assert_eq!(store.attest("claimant", "v1").unwrap(), AttestationOutcome::QuorumReachedVerified);
+    }
+
+    #[test]
+    fn per_attester_window_cap_still_applies_under_reduced_quorum() {
+        let mut store = make_store();
+        store.set_attestation_quorum(1);
+        assert_eq!(store.attestation_cap_per_window(), 3);
+        register_and_verify(&mut store, "attester", "qcb1attester");
+        for i in 0..DEFAULT_ATTESTATION_CAP_PER_WINDOW {
+            let id = format!("c{i}");
+            register_provisional(&mut store, &id, &format!("qcb1{id}"));
+            store.attest(&id, "attester").unwrap();
+        }
+        register_provisional(&mut store, "blocked", "qcb1blocked");
+        assert!(matches!(store.attest("blocked", "attester"),
+            Err(IdentityError::AttestationCapExceeded(..))),
+            "a lower quorum must not relax the per-attester cap");
+    }
+
+    #[test]
+    fn zero_quorum_is_clamped_to_one() {
+        let mut store = make_store();
+        store.set_attestation_quorum(0);
+        assert_eq!(store.attestation_quorum(), 1);
+        register_and_verify(&mut store, "v1", "qcb1v1");
+        register_provisional(&mut store, "claimant", "qcb1claimant");
+        assert_eq!(store.get("claimant").unwrap().tier(), &VerificationTier::Provisional,
+            "no claimant is Verified without at least one attestation");
+    }
+
+    #[test]
+    fn quorum_and_cap_are_never_read_from_persisted_store() {
+        // A store persisted while running at quorum 1 (or hand-edited on
+        // disk) must not carry that quorum across a restart: the value is
+        // not serialized, and a loaded store falls back to the production
+        // default until the node reinstalls the genesis quorum.
+        let mut store = make_store();
+        store.set_attestation_quorum(1);
+        store.set_attestation_cap_per_window(10);
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(!json.contains("attestation_quorum"), "quorum must not be persisted");
+        assert!(!json.contains("attestation_cap_per_window"), "cap must not be persisted");
+
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["attestation_quorum"] = serde_json::json!(1);
+        v["attestation_cap_per_window"] = serde_json::json!(10);
+        let restored: IdentityStore = serde_json::from_value(v).unwrap();
+        assert_eq!(restored.attestation_quorum(), DEFAULT_ATTESTATION_QUORUM);
+        assert_eq!(restored.attestation_cap_per_window(), DEFAULT_ATTESTATION_CAP_PER_WINDOW);
+    }
+
     #[test]
     fn quorum_upgrades_claimant_after_three_distinct_attestations() {
         let mut store = make_store();
@@ -2110,11 +2253,11 @@ mod tests {
         assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Provisional);
 
         let r1 = store.attest("newbie", "a1").unwrap();
-        assert_eq!(r1, AttestationOutcome::Recorded { attester_count: 1, quorum: ATTESTATION_QUORUM });
+        assert_eq!(r1, AttestationOutcome::Recorded { attester_count: 1, quorum: DEFAULT_ATTESTATION_QUORUM });
         assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Provisional);
 
         let r2 = store.attest("newbie", "a2").unwrap();
-        assert_eq!(r2, AttestationOutcome::Recorded { attester_count: 2, quorum: ATTESTATION_QUORUM });
+        assert_eq!(r2, AttestationOutcome::Recorded { attester_count: 2, quorum: DEFAULT_ATTESTATION_QUORUM });
         assert_eq!(*store.get("newbie").unwrap().tier(), VerificationTier::Provisional);
 
         let r3 = store.attest("newbie", "a3").unwrap();
@@ -2183,12 +2326,12 @@ mod tests {
 
     #[test]
     fn attestation_rate_limit_enforced_per_epoch() {
-        // Phase B: rolling-window cap (ATTESTATION_CAP_PER_WINDOW = 3) is the
-        // binding rate limit. ATTESTATION_CAP_PER_WINDOW distinct claimants succeed...
+        // Phase B: rolling-window cap (the per-attester cap = 3) is the
+        // binding rate limit. the per-attester cap distinct claimants succeed...
         let mut store = make_store();
         register_and_verify(&mut store, "attester", "qcb1attester");
 
-        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+        for i in 0..DEFAULT_ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
@@ -2207,7 +2350,7 @@ mod tests {
         let mut store = IdentityStore::with_epoch_ms(0, 1);
         register_and_verify(&mut store, "attester", "qcb1attester");
 
-        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+        for i in 0..DEFAULT_ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
@@ -2238,8 +2381,8 @@ mod tests {
         let _ = store.attest("does_not_exist", "attester"); // NotFound, rejected
 
         // The attester should still have their full budget -- prove it by
-        // successfully using all ATTESTATION_CAP_PER_WINDOW slots afterward.
-        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+        // successfully using all the per-attester cap slots afterward.
+        for i in 0..DEFAULT_ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
@@ -2427,12 +2570,12 @@ mod tests {
 
     #[test]
     fn rolling_window_cap_blocks_fourth_attestation() {
-        // An attester is allowed ATTESTATION_CAP_PER_WINDOW (3) active
+        // An attester is allowed the per-attester cap (3) active
         // attestations in a rolling window; the fourth must be rejected.
         let mut store = make_store();
         register_and_verify(&mut store, "attester", "qcb1attester");
 
-        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+        for i in 0..DEFAULT_ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
@@ -2454,7 +2597,7 @@ mod tests {
         register_and_verify(&mut store, "attester", "qcb1attester");
 
         // Fill the cap
-        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+        for i in 0..DEFAULT_ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
@@ -2481,7 +2624,7 @@ mod tests {
         register_and_verify(&mut store, "attester", "qcb1attester");
 
         // Fill the cap at epoch 0
-        for i in 0..ATTESTATION_CAP_PER_WINDOW {
+        for i in 0..DEFAULT_ATTESTATION_CAP_PER_WINDOW {
             let id = format!("claimant{i}");
             register_provisional(&mut store, &id, &format!("qcb1{id}"));
             store.attest(&id, "attester").unwrap();
@@ -3107,7 +3250,7 @@ mod tests {
         let mut store = make_store();
         setup_wot_verified(&mut store);
 
-        // Revoke one attestation — count drops from 3 to 2, below ATTESTATION_QUORUM=3.
+        // Revoke one attestation — count drops from 3 to 2, below the quorum (3).
         let cost = store.revoke_attestation("a1", "target").unwrap();
         assert!(cost.tier_downgraded, "tier_downgraded must be true when count drops below quorum");
         assert_eq!(
@@ -3187,7 +3330,7 @@ mod tests {
     fn revocation_cost_tier_downgraded_false_when_still_above_quorum() {
         let mut store = make_store();
         setup_wot_verified(&mut store);
-        // target has exactly 3 attesters (= ATTESTATION_QUORUM); revoking one
+        // target has exactly 3 attesters (= the default quorum); revoking one
         // leaves 2 — triggers downgrade.
         let cost = store.revoke_attestation("a1", "target").unwrap();
         assert!(cost.tier_downgraded);

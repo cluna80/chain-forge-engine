@@ -393,7 +393,55 @@ pub struct GenesisConfig {
     /// job (see `chain-forge-node::Node::new_with_config`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_bonding: Option<GenesisValidatorBonding>,
+
+    /// Optional identity-layer parameters. Omitted means the engine
+    /// defaults (`DEFAULT_ATTESTATION_QUORUM`). The effective values are
+    /// resolved and validated by `GenesisConfig::attestation_quorum`; every
+    /// node that loads the same genesis computes the same quorum, and no
+    /// runtime flag or environment variable can override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<GenesisIdentity>,
 }
+
+/// See `GenesisConfig::identity`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenesisIdentity {
+    /// Distinct eligible (Verified or Established) attesters a Provisional
+    /// identity needs before it becomes Verified. `None` means
+    /// `DEFAULT_ATTESTATION_QUORUM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_quorum: Option<usize>,
+
+    /// Maximum active outbound attestations one attester may hold within
+    /// the rolling attestation-cap window. `None` means
+    /// `DEFAULT_ATTESTATION_CAP_PER_WINDOW`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_cap_per_window: Option<u32>,
+
+    /// Explicit opt-in for identity parameters weaker than production: a
+    /// quorum below `DEFAULT_ATTESTATION_QUORUM` or a per-attester cap above
+    /// `DEFAULT_ATTESTATION_CAP_PER_WINDOW`. Honoured only when
+    /// `environment.mode == "devnet"` AND the engine was built with the
+    /// `insecure-dev-quorum` cargo feature. Both weaken Sybil resistance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_dev_identity_overrides: bool,
+}
+
+/// Production web-of-trust quorum: distinct eligible attesters required
+/// before a Provisional identity becomes Verified. Whitepaper Section 4 /
+/// Identity Pilot Design Section 3.1: "provisional target: 3 attestations."
+/// Also the minimum any non-devnet genesis may configure.
+pub const DEFAULT_ATTESTATION_QUORUM: usize = 3;
+
+/// Upper bound on a configured quorum. A larger value is almost certainly a
+/// typo and would make Verified unreachable.
+pub const MAX_ATTESTATION_QUORUM: usize = 64;
+
+/// Production per-attester cap: active outbound attestations one attester
+/// may hold within the rolling window. Bounds how fast a single compromised
+/// Verified identity can vouch for a cohort of fake claimants. Also the
+/// maximum any non-devnet genesis may configure.
+pub const DEFAULT_ATTESTATION_CAP_PER_WINDOW: u32 = 3;
 
 /// See `GenesisConfig::validator_bonding`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -788,6 +836,86 @@ impl GenesisConfig {
     /// `None` for either field is always valid (falls back to the engine
     /// default), so a genesis file that omits `validator_bonding` entirely
     /// always passes this check.
+    /// What is missing for this genesis to use identity parameters weaker
+    /// than production. Empty means a weaker value is authorized.
+    fn missing_insecure_identity_authorization(&self) -> Vec<&'static str> {
+        let flag = self.identity.as_ref().map_or(false, |i| i.insecure_dev_identity_overrides);
+        let mut missing = Vec::new();
+        if !flag {
+            missing.push("identity.insecure_dev_identity_overrides = true");
+        }
+        if self.environment.mode != "devnet" {
+            missing.push("environment.mode = \"devnet\"");
+        }
+        if !cfg!(feature = "insecure-dev-quorum") {
+            missing.push("an engine built with --features insecure-dev-quorum");
+        }
+        missing
+    }
+
+    /// Resolve and validate the web-of-trust attestation quorum. Hard
+    /// validation: `chain-forge-node::Node::new` refuses to start on `Err`.
+    ///
+    /// A quorum below `DEFAULT_ATTESTATION_QUORUM` requires all three of:
+    /// `identity.insecure_dev_identity_overrides = true`,
+    /// `environment.mode == "devnet"`, and an engine built with the
+    /// `insecure-dev-quorum` feature. A chain cannot reach a reduced quorum
+    /// by renaming itself "devnet", by omitting the flag, or on a default
+    /// build.
+    pub fn attestation_quorum(&self) -> Result<usize, String> {
+        let quorum = self.identity.as_ref()
+            .and_then(|i| i.attestation_quorum)
+            .unwrap_or(DEFAULT_ATTESTATION_QUORUM);
+
+        if quorum == 0 {
+            return Err("identity.attestation_quorum is 0 -- every Provisional \
+                        identity would be Verified with no attestations".into());
+        }
+        if quorum > MAX_ATTESTATION_QUORUM {
+            return Err(format!(
+                "identity.attestation_quorum is {quorum}, above the maximum \
+                 {MAX_ATTESTATION_QUORUM} -- Verified would be unreachable"
+            ));
+        }
+        if quorum < DEFAULT_ATTESTATION_QUORUM {
+            let missing = self.missing_insecure_identity_authorization();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "identity.attestation_quorum {quorum} is below the production \
+                     minimum {DEFAULT_ATTESTATION_QUORUM}; a reduced quorum requires {}",
+                    missing.join(", ")
+                ));
+            }
+        }
+        Ok(quorum)
+    }
+
+    /// Resolve and validate the per-attester rolling-window cap. Hard
+    /// validation, like `attestation_quorum`. A cap above
+    /// `DEFAULT_ATTESTATION_CAP_PER_WINDOW` needs the same three-part
+    /// devnet authorization; a lower (stricter) cap is always allowed.
+    pub fn attestation_cap_per_window(&self) -> Result<u32, String> {
+        let cap = self.identity.as_ref()
+            .and_then(|i| i.attestation_cap_per_window)
+            .unwrap_or(DEFAULT_ATTESTATION_CAP_PER_WINDOW);
+
+        if cap == 0 {
+            return Err("identity.attestation_cap_per_window is 0 -- no identity \
+                        could ever attest, so nobody could become Verified".into());
+        }
+        if cap > DEFAULT_ATTESTATION_CAP_PER_WINDOW {
+            let missing = self.missing_insecure_identity_authorization();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "identity.attestation_cap_per_window {cap} is above the production \
+                     maximum {DEFAULT_ATTESTATION_CAP_PER_WINDOW}; a raised cap requires {}",
+                    missing.join(", ")
+                ));
+            }
+        }
+        Ok(cap)
+    }
+
     pub fn validate_validator_bonding(&self) -> Result<(), String> {
         let Some(ref vb) = self.validator_bonding else { return Ok(()); };
 
@@ -815,6 +943,129 @@ impl GenesisConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Attestation quorum (H0 identity hardening) ---------------------------
+
+    fn genesis_with(mode: &str, identity: Option<serde_json::Value>) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["environment"]["mode"] = serde_json::Value::String(mode.into());
+        if let Some(id) = identity {
+            v["identity"] = id;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn attestation_quorum_defaults_to_production_value() {
+        for mode in ["devnet", "testnet", "mainnet"] {
+            let g = genesis_with(mode, None);
+            assert_eq!(g.attestation_quorum(), Ok(DEFAULT_ATTESTATION_QUORUM), "{mode}");
+            assert_eq!(DEFAULT_ATTESTATION_QUORUM, 3);
+        }
+    }
+
+    #[test]
+    fn attestation_quorum_at_or_above_default_is_accepted_everywhere() {
+        for mode in ["devnet", "testnet", "mainnet"] {
+            for q in [3usize, 5, MAX_ATTESTATION_QUORUM] {
+                let g = genesis_with(mode, Some(serde_json::json!({ "attestation_quorum": q })));
+                assert_eq!(g.attestation_quorum(), Ok(q), "{mode} q={q}");
+            }
+        }
+    }
+
+    #[test]
+    fn attestation_quorum_zero_and_oversized_are_rejected() {
+        let zero = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_quorum": 0, "insecure_dev_identity_overrides": true })));
+        assert!(zero.attestation_quorum().unwrap_err().contains("is 0"));
+        let big = genesis_with("mainnet", Some(serde_json::json!({
+            "attestation_quorum": MAX_ATTESTATION_QUORUM + 1 })));
+        assert!(big.attestation_quorum().unwrap_err().contains("above the maximum"));
+    }
+
+    #[test]
+    fn reduced_quorum_without_explicit_opt_in_is_rejected_even_on_devnet() {
+        // Calling the network "devnet" is not enough on its own.
+        for q in [1usize, 2] {
+            let g = genesis_with("devnet", Some(serde_json::json!({ "attestation_quorum": q })));
+            let err = g.attestation_quorum().unwrap_err();
+            assert!(err.contains("insecure_dev_identity_overrides"), "{err}");
+        }
+    }
+
+    #[test]
+    fn reduced_quorum_is_rejected_outside_devnet_even_with_opt_in() {
+        for mode in ["testnet", "mainnet", "Devnet", "devnet-prod", ""] {
+            let g = genesis_with(mode, Some(serde_json::json!({
+                "attestation_quorum": 1, "insecure_dev_identity_overrides": true })));
+            let err = g.attestation_quorum().unwrap_err();
+            assert!(err.contains("environment.mode"), "{mode}: {err}");
+        }
+    }
+
+    #[cfg(not(feature = "insecure-dev-quorum"))]
+    #[test]
+    fn reduced_quorum_is_rejected_on_default_builds() {
+        let g = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_quorum": 1, "insecure_dev_identity_overrides": true })));
+        let err = g.attestation_quorum().unwrap_err();
+        assert!(err.contains("insecure-dev-quorum"), "{err}");
+    }
+
+    #[cfg(feature = "insecure-dev-quorum")]
+    #[test]
+    fn reduced_quorum_is_accepted_only_with_flag_devnet_and_feature() {
+        let g = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_quorum": 1, "insecure_dev_identity_overrides": true })));
+        assert_eq!(g.attestation_quorum(), Ok(1));
+    }
+
+    #[test]
+    fn attestation_cap_defaults_to_production_value_and_may_be_stricter() {
+        assert_eq!(genesis_with("mainnet", None).attestation_cap_per_window(), Ok(3));
+        for cap in [1u32, 2, 3] {
+            let g = genesis_with("mainnet", Some(serde_json::json!({ "attestation_cap_per_window": cap })));
+            assert_eq!(g.attestation_cap_per_window(), Ok(cap));
+        }
+        let zero = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_cap_per_window": 0, "insecure_dev_identity_overrides": true })));
+        assert!(zero.attestation_cap_per_window().is_err());
+    }
+
+    #[test]
+    fn raised_attestation_cap_needs_the_same_devnet_authorization() {
+        let no_flag = genesis_with("devnet", Some(serde_json::json!({ "attestation_cap_per_window": 10 })));
+        assert!(no_flag.attestation_cap_per_window().unwrap_err().contains("insecure_dev_identity_overrides"));
+        let testnet = genesis_with("testnet", Some(serde_json::json!({
+            "attestation_cap_per_window": 10, "insecure_dev_identity_overrides": true })));
+        assert!(testnet.attestation_cap_per_window().unwrap_err().contains("environment.mode"));
+        let devnet = genesis_with("devnet", Some(serde_json::json!({
+            "attestation_cap_per_window": 10, "insecure_dev_identity_overrides": true })));
+        if cfg!(feature = "insecure-dev-quorum") {
+            assert_eq!(devnet.attestation_cap_per_window(), Ok(10));
+        } else {
+            assert!(devnet.attestation_cap_per_window().unwrap_err().contains("insecure-dev-quorum"));
+        }
+    }
+
+    #[test]
+    fn pilot_devnet_genesis_is_authorized_only_on_feature_builds() {
+        let g = GenesisConfig::from_json(include_str!("../../genesis-4node.json")).unwrap();
+        if cfg!(feature = "insecure-dev-quorum") {
+            assert_eq!(g.attestation_quorum(), Ok(1));
+            assert_eq!(g.attestation_cap_per_window(), Ok(10));
+        } else {
+            assert!(g.attestation_quorum().is_err());
+            assert!(g.attestation_cap_per_window().is_err());
+        }
+    }
+
+    #[test]
+    fn opt_in_flag_alone_does_not_lower_the_quorum() {
+        let g = genesis_with("devnet", Some(serde_json::json!({ "insecure_dev_identity_overrides": true })));
+        assert_eq!(g.attestation_quorum(), Ok(DEFAULT_ATTESTATION_QUORUM));
+    }
 
     // Minimal valid genesis JSON matching the Chain Forge wizard output schema.
     fn minimal_genesis_json() -> &'static str {

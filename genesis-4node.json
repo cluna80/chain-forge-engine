@@ -126,6 +126,11 @@
     }
   ],
   "attestation_coordinator": "qcb1alice",
+  "identity": {
+    "attestation_quorum": 1,
+    "attestation_cap_per_window": 10,
+    "insecure_dev_identity_overrides": true
+  },
   "pocd": {
     "enabled": true,
     "chain_id": "qcb-testnet-1",

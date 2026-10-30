@@ -1675,6 +1675,13 @@ pub struct ExecutionConfig {
     /// node's IssuerRegistry root. When `None`, all `VerifyIdentityWithProof`
     /// transactions are rejected with "no pop_verifier configured" (fail-closed).
     pub pop_verifier: Option<std::sync::Arc<dyn chain_forge_identity::PopProofVerifier + Send + Sync>>,
+    /// Web-of-trust attestation quorum from genesis (`identity.attestation_quorum`).
+    /// Installed on the IdentityStore before every identity-aware tx, so the
+    /// quorum always comes from genesis, never from persisted node state.
+    pub attestation_quorum: usize,
+    /// Per-attester rolling-window cap from genesis
+    /// (`identity.attestation_cap_per_window`), installed alongside the quorum.
+    pub attestation_cap_per_window: u32,
 }
 
 impl ExecutionConfig {
@@ -1699,6 +1706,12 @@ impl ExecutionConfig {
             fee_distribution: FeeDistribution::from_genesis(genesis)
                 .unwrap_or_else(|_| FeeDistribution::default()),
             pop_verifier: None,
+            // Fail closed: an invalid identity config gets the production
+            // quorum. (The node refuses to start on one anyway.)
+            attestation_quorum: genesis.attestation_quorum()
+                .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_QUORUM),
+            attestation_cap_per_window: genesis.attestation_cap_per_window()
+                .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW),
         }
     }
 }
@@ -2630,6 +2643,16 @@ impl Executor {
         &self.config.native_denom
     }
 
+    /// Genesis attestation quorum this executor installs on the IdentityStore.
+    pub fn attestation_quorum(&self) -> usize {
+        self.config.attestation_quorum
+    }
+
+    /// Genesis per-attester cap this executor installs on the IdentityStore.
+    pub fn attestation_cap_per_window(&self) -> u32 {
+        self.config.attestation_cap_per_window
+    }
+
     /// Execute a single transaction with CharmConfinement enforcement.
     /// Requires identity store, QRC engine, and agent store for identity-gated
     /// and agent-registered tx types.
@@ -2640,6 +2663,8 @@ impl Executor {
         identity: &mut IdentityStore,
         agents:   &mut AgentStore,
     ) -> TransactionResult {
+        identity.set_attestation_quorum(self.config.attestation_quorum);
+        identity.set_attestation_cap_per_window(self.config.attestation_cap_per_window);
         let gas_required = self.config.gas_model.calculate_gas(tx);
 
         if tx.gas_limit < gas_required {
@@ -3304,7 +3329,7 @@ impl Executor {
 
             TxBody::RevokeAttestation { attested_id } => {
                 // Pre-flight: if the attested identity is currently Verified via WoT
-                // and has fewer than ATTESTATION_QUORUM+1 active attesters, this
+                // and has fewer than quorum+1 active attesters, this
                 // revocation will trigger a tier downgrade and require charm-sync.
                 // Charm-sync needs the account to exist in StateStore. Every identity
                 // that reached Verified via on-chain Attest txs must have an account
@@ -3316,7 +3341,7 @@ impl Executor {
                         .map(|r| {
                             r.charm.verified_via_wot
                                 && r.charm.tier.grants_consensus()
-                                && r.attestation_ledger.count() <= chain_forge_identity::ATTESTATION_QUORUM
+                                && r.attestation_ledger.count() <= identity.attestation_quorum()
                         })
                         .unwrap_or(false);
                     if would_downgrade && state.get_account(attested_id).is_err() {
@@ -4636,6 +4661,8 @@ mod tests {
             fee_collector:    "treasury:fees".into(),
             fee_distribution: FeeDistribution::default(),
             pop_verifier:     None,
+            attestation_quorum: chain_forge_core::DEFAULT_ATTESTATION_QUORUM,
+            attestation_cap_per_window: chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -5032,6 +5059,39 @@ mod tests {
         let acct = state.get_account("qcb1newbie").unwrap();
         assert_eq!(acct.verification_tier(),
             Some(&chain_forge_identity::VerificationTier::Provisional));
+    }
+
+    /// H0 identity hardening: the quorum and per-attester cap come from the
+    /// executor's genesis config on every identity-aware tx. A store that
+    /// carries weaker values -- set in memory, or reloaded from a persisted
+    /// identity.json after a restart -- cannot lower the bar.
+    #[test]
+    fn executor_enforces_genesis_identity_params_over_store_values() {
+        use chain_forge_identity::VerificationTier;
+
+        let (exec, mut state, identity, mut agents) = setup_with_identity();
+        assert_eq!(exec.attestation_quorum(), 3);
+        assert_eq!(exec.attestation_cap_per_window(), 3);
+
+        // Simulate restart: persist, reload, and leave weak values in memory.
+        let json = serde_json::to_string(&identity).unwrap();
+        let mut identity: IdentityStore = serde_json::from_str(&json).unwrap();
+        identity.set_attestation_quorum(1);
+        identity.set_attestation_cap_per_window(10);
+
+        let mut acct = chain_forge_state::AccountState::new("qcb1newbie".into(), "user".into());
+        acct.credit("uqcb", 10_000);
+        state.upsert_account(acct);
+        let reg = Transaction::register_identity("tx0", "qcb1newbie", 0);
+        assert!(exec.execute_tx_with_identity(&reg, &mut state, &mut identity, &mut agents).success);
+
+        let a1 = Transaction::attest("tx1", "qcb1alice", "qcb1newbie", 0);
+        let r = exec.execute_tx_with_identity(&a1, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(identity.attestation_quorum(), 3, "executor reinstalls the genesis quorum");
+        assert_eq!(identity.attestation_cap_per_window(), 3, "executor reinstalls the genesis cap");
+        assert_eq!(*identity.get("qcb1newbie").unwrap().tier(), VerificationTier::Provisional,
+            "one attestation must not verify under the genesis quorum of 3");
     }
 
     #[test]
@@ -6138,26 +6198,26 @@ mod tests {
         let r = exec.execute_tx_with_identity(&dep_tx, &mut state, &mut identity, &mut agents);
         assert!(r.success, "deprecation tx must succeed: {:?}", r.error);
 
+        // Every tx below uses alice's current on-chain nonce, so a rejection
+        // can only come from the gate under test, never from a nonce mismatch.
+        let alice_nonce = |state: &StateStore| state.get_account("qcb1alice").unwrap().nonce;
+
         // Sanity: epoch 51 is the last grace epoch — transfer with Classical
         // sig_scheme should still be accepted.
         identity.clock.current_epoch = 51;
         let mut in_grace = Transaction::transfer(
-            "t-grace", "qcb1alice", "qcb1bob", "uqcb", 1, 1
+            "t-grace", "qcb1alice", "qcb1bob", "uqcb", 1, alice_nonce(&state)
         );
         in_grace.sig_scheme = Some(SchemeId::Classical);
         let r = exec.execute_tx_with_identity(&in_grace, &mut state, &mut identity, &mut agents);
-        // May fail for other reasons (balance, nonce) but must NOT fail with the
-        // cutoff message while still in the grace window.
-        if !r.success {
-            let err = r.error.unwrap_or_default();
-            assert!(!err.contains("was deprecated"),
-                "Classical scheme must still be accepted at epoch 51 (in grace window); got: {err}");
-        }
+        assert!(r.success,
+            "Classical scheme must still be accepted at epoch 51 (in grace window); got: {:?}", r.error);
 
         // Epoch 52 = one past the hard cutoff — Classical scheme must be rejected.
         identity.clock.current_epoch = 52;
+        let nonce_before_cutoff = alice_nonce(&state);
         let mut post_cutoff = Transaction::transfer(
-            "t-post-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, 2
+            "t-post-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, nonce_before_cutoff
         );
         post_cutoff.sig_scheme = Some(SchemeId::Classical);
         let r = exec.execute_tx_with_identity(&post_cutoff, &mut state, &mut identity, &mut agents);
@@ -6167,26 +6227,15 @@ mod tests {
             "error must mention deprecation; got: {err}");
         assert!(err.contains("rotate to"),
             "error must hint at replacement scheme; got: {err}");
-
-        // A transaction using the replacement scheme (ml-dsa) must NOT be
-        // blocked by the cutoff check — the cutoff is scheme-specific.
-        let mut pq_tx = Transaction::transfer(
-            "t-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, 2
-        );
-        pq_tx.sig_scheme = Some(SchemeId::MlDsa);
-        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
-        if !r.success {
-            let err = r.error.unwrap_or_default();
-            assert!(!err.contains("was deprecated"),
-                "MlDsa scheme must not be blocked by Classical cutoff; got: {err}");
-        }
+        assert_eq!(alice_nonce(&state), nonce_before_cutoff,
+            "a deprecated-scheme rejection must not consume the nonce");
 
         // CS-001-P6-G2: A transaction with sig_scheme = None (legacy classical path)
         // MUST be blocked by the cutoff after P6.  The untagged path reaches classical
         // Ed25519 verification, so it is treated as "ed25519" for cutoff purposes.
         // (This assertion was updated in P6; previously the gate did not cover None.)
         let untagged = Transaction::transfer(
-            "t-untagged", "qcb1alice", "qcb1bob", "uqcb", 1, 2
+            "t-untagged", "qcb1alice", "qcb1bob", "uqcb", 1, nonce_before_cutoff
         );
         assert!(untagged.sig_scheme.is_none());
         let r = exec.execute_tx_with_identity(&untagged, &mut state, &mut identity, &mut agents);
@@ -6194,6 +6243,16 @@ mod tests {
         let err = r.error.unwrap_or_default();
         assert!(err.contains("was deprecated") || err.contains("deprecated"),
             "Untagged classical tx must fail with deprecation error; got: {err}");
+
+        // Control: the replacement scheme (ml-dsa) at the SAME nonce is not
+        // blocked -- the cutoff is scheme-specific, and the nonce was valid,
+        // so the rejections above came from the deprecation gate.
+        let mut pq_tx = Transaction::transfer(
+            "t-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, nonce_before_cutoff
+        );
+        pq_tx.sig_scheme = Some(SchemeId::MlDsa);
+        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "MlDsa scheme must not be blocked by Classical cutoff; got: {:?}", r.error);
     }
 
     /// CS-001 P5 — Guard 0: consensus-scope deprecations are explicitly rejected.
@@ -6338,8 +6397,9 @@ mod tests {
         // 7. Hard cutoff still fires post-restore: advance past cutoff.
         use chain_forge_crypto::SchemeId;
         identity.clock.current_epoch = post_migration.hard_cutoff_epoch + 1;
+        let alice_nonce = state.get_account("qcb1alice").unwrap().nonce;
         let mut cutoff_tx = Transaction::transfer(
-            "restart-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, 1,
+            "restart-cutoff", "qcb1alice", "qcb1bob", "uqcb", 1, alice_nonce,
         );
         cutoff_tx.sig_scheme = Some(SchemeId::Classical);
         let r = exec.execute_tx_with_identity(
@@ -6350,6 +6410,15 @@ mod tests {
         let err = r.error.unwrap_or_default();
         assert!(err.contains("was deprecated"),
             "post-restart cutoff error must mention deprecation; got: {err}");
+
+        // Control: the replacement scheme at the same nonce is accepted, so
+        // the rejection above came from the restored deprecation state.
+        let mut pq_tx = Transaction::transfer(
+            "restart-pq-ok", "qcb1alice", "qcb1bob", "uqcb", 1, alice_nonce,
+        );
+        pq_tx.sig_scheme = Some(SchemeId::MlDsa);
+        let r = exec.execute_tx_with_identity(&pq_tx, &mut state, &mut identity, &mut agents);
+        assert!(r.success, "replacement scheme must be accepted post-restart; got: {:?}", r.error);
     }
 
     /// CS-001 P5 — Test 11: Invalid / unsupported replacement scheme is rejected.
