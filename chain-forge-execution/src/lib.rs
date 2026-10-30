@@ -1765,6 +1765,9 @@ pub struct ExecutionConfig {
     /// consensus keys may register, and ML-DSA consensus cannot be
     /// deprecated (it is the only consensus scheme the chain has).
     pub mldsa_consensus_only: bool,
+    /// Genesis `cryptography.signature_scheme`: which schemes user accounts
+    /// may sign with. See `check_account_signature_policy`.
+    pub account_signature_policy: chain_forge_core::AccountSignaturePolicy,
 }
 
 impl ExecutionConfig {
@@ -1796,6 +1799,10 @@ impl ExecutionConfig {
             attestation_cap_per_window: genesis.attestation_cap_per_window()
                 .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW),
             mldsa_consensus_only: genesis.mldsa_consensus_only(),
+            // Fail closed: an invalid scheme is treated as ML-DSA-only.
+            // (The node refuses to start on one anyway.)
+            account_signature_policy: genesis.account_signature_policy()
+                .unwrap_or(chain_forge_core::AccountSignaturePolicy::MlDsaOnly),
         }
     }
 }
@@ -1810,6 +1817,53 @@ impl ExecutionConfig {
 ///    so an unbound address can only ever be claimed by its own key holder.
 ///    Named addresses (genesis labels like "qcb1alice") are never derived,
 ///    so they are only usable when genesis bound a key to them.
+/// The scheme a transaction authenticates with, classified exactly as
+/// `verify_authorization_signed` dispatches it: the `sig_scheme` tag when
+/// present, otherwise an `mldsa65:` entry, otherwise the Ed25519 fields.
+/// `None` means the tx carries no signature at all.
+fn tx_signature_scheme(tx: &Transaction) -> Option<&'static str> {
+    match &tx.sig_scheme {
+        Some(SchemeId::MlDsa) | Some(SchemeId::HybridEd25519MlDsa) => Some("ml-dsa-65"),
+        Some(SchemeId::SlhDsa) => Some("slh-dsa"),
+        Some(SchemeId::FnDsa) => Some("fn-dsa"),
+        Some(SchemeId::Classical) => Some("ed25519"),
+        None if tx.pq_signatures.iter().any(|s| s.starts_with("mldsa65:")) => Some("ml-dsa-65"),
+        None if !tx.signature.is_empty() || !tx.public_key.is_empty() => Some("ed25519"),
+        None => None,
+    }
+}
+
+/// The account signature policy (genesis `cryptography.signature_scheme`),
+/// shared by every place a transaction can enter: API admission, gossip
+/// intake and block execution. One function, so a tx is never accepted at
+/// one entry point and refused at another.
+///
+/// Under `MlDsaOnly` a tx must be ML-DSA-65 signed. `RecoverAccountKey` is
+/// exempt: it is authenticated by its guardians' ML-DSA signatures, and its
+/// new key must already be ML-DSA-65. This checks the scheme only; the
+/// signature itself is verified by execution.
+pub fn check_account_signature_policy(
+    tx: &Transaction,
+    policy: chain_forge_core::AccountSignaturePolicy,
+) -> Result<(), String> {
+    if policy == chain_forge_core::AccountSignaturePolicy::Ed25519Allowed
+        || matches!(tx.body, TxBody::RecoverAccountKey { .. })
+    {
+        return Ok(());
+    }
+    match tx_signature_scheme(tx) {
+        Some("ml-dsa-65") => Ok(()),
+        Some(other) => Err(format!(
+            "{other}-signed transactions are not accepted on this chain \
+             (cryptography.signature_scheme = \"pqc-native\"); sign with ML-DSA-65"
+        )),
+        None => Err(
+            "unsigned transactions are not accepted on this chain \
+             (cryptography.signature_scheme = \"pqc-native\"); sign with ML-DSA-65".into()
+        ),
+    }
+}
+
 fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
     // DIS-002B Path 2: RecoverAccountKey authenticates entirely through
     // guardian signatures verified inside execute_recover_account_key —
@@ -1817,7 +1871,11 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
     if matches!(tx.body, TxBody::RecoverAccountKey { .. }) {
         return Ok(());
     }
-    if !config.require_signatures {
+    // An ML-DSA-only chain verifies every tx: require_signatures = false
+    // must not turn it into a chain that accepts unauthenticated txs.
+    if !config.require_signatures
+        && config.account_signature_policy != chain_forge_core::AccountSignaturePolicy::MlDsaOnly
+    {
         return Ok(());
     }
     verify_authorization_signed(config, tx, state)
@@ -1842,6 +1900,7 @@ fn verify_authorization_for(config: &ExecutionConfig, tx: &Transaction, state: &
 /// so `verify_authorization_for` can force it for specific tx types
 /// regardless of chain config.
 fn verify_authorization_signed(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
+    check_account_signature_policy(tx, config.account_signature_policy)?;
 
     // -- Scheme dispatch (CS-001-H2: versioned signature envelope) -------------
     //
@@ -5078,6 +5137,7 @@ mod tests {
             attestation_quorum: chain_forge_core::DEFAULT_ATTESTATION_QUORUM,
             attestation_cap_per_window: chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
             mldsa_consensus_only: false,
+            account_signature_policy: chain_forge_core::AccountSignaturePolicy::Ed25519Allowed,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();
@@ -6161,6 +6221,129 @@ mod tests {
         state.apply_genesis(&genesis).unwrap();
 
         (Executor::new(config), state)
+    }
+
+    // -- Account signature policy: ML-DSA-only accounts (pqc-native) --------
+
+    /// Like `setup_signed`, with the account signature scheme and
+    /// `require_signatures` chosen by the test; `sender` is funded.
+    fn setup_policy(chain_id: &str, sender: &str, signature_scheme: &str, require_signatures: bool) -> (Executor, StateStore) {
+        let genesis_json = format!(r#"{{
+            "chain_id": "{chain_id}",
+            "chain_name": "policy test chain",
+            "engine_version": "0.1.0",
+            "genesis_time": "2026-10-30T00:00:00Z",
+            "environment": {{ "mode": "devnet", "faucet_enabled": true, "relaxed_limits": true }},
+            "native_token": {{ "name": "QC", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" }},
+            "address_prefix": "qcb",
+            "consensus": {{ "type": "proof-of-stake", "validator_set_size": 3, "block_time_ms": 500 }},
+            "execution": {{ "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": {require_signatures} }},
+            "cryptography": {{ "signature_scheme": "{signature_scheme}", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "ml-dsa-65" }},
+            "network": {{ "network_id": "policy-net", "p2p_port": 27000, "rpc_port": 27001, "bootstrap_nodes": [], "peer_discovery": "bootstrap", "max_peers": 10 }},
+            "limits": {{ "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 }},
+            "modules": ["bank"],
+            "custom_modules": [],
+            "genesis_accounts": [
+                {{ "label": "sender", "address": "{sender}", "balance": "5000000", "role": "user" }},
+                {{ "label": "recv",   "address": "qcb1recv",  "balance": "0",       "role": "user" }}
+            ]
+        }}"#);
+        let genesis = GenesisConfig::from_json(&genesis_json).expect("policy genesis");
+        let mut state = StateStore::new(HashWidth::Bits256);
+        state.apply_genesis(&genesis).unwrap();
+        (Executor::new(ExecutionConfig::from_genesis(&genesis)), state)
+    }
+
+    /// An Ed25519-signed transfer from the address derived from the key,
+    /// tagged `sig_scheme = Classical` or left untagged (legacy envelope).
+    fn ed25519_transfer(chain_id: &str, seed: &str, tagged: bool) -> Transaction {
+        let kp = ClassicalScheme.generate_keypair(seed).unwrap();
+        let sender = Address::from_public_key(&kp.public_key, "qcb", HashWidth::Bits256);
+        let mut tx = Transaction::transfer("ed-tx", sender.as_str(), "qcb1recv", "uqcb", 100, 0);
+        tx.gas_limit = 500_000;
+        tx.sign(&kp, chain_id).unwrap();
+        if !tagged { tx.sig_scheme = None; }
+        tx
+    }
+
+    fn account_unchanged(state: &StateStore, addr: &str) -> bool {
+        let a = state.get_account(addr).unwrap();
+        a.nonce == 0 && a.balance_of("uqcb") == 5_000_000
+    }
+
+    #[test]
+    fn pqc_native_rejects_ed25519_signed_txs_tagged_or_not() {
+        const CHAIN: &str = "qcb-policy";
+        for require_signatures in [true, false] {
+            for tagged in [true, false] {
+                let tx = ed25519_transfer(CHAIN, "policy-ed25519", tagged);
+                let (exec, mut state) = setup_policy(CHAIN, &tx.sender, "pqc-native", require_signatures);
+                let r = exec.execute_tx(&tx, &mut state, 0);
+                assert!(!r.success, "Ed25519 tx accepted (tagged={tagged}, require_signatures={require_signatures})");
+                assert!(r.error.as_deref().unwrap_or("").contains("ML-DSA-65"), "{:?}", r.error);
+                assert!(account_unchanged(&state, &tx.sender), "a refused tx must not charge a fee or use the nonce");
+            }
+        }
+    }
+
+    #[test]
+    fn pqc_native_rejects_unsigned_txs_even_without_require_signatures() {
+        const CHAIN: &str = "qcb-policy";
+        let mut tx = Transaction::transfer("unsigned", "qcb1sender", "qcb1recv", "uqcb", 100, 0);
+        tx.gas_limit = 500_000;
+        let (exec, mut state) = setup_policy(CHAIN, "qcb1sender", "pqc-native", false);
+        let r = exec.execute_tx(&tx, &mut state, 0);
+        assert!(!r.success, "unsigned tx accepted on an ML-DSA-only chain");
+        assert!(account_unchanged(&state, "qcb1sender"));
+    }
+
+    #[test]
+    fn pqc_native_verifies_mldsa_even_without_require_signatures() {
+        const CHAIN: &str = "qcb-policy";
+        let (tx, _) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "policy-mldsa");
+        let (exec, mut state) = setup_policy(CHAIN, "qcb1sender", "pqc-native", false);
+        let r = exec.execute_tx(&tx, &mut state, 0);
+        assert!(r.success, "valid ML-DSA tx must be accepted: {:?}", r.error);
+
+        let (mut forged, _) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "policy-mldsa");
+        let sig = forged.pq_signatures[0].clone();
+        let flipped = if sig.ends_with('0') { '1' } else { '0' };
+        forged.pq_signatures[0] = format!("{}{flipped}", &sig[..sig.len() - 1]);
+        let (exec, mut state) = setup_policy(CHAIN, "qcb1sender", "pqc-native", false);
+        let r = exec.execute_tx(&forged, &mut state, 0);
+        assert!(!r.success, "require_signatures=false must not skip ML-DSA verification on an ML-DSA-only chain");
+    }
+
+    #[test]
+    fn hybrid_chain_still_accepts_ed25519() {
+        const CHAIN: &str = "qcb-policy";
+        let tx = ed25519_transfer(CHAIN, "policy-ed25519", true);
+        let (exec, mut state) = setup_policy(CHAIN, &tx.sender, "hybrid", true);
+        let r = exec.execute_tx(&tx, &mut state, 0);
+        assert!(r.success, "Ed25519 must stay accepted where genesis allows it: {:?}", r.error);
+    }
+
+    #[test]
+    fn account_policy_check_classifies_each_envelope() {
+        use chain_forge_core::AccountSignaturePolicy::{MlDsaOnly, Ed25519Allowed};
+        let (pq, _) = make_pq_tx_with_chain("c", "qcb1sender", 0, "policy-mldsa");
+        let ed = ed25519_transfer("c", "policy-ed25519", true);
+        let ed_untagged = ed25519_transfer("c", "policy-ed25519", false);
+        let unsigned = Transaction::transfer("u", "qcb1sender", "qcb1recv", "uqcb", 1, 0);
+        let mut recovery = unsigned.clone();
+        recovery.body = TxBody::RecoverAccountKey {
+            new_public_key: vec![], new_key_scheme: "ml-dsa-65".into(), key_version: 1,
+            pop_signature: vec![], guardian_signatures: vec![], policy_id: 1,
+        };
+        assert!(check_account_signature_policy(&pq, MlDsaOnly).is_ok());
+        assert!(check_account_signature_policy(&ed, MlDsaOnly).is_err());
+        assert!(check_account_signature_policy(&ed_untagged, MlDsaOnly).is_err());
+        assert!(check_account_signature_policy(&unsigned, MlDsaOnly).is_err());
+        // Guardian-authenticated (ML-DSA); its new key must be ML-DSA-65 already.
+        assert!(check_account_signature_policy(&recovery, MlDsaOnly).is_ok());
+        for tx in [&pq, &ed, &ed_untagged, &unsigned] {
+            assert!(check_account_signature_policy(tx, Ed25519Allowed).is_ok());
+        }
     }
 
     /// B4 — Correct chain_id: signed TX must be accepted.

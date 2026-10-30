@@ -185,6 +185,7 @@ async fn main() {
         block_gas_limit:        node.block_gas_limit(),
         attestation_coordinator: node.attestation_coordinator(),
         governance_authorities: node.governance_authorities(),
+        account_signature_policy: node.account_signature_policy(),
     };
     // Set the data directory for state persistence.
     if let Some(ref dir) = args.data_dir {

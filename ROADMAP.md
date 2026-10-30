@@ -176,12 +176,14 @@ Known failing live tests that **also fail on `main`** (not caused by the stack):
 ### Other follow-ups
 - ⬜ `attestation_guard_live` registers an unfunded account that ingress now rejects (test fix).
 - ⬜ Genesis-hash peer agreement (H0-8); per-tx identity/agent clone performance.
-- ⬜ `block_gas_limit` is enforced per tx at ingress but not per block (found with #34).
+- ⬜ Proposers don't budget gas. `block_gas_limit` is enforced per block at execution (txs past the limit are recorded as failed), so a tx that would exceed this block's gas is failed instead of waiting for the next block. Corrects the #34 note that said per-block gas was not enforced.
 - ⬜ `mempool_ttl_seconds` is not enforced (found with #34).
 - ⬜ **Investigate:** a node process aborted twice in the sandbox (`max_block_live`, 2 of ~14 runs, debug build) on a tokio-internal `debug_assert!` in the timer driver (`AtomicWaker::take_waker`, tokio 1.54.0). There were no Chain Forge frames in the backtrace, and 6/6 A/B reruns (3 with #34's head-of-line fix, 3 without) passed. Next steps: rerun under a release build and with `RUST_BACKTRACE=full`; check for unsafe or FFI memory errors (pqcrypto, libp2p).
 - ⬜ A failed proposal publish is silently ignored (`let _ = network.publish`); log it (found with #34).
 - ⬜ Mainnet `max_tx_bytes` / `max_block_bytes`: not decided. Review mempool admission, block capacity, execution cost and resource exhaustion first.
-- ⬜ After the merge (owner, 2026-10-30): enforce ML-DSA-only user tx authentication on ML-DSA-only chains; retire the Ed25519 fallback devnet once nothing depends on it; mark the superseded Ed25519 devnet sections below.
+- ✅ **ML-DSA-only user accounts** (owner, 2026-10-30; #35, ✅ Windows-confirmed 2026-10-30: node 270/270, mldsa_only_accounts_live A-01..A-05, mldsa_tx_live, devnet_4node 6/6). Genesis `cryptography.signature_scheme = "pqc-native"` (with `pqc_algorithm = "ml-dsa"`) refuses Ed25519-signed and unsigned user txs, whatever `require_signatures` says; `"classical"`/`"hybrid"` explicitly allow Ed25519. One function, `check_account_signature_policy`, is applied at API admission, gossip intake and execution. An unknown scheme stops the node. The upgraded-devnet template `genesis-4node-mldsa.json` is now `pqc-native`. Live: `mldsa_only_accounts_live` A-01..A-05.
+- ⬜ Retire the Ed25519 fallback devnet once nothing depends on it; mark the superseded Ed25519 devnet sections below.
+- ⬜ ML-DSA signatures are verified at execution, not at API admission: a tx with a bad ML-DSA signature is admitted to the mempool, then refused deterministically at execution (no fee, no nonce). Verify at admission too, to keep junk out of the mempool.
 - ⬜ Partition recovery is only exercised where iptables is available (skipped on Windows); run it on Linux with the P2P work.
 
 ---

@@ -576,6 +576,20 @@ pub const ED25519_CONSENSUS_KEY_BYTES: usize = 32;
 /// ML-DSA-65 (FIPS 204) consensus public key length.
 pub const MLDSA65_CONSENSUS_KEY_BYTES: usize = 1952;
 
+/// Which signature schemes user accounts may sign transactions with,
+/// resolved by `GenesisConfig::account_signature_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSignaturePolicy {
+    /// `signature_scheme = "pqc-native"`, `pqc_algorithm = "ml-dsa"`: every
+    /// transaction must carry a valid ML-DSA-65 signature. Ed25519-signed
+    /// and unsigned transactions are refused, whatever `require_signatures`
+    /// says.
+    MlDsaOnly,
+    /// `signature_scheme = "classical"` or `"hybrid"`: Ed25519 and ML-DSA-65
+    /// are both accepted (legacy and devnet chains).
+    Ed25519Allowed,
+}
+
 /// BFT engine a chain runs, resolved by `GenesisConfig::bft_variant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BftVariant {
@@ -1066,6 +1080,27 @@ impl GenesisConfig {
         self.cryptography.validator_scheme == "ml-dsa-65"
     }
 
+    /// Resolve `cryptography.signature_scheme` into the account signature
+    /// policy. Hard validation: the node refuses to start on `Err`, so an
+    /// unknown scheme, or a PQ-only chain whose algorithm has no live
+    /// verifier, never runs with a guessed policy.
+    pub fn account_signature_policy(&self) -> Result<AccountSignaturePolicy, String> {
+        let c = &self.cryptography;
+        match c.signature_scheme.as_str() {
+            "classical" | "hybrid" => Ok(AccountSignaturePolicy::Ed25519Allowed),
+            "pqc-native" => match c.pqc_algorithm.as_deref() {
+                Some("ml-dsa") => Ok(AccountSignaturePolicy::MlDsaOnly),
+                other => Err(format!(
+                    "cryptography.signature_scheme \"pqc-native\" requires pqc_algorithm \"ml-dsa\" \
+                     (the only post-quantum scheme with a live verifier), got {other:?}"
+                )),
+            },
+            other => Err(format!(
+                "unknown cryptography.signature_scheme {other:?}; expected \"classical\", \"hybrid\" or \"pqc-native\""
+            )),
+        }
+    }
+
     /// Resolve and validate the BFT engine selected by `consensus.bft_variant`.
     /// Hard validation: the node refuses to start on `Err`.
     ///
@@ -1217,6 +1252,38 @@ mod tests {
             serde_json::json!({ "max_missed_pct": 0 }),
         ] {
             assert!(genesis_with_liveness(Some(bad.clone())).liveness_params().is_err(), "{bad}");
+        }
+    }
+
+    // -- Account signature policy (cryptography.signature_scheme) -------------
+
+    fn genesis_with_signature_scheme(scheme: &str, pqc: &str) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["cryptography"]["signature_scheme"] = scheme.into();
+        v["cryptography"]["pqc_algorithm"] = pqc.into();
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn pqc_native_ml_dsa_means_ml_dsa_only_accounts() {
+        assert_eq!(genesis_with_signature_scheme("pqc-native", "ml-dsa").account_signature_policy(),
+                   Ok(AccountSignaturePolicy::MlDsaOnly));
+    }
+
+    #[test]
+    fn classical_and_hybrid_explicitly_allow_ed25519_accounts() {
+        for scheme in ["classical", "hybrid"] {
+            assert_eq!(genesis_with_signature_scheme(scheme, "ml-dsa").account_signature_policy(),
+                       Ok(AccountSignaturePolicy::Ed25519Allowed), "{scheme}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_unverifiable_account_schemes_are_refused() {
+        // pqc-native with a PQ algorithm that has no live verifier, or an
+        // unknown scheme name, must stop the node rather than guess.
+        for (scheme, pqc) in [("pqc-native", "falcon"), ("pqc-native", "sphincs-plus"), ("pqcnative", "ml-dsa"), ("", "ml-dsa")] {
+            assert!(genesis_with_signature_scheme(scheme, pqc).account_signature_policy().is_err(), "{scheme}/{pqc}");
         }
     }
 
