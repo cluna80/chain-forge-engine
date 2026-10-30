@@ -106,7 +106,7 @@ Nothing merges until these pass and the owner reviews the combined tree. All PRs
 | Deterministic equivocation live test (confirm the evidence reached validation; retry) | #29 | ✅ Windows-confirmed (adversarial_gossip 3/3 ×3) |
 | `pocd_reward_live` follows H0-5 nonce semantics (found by the candidate run) | #30 | ✅ Windows-confirmed |
 | API: explicit 413 for oversized requests; body limit = genesis `max_tx_bytes`; DIS-003D test genesis 256 KiB; `dis_003d_expiry_live` F-00..F-08 | #32 | ✅ Windows-confirmed (2026-10-30) |
-| ML-DSA devnet genesis `max_tx_bytes` 262144 (owner decision 2026-10-30) + 10-guardian recovery size test | #33 | Sandbox ✅; Windows pending |
+| ML-DSA devnet genesis `max_tx_bytes` 262144 (owner decision 2026-10-30) + 10-guardian recovery size test | #33 | ✅ Windows-confirmed (2026-10-30): devnet_4node 6/6 (10-guardian recovery 221,105 bytes; partition tests skip without iptables) |
 | Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30 + #16 + #19 | #31 | ✅ Windows-confirmed: 24/24 crates, node 257, all live acceptance tests (2026-10-30); ready for owner review |
 | Devnet upgrade procedure (preserve the legacy devnet; new chain side by side) | `docs/devnet-upgrade-phase-0-5.md` | draft for review |
 
