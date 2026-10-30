@@ -145,6 +145,37 @@ fn poll_height(api_port: u16) -> Option<u64> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// (block_hash, state_root) of block `height` as reported by the node.
+fn block_at(api_port: u16, height: u64) -> Option<(String, String)> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{api_port}")).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    let request = format!(
+        "GET /api/blocks/{height} HTTP/1.0\r\nHost: 127.0.0.1:{api_port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok()?;
+    let v: serde_json::Value = serde_json::from_str(buf.split("\r\n\r\n").nth(1)?).ok()?;
+    Some((v["block_hash"].as_str()?.to_string(), v["state_root"].as_str()?.to_string()))
+}
+
+/// Every node must report the same block hash (not merely the same state
+/// root: two different empty blocks execute to the same root) for every
+/// height up to `upto`.
+fn assert_block_agreement(label: &str, upto: u64) {
+    for h in 1..=upto {
+        let seen: Vec<Option<(String, String)>> = API_PORTS.iter().map(|&p| block_at(p, h)).collect();
+        assert!(seen.iter().all(Option::is_some), "[{label}] block {h} missing on some node: {seen:?}");
+        for (i, b) in seen.iter().enumerate().skip(1) {
+            assert_eq!(b, &seen[0],
+                "[{label}] CONFLICTING FINALIZATION at height {h}: {} has {b:?}, {} has {:?}",
+                VALIDATORS[i], VALIDATORS[0], seen[0]);
+        }
+    }
+    println!("── [{label}] all 4 nodes agree on block hash and state root for heights 1..={upto}");
+}
+
 /// Ensure a port is free before we try to bind it.
 fn port_is_free(port: u16) -> bool {
     TcpStream::connect(format!("127.0.0.1:{port}")).is_err()
@@ -448,6 +479,7 @@ fn devnet_4node_reaches_target_height() {
 
     let mut nodes = spawn_nodes(&bin, &genesis, &log_dir);
     poll_until_height(&mut nodes, target_height, timeout, &log_dir, "liveness");
+    assert_block_agreement("liveness", target_height);
     // NodeProcess::drop() kills the children.
 }
 
@@ -559,6 +591,7 @@ fn devnet_4node_partition_recovery() {
     guard.active = false; // disarm the guard — we already cleaned up
 
     poll_until_height(&mut nodes, phase3_target, timeout, &log_dir, "phase3/recovery");
+    assert_block_agreement("phase3/recovery", phase3_target);
 
     println!("── Partition recovery PASSED ────────────────────────────────────────");
     println!("   Alice re-joined the network and all 4 nodes reached height {phase3_target}.");

@@ -342,6 +342,25 @@ fn block_root(port: u16, height: u64) -> Option<String> {
         .and_then(|v| v["state_root"].as_str().map(str::to_string))
 }
 
+/// Hash of the block finalized at `height` on the node at `port`.
+fn block_hash_at(port: u16, height: u64) -> Option<String> {
+    api_get(port, &format!("/api/blocks/{height}"))
+        .and_then(|v| v["block_hash"].as_str().map(str::to_string))
+}
+
+/// Block hashes for heights 1..=upto; every node must report the same ones
+/// (state roots alone cannot tell two different empty blocks apart).
+fn agreed_block_hashes(ports: &[u16], upto: u64) -> Vec<String> {
+    (1..=upto).map(|h| {
+        let seen: Vec<Option<String>> = ports.iter().map(|&p| block_hash_at(p, h)).collect();
+        assert!(seen[0].is_some(), "no block hash recorded for height {h}");
+        for (i, b) in seen.iter().enumerate().skip(1) {
+            assert_eq!(b, &seen[0], "CONFLICTING FINALIZATION at height {h} on {}: {seen:?}", VALIDATORS[i]);
+        }
+        seen[0].clone().unwrap()
+    }).collect()
+}
+
 fn transfer(id: &str, nonce: u64, amount: u128) -> Transaction {
     Transaction {
         id: id.into(), sender: SENDER.into(), nonce,
@@ -478,7 +497,8 @@ fn h0_5_execution_atomicity_multi_node() {
     for addr in [SENDER, RECIPIENT, "treasury:fees", "treasury:validator-pool", "treasury:network"] {
         agreed(&format!("{addr} balance"), ports.iter().map(|&p| balance_of(p, addr)).collect());
     }
-    println!("   H5-4 PASS — all nodes agree; root@{pin}={}", root_at_pin.as_deref().unwrap());
+    let hashes_at_pin = agreed_block_hashes(&ports, pin);
+    println!("   H5-4 PASS — all nodes agree on block hashes 1..={pin} and root@{pin}={}", root_at_pin.as_deref().unwrap());
 
     // ── H5-5: kill all four nodes, restart from disk ──────────────────────────
     let height_before = ports.iter().map(|&p| height_of(p)).max().unwrap();
@@ -500,7 +520,9 @@ fn h0_5_execution_atomicity_multi_node() {
         assert_eq!(balance_of(p, SENDER), expected_balance,
             "H5-5 FAILED on {}: sender balance changed across restart", VALIDATORS[i]);
     }
-    println!("   H5-5 PASS — restart preserved root@{pin}, nonce and balance; chain resumed");
+    assert_eq!(agreed_block_hashes(&ports, pin), hashes_at_pin,
+        "H5-5 FAILED: finalized block hashes changed across restart");
+    println!("   H5-5 PASS — restart preserved block hashes, root@{pin}, nonce and balance; chain resumed");
 
     if std::env::var("H05_PRINT_LOGS").is_ok() {
         for n in &restarted { print_tail(&n.log_path, 20); }
