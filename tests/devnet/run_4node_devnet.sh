@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# run_4node_devnet.sh — 4-node devnet integration test
+# run_4node_devnet.sh — 4-node ML-DSA devnet integration test
 #
 # Spawns four chain-forge-node processes (Alice, Bob, Carol, Dave) against
-# the 4-node genesis, waits for all of them to reach height >= TARGET_HEIGHT
+# the upgraded ML-DSA devnet genesis (genesis-4node-mldsa.json: ML-DSA-65
+# consensus keys, ML-DSA-only user accounts), waits for all of them to reach height >= TARGET_HEIGHT
 # by polling their /api/status endpoints, then tears them down cleanly.
 #
 # Exit codes:
@@ -22,15 +23,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/debug/chain-forge-node}"
-GENESIS="$SCRIPT_DIR/genesis-4node.json"
+GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
+KEY_DIR="$SCRIPT_DIR/keys/mldsa"
 TIMEOUT_SECS="${TIMEOUT_SECS:-60}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-3}"
-LOG_DIR="${LOG_DIR:-/tmp/qcb-devnet-4node}"
+LOG_DIR="${LOG_DIR:-/tmp/qcb-devnet-4node-mldsa}"
 
-# Ports: each node gets its own API port and P2P port so they don't collide.
+# Ports: each node gets its own API port and P2P port so they don't collide,
+# and none collides with the legacy devnet (18080-18083 / 27000-27003).
 VALIDATORS=("qcb1alice" "qcb1bob" "qcb1carol" "qcb1dave")
-API_PORTS=(18080 18081 18082 18083)
-P2P_PORTS=(27000 27001 27002 27003)
+API_PORTS=(19080 19081 19082 19083)
+P2P_PORTS=(28000 28001 28002 28003)
 
 # ── Parse args ---------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -97,11 +100,16 @@ for i in "${!VALIDATORS[@]}"; do
 
     echo "   Starting $validator  api=:$api_port  p2p=:$p2p_port"
 
+    bootstrap=()
+    if (( i > 0 )); then bootstrap=(--bootstrap "/ip4/127.0.0.1/tcp/${P2P_PORTS[0]}"); fi
+
     "$BIN" \
         --genesis "$GENESIS" \
         --validator "$validator" \
+        --key-file "$KEY_DIR/${validator#qcb1}.key.json" \
         --api-port "$api_port" \
         --p2p-port "$p2p_port" \
+        "${bootstrap[@]}" \
         > "$log_file" 2>&1 &
 
     PIDS+=($!)

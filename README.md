@@ -50,17 +50,14 @@ Windows via MINGW64/Git Bash works).
 # Build the node binary
 cargo build -p chain-forge-node
 
-# Launch a single-node devnet (solo block production, no peers needed)
-./target/debug/chain-forge-node \
-  --genesis tests/devnet/genesis-mldsa.json \
-  --validator qcb1alice \
-  --key-file tests/devnet/keys/alice.key.json \
-  --api-port 8080 \
-  --p2p-port 9000
+# Launch the 4-node ML-DSA devnet (ML-DSA-65 consensus keys, ML-DSA-only
+# user accounts) on ports 19080-19083 / 28000-28003; it stops once all four
+# nodes reach height 3. One node alone cannot reach quorum.
+./tests/devnet/run_4node_devnet.sh
 
-# Query the chain
-curl http://127.0.0.1:8080/api/status
-curl http://127.0.0.1:8080/api/blocks
+# While it runs (raise --target-height to keep it up longer), query a node:
+curl http://127.0.0.1:19080/api/status
+curl http://127.0.0.1:19080/api/blocks
 ```
 
 **Run the 4-node devnet acceptance suite** (all nodes in-process, no manual port wiring):

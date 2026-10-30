@@ -29,11 +29,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
-GENESIS="$SCRIPT_DIR/genesis-4node.json"
-KEY_DIR="$SCRIPT_DIR/keys"
+GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
+KEY_DIR="$SCRIPT_DIR/keys/mldsa"
 LOG_DIR="${LOG_DIR:-/tmp/qcb-devnet-test8-logs}"
-ALICE_API="http://127.0.0.1:18080"
-BOB_API="http://127.0.0.1:18081"
+ALICE_API="http://127.0.0.1:19080"
+BOB_API="http://127.0.0.1:19081"
 
 echo "=== Acceptance Test #8: Multi-Machine Identity Binding ==="
 echo ""
@@ -126,8 +126,8 @@ else
         --genesis "$GENESIS" \
         --validator qcb1WRONG \
         --key-file "$KEY_DIR/alice.key.json" \
-        --api-port 18080 \
-        --p2p-port 27000 \
+        --api-port 19080 \
+        --p2p-port 28000 \
         > "$LOG_DIR/alice-test8.log" 2>&1 &
     ALICE_PID=$!
 
@@ -176,8 +176,8 @@ if [[ -z "${MACHINE2_IP:-}" ]]; then
     echo ""
 else
     echo "--- Part C: Live 4-node identity in committed blocks ---"
-    CAROL_PEER="/ip4/${MACHINE2_IP}/tcp/27000"
-    DAVE_PEER="/ip4/${MACHINE2_IP}/tcp/27001"
+    CAROL_PEER="/ip4/${MACHINE2_IP}/tcp/28000"
+    DAVE_PEER="/ip4/${MACHINE2_IP}/tcp/28001"
 
     mkdir -p "$LOG_DIR"
 
@@ -185,8 +185,8 @@ else
         --genesis "$GENESIS" \
         --validator qcb1alice \
         --key-file "$KEY_DIR/alice.key.json" \
-        --api-port 18080 \
-        --p2p-port 27000 \
+        --api-port 19080 \
+        --p2p-port 28000 \
         --bootstrap "$CAROL_PEER" \
         --bootstrap "$DAVE_PEER" \
         > "$LOG_DIR/alice-test8c.log" 2>&1 &
@@ -196,8 +196,8 @@ else
         --genesis "$GENESIS" \
         --validator qcb1bob \
         --key-file "$KEY_DIR/bob.key.json" \
-        --api-port 18081 \
-        --p2p-port 27001 \
+        --api-port 19081 \
+        --p2p-port 28001 \
         --bootstrap "$CAROL_PEER" \
         --bootstrap "$DAVE_PEER" \
         > "$LOG_DIR/bob-test8c.log" 2>&1 &

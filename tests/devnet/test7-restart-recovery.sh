@@ -27,8 +27,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
-GENESIS="$SCRIPT_DIR/genesis-4node.json"
-KEY_DIR="$SCRIPT_DIR/keys"
+GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
+KEY_DIR="$SCRIPT_DIR/keys/mldsa"
 DATA_DIR="${DATA_DIR:-/tmp/qcb-devnet-test7-data}"
 LOG_DIR="${LOG_DIR:-/tmp/qcb-devnet-test7-logs}"
 
@@ -39,10 +39,10 @@ if [[ -z "${MACHINE2_IP:-}" ]]; then
     exit 1
 fi
 
-CAROL_PEER="/ip4/${MACHINE2_IP}/tcp/27000"
-DAVE_PEER="/ip4/${MACHINE2_IP}/tcp/27001"
-ALICE_API="http://127.0.0.1:18080"
-BOB_API="http://127.0.0.1:18081"
+CAROL_PEER="/ip4/${MACHINE2_IP}/tcp/28000"
+DAVE_PEER="/ip4/${MACHINE2_IP}/tcp/28001"
+ALICE_API="http://127.0.0.1:19080"
+BOB_API="http://127.0.0.1:19081"
 
 ALICE_DATA_DIR="$DATA_DIR/alice"
 BOB_DATA_DIR="$DATA_DIR/bob"
@@ -105,26 +105,26 @@ wait_for_api() {
 
 start_nodes() {
     local suffix="$1"
-    echo "  Starting Alice (api=:18080 p2p=:27000) ..."
+    echo "  Starting Alice (api=:19080 p2p=:28000) ..."
     "$BIN" \
         --genesis "$GENESIS" \
         --validator qcb1alice \
         --key-file "$KEY_DIR/alice.key.json" \
-        --api-port 18080 \
-        --p2p-port 27000 \
+        --api-port 19080 \
+        --p2p-port 28000 \
         --data-dir "$ALICE_DATA_DIR" \
         --bootstrap "$CAROL_PEER" \
         --bootstrap "$DAVE_PEER" \
         > "$LOG_DIR/alice-${suffix}.log" 2>&1 &
     ALICE_PID=$!
 
-    echo "  Starting Bob (api=:18081 p2p=:27001) ..."
+    echo "  Starting Bob (api=:19081 p2p=:28001) ..."
     "$BIN" \
         --genesis "$GENESIS" \
         --validator qcb1bob \
         --key-file "$KEY_DIR/bob.key.json" \
-        --api-port 18081 \
-        --p2p-port 27001 \
+        --api-port 19081 \
+        --p2p-port 28001 \
         --data-dir "$BOB_DATA_DIR" \
         --bootstrap "$CAROL_PEER" \
         --bootstrap "$DAVE_PEER" \

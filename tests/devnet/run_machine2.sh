@@ -15,13 +15,17 @@
 #   BIN=/path/to/chain-forge-node   (default: target/release/chain-forge-node)
 #   LOG_DIR=/path/to/logs           (default: /tmp/qcb-devnet-machine2)
 
+# Upgraded ML-DSA devnet (genesis-4node-mldsa.json, keys/mldsa/). Ports
+# 19080-19081 / 28000-28001 never collide with the legacy devnet.
+# The legacy Ed25519 devnet runs from branch devnet-legacy-2026-10.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/chain-forge-node}"
-GENESIS="$SCRIPT_DIR/genesis-4node.json"
-KEY_DIR="$SCRIPT_DIR/keys"
+GENESIS="$SCRIPT_DIR/genesis-4node-mldsa.json"
+KEY_DIR="$SCRIPT_DIR/keys/mldsa"
 LOG_DIR="${LOG_DIR:-/tmp/qcb-devnet-machine2}"
 
 # ── Machine 1 IP (required) ─────────────────────────────────────────────────
@@ -31,9 +35,9 @@ if [[ -z "${MACHINE1_IP:-}" ]]; then
     exit 1
 fi
 
-# Machine 1 runs Alice on P2P port 27000, Bob on 27001
-ALICE_PEER="/ip4/${MACHINE1_IP}/tcp/27000"
-BOB_PEER="/ip4/${MACHINE1_IP}/tcp/27001"
+# Machine 1 runs Alice on P2P port 28000, Bob on 28001
+ALICE_PEER="/ip4/${MACHINE1_IP}/tcp/28000"
+BOB_PEER="/ip4/${MACHINE1_IP}/tcp/28001"
 
 # ── Sanity checks ────────────────────────────────────────────────────────────
 if [[ ! -x "$BIN" ]]; then
@@ -67,34 +71,34 @@ trap cleanup EXIT INT TERM
 mkdir -p "$LOG_DIR"
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  QCB 4-Node Devnet — Machine 2 (Carol + Dave)"
+echo "  QCB 4-Node ML-DSA Devnet — Machine 2 (Carol + Dave)"
 echo "  Machine 1 IP: $MACHINE1_IP"
 echo "  Binary:       $BIN"
 echo "  Logs:         $LOG_DIR"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-# Carol: API=18080, P2P=27000
-echo "  Starting Carol  (api=:18080  p2p=:27000)"
+# Carol: API=19080, P2P=28000
+echo "  Starting Carol  (api=:19080  p2p=:28000)"
 "$BIN" \
     --genesis "$GENESIS" \
     --validator qcb1carol \
     --key-file "$KEY_DIR/carol.key.json" \
-    --api-port 18080 \
-    --p2p-port 27000 \
+    --api-port 19080 \
+    --p2p-port 28000 \
     --bootstrap "$ALICE_PEER" \
     --bootstrap "$BOB_PEER" \
     > "$LOG_DIR/carol.log" 2>&1 &
 PIDS+=($!)
 
-# Dave: API=18081, P2P=27001
-echo "  Starting Dave   (api=:18081  p2p=:27001)"
+# Dave: API=19081, P2P=28001
+echo "  Starting Dave   (api=:19081  p2p=:28001)"
 "$BIN" \
     --genesis "$GENESIS" \
     --validator qcb1dave \
     --key-file "$KEY_DIR/dave.key.json" \
-    --api-port 18081 \
-    --p2p-port 27001 \
+    --api-port 19081 \
+    --p2p-port 28001 \
     --bootstrap "$ALICE_PEER" \
     --bootstrap "$BOB_PEER" \
     > "$LOG_DIR/dave.log" 2>&1 &
@@ -108,8 +112,8 @@ echo "    tail -f $LOG_DIR/carol.log"
 echo "    tail -f $LOG_DIR/dave.log"
 echo ""
 echo "  API:"
-echo "    curl http://127.0.0.1:18080/api/status   # Carol"
-echo "    curl http://127.0.0.1:18081/api/status   # Dave"
+echo "    curl http://127.0.0.1:19080/api/status   # Carol"
+echo "    curl http://127.0.0.1:19081/api/status   # Dave"
 echo ""
 echo "  Press Ctrl-C to stop."
 echo ""

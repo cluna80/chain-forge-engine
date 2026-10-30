@@ -21,16 +21,16 @@ LOG_FILE="${LOG_FILE:-/tmp/qcb-devnet-watch.log}"
 
 # Node name → host:port
 declare -A NODES
-NODES["Alice"]="${MACHINE1_IP}:18080"
-NODES["Bob"]="${MACHINE1_IP}:18081"
-NODES["Carol"]="${MACHINE2_IP}:18080"
-NODES["Dave"]="${MACHINE2_IP}:18081"
+NODES["Alice"]="${MACHINE1_IP}:19080"
+NODES["Bob"]="${MACHINE1_IP}:19081"
+NODES["Carol"]="${MACHINE2_IP}:19080"
+NODES["Dave"]="${MACHINE2_IP}:19081"
 
 ORDER=("Alice" "Bob" "Carol" "Dave")
 
 echo "QCB 4-Node Devnet Watcher"
-echo "  Machine 1 ($MACHINE1_IP): Alice :18080, Bob :18081"
-echo "  Machine 2 ($MACHINE2_IP): Carol :18080, Dave :18081"
+echo "  Machine 1 ($MACHINE1_IP): Alice :19080, Bob :19081"
+echo "  Machine 2 ($MACHINE2_IP): Carol :19080, Dave :19081"
 echo "  Poll interval: ${POLL_SECS}s"
 echo "  Log: $LOG_FILE"
 echo ""
