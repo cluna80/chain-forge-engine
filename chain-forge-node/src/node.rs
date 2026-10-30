@@ -3548,14 +3548,15 @@ impl Node {
         };
 
         // F1: update per-sender nonce cache AFTER execution, from the tx.nonce of each
-        // successfully committed transaction. The API check rejects tx.nonce <= cache,
-        // so cache must store the last committed tx.nonce (not state.nonce, which is
+        // INCLUDED transaction. The API check rejects tx.nonce <= cache, so cache
+        // must store the last consumed tx.nonce (not state.nonce, which is
         // post-increment and would block the immediately following valid submission).
-        // Updating before execution caused the cache to advance even for txs that
-        // failed, making it impossible to submit a corrected tx on the same sender.
+        // H0-5: an included-but-failed tx (fee_charged > 0) consumes its nonce on
+        // chain just like a successful one, so it advances the cache too; a
+        // rejected tx (fee_charged == 0) consumed nothing and leaves it alone.
         {
             let mut cache = self.nonce_cache.lock().unwrap();
-            for r in exec_result.tx_results.iter().filter(|r| r.success) {
+            for r in exec_result.tx_results.iter().filter(|r| r.fee_charged > 0) {
                 // TransactionResult has no sender field; look up (sender, nonce) from
                 // the index captured before txs was consumed by execute_block_with_identity.
                 if let Some((_, sender, tx_nonce)) = txs_for_cache.iter().find(|(id, _, _)| id == &r.tx_id) {
