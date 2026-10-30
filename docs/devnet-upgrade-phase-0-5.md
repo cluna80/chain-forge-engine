@@ -1,7 +1,7 @@
 # Devnet upgrade: Phase 0.5 security stack
 
 Status: **procedure for review.** Nothing in it has been run against the live devnet.
-Applies to: merging the Phase 0.5 stack (#14 → #30, plus #16 and #19) into `main`.
+Applies to: merging the Phase 0.5 stack (#14 → #30, #32, #33, plus #16 and #19) into `main`.
 Principle (owner, 2026-10-29): **preserve the existing devnet.** The upgraded network runs as a separate, new chain next to it. Nothing is deleted, and pilot identities are re-enrolled only with each owner's explicit confirmation.
 
 ---
@@ -86,6 +86,7 @@ Steps:
    - set the new `chain_id`, `network_id` and ports;
    - put each machine's new public key in its validator account;
    - keep `validator_scheme: "ml-dsa-65"`.
+   - keep `limits.max_tx_bytes: 262144` (owner decision 2026-10-30, #33): ML-DSA guardian recovery needs it. It is not the mainnet value.
 3. Start each node with `--genesis`, `--key-file`, `--data-dir`, `--api-port`, `--p2p-port` and `--bootstrap` pointing at the **new** values.
 4. Acceptance on the upgraded devnet:
    - all nodes reach the same height with the same block hash and state root (`/api/status`, `/api/blocks/<height>`);
