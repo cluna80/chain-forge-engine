@@ -1873,12 +1873,19 @@ fn verify_authorization(config: &ExecutionConfig, tx: &Transaction, state: &Stat
     }
     // An ML-DSA-only chain verifies every tx: require_signatures = false
     // must not turn it into a chain that accepts unauthenticated txs.
-    if !config.require_signatures
-        && config.account_signature_policy != chain_forge_core::AccountSignaturePolicy::MlDsaOnly
-    {
+    if !signatures_enforced(config) {
         return Ok(());
     }
     verify_authorization_signed(config, tx, state)
+}
+
+/// Whether this chain verifies transaction signatures: when genesis requires
+/// them, and always on an ML-DSA-only chain (require_signatures = false must
+/// not turn it into a chain that accepts unauthenticated txs). Authorization
+/// and key binding both use this, so a verified key is always bound.
+fn signatures_enforced(config: &ExecutionConfig) -> bool {
+    config.require_signatures
+        || config.account_signature_policy == chain_forge_core::AccountSignaturePolicy::MlDsaOnly
 }
 
 /// CF-VAL-KEY-002: like `verify_authorization`, but used for transaction
@@ -2177,6 +2184,21 @@ fn verify_mldsa_authorization(
                     tx.sender
                 ));
             }
+            // First use: the account must be the one this key controls. A
+            // funded account whose address is not derived from a key (e.g. a
+            // named genesis account) must have its key bound in genesis;
+            // otherwise whoever signed first would own it.
+            let derived = Address::from_public_key_schemed(
+                &tx.pq_public_key, &config.address_prefix, config.hash_width,
+                chain_forge_core::AddressScheme::PostQuantum,
+            );
+            if derived.as_str() != tx.sender {
+                return Err(format!(
+                    "{} has no bound key and is not derived from the signing key ({}); \
+                     bind the account's ML-DSA key in genesis or send from the derived address",
+                    tx.sender, derived.as_str()
+                ));
+            }
             tx.pq_public_key.clone()
         }
     };
@@ -2414,7 +2436,11 @@ pub fn verify_signature(tx: &Transaction, chain_id: &str) -> Result<(), String> 
 /// Bind the signing key to the sender's account on its first successful
 /// signed transaction (the account may have just been created by it).
 fn bind_key_if_unbound(config: &ExecutionConfig, tx: &Transaction, state: &mut StateStore) {
-    if !config.require_signatures {
+    // Bind whenever this tx's signature was verified (`signatures_enforced`):
+    // on an ML-DSA-only chain that is every tx, whatever require_signatures
+    // says. Binding only under require_signatures left such accounts unbound
+    // forever, so any key that matched first-use rules could keep spending.
+    if !signatures_enforced(config) {
         return;
     }
     // ML-DSA path: sig_scheme tag (CS-001-H2) or legacy prefix scan.
@@ -6300,18 +6326,99 @@ mod tests {
     #[test]
     fn pqc_native_verifies_mldsa_even_without_require_signatures() {
         const CHAIN: &str = "qcb-policy";
-        let (tx, _) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "policy-mldsa");
-        let (exec, mut state) = setup_policy(CHAIN, "qcb1sender", "pqc-native", false);
+        let sender = pq_address("policy-mldsa");
+        let (tx, _) = make_pq_tx_with_chain(CHAIN, &sender, 0, "policy-mldsa");
+        let (exec, mut state) = setup_policy(CHAIN, &sender, "pqc-native", false);
         let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(r.success, "valid ML-DSA tx must be accepted: {:?}", r.error);
 
-        let (mut forged, _) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "policy-mldsa");
+        let (mut forged, _) = make_pq_tx_with_chain(CHAIN, &sender, 0, "policy-mldsa");
         let sig = forged.pq_signatures[0].clone();
         let flipped = if sig.ends_with('0') { '1' } else { '0' };
         forged.pq_signatures[0] = format!("{}{flipped}", &sig[..sig.len() - 1]);
-        let (exec, mut state) = setup_policy(CHAIN, "qcb1sender", "pqc-native", false);
+        let (exec, mut state) = setup_policy(CHAIN, &sender, "pqc-native", false);
         let r = exec.execute_tx(&forged, &mut state, 0);
         assert!(!r.success, "require_signatures=false must not skip ML-DSA verification on an ML-DSA-only chain");
+    }
+
+    // -- ML-DSA account ownership (P0 security, owner 2026-10-30) ------------
+    //
+    // An account's ML-DSA key is either bound in state (genesis or an earlier
+    // tx) or, on first use, must be the key the sender address is derived
+    // from. Before this, an unbound funded account accepted any key: anyone
+    // could spend from it, and with require_signatures = false the key was
+    // never bound, so anyone could keep spending from it.
+
+    fn pq_address(seed: &str) -> String {
+        let kp = MlDsaScheme.generate_keypair(seed).unwrap();
+        Address::from_public_key_schemed(
+            &kp.public_key, "qcb", HashWidth::Bits256, chain_forge_core::AddressScheme::PostQuantum,
+        ).as_str().to_string()
+    }
+
+    /// `setup_policy`, with `sender`'s ML-DSA public key bound in genesis.
+    fn setup_policy_bound(chain_id: &str, sender: &str, key_seed: &str, scheme: &str, require_signatures: bool) -> (Executor, StateStore) {
+        let (exec, mut state) = setup_policy(chain_id, sender, scheme, require_signatures);
+        let pk = MlDsaScheme.generate_keypair(key_seed).unwrap().public_key;
+        state.get_account_mut(sender).unwrap().public_key = Some(pk);
+        state.refresh_leaf(sender);
+        (exec, state)
+    }
+
+    fn untouched(state: &StateStore, addr: &str, nonce: u64) -> bool {
+        let a = state.get_account(addr).unwrap();
+        a.nonce == nonce && a.balance_of("uqcb") == 5_000_000 && a.public_key.is_none()
+    }
+
+    #[test]
+    fn unbound_named_account_refuses_a_key_it_is_not_derived_from() {
+        const CHAIN: &str = "qcb-own";
+        for scheme in ["pqc-native", "hybrid"] {
+            for require_signatures in [true, false] {
+                if scheme == "hybrid" && !require_signatures { continue; } // unsigned devnet chain: no auth at all
+                let (exec, mut state) = setup_policy(CHAIN, "qcb1sender", scheme, require_signatures);
+                let (tx, _) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "attacker-key");
+                let r = exec.execute_tx(&tx, &mut state, 0);
+                assert!(!r.success, "{scheme}/require_signatures={require_signatures}: an unrelated key spent from qcb1sender");
+                assert!(untouched(&state, "qcb1sender", 0), "a refused tx must not bind a key, charge a fee or use the nonce");
+            }
+        }
+    }
+
+    #[test]
+    fn derived_address_binds_its_key_on_first_use_even_without_require_signatures() {
+        const CHAIN: &str = "qcb-own";
+        for require_signatures in [true, false] {
+            let owner = pq_address("owner-key");
+            let (exec, mut state) = setup_policy(CHAIN, &owner, "pqc-native", require_signatures);
+            let (tx, pk) = make_pq_tx_with_chain(CHAIN, &owner, 0, "owner-key");
+            let r = exec.execute_tx(&tx, &mut state, 0);
+            assert!(r.success, "the owner's first tx must succeed: {:?}", r.error);
+            assert_eq!(state.get_account(&owner).unwrap().public_key.as_deref(), Some(pk.as_slice()),
+                "require_signatures={require_signatures}: the verified key must be bound");
+
+            // Once bound, another key is refused even if it claims first use.
+            let (other, _) = make_pq_tx_with_chain(CHAIN, &owner, 1, "attacker-key");
+            let before = state.get_account(&owner).unwrap().balance_of("uqcb");
+            let r = exec.execute_tx(&other, &mut state, 0);
+            assert!(!r.success, "require_signatures={require_signatures}: a bound account accepted another key");
+            let a = state.get_account(&owner).unwrap();
+            assert_eq!((a.nonce, a.balance_of("uqcb")), (1, before), "the refused tx changed the account");
+            assert_eq!(a.public_key.as_deref(), Some(pk.as_slice()), "the binding must not change");
+        }
+    }
+
+    #[test]
+    fn genesis_bound_named_account_accepts_only_its_key() {
+        const CHAIN: &str = "qcb-own";
+        for require_signatures in [true, false] {
+            let (exec, mut state) = setup_policy_bound(CHAIN, "qcb1sender", "owner-key", "pqc-native", require_signatures);
+            let (attacker, _) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "attacker-key");
+            assert!(!exec.execute_tx(&attacker, &mut state, 0).success, "require_signatures={require_signatures}: attacker spent");
+            let (owner, _) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "owner-key");
+            let r = exec.execute_tx(&owner, &mut state, 0);
+            assert!(r.success, "require_signatures={require_signatures}: the genesis-bound key must work: {:?}", r.error);
+        }
     }
 
     #[test]
@@ -6350,8 +6457,10 @@ mod tests {
     #[test]
     fn b4_mldsa_correct_chain_id_accepted() {
         const CHAIN: &str = "qcb-b4-test";
-        let (tx, _pk) = make_pq_tx_with_chain(CHAIN, "qcb1sender", 0, "b4-alice-seed");
-        let (exec, mut state) = setup_signed(CHAIN, "qcb1sender");
+        // First use is accepted only from the address the key controls.
+        let sender = pq_address("b4-alice-seed");
+        let (tx, _pk) = make_pq_tx_with_chain(CHAIN, &sender, 0, "b4-alice-seed");
+        let (exec, mut state) = setup_signed(CHAIN, &sender);
         let r = exec.execute_tx(&tx, &mut state, 0);
         assert!(r.success,
             "valid ML-DSA tx with correct chain_id must be accepted; error: {:?}", r.error);
@@ -7358,7 +7467,7 @@ mod tests {
     #[test]
     fn cs001_p6_mldsa_tx_accepted_after_classical_cutoff() {
         // Use the signed executor setup (require_signatures = true, funded sender).
-        let sender = "qcb1senderabcdef";
+        let sender = &pq_address("p6-seed-unique");
         let chain_id = "b4-chain";
         let (exec, mut state) = setup_signed(chain_id, sender);
         let mut identity = IdentityStore::new(0);

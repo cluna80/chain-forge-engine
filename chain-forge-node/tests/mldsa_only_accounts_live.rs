@@ -13,6 +13,10 @@
 //! | A-03 | An unsigned tx is refused, although `require_signatures` is false |
 //! | A-04 | A valid ML-DSA-65 tx commits; all 4 nodes agree on the state root |
 //! | A-05 | None of the refused txs was ever executed on any node |
+//! | A-06 | An unrelated ML-DSA key cannot spend from a funded named account with no bound key |
+//! | A-07 | An unrelated key cannot spend from an account whose key is bound in genesis |
+//! | A-08 | A key-derived account binds its key on first use; another key is then refused |
+//! | A-09 | After all 4 nodes restart, the bindings hold and all 4 nodes agree on the state root |
 //!
 //! ## Run
 //! ```
@@ -36,6 +40,22 @@ use chain_forge_execution::Transaction;
 const CHAIN_ID:  &str = "qcb-devnet-4node-mldsa";
 const USER_ADDR: &str = "qcb1user";
 const SEED_USER: &str = "mldsa-only-accounts-user-seed-000000000000000000000001";
+/// Funded named account with no bound key: nobody may claim it by signing first.
+const KEYLESS_ADDR: &str = "qcb1keyless";
+const SEED_OWNER:    &str = "mldsa-only-accounts-owner-seed-00000000000000000000001";
+const SEED_ATTACKER: &str = "mldsa-only-accounts-attacker-seed-0000000000000000000001";
+
+fn mldsa_public_key(seed: &str) -> Vec<u8> { MlDsaScheme.generate_keypair(seed).expect("keygen").public_key }
+
+fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+
+/// The qcb1pq… address the owner's ML-DSA key controls.
+fn owner_addr() -> String {
+    chain_forge_core::Address::from_public_key_schemed(
+        &mldsa_public_key(SEED_OWNER), "qcb", chain_forge_core::HashWidth::Bits256,
+        chain_forge_core::AddressScheme::PostQuantum,
+    ).as_str().to_string()
+}
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").expect("free_port bind")
@@ -87,8 +107,17 @@ fn genesis_path() -> PathBuf {
     let template = repo_root().join("tests").join("devnet").join("genesis-4node-mldsa.json");
     let mut g: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(template).unwrap()).unwrap();
     assert_eq!(g["cryptography"]["signature_scheme"], "pqc-native", "the template must be ML-DSA-only");
-    g["genesis_accounts"].as_array_mut().unwrap().push(serde_json::json!({
-        "label": "User", "address": USER_ADDR, "balance": "50000000", "role": "user"
+    let accounts = g["genesis_accounts"].as_array_mut().unwrap();
+    // A named account's key must be bound in genesis.
+    accounts.push(serde_json::json!({
+        "label": "User", "address": USER_ADDR, "balance": "50000000", "role": "user",
+        "public_key": hex(&mldsa_public_key(SEED_USER))
+    }));
+    accounts.push(serde_json::json!({
+        "label": "Keyless", "address": KEYLESS_ADDR, "balance": "50000000", "role": "user"
+    }));
+    accounts.push(serde_json::json!({
+        "label": "Owner", "address": owner_addr(), "balance": "50000000", "role": "user"
     }));
     let out = devnet_dirs().join("genesis.json");
     std::fs::create_dir_all(devnet_dirs()).unwrap();
@@ -245,15 +274,21 @@ fn current_height(port: u16) -> u64 {
 
 fn tx_json(tx: &Transaction) -> String { serde_json::to_string(tx).expect("tx json") }
 
-fn transfer(id: &str, nonce: u64) -> Transaction {
-    let mut tx = Transaction::transfer(id, USER_ADDR, "qcb1bob", "uqcb", 1_000, nonce);
+fn transfer(id: &str, nonce: u64) -> Transaction { transfer_from(id, USER_ADDR, nonce) }
+
+fn transfer_from(id: &str, sender: &str, nonce: u64) -> Transaction {
+    let mut tx = Transaction::transfer(id, sender, "qcb1bob", "uqcb", 1_000, nonce);
     tx.gas_limit = 200_000;
     tx
 }
 
-fn mldsa_transfer(id: &str, nonce: u64) -> Transaction {
-    let kp = MlDsaScheme.generate_keypair(SEED_USER).expect("keygen");
-    let mut tx = transfer(id, nonce);
+fn mldsa_transfer(id: &str, nonce: u64) -> Transaction { mldsa_transfer_signed(id, USER_ADDR, nonce, SEED_USER) }
+
+/// A transfer from `sender`, signed with the ML-DSA key from `seed`, which it
+/// also presents as `pq_public_key` (the first-use form).
+fn mldsa_transfer_signed(id: &str, sender: &str, nonce: u64, seed: &str) -> Transaction {
+    let kp = MlDsaScheme.generate_keypair(seed).expect("keygen");
+    let mut tx = transfer_from(id, sender, nonce);
     let body_json = serde_json::to_string(&tx.body).expect("body");
     let sig = MlDsaScheme.sign(&mldsa_tx_prehash(CHAIN_ID, body_json.as_bytes()), &kp).expect("sign");
     tx.pq_signatures = vec![format!("mldsa65:{}", sig_to_hex(&sig))];
@@ -262,11 +297,52 @@ fn mldsa_transfer(id: &str, nonce: u64) -> Transaction {
     tx
 }
 
+/// Wait until every node is at the same height (at least `h`) with the same
+/// non-empty state root.
+fn assert_converged(ports: &Ports, h: u64, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let roots: Vec<String> = ports.all().iter().map(|&p| state_root(p)).collect();
+        let heights: Vec<u64> = ports.all().iter().map(|&p| current_height(p)).collect();
+        if heights.iter().all(|&x| x == heights[0] && x >= h) && roots.iter().all(|r| !r.is_empty() && *r == roots[0]) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: nodes disagree: {roots:?} at {heights:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn balance(port: u16, addr: &str) -> u64 {
+    account_of(port, addr).and_then(|v| v["balances"]["uqcb"].as_u64()).unwrap_or(0)
+}
+
+/// Submit `tx`; it must be refused at execution on every node, leaving
+/// `sender`'s nonce and balance unchanged everywhere.
+fn expect_refused(ports: &Ports, tx: &Transaction, what: &str, sender: &str) {
+    let before: Vec<(u64, u64)> = ports.all().iter().map(|&p| (current_nonce(p, sender), balance(p, sender))).collect();
+    let resp = submit_tx(ports.alice, &tx_json(tx));
+    assert_eq!(resp["status"], "queued", "{what}: the API should admit it (execution decides): {resp}");
+    let r = wait_tx_result(ports.alice, &tx.id, Duration::from_secs(60)).unwrap_or_else(|| panic!("{what}: no result"));
+    assert!(!r["success"].as_bool().unwrap_or(true), "{what}: {} with the wrong key succeeded: {r}", tx.id);
+    assert_converged(ports, r["height"].as_u64().unwrap_or(0), what);
+    let after: Vec<(u64, u64)> = ports.all().iter().map(|&p| (current_nonce(p, sender), balance(p, sender))).collect();
+    assert_eq!(before, after, "{what}: a refused tx changed {sender} (nonce, balance) on some node");
+}
+
+/// Submit `tx`; it must succeed and all nodes must converge.
+fn expect_success(ports: &Ports, tx: &Transaction, what: &str) {
+    let resp = submit_tx(ports.alice, &tx_json(tx));
+    assert_eq!(resp["status"], "queued", "{what}: {resp}");
+    let r = wait_tx_result(ports.alice, &tx.id, Duration::from_secs(60)).unwrap_or_else(|| panic!("{what}: no result"));
+    assert!(r["success"].as_bool().unwrap_or(false), "{what}: {} must succeed: {r}", tx.id);
+    assert_converged(ports, r["height"].as_u64().unwrap_or(0), what);
+}
+
 #[test]
 fn ml_dsa_only_accounts_refuse_ed25519_and_unsigned_at_every_node() {
     let _ = std::fs::remove_dir_all(devnet_dirs());
     let ports = Ports::new();
-    let _nodes = spawn_devnet(&ports);
+    let nodes = spawn_devnet(&ports);
     for p in ports.all() {
         assert!(poll_ready(p, Duration::from_secs(30)), "node on :{p} not ready");
     }
@@ -320,5 +396,26 @@ fn ml_dsa_only_accounts_refuse_ed25519_and_unsigned_at_every_node() {
         }
     }
     println!("✓ A-05: no refused tx was executed on any node");
+
+    // A-06..A-08: account ownership. The API admits these (the scheme is
+    // ML-DSA); block execution refuses the wrong key on every node.
+    let owner = owner_addr();
+    expect_refused(&ports, &mldsa_transfer_signed("own-keyless", KEYLESS_ADDR, 0, SEED_ATTACKER), "A-06", KEYLESS_ADDR);
+    expect_refused(&ports, &mldsa_transfer_signed("own-genesis-bound", USER_ADDR, 1, SEED_ATTACKER), "A-07", USER_ADDR);
+    expect_success(&ports, &mldsa_transfer_signed("own-first-use", &owner, 0, SEED_OWNER), "A-08");
+    expect_refused(&ports, &mldsa_transfer_signed("own-after-bind", &owner, 1, SEED_ATTACKER), "A-08", &owner);
+    println!("✓ A-06..A-08: only the account's own key can spend");
+
+    // A-09: restart all four nodes from their data dirs; bindings must hold.
+    drop(nodes);
+    std::thread::sleep(Duration::from_secs(2));
+    let _nodes = spawn_devnet(&ports);
+    for p in ports.all() {
+        assert!(poll_ready(p, Duration::from_secs(30)), "A-09: node on :{p} not ready after restart");
+    }
+    expect_refused(&ports, &mldsa_transfer_signed("own-restart-attacker", &owner, 1, SEED_ATTACKER), "A-09", &owner);
+    expect_success(&ports, &mldsa_transfer_signed("own-restart-owner", &owner, 1, SEED_OWNER), "A-09");
+    expect_refused(&ports, &mldsa_transfer_signed("own-restart-keyless", KEYLESS_ADDR, 0, SEED_ATTACKER), "A-09", KEYLESS_ADDR);
+    println!("✓ A-09: bindings hold after a full restart; all 4 nodes agree");
     let _ = std::fs::remove_dir_all(devnet_dirs());
 }
