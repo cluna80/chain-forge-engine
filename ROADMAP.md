@@ -4,6 +4,18 @@
 
 ---
 
+## Planned Repository Separation — CF-QAT-REPO-001
+
+**Status: PLANNED / NOT AUTHORIZED FOR EXECUTION.** Chain Forge and Qattice will become separate, independently versioned repositories. The existing Chain Forge frontend repository is the intended home of the reusable Rust backend; Qattice will have its own chain-specific repository with a pinned dependency on Chain Forge.
+
+**Normative migration procedure:** [docs/CF-QAT-REPO-001-repository-separation.md](docs/CF-QAT-REPO-001-repository-separation.md). Follow its preconditions, ownership inventory, sequence, acceptance tests, stop conditions and rollback requirements. This document is planning only: **do not migrate source, create/delete repositories, rewrite history, change remotes or modify deployments without a separate explicit go-ahead**.
+
+**Start gate:** Finish and document the 24-suite sweep; fix and regression-test the ML-DSA account-ownership issue; record the Phase 0 current-code baseline and all open failures; inventory crates, existing frontend repo, target repo and in-flight work; back up tags/devnet data. Then request explicit migration authorization. Preserve `v0.1.0-phase0`, `devnet-legacy-2026-10`, the original Phase 0 table and all historical evidence.
+
+**Development priority:** Complete Phase 0, then Phase 0.5, then Phase 1 protocol acceptance. PoCD and other application-layer development are deferred. Repository separation does not itself close any protocol acceptance gate.
+
+---
+
 ## Legend
 
 | Symbol | Meaning |
