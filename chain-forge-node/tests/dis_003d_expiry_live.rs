@@ -439,7 +439,7 @@ fn dis_003d_expiry_live() {
 
     // Read policy_id from account state.
     let acct = account_of(port, PILOT_ADDR).expect("pilot account");
-    let policy_id = acct["policy_id"].as_u64().unwrap_or(0);
+    let policy_id = acct["policy_generation"].as_u64().unwrap_or(0);
     println!("enrolled policy_id = {policy_id}");
 
     // ── F-01: Recovery with expires_at_height: None on all guardians succeeds ─
@@ -475,7 +475,7 @@ fn dis_003d_expiry_live() {
     assert!(enroll2_r["success"].as_bool().unwrap_or(false),
         "re-enroll must succeed: {enroll2_r}");
     let acct2   = account_of(port, PILOT_ADDR).expect("pilot account 2");
-    let policy_id2 = acct2["policy_id"].as_u64().unwrap_or(0);
+    let policy_id2 = acct2["policy_generation"].as_u64().unwrap_or(0);
 
     // ── F-02: Recovery with future expiry succeeds ────────────────────────────
     println!("\n── F-02: Recovery with future expiry ───────────────────────────────");
@@ -511,7 +511,7 @@ fn dis_003d_expiry_live() {
     assert!(enroll3_r["success"].as_bool().unwrap_or(false),
         "re-enroll-3 must succeed: {enroll3_r}");
     let acct3   = account_of(port, PILOT_ADDR).expect("pilot account 3");
-    let policy_id3 = acct3["policy_id"].as_u64().unwrap_or(0);
+    let policy_id3 = acct3["policy_generation"].as_u64().unwrap_or(0);
     let kv4      = acct3["key_version"].as_u64().unwrap_or(0) as u32 + 1;
 
     // ── F-03: Exact boundary — accepted when block_height == expires_at_height ─
@@ -551,7 +551,7 @@ fn dis_003d_expiry_live() {
     assert!(enroll4_r["success"].as_bool().unwrap_or(false),
         "re-enroll-4 must succeed: {enroll4_r}");
     let acct4      = account_of(port, PILOT_ADDR).expect("pilot account 4");
-    let policy_id4 = acct4["policy_id"].as_u64().unwrap_or(0);
+    let policy_id4 = acct4["policy_generation"].as_u64().unwrap_or(0);
     let kv5        = acct4["key_version"].as_u64().unwrap_or(0) as u32 + 1;
 
     // ── F-04: Recovery rejected when expiry < current height ─────────────────
