@@ -643,3 +643,69 @@ fn keygen_never_repeats_a_key() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The ML-DSA devnet must accept the largest guardian recovery the protocol
+/// allows: 10 guardians (MAX_GUARDIANS), each an ML-DSA key plus signature,
+/// in today's JSON transaction encoding. Owner decision 2026-10-30:
+/// `max_tx_bytes` 262144 on the upgraded ML-DSA devnet (mainnet not final).
+#[test]
+fn mldsa_genesis_fits_a_ten_guardian_recovery() {
+    use chain_forge_crypto::{mldsa_tx_prehash, MlDsaScheme, SchemeId, SignatureScheme};
+    use chain_forge_execution::{
+        account_key_rotation_signing_bytes, check_tx, recovery_domain_signing_bytes,
+        GuardianAuth, Transaction, TxBody,
+    };
+
+    let genesis: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(genesis_path(MLDSA.0)).unwrap(),
+    ).unwrap();
+    let chain_id = genesis["chain_id"].as_str().unwrap();
+    let max_tx_bytes = genesis["limits"]["max_tx_bytes"].as_u64().unwrap() as usize;
+    let block_gas_limit = genesis["limits"]["block_gas_limit"].as_u64().unwrap();
+
+    let account = "qcb1alice";
+    let key_version = 1;
+    let policy_id = 1;
+    let new_kp = MlDsaScheme.generate_keypair("recovery-size-new").unwrap();
+    let pop = MlDsaScheme.sign(
+        &account_key_rotation_signing_bytes(chain_id, account, key_version, &new_kp.public_key),
+        &new_kp,
+    ).unwrap();
+    let guardian_signatures: Vec<GuardianAuth> = (0..10).map(|i| {
+        let g = MlDsaScheme.generate_keypair(&format!("recovery-size-guardian-{i}")).unwrap();
+        let msg = recovery_domain_signing_bytes(
+            chain_id, account, key_version, &new_kp.public_key, policy_id, Some(u64::MAX),
+        );
+        GuardianAuth {
+            guardian_public_key: g.public_key.clone(),
+            signature:           MlDsaScheme.sign(&msg, &g).unwrap().bytes,
+            expires_at_height:   Some(u64::MAX),
+        }
+    }).collect();
+    let body = TxBody::RecoverAccountKey {
+        new_public_key: new_kp.public_key.clone(),
+        new_key_scheme: "ml-dsa-65".into(),
+        key_version,
+        pop_signature: pop.bytes,
+        guardian_signatures,
+        policy_id,
+    };
+    let sender = MlDsaScheme.generate_keypair("recovery-size-sender").unwrap();
+    let body_json = serde_json::to_string(&body).unwrap();
+    let sig = MlDsaScheme.sign(&mldsa_tx_prehash(chain_id, body_json.as_bytes()), &sender).unwrap();
+    let tx = Transaction {
+        id: "recovery-size".into(), sender: account.into(), nonce: 1, body,
+        gas_limit: 800_000,
+        signature: vec![], public_key: vec![],
+        pq_signatures: vec![format!("mldsa65:{}",
+            sig.bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())],
+        sig_scheme: Some(SchemeId::MlDsa),
+        pq_public_key: sender.public_key.clone(),
+    };
+
+    let size = serde_json::to_vec(&tx).unwrap().len();
+    println!("10-guardian ML-DSA recovery: {size} bytes; genesis max_tx_bytes {max_tx_bytes}");
+    assert!(size > 65_536, "the old 64 KiB limit is what this guards against");
+    check_tx(&tx, max_tx_bytes, block_gas_limit)
+        .unwrap_or_else(|e| panic!("{} must fit a 10-guardian recovery: {e}", MLDSA.0));
+}
