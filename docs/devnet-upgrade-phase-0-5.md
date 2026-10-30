@@ -1,7 +1,7 @@
 # Devnet upgrade: Phase 0.5 security stack
 
 Status: **procedure for review.** Nothing in it has been run against the live devnet.
-Applies to: merging the Phase 0.5 stack (#14 → #30, #32, #33, plus #16 and #19) into `main`.
+Applies to: merging the Phase 0.5 stack (#14 → #30, #32 → #34, plus #16 and #19) into `main`.
 Principle (owner, 2026-10-29): **preserve the existing devnet.** The upgraded network runs as a separate, new chain next to it. Nothing is deleted, and pilot identities are re-enrolled only with each owner's explicit confirmation.
 
 ---
@@ -21,6 +21,7 @@ The stack changes consensus and block formats. Old and new binaries cannot run o
 | Consensus keys | Ed25519 or ML-DSA-65 by key length; ML-DSA-only genesis supported (#24) | Genesis keys must be exactly 32 or 1952 bytes |
 | Slashing | Equivocation slashed only from committed evidence (#26) | Changes state roots when evidence is included |
 | Rewards | Epoch rewards from committed evidence; one minimum bond (#20) | Different state roots from the old chain |
+| Block size | Proposals limited to `max_block_bytes`; larger ones are rejected (#34) | A new validity rule |
 | Execution | H0-5 atomicity and fee conservation (#15); DIS-003 recovery security (#13 via #28) | Different transaction outcomes and state roots |
 | Keys | Wallet and `qcb-keygen` keys come from the OS RNG (#27) | See §5: some existing keys must be replaced |
 
