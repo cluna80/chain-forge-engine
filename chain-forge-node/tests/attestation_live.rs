@@ -443,6 +443,26 @@ async fn attestation_guard_live() {
         "Attest was not queued: {attest_resp}"
     );
 
+    // Wait for the first Attest to commit (Bob's nonce must advance to 1).
+    // This is critical: Phase 6's duplicate-attest guard can only fire if the
+    // first Attest is committed BEFORE the duplicate is submitted. Without this
+    // wait, the duplicate may reach the node with the same nonce as the first
+    // Attest (both nonce=0), one wins the race, the other is rejected by the
+    // nonce guard — masking the duplicate-attest guard entirely.
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let nonce: u64 = api_get(ports.bob_api, "/api/accounts/qcb1bob")
+                .and_then(|v| v["nonce"].as_u64())
+                .unwrap_or(0);
+            if nonce >= 1 { break; }
+            assert!(Instant::now() < deadline,
+                "first Attest from qcb1bob did not commit within 30s (nonce stuck at 0)");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    println!("   [phase3] First Attest from qcb1bob confirmed committed (bob nonce=1).");
+
     // ── Phase 4: Wait for convergence across all four nodes ───────────────
     // The key assertion: identity must be visible from every node's API,
     // not just the node that received the transaction. If it only shows on

@@ -102,8 +102,38 @@ fn node_bin() -> PathBuf {
     }
 }
 
-fn genesis_path() -> PathBuf {
+fn genesis_template_path() -> PathBuf {
     manifest_dir().join("tests").join("devnet").join("genesis-dis003b.json")
+}
+
+/// Write a patched copy of the genesis with the live pilot public key injected.
+///
+/// Because `dilithium3::keypair()` is randomised per process, we cannot store a
+/// static genesis key.  Instead we generate the pilot keypair at test startup,
+/// patch the genesis, and pass the temp file to each node.
+fn write_genesis_with_pilot_key(pilot_pubkey: &[u8]) -> PathBuf {
+    let hex: String = pilot_pubkey.iter().map(|b| format!("{b:02x}")).collect();
+    let template = std::fs::read_to_string(genesis_template_path())
+        .expect("read genesis template");
+    let mut genesis: serde_json::Value = serde_json::from_str(&template)
+        .expect("parse genesis template");
+
+    // Find the qcb1pilot entry and set its public_key.
+    let accounts = genesis["genesis_accounts"]
+        .as_array_mut()
+        .expect("genesis_accounts array");
+    let pilot = accounts.iter_mut()
+        .find(|a| a["address"].as_str() == Some("qcb1pilot"))
+        .expect("qcb1pilot account in genesis");
+    pilot["public_key"] = serde_json::Value::String(hex);
+
+    let out = std::env::temp_dir()
+        .join("dis003b_guardian_devnet")
+        .join("genesis-live.json");
+    std::fs::create_dir_all(out.parent().unwrap()).ok();
+    std::fs::write(&out, serde_json::to_string_pretty(&genesis).unwrap())
+        .expect("write patched genesis");
+    out
 }
 
 fn key_file(label: &str) -> PathBuf {
@@ -121,14 +151,15 @@ struct NodeHandle { #[allow(dead_code)] name: String, process: Child }
 impl Drop for NodeHandle { fn drop(&mut self) { let _ = self.process.kill(); } }
 
 fn spawn_node(name: &str, api: u16, p2p: u16, log_dir: &PathBuf,
-              peers: &[u16], key_file_path: Option<PathBuf>) -> NodeHandle {
+              peers: &[u16], key_file_path: Option<PathBuf>,
+              genesis: &PathBuf) -> NodeHandle {
     let log_file = std::fs::File::create(log_dir.join(format!("{name}.log")))
         .expect("create log");
     let data_dir = devnet_dirs().join("data").join(name);
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
     let mut cmd = Command::new(node_bin());
-    cmd.arg("--genesis").arg(genesis_path())
+    cmd.arg("--genesis").arg(genesis)
        .arg("--validator").arg(name)
        .arg("--api-port").arg(api.to_string())
        .arg("--p2p-port").arg(p2p.to_string())
@@ -141,7 +172,7 @@ fn spawn_node(name: &str, api: u16, p2p: u16, log_dir: &PathBuf,
     NodeHandle { name: name.to_string(), process }
 }
 
-fn spawn_devnet(ports: &Ports) -> [NodeHandle; 4] {
+fn spawn_devnet(ports: &Ports, genesis: &PathBuf) -> [NodeHandle; 4] {
     let base = devnet_dirs();
     let log_dir = base.join("logs");
     std::fs::create_dir_all(&log_dir).expect("create log dir");
@@ -151,13 +182,13 @@ fn spawn_devnet(ports: &Ports) -> [NodeHandle; 4] {
     };
     [
         spawn_node("qcb1alice", ports.alice, ports.alice_p2p, &log_dir,
-            &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice")),
+            &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p], kf("alice"), genesis),
         spawn_node("qcb1bob",   ports.bob,   ports.bob_p2p,   &log_dir,
-            &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob")),
+            &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p], kf("bob"), genesis),
         spawn_node("qcb1carol", ports.carol, ports.carol_p2p, &log_dir,
-            &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol")),
+            &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p], kf("carol"), genesis),
         spawn_node("qcb1dave",  ports.dave,  ports.dave_p2p,  &log_dir,
-            &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave")),
+            &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p], kf("dave"), genesis),
     ]
 }
 
@@ -321,11 +352,18 @@ fn send_wait(port: u16, tx: &Transaction, label: &str) -> serde_json::Value {
 fn dis_003b_guardian_update() {
     let _ = std::fs::remove_dir_all(devnet_dirs());
 
+    // Generate the pilot keypair first so we can embed the public key in genesis.
+    // dilithium3::keypair() is randomised per process; we cannot use a static key.
+    let pilot_kp = MlDsaScheme.generate_keypair(SEED_A).expect("pilot keygen");
+    let genesis = write_genesis_with_pilot_key(&pilot_kp.public_key);
+    eprintln!("  [+] pilot pubkey: {} bytes, genesis written to {:?}",
+              pilot_kp.public_key.len(), genesis);
+
     let ports = Ports::new();
     eprintln!("\n=== DIS-003B: Guardian Policy Updates and Compromise Resistance ===");
     eprintln!("    alice={} bob={} carol={} dave={}", ports.alice, ports.bob, ports.carol, ports.dave);
 
-    let _nodes = spawn_devnet(&ports);
+    let _nodes = spawn_devnet(&ports, &genesis);
     let all = ports.all();
 
     for (i, &p) in all.iter().enumerate() {
@@ -498,7 +536,7 @@ fn dis_003b_guardian_update() {
     let ports2 = Ports::new();
     eprintln!("  Restarting: alice={} bob={} carol={} dave={}",
         ports2.alice, ports2.bob, ports2.carol, ports2.dave);
-    let _nodes2 = spawn_devnet(&ports2);
+    let _nodes2 = spawn_devnet(&ports2, &genesis);
     let all2 = ports2.all();
 
     for (i, &p) in all2.iter().enumerate() {
@@ -576,3 +614,4 @@ fn dis_003b_guardian_update() {
     eprintln!("  policy_generation: {}", pgen_all[0]);
     eprintln!("  key_version: {}", acct["key_version"].as_u64().unwrap_or(0));
 }
+
