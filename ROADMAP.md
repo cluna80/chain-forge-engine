@@ -150,7 +150,8 @@ Nothing merges until these pass and the owner reviews the combined tree. All PRs
 | `pocd_reward_live` follows H0-5 nonce semantics (found by the candidate run) | #30 | ✅ Windows-confirmed |
 | API: explicit 413 for oversized requests; body limit = genesis `max_tx_bytes`; DIS-003D test genesis 256 KiB; `dis_003d_expiry_live` F-00..F-08 | #32 | ✅ Windows-confirmed (2026-10-30) |
 | ML-DSA devnet genesis `max_tx_bytes` 262144 (owner decision 2026-10-30) + 10-guardian recovery size test | #33 | ✅ Windows-confirmed (2026-10-30): devnet_4node 6/6 (10-guardian recovery 221,105 bytes; partition tests skip without iptables) |
-| Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30 + #16 + #19 | #31 | ✅ Windows-confirmed: 24/24 crates, node 257, all live acceptance tests (2026-10-30); ready for owner review |
+| **Security (liveness): proposals stay within `max_block_bytes`.** Every proposal carried the whole mempool; a burst of large txs outgrew the 16 MB gossip limit and stalled finality (reproduced: 25 × 221 KB recoveries stalled a 4-node devnet at height 3). Proposer takes the fitting mempool prefix; validators reject oversized payloads. Live `max_block_live` M-01..M-05 | #34 | Sandbox ✅ (Ed25519 and ML-DSA keys); Windows pending |
+| Integration candidate `integration/phase-0-5-candidate` = `main` + #14→#30, #32→#34 + #16 + #19 | #31 | ✅ Windows-confirmed: 24/24 crates, node 257, all live acceptance tests (2026-10-30); ready for owner review |
 | Devnet upgrade procedure (preserve the legacy devnet; new chain side by side) | `docs/devnet-upgrade-phase-0-5.md` | draft for review |
 
 **First follow-up after the merge: P2P reconnection.** With `peer_discovery: "bootstrap"` a node dials its bootstrap peers once and never reconnects; failed dials and unparseable bootstrap addresses are silently ignored (unchanged from `main`). Found while explaining one ML-DSA `consensus_safety_live` stall during a ~99-minute machine suspend (rerun 3/3; sandbox 15/15; a 5–10 minute sleep test recovered).
@@ -175,6 +176,12 @@ Known failing live tests that **also fail on `main`** (not caused by the stack):
 ### Other follow-ups
 - ⬜ `attestation_guard_live` registers an unfunded account that ingress now rejects (test fix).
 - ⬜ Genesis-hash peer agreement (H0-8); per-tx identity/agent clone performance.
+- ⬜ `block_gas_limit` is enforced per tx at ingress but not per block (found with #34).
+- ⬜ `mempool_ttl_seconds` is not enforced (found with #34).
+- ⬜ A failed proposal publish is silently ignored (`let _ = network.publish`); log it (found with #34).
+- ⬜ Mainnet `max_tx_bytes` / `max_block_bytes`: not decided. Review mempool admission, block capacity, execution cost and resource exhaustion first.
+- ⬜ After the merge (owner, 2026-10-30): enforce ML-DSA-only user tx authentication on ML-DSA-only chains; retire the Ed25519 fallback devnet once nothing depends on it; mark the superseded Ed25519 devnet sections below.
+- ⬜ Partition recovery is only exercised where iptables is available (skipped on Windows); run it on Linux with the P2P work.
 
 ---
 
