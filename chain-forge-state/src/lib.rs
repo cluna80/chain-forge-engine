@@ -89,6 +89,12 @@ pub struct AccountState {
     /// account holder while they still control the signing key.
     #[serde(default)]
     pub recovery_policy: Option<RecoveryPolicy>,
+    /// DIS-003A: monotonically increasing generation counter. Incremented on
+    /// every EnrollRecoveryPolicy; never reset, not even after revocation.
+    /// Ensures old guardian signatures cannot be replayed under a re-enrolled
+    /// policy that happens to share the same guardian set.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// An enrolled threshold-guardian recovery policy for lost-device recovery.
@@ -104,6 +110,13 @@ pub struct RecoveryPolicy {
     /// is only valid if `account.key_version == enrolled_at_key_version`,
     /// preventing a stale policy from being used after a legitimate rotation.
     pub enrolled_at_key_version: u32,
+    /// DIS-003A: the policy_generation value at enrollment time. A
+    /// `RecoverAccountKey` tx must carry the matching policy_id.
+    /// Defaults to 0 for policies persisted before DIS-003; 0 is never issued
+    /// by enrollment (generations start at 1), so a legacy policy is replaced
+    /// by a distinct generation on the next enrollment.
+    #[serde(default)]
+    pub policy_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +138,7 @@ impl AccountState {
             key_version: 0,
             escrow: None,
             recovery_policy: None,
+            policy_generation: 0,
         }
     }
 
@@ -142,6 +156,7 @@ impl AccountState {
             key_version: 0,
             escrow: None,
             recovery_policy: None,
+            policy_generation: 0,
         }
     }
 
@@ -242,11 +257,14 @@ impl AccountState {
             parts.push(format!("escrow={}", serde_json::to_string(binding).unwrap()));
         }
         if let Some(rp) = &self.recovery_policy {
-            // Include a compact summary so policy enrollment/revocation affects
-            // the state root and is visible to all nodes.
+            // Include policy_id so replacement policies produce distinct state roots.
             parts.push(format!(
-                "recovery=t{}/{}/{}", rp.threshold, rp.guardians.len(), rp.enrolled_at_key_version
+                "recovery=t{}/{}/{}/pid{}", rp.threshold, rp.guardians.len(),
+                rp.enrolled_at_key_version, rp.policy_id
             ));
+        }
+        if self.policy_generation > 0 {
+            parts.push(format!("pgen={}", self.policy_generation));
         }
         parts.join("|").into_bytes()
     }
@@ -1240,5 +1258,33 @@ mod tests {
         assert_eq!(snap.metadata.get("crypto_migration:active").map(String::as_str),
             Some(r#"{"cutoff":100}"#),
             "commit snapshot must carry metadata");
+    }
+
+    // DIS-003A compatibility: state persisted before DIS-003 has recovery
+    // policies without `policy_id` and accounts without `policy_generation`.
+    // Such state must still load (persist/state.json is plain serde JSON).
+    #[test]
+    fn legacy_recovery_policy_without_policy_id_deserializes() {
+        let legacy = r#"{"guardians":[[1,2,3]],"threshold":1,"enrolled_at_key_version":0}"#;
+        let p: RecoveryPolicy = serde_json::from_str(legacy)
+            .expect("pre-DIS-003 RecoveryPolicy JSON must deserialize");
+        assert_eq!(p.policy_id, 0, "legacy policy defaults to policy_id 0");
+        assert_eq!(p.threshold, 1);
+    }
+
+    #[test]
+    fn legacy_account_with_recovery_policy_roundtrips_through_snapshot_json() {
+        let mut acct = AccountState::new("qcb1legacy".into(), "user".into());
+        acct.recovery_policy = Some(RecoveryPolicy {
+            guardians: vec![vec![9; 4]], threshold: 1, enrolled_at_key_version: 0, policy_id: 0,
+        });
+        // Strip the DIS-003 fields to reproduce a pre-DIS-003 state.json entry.
+        let mut v = serde_json::to_value(&acct).unwrap();
+        v.as_object_mut().unwrap().remove("policy_generation");
+        v["recovery_policy"].as_object_mut().unwrap().remove("policy_id");
+        let restored: AccountState = serde_json::from_value(v)
+            .expect("pre-DIS-003 account JSON must deserialize");
+        assert_eq!(restored.policy_generation, 0);
+        assert_eq!(restored.recovery_policy.unwrap().policy_id, 0);
     }
 }

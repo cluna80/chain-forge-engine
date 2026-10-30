@@ -17,6 +17,50 @@
 ---
 ### The name is Qattice, changed from QCB but still uses $QCB as the token to the ecosystem.
 
+---
+
+## Qattice LLC — Business Activation (Future Milestone)
+
+> **What:** Formally activate Qattice LLC as a U.S. software engineering company. The LLC is the legal entity that owns all IP, signs government contracts, holds SBIR awards, and enters commercial agreements. The company builds three core products: **Chain Forge** (modular blockchain creation platform), **Qattice** (the first production chain built with Chain Forge), and **DIS** (post-quantum cryptographic identity enforcement for regulated contracts and high-security systems).
+>
+> **One-line description (SAM.gov / SBIR / contracts):**
+> *Qattice LLC is a software engineering company building post-quantum blockchain infrastructure, modular distributed computing platforms, and cryptographic identity systems for regulated contracts and decentralized applications.*
+>
+> **Status:** 🔲 Locked — activate when prerequisite tracks reach completion gates below.
+
+### Activation Prerequisites
+
+| # | Track | Required completion gate | Status |
+|---|-------|--------------------------|--------|
+| BIZ-PRE-1 | **Phase 0.5 — Protocol Hardening** | H0-5 (execution rollback) and H0-7 (supply conservation) confirmed locally | 🔲 |
+| BIZ-PRE-2 | **DIS — Account Security and Recovery** | DIS-003D and DIS-003E confirmed locally on Windows/MINGW64 | 🔲 |
+| BIZ-PRE-3 | **DIS Standalone Product** | Independent cryptographic review gate passed (currently marked ⚠️ return before production on DIS-CORE-001, DIS-PQ-001, DIS-PRIV-001) | 🔲 |
+| BIZ-PRE-4 | **FeeSponsor** | FS-03 live authorization complete (SponsorAuthorization wired into execution path) | 🔲 |
+| BIZ-PRE-5 | **Validator Onboarding** | Validator eviction policy decided and implemented (H0-11) | 🔲 |
+
+> All five gates do not need to close simultaneously. BIZ-PRE-1 and BIZ-PRE-2 are the minimum viable gates — the company can be formed and SAM.gov registration started in parallel with engineering, but active SBIR pursuit requires a demonstrable post-quantum identity capability (DIS-003D/E complete) and a provably correct state machine (H0-5/H0-7 confirmed).
+
+### Business Activation Checklist (when prerequisites met)
+
+| Step | Action | Notes |
+|------|--------|-------|
+| CORP-1 | Form Qattice LLC in home state | Sole member LLC; ~$50–150 state filing fee |
+| CORP-2 | Register on SAM.gov — obtain UEI | Takes 1–2 weeks; required before any federal contract or SBIR submission |
+| CORP-3 | Register on SBIR.gov using UEI | Unlocks submission to all 11 SBIR agencies including Army |
+| CORP-4 | File NAICS codes: 541511 (Custom Computer Programming), 541519 | Primary codes for software engineering company |
+| CORP-5 | Prepare technical capability statement | 1-page: Chain Forge + Qattice + DIS, framed for Army MOSA open-architecture requirement |
+| CORP-6 | Monitor Army SBIR topic releases at armysbir.army.mil | Army releases topics several times per year; Phase I window ~30–60 days |
+| CORP-7 | Submit Phase I proposal | Target: post-quantum machine/operator identity for MOSA-compliant defense platforms |
+
+### Defense Market Positioning
+
+**Primary SBIR pitch:** Post-quantum machine and operator identity for MOSA-compliant defense platforms — DIS as a drop-in ML-DSA-65 authentication module that any open-architecture defense system can integrate.
+
+**Secondary (Phase II expansion):** Chain Forge Secure Compute — private, verifiable distributed computing for defense research laboratories and contractors, with DIS authorization, PoCD verification, and signed execution receipts.
+
+**Relevant Army priorities (per Secretary Driscoll, 2026):** Modular open-system architecture software, next-gen sensors and software payloads, resilient logistics, and advanced manufacturing — Qattice targets the software and identity layer of that stack.
+
+---
 
 ## DIS Standalone Product — Keystone Identity and Authorization (Planned)
 
@@ -39,8 +83,7 @@
 | **DIS-SEC-001 — Assurance and adversarial validation** | ✅ Complete v0.1 | 33 labeled attack scenarios in `dis-core/tests/adversarial.rs`: signature forgery, replay, cross-RP challenge, wrong audience, scope injection, revocation, key rotation, downgrade, delegation chain abuse (depth overflow, scope widening, expired links, max_uses exhaustion, forged delegation sigs, human-approval bypass), stolen-device recovery. All 33 pass. **Full pre-merge validation (2026-10-21):** 104 tests across all DIS crates — 35 `dis-core` unit, 33 adversarial, 16 `dis-vendor-server` unit, 20 `dis-vendor-server` integration, 0 failures; conformance vectors verified (no encoding drift). Return gates in `docs/DIS-SEC-001-adversarial-validation.md`. |
 | **DIS-COM-001 — Commercialization readiness** | ✅ Complete v0.1 | Open-core licensing: `dis-core` + `dis-sdk` under MIT (see `LICENSE`); `dis-vendor-server` under BUSL-1.1 converting to Apache-2.0 on 2030-01-01 (see `dis-vendor-server/LICENSE`); split documented in `LICENSE.md`. Revenue path: hosted DIS service + enterprise self-host licenses. Remaining: trademark/prior-art review, formal pricing, pilot customer agreements. |
 | **DIS-PILOT-001 — Real-device identity pilot (4 nodes, Verified tier)** | ✅ Complete (2026-10-25) | All 4 pilot device identities — BossKing, Laptop, Phone (Galaxy A15), King-OptiPlex-990 — reached **Verified** tier on the chain-forge devnet node (`qcb-testnet-4node`). Each pilot holds an ML-DSA-65 key (`qcb1pq…` address); ML-DSA-65 identity verification is fully independent of the Ed25519 consensus keys required by genesis validators (pilots registered as `role: "user"`). Bootstrap mechanism: `ATTESTATION_QUORUM` lowered to 1 (from 3) so Alice's single attestation satisfies quorum; `ATTESTATION_CAP_PER_WINDOW` raised to 10 (from 3) to allow Alice to attest all 4 pilots within one rolling window. Key findings: (1) `RegisterIdentity` body must be the string `"RegisterIdentity"` (Rust unit enum variant, not a map); (2) each pilot account has an independent nonce starting at 0; (3) Alice's sequential nonces 0–3 cover all 4 attestations; (4) Qattice wallet UI reflects Verified tier after a page refresh (node state overrides cache). All 4 wallets confirmed Verified across BossKing, Laptop, Phone, and King-OptiPlex-990. Commits: `fcf839d` (lower quorum to 1, revert pilot roles to user), `e59c776` (raise attestation cap to 10). |
-| **DIS-002B — Identity Continuity, Device Migration, and Recovery** | ✅ Complete (2026-10-26) | **Path 1 (authorized migration) — B-01 through B-08 confirmed passing on Windows/MINGW64 (`krizz@BossKing`).** All 8 acceptance cases verified in `dis_002b_migration_live` (34.66 s, 4-node devnet): (B-01) Verified pilot identity `qcb1pilot` migrated Key_A → Key_B via `RotateAccountKey`; (B-02) identity ID and account address unchanged; (B-03) `tier=Verified`, `attestation_count=1`, `attested_by=["qcb1bob"]` — all unchanged; (B-04) nonce=2, balance decreased by gas only (49 994 590 uqcb); (B-05) Key_B signed and finalized a transfer; (B-06) Key_A rejected ("ML-DSA signature verification failed for key 05175c…"); (B-07) replayed migration tx rejected (nonce consumed); (B-08) unauthorized rotation attempt (attacker's outer signature) rejected. All 4 nodes converged on state root `d5fe2db4…` and show `tier=Verified`. Bootstrap: disposable `qcb1pilot` identity registered with ML-DSA Key_A (`RegisterIdentity` + Ed25519-signed `Attest` from `qcb1bob` key file). **Path 2 (lost-device recovery) — B-09 through B-13 confirmed passing on Windows/MINGW64 (`krizz@BossKing`).** All 5 acceptance cases verified in `dis_002b_recovery_live` (32.00 s, 4-node devnet, commit `a1fba71`): (B-09) `RecoverAccountKey` with valid 2-of-3 guardian threshold succeeded (`height=3`, `success=true`, `key_version=1`); new recovery key immediately functional for transfers; (B-10) 1-of-3 guardian sig attempt (below threshold=2) correctly rejected; (B-11) forged guardian public key attempt rejected by executor; (B-12) all 4 nodes restarted from persisted `--data-dir` snapshots — `key_version=1` survived restart, post-restart transfer with recovery key succeeded; (B-13) all 4 nodes converged on identical state root (`2e532f63…`), `key_version=[1,1,1,1]`, `tier=["Verified","Verified","Verified","Verified"]`. New TxBody variants: `EnrollRecoveryPolicy`, `RecoverAccountKey`; new struct: `GuardianAuth`; new function: `recovery_domain_signing_bytes()` (domain `CFREC|`). `RecoveryPolicy` persisted on `AccountState`. `AccountSummary` now exposes `key_version`. Spec: `docs/DIS-002B-IDENTITY-CONTINUITY.md`. Branch: `feature/dis-002b-identity-continuity`. |
-| **DIS-002A — Authenticated Account Key Rotation** | ✅ Complete (2026-10-25) | End-to-end `RotateAccountKey` transaction path proven on a 4-node devnet. All 9 acceptance cases confirmed passing on Windows/MINGW64 (`dis_002a_key_rotation_live`): (A) Key_A → Key_B rotation succeeds; (B) address, nonce, and balance unchanged post-rotation; (C) old Key_A rejected after rotation; (D) new Key_B accepted for subsequent txs; (E) rotation replay (same nonce) rejected; (F) stale `key_version` rejected; (G) unauthorized rotation (wrong outer signer) rejected; (H) invalid proof-of-possession rejected; (I) all 4 nodes agree on state root `4113853e…`. Three bugs fixed: (1) gossipsub `max_transmit_size` defaulted to 64 KB — block proposals containing `RotateAccountKey` txs expand ~3× when `tx_data: Vec<u8>` is JSON-serialized as an integer array (~73 KB), causing the proposal to be silently dropped; fixed with `.max_transmit_size(16 * 1024 * 1024)` (`chain-forge-p2p`). (2) `MLDSA65_PK_BYTES` constant was `2592` (ML-DSA-87) instead of `1952` (ML-DSA-65 / Dilithium3) (`chain-forge-execution`). (3) `pqcrypto_dilithium::dilithium3::keypair()` is non-deterministic; the seed was ignored, so `generate_keypair(SEED_A)` produced a different key on each call — the key bound in A-1 would not match the key used to sign A-2; fixed with an in-process OnceLock cache in `chain-forge-crypto`. Commits: `243fb5e` (p2p + execution fixes), `8d3bc96` (crypto cache fix). Branch: `feature/dis-002a-key-rotation`. |
+| **DIS-002A / DIS-002B / DIS-003 — Qattice on-chain account security** | ➡ See Phase 1 → *Digital Identity Stone — Account Security and Recovery* | DIS-002A (key rotation), DIS-002B (recovery), DIS-003A–E (security hardening) are Protocol Phase 1 milestones; full records live in the Phase 1 section below. |
 
 **First demonstration (DIS-KS-002):** Install a DIS-enabled Qattice Android devnet wallet; connect to three separately operated mock vendors; assign different rights; authenticate with locally held ML-DSA keys; revoke one vendor without impacting the others; rotate/recover the key while preserving authorized continuity; reject old-key signatures, cross-vendor credential reuse, and replay. Measure integration time, latency, privacy leakage, and revocation propagation against reference standards.
 
@@ -277,11 +320,95 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 
 ---
 
+## Phase 0.5 — Protocol Hardening and Integration
+
+> **Chain Forge vs. Qattice:** Chain Forge is the blockchain creation platform and framework. Qattice is the first independent Layer-1 blockchain being built with it. Phase 0.5 hardening work therefore has two layers: (1) the reusable Chain Forge engine — transaction atomicity, deterministic execution, state persistence, consensus interfaces — and (2) Qattice-specific validation through its own 4-node devnet, post-quantum transactions, identity system, monetary rules, and PoCD mining. Improvements to Chain Forge's engine benefit every future chain built on the platform. The acceptance tests are Qattice-specific because Qattice is the live implementation.
+
+> **Purpose:** This is a security-hardening gate, not a feature phase. Phase 0 proved that Qattice works under cooperative conditions. Phase 0.5 proves it holds under adversarial ones. This phase runs **in parallel** with selective Phase 1 work; however, the protocol blockers listed below must be resolved before any Phase 1 milestone that depends on the affected subsystem can be closed.
+>
+> **How milestones close:** Same rule as Phase 0 — implementation **and** a passing adversarial acceptance test confirmed locally on Windows/MINGW64. Passing in sandbox only is not sufficient.
+
+### Recommended Execution Order
+
+| Priority | Criterion | Rationale |
+|----------|-----------|-----------|
+| **1st** | **H0-5 — Execution rollback** | Most fundamental question about the Chain Forge state machine: can a failed transaction leave behind unauthorized state mutations? Transaction atomicity must be provably correct before building on top of it. |
+| **2nd** | **H0-7 — Supply conservation** | Verify the monetary rules: fees, burns, PoCD rewards, and transfers must follow the correct conservation law. Note: the correct invariant is `S_after = S_before + I - B` where `I` is authorized issuance and `B` is authorized burning — `S_after == S_before` is only valid for blocks with no mint or burn events. |
+| **3rd** | **H0-9 — Test harness repair** | Restore reliable large-transaction testing (needed for DIS-003D/E). Can run in parallel with H0-5 since it is a harness infrastructure problem, not a protocol change. |
+
+**H0-5 acceptance criteria (Qattice 4-node, Chain Forge atomicity gate):**
+
+1. **Mid-tx failure:** Force a failure after an earlier state mutation; verify none of that tx's intended state changes persist anywhere in the state store.
+2. **Balance protection:** Failed transfers, treasury operations, and fee sponsorship must not leave partial debits or credits on any account.
+3. **Identity protection:** Failed account-key rotation or recovery must not modify authorized keys, policy generations, or identity state.
+4. **Nonce and fee semantics:** Verify the distinction between a *rejected* tx (never included in a block — nonce not consumed) and an *included-but-failed* tx (in the block, nonce consumed, fee charged, zero other state changes). Both cases must be tested.
+5. **Cross-node determinism:** All four validators agree on the final state root after the adversarial tx sequence.
+6. **Restart persistence:** Restart all four nodes; verify no partial mutation reappears from disk.
+
+### Exit Criteria
+
+| # | Domain | Invariant / Test required | Status |
+|---|--------|--------------------------|--------|
+| H0-1 | Consensus safety | No two nodes finalize conflicting blocks at the same height under any validator failure pattern within f=1 | 🔲 |
+| H0-2 | State determinism | All nodes produce identical state roots after processing the same tx sequence regardless of arrival order | 🔲 |
+| H0-3 | Crash recovery | Node state is consistent with the canonical chain after an unclean shutdown at any block height | 🔲 |
+| H0-4 | Nonce / replay | Nonce wrap-around and duplicate txs across blocks are rejected with zero partial state change | 🔲 |
+| H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | 🔲 |
+| H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
+| H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
+| H0-8 | Chain-ID isolation | A committed block from chain A cannot be replayed against chain B even with matching height and validator set | 🔲 |
+| H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` passes locally on Windows/MINGW64 — fix `submit_tx` returning null for ~77 KB recovery tx bodies | 🔴 Blocked (see DIS-003D entry in Phase 1) |
+| H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | 🔲 Blocked on H0-9 |
+| H0-11 | Validator eviction | Product decision on eviction policy recorded (are genesis validators exempt forever or swept on first outbid?); decision implemented and tested | 🔲 |
+| H0-12 | Governance quorum | >3% turnout for ordinary votes, >6% for constitutional changes — implemented, wired to `VoteOnProposal`, and adversarially tested | 🔲 |
+
+### Protocol Blockers
+
+The following open items in Phase 0.5 block specific Phase 1 milestones. Phase 1 work that does **not** touch these subsystems may continue in parallel.
+
+| Blocker | Blocks |
+|---|---|
+| H0-9 / H0-10 — DIS-003D/E confirmation | DIS-003E, QCB-KR-001 multisig key lifecycle |
+| H0-5 — Execution rollback guarantee | FeeSponsor live authorization (FS-03 follow-on); any multi-step tx type |
+| H0-11 — Validator eviction decision | Validator Onboarding section marked complete |
+| H0-12 — Governance quorum | `ProposeChange` / `VoteOnProposal` / `ActivateChange` in any production tx flow |
+
+### What Is NOT in Scope for Phase 0.5
+
+- ZK block proving (QCB-ZKP-001) — long-horizon research, independent of foundation hardening
+- EVM precompile layer — Phase 5+
+- Libp2p PQ transport (CS-001-L3) — follows upstream
+- QSWIP standard — proposed, not protocol-blocking
+
+### Relationship to Phase 0
+
+Phase 0 milestones remain closed. Phase 0.5 adds adversarial coverage on top of the cooperative devnet acceptance tests already confirmed in Phase 0. Nothing is reopened; the completed work is the baseline that Phase 0.5 tests against.
+
+---
+
 ## Phase 1 — Personhood-Weighted BFT + Resource Market Foundation
 
 **Goal**: Consensus power tied to verified human identity, not raw stake. Resource market hardened with provider reputation, dispute resolution skeleton, and multi-provider discovery. Charmed Agent identity/budget primitive live.
 
 **Prerequisite**: Phase 0 complete — includes cross-machine resource purchase acceptance test passing.
+
+### Digital Identity Stone (DIS) — Account Security and Recovery
+
+> On-chain protocol milestones for Qattice account key lifecycle, guardian-based recovery,
+> and recovery security hardening. These are distinct from the standalone DIS protocol
+> (see the *DIS Standalone Product* section above), which targets vendor-independent identity
+> across multiple systems. These milestones prove the account security properties of the
+> Qattice chain itself, independent of any wallet or vendor integration.
+
+| Milestone | Status | Acceptance summary |
+|---|---|---|
+| **DIS-002A — Authenticated Account Key Rotation** | ✅ Complete (2026-10-25) | 9 live acceptance cases confirmed on Windows/MINGW64 (`dis_002a_key_rotation_live`): rotation succeeds; address/nonce/balance unchanged; old key rejected; new key accepted; replay rejected; stale key_version rejected; unauthorized rotation rejected; invalid PoP rejected; 4-node state root convergence `4113853e…`. Branch: `feature/dis-002a-key-rotation`. |
+| **DIS-002B — Identity Continuity, Device Migration, and Recovery** | ✅ Complete (2026-10-26) | 13 live acceptance cases confirmed on Windows/MINGW64 (`dis_002b_migration_live` + `dis_002b_recovery_live`): Path 1 (authorized migration, B-01..B-08) — key rotation, identity unchanged, old key rejected, replay rejected; Path 2 (lost-device recovery, B-09..B-13) — 2-of-3 guardian threshold, below-threshold rejected, forged guardian rejected, restart persistence, 4-node convergence. Branch: `feature/dis-002b-identity-continuity`. |
+| **DIS-003A — Recovery-Policy Lifecycle Security** | ✅ Complete (2026-10-26) | 8 live acceptance cases confirmed on Windows/MINGW64 (`dis_003a_policy_lifecycle_live`, 38.72 s): `policy_id` counter prevents guardian-sig replay across policy generations; `RevokeRecoveryPolicy` clears policy with monotone generation counter; 4-node convergence `97255bd9…`. |
+| **DIS-003B — Guardian Policy Updates and Compromise Resistance** | ✅ Complete (2026-10-26) | 9 live acceptance cases confirmed on Windows/MINGW64 (`dis_003b_guardian_update_live`, 37.88 s): `UpdateGuardianPolicy` replaces guardian set, increments generation; removed guardian rejected post-update; `policy_generation=4` survived 4-node full restart; convergence `3d49fa98…`. |
+| **DIS-003C — Cross-Chain / Cross-Account Replay Protection** | ✅ Complete (2026-10-26) | 8 live acceptance cases confirmed on Windows/MINGW64 (`dis_003c_replay_attack_live`, 42.74 s): guardian sigs and PoP bound to `(chain_id, account, key_version, new_pk)` tuple; cross-chain, cross-account, stale key_version, wrong-pk, and wrong-PoP attacks all rejected; 4-node convergence `b86fb2e9…`. |
+| **DIS-003D — Recovery Authorization Expiry** | 🔴 Blocked — test harness bug | `expires_at_height: Option<u64>` in `GuardianAuth`; executor logic complete and verified in sandbox. **Local test (`dis_003d_expiry_live`) currently fails with a test-harness infrastructure issue, not a protocol bug.** Root cause under investigation: `submit_tx` returns `null` for the F-01 recovery tx (the enroll tx immediately before it succeeds). Two causes fixed so far — wrong `key_version` in F-01 (`nonce+1` instead of `account.key_version+1`) and `http_raw` read timeout too short (3 s → 15 s) — but `submit_tx` still returns `null`. Likely cause: the ~77 KB recovery tx body (ML-DSA guardian signatures + PoP serialised as JSON arrays of integers) exceeds what the raw TCP+HTTP/1.0 client in the test harness can write or the node can receive in one shot on Windows/MINGW64. **Needs:** diagnose whether `write_all` fails, whether the node HTTP server has a body-size limit, or whether the harness needs chunked writes / a larger send buffer. Protocol implementation (`execute_recover_account_key`, expiry guard, signing domain) is not in question. Branch: `feature/dis-003-recovery-security`. Commits: `91bec73` (impl), `e5f9dbb` (kv fix), `02cdbde` (timeout). |
+| **DIS-003E — Recovery Timelock and Cancellation** | 🔲 Pending | Two-phase commit: `PendingRecovery` state, `CancelRecovery` tx, block-finalisation sweep. Blocked on DIS-003D local confirmation. |
 
 ### Validator Onboarding — Permissionless Entry via Stake Bond
 
@@ -1435,3 +1562,37 @@ routes are unavailable in production configurations.
 revocation lifecycle test shipped (see Phase 1 → Consensus — Personhood Weighting).
 The devnet liveness and authentic adversarial test gates above remain open
 security-validation prerequisites, not completed findings.
+
+
+---
+
+## Qattice ComputeOS + PoCD Integration — Planned Initiative
+
+**Status:** 🔲 Planned / architecture definition (2026-10-26). This is a Qattice product initiative; it is not a change to the independent blockchain-creation platform. No production ComputeOS marketplace or customer-funded compute settlement is claimed.
+
+**Product thesis:** Qattice ComputeOS coordinates independently owned CPU/GPU resources, workload discovery, scheduling, isolated execution, independent result verification where feasible, and customer settlement. PoCD is its native scientific-research workload engine: both share worker registration and orchestration infrastructure, but commercial jobs do not have to generate discoveries. ComputeOS is an application/service layer integrating with Qattice L1; it is not a new consensus mechanism.
+
+**Locked architectural invariants:**
+- Preserve Qattice's personhood-bounded BFT consensus. PoCD computation, discovery, and receipts do not grant block voting power or become prerequisites for finality.
+- Preserve the fixed genesis supply of 210,000,000 QCB; no PoCD or ComputeOS token minting. Research rewards follow existing treasury/sponsor-funded Pending uQCB redemption rules; commercial jobs use separately funded customer escrow/payment paths.
+- Reuse existing PoCD task scheduler, miner, independent verifier, acceptance flow, MachineID, signed discovery/useful-work receipts, and research reward settlement wherever compatible; keep existing discovery receipt semantics.
+- A signed receipt or hash seal alone is not proof of arbitrary computational correctness. Each workload class needs explicit reproducible verification, formal proof, redundancy, or an agreed acceptance policy; unsupported workloads must not be advertised as cryptographically verified.
+- Separate accounting and anti-double-payment controls for PoCD research rewards and customer-funded jobs. Shared machines may opt into both; participation in one does not imply entitlement to the other.
+- Provider resource contribution is opt-in, policy-controlled, and permissionless where safe. Identity/authorization for machine operators, buyers, and delegated agents is distinct from QPC personhood requirements for consensus/governance.
+- Compute executes off-chain in isolated workers; Qattice stores only necessary commitments, identities/authorizations, receipts, and settlement state. Do not place raw customer workloads, sensitive data, or large outputs on-chain by default.
+- Do not revive the previously archived protocol-level resource marketplace or modify monetary rules as a prerequisite. Commercial compute marketplace functionality begins outside consensus.
+
+| Milestone | Status | Deliverable / acceptance criteria |
+|---|---|---|
+| **COS-PoCD-000 — Code and threat-model audit** | 🔲 Planned | Inventory live scheduler/miner/verifier/receipt/MachineID/settlement APIs; map reusable modules versus missing pieces; define adversaries, provider trust, workload confidentiality, resource abuse, and payout risks; reconcile docs with tested code before claiming capabilities. |
+| **COS-PoCD-001 — Shared worker registry and resource advertisement** | 🔲 Planned | Two independently operated physical machines register/advertise supported CPU/RAM/GPU capacity, availability, pricing/policy, and PoCD opt-in; signed updates, freshness/expiry, duplicate identity and spoofed-capacity defenses. |
+| **COS-PoCD-002 — Unified scheduler with distinct workload classes** | 🔲 Planned | Schedule deterministic PoCD tasks and separately funded commercial tasks on the same worker fleet; enforce provider resource limits, lease expiry/retry, task cancellation, fair resource allocation, and no double assignment/settlement. |
+| **COS-PoCD-003 — Sandboxed execution and result verification** | 🔲 Planned | Isolated, resource-limited worker execution; reproducible deterministic research task with independent verifier; workload-specific commercial acceptance rules; failure, timeout, dishonest-result, and verifier-collusion tests. |
+| **COS-PoCD-004 — Receipts, accounting, and settlement** | 🔲 Planned | Preserve existing PoCD discovery/useful-work receipt and treasury-funded reward path; introduce separately identified customer-job execution receipts, pre-funded customer payment/escrow, dispute/failure/refund rules, replay resistance, and conservation tests; no inflation or reward cross-subsidy. |
+| **COS-PoCD-005 — Two-machine end-to-end pilot** | 🔲 Planned | From an independent client, submit one PoCD task and one customer-funded deterministic compute task; schedule on independent machines, independently verify results, produce distinct signed receipts, and demonstrate correct research reward versus customer payment settlement; publish logs and repeatable test instructions. |
+| **COS-PoCD-006 — Developer API and first paying pilot** | 🔲 Future | Document job submission/status/results, provider onboarding, cost and verification guarantees; validate with at least one external customer and measure reliability, verification overhead, job economics, and payment completion. |
+| **COS-PoCD-007 — Authorized agent purchasing (optional)** | 🔲 Future | Delegated agent permissions with enforceable budgets, provider allowlists, revocation, replay protection, and independent security review before production financial use. |
+
+**First product wedge:** Verified deterministic scientific/cryptographic computation. General-purpose GPU/AI workloads are a later expansion and must not inherit unsupported PoCD verification claims.
+
+**Non-goals for initial milestone:** Replacing BFT with PoCD; requiring every paid job to produce scientific discoveries; creating a new token; modifying the fixed QCB supply; claiming general-purpose zero-knowledge proof of computation; production launch before security review and customer validation.
