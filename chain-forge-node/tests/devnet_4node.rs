@@ -623,3 +623,23 @@ fn partition_recovery((genesis_file, key_dir): (&str, &str), log_name: &str) {
     println!();
     // NodeProcess::drop() kills the children.
 }
+
+/// The node's keygen produces a fresh key per run, for both schemes.
+#[test]
+fn keygen_never_repeats_a_key() {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_chain-forge-keygen"));
+    let dir = std::env::temp_dir().join(format!("cf-keygen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for scheme in ["ed25519", "ml-dsa-65"] {
+        let keys: Vec<serde_json::Value> = (0..2).map(|i| {
+            let out = dir.join(format!("{scheme}-{i}.key.json"));
+            let st = Command::new(&bin)
+                .args(["--address", "qcb1alice", "--scheme", scheme, "--out", out.to_str().unwrap()])
+                .stdout(Stdio::null()).status().unwrap();
+            assert!(st.success());
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap()
+        }).collect();
+        assert_ne!(keys[0]["private_key"], keys[1]["private_key"], "{scheme}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

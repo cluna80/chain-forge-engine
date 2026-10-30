@@ -199,8 +199,9 @@ pub fn generate_wallet(
     }
 
     // Generate ML-DSA-65 key pair
-    let scheme = MlDsaScheme;
-    let kp = scheme.generate_keypair("random")?; // pqcrypto ignores seed; uses OS RNG
+    // A fresh key from the OS RNG. (The seeded generate_keypair caches per
+    // seed: with a constant seed every wallet in a process got one key.)
+    let kp = MlDsaScheme.generate_random()?;
 
     // Derive address from public key (QCB bech32 prefix)
     let address = derive_address_from_pq_key(&kp.public_key);
@@ -672,6 +673,32 @@ mod tests {
     }
 
     // ── Test 5: Forged signature is rejected ──────────────────────────────────
+
+    /// Regression: generate_wallet used a constant keygen seed, and ML-DSA
+    /// seeded keygen is cached per process, so every wallet created in one
+    /// process got the same private key (and could sign for the others).
+    #[test]
+    fn wallets_generated_in_one_process_have_distinct_keys() {
+        let paths: Vec<String> = (0..3).map(|i| tmp_path(&format!("distinct{i}"))).collect();
+        for p in &paths { cleanup(p); }
+        let files: Vec<WalletKeyFile> = paths.iter().enumerate()
+            .map(|(i, p)| generate_wallet(p, &format!("w{i}"), "pw").unwrap()).collect();
+        for i in 0..files.len() {
+            for j in (i + 1)..files.len() {
+                assert_ne!(files[i].public_key, files[j].public_key, "wallets {i} and {j} share a key");
+                assert_ne!(files[i].address, files[j].address, "wallets {i} and {j} share an address");
+            }
+        }
+        let (_, kp0) = load_wallet(&paths[0], "pw").unwrap();
+        let body = r#"{"type":"Transfer","to":"qcb1x","amount":1,"denom":"uqcb"}"#;
+        let sig = sign_transaction(body, "testchain", &kp0).unwrap();
+        for f in &files[1..] {
+            let pk = hex_decode(&f.public_key).unwrap();
+            assert!(verify_transaction(body, "testchain", &sig, &pk).is_err(),
+                "wallet 0's signature must not verify under another wallet's key");
+        }
+        for p in &paths { cleanup(p); }
+    }
 
     #[test]
     fn forged_signature_rejected() {
