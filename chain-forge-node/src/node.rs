@@ -426,6 +426,7 @@ struct SyncResponseMsg {
 
 /// Outcome of `Node::load_persisted_state()`.  Returned to the caller
 /// (`main.rs`) so it can make the correct startup decision.
+#[derive(Debug)]
 pub enum PersistStartup {
     /// No CURRENT pointer found — fresh data directory, start genesis.
     Fresh,
@@ -2214,7 +2215,11 @@ impl Node {
         let generation = snap_contents.generation.clone();
 
         // ── 2. Check signing-history compatibility ──────────────────────────
-        let signing_path = dir.join("consensus_signing.json");
+        // NOTE: the authoritative signing record lives in data_dir/persist/,
+        // written by persist_sign_guard() and restored by restore_sign_guard().
+        // data_dir/consensus_signing.json does NOT exist; reading it would
+        // silently skip the check.
+        let signing_path = dir.join("persist").join("consensus_signing.json");
         if signing_path.exists() {
             match std::fs::read_to_string(&signing_path)
                 .map_err(|e| e.to_string())
@@ -13713,6 +13718,74 @@ mod tests {
             "Phase F: Eve's registry pop_verified=false must survive restart");
         assert_eq!(eve_reg_after.status, chain_forge_validators::ValidatorStatus::Candidate,
             "Phase F: Eve's Candidate status must survive restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // C-11: signing-guard path regression
+    //
+    // load_persisted_state() must read the guard from data_dir/persist/
+    // consensus_signing.json, not from data_dir/consensus_signing.json.
+    //
+    // Before the fix these two paths diverged: persist_sign_guard() wrote to
+    // persist/ but the startup check read from data_dir/.  An ahead-of-state
+    // guard was silently ignored, allowing a validator to restart past its own
+    // double-sign protection.
+    // ──────────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn c_11_load_persisted_state_reads_persist_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        // Build a node and persist its genesis state (height 0).
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        node.set_data_dir(data_dir.clone()).unwrap();
+        node.persist_state().unwrap_or_else(|e| panic!("persist_state: {e}"));
+        let state_height = node.consensus.current_height();
+        drop(node);
+
+        // Write an ahead-of-state signing guard to the authoritative path
+        // (data_dir/persist/consensus_signing.json — same as persist_sign_guard).
+        // Guard height = state_height + 10 → unmistakably ahead.
+        let guard_height = state_height + 10;
+        let guard = serde_json::json!({
+            "last": [guard_height, 0, 2],
+            "votes": [],
+            "lock": null
+        });
+        let persist_dir = data_dir.join("persist");
+        let guard_path = persist_dir.join("consensus_signing.json");
+        // persist_dir is created by set_data_dir; write atomically.
+        let tmp = persist_dir.join("consensus_signing.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&guard).unwrap()).unwrap();
+        std::fs::rename(&tmp, &guard_path).unwrap();
+
+        // Confirm the wrong path does NOT exist (defence-in-depth: if this
+        // fails the test setup is wrong, not the production code).
+        let wrong_path = data_dir.join("consensus_signing.json");
+        assert!(!wrong_path.exists(),
+            "guard must NOT be at data_dir/consensus_signing.json (wrong path)");
+        assert!(guard_path.exists(),
+            "guard must be at data_dir/persist/consensus_signing.json (correct path)");
+
+        // Restart a fresh node into the same data_dir.
+        let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        restarted.set_data_dir(data_dir.clone()).unwrap();
+        let result = restarted.load_persisted_state();
+
+        // Must be SigningBlocked — if it returns Restored, the guard was missed.
+        assert!(
+            matches!(
+                result,
+                PersistStartup::SigningBlocked {
+                    guard_height: gh,
+                    state_height: sh,
+                } if gh == guard_height && sh == state_height
+            ),
+            "load_persisted_state must return SigningBlocked when persist/consensus_signing.json \
+             has guard_height ({guard_height}) > state_height ({state_height}); got {result:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

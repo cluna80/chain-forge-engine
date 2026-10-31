@@ -666,6 +666,64 @@ mod h0_3_crash_recovery_live {
         );
     }
 
+    // ── C-11: signing guard at persist/ path is read during load ────────────
+
+    /// C-11 — regression for the signing-guard path mismatch.
+    ///
+    /// Before the fix, `load_persisted_state()` read
+    /// `data_dir/consensus_signing.json`.  `persist_sign_guard()` writes (and
+    /// `restore_sign_guard()` reads) `data_dir/persist/consensus_signing.json`.
+    /// A guard placed at the wrong path was silently ignored; a validator could
+    /// restart past an ahead-of-state guard without being blocked.
+    ///
+    /// This test confirms the authoritative path: it writes a committed snapshot
+    /// at height 10, places a guard at `persist/consensus_signing.json` with
+    /// last[0]=20 (guard_height 20 > state_height 10), then uses
+    /// `check_signing_compatibility` with the value read from that path and
+    /// asserts `GuardAheadOfState`.  The companion unit test in node.rs
+    /// (`c_11_load_persisted_state_reads_persist_path`) confirms that
+    /// `load_persisted_state()` returns `SigningBlocked` from the same setup.
+    #[test]
+    fn c_11_signing_guard_at_persist_path_is_readable() {
+        use chain_forge_node::persistence::{write_snapshot, write_current};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        // Step 1: committed snapshot at height 10
+        let contents = valid_contents(10);
+        let gen = write_snapshot(&data_dir, 10, &contents).unwrap();
+        write_current(&data_dir, &gen).unwrap();
+
+        // Step 2: write ahead-of-state guard to the authoritative path
+        let persist_dir = data_dir.join("persist");
+        std::fs::create_dir_all(&persist_dir).unwrap();
+        let guard = json!({"last": [20, 0, 2], "votes": [], "lock": null});
+        let guard_bytes = serde_json::to_vec_pretty(&guard).unwrap();
+        let tmp = persist_dir.join("consensus_signing.json.tmp");
+        std::fs::write(&tmp, &guard_bytes).unwrap();
+        std::fs::rename(&tmp, persist_dir.join("consensus_signing.json")).unwrap();
+
+        // Step 3: reading from persist/ and checking compatibility must return
+        // GuardAheadOfState — proving the path is correct and the data is there.
+        let signing_path = persist_dir.join("consensus_signing.json");
+        assert!(signing_path.exists(), "guard file must exist at persist/ path");
+        let guard_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&signing_path).unwrap()).unwrap();
+        let result = check_signing_compatibility(&guard_json, 10).unwrap();
+        assert!(
+            matches!(
+                result,
+                SigningCompatibility::GuardAheadOfState {
+                    guard_height: 20,
+                    state_height: 10
+                }
+            ),
+            "guard at persist/consensus_signing.json must be ahead-of-state; got {result:?}"
+        );
+    }
+
     // ── C-07: four-node crash restart, state root convergence ────────────────
 
     /// C-07 — four-node SIGKILL crash-restart, state root convergence.
