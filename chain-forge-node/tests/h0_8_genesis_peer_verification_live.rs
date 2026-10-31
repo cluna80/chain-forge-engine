@@ -122,12 +122,22 @@ mod h0_8_genesis_peer_verification_live {
     }
 
     fn genesis_4node_mldsa_path() -> PathBuf {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // The canonical devnet fixtures live at the workspace root under
+        // tests/devnet/.  CARGO_MANIFEST_DIR points to chain-forge-node/,
+        // so walk up one level to reach the workspace root.
+        let manifest   = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace  = manifest.parent().expect("workspace root");
+        let ws_path    = workspace.join("tests/devnet/genesis-4node-mldsa.json");
+        if ws_path.exists() { return ws_path; }
+        // Fallback: a copy committed inside the crate's own test tree.
         manifest.join("tests/devnet/genesis-4node-mldsa.json")
     }
 
     fn keys_dir() -> PathBuf {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let manifest  = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest.parent().expect("workspace root");
+        let ws_keys   = workspace.join("tests/devnet/keys");
+        if ws_keys.exists() { return ws_keys; }
         manifest.join("tests/devnet/keys")
     }
 
