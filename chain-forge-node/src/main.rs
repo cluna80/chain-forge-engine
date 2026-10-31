@@ -28,6 +28,7 @@ pub mod gossip_proof;
 pub mod gossip_attestation;
 pub mod gossip_capacity;
 pub mod telemetry;
+pub mod persistence;
 
 use std::path::PathBuf;
 use tracing::info;
@@ -191,10 +192,35 @@ async fn main() {
     if let Some(ref dir) = args.data_dir {
         match node.set_data_dir(dir.clone()) {
             Ok(()) => {
-                if node.load_persisted_state() {
-                    info!(dir = %dir.display(), "resumed from persisted state");
-                } else {
-                    info!(dir = %dir.display(), "no persisted state found — starting from genesis");
+                match node.load_persisted_state() {
+                    crate::node::PersistStartup::Fresh => {
+                        info!(dir = %dir.display(), "fresh data directory — starting from genesis");
+                    }
+                    crate::node::PersistStartup::Restored { height, generation } => {
+                        info!(dir = %dir.display(), height, %generation,
+                              "resumed from persisted state");
+                    }
+                    crate::node::PersistStartup::Fatal { error } => {
+                        tracing::error!(
+                            dir  = %dir.display(),
+                            error = %error,
+                            "FATAL: committed snapshot is corrupt or incomplete — \
+                             refusing to start from genesis (H0-3 fail-closed). \
+                             Restore from a backup or use a clean data directory."
+                        );
+                        std::process::exit(1);
+                    }
+                    crate::node::PersistStartup::SigningBlocked { guard_height, state_height } => {
+                        tracing::error!(
+                            guard_height,
+                            state_height,
+                            "FATAL: consensus signing guard is ahead of restored state — \
+                             this node may have voted on blocks not reflected in the snapshot. \
+                             Signing is blocked. Sync from peers to catch up to guard height \
+                             before resuming validator operation."
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "could not set data dir — running memory-only"),
