@@ -4560,7 +4560,11 @@ impl Node {
             // only one validator may have pop_verified=true (power_cap = 1).
             // The canonical winner is the one with the lowest registration_seq
             // in ValidatorRegistry; all others are forced to pop_verified=false.
-            {
+            //
+            // Skip entirely when personhood_weighted=false (personhood_power_cap=None).
+            // The `unwrap_or(1)` fallback would incorrectly apply a cap of 1 uqcb to
+            // every validator, revoking all high-stake validators each block.
+            if self.personhood_power_cap.is_some() {
                 // Build owner → [(seq, validator_id)] map for pop_verified=true validators.
                 let mut owner_candidates: std::collections::HashMap<String, Vec<(u64, String)>> =
                     std::collections::HashMap::new();
