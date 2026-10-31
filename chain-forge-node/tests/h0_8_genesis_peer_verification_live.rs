@@ -175,22 +175,30 @@ mod h0_8_genesis_peer_verification_live {
     //          This is the critical attack scenario: matching chain_id must NOT
     //          be sufficient to accept a peer.
 
-    fn genesis_a_json() -> String {
-        std::fs::read_to_string(genesis_4node_mldsa_path())
-            .unwrap_or_else(|e| panic!("cannot read genesis A: {e}"))
+    /// Returns the genesis-A JSON, or None if the devnet file is not present
+    /// (e.g. on a freshly-cloned machine that hasn't run `make devnet-keys`).
+    /// Tests that depend on this file skip themselves when it returns None.
+    fn genesis_a_json() -> Option<String> {
+        let path = genesis_4node_mldsa_path();
+        if !path.exists() {
+            println!("SKIP: genesis-4node-mldsa.json not found at {path:?}");
+            return None;
+        }
+        Some(std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read genesis A at {path:?}: {e}")))
     }
 
     /// Chain B shares chain_id with chain A but differs in genesis_time.
     /// compute_genesis_hash(B) must ≠ compute_genesis_hash(A).
-    fn genesis_b_json() -> String {
-        let mut v: serde_json::Value = serde_json::from_str(&genesis_a_json()).unwrap();
+    fn genesis_b_json(a_json: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(a_json).unwrap();
         v["genesis_time"] = serde_json::json!("2099-01-01T00:00:00Z");
         serde_json::to_string_pretty(&v).unwrap()
     }
 
     /// Chain C has a distinct chain_id (used in G-01 sanity check).
-    fn genesis_c_json() -> String {
-        let mut v: serde_json::Value = serde_json::from_str(&genesis_a_json()).unwrap();
+    fn genesis_c_json(a_json: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(a_json).unwrap();
         v["chain_id"]     = serde_json::json!("different-chain-id-999");
         v["genesis_time"] = serde_json::json!("2099-06-01T00:00:00Z");
         serde_json::to_string_pretty(&v).unwrap()
@@ -206,9 +214,10 @@ mod h0_8_genesis_peer_verification_live {
     /// FAILS UNTIL: compute_genesis_hash() is added to chain-forge-core.
     #[test]
     fn g_01_genesis_hash_is_stable_and_mutation_sensitive() {
-        let genesis_a: GenesisConfig = serde_json::from_str(&genesis_a_json()).unwrap();
-        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json()).unwrap();
-        let genesis_c: GenesisConfig = serde_json::from_str(&genesis_c_json()).unwrap();
+        let Some(a_json) = genesis_a_json() else { return; };
+        let genesis_a: GenesisConfig = serde_json::from_str(&a_json).unwrap();
+        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json(&a_json)).unwrap();
+        let genesis_c: GenesisConfig = serde_json::from_str(&genesis_c_json(&a_json)).unwrap();
 
         let hash_a1 = compute_genesis_hash(&genesis_a);
         let hash_a2 = compute_genesis_hash(&genesis_a);
@@ -248,8 +257,9 @@ mod h0_8_genesis_peer_verification_live {
     ///   - PeerManager gains set_local_genesis_hash() and try_accept_peer()
     #[test]
     fn g_02_peer_with_wrong_genesis_hash_is_rejected() {
-        let genesis_a: GenesisConfig = serde_json::from_str(&genesis_a_json()).unwrap();
-        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json()).unwrap();
+        let Some(a_json) = genesis_a_json() else { return; };
+        let genesis_a: GenesisConfig = serde_json::from_str(&a_json).unwrap();
+        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json(&a_json)).unwrap();
 
         let local_genesis_hash   = compute_genesis_hash(&genesis_a);
         let foreign_genesis_hash = compute_genesis_hash(&genesis_b);
@@ -307,8 +317,9 @@ mod h0_8_genesis_peer_verification_live {
     ///   - verify_transaction_domain() is added to chain_forge_execution
     #[test]
     fn g_03_cross_chain_tx_replay_is_rejected() {
-        let genesis_a: GenesisConfig = serde_json::from_str(&genesis_a_json()).unwrap();
-        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json()).unwrap();
+        let Some(a_json) = genesis_a_json() else { return; };
+        let genesis_a: GenesisConfig = serde_json::from_str(&a_json).unwrap();
+        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json(&a_json)).unwrap();
 
         let hash_a = compute_genesis_hash(&genesis_a);
         let hash_b = compute_genesis_hash(&genesis_b);
@@ -362,8 +373,9 @@ mod h0_8_genesis_peer_verification_live {
     /// FAILS UNTIL: PeerManager enforces genesis-hash check in try_accept_peer().
     #[test]
     fn g_04_same_chain_id_different_genesis_hash_is_rejected() {
-        let genesis_a: GenesisConfig = serde_json::from_str(&genesis_a_json()).unwrap();
-        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json()).unwrap();
+        let Some(a_json) = genesis_a_json() else { return; };
+        let genesis_a: GenesisConfig = serde_json::from_str(&a_json).unwrap();
+        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json(&a_json)).unwrap();
 
         // Confirm the test invariant: A and B really share chain_id.
         assert_eq!(genesis_a.chain_id, genesis_b.chain_id,
@@ -403,8 +415,9 @@ mod h0_8_genesis_peer_verification_live {
     ///              exposes is_genesis_denied().
     #[test]
     fn g_05_genesis_rejected_peer_cannot_reconnect() {
-        let genesis_a: GenesisConfig = serde_json::from_str(&genesis_a_json()).unwrap();
-        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json()).unwrap();
+        let Some(a_json) = genesis_a_json() else { return; };
+        let genesis_a: GenesisConfig = serde_json::from_str(&a_json).unwrap();
+        let genesis_b: GenesisConfig = serde_json::from_str(&genesis_b_json(&a_json)).unwrap();
 
         let hash_a = compute_genesis_hash(&genesis_a);
         let hash_b = compute_genesis_hash(&genesis_b);
@@ -455,7 +468,8 @@ mod h0_8_genesis_peer_verification_live {
     ///              exist and work correctly.
     #[test]
     fn g_06_valid_same_chain_peer_is_accepted() {
-        let genesis_a: GenesisConfig = serde_json::from_str(&genesis_a_json()).unwrap();
+        let Some(a_json) = genesis_a_json() else { return; };
+        let genesis_a: GenesisConfig = serde_json::from_str(&a_json).unwrap();
         let hash_a = compute_genesis_hash(&genesis_a);
 
         let mut mgr = PeerManager::new(50);
@@ -521,8 +535,10 @@ mod h0_8_genesis_peer_verification_live {
         let keys = keys_dir();
 
         // Write chain B genesis (same chain_id, mutated genesis_time).
+        let a_json = std::fs::read_to_string(&genesis_a_path)
+            .expect("genesis A already confirmed to exist above");
         let genesis_b_path = tmp.path().join("genesis-b.json");
-        std::fs::write(&genesis_b_path, genesis_b_json()).unwrap();
+        std::fs::write(&genesis_b_path, genesis_b_json(&a_json)).unwrap();
 
         let (alice_api, alice_p2p) = (free_port(), free_port());
         let (bob_api,   bob_p2p)   = (free_port(), free_port());
