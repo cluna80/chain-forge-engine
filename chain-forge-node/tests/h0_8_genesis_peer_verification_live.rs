@@ -103,6 +103,45 @@ mod h0_8_genesis_peer_verification_live {
             .port()
     }
 
+    fn wait_for_port(port: u16, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() { return true; }
+            if std::time::Instant::now() >= deadline { return false; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Read Alice's libp2p peer ID from her log (strips ANSI escapes).
+    /// Returns the 12D3… peer-id string once Alice logs "P2P listening peer=<id>".
+    fn read_peer_id(log_path: &PathBuf, timeout: Duration) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let text = std::fs::read_to_string(log_path).unwrap_or_default();
+            // Strip ANSI escape sequences before searching.
+            let mut clean = String::with_capacity(text.len());
+            let mut in_esc = false;
+            for c in text.chars() {
+                if c == '\x1b' { in_esc = true; continue; }
+                if in_esc { if c == 'm' { in_esc = false; } continue; }
+                clean.push(c);
+            }
+            if let Some(id) = clean.lines()
+                .filter(|l| l.contains("P2P listening"))
+                .find_map(|l| l.split("peer=").nth(1))
+                .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+                .filter(|id| id.starts_with("12D3"))
+            {
+                return id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "G-07: no libp2p peer id in {log_path:?} within {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn node_binary() -> Option<PathBuf> {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let repo = manifest.parent().unwrap().to_path_buf();
@@ -556,16 +595,25 @@ mod h0_8_genesis_peer_verification_live {
         let (dave_api,  dave_p2p)  = (free_port(), free_port());
         let (eve_api,   eve_p2p)   = (free_port(), free_port());
 
-        let alice_bootstrap = format!("/ip4/127.0.0.1/tcp/{alice_p2p}");
         let alice_log = tmp.path().join("alice.log");
 
-        println!("── G-07: spawn 4-node chain A (ML-DSA devnet) ──");
-        let alice = spawn_node(
+        println!("── G-07: spawn chain A — Alice ──");
+        let _alice = spawn_node(
             &bin, &genesis_a_path, "qcb1alice",
             &keys.join("alice.key.json"),
             &tmp.path().join("alice"), alice_api, alice_p2p,
             None, &alice_log,
         );
+
+        // Wait for Alice's API port before reading her peer ID from the log.
+        assert!(
+            wait_for_port(alice_api, Duration::from_secs(15)),
+            "G-07: Alice API port never opened"
+        );
+        let alice_peer_id = read_peer_id(&alice_log, Duration::from_secs(15));
+        let alice_bootstrap = format!("/ip4/127.0.0.1/tcp/{alice_p2p}/p2p/{alice_peer_id}");
+        println!("── G-07: Alice peer id={alice_peer_id}  bootstrap={alice_bootstrap} ──");
+
         let _bob = spawn_node(
             &bin, &genesis_a_path, "qcb1bob",
             &keys.join("bob.key.json"),
@@ -633,6 +681,6 @@ mod h0_8_genesis_peer_verification_live {
         );
 
         println!("── G-07 PASSED: foreign-genesis node rejected; chain A unaffected ──");
-        drop(alice);
+        drop(_alice);
     }
 }
