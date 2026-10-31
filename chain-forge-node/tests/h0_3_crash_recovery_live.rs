@@ -741,18 +741,27 @@ mod h0_3_crash_recovery_live {
 
         println!("── C-07 Phase 1: spawn all 4 nodes ──");
 
-        /// Spawn a single node and return its guard.  `bootstrap` is the
-        /// multiaddr of the first node (Alice), or None for Alice herself.
+        /// Spawn a single node and return its guard.
+        ///
+        /// `bootstrap` is the libp2p multiaddr of the first node (Alice), or
+        /// None for Alice herself.
+        ///
+        /// `expect_peers` passes `--expect-peers` to the node binary, telling
+        /// it to stay in multi-node mode even when no `--bootstrap` address is
+        /// provided.  Alice needs this because she IS the bootstrap anchor:
+        /// other nodes dial her, so she has no upstream address to dial, but
+        /// she still must not fall into the solo-devnet auto-commit path.
         fn spawn4(
-            bin:       &PathBuf,
-            genesis:   &PathBuf,
-            validator: &str,
-            key_file:  &PathBuf,
-            data_dir:  &PathBuf,
-            api_port:  u16,
-            p2p_port:  u16,
-            bootstrap: Option<&str>,
-            log_path:  &PathBuf,
+            bin:          &PathBuf,
+            genesis:      &PathBuf,
+            validator:    &str,
+            key_file:     &PathBuf,
+            data_dir:     &PathBuf,
+            api_port:     u16,
+            p2p_port:     u16,
+            bootstrap:    Option<&str>,
+            expect_peers: bool,
+            log_path:     &PathBuf,
         ) -> NodeGuard {
             let log = std::fs::File::create(log_path)
                 .unwrap_or_else(|e| panic!("log create {log_path:?}: {e}"));
@@ -767,6 +776,9 @@ mod h0_3_crash_recovery_live {
             ]);
             if let Some(b) = bootstrap {
                 cmd.args(["--bootstrap", b]);
+            }
+            if expect_peers {
+                cmd.arg("--expect-peers");
             }
             let child = cmd
                 .stdout(log.try_clone().unwrap())
@@ -812,10 +824,18 @@ mod h0_3_crash_recovery_live {
 
         // Spawn Alice first; extract her peer ID; give it as bootstrap to the others.
         let alice_log = log_dir.join("alice.log");
+        // Alice has no --bootstrap (she IS the bootstrap anchor others dial
+        // into), but she must know she is part of a multi-node network so
+        // her consensus_tick fires and she drives her own propose timeouts.
+        // --expect-peers tells the node to treat has_bootstrap_peers=true
+        // even though no peer addresses are listed.
         let alice = spawn4(
             &bin, &genesis_4node, "qcb1alice",
             &keys_dir.join("alice.key.json"),
-            &alice_data, alice_api, alice_p2p, None, &alice_log,
+            &alice_data, alice_api, alice_p2p,
+            None,   // Alice is the bootstrap anchor — no upstream to dial
+            true,   // --expect-peers: stay in multi-node mode from the start
+            &alice_log,
         );
         if !wait_for_port(alice_api, Duration::from_secs(20)) {
             let log_tail = std::fs::read_to_string(&alice_log).unwrap_or_default();
@@ -838,19 +858,22 @@ mod h0_3_crash_recovery_live {
             &bin, &genesis_4node, "qcb1bob",
             &keys_dir.join("bob.key.json"),
             &bob_data, bob_api, bob_p2p,
-            Some(&alice_bootstrap), &bob_log,
+            Some(&alice_bootstrap), false,
+            &bob_log,
         );
         let carol = spawn4(
             &bin, &genesis_4node, "qcb1carol",
             &keys_dir.join("carol.key.json"),
             &carol_data, carol_api, carol_p2p,
-            Some(&alice_bootstrap), &carol_log,
+            Some(&alice_bootstrap), false,
+            &carol_log,
         );
         let mut dave = spawn4(
             &bin, &genesis_4node, "qcb1dave",
             &keys_dir.join("dave.key.json"),
             &dave_data, dave_api, dave_p2p,
-            Some(&alice_bootstrap), &dave_log,
+            Some(&alice_bootstrap), false,
+            &dave_log,
         );
 
         let bcd_logs = [(&bob_log, bob_api, "Bob"), (&carol_log, carol_api, "Carol"), (&dave_log, dave_api, "Dave")];
@@ -960,6 +983,7 @@ mod h0_3_crash_recovery_live {
             &dave_data,             // same data directory — this is the crash recovery
             dave_api2, dave_p2p2,
             Some(&alice_bootstrap), // bootstrap against Alice again
+            false,
             &dave_log2,
         );
 
