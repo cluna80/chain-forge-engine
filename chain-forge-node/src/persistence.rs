@@ -195,8 +195,16 @@ pub fn read_current(data_dir: &Path) -> std::io::Result<Option<String>> {
 }
 
 /// Write `<data_dir>/CURRENT` atomically, pointing to `gen_label`.
+///
+/// After the atomic rename of the CURRENT tmp file, we fsync `data_dir`
+/// itself so the rename is durable on Linux (POSIX requires an explicit
+/// directory fsync to guarantee a rename survives a crash).  On Windows
+/// the NTFS journal provides the same guarantee without an explicit fsync,
+/// so the `fsync_dir` call is a no-op there.
 pub fn write_current(data_dir: &Path, gen: &str) -> std::io::Result<()> {
-    write_atomic_bytes(&data_dir.join("CURRENT"), gen.as_bytes())
+    write_atomic_bytes(&data_dir.join("CURRENT"), gen.as_bytes())?;
+    // Durability: flush the directory entry for the CURRENT rename.
+    fsync_dir(data_dir)
 }
 
 /// Read the generation number from CURRENT (0 if fresh).
@@ -293,7 +301,35 @@ pub struct SnapshotContents {
 pub fn load_snapshot(data_dir: &Path) -> Result<Option<SnapshotContents>, PersistError> {
     let gen_label_str = match read_current(data_dir)
         .map_err(PersistError::Io)? {
-        None => return Ok(None), // fresh
+        None => {
+            // CURRENT is absent.  If *any* generation directory exists under
+            // snapshots/, CURRENT was lost mid-write (crash between the tmp
+            // rename and the parent-dir fsync).  Treat this as Fatal rather
+            // than silently starting from genesis — the operator must confirm
+            // the intent.  A truly fresh directory has no snapshots/ at all,
+            // or an empty one.
+            let snaps = data_dir.join("snapshots");
+            if snaps.exists() {
+                let has_gens = std::fs::read_dir(&snaps)
+                    .map_err(PersistError::Io)?
+                    .filter_map(|e| e.ok())
+                    .any(|e| {
+                        e.file_name().to_string_lossy().starts_with("gen-")
+                            && e.path().is_dir()
+                    });
+                if has_gens {
+                    return Err(PersistError::CorruptManifest {
+                        gen: "CURRENT".to_string(),
+                        detail: "CURRENT pointer is absent but generation directories exist \
+                                 under snapshots/ — CURRENT may have been lost in a crash. \
+                                 Restore CURRENT from a backup or remove snapshots/ to start \
+                                 from genesis."
+                            .to_string(),
+                    });
+                }
+            }
+            return Ok(None); // genuinely fresh
+        }
         Some(s) => s,
     };
 
@@ -432,11 +468,36 @@ pub fn check_signing_compatibility(
     guard_json: &serde_json::Value,
     state_height: u64,
 ) -> Result<SigningCompatibility, PersistError> {
-    let guard_height = match guard_json["last_height"].as_u64() {
-        Some(h) => h,
-        None => return Err(PersistError::SigningHistoryConflict {
-            detail: "consensus_signing.json missing 'last_height' field".to_string(),
-        }),
+    // `SignGuard` serializes as:
+    //   { "last": [height, round, step] | null, "votes": [...], "lock": ... }
+    //
+    // `last` is `Option<(u64, u32, u8)>` — serde serialises the tuple as a
+    // JSON array, so guard_json["last"][0] is the height.
+    // If `last` is null or absent the guard has never signed; treat as height 0.
+    let guard_height = match &guard_json["last"] {
+        serde_json::Value::Array(arr) => {
+            match arr.first().and_then(|v| v.as_u64()) {
+                Some(h) => h,
+                None => return Err(PersistError::SigningHistoryConflict {
+                    detail: "consensus_signing.json: 'last' array is present but \
+                             first element (height) is not a u64".to_string(),
+                }),
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Object(_) => {
+            // Null last → guard has never signed; height 0 is consistent with
+            // any state height (state may have been restored from a backup).
+            // Object(_) branch should not occur but is safe to treat as 0.
+            0
+        }
+        _ => {
+            return Err(PersistError::SigningHistoryConflict {
+                detail: format!(
+                    "consensus_signing.json: unexpected type for 'last' field: {:?}",
+                    guard_json["last"]
+                ),
+            })
+        }
     };
 
     if guard_height > state_height {
@@ -642,10 +703,14 @@ mod tests {
     }
 
     // ── signing compatibility ───────────────────────────────────────────────
+    //
+    // SignGuard serialises as {"last": [height, round, step] | null, "votes": [...], "lock": ...}
+    // check_signing_compatibility extracts the height from last[0].
 
     #[test]
     fn signing_guard_consistent() {
-        let guard = serde_json::json!({"last_height": 10, "last_round": 0, "last_step": "Precommit"});
+        // last = [10, 0, 2] → height 10, consistent with state at 10.
+        let guard = serde_json::json!({"last": [10, 0, 2], "votes": [], "lock": null});
         assert_eq!(
             check_signing_compatibility(&guard, 10).unwrap(),
             SigningCompatibility::Consistent
@@ -654,7 +719,7 @@ mod tests {
 
     #[test]
     fn signing_guard_behind_state() {
-        let guard = serde_json::json!({"last_height": 9, "last_round": 0, "last_step": "Precommit"});
+        let guard = serde_json::json!({"last": [9, 0, 2], "votes": [], "lock": null});
         assert!(matches!(
             check_signing_compatibility(&guard, 10).unwrap(),
             SigningCompatibility::GuardBehindState { guard_height: 9, state_height: 10 }
@@ -663,7 +728,7 @@ mod tests {
 
     #[test]
     fn signing_guard_ahead_of_state() {
-        let guard = serde_json::json!({"last_height": 15, "last_round": 0, "last_step": "Precommit"});
+        let guard = serde_json::json!({"last": [15, 0, 2], "votes": [], "lock": null});
         assert!(matches!(
             check_signing_compatibility(&guard, 10).unwrap(),
             SigningCompatibility::GuardAheadOfState { guard_height: 15, state_height: 10 }
@@ -671,12 +736,83 @@ mod tests {
     }
 
     #[test]
-    fn signing_guard_missing_height_is_error() {
-        let guard = serde_json::json!({"last_step": "Precommit"});
+    fn signing_guard_null_last_at_genesis_is_consistent() {
+        // Guard has never signed (null last) against state at height 0 → Consistent.
+        let guard = serde_json::json!({"last": null, "votes": [], "lock": null});
+        assert_eq!(
+            check_signing_compatibility(&guard, 0).unwrap(),
+            SigningCompatibility::Consistent
+        );
+    }
+
+    #[test]
+    fn signing_guard_null_last_behind_state_is_guard_behind() {
+        // Guard has never signed (height 0) but state is at height 5 → GuardBehindState.
+        // The consensus engine must advance the guard to 5 before allowing new signatures.
+        let guard = serde_json::json!({"last": null, "votes": [], "lock": null});
+        assert!(matches!(
+            check_signing_compatibility(&guard, 5).unwrap(),
+            SigningCompatibility::GuardBehindState { guard_height: 0, state_height: 5 }
+        ));
+    }
+
+    #[test]
+    fn signing_guard_missing_last_field_is_guard_behind() {
+        // Missing `last` key → height 0; if state > 0, GuardBehindState.
+        let guard = serde_json::json!({"votes": [], "lock": null});
+        assert!(matches!(
+            check_signing_compatibility(&guard, 5).unwrap(),
+            SigningCompatibility::GuardBehindState { guard_height: 0, state_height: 5 }
+        ));
+    }
+
+    #[test]
+    fn signing_guard_malformed_last_array_is_error() {
+        // Array present but first element is not a number.
+        let guard = serde_json::json!({"last": ["bad", 0, 2], "votes": [], "lock": null});
         assert!(matches!(
             check_signing_compatibility(&guard, 10),
             Err(PersistError::SigningHistoryConflict { .. })
         ));
+    }
+
+    // ── F1 regression: data_dir fsynced after CURRENT rename ───────────────
+
+    #[test]
+    fn write_current_does_not_leave_tmp_file() {
+        // write_current should atomically rename and leave no .tmp behind.
+        let dir = make_temp_dir();
+        write_current(dir.path(), "gen-000001").unwrap();
+        assert!(!dir.path().join("CURRENT.tmp").exists(),
+            "CURRENT.tmp must not survive after write_current");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("CURRENT")).unwrap().trim(),
+            "gen-000001"
+        );
+    }
+
+    // ── F3 regression: orphaned gen dirs without CURRENT are detected ───────
+
+    #[test]
+    fn orphaned_gen_dir_without_current_is_fatal() {
+        // CURRENT absent but a gen-NNNNNN directory exists → CorruptManifest.
+        let dir = make_temp_dir();
+        let snaps = dir.path().join("snapshots");
+        std::fs::create_dir_all(snaps.join("gen-000001")).unwrap();
+
+        assert!(matches!(
+            load_snapshot(dir.path()),
+            Err(PersistError::CorruptManifest { .. })
+        ), "orphaned gen dir without CURRENT must be detected as fatal");
+    }
+
+    #[test]
+    fn empty_snapshots_dir_without_current_is_fresh() {
+        // Empty snapshots/ with no CURRENT and no gen dirs → fresh install.
+        let dir = make_temp_dir();
+        std::fs::create_dir_all(dir.path().join("snapshots")).unwrap();
+        assert!(load_snapshot(dir.path()).unwrap().is_none(),
+            "empty snapshots/ with no CURRENT must be treated as fresh");
     }
 
     // ── crash-resilience: CURRENT not updated on incomplete write ──────────

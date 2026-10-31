@@ -2119,38 +2119,48 @@ impl Node {
     /// fsynced does the `CURRENT` pointer advance atomically. The previous
     /// generation is retained as a fallback until the next write. A crash at
     /// any point before `CURRENT` updates leaves the previous generation intact.
-    fn persist_state(&self) {
-        let Some(ref dir) = self.data_dir else { return };
+    /// Serialise and persist the current node state as a new generation snapshot.
+    ///
+    /// Returns `Err(String)` if serialisation or the snapshot write fails.
+    /// The caller is responsible for treating this as a fatal error in the
+    /// consensus commit path — a node that cannot write its snapshot must not
+    /// continue voting, because it could re-sign at already-committed heights
+    /// after a restart that silently falls back to genesis.
+    fn persist_state(&self) -> Result<(), String> {
+        let Some(ref dir) = self.data_dir else { return Ok(()) };
         let snap   = self.state.export_snapshot();
         let height = snap.height;
 
-        // Serialise all 8 files.
+        // Serialise all 8 files.  Any serialisation failure is immediately
+        // fatal: a partial contents list would produce an incomplete snapshot
+        // that the manifest hash-check would reject on restart, but it is
+        // cleaner to never write the snapshot than to write a known-bad one.
         let mut contents: Vec<(&'static str, Vec<u8>)> = Vec::with_capacity(8);
-        let mut push = |name: &'static str, result: serde_json::Result<String>| {
+        let mut push = |name: &'static str, result: serde_json::Result<String>|
+                -> Result<(), String> {
             match result {
-                Ok(s)  => contents.push((name, s.into_bytes())),
-                Err(e) => tracing::warn!(name, error = %e, "persist_state: serialise failed"),
+                Ok(s)  => { contents.push((name, s.into_bytes())); Ok(()) }
+                Err(e) => Err(format!("persist_state: serialise {name} failed: {e}")),
             }
         };
-        push("state.json",      serde_json::to_string_pretty(&snap));
-        push("identity.json",   serde_json::to_string_pretty(&self.identity));
-        push("validators.json", serde_json::to_string_pretty(&self.validator_registry));
-        push("agents.json",     serde_json::to_string_pretty(&self.agents));
-        push("slashing.json",   serde_json::to_string_pretty(&self.slasher));
-        push("chain_store.json",serde_json::to_string_pretty(&self.chain_store));
+        push("state.json",      serde_json::to_string_pretty(&snap))?;
+        push("identity.json",   serde_json::to_string_pretty(&self.identity))?;
+        push("validators.json", serde_json::to_string_pretty(&self.validator_registry))?;
+        push("agents.json",     serde_json::to_string_pretty(&self.agents))?;
+        push("slashing.json",   serde_json::to_string_pretty(&self.slasher))?;
+        push("chain_store.json",serde_json::to_string_pretty(&self.chain_store))?;
         push("historical_validator_sets.json",
-             serde_json::to_string_pretty(&self.historical_validator_sets));
+             serde_json::to_string_pretty(&self.historical_validator_sets))?;
         // CF-VAL-KEY-002: the live consensus ValidatorSet, exactly as
         // `self.consensus` holds it right now -- real keys, real voting power,
         // every currently-seated validator whether seated at genesis or admitted
         // later by stake bonding. See load_persisted_state for full rationale.
         push("live_validator_set.json",
-             serde_json::to_string_pretty(self.consensus.validator_set()));
+             serde_json::to_string_pretty(self.consensus.validator_set()))?;
 
         match crate::persistence::write_snapshot(dir, height, &contents) {
-            Ok(gen) => tracing::debug!(height, %gen, "state persisted (generation-based)"),
-            Err(e)  => tracing::error!(height, error = %e,
-                "persist_state: failed to write snapshot — data_dir may be corrupt"),
+            Ok(gen) => { tracing::debug!(height, %gen, "state persisted (generation-based)"); Ok(()) }
+            Err(e)  => Err(format!("persist_state: snapshot write failed at height {height}: {e}")),
         }
     }
 
@@ -2690,7 +2700,11 @@ impl Node {
                                     // it here so every solo-devnet commit is
                                     // durable — same guarantee as the real
                                     // multi-node commit_block() path.
-                                    self.persist_state();
+                                    if let Err(e) = self.persist_state() {
+                                        tracing::error!(error = %e,
+                                            "FATAL: snapshot write failed — halting event loop");
+                                        running = false;
+                                    }
                                 }
                                 Err(e) => {
                                     debug!(error = %e, "block proposal skipped");
@@ -4864,7 +4878,17 @@ impl Node {
 
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
-        self.persist_state();
+        //
+        // Failure is fatal for the consensus commit path: a node that cannot
+        // write its snapshot must not continue voting, because a later restart
+        // might silently start from genesis and allow double-signing at heights
+        // already committed.
+        if let Err(e) = self.persist_state() {
+            tracing::error!(error = %e,
+                "FATAL: snapshot write failed after commit — halting consensus to prevent \
+                 double-signing on restart. Operator must fix the data directory.");
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -6219,7 +6243,7 @@ mod tests {
             // Call it explicitly here so this test persists to disk exactly
             // what a real node's commit_block() would have persisted after
             // these same two blocks.
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
 
             // Sanity: before any restart, every genesis validator's real
             // public key is present in the live set (as seeded from
@@ -6312,7 +6336,7 @@ mod tests {
             let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
             let cert0 = node.propose_block(genesis_hash).await.unwrap();
             node.propose_block(cert0.block_hash).await.unwrap();
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         }
 
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
@@ -6406,7 +6430,7 @@ mod tests {
             let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
             let cert0 = node.propose_block(genesis_hash).await.unwrap();
             node.propose_block(cert0.block_hash).await.unwrap();
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
             assert_eq!(node.state.current_height(), 1, "blocks 0 and 1 committed");
             node.consensus.current_height()
         };
@@ -6868,7 +6892,7 @@ mod tests {
                 let mut first = rewards_node(67).await;
                 first.set_data_dir(dir.clone()).unwrap();
                 drive(&mut [&mut first], local, 0..6, &mut prev, dave_offline).await;
-                first.persist_state();
+                first.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
             }
             let json = GENESIS.replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
         "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
@@ -7300,7 +7324,7 @@ mod tests {
             node.set_data_dir(dir.clone()).unwrap();
             let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
             node.propose_block(genesis_hash).await.unwrap();
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         }
         let mut restarted = Node::new(&json, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
@@ -7346,7 +7370,7 @@ mod tests {
             node.set_data_dir(dir.clone()).unwrap();
             let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
             node.propose_block(genesis_hash).await.unwrap();
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         }
         // Tamper with the persisted policy.
         let path = dir.join("persist").join("slashing.json");
@@ -7933,7 +7957,7 @@ mod tests {
             let cert = fund_bond_and_verify_personhood(&mut node, &addr, 2_000_000, genesis_hash).await;
             node.submit_tx(register_key_tx(&addr, 1, &kp, node.chain_id()));
             node.propose_block(cert.block_hash).await.unwrap();
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
             // `persist_state()`/`load_persisted_state()` key off the
             // StateStore's own committed height (the last EXECUTED block),
             // not `consensus.current_height()` (the NEXT height to
@@ -9710,7 +9734,7 @@ mod tests {
             let root   = node.status.lock().unwrap().state_root.clone().unwrap();
             let raw    = node.state.get_raw(CRYPTO_MIGRATION_STATE_KEY).unwrap();
             let m: CryptoMigrationState = serde_json::from_str(&raw).unwrap();
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
             (height, root, m.hard_cutoff_epoch)
         };
 
@@ -10249,7 +10273,7 @@ mod tests {
                 &addr, 1, &mldsa_kp, node.chain_id(), &account_kp,
             ));
             node.propose_block(cert.block_hash).await.unwrap();
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
             node.state.current_height()
         };
 
@@ -11486,7 +11510,7 @@ mod tests {
         node.propose_block(genesis_hash).await.unwrap();
         assert_eq!(node.pq_activation_epoch(), Some(42), "activation epoch must be set before persist");
 
-        node.persist_state();
+        node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
 
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
@@ -12302,7 +12326,7 @@ mod tests {
                 "in-memory binding must be set before persist"
             );
 
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         }
 
         // Phase 2: fresh node restores from disk — rebuild_bond_owner_bindings must
@@ -12582,7 +12606,7 @@ mod tests {
 
                 node.state.set_raw(&format!("validator-owner:{}", addr), human);
                 node.bond_owner_bindings.insert(addr.to_string(), human.to_string());
-                node.persist_state();
+                node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
                 cap_before = node.personhood_power_cap;
             }
 
@@ -12794,7 +12818,7 @@ mod tests {
                 "pre-persist: Alice must be !pop_verified before restart"
             );
 
-            node.persist_state();
+            node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         } // node dropped — simulates process exit.
 
         // Phase 2: restart from the same data dir.
@@ -13131,7 +13155,7 @@ mod tests {
         }
 
         // ── Phase E: revocation survives node restart ──
-        node.persist_state();
+        node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         drop(node);
 
         let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
@@ -13380,7 +13404,7 @@ mod tests {
         //
         // bond_owner_bindings is rebuilt from persisted StateStore key
         // "validator-owner:qcb1eve" via rebuild_bond_owner_bindings().
-        node.persist_state();
+        node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         drop(node);
 
         let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
@@ -13657,7 +13681,7 @@ mod tests {
         }
 
         // ── Phase F: exclusion survives node restart ──
-        node.persist_state();
+        node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         drop(node);
 
         let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
