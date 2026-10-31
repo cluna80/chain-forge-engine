@@ -616,10 +616,12 @@ mod h0_3_crash_recovery_live {
     /// and exits rather than starting the validator.
     #[test]
     fn c_06_sign_guard_ahead_of_state_is_blocked() {
+        // SignGuard wire format: {"last": [height, round, step], "votes": [], "lock": null}
+        // step 2 = Precommit
         let guard = serde_json::json!({
-            "last_height": 15,
-            "last_round": 0,
-            "last_step": "Precommit"
+            "last": [15, 0, 2],
+            "votes": [],
+            "lock": null
         });
         let result = check_signing_compatibility(&guard, 10).unwrap();
         assert!(
@@ -645,10 +647,11 @@ mod h0_3_crash_recovery_live {
     /// already committed by definition of the committed snapshot).
     #[test]
     fn c_06b_sign_guard_height_consistent_after_restart() {
+        // SignGuard wire format: {"last": [height, round, step], "votes": [], "lock": null}
         let guard = serde_json::json!({
-            "last_height": 14,
-            "last_round": 0,
-            "last_step": "Precommit"
+            "last": [14, 0, 2],
+            "votes": [],
+            "lock": null
         });
         let result = check_signing_compatibility(&guard, 15).unwrap();
         assert!(
