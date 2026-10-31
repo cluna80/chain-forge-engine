@@ -817,10 +817,15 @@ mod h0_3_crash_recovery_live {
             &keys_dir.join("alice.key.json"),
             &alice_data, alice_api, alice_p2p, None, &alice_log,
         );
-        assert!(
-            wait_for_port(alice_api, Duration::from_secs(20)),
-            "C-07: Alice API :{alice_api} never opened"
-        );
+        if !wait_for_port(alice_api, Duration::from_secs(20)) {
+            let log_tail = std::fs::read_to_string(&alice_log).unwrap_or_default();
+            let last: Vec<&str> = log_tail.lines().collect();
+            let tail_start = last.len().saturating_sub(40);
+            eprintln!("\n── Alice log (last 40 lines) ──────────────────────────────");
+            for l in &last[tail_start..] { eprintln!("{l}"); }
+            eprintln!("────────────────────────────────────────────────────────────\n");
+            panic!("C-07: Alice API :{alice_api} never opened — see log above");
+        }
         let alice_peer_id = read_peer_id_from_log(&alice_log, Duration::from_secs(15));
         let alice_bootstrap = format!("/ip4/127.0.0.1/tcp/{alice_p2p}/p2p/{alice_peer_id}");
         println!("   bootstrap: {alice_bootstrap}");
@@ -848,11 +853,17 @@ mod h0_3_crash_recovery_live {
             Some(&alice_bootstrap), &dave_log,
         );
 
-        for (port, name) in [(bob_api, "Bob"), (carol_api, "Carol"), (dave_api, "Dave")] {
-            assert!(
-                wait_for_port(port, Duration::from_secs(20)),
-                "C-07: {name} API :{port} never opened"
-            );
+        let bcd_logs = [(&bob_log, bob_api, "Bob"), (&carol_log, carol_api, "Carol"), (&dave_log, dave_api, "Dave")];
+        for (log_path, port, name) in &bcd_logs {
+            if !wait_for_port(*port, Duration::from_secs(20)) {
+                let log_tail = std::fs::read_to_string(log_path).unwrap_or_default();
+                let last: Vec<&str> = log_tail.lines().collect();
+                let tail_start = last.len().saturating_sub(40);
+                eprintln!("\n── {name} log (last 40 lines) ─────────────────────────────");
+                for l in &last[tail_start..] { eprintln!("{l}"); }
+                eprintln!("────────────────────────────────────────────────────────────\n");
+                panic!("C-07: {name} API :{port} never opened — see log above");
+            }
         }
 
         // ── Phase 2: wait for all 4 to reach height ≥ 5 ─────────────────────
