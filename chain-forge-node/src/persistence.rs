@@ -5,7 +5,11 @@
 /// ```text
 /// <data_dir>/
 ///   CURRENT                        ← atomically updated pointer: "gen-000042\n"
-///   consensus_signing.json         ← independently durable (not in snapshots)
+///   persist/
+///     consensus_signing.json       ← independently durable; written by
+///                                    persist_sign_guard(), read by
+///                                    restore_sign_guard() and the startup
+///                                    compatibility check in load_persisted_state()
 ///   snapshots/
 ///     gen-000041/
 ///       manifest.json              ← written LAST; validates the generation
