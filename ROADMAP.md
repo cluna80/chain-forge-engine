@@ -408,12 +408,12 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 |---|--------|--------------------------|--------|
 | H0-1 | Consensus safety | No two nodes finalize conflicting blocks at the same height under any validator failure pattern within f=1 | 🔲 |
 | H0-2 | State determinism | All nodes produce identical state roots after processing the same tx sequence regardless of arrival order | 🔲 |
-| H0-3 | Crash recovery | Node state is consistent with the canonical chain after an unclean shutdown at any block height | 🔲 |
+| H0-3 | Crash recovery | Node state is consistent with the canonical chain after an unclean shutdown at any block height | ✅ **Windows-confirmed 2026-10-31 (all five security findings F1–F5 resolved)** — C-01 (`367b060`…); C-07 (`bd1818e`…); security re-run (`ab5feac`, F1–F4, 11/11, 14.84s); signing-guard path fix + C-11 (`6f98800`, F5, 12/12, 11.53s BossKing/MINGW64 2026-10-31). PR #41. |
 | H0-4 | Nonce / replay | Nonce wrap-around and duplicate txs across blocks are rejected with zero partial state change | 🔲 |
 | H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | 🔲 |
 | H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
 | H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
-| H0-8 | Chain-ID isolation | A committed block from chain A cannot be replayed against chain B even with matching height and validator set | 🔲 |
+| H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | 🔶 In progress — failing tests G-01…G-07 committed (`a0d4392`, branch `security/h0-8-genesis-peer-verification`) |
 | H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` passes locally on Windows/MINGW64 — fix `submit_tx` returning null for ~77 KB recovery tx bodies | 🔴 Blocked (see DIS-003D entry in Phase 1) |
 | H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | 🔲 Blocked on H0-9 |
 | H0-11 | Validator eviction | Product decision on eviction policy recorded (are genesis validators exempt forever or swept on first outbid?); decision implemented and tested | 🔲 |
