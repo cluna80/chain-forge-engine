@@ -64,28 +64,28 @@
     {
       "label": "Alice",
       "address": "qcb1alice",
-      "balance": "1000000000",
+      "balance": "1100000000",
       "role": "validator",
       "public_key": "e1cb252a0db0514e8e639a5d20755a66af385deae8f1b44932c97845d5cc856e"
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
-      "balance": "1000000000",
+      "balance": "1100000000",
       "role": "validator",
       "public_key": "92eb29af99ec7629c13d4b9e15a588434783ba97a7ff1a7f18eb31c6d077e856"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
-      "balance": "1000000000",
+      "balance": "1100000000",
       "role": "validator",
       "public_key": "318e1213c8da2c7b01d31d55d1239ff0518e5811ba57e4077925dcbf35a5600a"
     },
     {
       "label": "Dave",
       "address": "qcb1dave",
-      "balance": "1000000000",
+      "balance": "1100000000",
       "role": "validator",
       "public_key": "ae1c44b845f7309694870b923926dd3db641e4e5a5ec7fb75180b74cc8aabc1d"
     },
