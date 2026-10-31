@@ -428,12 +428,22 @@ fn build_transfer_tx(from: &str, from_nonce: u64, to: &str, amount_uqcb: u64) ->
 }
 
 /// Build and sign a BondValidator tx for `sender`.
+///
+/// `owner_identity_id` is set to `Some(sender)` so the bond is authenticated:
+/// the execution layer requires this to establish the validator→identity
+/// binding that sets `pop_verified = true` and grants real consensus voting
+/// power at the epoch boundary.  Without it the bond is accepted but marked
+/// "unbound", and `gate_voting_power` zeros the validator at height 10.
 fn build_bond_tx(sender: &str, nonce: u64, amount_uqcb: u64) -> Transaction {
     let kp = ClassicalScheme.generate_keypair(sender).unwrap();
     let mut tx = Transaction::bond_validator(
         &format!("bond-{sender}-{nonce}"),
         sender, amount_uqcb as u128, nonce,
     );
+    // Authenticate the bond: sender is their own identity owner.
+    if let TxBody::BondValidator { ref mut owner_identity_id, .. } = tx.body {
+        *owner_identity_id = Some(sender.to_string());
+    }
     tx.sign(&kp, CHAIN_ID).unwrap();
     tx
 }
