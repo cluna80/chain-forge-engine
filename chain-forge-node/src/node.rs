@@ -2682,6 +2682,14 @@ impl Node {
                                         block_hash = %cert.block_hash,
                                         "devnet block committed"
                                     );
+                                    // persist_state() is NOT called inside
+                                    // propose_block (that path duplicates the
+                                    // commit logic but skips persistence so unit
+                                    // tests can control when it flushes). Call
+                                    // it here so every solo-devnet commit is
+                                    // durable — same guarantee as the real
+                                    // multi-node commit_block() path.
+                                    self.persist_state();
                                 }
                                 Err(e) => {
                                     debug!(error = %e, "block proposal skipped");
