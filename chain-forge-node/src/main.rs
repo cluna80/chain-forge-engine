@@ -50,6 +50,11 @@ struct Args {
     /// Extra bootstrap peer addresses (libp2p multiaddrs, e.g. /ip4/127.0.0.1/tcp/27001).
     /// Merged with genesis `network.bootstrap_nodes`. Repeatable: --bootstrap A --bootstrap B.
     bootstrap_peers: Vec<String>,
+    /// Signal that this node is part of a multi-node network even if no bootstrap
+    /// addresses are known at startup (e.g. it is the anchor node that others dial
+    /// into).  Prevents the solo-devnet auto-commit path from firing while peers
+    /// are still dialling in.
+    expect_peers: bool,
 }
 
 fn parse_args() -> Args {
@@ -61,6 +66,7 @@ fn parse_args() -> Args {
     let mut key_file: Option<std::path::PathBuf> = None;
     let mut data_dir: Option<std::path::PathBuf> = None;
     let mut bootstrap_peers: Vec<String> = Vec::new();
+    let mut expect_peers = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -97,6 +103,9 @@ fn parse_args() -> Args {
                 i += 1;
                 if i < args.len() { bootstrap_peers.push(args[i].clone()); }
             }
+            "--expect-peers" => {
+                expect_peers = true;
+            }
             "--help" | "-h" => {
                 println!("chain-forge-node");
                 println!("  --genesis <path>     Path to genesis.json (default: genesis.json)");
@@ -115,7 +124,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { genesis_path, validator_address, api_port, p2p_port, key_file, data_dir, bootstrap_peers }
+    Args { genesis_path, validator_address, api_port, p2p_port, key_file, data_dir, bootstrap_peers, expect_peers }
 }
 
 #[tokio::main]
@@ -155,7 +164,7 @@ async fn main() {
     // find each other immediately via direct dial rather than relying on mDNS
     // (which is unreliable in CI / container environments).
     let mut node = match node::Node::new_with_config(
-        &genesis_json, args.validator_address, args.p2p_port, args.bootstrap_peers,
+        &genesis_json, args.validator_address, args.p2p_port, args.bootstrap_peers, args.expect_peers,
     ).await {
         Ok(n) => n,
         Err(e) => {

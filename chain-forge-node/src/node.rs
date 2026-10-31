@@ -813,7 +813,7 @@ impl Node {
         validator_address: Option<String>,
         p2p_port_override: Option<u16>,
     ) -> Result<Self, NodeError> {
-        Self::new_with_config(genesis_json, validator_address, p2p_port_override, vec![]).await
+        Self::new_with_config(genesis_json, validator_address, p2p_port_override, vec![], false).await
     }
 
     /// Full constructor: P2P port override + extra bootstrap peer addresses.
@@ -829,6 +829,7 @@ impl Node {
         validator_address: Option<String>,
         p2p_port_override: Option<u16>,
         extra_bootstrap: Vec<String>,
+        expect_peers: bool,
     ) -> Result<Self, NodeError> {
         // Parse and validate genesis
         let genesis = GenesisConfig::from_json(genesis_json)
@@ -1386,7 +1387,7 @@ impl Node {
 
         // Record whether the final runtime config has bootstrap peers so the
         // event loop can decide between solo-devnet and multi-node mode.
-        let has_bootstrap_peers = !net_config.bootstrap_nodes.is_empty();
+        let has_bootstrap_peers = !net_config.bootstrap_nodes.is_empty() || expect_peers;
 
         // ── PoCD: parse optional genesis.pocd section ─────────────────────
         // `genesis.pocd` is stored as raw `serde_json::Value` in GenesisConfig
