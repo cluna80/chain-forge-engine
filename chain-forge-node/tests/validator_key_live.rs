@@ -51,24 +51,29 @@
 //!
 //! ## Quorum maths
 //!
-//! Genesis validators each bond 500_000_000 uqcb in Phase 0b so the bond
-//! ledger matches their genesis allocation.  Without this, `compute_stake_active_set`
+//! Genesis validators each bond 490_000_000 uqcb in Phase 0b so the bond
+//! ledger reflects their genesis allocation.  Without this, `compute_stake_active_set`
 //! (which reads `validator-bond:*` accounts) would see them as unbonded and assign
 //! them consensus power=1 (the engine's genesis default), while Eve's 2_000_000 uqcb
 //! bond would dominate total_power → the four live genesis nodes could never reach
 //! quorum.
 //!
+//! 490_000_000 (not 500_000_000) is intentional: the engine charges small fees
+//! before Phase 0b executes, leaving each validator's balance slightly below its
+//! genesis allocation.  Using 490_000_000 gives a comfortable 10 M uqcb fee buffer
+//! while preserving the quorum invariants below.
+//!
 //! With Phase 0b bonds:
-//!   total_power = 4 × 500_000_000 + 2_000_000 = 2_002_000_000 uqcb
-//!   quorum      = floor(2_002_000_000 * 2/3) + 1 = 1_334_666_668
-//!   → any 3 of 4 genesis validators commit (1_500_000_000 >= quorum)  ✓
-//!   → Alice + Bob alone (1_000_000_000) < quorum (deliberate-halt scenario)  ✓
+//!   total_power = 4 × 490_000_000 + 2_000_000 = 1_962_000_000 uqcb
+//!   quorum      = floor(1_962_000_000 * 2/3) + 1 = 1_308_000_001
+//!   → any 3 of 4 genesis validators commit (1_470_000_000 >= quorum)  ✓
+//!   → Alice + Bob alone (980_000_000) < quorum (deliberate-halt scenario)  ✓
 //!
 //! After Eve bonds 2_000_000 uqcb and is admitted:
-//!   total_power ≈ 2_002_000_000 uqcb
-//!   quorum      ≈ 1_334_666_668
-//!   → 4 of 5 can always commit; Alice + Bob (1_000_000_000 uqcb) < quorum
-//!   → killing Alice + Bob halts the chain (Carol + Dave + Eve ≈ 1_002_000_000
+//!   total_power ≈ 1_962_000_000 uqcb
+//!   quorum      ≈ 1_308_000_001
+//!   → 4 of 5 can always commit; Alice + Bob (980_000_000 uqcb) < quorum
+//!   → killing Alice + Bob halts the chain (Carol + Dave + Eve ≈ 982_000_000
 //!     < quorum). Tested in the deliberate-halt scenario only.
 
 use std::{
@@ -526,12 +531,14 @@ fn post_genesis_validator_admission() {
     // and stay at power=1 while Eve's 2_000_000 uqcb bond would dominate
     // total_power, making the four live nodes permanently unable to reach quorum.
     //
-    // Bonding 500_000_000 uqcb per genesis validator gives them realistic power
-    // proportional to their genesis allocation and ensures Bob+Carol+Dave
-    // (1_500_000_000 uqcb) always exceeds the quorum threshold (~1_334_666_668).
+    // Bonding 490_000_000 uqcb per genesis validator (not the full 500_000_000
+    // genesis allocation) gives them realistic power while leaving a 10 M uqcb
+    // buffer for any fees the engine may have charged before Phase 0b.  This
+    // ensures Bob+Carol+Dave (1_470_000_000 uqcb) always exceed the quorum
+    // threshold (~1_308_000_001) even if a small amount was deducted before bonding.
 
     eprintln!("\n── Phase 0b: bonding genesis validators to populate bond ledger ─────");
-    const GENESIS_BOND_UQCB: u64 = 500_000_000;
+    const GENESIS_BOND_UQCB: u64 = 490_000_000;
     let genesis_validators = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
     let mut genesis_bond_ids = Vec::new();
     for &gv in &genesis_validators {
@@ -816,13 +823,13 @@ fn post_genesis_validator_admission() {
     // Kill Alice.
     drop(nodes.remove(0));  // Alice is index 0
     eprintln!("   Alice killed. Bob/Carol/Dave continue (Eve is in set but not running).");
-    eprintln!("   Quorum check: Bob+Carol+Dave = 1_500_000_000 uqcb > quorum (~1_334_666_668). ✓");
+    eprintln!("   Quorum check: Bob+Carol+Dave = 1_470_000_000 uqcb > quorum (~1_308_000_001). ✓");
     eprintln!("   NOTE: Eve is in the consensus set with a registered key but no running");
     eprintln!("         process. Every round Eve is proposer times out (~8s). Allowing");
     eprintln!("         120 s for 2 blocks (worst case: Eve proposes both).");
 
-    // Bob+Carol+Dave = 1_500_000_000 uqcb; quorum ≈ 1_334_666_668.
-    // 1_500_000_000 > quorum → they can commit without Alice and without Eve.
+    // Bob+Carol+Dave = 1_470_000_000 uqcb; quorum ≈ 1_308_000_001.
+    // 1_470_000_000 > quorum → they can commit without Alice and without Eve.
     // However, when it is Eve's turn to propose a block, the round times out
     // (~8 s with block_time_ms=2000) before Bob takes over as the next proposer.
     // Give 120 s for 2 blocks to handle worst-case proposer-rotation delays.
@@ -878,9 +885,9 @@ fn post_genesis_validator_admission() {
     // Remove Bob from nodes list cleanly.
     nodes.retain(|n| n.name != "qcb1bob");
     eprintln!("   Bob killed. Waiting for Alice/Carol/Dave to advance (Eve in set, not running).");
-    eprintln!("   Alice+Carol+Dave = 1_500_000_000 uqcb > quorum. Allowing 120 s for proposer-rotation delays.");
+    eprintln!("   Alice+Carol+Dave = 1_470_000_000 uqcb > quorum. Allowing 120 s for proposer-rotation delays.");
 
-    // Alice+Carol+Dave = 1_500_000_000 uqcb > quorum (~1_334_666_668). ✓
+    // Alice+Carol+Dave = 1_470_000_000 uqcb > quorum (~1_308_000_001). ✓
     // Eve is still in the consensus set with a registered key but not running,
     // so her proposal rounds time out before the next proposer takes over.
     let without_bob = [ports.alice_api, ports.carol_api, ports.dave_api];
