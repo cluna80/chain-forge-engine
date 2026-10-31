@@ -4,7 +4,7 @@
   "engine_version": "0.1.0",
   "genesis_time": "2026-10-31T00:00:00Z",
   "environment": {
-    "mode": "devnet",
+    "mode": "testnet",
     "faucet_enabled": true,
     "relaxed_limits": true
   },
@@ -19,7 +19,7 @@
     "type": "proof-of-stake",
     "validator_set_size": 4,
     "block_time_ms": 500,
-    "personhood_weighted": false
+    "personhood_weighted": true
   },
   "execution": {
     "state_model": "account",
