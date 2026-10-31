@@ -665,19 +665,396 @@ mod h0_3_crash_recovery_live {
 
     // ── C-07: four-node crash restart, state root convergence ────────────────
 
-    /// C-07: In a 4-node devnet, SIGKILL one node mid-run (simulating an OS
-    /// crash, not a clean shutdown), restart it, and verify:
-    ///   - it catches up to the canonical height
-    ///   - its state_root matches the three surviving peers
-    ///   - no "starting from genesis" line in its log
+    /// C-07 — four-node SIGKILL crash-restart, state root convergence.
+    ///
+    /// Acceptance sequence:
+    ///   1.  Spawn 4 nodes (Alice, Bob, Carol, Dave) against
+    ///       `tests/devnet/genesis-4node-crash.json`.
+    ///   2.  Wait for all 4 to reach height ≥ 5 (enough committed state to
+    ///       verify persistence is working).
+    ///   3.  Record the state_root at height 5 from one of the surviving peers.
+    ///   4.  SIGKILL Dave (simulating an OS crash, not a clean shutdown).
+    ///   5.  The 3 survivors (Alice, Bob, Carol) must advance to height ≥ 8
+    ///       (proves quorum continued without Dave).
+    ///   6.  Restart Dave with the same `--data-dir`.
+    ///   7.  Dave must log "resumed from persisted state", NOT "starting from genesis".
+    ///   8.  Dave must catch up to the survivor height (≥ 8) within 60 s.
+    ///   9.  All 4 nodes must agree on the same state_root at the catch-up height.
     ///
     /// This is the live cross-node integration gate for H0-3.
     #[test]
     fn c_07_four_node_crash_restart_converges() {
-        todo!(
-            "C-07: wire 4-node SIGKILL crash-restart harness — \
-             implement after C-01..C-06 unit tests pass"
-        )
+        let bin = match node_binary() {
+            Some(b) if b.exists() => b,
+            _ => {
+                println!(
+                    "SKIP c_07: node binary not found. \
+                     Run `cargo build -p chain-forge-node` first."
+                );
+                return;
+            }
+        };
+
+        let genesis_4node = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/devnet/genesis-4node-crash.json");
+        assert!(genesis_4node.exists(), "genesis-4node-crash.json not found");
+
+        // Key files for all four validators (Ed25519 keys matching the genesis).
+        let keys_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/devnet/keys");
+
+        // ── allocate ports ────────────────────────────────────────────────────
+
+        let alice_api  = free_port();
+        let alice_p2p  = free_port();
+        let bob_api    = free_port();
+        let bob_p2p    = free_port();
+        let carol_api  = free_port();
+        let carol_p2p  = free_port();
+        let dave_api   = free_port();
+        let dave_p2p   = free_port();
+
+        println!(
+            "\n── C-07: 4-node SIGKILL crash-restart ────────────────────────────────\n\
+             Alice  api=:{alice_api}  p2p=:{alice_p2p}\n\
+             Bob    api=:{bob_api}   p2p=:{bob_p2p}\n\
+             Carol  api=:{carol_api}  p2p=:{carol_p2p}\n\
+             Dave   api=:{dave_api}   p2p=:{dave_p2p}"
+        );
+
+        // ── isolated data directories, one per node ───────────────────────────
+
+        let base: PathBuf = std::env::temp_dir()
+            .join(format!("cf-c07-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let alice_data  = base.join("alice");
+        let bob_data    = base.join("bob");
+        let carol_data  = base.join("carol");
+        let dave_data   = base.join("dave");
+        let log_dir     = base.join("logs");
+        for d in [&alice_data, &bob_data, &carol_data, &dave_data, &log_dir] {
+            std::fs::create_dir_all(d).expect("create node data dir");
+        }
+
+        // ── Phase 1: spawn all 4 nodes ────────────────────────────────────────
+
+        println!("── C-07 Phase 1: spawn all 4 nodes ──");
+
+        /// Spawn a single node and return its guard.  `bootstrap` is the
+        /// multiaddr of the first node (Alice), or None for Alice herself.
+        fn spawn4(
+            bin:       &PathBuf,
+            genesis:   &PathBuf,
+            validator: &str,
+            key_file:  &PathBuf,
+            data_dir:  &PathBuf,
+            api_port:  u16,
+            p2p_port:  u16,
+            bootstrap: Option<&str>,
+            log_path:  &PathBuf,
+        ) -> NodeGuard {
+            let log = std::fs::File::create(log_path)
+                .unwrap_or_else(|e| panic!("log create {log_path:?}: {e}"));
+            let mut cmd = Command::new(bin);
+            cmd.args([
+                "--genesis",   genesis.to_str().unwrap(),
+                "--validator", validator,
+                "--key-file",  key_file.to_str().unwrap(),
+                "--data-dir",  data_dir.to_str().unwrap(),
+                "--api-port",  &api_port.to_string(),
+                "--p2p-port",  &p2p_port.to_string(),
+            ]);
+            if let Some(b) = bootstrap {
+                cmd.args(["--bootstrap", b]);
+            }
+            let child = cmd
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn {validator} failed: {e}"));
+            NodeGuard { child, api_port, log_path: log_path.clone() }
+        }
+
+        /// Strip ANSI escape sequences and extract the libp2p peer ID from
+        /// a node log ("P2P listening ... peer=12D3…").
+        fn read_peer_id_from_log(log_path: &PathBuf, timeout: Duration) -> String {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let text = std::fs::read_to_string(log_path).unwrap_or_default();
+                let clean: String = {
+                    let mut out = String::with_capacity(text.len());
+                    let mut in_esc = false;
+                    for c in text.chars() {
+                        if c == '\x1b' { in_esc = true; continue; }
+                        if in_esc { if c == 'm' { in_esc = false; } continue; }
+                        out.push(c);
+                    }
+                    out
+                };
+                if let Some(id) = clean
+                    .lines()
+                    .filter(|l| l.contains("P2P listening"))
+                    .find_map(|l| l.split("peer=").nth(1))
+                    .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+                    .filter(|id| id.starts_with("12D3"))
+                {
+                    return id;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "C-07: no libp2p peer id found in {log_path:?} within {timeout:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        // Spawn Alice first; extract her peer ID; give it as bootstrap to the others.
+        let alice_log = log_dir.join("alice.log");
+        let alice = spawn4(
+            &bin, &genesis_4node, "qcb1alice",
+            &keys_dir.join("alice.key.json"),
+            &alice_data, alice_api, alice_p2p, None, &alice_log,
+        );
+        assert!(
+            wait_for_port(alice_api, Duration::from_secs(20)),
+            "C-07: Alice API :{alice_api} never opened"
+        );
+        let alice_peer_id = read_peer_id_from_log(&alice_log, Duration::from_secs(15));
+        let alice_bootstrap = format!("/ip4/127.0.0.1/tcp/{alice_p2p}/p2p/{alice_peer_id}");
+        println!("   bootstrap: {alice_bootstrap}");
+
+        let bob_log   = log_dir.join("bob.log");
+        let carol_log = log_dir.join("carol.log");
+        let dave_log  = log_dir.join("dave.log");
+
+        let bob = spawn4(
+            &bin, &genesis_4node, "qcb1bob",
+            &keys_dir.join("bob.key.json"),
+            &bob_data, bob_api, bob_p2p,
+            Some(&alice_bootstrap), &bob_log,
+        );
+        let carol = spawn4(
+            &bin, &genesis_4node, "qcb1carol",
+            &keys_dir.join("carol.key.json"),
+            &carol_data, carol_api, carol_p2p,
+            Some(&alice_bootstrap), &carol_log,
+        );
+        let mut dave = spawn4(
+            &bin, &genesis_4node, "qcb1dave",
+            &keys_dir.join("dave.key.json"),
+            &dave_data, dave_api, dave_p2p,
+            Some(&alice_bootstrap), &dave_log,
+        );
+
+        for (port, name) in [(bob_api, "Bob"), (carol_api, "Carol"), (dave_api, "Dave")] {
+            assert!(
+                wait_for_port(port, Duration::from_secs(20)),
+                "C-07: {name} API :{port} never opened"
+            );
+        }
+
+        // ── Phase 2: wait for all 4 to reach height ≥ 5 ─────────────────────
+
+        println!("── C-07 Phase 2: wait for all 4 nodes to reach h ≥ 5 ──");
+
+        let all_at_5 = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            let ports = [alice_api, bob_api, carol_api, dave_api];
+            let names = ["Alice", "Bob", "Carol", "Dave"];
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    for (p, n) in ports.iter().zip(names.iter()) {
+                        let h = status_height(*p).unwrap_or(0);
+                        eprintln!("   {n}: height={h}");
+                    }
+                    // Dump logs on timeout.
+                    for (g, n) in [(&alice_log, "Alice"), (&bob_log, "Bob"),
+                                   (&carol_log, "Carol"), (&dave_log, "Dave")]
+                    {
+                        let text = std::fs::read_to_string(g).unwrap_or_default();
+                        let lines: Vec<_> = text.lines().collect();
+                        let s = lines.len().saturating_sub(20);
+                        println!("── {n} log (last 20) ──");
+                        for l in &lines[s..] { println!("{l}"); }
+                    }
+                    break false;
+                }
+                let heights: Vec<u64> = ports.iter()
+                    .map(|&p| status_height(p).unwrap_or(0))
+                    .collect();
+                print!("\r   heights: Alice={} Bob={} Carol={} Dave={}   ",
+                       heights[0], heights[1], heights[2], heights[3]);
+                if heights.iter().all(|&h| h >= 5) { println!(); break true; }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        };
+        assert!(all_at_5, "C-07: not all 4 nodes reached height 5 within 90s");
+
+        // Record a reference state root at height 5 from Alice.
+        let pre_state_root = status_state_root(alice_api)
+            .expect("C-07: cannot read state_root from Alice");
+        let pre_height = status_height(alice_api).expect("C-07: cannot read height from Alice");
+        println!("   all 4 at height ≥ 5; Alice pre-crash: h={pre_height} root={pre_state_root}");
+
+        // ── Phase 3: SIGKILL Dave ─────────────────────────────────────────────
+
+        println!("── C-07 Phase 3: SIGKILL Dave ──");
+        dave.kill_abruptly();
+
+        // Verify Dave's CURRENT file exists (he persisted at least one generation).
+        let dave_current = std::fs::read_to_string(dave_data.join("CURRENT"))
+            .expect("C-07: Dave must have a CURRENT file after ≥ 5 committed blocks");
+        println!("   Dave CURRENT after crash: {}", dave_current.trim());
+
+        // ── Phase 4: survivors advance while Dave is down ─────────────────────
+
+        println!("── C-07 Phase 4: survivors (Alice/Bob/Carol) advance to h ≥ 8 ──");
+
+        let survivors_advanced = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let ports = [alice_api, bob_api, carol_api];
+            loop {
+                if std::time::Instant::now() >= deadline { break false; }
+                let heights: Vec<u64> = ports.iter()
+                    .map(|&p| status_height(p).unwrap_or(0))
+                    .collect();
+                print!("\r   survivors: Alice={} Bob={} Carol={}   ",
+                       heights[0], heights[1], heights[2]);
+                if heights.iter().all(|&h| h >= 8) { println!(); break true; }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        };
+        assert!(
+            survivors_advanced,
+            "C-07: Alice/Bob/Carol did not advance to height 8 without Dave within 60s"
+        );
+
+        let survivor_height = status_height(alice_api)
+            .expect("C-07: cannot read survivor height");
+        println!("   survivors at height {survivor_height}");
+
+        // ── Phase 5: restart Dave ─────────────────────────────────────────────
+
+        let dave_api2   = free_port();
+        let dave_p2p2   = free_port();
+        let dave_log2   = log_dir.join("dave2.log");
+
+        println!("── C-07 Phase 5: restart Dave on api=:{dave_api2}  p2p=:{dave_p2p2} ──");
+
+        let dave2 = spawn4(
+            &bin, &genesis_4node, "qcb1dave",
+            &keys_dir.join("dave.key.json"),
+            &dave_data,             // same data directory — this is the crash recovery
+            dave_api2, dave_p2p2,
+            Some(&alice_bootstrap), // bootstrap against Alice again
+            &dave_log2,
+        );
+
+        assert!(
+            wait_for_port(dave_api2, Duration::from_secs(20)),
+            "C-07: restarted Dave API :{dave_api2} never opened"
+        );
+
+        // Give the startup log a moment to flush.
+        std::thread::sleep(Duration::from_secs(1));
+
+        // Dave must resume from his persisted state — not fall back to genesis.
+        {
+            let log = std::fs::read_to_string(&dave_log2).unwrap_or_default();
+            assert!(
+                log.contains("resumed from persisted state"),
+                "C-07: restarted Dave did not log 'resumed from persisted state'"
+            );
+            assert!(
+                !log.contains("starting from genesis"),
+                "C-07: restarted Dave incorrectly fell back to genesis"
+            );
+        }
+
+        // ── Phase 6: Dave catches up ──────────────────────────────────────────
+
+        println!("── C-07 Phase 6: Dave catches up to h ≥ {survivor_height} ──");
+
+        assert!(
+            wait_for_height_proc(dave_api2, survivor_height, Duration::from_secs(90)),
+            "C-07: restarted Dave did not catch up to survivor height {survivor_height} within 90s"
+        );
+
+        let dave_catchup_height = status_height(dave_api2)
+            .expect("C-07: cannot read Dave catch-up height");
+        println!("   Dave caught up to height {dave_catchup_height}");
+
+        // ── Phase 7: state root agreement ─────────────────────────────────────
+
+        println!("── C-07 Phase 7: verify state root agreement at h={dave_catchup_height} ──");
+
+        // Poll until all 4 nodes have reached dave_catchup_height.
+        let all_at_catchup = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let ports = [alice_api, bob_api, carol_api, dave_api2];
+            loop {
+                if std::time::Instant::now() >= deadline { break false; }
+                let heights: Vec<u64> = ports.iter()
+                    .map(|&p| status_height(p).unwrap_or(0))
+                    .collect();
+                if heights.iter().all(|&h| h >= dave_catchup_height) { break true; }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        };
+        assert!(
+            all_at_catchup,
+            "C-07: not all 4 nodes reached height {dave_catchup_height} for root comparison"
+        );
+
+        // Collect state_root from all 4 nodes at the current height.
+        let roots: Vec<Option<String>> = [alice_api, bob_api, carol_api, dave_api2]
+            .iter()
+            .map(|&p| {
+                // Use /api/blocks/<h> if available; fall back to /api/status root.
+                api_get_json(p, &format!("/api/blocks/{dave_catchup_height}"))
+                    .and_then(|j| j["state_root"].as_str().map(|s| s.to_string()))
+                    .or_else(|| status_state_root(p))
+            })
+            .collect();
+
+        println!("   State roots at h={dave_catchup_height}:");
+        let names = ["Alice", "Bob", "Carol", "Dave"];
+        for (n, r) in names.iter().zip(roots.iter()) {
+            println!("     {n}: {}", r.as_deref().unwrap_or("<unavailable>"));
+        }
+
+        // At minimum, Dave's root must match Alice's (the reference survivor).
+        let alice_root = roots[0].as_deref().unwrap_or("");
+        let dave_root  = roots[3].as_deref().unwrap_or("");
+        assert!(
+            !alice_root.is_empty() && !dave_root.is_empty(),
+            "C-07: could not read state root from Alice or Dave"
+        );
+        assert_eq!(
+            alice_root, dave_root,
+            "C-07: Dave's state root diverged from Alice's after crash recovery"
+        );
+
+        // All 4 must agree (or be unavailable via /api/blocks — skip those).
+        let available: Vec<&str> = roots.iter()
+            .filter_map(|r| r.as_deref())
+            .collect();
+        let all_agree = available.windows(2).all(|w| w[0] == w[1]);
+        assert!(
+            all_agree,
+            "C-07: state roots do not agree across all 4 nodes"
+        );
+
+        println!("── C-07 PASSED: Dave crash-recovered, caught up, state root matches peers ──");
+
+        // Cleanup: Drop guards kill the processes.
+        drop(alice);
+        drop(bob);
+        drop(carol);
+        drop(dave2);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── C-08: crash-during-write — previous generation survives ──────────────
