@@ -362,6 +362,42 @@ async fn attestation_guard_live() {
         "chain did not reach height 3 within 60s"
     );
 
+    // ── Phase 1.5: Fund the claimant from qcb1alice ───────────────────────
+    // After the account-ownership fix (PR #39), `debit_fee` runs before the tx
+    // body and the claimant address has no genesis balance.  Transfer a small
+    // amount from the genesis-funded qcb1alice so the claimant can pay gas.
+    println!("   [phase1.5] Funding claimant {claimant} from qcb1alice...");
+    let fund_tx = serde_json::json!({
+        "id":         format!("fund-{claimant}"),
+        "sender":     "qcb1alice",
+        "nonce":      0u64,
+        "body":       { "Transfer": { "to": &claimant, "denom": "uqcb", "amount": 10_000u64 } },
+        "gas_limit":  100_000u64,
+        "signature":  [],
+        "public_key": []
+    }).to_string();
+    let fund_resp = api_post_tx(ports.alice_api, &fund_tx)
+        .expect("fund claimant POST failed (network error)");
+    println!("   Fund claimant response: {fund_resp}");
+    assert!(
+        fund_resp["status"].as_str().unwrap_or("") == "queued"
+            || fund_resp["status"].as_str().unwrap_or("") == "ok",
+        "fund claimant was not queued: {fund_resp}"
+    );
+    // Wait for the fund tx to settle (alice nonce must reach 1).
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let nonce: u64 = api_get(ports.alice_api, "/api/accounts/qcb1alice")
+                .and_then(|v| v["nonce"].as_u64())
+                .unwrap_or(0);
+            if nonce >= 1 { break; }
+            assert!(Instant::now() < deadline, "fund claimant tx did not settle within 30s");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    println!("   Claimant funded.");
+
     // ── Phase 2: RegisterIdentity for the claimant ────────────────────────
     // Submit to Alice's API. Signature is empty (require_signatures: false in genesis).
     println!("   [phase2] Submitting RegisterIdentity for {claimant}...");
@@ -383,6 +419,33 @@ async fn attestation_guard_live() {
         reg_status == "queued" || reg_status == "ok",
         "RegisterIdentity was not queued: {reg_resp}"
     );
+
+    // Wait for the RegisterIdentity to commit and propagate to ALL nodes before
+    // submitting the Attest. This is critical: if the Attest is included in a
+    // block before the RegisterIdentity commits, the identity store will not
+    // contain the claimant yet and identity.attest() will return NotFound --
+    // the tx is included-but-failed (nonce consumed, fee charged), and the
+    // identity write is rolled back. Bob's nonce advances to 1 even though
+    // attestation_ledger.count() stays 0, so the duplicate Attest in Phase 6
+    // is treated as the first attestation (success=true with "1/3 attestations").
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let all_api_ports = [ports.alice_api, ports.bob_api, ports.carol_api, ports.dave_api];
+        loop {
+            let all_registered = all_api_ports.iter().all(|&p| {
+                identity_of(p, &claimant)
+                    .and_then(|v| v["registered"].as_bool())
+                    .unwrap_or(false)
+            });
+            if all_registered { break; }
+            assert!(
+                Instant::now() < deadline,
+                "RegisterIdentity for {claimant} did not propagate to all 4 nodes within 60s"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    println!("   [phase2] RegisterIdentity confirmed on all 4 nodes.");
 
     // ── Phase 3: Attest from qcb1bob ──────────────────────────────────────
     // qcb1bob is bootstrapped as Verified at genesis, so it is eligible to attest.
@@ -406,6 +469,56 @@ async fn attestation_guard_live() {
         attest_status == "queued" || attest_status == "ok",
         "Attest was not queued: {attest_resp}"
     );
+
+    // Wait for the first Attest to commit (Bob's nonce must advance to 1).
+    // This is critical for two reasons:
+    //
+    // 1. Phase 6 must submit the duplicate with the correct nonce (bob_nonce).
+    //    Without this wait, bob_nonce could still be 0, and both the first
+    //    Attest and the duplicate would use nonce=0; whichever lands second is
+    //    rejected by the nonce guard — masking the duplicate-attest guard.
+    //
+    // 2. The duplicate-attest guard (has_attested) can only fire if the first
+    //    Attest is committed before the duplicate is submitted. If the duplicate
+    //    reaches the executor before the first Attest's block commits, both run
+    //    against a ledger where has_attested("qcb1bob")=false and both succeed.
+    //
+    // Note: nonce increments on BOTH successful and failed txs (fee charged
+    // either way), so bob_nonce=1 confirms the first Attest was INCLUDED but
+    // does not by itself confirm it SUCCEEDED. The Phase 2 RegisterIdentity
+    // pre-wait ensures the claimant exists when the Attest executes, which is
+    // why the first Attest should succeed and attestation_count reach 1.
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let nonce: u64 = api_get(ports.bob_api, "/api/accounts/qcb1bob")
+                .and_then(|v| v["nonce"].as_u64())
+                .unwrap_or(0);
+            if nonce >= 1 { break; }
+            assert!(Instant::now() < deadline,
+                "first Attest from qcb1bob did not commit within 30s (nonce stuck at 0)");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    println!("   [phase3] First Attest from qcb1bob confirmed committed (bob nonce=1).");
+
+    // Verify the first Attest actually SUCCEEDED (attestation_count=1 on bob's node).
+    // bob_nonce=1 only proves the tx was included (nonce+fee consumed). The attestation
+    // ledger must also reflect the Attest to distinguish success from included-but-failed.
+    {
+        let att_count = identity_of(ports.bob_api, &claimant)
+            .and_then(|v| v["attestation_count"].as_u64())
+            .unwrap_or(0);
+        assert!(
+            att_count >= 1,
+            "[phase3] first Attest was INCLUDED (bob nonce=1) but FAILED: \
+             attestation_count={att_count} on bob's node. \
+             This means identity.attest() returned an error — check that \
+             the claimant was registered before the Attest was submitted \
+             and that the RegisterIdentity pre-wait worked correctly."
+        );
+        println!("   [phase3] Attestation confirmed: claimant attestation_count={att_count} on bob's node.");
+    }
 
     // ── Phase 4: Wait for convergence across all four nodes ───────────────
     // The key assertion: identity must be visible from every node's API,
