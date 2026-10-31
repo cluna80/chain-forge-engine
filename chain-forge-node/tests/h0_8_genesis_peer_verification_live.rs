@@ -173,11 +173,13 @@ mod h0_8_genesis_peer_verification_live {
     }
 
     fn keys_dir() -> PathBuf {
+        // The ML-DSA devnet genesis requires ML-DSA consensus keys, which live
+        // under tests/devnet/keys/mldsa/ (not the Ed25519 keys/alice.key.json).
         let manifest  = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace = manifest.parent().expect("workspace root");
-        let ws_keys   = workspace.join("tests/devnet/keys");
+        let ws_keys   = workspace.join("tests/devnet/keys/mldsa");
         if ws_keys.exists() { return ws_keys; }
-        manifest.join("tests/devnet/keys")
+        manifest.join("tests/devnet/keys/mldsa")
     }
 
     struct NodeGuard { child: Child }
