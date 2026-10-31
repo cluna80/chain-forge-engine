@@ -3310,6 +3310,23 @@ impl Node {
             }
 
             NetworkEvent::PeerConnected(peer) => {
+                // H0-8: genesis-hash peer verification.
+                // If the peer has already advertised a genesis hash, compare
+                // it against our own before trusting the peer.
+                if let Some(ref remote_hash) = peer.genesis_hash {
+                    let local_hash = chain_forge_core::compute_genesis_hash(&self.genesis);
+                    if *remote_hash != local_hash {
+                        warn!(
+                            peer_id = %peer.peer_id,
+                            addr   = %peer.addr,
+                            remote_genesis_hash = %remote_hash,
+                            local_genesis_hash  = %local_hash,
+                            "genesis_hash_mismatch: rejecting peer from foreign chain"
+                        );
+                        // Do not add to the peer list.
+                        return Ok(());
+                    }
+                }
                 info!(peer_id = %peer.peer_id, addr = %peer.addr, "peer connected");
                 let mut list = self.peers.lock().unwrap();
                 // De-duplicate: a reconnect updates the existing entry

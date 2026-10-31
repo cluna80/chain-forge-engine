@@ -1177,6 +1177,47 @@ impl GenesisConfig {
     }
 }
 
+// -- Genesis hash -------------------------------------------------------------
+
+/// Compute the canonical genesis hash for a chain.
+///
+/// The genesis hash is the SHA-256 digest of the canonical JSON serialization
+/// of the `GenesisConfig`, returned as a 64-character lowercase hex string.
+///
+/// ## Stability contract
+///
+/// The hash is deterministic over the *canonical* JSON form produced by
+/// `serde_json::to_vec` (compact, keys in struct-definition order as
+/// serialized by serde).  Two `GenesisConfig` values that differ in any field
+/// will produce different hashes.  The hash does NOT depend on any runtime
+/// state; it can be computed offline from the genesis file.
+///
+/// ## Usage
+///
+/// The genesis hash is used as a second-layer peer identity check:
+///   - After the libp2p `identify` handshake, the remote's genesis hash must
+///     match the local node's `compute_genesis_hash(&local_genesis)`.
+///   - Transaction signing domains incorporate the genesis hash so that a
+///     signature made on chain A cannot be replayed on chain B even when both
+///     chains share the same `chain_id`.
+///
+/// ## Chain Forge modular design
+///
+/// This function is defined in `chain-forge-core` and is chain-agnostic.
+/// Qattice ($QCB) is one consumer; any other Chain Forge chain uses the same
+/// function and inherits the same protection without Qattice-specific constants.
+pub fn compute_genesis_hash(genesis: &GenesisConfig) -> String {
+    use sha2::{Sha256, Digest};
+    // Canonical form: compact JSON, key order determined by struct layout.
+    // Use unwrap: GenesisConfig always serializes (no maps with non-string keys,
+    // no floats that would produce NaN/Inf, all fields are serde-derived).
+    let canonical = serde_json::to_vec(genesis)
+        .expect("GenesisConfig serialization must not fail");
+    let digest = Sha256::digest(&canonical);
+    // 64 lowercase hex chars (SHA-256 → 32 bytes → 64 hex nibbles).
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
