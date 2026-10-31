@@ -44,8 +44,8 @@
 /// 4. Parse each file; cross-check heights.
 /// 5. On any error → `PersistError` (never silent genesis fallback).
 
-use std::io::{BufRead, Write as IoWrite};
-use std::path::{Path, PathBuf};
+use std::io::Write as IoWrite;
+use std::path::Path;
 use sha2::{Sha256, Digest};
 
 // ── public error type ────────────────────────────────────────────────────────

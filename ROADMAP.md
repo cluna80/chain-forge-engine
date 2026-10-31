@@ -408,7 +408,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 |---|--------|--------------------------|--------|
 | H0-1 | Consensus safety | No two nodes finalize conflicting blocks at the same height under any validator failure pattern within f=1 | 🔲 |
 | H0-2 | State determinism | All nodes produce identical state roots after processing the same tx sequence regardless of arrival order | 🔲 |
-| H0-3 | Crash recovery | Node state is consistent with the canonical chain after an unclean shutdown at any block height | 🔲 |
+| H0-3 | Crash recovery | Node state is consistent with the canonical chain after an unclean shutdown at any block height | ⏳ In progress — generation-based persistence implemented (`22ef3c5`); 9/11 acceptance tests pass on Windows (C-01 single-node harness + C-07 4-node SIGKILL harness pending) |
 | H0-4 | Nonce / replay | Nonce wrap-around and duplicate txs across blocks are rejected with zero partial state change | 🔲 |
 | H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | 🔲 |
 | H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
