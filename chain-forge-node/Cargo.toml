@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name    = "chain_forge_node"
+path    = "src/lib.rs"
+
 [[bin]]
 name = "chain-forge-node"
 path = "src/main.rs"
@@ -125,3 +129,7 @@ path = "tests/timestamp_monotonic_live.rs"
 [[test]]
 name = "pocd_reward_live"
 path = "tests/pocd_reward_live.rs"
+
+[[test]]
+name = "h0_3_crash_recovery_live"
+path = "tests/h0_3_crash_recovery_live.rs"

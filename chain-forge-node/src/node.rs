@@ -424,6 +424,40 @@ struct SyncResponseMsg {
     proposal: BlockProposal,
 }
 
+/// Outcome of `Node::load_persisted_state()`.  Returned to the caller
+/// (`main.rs`) so it can make the correct startup decision.
+pub enum PersistStartup {
+    /// No CURRENT pointer found — fresh data directory, start genesis.
+    Fresh,
+    /// Valid snapshot loaded and verified.
+    Restored { height: u64, generation: String },
+    /// CURRENT points at a committed snapshot that is corrupt or incomplete.
+    /// The node MUST NOT start from genesis; it should exit with an error.
+    Fatal { error: String },
+    /// The consensus signing guard is ahead of the restored state height.
+    /// Starting as a validator is unsafe until the node has synced up to
+    /// the guard height from peers.
+    SigningBlocked { guard_height: u64, state_height: u64 },
+}
+
+impl PersistStartup {
+    /// Returns `true` if state was successfully loaded (`Restored`) or if there
+    /// was no prior state (`Fresh`). Returns `false` for `Fatal` and
+    /// `SigningBlocked`.
+    ///
+    /// Used by internal unit tests that pre-date the typed API.  Production
+    /// code (`main.rs`) should always match on the full enum.
+    pub fn loaded(&self) -> bool {
+        matches!(self, PersistStartup::Restored { .. } | PersistStartup::Fresh)
+    }
+
+    /// Returns `true` specifically when state was successfully restored from a
+    /// prior committed snapshot (not just a fresh directory).
+    pub fn is_restored(&self) -> bool {
+        matches!(self, PersistStartup::Restored { .. })
+    }
+}
+
 pub struct Node {
     genesis:   GenesisConfig,
     consensus: Box<dyn ConsensusEngine>,
@@ -2076,44 +2110,47 @@ impl Node {
 
     // ── end PQ-VAL-002 public API ────────────────────────────────────────────
 
-    /// Write chain state to disk. Called after every committed block.
-    /// Writes JSON files for all stateful subsystems so a restarted node
-    /// can resume at the exact committed height without replaying from genesis.
+    /// Write chain state to disk atomically using the generation-based snapshot
+    /// scheme (H0-3). Called after every committed block.
+    ///
+    /// All 8 state files are written atomically into a new generation directory
+    /// (`data/snapshots/gen-NNNNNN/`). Only after all files are written and
+    /// fsynced does the `CURRENT` pointer advance atomically. The previous
+    /// generation is retained as a fallback until the next write. A crash at
+    /// any point before `CURRENT` updates leaves the previous generation intact.
     fn persist_state(&self) {
         let Some(ref dir) = self.data_dir else { return };
-        let persist = dir.join("persist");
-        let snap    = self.state.export_snapshot();
-        let height  = snap.height;
-        for (name, value) in [
-            ("state.json",      serde_json::to_string_pretty(&snap)                  .ok()),
-            ("identity.json",   serde_json::to_string_pretty(&self.identity)         .ok()),
-            ("validators.json", serde_json::to_string_pretty(&self.validator_registry).ok()),
-            ("agents.json",     serde_json::to_string_pretty(&self.agents)           .ok()),
-            ("slashing.json",   serde_json::to_string_pretty(&self.slasher)          .ok()),
-            ("chain_store.json",serde_json::to_string_pretty(&self.chain_store)      .ok()),
-            ("historical_validator_sets.json", serde_json::to_string_pretty(&self.historical_validator_sets).ok()),
-            // CF-VAL-KEY-002: the live consensus ValidatorSet, exactly as
-            // `self.consensus` holds it right now -- real keys, real
-            // voting power, every currently-seated validator whether seated
-            // at genesis or admitted later by stake bonding. This is
-            // authoritative in a way `validator_registry.build_validator_set()`
-            // is not: that function only knows about validators that went
-            // through `ValidatorRegistry::register()`/`register_genesis_validator()`,
-            // which the live stake-bond admission path (`compute_stake_active_set`,
-            // node.rs) never calls -- so a bonded validator admitted after
-            // genesis is entirely absent from `build_validator_set()`'s
-            // output, not merely missing its key. Persisting the real,
-            // live set directly and restoring it verbatim at restart
-            // (`load_persisted_state`) is what actually satisfies "a
-            // bonded validator's key and seat survive restart" -- see
-            // that function for how this file is used.
-            ("live_validator_set.json", serde_json::to_string_pretty(self.consensus.validator_set()).ok()),
-        ] {
-            if let Some(json) = value {
-                let _ = std::fs::write(persist.join(name), json);
+        let snap   = self.state.export_snapshot();
+        let height = snap.height;
+
+        // Serialise all 8 files.
+        let mut contents: Vec<(&'static str, Vec<u8>)> = Vec::with_capacity(8);
+        let mut push = |name: &'static str, result: serde_json::Result<String>| {
+            match result {
+                Ok(s)  => contents.push((name, s.into_bytes())),
+                Err(e) => tracing::warn!(name, error = %e, "persist_state: serialise failed"),
             }
+        };
+        push("state.json",      serde_json::to_string_pretty(&snap));
+        push("identity.json",   serde_json::to_string_pretty(&self.identity));
+        push("validators.json", serde_json::to_string_pretty(&self.validator_registry));
+        push("agents.json",     serde_json::to_string_pretty(&self.agents));
+        push("slashing.json",   serde_json::to_string_pretty(&self.slasher));
+        push("chain_store.json",serde_json::to_string_pretty(&self.chain_store));
+        push("historical_validator_sets.json",
+             serde_json::to_string_pretty(&self.historical_validator_sets));
+        // CF-VAL-KEY-002: the live consensus ValidatorSet, exactly as
+        // `self.consensus` holds it right now -- real keys, real voting power,
+        // every currently-seated validator whether seated at genesis or admitted
+        // later by stake bonding. See load_persisted_state for full rationale.
+        push("live_validator_set.json",
+             serde_json::to_string_pretty(self.consensus.validator_set()));
+
+        match crate::persistence::write_snapshot(dir, height, &contents) {
+            Ok(gen) => tracing::debug!(height, %gen, "state persisted (generation-based)"),
+            Err(e)  => tracing::error!(height, error = %e,
+                "persist_state: failed to write snapshot — data_dir may be corrupt"),
         }
-        tracing::debug!(height, "state persisted to disk");
     }
 
     /// Rebuild `bond_owner_bindings` from persistent StateStore metadata.
@@ -2137,60 +2174,130 @@ impl Node {
         }
     }
 
-    /// Load chain state from disk. Returns true if state was found and loaded.
-    /// On success, the node resumes from the last persisted height. All
-    /// stateful subsystems (state, identity, QRC, validators, agents, slasher,
-    /// block history) are restored so the node is fully caught-up immediately.
-    pub fn load_persisted_state(&mut self) -> bool {
-        let Some(ref dir) = self.data_dir else { return false };
-        let persist = dir.join("persist");
-        let snap_path        = persist.join("state.json");
-        let id_path          = persist.join("identity.json");
-        let validators_path  = persist.join("validators.json");
-        let agents_path      = persist.join("agents.json");
-        let slashing_path    = persist.join("slashing.json");
-        let chain_store_path = persist.join("chain_store.json");
-        let historical_vs_path = persist.join("historical_validator_sets.json");
-        let live_vs_path      = persist.join("live_validator_set.json");
+    /// Load chain state from the generation-based snapshot (H0-3).
+    ///
+    /// Returns a [`PersistStartup`] variant:
+    /// - `Fresh`          — no CURRENT pointer; caller should start genesis.
+    /// - `Restored`       — valid snapshot loaded; node is at `height`.
+    /// - `Fatal`          — corrupt/incomplete committed snapshot; must exit.
+    /// - `SigningBlocked` — guard ahead of state; validator signing unsafe.
+    ///
+    /// Never silently falls back to genesis on any error.
+    pub fn load_persisted_state(&mut self) -> PersistStartup {
+        let Some(ref dir) = self.data_dir.clone() else {
+            return PersistStartup::Fresh;
+        };
 
-        if !snap_path.exists() { return false; }
+        // ── 1. Load and validate the committed snapshot ──────────────────────
+        let snap_contents = match crate::persistence::load_snapshot(dir) {
+            Err(crate::persistence::PersistError::Fresh) | Ok(None) => {
+                return PersistStartup::Fresh;
+            }
+            Err(e) => {
+                return PersistStartup::Fatal { error: e.to_string() };
+            }
+            Ok(Some(c)) => c,
+        };
+
+        let height     = snap_contents.height;
+        let generation = snap_contents.generation.clone();
+
+        // ── 2. Check signing-history compatibility ──────────────────────────
+        let signing_path = dir.join("consensus_signing.json");
+        if signing_path.exists() {
+            match std::fs::read_to_string(&signing_path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string()))
+            {
+                Ok(guard_json) => {
+                    match crate::persistence::check_signing_compatibility(&guard_json, height) {
+                        Ok(crate::persistence::SigningCompatibility::GuardAheadOfState {
+                            guard_height, state_height
+                        }) => {
+                            return PersistStartup::SigningBlocked { guard_height, state_height };
+                        }
+                        Ok(crate::persistence::SigningCompatibility::GuardBehindState {
+                            guard_height, ..
+                        }) => {
+                            // Safe: advance the guard to state_height before
+                            // the consensus engine resumes signing.
+                            tracing::warn!(
+                                guard_height, state_height = height,
+                                "consensus signing guard is behind restored state — \
+                                 guard will be advanced to state height before signing resumes"
+                            );
+                        }
+                        Ok(crate::persistence::SigningCompatibility::Consistent) => {}
+                        Err(e) => {
+                            return PersistStartup::Fatal { error: e.to_string() };
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Signing file exists but is unreadable/corrupt — fail closed.
+                    return PersistStartup::Fatal {
+                        error: format!("consensus_signing.json unreadable: {e}"),
+                    };
+                }
+            }
+        }
+
+        // ── 3. Restore all subsystems from the validated snapshot ────────────
+        // Borrow the files map from the snapshot contents.  All files have
+        // already been hash-verified by load_snapshot(); we parse them here.
+        let files = snap_contents.files;
+        let live_vs_bytes = files.get("live_validator_set.json").cloned();
 
         let mut load = || -> Result<(), Box<dyn std::error::Error>> {
+            // All files have already been hash-verified by load_snapshot().
+            // Parse them from the in-memory map; every file is required (the
+            // manifest guarantees their presence — missing entries would have
+            // been caught as PersistError::MissingFile above).
+            macro_rules! required {
+                ($name:expr) => {
+                    files.get($name).ok_or(concat!($name, " missing from validated snapshot"))?
+                }
+            }
+            macro_rules! optional_parse {
+                ($name:expr, $ty:ty) => {
+                    if let Some(b) = files.get($name) {
+                        Some(serde_json::from_slice::<$ty>(b)?)
+                    } else {
+                        None
+                    }
+                }
+            }
+
             let snap: chain_forge_state::StateSnapshot =
-                serde_json::from_str(&std::fs::read_to_string(&snap_path)?)?;
-            let height = snap.height;
+                serde_json::from_slice(required!("state.json"))?;
             self.state.restore_snapshot(snap);
 
-            if id_path.exists() {
-                self.identity = serde_json::from_str(&std::fs::read_to_string(&id_path)?)?;
+            if let Some(id) = optional_parse!("identity.json", _) {
+                self.identity = id;
                 // Identity parameters are not persisted; reinstall them from genesis.
                 self.identity.set_attestation_quorum(self.executor.attestation_quorum());
                 self.identity.set_attestation_cap_per_window(self.executor.attestation_cap_per_window());
             }
-            if validators_path.exists() {
-                self.validator_registry =
-                    serde_json::from_str(&std::fs::read_to_string(&validators_path)?)?;
+            if let Some(vr) = optional_parse!("validators.json", _) {
+                self.validator_registry = vr;
                 // The minimum bond comes from genesis, never from disk.
                 self.validator_registry.set_min_bond(self.min_bond_uqcb);
                 tracing::debug!("validator registry restored from disk");
             }
-            if agents_path.exists() {
-                self.agents =
-                    serde_json::from_str(&std::fs::read_to_string(&agents_path)?)?;
+            if let Some(ag) = optional_parse!("agents.json", _) {
+                self.agents = ag;
                 tracing::debug!("agent store restored from disk");
             }
-            if slashing_path.exists() {
+            if let Some(sl) = optional_parse!("slashing.json", _) {
                 // Restore windows and history, but keep the genesis-derived
                 // policy: a stale or edited slashing.json must not change it.
                 let policy = self.slasher.config().clone();
-                self.slasher =
-                    serde_json::from_str(&std::fs::read_to_string(&slashing_path)?)?;
+                self.slasher = sl;
                 self.slasher.set_config(policy);
                 tracing::debug!("slashing module restored from disk");
             }
-            if chain_store_path.exists() {
-                self.chain_store =
-                    serde_json::from_str(&std::fs::read_to_string(&chain_store_path)?)?;
+            if let Some(cs) = optional_parse!("chain_store.json", _) {
+                self.chain_store = cs;
                 tracing::debug!(
                     blocks = self.chain_store.len(),
                     "block history restored from disk"
@@ -2200,9 +2307,8 @@ impl Node {
                 self.last_commit_evidence = self.chain_store.values().next_back()
                     .map(|(cert, _)| cert.clone());
             }
-            if historical_vs_path.exists() {
-                self.historical_validator_sets =
-                    serde_json::from_str(&std::fs::read_to_string(&historical_vs_path)?)?;
+            if let Some(hvs) = optional_parse!("historical_validator_sets.json", _) {
+                self.historical_validator_sets = hvs;
                 tracing::debug!(
                     heights = self.historical_validator_sets.len(),
                     "historical validator sets restored from disk"
@@ -2340,8 +2446,13 @@ impl Node {
             // a data directory written before this change existed (no
             // live_validator_set.json yet), so an old devnet data dir still
             // restarts rather than refusing to start.
-            let vs = if live_vs_path.exists() {
-                serde_json::from_str(&std::fs::read_to_string(&live_vs_path)?)?
+            // CF-VAL-KEY-002: restore the live ValidatorSet from the snapshot.
+            // `live_vs_bytes` was extracted before the `load` closure captured
+            // `files`.  The generation-based snapshot always includes
+            // live_validator_set.json, so the fallback only fires for data
+            // directories written by a pre-H0-3 node build.
+            let vs: chain_forge_consensus::ValidatorSet = if let Some(b) = &live_vs_bytes {
+                serde_json::from_slice(b)?
             } else {
                 tracing::warn!(
                     "no live_validator_set.json found (data dir predates CF-VAL-KEY-002) \
@@ -2375,14 +2486,17 @@ impl Node {
             }
 
             self.rebuild_bond_owner_bindings();
-            tracing::info!(height, "chain state loaded from disk");
+            tracing::info!(height, %generation, "chain state loaded from generation-based snapshot");
             Ok(())
         };
         match load() {
-            Ok(()) => true,
+            Ok(()) => PersistStartup::Restored { height, generation },
             Err(e) => {
-                tracing::warn!(error = %e, "could not load persisted state — starting from genesis");
-                false
+                // Any parse error on a hash-verified file is unexpected but
+                // must not be silently ignored. Return Fatal so main.rs exits.
+                PersistStartup::Fatal {
+                    error: format!("failed to restore subsystems from validated snapshot: {e}"),
+                }
             }
         }
     }
@@ -6117,7 +6231,7 @@ mod tests {
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
         assert!(
-            restarted.load_persisted_state(),
+            restarted.load_persisted_state().is_restored(),
             "persisted state from phase 1 must be found and loaded"
         );
 
@@ -6194,7 +6308,7 @@ mod tests {
 
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state());
+        assert!(restarted.load_persisted_state().is_restored());
 
         let alice = chain_forge_consensus::ValidatorId("qcb1alice".into());
         let height = restarted.consensus.current_height();
@@ -6291,7 +6405,7 @@ mod tests {
 
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state());
+        assert!(restarted.load_persisted_state().is_restored());
         assert_eq!(restarted.consensus.current_height(), next_height,
             "after restart the engine must work on height 2, not re-decide committed block 1");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6751,7 +6865,7 @@ mod tests {
         "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
             let mut restarted = Node::new(&json, None).await.unwrap();
             restarted.set_data_dir(dir.clone()).unwrap();
-            assert!(restarted.load_persisted_state(), "must load persisted state");
+            assert!(restarted.load_persisted_state().is_restored(), "must load persisted state");
             drive(&mut [&mut restarted], local, 6..EPOCH + 1, &mut prev, nobody).await;
 
             assert_eq!(bal(&steady, "qcb1dave"), 5_000_000, "dave at 40% earns nothing");
@@ -6844,7 +6958,7 @@ mod tests {
             let mut carol = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
             carol.signing_key = Some(carol_key());
             carol.set_data_dir(dir.clone()).unwrap();
-            carol.load_persisted_state();
+            carol.load_persisted_state(); // result intentionally discarded in test
             assert_eq!(carol.sign_guard.last, Some((0, 0, 2)), "guard restored from disk");
             assert_eq!(carol.consensus.lock_state().unwrap().locked, Some((x_hash.clone(), 0)), "lock restored");
 
@@ -7181,7 +7295,7 @@ mod tests {
         }
         let mut restarted = Node::new(&json, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state());
+        assert!(restarted.load_persisted_state().is_restored());
         assert_eq!(restarted.identity.attestation_quorum(), 5);
         assert_eq!(restarted.identity.attestation_cap_per_window(), 2);
 
@@ -7233,7 +7347,7 @@ mod tests {
 
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state());
+        assert!(restarted.load_persisted_state().is_restored());
         assert_eq!(restarted.slasher.config().liveness_miss_pct_threshold,
                    chain_forge_core::DEFAULT_LIVENESS_MAX_MISSED_PCT,
                    "the genesis policy applies after restart, not the persisted one");
@@ -7825,7 +7939,7 @@ mod tests {
 
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state());
+        assert!(restarted.load_persisted_state().is_restored());
         // The engine resumes at the NEXT height after the last executed block.
         assert_eq!(restarted.consensus.current_height(), height_before + 1);
 
@@ -9596,7 +9710,7 @@ mod tests {
         // ── Phase 2: restart from disk ───────────────────────────────────────
         let mut restarted = Node::new(P7_GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state(), "must find and load persisted state");
+        assert!(restarted.load_persisted_state().is_restored(), "must find and load persisted state");
 
         // Height must be restored.
         assert_eq!(
@@ -10133,7 +10247,7 @@ mod tests {
         // --- Phase 2: reload from disk, verify key is still there ---
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state(), "state must reload from disk");
+        assert!(restarted.load_persisted_state().is_restored(), "state must reload from disk");
         assert_eq!(restarted.consensus.current_height(), height_before + 1,
             "after restart the engine works on the height after the last executed block");
 
@@ -11367,7 +11481,7 @@ mod tests {
 
         let mut restarted = Node::new(GENESIS, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        restarted.load_persisted_state();
+        restarted.load_persisted_state(); // result intentionally discarded in test
 
         assert_eq!(
             restarted.pq_activation_epoch(),
@@ -12187,7 +12301,7 @@ mod tests {
         {
             let mut node = Node::new(GENESIS, None).await.unwrap();
             node.set_data_dir(dir.clone());
-            let loaded = node.load_persisted_state();
+            let loaded = node.load_persisted_state().is_restored();
             assert!(loaded, "load_persisted_state must succeed");
 
             assert!(
@@ -12467,7 +12581,7 @@ mod tests {
             {
                 let mut node = Node::new(GENESIS, None).await.unwrap();
                 node.set_data_dir(dir.clone());
-                assert!(node.load_persisted_state(), "load_persisted_state must succeed");
+                assert!(node.load_persisted_state().is_restored(), "load_persisted_state must succeed");
 
                 assert_eq!(node.personhood_power_cap, cap_before,
                     "Sub-test 6: power_cap must survive restart");
@@ -12678,7 +12792,7 @@ mod tests {
         let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
         assert!(
-            restarted.load_persisted_state(),
+            restarted.load_persisted_state().is_restored(),
             "load_persisted_state must succeed after restart"
         );
 
@@ -13014,7 +13128,7 @@ mod tests {
         let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
         assert!(
-            restarted.load_persisted_state(),
+            restarted.load_persisted_state().is_restored(),
             "Phase E: load_persisted_state must succeed after restart"
         );
 
@@ -13262,7 +13376,7 @@ mod tests {
 
         let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state(),
+        assert!(restarted.load_persisted_state().is_restored(),
             "Phase F: load_persisted_state must succeed after restart");
 
         // Owner binding must be restored from persisted StateStore.
@@ -13539,7 +13653,7 @@ mod tests {
 
         let mut restarted = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
-        assert!(restarted.load_persisted_state(),
+        assert!(restarted.load_persisted_state().is_restored(),
             "Phase F: load_persisted_state must succeed");
 
         // Bond-owner binding must be restored.
