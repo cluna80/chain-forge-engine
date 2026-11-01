@@ -52,8 +52,6 @@ const SEED_REC: &str = "dis002b-pilot-recovery-seed-0000000000000000000000000009
 const SEED_G1: &str = "dis002b-guardian-1-seed-000000000000000000000000000010";
 const SEED_G2: &str = "dis002b-guardian-2-seed-000000000000000000000000000020";
 const SEED_G3: &str = "dis002b-guardian-3-seed-000000000000000000000000000030";
-// Bob's attestation key (ML-DSA; first-use binds to qcb1bob at runtime).
-const SEED_BOB: &str = "dis002b-bob-attest-seed-0000000000000000000000000000002";
 // Attacker seed (for forged sig test).
 const SEED_ATK: &str = "dis002b-attacker-seed-000000000000000000000000000003";
 
@@ -449,13 +447,6 @@ fn dis_002b_recovery() {
     let reg_json = serde_json::to_string(&reg_tx).unwrap();
     let reg_res = submit_tx(ports.alice_api, &reg_json);
     eprintln!("  RegisterIdentity: {:?}", reg_res);
-
-    let attest_tx = ml_dsa_tx(SEED_BOB, "qcb1bob", 0,
-        TxBody::Attest { claimant_id: PILOT_ADDR.to_string() },
-        "rec-attest-qcb1bob-for-qcb1pilot", 200_000);
-    let attest_json = serde_json::to_string(&attest_tx).unwrap();
-    let attest_res = submit_tx(ports.bob_api, &attest_json);
-    eprintln!("  Attest(bob→pilot): {:?}", attest_res);
 
     assert!(
         poll_until_registered(&all_api, PILOT_ADDR, Duration::from_secs(30)),
