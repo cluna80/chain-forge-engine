@@ -85,7 +85,10 @@ fn load_fixture_keypair(seed: &str) -> KeyPair {
                 }
                 let pk = from_hex(pk_hex);
                 let sk = from_hex(sk_hex);
-                if pk.len() == 1952 && sk.len() == 3904 {
+                // Accept any non-empty sk; the pqcrypto-dilithium build size
+                // varies by platform (3904 on Linux system lib, 4032 from
+                // the bundled PQClean C source used on Windows).
+                if pk.len() == 1952 && !sk.is_empty() {
                     return KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk };
                 }
             }
