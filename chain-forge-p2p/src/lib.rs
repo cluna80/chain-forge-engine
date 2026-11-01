@@ -1021,6 +1021,29 @@ pub mod real {
                                     }
                                 }
 
+                                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                    tracing::warn!(
+                                        peer = ?peer_id,
+                                        error = %error,
+                                        "outgoing connection failed"
+                                    );
+                                }
+
+                                SwarmEvent::IncomingConnectionError { error, .. } => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "incoming connection failed"
+                                    );
+                                }
+
+                                SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
+                                    tracing::info!(
+                                        local = %local_addr,
+                                        from  = %send_back_addr,
+                                        "incoming connection attempt"
+                                    );
+                                }
+
                                 _ => {}
                             }
                         }
