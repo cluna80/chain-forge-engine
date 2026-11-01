@@ -59,10 +59,21 @@ const SEED_G3:    &str = "dis003d-guardian-3-seed-000000000000000000000000000030
 // files pin each seed to a specific keypair so the genesis public key and the
 // signing key in the test always match across processes.
 const SEED_FIXTURE_NAMES: &[(&str, &str)] = &[
+    // Genesis-bound keys: must match genesis-dis003d.json public keys exactly.
     (SEED_PILOT, "dis003d-pilot"),
     (SEED_G1,    "dis003d-guardian1"),
     (SEED_G2,    "dis003d-guardian2"),
     (SEED_G3,    "dis003d-guardian3"),
+    // Rotation keys: used as the new key in each fixture's recover_account_key tx,
+    // then immediately re-enrolled as the active signing key.  Must be
+    // cross-process deterministic even though they are not genesis-constrained.
+    ("dis003d-new-key-f01-seed-000000000000000000000001", "dis003d-new-key-f01"),
+    ("dis003d-new-key-f02-seed-000000000000000000000002", "dis003d-new-key-f02"),
+    ("dis003d-new-key-f03-seed-000000000000000000000003", "dis003d-new-key-f03"),
+    ("dis003d-new-key-f04-seed-000000000000000000000004", "dis003d-new-key-f04"),
+    ("dis003d-new-key-f05-seed-000000000000000000000005", "dis003d-new-key-f05"),
+    ("dis003d-new-key-f06-seed-000000000000000000000006", "dis003d-new-key-f06"),
+    ("dis003d-new-key-f07-seed-000000000000000000000007", "dis003d-new-key-f07"),
 ];
 
 /// Load a pinned keypair from `tests/devnet/keys/<name>.key.json`.
