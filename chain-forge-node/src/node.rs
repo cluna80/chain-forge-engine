@@ -294,6 +294,11 @@ pub struct AccountSummary {
     /// and UpdateGuardianPolicy. Never reset to zero.
     #[serde(default)]
     pub policy_generation: u64,
+    /// DIS-003E: pending two-phase key recovery, or null if none.
+    /// Set by RecoverAccountKey; cleared on activation or after EnrollRecoveryPolicy
+    /// auto-cancels it.  `cancelled: true` means the window closed without activation.
+    #[serde(default)]
+    pub pending_recovery: Option<chain_forge_state::PendingRecovery>,
 }
 
 /// Voting-power snapshot for one validator.
@@ -1455,6 +1460,7 @@ impl Node {
                     attested_by:       vec![],
                     key_version:    acct.key_version,
                     policy_generation: acct.policy_generation,
+                    pending_recovery: acct.pending_recovery.clone(),
                 });
             }
         }
@@ -2240,6 +2246,7 @@ impl Node {
                         attested_by:       att_by,
                         key_version:    a.key_version,
                     policy_generation: a.policy_generation,
+                        pending_recovery: a.pending_recovery.clone(),
                     });
                 }
 
@@ -4739,6 +4746,7 @@ impl Node {
                     attested_by:       att_by,
                     key_version:    a.key_version,
                     policy_generation: a.policy_generation,
+                    pending_recovery: a.pending_recovery.clone(),
                 });
             }
 
@@ -5986,6 +5994,7 @@ impl Node {
                     attested_by:       att_by,
                     key_version:    a.key_version,
                     policy_generation: a.policy_generation,
+                    pending_recovery: a.pending_recovery.clone(),
                 });
             }
 
