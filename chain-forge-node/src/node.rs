@@ -57,6 +57,9 @@ pub struct NodeStatus {
     /// True when this chain runs identity parameters weaker than production
     /// under the explicit devnet-only opt-in. Reduced Sybil resistance.
     pub insecure_dev_identity_overrides: bool,
+    /// The node's libp2p peer ID as a base58-encoded string.
+    /// Set once the P2P network starts; None before startup.
+    pub local_peer_id: Option<String>,
 }
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
@@ -1101,6 +1104,7 @@ impl Node {
             attestation_quorum,
             attestation_cap_per_window,
             insecure_dev_identity_overrides: insecure_identity,
+            local_peer_id:  None,
         }));
 
         let validator_id = validator_address.map(ValidatorId);
@@ -2714,6 +2718,13 @@ impl Node {
         match event {
             NetworkEvent::Started { local_addr, peer_id } => {
                 info!(local_addr = %local_addr, peer_id = %peer_id, "P2P network started");
+                // Store the peer ID so the HTTP API can expose it (used by
+                // test harnesses to construct bootstrap multiaddrs).
+                if let Ok(mut s) = self.status.lock() {
+                    if s.local_peer_id.is_none() {
+                        s.local_peer_id = Some(peer_id.to_string());
+                    }
+                }
             }
 
             NetworkEvent::Message(msg) => {

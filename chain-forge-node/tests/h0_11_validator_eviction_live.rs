@@ -332,8 +332,8 @@ fn validator_eviction_genesis_no_exemption() {
         "alice", ALICE_ADDR, ALICE_API, ALICE_P2P, None, &dirs,
     );
     wait_api_ready(ALICE_API, deadline);
-    let alice_peer_id = http_get(ALICE_API, "/api/node-info")
-        .and_then(|v| v["peer_id"].as_str().map(|s| s.to_string()))
+    let alice_peer_id = http_get(ALICE_API, "/api/status")
+        .and_then(|v| v["local_peer_id"].as_str().map(|s| s.to_string()))
         .expect("E-01: alice peer_id");
     let bootstrap_addr = format!(
         "/ip4/127.0.0.1/tcp/{ALICE_P2P}/p2p/{alice_peer_id}"
