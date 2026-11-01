@@ -85,12 +85,18 @@ fn load_fixture_keypair(seed: &str) -> KeyPair {
                 }
                 let pk = from_hex(pk_hex);
                 let sk = from_hex(sk_hex);
-                // Accept any non-empty sk; the pqcrypto-dilithium build size
-                // varies by platform (3904 on Linux system lib, 4032 from
-                // the bundled PQClean C source used on Windows).
-                if pk.len() == 1952 && !sk.is_empty() {
-                    return KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk };
+                // Accept valid pk; sk size varies by platform (3904 on some
+                // Linux builds, 4032 on Windows bundled PQClean C source).
+                // Panic loudly if sizes are wrong so the fixture file can be
+                // identified and regenerated.
+                if pk.len() != 1952 {
+                    panic!("fixture {name}: bad pk len {} (want 1952)", pk.len());
                 }
+                if sk.is_empty() {
+                    panic!("fixture {name}: empty secret key in fixture file");
+                }
+                eprintln!("[fixture] loaded {name}: pk={}B sk={}B", pk.len(), sk.len());
+                return KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk };
             }
         }
     }
