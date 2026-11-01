@@ -201,7 +201,7 @@ Nothing merges until these pass and the owner reviews the combined tree. All PRs
 
 ### Other follow-ups
 - ✅ `attestation_guard_live` / `attestation_coordinator_gate` — fixed in PR #40 (2026-10-31, Windows-confirmed). Root cause: Attest submitted before RegisterIdentity committed; added pre-Attest wait for `registered=true` on all nodes + post-Attest `attestation_count>=1` assertion.
-- ⬜ Genesis-hash peer agreement (H0-8); per-tx identity/agent clone performance.
+- ✅ Genesis-hash peer agreement (H0-8) — Windows-confirmed 2026-10-31 (`616bf0e`); per-tx identity/agent clone performance still ⬜.
 - ⬜ Proposers don't budget gas. `block_gas_limit` is enforced per block at execution (txs past the limit are recorded as failed), so a tx that would exceed this block's gas is failed instead of waiting for the next block. Corrects the #34 note that said per-block gas was not enforced.
 - ⬜ `mempool_ttl_seconds` is not enforced (found with #34).
 - ⬜ **Investigate:** a node process aborted twice in the sandbox (`max_block_live`, 2 of ~14 runs, debug build) on a tokio-internal `debug_assert!` in the timer driver (`AtomicWaker::take_waker`, tokio 1.54.0). There were no Chain Forge frames in the backtrace, and 6/6 A/B reruns (3 with #34's head-of-line fix, 3 without) passed. Next steps: rerun under a release build and with `RUST_BACKTRACE=full`; check for unsafe or FFI memory errors (pqcrypto, libp2p).
@@ -413,7 +413,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | 🔲 |
 | H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
 | H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
-| H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | 🔶 In progress — failing tests G-01…G-07 committed (`a0d4392`, branch `security/h0-8-genesis-peer-verification`) |
+| H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | ✅ G-01…G-07 passing on Windows (BossKing, MINGW64, 2026-10-31, `616bf0e`) |
 | H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` passes locally on Windows/MINGW64 — fix `submit_tx` returning null for ~77 KB recovery tx bodies | 🔴 Blocked (see DIS-003D entry in Phase 1) |
 | H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | 🔲 Blocked on H0-9 |
 | H0-11 | Validator eviction | Product decision on eviction policy recorded (are genesis validators exempt forever or swept on first outbid?); decision implemented and tested | 🔲 |
