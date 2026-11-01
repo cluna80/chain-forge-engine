@@ -787,13 +787,6 @@ pub mod real {
                     .map_err(|e| P2pError::Internal(format!("subscribe {topic_str}: {e}")))?;
             }
 
-            // Dial bootstrap nodes (testnet/mainnet)
-            for addr_str in &config.bootstrap_nodes {
-                if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-                    let _ = swarm.dial(addr);
-                }
-            }
-
             let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
             let (event_tx, event_rx)           = mpsc::unbounded_channel::<NetworkEvent>();
             let (cmd_tx, mut cmd_rx)           = mpsc::unbounded_channel::<SwarmCommand>();
@@ -804,6 +797,10 @@ pub mod real {
             let peer_map_loop = peer_map.clone();
             // Capture peer_discovery setting so the event loop can gate mDNS.
             let use_mdns = config.peer_discovery != PeerDiscovery::Bootstrap;
+            // Move bootstrap node addresses into the event loop so dials are issued
+            // AFTER the tokio task is spawned and the swarm event loop is running.
+            // Dialling before the loop starts queues dials that are never driven.
+            let bootstrap_nodes = config.bootstrap_nodes.clone();
 
             // Swarm event loop
             tokio::spawn(async move {
@@ -811,6 +808,22 @@ pub mod real {
                 // redundant-connection dedupe-close (see ConnectionClosed below)
                 // doesn't get misread as the peer fully disconnecting.
                 let mut peer_conn_count: HashMap<String, usize> = HashMap::new();
+
+                // Dial bootstrap peers now that the event loop is running.
+                // We do this once, immediately, before entering the select! loop.
+                for addr_str in &bootstrap_nodes {
+                    match addr_str.parse::<Multiaddr>() {
+                        Ok(addr) => {
+                            tracing::info!(addr = %addr, "dialling bootstrap peer");
+                            if let Err(e) = swarm.dial(addr) {
+                                tracing::warn!(addr = %addr_str, error = %e, "bootstrap dial error");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(addr = %addr_str, error = %e, "bootstrap addr parse error");
+                        }
+                    }
+                }
 
                 loop {
                     tokio::select! {
