@@ -2494,14 +2494,20 @@ impl Node {
         let mut consensus_interval = tokio::time::interval(
             tokio::time::Duration::from_millis(CONSENSUS_TICK_MS)
         );
-        if self.consensus.drives_own_votes() && self.has_bootstrap_peers {
+        // Every validator runs its own round clock. The old guard also required
+        // `has_bootstrap_peers`, which meant the seed node (Alice, started with
+        // no --bootstrap arg) never fired round timeouts. When any other
+        // validator went down, Alice could not advance the round independently,
+        // stalling the chain permanently. The correct predicate is
+        // drives_own_votes(): if this node is a validator, it must run timers.
+        if self.consensus.drives_own_votes() {
             self.consensus.start();
             self.drive_consensus().await;
         }
         let mut running = true;
         while running {
             tokio::select! {
-                _ = consensus_interval.tick(), if self.consensus.drives_own_votes() && self.has_bootstrap_peers => {
+                _ = consensus_interval.tick(), if self.consensus.drives_own_votes() => {
                     self.consensus_tick().await;
                 }
 
