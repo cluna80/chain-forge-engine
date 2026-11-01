@@ -322,30 +322,47 @@ fn bootstrap_identities(port: u16) {
         v
     };
 
-    println!("[bootstrap] RegisterIdentity for {} accounts", all_addrs.len());
-    let mut reg_ids = Vec::new();
-    for (i, (addr, _)) in all_addrs.iter().enumerate() {
-        let nonce = current_nonce(port, addr);
-        let id = format!("reg-{i}-{addr}");
-        let tx = unsigned_tx(&id, addr, nonce,
-            json!("RegisterIdentity"), 200_000);
-        let resp = submit_tx_json(port, &tx);
-        let status = resp["status"].as_str().unwrap_or("");
-        assert!(
-            status == "queued" || status == "ok",
-            "RegisterIdentity for {addr} not queued: {resp}"
-        );
-        reg_ids.push(id);
-    }
+    // EPOCH_REG_CAP = 10 (hardcoded in chain-forge-identity).
+    // With validator_epoch_blocks=1 each block is a new epoch, so we submit
+    // at most 10 registrations per block and wait for the block to commit
+    // before sending the next batch.
+    println!("[bootstrap] RegisterIdentity for {} accounts (batched by epoch cap=10)",
+             all_addrs.len());
+    let mut global_offset = 0usize;
+    for batch in all_addrs.chunks(10) {
+        let mut batch_ids = Vec::new();
+        let h_before = current_height(port);
+        for (i, (addr, _)) in batch.iter().enumerate() {
+            let nonce = current_nonce(port, addr);
+            let id = format!("reg-{}-{addr}", global_offset + i);
+            let tx = unsigned_tx(&id, addr, nonce,
+                json!("RegisterIdentity"), 200_000);
+            let resp = submit_tx_json(port, &tx);
+            let status = resp["status"].as_str().unwrap_or("");
+            assert!(
+                status == "queued" || status == "ok",
+                "RegisterIdentity for {addr} not queued: {resp}"
+            );
+            batch_ids.push(id);
+        }
+        global_offset += batch.len();
 
-    // Wait for all RegisterIdentity txs to commit.
-    for id in &reg_ids {
-        let r = wait_tx(port, id, Duration::from_secs(30))
-            .unwrap_or_else(|| panic!("{id} never landed"));
-        assert!(
-            r["success"].as_bool().unwrap_or(false),
-            "RegisterIdentity {id} failed: {r}"
-        );
+        // Wait for this batch to commit before the next batch (next epoch).
+        for id in &batch_ids {
+            let r = wait_tx(port, id, Duration::from_secs(30))
+                .unwrap_or_else(|| panic!("{id} never landed"));
+            assert!(
+                r["success"].as_bool().unwrap_or(false),
+                "RegisterIdentity {id} failed: {r}"
+            );
+        }
+        // Ensure the chain advances to the next epoch before the next batch.
+        if global_offset < all_addrs.len() {
+            assert!(
+                wait_for_height(port, h_before + 1, Duration::from_secs(15)),
+                "chain did not advance for next registration epoch"
+            );
+        }
     }
     println!("[bootstrap] All RegisterIdentity committed.");
 
