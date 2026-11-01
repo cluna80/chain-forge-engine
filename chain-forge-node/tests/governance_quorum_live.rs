@@ -368,27 +368,19 @@ fn bootstrap_identities(port: u16) {
 
     // Alice (genesis validator, auto-Verified) attests each user.
     // With attestation_quorum=1, one attest makes them Verified.
-    println!("[bootstrap] Attesting {} accounts via {COORDINATOR}", all_addrs.len());
-    let mut attest_ids = Vec::new();
-    let mut alice_nonce = current_nonce(port, COORDINATOR);
+    // Each attest must commit before the next is sent because the node's
+    // mempool validates nonces against committed state (no pending-nonce
+    // tracking), so submitting nonce N+1 while nonce N is still pending
+    // causes a nonce mismatch rejection.
+    println!("[bootstrap] Attesting {} accounts via {COORDINATOR} (one at a time)", all_addrs.len());
     for (addr, _) in &all_addrs {
+        let alice_nonce = current_nonce(port, COORDINATOR);
         let id = format!("attest-{addr}");
-        let tx = unsigned_tx(&id, COORDINATOR, alice_nonce,
-            json!({ "Attest": { "claimant_id": addr } }), 100_000);
-        let resp = submit_tx_json(port, &tx);
-        let status = resp["status"].as_str().unwrap_or("");
-        assert!(
-            status == "queued" || status == "ok",
-            "Attest for {addr} not queued: {resp}"
+        let r = submit_and_wait(
+            port, &id, COORDINATOR, alice_nonce,
+            json!({ "Attest": { "claimant_id": addr } }), 100_000,
+            Duration::from_secs(30),
         );
-        alice_nonce += 1;
-        attest_ids.push(id);
-    }
-
-    // Wait for all Attest txs to commit and verify Verified tier.
-    for id in &attest_ids {
-        let r = wait_tx(port, id, Duration::from_secs(30))
-            .unwrap_or_else(|| panic!("{id} never landed"));
         assert!(
             r["success"].as_bool().unwrap_or(false),
             "Attest {id} failed: {r}"
