@@ -58,7 +58,7 @@ Protocol first; applications (PoCD, marketplace, research apps) come after the p
 
 | # | Track | Required completion gate | Status |
 |---|-------|--------------------------|--------|
-| BIZ-PRE-1 | **Phase 0.5 — Protocol Hardening** | H0-5 (execution rollback) and H0-7 (supply conservation) confirmed locally | 🔲 |
+| BIZ-PRE-1 | **Phase 0.5 — Protocol Hardening** | H0-5 (execution rollback) and H0-7 (supply conservation) confirmed locally | ✅ Windows-confirmed 2026-10-31 — H0-5 (H5-1..H5-5, 66.83s) and H0-7 (S-01..S-06, 83.69s) both passed on BossKing/MINGW64. |
 | BIZ-PRE-2 | **DIS — Account Security and Recovery** | DIS-003D and DIS-003E confirmed locally on Windows/MINGW64 | 🔲 |
 | BIZ-PRE-3 | **DIS Standalone Product** | Independent cryptographic review gate passed (currently marked ⚠️ return before production on DIS-CORE-001, DIS-PQ-001, DIS-PRIV-001) | 🔲 |
 | BIZ-PRE-4 | **FeeSponsor** | FS-03 live authorization complete (SponsorAuthorization wired into execution path) | 🔲 |
@@ -150,7 +150,7 @@ Hardening the foundation before adding features. Each item is a draft PR, unmerg
 | Item | PR / branch | Status |
 |---|---|---|
 | Attestation quorum hardening (genesis-configurable) | #14 | 🔄 open |
-| H0-5/H0-7 execution atomicity + fee conservation | #15 | 🔄 open |
+| H0-5/H0-7 execution atomicity + fee conservation | #15 | ✅ Windows-confirmed 2026-10-31 |
 | MN-7 rewrite (verified outcomes); MN-8 removed pending rewards | #16 | 🔄 open; needs a genuine second Windows `fee_settle_live` run |
 | H0-1/H0-2 deterministic participation (committed `last_commit`), state-root binding, liveness jails without burning, Byzantine-robust miss counting, genesis liveness policy, HotStuff/FBA restart height | #17 | ✅ Windows-confirmed; awaiting merge |
 | **Consensus safety**: full Tendermint prevote/precommit/lock/unlock; persisted double-sign guard; block-hash verification and agreement | #18 | ✅ Windows-confirmed (consensus 91/91, node 231/231, devnet, restart, `consensus_safety_live` 3/3); awaiting merge |
@@ -412,7 +412,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | H0-4 | Nonce / replay | Nonce wrap-around and duplicate txs across blocks are rejected with zero partial state change | 🔲 |
 | H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | ✅ **Windows-confirmed 2026-10-31 (BossKing/MINGW64, H5-1..H5-5 all passed, 66.83s, root@7=`ef5bb34e…`)** — fee charged + nonce consumed on failed tx, replay rejected, future-nonce rejected, 4-node block-hash agreement, crash-restart preserved all state. |
 | H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
-| H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
+| H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | ✅ **Windows-confirmed 2026-10-31 (BossKing/MINGW64, S-01..S-06 all passed, 83.69s, root@13=`c6b5d405…`)** — fee split integer-exact (actual_fee measured from balance delta, not gas estimate); supply −150 032 uqcb = authorized burns only; crash-restart preserved supply and state roots. Branch `phase0/h0-7-supply-conservation`, commit `ebf3a15`. |
 | H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | ✅ G-01…G-07 passing on Windows (BossKing, MINGW64, 2026-10-31, `616bf0e`) |
 | H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` passes locally on Windows/MINGW64 — fix `submit_tx` returning null for ~77 KB recovery tx bodies | ✅ **Windows-confirmed 2026-10-31 (BossKing/MINGW64, F-00..F-08 all passed, 38.77s)** — root cause: ML-DSA `generate_keypair(seed)` non-deterministic across processes; fix: pre-generated fixture keypairs committed to `tests/devnet/keys/`. Commits `c2e0a6b`…`6e94671` on `security/h0-9-recovery-tx-size`. |
 | H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | ✅ **Windows-confirmed 2026-10-31 (BossKing/MINGW64, C-14..C-19 all passed, 55.78s, four-node state roots converge)** — root cause of C-16: `public_key` not exposed in `AccountSummary` API response; fix: added hex-encoded `public_key` field to `AccountSummary` and all 4 construction sites in `node.rs`. Commits `5c91682`, `be823b5` on `security/h0-10-recovery-timelock`. |
