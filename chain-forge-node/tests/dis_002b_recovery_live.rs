@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
+use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash, KeyPair};
 use chain_forge_execution::{
     Transaction, TxBody, GuardianAuth,
     account_key_rotation_signing_bytes,
@@ -44,8 +44,9 @@ const CHAIN_ID:    &str = "qcb-devnet-dis002b";
 const PILOT_ADDR:  &str = "qcb1pilot";
 const ATTACKER:    &str = "qcb1attacker";
 
-// Pilot's initial key (will be "lost").
-const SEED_A: &str = "dis002b-pilot-device-a-seed-00000000000000000000000000001";
+// Pilot's initial key — loaded from fixture dis003d-pilot.key.json (bound in genesis-dis002b.json).
+// generate_keypair is non-deterministic across processes; fixture files provide a stable key.
+const PILOT_FIXTURE: &str = "dis003d-pilot";
 // Pilot's recovery key (new device).
 const SEED_REC: &str = "dis002b-pilot-recovery-seed-00000000000000000000000000099";
 // Three independent guardians.
@@ -329,14 +330,54 @@ fn ml_dsa_tx(
     }
 }
 
-fn build_register_identity(seed: &str, sender: &str, nonce: u64, tx_id: &str) -> Transaction {
-    ml_dsa_tx(seed, sender, nonce, TxBody::RegisterIdentity, tx_id, 200_000)
+/// Build any ML-DSA-signed transaction using a pre-loaded KeyPair.
+/// Use for accounts whose key is pre-bound in genesis (named accounts).
+fn ml_dsa_tx_kp(kp: &KeyPair, sender: &str, nonce: u64, body: TxBody, tx_id: &str, gas_limit: u64) -> Transaction {
+    let body_json = serde_json::to_string(&body).expect("body serialise");
+    let msg = mldsa_tx_prehash(CHAIN_ID, body_json.as_bytes());
+    let sig = MlDsaScheme.sign(&msg, kp).expect("ML-DSA sign");
+    Transaction {
+        id:            tx_id.to_string(),
+        sender:        sender.to_string(),
+        nonce,
+        body,
+        gas_limit,
+        signature:     vec![],
+        public_key:    vec![],
+        pq_signatures: vec![format!("mldsa65:{}", sig_to_hex(&sig))],
+        sig_scheme:    Some(SchemeId::MlDsa),
+        pq_public_key: kp.public_key.clone(),
+    }
+}
+
+/// Load a pinned ML-DSA-65 keypair from tests/devnet/keys/<name>.key.json.
+fn load_fixture_keypair(name: &str) -> KeyPair {
+    let path = manifest_dir()
+        .join("tests").join("devnet").join("keys")
+        .join(format!("{name}.key.json"));
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("fixture {name}: cannot read {path:?}: {e}"));
+    let obj: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("fixture {name}: JSON parse: {e}"));
+    fn from_hex(h: &str) -> Vec<u8> {
+        (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i+2], 16).unwrap_or(0)).collect()
+    }
+    let pk = from_hex(obj["public_key"].as_str().unwrap_or_else(|| panic!("fixture {name}: no public_key")));
+    let sk = from_hex(obj["private_key"].as_str().unwrap_or_else(|| panic!("fixture {name}: no private_key")));
+    if pk.len() != 1952 { panic!("fixture {name}: bad pk len {} (want 1952)", pk.len()); }
+    if sk.len() != 4032 { panic!("fixture {name}: bad sk len {} (want 4032)", sk.len()); }
+    eprintln!("[fixture] loaded {name}: pk={}B sk={}B", pk.len(), sk.len());
+    KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk }
+}
+
+fn build_register_identity(kp: &KeyPair, sender: &str, nonce: u64, tx_id: &str) -> Transaction {
+    ml_dsa_tx_kp(kp, sender, nonce, TxBody::RegisterIdentity, tx_id, 200_000)
 }
 
 
 /// Build EnrollRecoveryPolicy signed by the account's current ML-DSA key.
 fn build_enroll_policy(
-    seed: &str,
+    kp: &KeyPair,
     sender: &str,
     nonce: u64,
     guardians: Vec<Vec<u8>>,
@@ -344,7 +385,7 @@ fn build_enroll_policy(
     tx_id: &str,
 ) -> Transaction {
     let body = TxBody::EnrollRecoveryPolicy { guardians, threshold };
-    ml_dsa_tx(seed, sender, nonce, body, tx_id, 500_000)
+    ml_dsa_tx_kp(kp, sender, nonce, body, tx_id, 500_000)
 }
 
 /// Build RecoverAccountKey. The tx carries no outer signing key — authentication
@@ -443,7 +484,8 @@ fn dis_002b_recovery() {
 
     eprintln!("\n--- Phase 1: Bootstrap Verified identity for {PILOT_ADDR} ---");
 
-    let reg_tx = build_register_identity(SEED_A, PILOT_ADDR, 0, "rec-reg-identity-001");
+    let pilot_kp = load_fixture_keypair(PILOT_FIXTURE);
+    let reg_tx = build_register_identity(&pilot_kp, PILOT_ADDR, 0, "rec-reg-identity-001");
     let reg_json = serde_json::to_string(&reg_tx).unwrap();
     let reg_res = submit_tx(ports.alice_api, &reg_json);
     eprintln!("  RegisterIdentity: {:?}", reg_res);
@@ -468,7 +510,7 @@ fn dis_002b_recovery() {
     ];
 
     let enroll_tx = build_enroll_policy(
-        SEED_A, PILOT_ADDR, 1, guardians.clone(), 2, "rec-enroll-001",
+        &pilot_kp, PILOT_ADDR, 1, guardians.clone(), 2, "rec-enroll-001",
     );
     let enroll_json = serde_json::to_string(&enroll_tx).unwrap();
     let _ = submit_tx(ports.alice_api, &enroll_json);
@@ -534,8 +576,9 @@ fn dis_002b_recovery() {
     eprintln!("\n--- B-10: RecoverAccountKey (insufficient sigs — only 1-of-3) ---");
 
     // Re-enroll a policy with the new key (SEED_REC, nonce=4).
+    let rec_kp = MlDsaScheme.generate_keypair(SEED_REC).expect("rec keygen");
     let re_enroll_tx = build_enroll_policy(
-        SEED_REC, PILOT_ADDR, 4,
+        &rec_kp, PILOT_ADDR, 4,
         vec![g1_kp.public_key.clone(), g2_kp.public_key.clone(), g3_kp.public_key.clone()],
         2, "rec-enroll-002",
     );
