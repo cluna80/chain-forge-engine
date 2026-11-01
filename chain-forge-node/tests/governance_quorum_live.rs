@@ -109,7 +109,14 @@ fn key_file(label: &str) -> PathBuf {
 }
 
 fn devnet_dirs() -> PathBuf {
-    std::env::temp_dir().join("gov_quorum_devnet")
+    // Use a per-process-ID directory so each test run is always isolated,
+    // even if a previous run's node processes are still holding file locks
+    // (common on Windows when the test panics before Drop kills children).
+    use std::sync::OnceLock;
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::temp_dir().join(format!("gov_quorum_devnet_{}", std::process::id()))
+    }).clone()
 }
 
 // ── Node lifecycle ─────────────────────────────────────────────────────────────
@@ -383,8 +390,6 @@ fn governance_quorum_live() {
     println!("\n── Governance Quorum (H0-12) ──────────────────────────────────────");
     println!("   chain_id={CHAIN_ID}  alice_api={}", ports.alice);
 
-    // Clean devnet state.
-    let _ = std::fs::remove_dir_all(devnet_dirs());
     let _nodes = spawn_devnet(&ports);
     let port = ports.alice;
 
