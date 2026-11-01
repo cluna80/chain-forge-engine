@@ -680,6 +680,20 @@ pub struct GenesisExecution {
     /// Defaults to 70% validators / 20% treasury / 10% burn.
     #[serde(default)]
     pub fee_distribution_bps: Option<FeeDistributionBps>,
+
+    /// DIS-003E: number of blocks a pending recovery must remain unchallenged
+    /// before the block-end sweep activates it.  MUST be nonzero in production.
+    /// Defaults to 0 when absent (not present in genesis), which will cause
+    /// `ExecutionConfig::from_genesis` to panic unless
+    /// `allow_zero_recovery_timelock` is also set to true.
+    #[serde(default)]
+    pub recovery_timelock_blocks: u64,
+
+    /// DIS-003E: explicit opt-in to allow `recovery_timelock_blocks = 0`.
+    /// Set `true` only in dev/test genesis files. Production genesis MUST
+    /// omit this (defaults to `false`) and set a nonzero timelock.
+    #[serde(default)]
+    pub allow_zero_recovery_timelock: bool,
 }
 
 /// Basis-point split for collected transaction fees.
