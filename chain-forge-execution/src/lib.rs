@@ -1834,19 +1834,9 @@ impl ExecutionConfig {
             // (The node refuses to start on one anyway.)
             account_signature_policy: genesis.account_signature_policy()
                 .unwrap_or(chain_forge_core::AccountSignaturePolicy::MlDsaOnly),
-            recovery_timelock_blocks: {
-                let tl = genesis.execution.recovery_timelock_blocks;
-                if tl == 0 && !genesis.execution.allow_zero_recovery_timelock {
-                    panic!(
-                        "DIS-003E: genesis chain_id={} has recovery_timelock_blocks=0 \
-                         but allow_zero_recovery_timelock is not set. \
-                         Production genesis MUST set a nonzero recovery_timelock_blocks. \
-                         For dev/test only: set allow_zero_recovery_timelock=true in genesis execution config.",
-                        genesis.chain_id
-                    );
-                }
-                tl
-            },
+            // Fail closed: an invalid timelock makes recovery never activate.
+            // (The node refuses to start on one: GenesisConfig::recovery_timelock_blocks.)
+            recovery_timelock_blocks: genesis.recovery_timelock_blocks().unwrap_or(u64::MAX),
         }
     }
 }
@@ -2941,7 +2931,7 @@ fn execute_recover_account_key(
 
     // DIS-003E: two-phase commit — set pending_recovery instead of immediately
     // rotating the key. The block-end sweep activates at activation_height.
-    let activation_height = block_height + config.recovery_timelock_blocks;
+    let activation_height = block_height.saturating_add(config.recovery_timelock_blocks);
     {
         let acct = state
             .get_account_mut(&tx.sender)
@@ -5508,6 +5498,7 @@ mod tests {
             attestation_cap_per_window: chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
             mldsa_consensus_only: false,
             account_signature_policy: chain_forge_core::AccountSignaturePolicy::Ed25519Allowed,
+            recovery_timelock_blocks: 0,
         };
         let mut state = StateStore::new(HashWidth::Bits256);
         state.apply_genesis(&genesis).unwrap();

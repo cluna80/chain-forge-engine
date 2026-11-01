@@ -829,6 +829,7 @@ impl Node {
         // boot into a validator set that can never vote.
         genesis.validate_validator_keys().map_err(NodeError::Genesis)?;
         genesis.account_signature_policy().map_err(NodeError::Genesis)?;
+        genesis.recovery_timelock_blocks().map_err(NodeError::Genesis)?;
 
         // Hard error, in every environment: an accepted-but-nonsensical
         // `validator_bonding` override (zero minimum bond, zero epoch
@@ -6044,7 +6045,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
@@ -9344,7 +9345,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 5, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": true },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": true, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "cs001-p7-net", "p2p_port": 27100, "rpc_port": 27101, "bootstrap_nodes": [], "peer_discovery": "bootstrap", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
@@ -12581,7 +12582,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
