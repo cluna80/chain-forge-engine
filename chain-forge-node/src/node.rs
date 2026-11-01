@@ -1068,6 +1068,10 @@ impl Node {
                 net_config.bootstrap_nodes.push(addr);
             }
         }
+        tracing::info!(
+            bootstrap_nodes = ?net_config.bootstrap_nodes,
+            "network config before p2p start"
+        );
 
         // Real libp2p when the "real-network" feature is enabled AND we are
         // not running under `cargo test`.  Unit tests (cfg(test)) always use

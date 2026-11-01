@@ -811,6 +811,11 @@ pub mod real {
 
                 // Dial bootstrap peers now that the event loop is running.
                 // We do this once, immediately, before entering the select! loop.
+                tracing::info!(
+                    count = bootstrap_nodes.len(),
+                    nodes = ?bootstrap_nodes,
+                    "bootstrap dial start"
+                );
                 for addr_str in &bootstrap_nodes {
                     match addr_str.parse::<Multiaddr>() {
                         Ok(addr) => {
