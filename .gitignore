@@ -6,6 +6,9 @@
 qcb-genesis.json
 
 keys/
+!chain-forge-node/tests/devnet/keys/
+!chain-forge-node/tests/devnet/keys/dis003d-*.key.json
+!chain-forge-node/tests/devnet/keys/dis003d-new-key-*.key.json
 __pycache__/
 
 # QCB-WALLET-001: encrypted wallet key files — never commit signing seeds
