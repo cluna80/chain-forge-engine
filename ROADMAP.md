@@ -415,7 +415,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
 | H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | ✅ G-01…G-07 passing on Windows (BossKing, MINGW64, 2026-10-31, `616bf0e`) |
 | H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` F-00–F-08 passes on BossKing/Windows (2026-10-31). Root cause: ML-DSA `generate_keypair(seed)` is not deterministic across OS processes; test harness now uses 11 committed fixture keypairs (4 genesis-bound + 7 rotation; pk 1,952 B, sk 4,032 B) with fail-closed hard-panic loader and no random fallback. Fixtures are test-only. | ✅ Windows-confirmed 2026-10-31 — F-00–F-08 PASS |
-| H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, `PendingRecovery`, block-finalisation sweep) confirmed locally on Windows/MINGW64 | 🔲 Ready — H0-9 dependency cleared |
+| H0-10 | DIS-003E completion | `dis_003e_timelock_live` C-14–C-19 PASS on BossKing/MINGW64 (2026-10-31, 55.78 s): pending recovery preserves old key; cancellation prevents activation; unchallenged recovery activates at timelock; cancelled recovery never reactivates; policy reenrollment cancels pending recovery; four-node state roots agree (`80d56a7c…`). Implementation branch: `security/h0-10-recovery-timelock` (PR pending). | ✅ Windows-confirmed 2026-10-31 — awaiting PR/merge |
 | H0-11 | Validator eviction | Product decision on eviction policy recorded (are genesis validators exempt forever or swept on first outbid?); decision implemented and tested | 🔲 |
 | H0-12 | Governance quorum | >3% turnout for ordinary votes, >6% for constitutional changes — implemented, wired to `VoteOnProposal`, and adversarially tested | 🔲 |
 
@@ -425,7 +425,7 @@ The following open items in Phase 0.5 block specific Phase 1 milestones. Phase 1
 
 | Blocker | Blocks |
 |---|---|
-| H0-10 — DIS-003E recovery timelock/cancellation (H0-9 harness confirmation closed 2026-10-31) | DIS-003E, QCB-KR-001 multisig key lifecycle |
+
 | H0-5 — Execution rollback guarantee | FeeSponsor live authorization (FS-03 follow-on); any multi-step tx type |
 | H0-11 — Validator eviction decision | Validator Onboarding section marked complete |
 | H0-12 — Governance quorum | `ProposeChange` / `VoteOnProposal` / `ActivateChange` in any production tx flow |
