@@ -2726,7 +2726,8 @@ impl Node {
                 // test harnesses to construct bootstrap multiaddrs).
                 if let Ok(mut s) = self.status.lock() {
                     if s.local_peer_id.is_none() {
-                        s.local_peer_id = Some(peer_id.to_string());
+                        // The full base58 ID: PeerId's Display shows only 8 chars.
+                        s.local_peer_id = Some(peer_id.0.clone());
                     }
                 }
             }
