@@ -66,44 +66,71 @@ const SEED_FIXTURE_NAMES: &[(&str, &str)] = &[
 ];
 
 /// Load a pinned keypair from `tests/devnet/keys/<name>.key.json`.
-/// Falls back to `generate_keypair(seed)` (in-process cache) if no fixture file exists.
+///
+/// # Panics
+/// Panics on any problem: missing file, bad JSON, wrong key sizes, or an
+/// unrecognised seed.  There is NO fallback to `generate_keypair` — that
+/// produces a random key that will never match the genesis public key stored
+/// in `genesis-dis003d.json`, causing opaque auth failures later.
 fn load_fixture_keypair(seed: &str) -> KeyPair {
-    if let Some(&(_, name)) = SEED_FIXTURE_NAMES.iter().find(|(s, _)| *s == seed) {
-        let path = manifest_dir()
-            .join("tests")
-            .join("devnet")
-            .join("keys")
-            .join(format!("{name}.key.json"));
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&raw) {
-                let pk_hex = obj["public_key"].as_str().unwrap_or("");
-                let sk_hex = obj["private_key"].as_str().unwrap_or("");
-                fn from_hex(h: &str) -> Vec<u8> {
-                    (0..h.len()).step_by(2)
-                        .map(|i| u8::from_str_radix(&h[i..i+2], 16).unwrap_or(0))
-                        .collect()
-                }
-                let pk = from_hex(pk_hex);
-                let sk = from_hex(sk_hex);
-                // Accept valid pk; sk size varies by platform (3904 on some
-                // Linux builds, 4032 on Windows bundled PQClean C source).
-                // Panic loudly if sizes are wrong so the fixture file can be
-                // identified and regenerated.
-                if pk.len() != 1952 {
-                    panic!("fixture {name}: bad pk len {} (want 1952)", pk.len());
-                }
-                if sk.is_empty() {
-                    panic!("fixture {name}: empty secret key in fixture file");
-                }
-                eprintln!("[fixture] loaded {name}: pk={}B sk={}B", pk.len(), sk.len());
-                return KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk };
-            }
-        }
+    let (_, name) = SEED_FIXTURE_NAMES
+        .iter()
+        .find(|(s, _)| *s == seed)
+        .unwrap_or_else(|| panic!(
+            "load_fixture_keypair: no fixture registered for seed {:?}. \
+             Add an entry to SEED_FIXTURE_NAMES and generate a fixture file.",
+            seed
+        ));
+
+    let path = manifest_dir()
+        .join("tests")
+        .join("devnet")
+        .join("keys")
+        .join(format!("{name}.key.json"));
+
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!(
+        "fixture {name}: cannot read {:?}: {e}. \
+         Run `cargo run --example gen_dis003d_fixture` (in chain-forge-crypto) \
+         to regenerate and commit the fixture files.",
+        path
+    ));
+
+    let obj = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|e| panic!(
+        "fixture {name}: JSON parse error in {:?}: {e}", path
+    ));
+
+    let pk_hex = obj["public_key"].as_str().unwrap_or_else(|| panic!(
+        "fixture {name}: missing \"public_key\" field"
+    ));
+    let sk_hex = obj["private_key"].as_str().unwrap_or_else(|| panic!(
+        "fixture {name}: missing \"private_key\" field"
+    ));
+
+    fn from_hex(h: &str) -> Vec<u8> {
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0))
+            .collect()
     }
-    // Fallback: in-process cached keygen (key matches genesis only if genesis was
-    // also generated in this same process — only safe for integration tests that
-    // embed the genesis public key inline).
-    MlDsaScheme.generate_keypair(seed).expect("keygen fallback")
+
+    let pk = from_hex(pk_hex);
+    let sk = from_hex(sk_hex);
+
+    if pk.len() != 1952 {
+        panic!("fixture {name}: bad pk len {} (want 1952)", pk.len());
+    }
+    if sk.len() != 4032 {
+        panic!(
+            "fixture {name}: bad sk len {} (want 4032). \
+             The fixture was probably generated against the Linux system \
+             dilithium3 library instead of the bundled PQClean C source. \
+             Regenerate with an isolated pqcrypto-dilithium 0.5.0 build.",
+            sk.len()
+        );
+    }
+
+    eprintln!("[fixture] loaded {name}: pk={}B sk={}B", pk.len(), sk.len());
+    KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk }
 }
 
 // ── Port helpers ──────────────────────────────────────────────────────────────
