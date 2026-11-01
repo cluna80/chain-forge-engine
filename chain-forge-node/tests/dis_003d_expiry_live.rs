@@ -161,18 +161,41 @@ fn spawn_devnet(ports: &Ports) -> [NodeHandle; 4] {
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
 
+/// Raw HTTP/1.0 request helper.
+///
+/// Sends headers and body as two separate writes so the server can open
+/// its receive window before the full body is in-flight — important on
+/// Windows where the loopback TCP send buffer is small (~8 KiB) and a
+/// single write_all of a 100 KB+ recovery tx can block waiting for the
+/// server to drain, while the server's body-read timeout is ticking.
+///
+/// Read timeout scales with body size: 15 s base + 1 s per 4 KB, so a
+/// 100 KB ML-DSA recovery tx gets ~40 s to arrive and be processed.
 fn http_raw(method: &str, port: u16, path: &str, body: Option<&str>) -> Option<(u16, String)> {
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().unwrap(),
         Duration::from_millis(500),
     ).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(15_000))).ok()?;
-    let req = if let Some(b) = body {
-        format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())
+    // Scale read timeout with body size so large recovery transactions
+    // (100 KB+ JSON) have enough time to be written, received, and processed.
+    let body_len = body.map(|b| b.len()).unwrap_or(0);
+    let read_ms  = 15_000u64 + (body_len as u64 / 4_096) * 1_000;
+    stream.set_read_timeout(Some(Duration::from_millis(read_ms))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(30))).ok()?;
+
+    // Write headers first, then body as a separate write.
+    // This lets the server start reading the headers (and open its TCP
+    // receive window) before we have finished sending the body bytes.
+    let headers = if let Some(b) = body {
+        format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b.len())
     } else {
         format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
     };
-    stream.write_all(req.as_bytes()).ok()?;
+    stream.write_all(headers.as_bytes()).ok()?;
+    if let Some(b) = body {
+        stream.write_all(b.as_bytes()).ok()?;
+    }
+
     let mut buf = String::new();
     stream.read_to_string(&mut buf).ok()?;
     let status = buf.lines().next()
@@ -203,7 +226,15 @@ fn poll_ready(port: u16, timeout: Duration) -> bool {
 }
 
 fn submit_tx(port: u16, json: &str) -> serde_json::Value {
-    api_post(port, "/api/tx", json).1
+    let body_len = json.len();
+    let (status, val) = api_post(port, "/api/tx", json);
+    if val.is_null() {
+        eprintln!("[submit_tx] WARNING: null response from port {port} \
+                   (body={body_len} bytes, http_status={status}) — \
+                   server may have timed out reading the body or closed \
+                   the connection before responding.");
+    }
+    val
 }
 
 fn wait_tx_result(port: u16, tx_id: &str, timeout: Duration) -> Option<serde_json::Value> {
