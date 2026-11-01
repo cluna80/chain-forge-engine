@@ -376,6 +376,8 @@ impl GasModel {
                     TxBody::RevokeRecoveryPolicy => op_multiplier * 2,
                     // UpdateGuardianPolicy: same cost as EnrollRecoveryPolicy (writes guardian set).
                     TxBody::UpdateGuardianPolicy { .. } => op_multiplier * 5,
+                    // CancelRecovery: simple state flag write.
+                    TxBody::CancelRecovery => op_multiplier * 2,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -888,6 +890,21 @@ pub enum TxBody {
     /// `policy_generation` — the generation counter is monotone forever.
     RevokeRecoveryPolicy,
 
+    /// DIS-003E: Cancel a pending two-phase recovery before it activates.
+    ///
+    /// Must be signed by the account's **currently active** signing key (the
+    /// one being replaced), not the proposed new key.  The executor verifies
+    /// the outer `pq_signatures` against the account's current `public_key`.
+    ///
+    /// If a `CancelRecovery` tx appears in the same block as `activation_height`,
+    /// it is processed (as a normal tx) before the block-end sweep runs, so the
+    /// `cancelled = true` flag is already set when the sweep checks — this gives
+    /// cancellation absolute priority over same-block activation.
+    ///
+    /// Once `cancelled = true`, no code path can revert it.  A new recovery
+    /// requires a new `RecoverAccountKey` tx.
+    CancelRecovery,
+
     /// DIS-003B: Replace the guardian set of an already-enrolled recovery policy.
     /// Signed by the current account key. Increments `policy_generation` so
     /// any guardian signatures collected under the old set are invalidated.
@@ -962,6 +979,7 @@ impl TxBody {
             TxBody::RecoverAccountKey { .. }        => "RecoverAccountKey",
             TxBody::RevokeRecoveryPolicy            => "RevokeRecoveryPolicy",
             TxBody::UpdateGuardianPolicy { .. }     => "UpdateGuardianPolicy",
+            TxBody::CancelRecovery                  => "CancelRecovery",
         }
     }
 }
@@ -1266,6 +1284,7 @@ impl Transaction {
             TxBody::UpdateGuardianPolicy { new_guardians, .. } => {
                 new_guardians.iter().map(|g| g.len()).sum::<usize>() + 16
             }
+            TxBody::CancelRecovery => 8,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -1768,6 +1787,18 @@ pub struct ExecutionConfig {
     /// Genesis `cryptography.signature_scheme`: which schemes user accounts
     /// may sign with. See `check_account_signature_policy`.
     pub account_signature_policy: chain_forge_core::AccountSignaturePolicy,
+
+    /// DIS-003E: how many blocks a pending recovery must age before the
+    /// block-end sweep may activate it.
+    ///
+    /// A value of 0 is only acceptable in explicit dev/test configurations —
+    /// the `from_genesis` constructor panics if this is 0 and the genesis
+    /// `execution.allow_zero_recovery_timelock != true`.  Production genesis
+    /// files MUST set this to a nonzero value.
+    ///
+    /// When 0, the sweep activates at the same block the recovery was
+    /// submitted (no window at all).  This MUST NOT be used in production.
+    pub recovery_timelock_blocks: u64,
 }
 
 impl ExecutionConfig {
@@ -1803,6 +1834,19 @@ impl ExecutionConfig {
             // (The node refuses to start on one anyway.)
             account_signature_policy: genesis.account_signature_policy()
                 .unwrap_or(chain_forge_core::AccountSignaturePolicy::MlDsaOnly),
+            recovery_timelock_blocks: {
+                let tl = genesis.execution.recovery_timelock_blocks;
+                if tl == 0 && !genesis.execution.allow_zero_recovery_timelock {
+                    panic!(
+                        "DIS-003E: genesis chain_id={} has recovery_timelock_blocks=0 \
+                         but allow_zero_recovery_timelock is not set. \
+                         Production genesis MUST set a nonzero recovery_timelock_blocks. \
+                         For dev/test only: set allow_zero_recovery_timelock=true in genesis execution config.",
+                        genesis.chain_id
+                    );
+                }
+                tl
+            },
         }
     }
 }
@@ -2097,6 +2141,32 @@ pub fn recovery_domain_signing_bytes(
     b
 }
 
+/// DIS-003E: Domain-separated signing bytes for `CancelRecovery` authorization.
+///
+/// The cancellation must be signed by the account's **currently active** signing
+/// key (the one that is being replaced by the pending recovery), not the proposed
+/// new key.  This signing-bytes format is distinct from the tx-level prehash so
+/// that a single signature cannot serve as both the tx auth and the cancel auth.
+///
+/// Format: `b"CFCANREC|" || chain_id || b"|" || account_address || b"|" || nonce`
+///
+/// `nonce` is the sender's nonce at the time the `CancelRecovery` tx is built;
+/// including it prevents cross-tx replay of cancel signatures.
+pub fn cancel_recovery_signing_bytes(
+    chain_id: &str,
+    account:  &str,
+    nonce:    u64,
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"CFCANREC|");
+    b.extend_from_slice(chain_id.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(account.as_bytes());
+    b.push(b'|');
+    b.extend_from_slice(nonce.to_string().as_bytes());
+    b
+}
+
 /// PQ-VAL-002 R2: Domain-separated signing bytes for consensus precommit votes.
 ///
 /// Format (spec §Precommit-signing-bytes):
@@ -2287,6 +2357,7 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::RecoverAccountKey { .. }        => None,
         TxBody::RevokeRecoveryPolicy            => None,
         TxBody::UpdateGuardianPolicy { .. }     => None,
+        TxBody::CancelRecovery                  => None,
     }
 }
 
@@ -2845,30 +2916,150 @@ fn execute_recover_account_key(
     policy_id:            u64,
     block_height:         u64,
 ) -> Result<(), String> {
+    // DIS-003E: reject if a pending recovery is already in flight (not yet
+    // activated or cancelled). Requiring users to cancel first prevents
+    // concurrent recovery races.
+    {
+        let acct = state
+            .get_account(&tx.sender)
+            .map_err(|e| format!("RecoverAccountKey: account lookup failed: {e}"))?;
+        if let Some(ref pending) = acct.pending_recovery {
+            if !pending.cancelled {
+                return Err(format!(
+                    "RecoverAccountKey: {} already has a pending recovery (activation_height={}). \
+                     Submit CancelRecovery first, or wait for the pending recovery to activate.",
+                    tx.sender, pending.activation_height
+                ));
+            }
+        }
+    }
+
     let current_version = verify_recover_account_key(
         config, tx, state, new_public_key, new_key_scheme, key_version,
         pop_signature, guardian_signatures, policy_id, block_height,
     )?;
 
-    // All guards passed — commit the recovery.
+    // DIS-003E: two-phase commit — set pending_recovery instead of immediately
+    // rotating the key. The block-end sweep activates at activation_height.
+    let activation_height = block_height + config.recovery_timelock_blocks;
     {
         let acct = state
             .get_account_mut(&tx.sender)
             .map_err(|e| format!("RecoverAccountKey: account lookup failed: {e}"))?;
-        acct.public_key      = Some(new_public_key.to_vec());
-        acct.key_version     = current_version + 1;
-        // Policy is consumed — must re-enroll after recovery.
+        acct.pending_recovery = Some(chain_forge_state::PendingRecovery {
+            new_public_key:      new_public_key.to_vec(),
+            new_key_scheme:      new_key_scheme.to_string(),
+            key_version:         current_version + 1,
+            submitted_at_height: block_height,
+            activation_height,
+            policy_id,
+            cancelled:           false,
+        });
+        // Policy is consumed when recovery is submitted (not on activation).
+        // This prevents submitting another RecoverAccountKey with the same policy.
         acct.recovery_policy = None;
     }
     state.refresh_leaf(&tx.sender);
 
     tracing::info!(
-        sender    = %tx.sender,
-        new_ver   = current_version + 1,
-        pk_len    = new_public_key.len(),
-        "DIS-002B: account key recovered via guardian policy"
+        sender            = %tx.sender,
+        activation_height,
+        timelock_blocks   = config.recovery_timelock_blocks,
+        pk_len            = new_public_key.len(),
+        "DIS-003E: recovery pending — will activate at block {}",
+        activation_height
     );
     Ok(())
+}
+
+/// DIS-003E: Execute a `CancelRecovery` transaction.
+///
+/// Authorization: the outer `pq_signatures` in the transaction must verify
+/// against the account's **current** public key (the one being replaced),
+/// not the proposed new key. This is enforced by the standard tx auth check
+/// that runs before dispatch, since the account's `public_key` is still the
+/// current key until activation.
+///
+/// Effect: sets `pending_recovery.cancelled = true`. This is irreversible —
+/// once cancelled, no code path can unset the flag.
+///
+/// Invariants checked:
+///  - Account must have a pending recovery (not None).
+///  - The pending recovery must not already be cancelled (idempotency guard).
+fn execute_cancel_recovery(
+    tx:    &Transaction,
+    state: &mut StateStore,
+) -> Result<(), String> {
+    {
+        let acct = state
+            .get_account_mut(&tx.sender)
+            .map_err(|e| format!("CancelRecovery: account lookup failed: {e}"))?;
+        match acct.pending_recovery.as_mut() {
+            None => {
+                return Err(format!(
+                    "CancelRecovery: {} has no pending recovery to cancel",
+                    tx.sender
+                ));
+            }
+            Some(p) if p.cancelled => {
+                return Err(format!(
+                    "CancelRecovery: {}'s pending recovery is already cancelled",
+                    tx.sender
+                ));
+            }
+            Some(p) => {
+                p.cancelled = true;
+            }
+        }
+    }
+    state.refresh_leaf(&tx.sender);
+
+    tracing::info!(sender = %tx.sender, "DIS-003E: pending recovery cancelled by current account key");
+    Ok(())
+}
+
+/// DIS-003E: Block-end sweep — activate all unchallenged pending recoveries
+/// whose `activation_height` has been reached.
+///
+/// Called in both `execute_block` and `execute_block_with_identity` AFTER all
+/// transactions for the block have executed (so any `CancelRecovery` txs in
+/// the same block have already set `cancelled = true`) but BEFORE
+/// `state.commit()`.
+///
+/// This ordering gives `CancelRecovery` absolute priority: a cancel submitted
+/// in the same block as `activation_height` prevents activation in that sweep.
+pub fn sweep_pending_recoveries(state: &mut StateStore, block_height: u64) {
+    // Collect addresses that need activation — avoid borrowing state mutably
+    // while iterating over accounts.
+    let to_activate: Vec<(String, chain_forge_state::PendingRecovery)> = state
+        .all_accounts()
+        .filter_map(|acct| {
+            let p = acct.pending_recovery.as_ref()?;
+            if !p.cancelled && block_height >= p.activation_height {
+                Some((acct.address.clone(), p.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (addr, pending) in to_activate {
+        if let Ok(acct) = state.get_account_mut(&addr) {
+            acct.public_key      = Some(pending.new_public_key.clone());
+            acct.key_version     = pending.key_version;
+            acct.pending_recovery = None;
+            // recovery_policy is already None (cleared when recovery was submitted).
+        }
+        state.refresh_leaf(&addr);
+
+        tracing::info!(
+            address   = %addr,
+            key_ver   = pending.key_version,
+            pk_len    = pending.new_public_key.len(),
+            at_height = block_height,
+            "DIS-003E: pending recovery activated — key replaced"
+        );
+    }
 }
 
 /// DIS-003A: Execute a RevokeRecoveryPolicy transaction.
@@ -3715,7 +3906,25 @@ impl Executor {
             }
 
             // DIS-002B: recovery policy enrollment and recovery.
+            // DIS-003E C-18: if a pending (non-cancelled) recovery exists,
+            // enrolling a new policy cancels it first.
             TxBody::EnrollRecoveryPolicy { guardians, threshold } => {
+                // C-18: cancel any pending recovery before enrolling a new policy.
+                if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                    if let Some(ref p) = acct.pending_recovery.clone() {
+                        if !p.cancelled {
+                            acct.pending_recovery = Some(chain_forge_state::PendingRecovery {
+                                cancelled: true,
+                                ..p.clone()
+                            });
+                            state.refresh_leaf(&tx.sender);
+                            tracing::info!(
+                                sender = %tx.sender,
+                                "DIS-003E C-18: pending recovery cancelled by new EnrollRecoveryPolicy"
+                            );
+                        }
+                    }
+                }
                 execute_enroll_recovery_policy(tx, state, guardians, *threshold)
             }
             TxBody::RecoverAccountKey {
@@ -3733,6 +3942,10 @@ impl Executor {
             }
             TxBody::UpdateGuardianPolicy { new_guardians, new_threshold } => {
                 execute_update_guardian_policy(tx, state, new_guardians, *new_threshold)
+            }
+            // DIS-003E: cancel a pending recovery (must be signed by current key).
+            TxBody::CancelRecovery => {
+                execute_cancel_recovery(tx, state)
             }
 
             TxBody::SponsorAgent { agent_address } => {
@@ -4720,8 +4933,24 @@ impl Executor {
                     new_public_key, new_key_scheme, key_version, pop_signature,
                 )
             }
-            // DIS-002B: recovery policy enrollment and recovery (no identity store needed).
+            // DIS-002B / DIS-003E: recovery policy enrollment and recovery (no identity store needed).
+            // C-18: if a pending (non-cancelled) recovery exists, cancel it before enrolling a new policy.
             TxBody::EnrollRecoveryPolicy { guardians, threshold } => {
+                if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                    if let Some(ref p) = acct.pending_recovery.clone() {
+                        if !p.cancelled {
+                            acct.pending_recovery = Some(chain_forge_state::PendingRecovery {
+                                cancelled: true,
+                                ..p.clone()
+                            });
+                            state.refresh_leaf(&tx.sender);
+                            tracing::info!(
+                                sender = %tx.sender,
+                                "DIS-003E C-18: pending recovery cancelled by new EnrollRecoveryPolicy"
+                            );
+                        }
+                    }
+                }
                 execute_enroll_recovery_policy(tx, state, guardians, *threshold)
             }
             TxBody::RecoverAccountKey {
@@ -4739,6 +4968,10 @@ impl Executor {
             }
             TxBody::UpdateGuardianPolicy { new_guardians, new_threshold } => {
                 execute_update_guardian_policy(tx, state, new_guardians, *new_threshold)
+            }
+            // DIS-003E: cancel a pending recovery (must be signed by current key).
+            TxBody::CancelRecovery => {
+                execute_cancel_recovery(tx, state)
             }
         };
 
@@ -4795,6 +5028,11 @@ impl Executor {
             fees_collected += result.fee_charged;
             results.push(result);
         }
+
+        // DIS-003E: block-end sweep — activate unchallenged pending recoveries.
+        // Runs AFTER all txs (so CancelRecovery txs in this block have fired)
+        // and BEFORE commit (so activation is included in the state root).
+        sweep_pending_recoveries(state, height);
 
         // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
         // Operates only on fees_collected (this block) — not the collector's
@@ -4962,6 +5200,11 @@ impl Executor {
                 }
             }
         }
+
+        // DIS-003E: block-end sweep — activate unchallenged pending recoveries.
+        // Runs AFTER all txs (so CancelRecovery txs in this block have fired)
+        // and BEFORE commit (so activation is included in the state root).
+        sweep_pending_recoveries(state, height);
 
         // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
         distribute_block_fees_from(&self.config.fee_collector, fees_collected,
