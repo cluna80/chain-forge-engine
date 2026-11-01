@@ -321,6 +321,7 @@ impl Proposal {
 // -- GovernanceModule ---------------------------------------------------------
 
 /// The on-chain governance module for QCB Chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceModule {
     config:    GovernanceConfig,
     proposals: HashMap<u64, Proposal>,
