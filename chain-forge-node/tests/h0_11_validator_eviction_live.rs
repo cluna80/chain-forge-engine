@@ -259,19 +259,24 @@ fn spawn_node(
     let data_dir = dirs.join(label);
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
-    // Log stderr to a file so failures are diagnosable.
+    // Log both stdout and stderr to a file (tracing goes to stdout).
+    // stdin is null — without this the node inherits the test's stdin pipe
+    // which can cause it to block on Windows.
     let log_path = dirs.join(format!("{label}.log"));
-    let log_file = std::fs::File::create(&log_path)
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&log_path)
         .unwrap_or_else(|e| panic!("open log {}: {e}", log_path.display()));
 
     let mut cmd = Command::new(node_bin());
     cmd.arg("--genesis").arg(genesis_path())
-       .arg("--validator-id").arg(validator_id)
+       .arg("--validator").arg(validator_id)
        .arg("--api-port").arg(api_port.to_string())
        .arg("--p2p-port").arg(p2p_port.to_string())
        .arg("--data-dir").arg(&data_dir)
-       .stdout(Stdio::null())
-       .stderr(log_file);
+       .stdout(log_file.try_clone().unwrap())
+       .stderr(log_file)
+       .stdin(Stdio::null());
     if let Some(bs) = bootstrap {
         cmd.arg("--bootstrap").arg(bs);
     }
