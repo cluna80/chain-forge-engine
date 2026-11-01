@@ -151,11 +151,19 @@ pub struct OutboundMessage {
 /// What we know about a connected peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
-    pub peer_id:    PeerId,
-    pub addr:       String,       // multiaddr string e.g. "/ip4/1.2.3.4/tcp/26656"
-    pub chain_id:   Option<String>,
-    pub connected:  bool,
-    pub score:      i32,          // higher = more trusted; drop at < -100
+    pub peer_id:      PeerId,
+    pub addr:         String,         // multiaddr string e.g. "/ip4/1.2.3.4/tcp/26656"
+    pub chain_id:     Option<String>,
+    /// The genesis hash the remote peer reported during the identify handshake.
+    /// `None` means the peer has not yet provided one (pre-H0-8 peers, or
+    /// peers that connected before the handshake completed).
+    /// `Some(h)` means the peer asserted its genesis hash is `h`.
+    ///
+    /// The local node MUST check this against its own genesis hash before
+    /// adding the peer to the trusted set.  See `PeerManager::try_accept_peer`.
+    pub genesis_hash: Option<String>,
+    pub connected:    bool,
+    pub score:        i32,            // higher = more trusted; drop at < -100
 }
 
 impl PeerInfo {
@@ -163,9 +171,10 @@ impl PeerInfo {
         Self {
             peer_id,
             addr,
-            chain_id: None,
-            connected: true,
-            score: 0,
+            chain_id:     None,
+            genesis_hash: None,
+            connected:    true,
+            score:        0,
         }
     }
 
@@ -193,6 +202,11 @@ pub struct NetworkConfig {
     /// Maximum gossip message size in bytes. Checked before broadcasting.
     /// Should be at least max_tx_bytes from genesis limits.
     pub max_message_bytes: usize,
+    /// H0-8: this node's genesis hash, embedded in the libp2p identify
+    /// agent_version so remote peers can verify chain membership.
+    /// Format: "chain-forge-node/<genesis_hash>".
+    /// None = genesis hash not yet computed (legacy / tests without H0-8).
+    pub genesis_hash:    Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +232,7 @@ impl NetworkConfig {
             peer_discovery:  discovery,
             max_peers:       genesis.network.max_peers,
             max_message_bytes: genesis.limits.max_tx_bytes as usize * 2,
+            genesis_hash:    None, // caller sets this via compute_genesis_hash()
         }
     }
 }
@@ -252,6 +267,11 @@ pub enum NetworkEvent {
     Started { local_addr: String, peer_id: PeerId },
     /// Fatal network error — node should shut down.
     FatalError(String),
+    /// Identify handshake completed for a peer; carries the genesis hash
+    /// the remote peer embedded in its agent version string.
+    /// The node must compare this against its own genesis hash and disconnect
+    /// the peer if they do not match.
+    PeerIdentified { peer_id: PeerId, genesis_hash: String },
 }
 
 // -- NetworkService trait -----------------------------------------------------
@@ -291,17 +311,24 @@ pub trait NetworkService: Send + Sync {
 /// Shared between the network service and the node layer.
 #[derive(Debug, Default)]
 pub struct PeerManager {
-    peers:   std::collections::HashMap<PeerId, PeerInfo>,
-    banned:  HashSet<PeerId>,
-    max_peers: u32,
+    peers:              std::collections::HashMap<PeerId, PeerInfo>,
+    banned:             HashSet<PeerId>,
+    max_peers:          u32,
+    /// This node's own genesis hash, set at startup via `set_local_genesis_hash`.
+    local_genesis_hash: Option<String>,
+    /// Peers denied due to genesis-hash mismatch.  Persists for the session so
+    /// a reconnect attempt is refused without a second handshake.
+    genesis_denied:     HashSet<PeerId>,
 }
 
 impl PeerManager {
     pub fn new(max_peers: u32) -> Self {
         Self {
-            peers: std::collections::HashMap::new(),
-            banned: HashSet::new(),
+            peers:              std::collections::HashMap::new(),
+            banned:             HashSet::new(),
             max_peers,
+            local_genesis_hash: None,
+            genesis_denied:     HashSet::new(),
         }
     }
 
@@ -366,6 +393,64 @@ impl PeerManager {
             .values()
             .filter(|p| p.chain_id.as_deref() == Some(network_id))
             .collect()
+    }
+
+    // ── H0-8: genesis-hash peer verification ─────────────────────────────────
+
+    /// Set the local node's genesis hash.  Must be called at startup before
+    /// accepting any peers.  The hash is the output of
+    /// `chain_forge_core::compute_genesis_hash(&local_genesis)`.
+    pub fn set_local_genesis_hash(&mut self, hash: String) {
+        self.local_genesis_hash = Some(hash);
+    }
+
+    /// Attempt to accept an inbound or outbound peer.
+    ///
+    /// Checks (in order):
+    ///   1. Peer is not on the standard ban list.
+    ///   2. Peer is not on the genesis-mismatch deny list.
+    ///   3. If the local node has a genesis hash configured AND the peer
+    ///      advertises a genesis hash, they must match.
+    ///      (Peers that have not yet provided a genesis hash are accepted
+    ///       tentatively; the node should re-check once the handshake completes.)
+    ///   4. Peer table is not full.
+    ///
+    /// Returns `true` if the peer was added to the trusted set, `false` if it
+    /// was rejected.  Rejected peers whose genesis hash mismatches are added to
+    /// `genesis_denied`.
+    pub fn try_accept_peer(&mut self, info: PeerInfo) -> bool {
+        // Standard ban check.
+        if self.banned.contains(&info.peer_id) {
+            return false;
+        }
+        // Genesis-mismatch deny list (persistent within session).
+        if self.genesis_denied.contains(&info.peer_id) {
+            return false;
+        }
+        // Genesis-hash check: if both sides have a genesis hash, they must match.
+        if let (Some(local), Some(remote)) = (
+            self.local_genesis_hash.as_deref(),
+            info.genesis_hash.as_deref(),
+        ) {
+            if local != remote {
+                // Add to deny list so reconnects are refused immediately.
+                self.genesis_denied.insert(info.peer_id.clone());
+                return false;
+            }
+        }
+        // Peer table capacity.
+        if self.peers.len() >= self.max_peers as usize
+            && !self.peers.contains_key(&info.peer_id)
+        {
+            return false;
+        }
+        self.peers.insert(info.peer_id.clone(), info);
+        true
+    }
+
+    /// Returns `true` if `peer_id` is on the genesis-mismatch deny list.
+    pub fn is_genesis_denied(&self, peer_id: &PeerId) -> bool {
+        self.genesis_denied.contains(peer_id)
     }
 }
 
@@ -647,8 +732,15 @@ pub mod real {
             ).map_err(|e| P2pError::Internal(format!("mdns: {e}")))?;
 
             // Identify protocol
+            // H0-8: embed this node's genesis hash in agent_version so remote
+            // peers can verify chain membership during the handshake.
+            let agent_version = match &config.genesis_hash {
+                Some(hash) => format!("chain-forge-node/{hash}"),
+                None       => "chain-forge-node/unknown".to_string(),
+            };
             let identify = identify::Behaviour::new(
-                identify::Config::new("/chain-forge/1.0.0".to_string(), local_key.public()),
+                identify::Config::new("/chain-forge/1.0.0".to_string(), local_key.public())
+                    .with_agent_version(agent_version),
             );
 
             // Build swarm
@@ -808,11 +900,12 @@ pub mod real {
                                                 .insert(peer.to_string(), addr.to_string());
                                             let _ = event_tx.send(NetworkEvent::PeerConnected(
                                                 PeerInfo {
-                                                    peer_id:   PeerId(peer.to_string()),
-                                                    addr:      addr.to_string(),
-                                                    chain_id:  None,
-                                                    connected: true,
-                                                    score:     0,
+                                                    peer_id:      PeerId(peer.to_string()),
+                                                    addr:         addr.to_string(),
+                                                    chain_id:     None,
+                                                    genesis_hash: None,
+                                                    connected:    true,
+                                                    score:        0,
                                                 }
                                             ));
                                         }
@@ -872,11 +965,12 @@ pub mod real {
                                         // a real, live connection underneath.
                                         let _ = event_tx.send(NetworkEvent::PeerConnected(
                                             PeerInfo {
-                                                peer_id:   PeerId(peer_id.to_string()),
+                                                peer_id:      PeerId(peer_id.to_string()),
                                                 addr,
-                                                chain_id:  None,
-                                                connected: true,
-                                                score:     0,
+                                                chain_id:     None,
+                                                genesis_hash: None,
+                                                connected:    true,
+                                                score:        0,
                                             }
                                         ));
                                     }
@@ -903,6 +997,28 @@ pub mod real {
                                     let _ = event_tx.send(NetworkEvent::PeerDisconnected(
                                         PeerId(peer_id.to_string())
                                     ));
+                                }
+
+                                // H0-8: parse genesis hash from the remote
+                                // peer's agent_version string.
+                                SwarmEvent::Behaviour(ChainForgeBehaviourEvent::Identify(
+                                    identify::Event::Received { peer_id, info, .. }
+                                )) => {
+                                    // agent_version format: "chain-forge-node/<genesis_hash>"
+                                    const PREFIX: &str = "chain-forge-node/";
+                                    if let Some(hash) = info.agent_version.strip_prefix(PREFIX) {
+                                        if hash != "unknown" && !hash.is_empty() {
+                                            tracing::debug!(
+                                                peer = %peer_id,
+                                                genesis_hash = %hash,
+                                                "identify: peer reported genesis hash"
+                                            );
+                                            let _ = event_tx.send(NetworkEvent::PeerIdentified {
+                                                peer_id:      PeerId(peer_id.to_string()),
+                                                genesis_hash: hash.to_string(),
+                                            });
+                                        }
+                                    }
                                 }
 
                                 _ => {}
@@ -953,11 +1069,12 @@ pub mod real {
             let map = self.peer_map.lock().unwrap();
             let peers = map.iter()
                 .map(|(peer_id, addr)| PeerInfo {
-                    peer_id:   PeerId(peer_id.clone()),
-                    addr:      addr.clone(),
-                    chain_id:  None,
-                    connected: true,
-                    score:     0,
+                    peer_id:      PeerId(peer_id.clone()),
+                    addr:         addr.clone(),
+                    chain_id:     None,
+                    genesis_hash: None,
+                    connected:    true,
+                    score:        0,
                 })
                 .collect();
             Ok(peers)

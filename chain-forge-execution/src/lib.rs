@@ -4989,6 +4989,107 @@ impl Executor {
     }
 }
 
+// -- Transaction domain (H0-8 cross-chain replay protection) -----------------
+
+/// The signing domain for a transaction on a specific chain.
+///
+/// A `TransactionDomain` encapsulates `(chain_id, genesis_hash)` and is used
+/// to derive the pre-hash bytes that an ML-DSA-65 signature covers.  Because
+/// the genesis hash is included, a signature made on chain A cannot be
+/// accepted as valid on chain B even when the two chains share the same
+/// `chain_id` (e.g. a fork at height 0 with different initial balances).
+///
+/// ## Canonical byte layout
+///
+/// ```text
+/// "chain-forge/tx-domain/v1\n"   (ASCII domain prefix, 26 bytes)
+/// chain_id                       (UTF-8)
+/// "\n"
+/// genesis_hash                   (64 lowercase hex chars, UTF-8)
+/// "\n"
+/// ```
+///
+/// The `prehash_for_signing(body)` method appends the body bytes to this
+/// prefix and returns the SHA-256 digest, suitable for direct use as the
+/// message to `MlDsaScheme::sign` / `MlDsaScheme::verify`.
+///
+/// ## Chain Forge modular design
+///
+/// This type lives in `chain-forge-execution` so any chain built on Chain
+/// Forge can use it without Qattice-specific constants.  Qattice ($QCB) uses
+/// `genesis_hash = compute_genesis_hash(&genesis)` from `chain-forge-core`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionDomain {
+    chain_id:     String,
+    genesis_hash: String,
+}
+
+/// Domain-prefix constant for the `TransactionDomain` canonical bytes.
+const TX_DOMAIN_V1_PREFIX: &[u8] = b"chain-forge/tx-domain/v1\n";
+
+impl TransactionDomain {
+    /// Create a new domain from `chain_id` and `genesis_hash` (64-char hex string
+    /// returned by `chain_forge_core::compute_genesis_hash`).
+    pub fn new(chain_id: &str, genesis_hash: &str) -> Self {
+        Self {
+            chain_id:     chain_id.to_owned(),
+            genesis_hash: genesis_hash.to_owned(),
+        }
+    }
+
+    /// Returns the canonical byte representation of this domain:
+    ///
+    /// ```text
+    /// TX_DOMAIN_V1_PREFIX || chain_id || "\n" || genesis_hash || "\n"
+    /// ```
+    ///
+    /// Two domains are equal if and only if their `canonical_bytes()` are equal.
+    /// G-03 requires that domains with the same `chain_id` but different
+    /// `genesis_hash` produce different canonical bytes.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            TX_DOMAIN_V1_PREFIX.len() +
+            self.chain_id.len() + 1 +
+            self.genesis_hash.len() + 1,
+        );
+        out.extend_from_slice(TX_DOMAIN_V1_PREFIX);
+        out.extend_from_slice(self.chain_id.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(self.genesis_hash.as_bytes());
+        out.push(b'\n');
+        out
+    }
+
+    /// Compute the 32-byte SHA-256 pre-hash digest that a signer covers.
+    ///
+    /// `body_bytes` is the raw tx body bytes (typically the JSON serialization
+    /// of a `TxBody`).  The digest is:
+    ///
+    /// ```text
+    /// SHA-256(canonical_bytes(domain) || body_bytes)
+    /// ```
+    ///
+    /// This is the byte slice that must be passed to `MlDsaScheme::sign` /
+    /// `MlDsaScheme::verify` (not the full tx body).
+    pub fn prehash_for_signing(&self, body_bytes: &[u8]) -> Vec<u8> {
+        use sha2::{Sha256, Digest as _};
+        let mut h = Sha256::new();
+        h.update(&self.canonical_bytes());
+        h.update(body_bytes);
+        h.finalize().to_vec()
+    }
+
+    /// The `chain_id` component of this domain.
+    pub fn chain_id(&self) -> &str {
+        &self.chain_id
+    }
+
+    /// The genesis hash component of this domain.
+    pub fn genesis_hash(&self) -> &str {
+        &self.genesis_hash
+    }
+}
+
 // -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]

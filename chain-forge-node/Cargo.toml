@@ -125,3 +125,7 @@ path = "tests/timestamp_monotonic_live.rs"
 [[test]]
 name = "pocd_reward_live"
 path = "tests/pocd_reward_live.rs"
+
+[[test]]
+name = "h0_8_genesis_peer_verification_live"
+path = "tests/h0_8_genesis_peer_verification_live.rs"
