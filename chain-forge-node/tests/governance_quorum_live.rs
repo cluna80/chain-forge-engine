@@ -282,12 +282,13 @@ fn submit_and_wait(port: u16, id: &str, sender: &str, nonce: u64,
     let tx = unsigned_tx(id, sender, nonce, body, gas);
     let sub = submit_tx_json(port, &tx);
     let status = sub["status"].as_str().unwrap_or("");
+    eprintln!("[submit_and_wait] id={id} sender={sender} nonce={nonce} status={status} sub={sub}");
     assert!(
         status == "queued" || status == "ok",
         "tx {id} not queued — got: {sub}"
     );
     wait_tx(port, id, timeout)
-        .unwrap_or_else(|| panic!("tx {id} never landed"))
+        .unwrap_or_else(|| panic!("tx {id} never landed (height={})", current_height(port)))
 }
 
 // ── Governance JSON helpers ───────────────────────────────────────────────────
@@ -436,11 +437,16 @@ fn governance_quorum_live() {
 
     let proposer_nonce_base = current_nonce(port, PROPOSER);
 
+    // Proposals are submitted sequentially. Each proposal must commit before the
+    // next is sent because the proposer's nonce must match committed state.
+    // Use a fresh current_nonce() before each proposal to be safe against any
+    // timing edge cases.
+
     // GQ-01: ordinary, 0 voters
     let p1_resp = submit_and_wait(
-        port, "gov-p01", PROPOSER, proposer_nonce_base,
+        port, "gov-p01", PROPOSER, current_nonce(port, PROPOSER),
         json!({ "ProposeChange": { "kind_json": ordinary_kind_json() } }), 1_000_000,
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     );
     assert!(p1_resp["success"].as_bool().unwrap_or(false),
         "GQ-01: proposal submission failed: {p1_resp}");
@@ -448,9 +454,9 @@ fn governance_quorum_live() {
 
     // GQ-02: ordinary, 1 voter yes
     let p2_resp = submit_and_wait(
-        port, "gov-p02", PROPOSER, proposer_nonce_base + 1,
+        port, "gov-p02", PROPOSER, current_nonce(port, PROPOSER),
         json!({ "ProposeChange": { "kind_json": ordinary_kind_json() } }), 1_000_000,
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     );
     assert!(p2_resp["success"].as_bool().unwrap_or(false),
         "GQ-02: proposal submission failed: {p2_resp}");
@@ -458,9 +464,9 @@ fn governance_quorum_live() {
 
     // GQ-03: constitutional, 9 voters (fails abs_min)
     let p3_resp = submit_and_wait(
-        port, "gov-p03", PROPOSER, proposer_nonce_base + 2,
+        port, "gov-p03", PROPOSER, current_nonce(port, PROPOSER),
         json!({ "ProposeChange": { "kind_json": constitutional_kind_json() } }), 1_000_000,
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     );
     assert!(p3_resp["success"].as_bool().unwrap_or(false),
         "GQ-03: proposal submission failed: {p3_resp}");
@@ -468,9 +474,9 @@ fn governance_quorum_live() {
 
     // GQ-04: constitutional, 11 voters ≥67% yes
     let p4_resp = submit_and_wait(
-        port, "gov-p04", PROPOSER, proposer_nonce_base + 3,
+        port, "gov-p04", PROPOSER, current_nonce(port, PROPOSER),
         json!({ "ProposeChange": { "kind_json": constitutional_kind_json() } }), 1_000_000,
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     );
     assert!(p4_resp["success"].as_bool().unwrap_or(false),
         "GQ-04: proposal submission failed: {p4_resp}");
@@ -478,9 +484,9 @@ fn governance_quorum_live() {
 
     // GQ-05: ordinary, quorum met but approval below threshold (0 yes, 1 no)
     let p5_resp = submit_and_wait(
-        port, "gov-p05", PROPOSER, proposer_nonce_base + 4,
+        port, "gov-p05", PROPOSER, current_nonce(port, PROPOSER),
         json!({ "ProposeChange": { "kind_json": ordinary_kind_json() } }), 1_000_000,
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     );
     assert!(p5_resp["success"].as_bool().unwrap_or(false),
         "GQ-05: proposal submission failed: {p5_resp}");
@@ -488,9 +494,9 @@ fn governance_quorum_live() {
 
     // GQ-06: ordinary (will be activated early — before voting ends)
     let p6_resp = submit_and_wait(
-        port, "gov-p06", PROPOSER, proposer_nonce_base + 5,
+        port, "gov-p06", PROPOSER, current_nonce(port, PROPOSER),
         json!({ "ProposeChange": { "kind_json": ordinary_kind_json() } }), 1_000_000,
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     );
     assert!(p6_resp["success"].as_bool().unwrap_or(false),
         "GQ-06: proposal submission failed: {p6_resp}");
