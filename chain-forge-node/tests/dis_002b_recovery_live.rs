@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash, KeyPair};
+use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
 use chain_forge_execution::{
     Transaction, TxBody, GuardianAuth,
     account_key_rotation_signing_bytes,
@@ -52,6 +52,8 @@ const SEED_REC: &str = "dis002b-pilot-recovery-seed-0000000000000000000000000009
 const SEED_G1: &str = "dis002b-guardian-1-seed-000000000000000000000000000010";
 const SEED_G2: &str = "dis002b-guardian-2-seed-000000000000000000000000000020";
 const SEED_G3: &str = "dis002b-guardian-3-seed-000000000000000000000000000030";
+// Bob's attestation key (ML-DSA; first-use binds to qcb1bob at runtime).
+const SEED_BOB: &str = "dis002b-bob-attest-seed-0000000000000000000000000000002";
 // Attacker seed (for forged sig test).
 const SEED_ATK: &str = "dis002b-attacker-seed-000000000000000000000000000003";
 
@@ -121,19 +123,6 @@ fn key_file(label: &str) -> PathBuf {
         .join(format!("{label}.key.json"))
 }
 
-fn load_ed25519_keypair(path: &PathBuf) -> KeyPair {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("cannot read key file {path:?}: {e}"));
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("cannot parse key file {path:?}: {e}"));
-    let pk_hex = v["public_key"].as_str().expect("public_key missing");
-    let sk_hex = v["private_key"].as_str().expect("private_key missing");
-    KeyPair {
-        scheme:      SchemeId::Classical,
-        public_key:  hex::decode(pk_hex).expect("pk hex decode"),
-        private_key: hex::decode(sk_hex).expect("sk hex decode"),
-    }
-}
 
 // ── Node lifecycle ─────────────────────────────────────────────────────────────
 
@@ -346,23 +335,6 @@ fn build_register_identity(seed: &str, sender: &str, nonce: u64, tx_id: &str) ->
     ml_dsa_tx(seed, sender, nonce, TxBody::RegisterIdentity, tx_id, 200_000)
 }
 
-fn build_attest_ed25519(kp: &KeyPair, attester: &str, nonce: u64, claimant_id: &str) -> Transaction {
-    let body = TxBody::Attest { claimant_id: claimant_id.to_string() };
-    let mut tx = Transaction {
-        id:            format!("rec-attest-{attester}-for-{claimant_id}"),
-        sender:        attester.to_string(),
-        nonce,
-        body,
-        gas_limit:     200_000,
-        signature:     vec![],
-        public_key:    vec![],
-        pq_signatures: vec![],
-        sig_scheme:    Some(SchemeId::Classical),
-        pq_public_key: vec![],
-    };
-    tx.sign(kp, CHAIN_ID).expect("Ed25519 sign Attest");
-    tx
-}
 
 /// Build EnrollRecoveryPolicy signed by the account's current ML-DSA key.
 fn build_enroll_policy(
@@ -478,8 +450,9 @@ fn dis_002b_recovery() {
     let reg_res = submit_tx(ports.alice_api, &reg_json);
     eprintln!("  RegisterIdentity: {:?}", reg_res);
 
-    let bob_kp = load_ed25519_keypair(&key_file("bob"));
-    let attest_tx = build_attest_ed25519(&bob_kp, "qcb1bob", 0, PILOT_ADDR);
+    let attest_tx = ml_dsa_tx(SEED_BOB, "qcb1bob", 0,
+        TxBody::Attest { claimant_id: PILOT_ADDR.to_string() },
+        "rec-attest-qcb1bob-for-qcb1pilot", 200_000);
     let attest_json = serde_json::to_string(&attest_tx).unwrap();
     let attest_res = submit_tx(ports.bob_api, &attest_json);
     eprintln!("  Attest(bob→pilot): {:?}", attest_res);
