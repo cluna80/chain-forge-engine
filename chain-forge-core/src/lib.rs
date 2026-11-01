@@ -1066,6 +1066,12 @@ impl GenesisConfig {
 
     /// Resolve and validate the liveness policy. Hard validation: the node
     /// refuses to start on `Err`.
+    ///
+    /// When `environment.mode == "devnet"` AND `environment.relaxed_limits ==
+    /// true` the `window_blocks` lower bound is relaxed to 5 blocks, allowing
+    /// integration tests to use short windows without waiting hundreds of
+    /// blocks for a validator to be jailed.  On testnet and mainnet the full
+    /// `[100, 100_000]` range is always enforced regardless of `relaxed_limits`.
     pub fn liveness_params(&self) -> Result<LivenessParams, String> {
         let cfg = self.consensus.liveness.clone().unwrap_or_default();
         let p = LivenessParams {
@@ -1074,9 +1080,20 @@ impl GenesisConfig {
             start_height:   cfg.start_height.unwrap_or(DEFAULT_LIVENESS_START_HEIGHT),
         };
         let (wmin, wmax) = LIVENESS_WINDOW_BLOCKS_RANGE;
-        if !(wmin..=wmax).contains(&p.window_blocks) {
+        // Devnet + relaxed_limits: allow short windows for integration tests.
+        // Testnet and mainnet always enforce the full production range.
+        let is_relaxed_devnet = self.environment.mode == "devnet"
+            && self.environment.relaxed_limits;
+        let wmin_effective = if is_relaxed_devnet { 5 } else { wmin };
+        if !(wmin_effective..=wmax).contains(&p.window_blocks) {
+            let hint = if p.window_blocks < wmin {
+                " (set environment.mode=\"devnet\" and environment.relaxed_limits=true to allow short windows in tests)"
+            } else if p.window_blocks < 5 {
+                " (minimum is 5 even on relaxed devnet)"
+            } else { "" };
             return Err(format!(
-                "consensus.liveness.window_blocks {} is outside [{wmin}, {wmax}]", p.window_blocks
+                "consensus.liveness.window_blocks {} is outside [{wmin_effective}, {wmax}]{hint}",
+                p.window_blocks
             ));
         }
         let (pmin, pmax) = LIVENESS_MAX_MISSED_PCT_RANGE;

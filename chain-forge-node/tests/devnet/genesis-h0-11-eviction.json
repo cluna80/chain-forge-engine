@@ -4,7 +4,7 @@
   "engine_version": "0.1.0",
   "genesis_time": "2026-10-31T00:00:00Z",
   "environment": {
-    "mode": "testnet",
+    "mode": "devnet",
     "faucet_enabled": true,
     "relaxed_limits": true
   },
