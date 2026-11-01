@@ -758,6 +758,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RevokeRecoveryPolicy             => "revoke_recovery_policy",
         // DIS-003B: guardian set replacement
         TxBody::UpdateGuardianPolicy { .. }      => "update_guardian_policy",
+        // DIS-003E: cancel a pending recovery
+        TxBody::CancelRecovery                   => "cancel_recovery",
     }
 }
 
