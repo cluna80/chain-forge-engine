@@ -410,7 +410,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | H0-2 | State determinism | All nodes produce identical state roots after processing the same tx sequence regardless of arrival order | 🔲 |
 | H0-3 | Crash recovery | Node state is consistent with the canonical chain after an unclean shutdown at any block height | ✅ **Windows-confirmed 2026-10-31 (all five security findings F1–F5 resolved)** — C-01 (`367b060`…); C-07 (`bd1818e`…); security re-run (`ab5feac`, F1–F4, 11/11, 14.84s); signing-guard path fix + C-11 (`6f98800`, F5, 12/12, 11.53s BossKing/MINGW64 2026-10-31). PR #41. |
 | H0-4 | Nonce / replay | Nonce wrap-around and duplicate txs across blocks are rejected with zero partial state change | 🔲 |
-| H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | 🔲 |
+| H0-5 | Execution rollback | A tx that fails mid-execution or runs out of gas applies zero state changes — full rollback, not partial | ✅ **Windows-confirmed 2026-10-31 (BossKing/MINGW64, H5-1..H5-5 all passed, 66.83s, root@7=`ef5bb34e…`)** — fee charged + nonce consumed on failed tx, replay rejected, future-nonce rejected, 4-node block-hash agreement, crash-restart preserved all state. |
 | H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
 | H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
 | H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | ✅ G-01…G-07 passing on Windows (BossKing, MINGW64, 2026-10-31, `616bf0e`) |
@@ -426,7 +426,7 @@ The following open items in Phase 0.5 block specific Phase 1 milestones. Phase 1
 | Blocker | Blocks |
 |---|---|
 | ~~H0-10 — DIS-003E confirmation~~ | ~~DIS-003E, QCB-KR-001 multisig key lifecycle~~ — **✅ unblocked 2026-10-31** |
-| H0-5 — Execution rollback guarantee | FeeSponsor live authorization (FS-03 follow-on); any multi-step tx type |
+| ~~H0-5 — Execution rollback guarantee~~ | ~~FeeSponsor live authorization (FS-03 follow-on); any multi-step tx type~~ — **✅ unblocked 2026-10-31** |
 | H0-11 — Validator eviction decision | Validator Onboarding section marked complete |
 | H0-12 — Governance quorum | `ProposeChange` / `VoteOnProposal` / `ActivateChange` in any production tx flow |
 
