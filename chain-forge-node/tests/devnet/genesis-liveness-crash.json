@@ -38,7 +38,7 @@
     "pqc_algorithm": "ml-dsa",
     "migration_trigger": "nist-guidance",
     "hash_width": 256,
-    "validator_scheme": "ed25519"
+    "validator_scheme": "pqc-native"
   },
   "network": {
     "network_id": "qcb-devnet-liveness-crash",

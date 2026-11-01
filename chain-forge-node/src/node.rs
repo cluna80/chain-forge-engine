@@ -2564,13 +2564,21 @@ impl Node {
                     // peers configured at all -- a genuinely standalone node.
                     // Use the runtime-resolved flag (which accounts for
                     // --bootstrap CLI peers merged in addition to genesis).
-                    let expects_peers = self.has_bootstrap_peers;
+                    // Also treat a multi-validator genesis as "expecting peers"
+                    // even when this node IS the bootstrap seed and therefore
+                    // has no --bootstrap arg itself: a 4-node chain should
+                    // never run in solo/synthetic-vote mode, including on the
+                    // seed node.  Solo mode is only correct for a genuinely
+                    // single-validator chain (validator_set_size == 1).
+                    let genesis_validators = self.consensus.validator_set().validators.len();
+                    let expects_peers = self.has_bootstrap_peers || genesis_validators > 1;
 
                     if peer_count == 0 && !expects_peers {
                         // No real peers, none expected: solo devnet convenience
                         // path, unchanged from Phase 0. The proposer synthesises
                         // every genesis validator's vote itself and commits in
                         // one call, since there is no one else to actually vote.
+                        // Only reached when validator_set_size == 1.
                         if self.genesis.environment.mode == "devnet" {
                             let parent = chain_forge_consensus::BlockHash(
                                 format!("genesis_h{height}")
