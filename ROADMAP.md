@@ -59,7 +59,7 @@ Protocol first; applications (PoCD, marketplace, research apps) come after the p
 | # | Track | Required completion gate | Status |
 |---|-------|--------------------------|--------|
 | BIZ-PRE-1 | **Phase 0.5 — Protocol Hardening** | H0-5 (execution rollback) and H0-7 (supply conservation) confirmed locally | 🔲 |
-| BIZ-PRE-2 | **DIS — Account Security and Recovery** | DIS-003D and DIS-003E confirmed locally on Windows/MINGW64 | 🔲 |
+| BIZ-PRE-2 | **DIS — Account Security and Recovery** | DIS-003D and DIS-003E confirmed locally on Windows/MINGW64 | ✅ DIS-003D (2026-10-30) + DIS-003E (2026-11-01) both Windows-confirmed |
 | BIZ-PRE-3 | **DIS Standalone Product** | Independent cryptographic review gate passed (currently marked ⚠️ return before production on DIS-CORE-001, DIS-PQ-001, DIS-PRIV-001) | 🔲 |
 | BIZ-PRE-4 | **FeeSponsor** | FS-03 live authorization complete (SponsorAuthorization wired into execution path) | 🔲 |
 | BIZ-PRE-5 | **Validator Onboarding** | Validator eviction policy decided and implemented (H0-11) | 🔲 |
@@ -415,7 +415,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
 | H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | ✅ G-01…G-07 passing on Windows (BossKing, MINGW64, 2026-10-31, `616bf0e`) |
 | H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` passes locally on Windows/MINGW64 — fix `submit_tx` returning null for ~77 KB recovery tx bodies | ✅ **Windows-confirmed 2026-10-30** — node HTTP body limit promoted to genesis `max_tx_bytes`; explicit 413 response; F-00..F-08 all pass (PR #32). |
-| H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | ⬜ Implementation complete (`feat/dis-003e-recovery-timelock`); sandbox compile ✅; **awaiting Windows run** of `dis_003e_timelock_live` + regression suites. |
+| H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | ✅ **Windows-confirmed 2026-11-01** — C-14..C-19 all pass, 4-node state roots converge (`80d56a7c…`); regression suites (`dis_003a/b/c`, `dis_002b`) clean (commit `ac2c122`, `feat/dis-003e-recovery-timelock`). |
 | H0-11 | Validator eviction | Product decision on eviction policy recorded (are genesis validators exempt forever or swept on first outbid?); decision implemented and tested | 🔲 |
 | H0-12 | Governance quorum | >3% turnout for ordinary votes, >6% for constitutional changes — implemented, wired to `VoteOnProposal`, and adversarially tested | 🔲 |
 
@@ -425,7 +425,7 @@ The following open items in Phase 0.5 block specific Phase 1 milestones. Phase 1
 
 | Blocker | Blocks |
 |---|---|
-| H0-10 — DIS-003E Windows confirmation | DIS-003E, QCB-KR-001 multisig key lifecycle (H0-9 cleared 2026-10-30) |
+| ~~H0-10 — DIS-003E Windows confirmation~~ | ~~DIS-003E, QCB-KR-001 multisig key lifecycle~~ | ✅ Cleared 2026-11-01 |
 | H0-5 — Execution rollback guarantee | FeeSponsor live authorization (FS-03 follow-on); any multi-step tx type |
 | H0-11 — Validator eviction decision | Validator Onboarding section marked complete |
 | H0-12 — Governance quorum | `ProposeChange` / `VoteOnProposal` / `ActivateChange` in any production tx flow |
@@ -465,7 +465,7 @@ Phase 0 milestones remain closed. Phase 0.5 adds adversarial coverage on top of 
 | **DIS-003B — Guardian Policy Updates and Compromise Resistance** | ✅ Complete (2026-10-26) | 9 live acceptance cases confirmed on Windows/MINGW64 (`dis_003b_guardian_update_live`, 37.88 s): `UpdateGuardianPolicy` replaces guardian set, increments generation; removed guardian rejected post-update; `policy_generation=4` survived 4-node full restart; convergence `3d49fa98…`. |
 | **DIS-003C — Cross-Chain / Cross-Account Replay Protection** | ✅ Complete (2026-10-26) | 8 live acceptance cases confirmed on Windows/MINGW64 (`dis_003c_replay_attack_live`, 42.74 s): guardian sigs and PoP bound to `(chain_id, account, key_version, new_pk)` tuple; cross-chain, cross-account, stale key_version, wrong-pk, and wrong-PoP attacks all rejected; 4-node convergence `b86fb2e9…`. |
 | **DIS-003D — Recovery Authorization Expiry** | ✅ Complete (2026-10-30) | F-00..F-08 all passing on Windows/MINGW64 (PR #32, `9723c53`). Root cause of original `submit_tx` null: node HTTP server had a hard-coded 64 KiB body limit — the ~77 KB ML-DSA recovery tx was silently dropped. Fix: explicit 413 for oversized requests; body limit promoted to genesis `max_tx_bytes` (256 KiB in `genesis-dis003d.json`). All 8 expiry acceptance criteria confirmed: valid expiry enforced; expired authorization rejected; boundary height accepted; 4-node state root convergence. Branch: `fix/api-request-limit-413` + `feature/dis-003-on-security-stack`. |
-| **DIS-003E — Recovery Timelock and Cancellation** | ⬜ Awaiting Windows confirmation | Implementation complete on `feat/dis-003e-recovery-timelock`: `PendingRecovery` state in `AccountState`, `CancelRecovery` tx, block-finalisation sweep at `activation_height`, zero-timelock opt-in (`allow_zero_recovery_timelock`). Tests C-14..C-19 written and compile-verified in sandbox. **Needs:** local Windows/MINGW64 run of `dis_003e_timelock_live` + regression suites (`dis_003a/b/c`, `dis_002b_recovery`), then open draft PR. |
+| **DIS-003E — Recovery Timelock and Cancellation** | ✅ Complete (2026-11-01) | C-14..C-19 all passing on Windows/MINGW64 (`dis_003e_timelock_live`, 55.83 s, commit `ac2c122`): timelock sets `PendingRecovery`; cancellation voids pending recovery; unchallenged recovery activates at `activation_height`; cancelled recovery cannot reactivate; new `EnrollRecoveryPolicy` cancels pending; 4-node state root convergence `80d56a7c…`. Regression suites (`dis_003a/b/c`, `dis_002b_recovery`) all pass. Branch: `feat/dis-003e-recovery-timelock`. |
 
 ### Validator Onboarding — Permissionless Entry via Stake Bond
 
