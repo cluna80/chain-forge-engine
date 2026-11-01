@@ -30,7 +30,8 @@
       "validator_bps": 7000,
       "treasury_bps": 2000,
       "burn_bps": 1000
-    }
+    },
+    "allow_zero_recovery_timelock": true
   },
   "cryptography": {
     "signature_scheme": "hybrid",

@@ -28,9 +28,10 @@
     "require_signatures": false,
     "fee_distribution_bps": {
       "validator_bps": 7000,
-      "treasury_bps":  2000,
-      "burn_bps":      1000
-    }
+      "treasury_bps": 2000,
+      "burn_bps": 1000
+    },
+    "allow_zero_recovery_timelock": true
   },
   "cryptography": {
     "signature_scheme": "hybrid",
@@ -60,7 +61,10 @@
   "pocd": {
     "enabled": true,
     "chain_id": "qcb-devnet-pocd",
-    "challenge_tracks": ["Mathematics", "Cryptography"],
+    "challenge_tracks": [
+      "Mathematics",
+      "Cryptography"
+    ],
     "reward_epoch_blocks": 720,
     "require_verified_identity": false,
     "min_seal_difficulty_bits": 8
@@ -116,5 +120,7 @@
     }
   ],
   "attestation_coordinator": "qcb1alice",
-  "settlement_operators": ["qcb1alice"]
+  "settlement_operators": [
+    "qcb1alice"
+  ]
 }
