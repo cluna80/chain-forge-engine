@@ -415,7 +415,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
 | H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | ✅ G-01…G-07 passing on Windows (BossKing, MINGW64, 2026-10-31, `616bf0e`) |
 | H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` passes locally on Windows/MINGW64 — fix `submit_tx` returning null for ~77 KB recovery tx bodies | ✅ **Windows-confirmed 2026-10-31 (BossKing/MINGW64, F-00..F-08 all passed, 38.77s)** — root cause: ML-DSA `generate_keypair(seed)` non-deterministic across processes; fix: pre-generated fixture keypairs committed to `tests/devnet/keys/`. Commits `c2e0a6b`…`6e94671` on `security/h0-9-recovery-tx-size`. |
-| H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | ⬜ Unblocked |
+| H0-10 | DIS-003E completion | Recovery timelock and cancellation (`CancelRecovery`, pending sweep) confirmed locally on Windows/MINGW64 | ✅ **Windows-confirmed 2026-10-31 (BossKing/MINGW64, C-14..C-19 all passed, 55.78s, four-node state roots converge)** — root cause of C-16: `public_key` not exposed in `AccountSummary` API response; fix: added hex-encoded `public_key` field to `AccountSummary` and all 4 construction sites in `node.rs`. Commits `5c91682`, `be823b5` on `security/h0-10-recovery-timelock`. |
 | H0-11 | Validator eviction | Product decision on eviction policy recorded (are genesis validators exempt forever or swept on first outbid?); decision implemented and tested | 🔲 |
 | H0-12 | Governance quorum | >3% turnout for ordinary votes, >6% for constitutional changes — implemented, wired to `VoteOnProposal`, and adversarially tested | 🔲 |
 
@@ -425,7 +425,7 @@ The following open items in Phase 0.5 block specific Phase 1 milestones. Phase 1
 
 | Blocker | Blocks |
 |---|---|
-| H0-10 — DIS-003E confirmation | DIS-003E, QCB-KR-001 multisig key lifecycle |
+| ~~H0-10 — DIS-003E confirmation~~ | ~~DIS-003E, QCB-KR-001 multisig key lifecycle~~ — **✅ unblocked 2026-10-31** |
 | H0-5 — Execution rollback guarantee | FeeSponsor live authorization (FS-03 follow-on); any multi-step tx type |
 | H0-11 — Validator eviction decision | Validator Onboarding section marked complete |
 | H0-12 — Governance quorum | `ProposeChange` / `VoteOnProposal` / `ActivateChange` in any production tx flow |
