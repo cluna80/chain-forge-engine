@@ -129,3 +129,7 @@ path = "tests/pocd_reward_live.rs"
 [[test]]
 name = "h0_8_genesis_peer_verification_live"
 path = "tests/h0_8_genesis_peer_verification_live.rs"
+
+[[test]]
+name = "h0_11_validator_eviction_live"
+path = "tests/h0_11_validator_eviction_live.rs"
