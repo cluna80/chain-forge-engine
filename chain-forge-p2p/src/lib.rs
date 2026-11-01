@@ -202,6 +202,11 @@ pub struct NetworkConfig {
     /// Maximum gossip message size in bytes. Checked before broadcasting.
     /// Should be at least max_tx_bytes from genesis limits.
     pub max_message_bytes: usize,
+    /// H0-8: this node's genesis hash, embedded in the libp2p identify
+    /// agent_version so remote peers can verify chain membership.
+    /// Format: "chain-forge-node/<genesis_hash>".
+    /// None = genesis hash not yet computed (legacy / tests without H0-8).
+    pub genesis_hash:    Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +232,7 @@ impl NetworkConfig {
             peer_discovery:  discovery,
             max_peers:       genesis.network.max_peers,
             max_message_bytes: genesis.limits.max_tx_bytes as usize * 2,
+            genesis_hash:    None, // caller sets this via compute_genesis_hash()
         }
     }
 }
@@ -261,6 +267,11 @@ pub enum NetworkEvent {
     Started { local_addr: String, peer_id: PeerId },
     /// Fatal network error — node should shut down.
     FatalError(String),
+    /// Identify handshake completed for a peer; carries the genesis hash
+    /// the remote peer embedded in its agent version string.
+    /// The node must compare this against its own genesis hash and disconnect
+    /// the peer if they do not match.
+    PeerIdentified { peer_id: PeerId, genesis_hash: String },
 }
 
 // -- NetworkService trait -----------------------------------------------------
@@ -721,8 +732,15 @@ pub mod real {
             ).map_err(|e| P2pError::Internal(format!("mdns: {e}")))?;
 
             // Identify protocol
+            // H0-8: embed this node's genesis hash in agent_version so remote
+            // peers can verify chain membership during the handshake.
+            let agent_version = match &config.genesis_hash {
+                Some(hash) => format!("chain-forge-node/{hash}"),
+                None       => "chain-forge-node/unknown".to_string(),
+            };
             let identify = identify::Behaviour::new(
-                identify::Config::new("/chain-forge/1.0.0".to_string(), local_key.public()),
+                identify::Config::new("/chain-forge/1.0.0".to_string(), local_key.public())
+                    .with_agent_version(agent_version),
             );
 
             // Build swarm
@@ -979,6 +997,28 @@ pub mod real {
                                     let _ = event_tx.send(NetworkEvent::PeerDisconnected(
                                         PeerId(peer_id.to_string())
                                     ));
+                                }
+
+                                // H0-8: parse genesis hash from the remote
+                                // peer's agent_version string.
+                                SwarmEvent::Behaviour(ChainForgeBehaviourEvent::Identify(
+                                    identify::Event::Received { peer_id, info, .. }
+                                )) => {
+                                    // agent_version format: "chain-forge-node/<genesis_hash>"
+                                    const PREFIX: &str = "chain-forge-node/";
+                                    if let Some(hash) = info.agent_version.strip_prefix(PREFIX) {
+                                        if hash != "unknown" && !hash.is_empty() {
+                                            tracing::debug!(
+                                                peer = %peer_id,
+                                                genesis_hash = %hash,
+                                                "identify: peer reported genesis hash"
+                                            );
+                                            let _ = event_tx.send(NetworkEvent::PeerIdentified {
+                                                peer_id:      PeerId(peer_id.to_string()),
+                                                genesis_hash: hash.to_string(),
+                                            });
+                                        }
+                                    }
                                 }
 
                                 _ => {}
