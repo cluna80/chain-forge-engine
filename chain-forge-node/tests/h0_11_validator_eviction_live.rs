@@ -50,19 +50,14 @@
 //! no real personhood verification, so every validator gets equal weight):
 //!   n=3 remaining → quorum = floor(3 × 2/3) + 1 = 3 → all 3 must sign.
 //!
-//! Actually: the engine computes quorum from total bonded power.  Because
-//! liveness jails Dave but does NOT remove him from the validator registry
-//! (he is `Jailed`, not `Tombstoned`), his registered power is still counted
-//! in total_power.  In Phase 0, all validators share equal power from genesis
-//! bonds.  With Dave jailed:
-//!   total_power = 4 units (still includes Dave's registered power)
-//!   quorum      = floor(4 × 2/3) + 1 = 3
+//! Owner decision 2026-11-01: a jailed validator **loses its voting power**
+//! from the block after the jailing block (and only an explicit unjail
+//! transaction, not yet built, can restore it). With Dave jailed:
+//!   total_power = 3 (Alice + Bob + Carol)
+//!   quorum      = floor(3 × 2/3) + 1 = 3
 //!   signing     = Alice + Bob + Carol = 3 → exactly quorum ✓
-//!
-//! Note: if the chain uses stake-computed power (BondValidator phase), the
-//! numbers change; the genesis file here keeps the Phase 0 equal-weight model
-//! (no BondValidator txs in the test).  Three validators are always enough to
-//! commit a block.
+//! `GET /api/validators` lists Dave with voting power 0, which is what E-02
+//! checks.
 //!
 //! ## Run
 //!

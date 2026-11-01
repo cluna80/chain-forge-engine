@@ -4830,12 +4830,48 @@ impl Node {
         if let Some(lc) = &participation {
             self.check_liveness_after_commit(lc, &proposal.proposer.0);
         }
+        // H0-11: a jailed (or tombstoned) validator has no voting power from
+        // the next block on. Applied after every rebuild in this commit
+        // (epoch boundary, admission, liveness), so none can give it back.
+        self.zero_power_of_jailed_validators();
 
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
         self.persist_state();
 
         Ok(())
+    }
+
+    /// H0-11 (owner, 2026-11-01): set the voting power of every Jailed or
+    /// Tombstoned validator in the live consensus set to 0, effective from
+    /// the next block, and refresh `/api/validators` to match. Deterministic:
+    /// it reads only the registry, which every node updates identically at
+    /// commit. Power returns only through an explicit unjail (not yet built).
+    fn zero_power_of_jailed_validators(&mut self) {
+        use chain_forge_validators::ValidatorStatus;
+        let mut vs = self.consensus.validator_set().clone();
+        let mut changed = false;
+        for v in &mut vs.validators {
+            let out = self.validator_registry.get(&v.id.0)
+                .map(|r| matches!(r.status, ValidatorStatus::Jailed | ValidatorStatus::Tombstoned))
+                .unwrap_or(false);
+            if out && v.voting_power > 0 {
+                info!(validator = %v.id.0, "jailed validator: voting power set to 0 from the next block");
+                v.voting_power = 0;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        let _ = self.consensus.update_validator_set(vs);
+        let live = self.consensus.validator_set();
+        self.explorer.lock().unwrap().validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
+            id:           v.id.0.clone(),
+            voting_power: v.voting_power,
+            pop_verified: v.pop_verified,
+            consensus_pubkey: hex::encode(&v.public_key),
+        }).collect();
     }
 
     /// Verify a `CommitCertificate` against the validator set that was
@@ -6074,7 +6110,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
@@ -6637,6 +6673,24 @@ mod tests {
             let dave = obs.validator_registry.get("qcb1dave").unwrap();
             assert_eq!(dave.status, chain_forge_validators::ValidatorStatus::Jailed);
             assert_eq!(dave.bonded_uqcb, bonded, "jailed for liveness, stake intact");
+        }
+
+        /// H0-11 (owner, 2026-11-01): a validator jailed for liveness loses its
+        /// consensus voting power from the block after the jailing block, and
+        /// no epoch-boundary rebuild gives it back (only an explicit unjail
+        /// may). Before this, jail was a registry flag only: a jailed
+        /// validator kept full voting power.
+        #[tokio::test]
+        async fn jailed_validator_has_no_voting_power_even_across_epochs() {
+            let obs = observer_after(600, |_| true).await;
+            assert_eq!(obs.validator_registry.get("qcb1dave").unwrap().status,
+                chain_forge_validators::ValidatorStatus::Jailed);
+            let power = |id: &str| obs.consensus.validator_set().validators.iter()
+                .find(|v| v.id.0 == id).map(|v| v.voting_power).unwrap_or(0);
+            assert_eq!(power("qcb1dave"), 0, "a jailed validator must not vote");
+            for v in ["qcb1alice", "qcb1bob", "qcb1carol"] {
+                assert!(power(v) > 0, "{v} must keep its voting power");
+            }
         }
 
         /// H0-1 fail-stop: a block that reached quorum elsewhere (partition
@@ -9374,7 +9428,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 5, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": true },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": true, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "cs001-p7-net", "p2p_port": 27100, "rpc_port": 27101, "bootstrap_nodes": [], "peer_discovery": "bootstrap", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
@@ -9762,7 +9816,14 @@ mod tests {
         // all five P7 genesis validators already have classical keys bound.
         // "qcb1pquser" is funded here so it can pay gas for the ML-DSA txs.
         let eda    = p7_eda_tx("eda-p7-mldsa", "qcb1alice", 0, 10, &alice_kp);
-        let fund   = p7_signed_transfer("fund-pquser", "qcb1alice", "qcb1pquser", 500_000, 1, &alice_kp);
+        // First use of an ML-DSA key must come from the address it derives
+        // (account-ownership rule), so fund that address.
+        let pquser_kp = MlDsaScheme.generate_keypair("qcb1pquser-p7-mldsa")
+            .expect("ML-DSA keygen for qcb1pquser");
+        let pquser = chain_forge_core::Address::from_public_key_schemed(
+            &pquser_kp.public_key, "qcb", HashWidth::Bits256, chain_forge_core::AddressScheme::PostQuantum,
+        ).as_str().to_string();
+        let fund   = p7_signed_transfer("fund-pquser", "qcb1alice", &pquser, 500_000, 1, &alice_kp);
         node.submit_tx(eda);
         node.submit_tx(fund);
         let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
@@ -9784,12 +9845,9 @@ mod tests {
         // now-bound key.  We therefore generate once and pass the same keypair
         // to both p7_mldsa_transfer_with_kp calls.
         use chain_forge_crypto::MlDsaScheme;
-        let pquser_kp = MlDsaScheme.generate_keypair("qcb1pquser-p7-mldsa")
-            .expect("ML-DSA keygen for qcb1pquser");
-
         // ── Accepted during grace window (epoch 55 ≤ cutoff 59) ──────────────
         node.identity.clock.current_epoch = 55;
-        let mldsa_tx = p7_mldsa_transfer_with_kp("mldsa-grace", "qcb1pquser", 0, &pquser_kp);
+        let mldsa_tx = p7_mldsa_transfer_with_kp("mldsa-grace", &pquser, 0, &pquser_kp);
         let r = node.executor.execute_tx_with_identity(
             &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
@@ -9803,7 +9861,7 @@ mod tests {
         // A second ML-DSA tx from the same account (same keypair, nonce 1) must
         // still succeed even after the classical Ed25519 hard cutoff.
         node.identity.clock.current_epoch = 61;
-        let mldsa_tx2 = p7_mldsa_transfer_with_kp("mldsa-post-cutoff", "qcb1pquser", 1, &pquser_kp);
+        let mldsa_tx2 = p7_mldsa_transfer_with_kp("mldsa-post-cutoff", &pquser, 1, &pquser_kp);
         let r2 = node.executor.execute_tx_with_identity(
             &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
@@ -12611,7 +12669,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
