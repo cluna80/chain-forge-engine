@@ -37,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
+use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
 use chain_forge_execution::{
     Transaction, TxBody, GuardianAuth,
     account_key_rotation_signing_bytes,
@@ -53,6 +53,49 @@ const SEED_PILOT: &str = "dis003d-pilot-device-seed-000000000000000000000000001"
 const SEED_G1:    &str = "dis003d-guardian-1-seed-000000000000000000000000000010";
 const SEED_G2:    &str = "dis003d-guardian-2-seed-000000000000000000000000000020";
 const SEED_G3:    &str = "dis003d-guardian-3-seed-000000000000000000000000000030";
+
+// Seed → fixture file stem mapping (stored in tests/devnet/keys/).
+// ML-DSA keygen in pqcrypto-dilithium is randomised per process; the fixture
+// files pin each seed to a specific keypair so the genesis public key and the
+// signing key in the test always match across processes.
+const SEED_FIXTURE_NAMES: &[(&str, &str)] = &[
+    (SEED_PILOT, "dis003d-pilot"),
+    (SEED_G1,    "dis003d-guardian1"),
+    (SEED_G2,    "dis003d-guardian2"),
+    (SEED_G3,    "dis003d-guardian3"),
+];
+
+/// Load a pinned keypair from `tests/devnet/keys/<name>.key.json`.
+/// Falls back to `generate_keypair(seed)` (in-process cache) if no fixture file exists.
+fn load_fixture_keypair(seed: &str) -> KeyPair {
+    if let Some(&(_, name)) = SEED_FIXTURE_NAMES.iter().find(|(s, _)| *s == seed) {
+        let path = manifest_dir()
+            .join("tests")
+            .join("devnet")
+            .join("keys")
+            .join(format!("{name}.key.json"));
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let pk_hex = obj["public_key"].as_str().unwrap_or("");
+                let sk_hex = obj["private_key"].as_str().unwrap_or("");
+                fn from_hex(h: &str) -> Vec<u8> {
+                    (0..h.len()).step_by(2)
+                        .map(|i| u8::from_str_radix(&h[i..i+2], 16).unwrap_or(0))
+                        .collect()
+                }
+                let pk = from_hex(pk_hex);
+                let sk = from_hex(sk_hex);
+                if pk.len() == 1952 && sk.len() == 3904 {
+                    return KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk };
+                }
+            }
+        }
+    }
+    // Fallback: in-process cached keygen (key matches genesis only if genesis was
+    // also generated in this same process — only safe for integration tests that
+    // embed the genesis public key inline).
+    MlDsaScheme.generate_keypair(seed).expect("keygen fallback")
+}
 
 // ── Port helpers ──────────────────────────────────────────────────────────────
 
@@ -281,7 +324,7 @@ fn current_height(port: u16) -> u64 {
 
 fn ml_dsa_tx(seed: &str, sender: &str, nonce: u64, body: TxBody,
              tx_id: &str, gas: u64) -> Transaction {
-    let kp        = MlDsaScheme.generate_keypair(seed).expect("keygen");
+    let kp        = load_fixture_keypair(seed);
     let body_json = serde_json::to_string(&body).expect("body serialise");
     let msg       = mldsa_tx_prehash(CHAIN_ID, body_json.as_bytes());
     let sig       = MlDsaScheme.sign(&msg, &kp).expect("sign");
@@ -317,14 +360,14 @@ fn build_recover(
     assert_eq!(guardian_seeds.len(), expires_per_guardian.len(),
         "guardian_seeds and expires_per_guardian must have equal length");
 
-    let new_kp  = MlDsaScheme.generate_keypair(new_seed).expect("new keygen");
+    let new_kp  = load_fixture_keypair(new_seed);
     let pop_msg = account_key_rotation_signing_bytes(CHAIN_ID, sender, key_version, &new_kp.public_key);
     let pop_sig = MlDsaScheme.sign(&pop_msg, &new_kp).expect("PoP sign");
 
     let guardian_signatures: Vec<GuardianAuth> = guardian_seeds.iter()
         .zip(expires_per_guardian.iter())
         .map(|(&gs, &exp)| {
-            let gkp     = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
+            let gkp     = load_fixture_keypair(gs);
             let rec_msg = recovery_domain_signing_bytes(
                 CHAIN_ID, sender, key_version, &new_kp.public_key, policy_id, exp,
             );
@@ -336,7 +379,7 @@ fn build_recover(
             }
         }).collect();
 
-    let kp_sender = MlDsaScheme.generate_keypair(SEED_PILOT).expect("sender keygen");
+    let kp_sender = load_fixture_keypair(SEED_PILOT);
     let body      = TxBody::RecoverAccountKey {
         new_public_key:      new_kp.public_key.clone(),
         new_key_scheme:      "ml-dsa-65".to_string(),
@@ -373,12 +416,12 @@ fn build_recover_tampered_expiry(
     policy_id:        u64,
     tx_id:            &str,
 ) -> Transaction {
-    let new_kp  = MlDsaScheme.generate_keypair(new_seed).expect("new keygen");
+    let new_kp  = load_fixture_keypair(new_seed);
     let pop_msg = account_key_rotation_signing_bytes(CHAIN_ID, sender, key_version, &new_kp.public_key);
     let pop_sig = MlDsaScheme.sign(&pop_msg, &new_kp).expect("PoP sign");
 
     let guardian_signatures: Vec<GuardianAuth> = guardian_seeds.iter().map(|&gs| {
-        let gkp     = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
+        let gkp     = load_fixture_keypair(gs);
         // Sign over `signed_expiry` but present `presented_expiry` in the field.
         let rec_msg = recovery_domain_signing_bytes(
             CHAIN_ID, sender, key_version, &new_kp.public_key, policy_id, signed_expiry,
@@ -391,7 +434,7 @@ fn build_recover_tampered_expiry(
         }
     }).collect();
 
-    let kp_sender = MlDsaScheme.generate_keypair(SEED_PILOT).expect("sender keygen");
+    let kp_sender = load_fixture_keypair(SEED_PILOT);
     let body      = TxBody::RecoverAccountKey {
         new_public_key:      new_kp.public_key.clone(),
         new_key_scheme:      "ml-dsa-65".to_string(),
@@ -450,9 +493,9 @@ fn dis_003d_expiry_live() {
     println!("✓ F-00 passed (413 for {} bytes)", max_tx_bytes + 1);
 
     // ── Derive guardian public keys ───────────────────────────────────────────
-    let g1_pk = MlDsaScheme.generate_keypair(SEED_G1).expect("g1").public_key;
-    let g2_pk = MlDsaScheme.generate_keypair(SEED_G2).expect("g2").public_key;
-    let g3_pk = MlDsaScheme.generate_keypair(SEED_G3).expect("g3").public_key;
+    let g1_pk = load_fixture_keypair(SEED_G1).public_key;
+    let g2_pk = load_fixture_keypair(SEED_G2).public_key;
+    let g3_pk = load_fixture_keypair(SEED_G3).public_key;
 
     // ── Enroll a 2-of-3 recovery policy ──────────────────────────────────────
     let nonce0 = current_nonce(port, PILOT_ADDR);
