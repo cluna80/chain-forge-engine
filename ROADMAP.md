@@ -58,7 +58,7 @@ Protocol first; applications (PoCD, marketplace, research apps) come after the p
 
 | # | Track | Required completion gate | Status |
 |---|-------|--------------------------|--------|
-| BIZ-PRE-1 | **Phase 0.5 — Protocol Hardening** | H0-5 Windows-confirmed (H5-1–H5-5, 2026-10-31); H0-7 supply-conservation acceptance still required | 🔲 Pending H0-7 |
+| BIZ-PRE-1 | **Phase 0.5 — Protocol Hardening** | H0-5 execution rollback (H5-1–H5-5) and H0-7 supply conservation (S-01–S-06) Windows-confirmed on BossKing/MINGW64, 2026-10-31; implementation integration/merge tracked separately | ✅ Windows-confirmed 2026-10-31 |
 | BIZ-PRE-2 | **DIS — Account Security and Recovery** | DIS-003D and DIS-003E confirmed locally on Windows/MINGW64 | 🔲 |
 | BIZ-PRE-3 | **DIS Standalone Product** | Independent cryptographic review gate passed (currently marked ⚠️ return before production on DIS-CORE-001, DIS-PQ-001, DIS-PRIV-001) | 🔲 |
 | BIZ-PRE-4 | **FeeSponsor** | FS-03 live authorization complete (SponsorAuthorization wired into execution path) | 🔲 |
@@ -150,7 +150,7 @@ Hardening the foundation before adding features. Each item is a draft PR, unmerg
 | Item | PR / branch | Status |
 |---|---|---|
 | Attestation quorum hardening (genesis-configurable) | #14 | 🔄 open |
-| H0-5/H0-7 execution atomicity + fee conservation | #15 | 🔄 open |
+| H0-5/H0-7 execution atomicity + fee conservation | #15 | ✅ H0-5 (H5-1–H5-5, 66.83 s) and H0-7 (S-01–S-06, 83.69 s, `7581d47`) Windows-confirmed 2026-10-31; PR #15 merge status remains open/pending |
 | MN-7 rewrite (verified outcomes); MN-8 removed pending rewards | #16 | 🔄 open; needs a genuine second Windows `fee_settle_live` run |
 | H0-1/H0-2 deterministic participation (committed `last_commit`), state-root binding, liveness jails without burning, Byzantine-robust miss counting, genesis liveness policy, HotStuff/FBA restart height | #17 | ✅ Windows-confirmed; awaiting merge |
 | **Consensus safety**: full Tendermint prevote/precommit/lock/unlock; persisted double-sign guard; block-hash verification and agreement | #18 | ✅ Windows-confirmed (consensus 91/91, node 231/231, devnet, restart, `consensus_safety_live` 3/3); awaiting merge |
@@ -412,7 +412,7 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 | H0-4 | Nonce / replay | Nonce wrap-around and duplicate txs across blocks are rejected with zero partial state change | 🔲 |
 | H0-5 | Execution rollback | BossKing/MINGW64 `h0_5_atomicity_live` H5-1–H5-5 PASS (2026-10-31, 66.83 s): failed tx charged fee and consumed nonce without other state change; spent-nonce replay charged nothing; future-nonce tx changed nothing; four nodes agreed on block hashes 1–7 and `root@7=ef5bb34e…`; crash/restart preserved hashes, root, nonce, balance, and resumed chain. Explicit out-of-gas case not established by this run. | ✅ Windows-confirmed 2026-10-31 — H5-1–H5-5 PASS; out-of-gas coverage to verify |
 | H0-6 | Key binding race | Two txs in the same block cannot both successfully bind a key to the same account | 🔲 |
-| H0-7 | Supply invariant | No tx sequence increases total uQCB supply; `treasury + burn + validator_rewards = fees_collected` per block, verified end-to-end | 🔲 |
+| H0-7 | Supply invariant | `h0_7_supply_conservation_live` S-01–S-06 PASS on BossKing/MINGW64 (2026-10-31, 83.69 s; commit `7581d47`): fee conservation, authorized PoCD issuance, explicit burns, combined accounting, four-node convergence/restart, and invalid-accounting rejection. Four-node `root@13=c6b5d405…`; final supply 2,029,849,968 uqcb, 150,032 uqcb below genesis from authorized burns. Supply rule: `S_after = S_before + authorized_issuance - authorized_burn`. | ✅ Windows-confirmed 2026-10-31 — S-01–S-06 PASS |
 | H0-8 | Genesis-hash peer verification + cross-chain replay protection | A peer must prove matching genesis hash (not just chain_id) to be trusted; a tx signed on chain A is rejected on chain B | ✅ G-01…G-07 passing on Windows (BossKing, MINGW64, 2026-10-31, `616bf0e`) |
 | H0-9 | DIS-003D harness fix | `dis_003d_expiry_live` F-00–F-08 passes on BossKing/Windows (2026-10-31). Root cause: ML-DSA `generate_keypair(seed)` is not deterministic across OS processes; test harness now uses 11 committed fixture keypairs (4 genesis-bound + 7 rotation; pk 1,952 B, sk 4,032 B) with fail-closed hard-panic loader and no random fallback. Fixtures are test-only. | ✅ Windows-confirmed 2026-10-31 — F-00–F-08 PASS |
 | H0-10 | DIS-003E completion | `dis_003e_timelock_live` C-14–C-19 PASS on BossKing/MINGW64 (2026-10-31, 55.78 s): pending recovery preserves old key; cancellation prevents activation; unchallenged recovery activates at timelock; cancelled recovery never reactivates; policy reenrollment cancels pending recovery; four-node state roots agree (`80d56a7c…`). Implementation branch: `security/h0-10-recovery-timelock` (PR pending). | ✅ Windows-confirmed 2026-10-31 — awaiting PR/merge |
