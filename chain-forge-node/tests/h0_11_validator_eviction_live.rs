@@ -169,6 +169,12 @@ fn genesis_path() -> PathBuf {
         .join("genesis-h0-11-eviction.json")
 }
 
+fn key_path(short_name: &str) -> PathBuf {
+    manifest_dir()
+        .join("tests").join("devnet").join("keys")
+        .join(format!("{short_name}.key.json"))
+}
+
 fn devnet_dirs() -> PathBuf {
     std::env::temp_dir().join("h0_11_eviction_devnet")
 }
@@ -259,6 +265,10 @@ fn spawn_node(
     let data_dir = dirs.join(label);
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
+    // Key file: short name is the part after "qcb1" (e.g. "alice").
+    let short_name = validator_id.strip_prefix("qcb1").unwrap_or(validator_id);
+    let kf = key_path(short_name);
+
     // Log both stdout and stderr to a file (tracing goes to stdout).
     // stdin is null — without this the node inherits the test's stdin pipe
     // which can cause it to block on Windows.
@@ -271,6 +281,7 @@ fn spawn_node(
     let mut cmd = Command::new(node_bin());
     cmd.arg("--genesis").arg(genesis_path())
        .arg("--validator").arg(validator_id)
+       .arg("--key-file").arg(&kf)
        .arg("--api-port").arg(api_port.to_string())
        .arg("--p2p-port").arg(p2p_port.to_string())
        .arg("--data-dir").arg(&data_dir)
