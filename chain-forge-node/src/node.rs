@@ -299,6 +299,10 @@ pub struct AccountSummary {
     /// auto-cancels it.  `cancelled: true` means the window closed without activation.
     #[serde(default)]
     pub pending_recovery: Option<chain_forge_state::PendingRecovery>,
+    /// DIS-002A/B/003E: hex-encoded current account public key, or empty string if unbound.
+    /// Updated by RotateAccountKey and by the sweep_pending_recoveries activation sweep.
+    #[serde(default)]
+    pub public_key: String,
 }
 
 /// Voting-power snapshot for one validator.
@@ -1461,6 +1465,7 @@ impl Node {
                     key_version:    acct.key_version,
                     policy_generation: acct.policy_generation,
                     pending_recovery: acct.pending_recovery.clone(),
+                    public_key: acct.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
         }
@@ -2247,6 +2252,7 @@ impl Node {
                         key_version:    a.key_version,
                     policy_generation: a.policy_generation,
                         pending_recovery: a.pending_recovery.clone(),
+                        public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                     });
                 }
 
@@ -4747,6 +4753,7 @@ impl Node {
                     key_version:    a.key_version,
                     policy_generation: a.policy_generation,
                     pending_recovery: a.pending_recovery.clone(),
+                    public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
 
@@ -5995,6 +6002,7 @@ impl Node {
                     key_version:    a.key_version,
                     policy_generation: a.policy_generation,
                     pending_recovery: a.pending_recovery.clone(),
+                    public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
 
