@@ -75,7 +75,7 @@
 //! developer's local machine (Windows/MINGW64).
 
 use std::{
-    net::TcpListener,
+    net::TcpStream,
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -105,36 +105,41 @@ const CONTINUE_THROUGH_HEIGHT: u64 = 35;
 const POLL_MS: u64 = 400;
 
 /// Overall test timeout.
-const TIMEOUT_SECS: u64 = 180;
+const TIMEOUT_SECS: u64 = 240;
 
-// ── Port helpers ──────────────────────────────────────────────────────────────
+// ── Fixed ports ───────────────────────────────────────────────────────────────
+//
+// Fixed ports prevent the Windows port-reuse race that occurs when free_port()
+// releases its TcpListener and the OS reallocates the port before the node
+// process binds it.  These ranges are chosen to avoid conflicts with other
+// live tests:
+//   fee_settle   → 18500..18519 / 27100..27119
+//   h0_5         → 18280..18299 / 27200..27219
+//   h0_7         → 18560..18579 / 27500..27519
+//   consensus    → 18480..18499 / 27400..27419
+//   h0_11 (this) → 18620..18629 / 27600..27609
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("free_port: bind failed")
-        .local_addr()
-        .expect("free_port: local_addr")
-        .port()
+const ALICE_API: u16 = 18620;
+const ALICE_P2P: u16 = 27600;
+const BOB_API:   u16 = 18621;
+const BOB_P2P:   u16 = 27601;
+const CAROL_API: u16 = 18622;
+const CAROL_P2P: u16 = 27602;
+const DAVE_API:  u16 = 18623;
+const DAVE_P2P:  u16 = 27603;
+
+fn port_is_free(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_millis(200),
+    ).is_err()
 }
 
-struct Ports {
-    alice: u16, alice_p2p: u16,
-    bob:   u16, bob_p2p:   u16,
-    carol: u16, carol_p2p: u16,
-    dave:  u16, dave_p2p:  u16,
-}
+struct Ports;
 
 impl Ports {
-    fn new() -> Self {
-        Self {
-            alice: free_port(), alice_p2p: free_port(),
-            bob:   free_port(), bob_p2p:   free_port(),
-            carol: free_port(), carol_p2p: free_port(),
-            dave:  free_port(), dave_p2p:  free_port(),
-        }
-    }
     /// API ports for the three surviving nodes (alice, bob, carol).
-    fn surviving(&self) -> [u16; 3] { [self.alice, self.bob, self.carol] }
+    fn surviving(&self) -> [u16; 3] { [ALICE_API, BOB_API, CAROL_API] }
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -254,6 +259,11 @@ fn spawn_node(
     let data_dir = dirs.join(label);
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
+    // Log stderr to a file so failures are diagnosable.
+    let log_path = dirs.join(format!("{label}.log"));
+    let log_file = std::fs::File::create(&log_path)
+        .unwrap_or_else(|e| panic!("open log {}: {e}", log_path.display()));
+
     let mut cmd = Command::new(node_bin());
     cmd.arg("--genesis").arg(genesis_path())
        .arg("--validator-id").arg(validator_id)
@@ -261,7 +271,7 @@ fn spawn_node(
        .arg("--p2p-port").arg(p2p_port.to_string())
        .arg("--data-dir").arg(&data_dir)
        .stdout(Stdio::null())
-       .stderr(Stdio::null());
+       .stderr(log_file);
     if let Some(bs) = bootstrap {
         cmd.arg("--bootstrap").arg(bs);
     }
@@ -284,49 +294,62 @@ fn wait_api_ready(port: u16, deadline: Instant) {
 /// preserved after a genesis validator is jailed.
 #[test]
 fn validator_eviction_genesis_no_exemption() {
+    // ── Pre-flight port check ─────────────────────────────────────────────────
+    for (name, port) in [
+        ("alice-api", ALICE_API), ("alice-p2p", ALICE_P2P),
+        ("bob-api",   BOB_API),   ("bob-p2p",   BOB_P2P),
+        ("carol-api", CAROL_API), ("carol-p2p", CAROL_P2P),
+        ("dave-api",  DAVE_API),  ("dave-p2p",  DAVE_P2P),
+    ] {
+        assert!(port_is_free(port),
+            "port {port} ({name}) is already in use — kill stray h0_11 processes first");
+    }
+
     let deadline = Instant::now() + Duration::from_secs(TIMEOUT_SECS);
-    let ports    = Ports::new();
+    let ports    = Ports;
     let dirs     = devnet_dirs();
     let _ = std::fs::remove_dir_all(&dirs);
     std::fs::create_dir_all(&dirs).unwrap();
 
     // ── Spawn Alice first (bootstrap) ─────────────────────────────────────────
     let mut alice = spawn_node(
-        "alice", ALICE_ADDR, ports.alice, ports.alice_p2p, None, &dirs,
+        "alice", ALICE_ADDR, ALICE_API, ALICE_P2P, None, &dirs,
     );
-    wait_api_ready(ports.alice, deadline);
-    let alice_peer_id = http_get(ports.alice, "/api/node-info")
+    wait_api_ready(ALICE_API, deadline);
+    let alice_peer_id = http_get(ALICE_API, "/api/node-info")
         .and_then(|v| v["peer_id"].as_str().map(|s| s.to_string()))
         .expect("E-01: alice peer_id");
     let bootstrap_addr = format!(
-        "/ip4/127.0.0.1/tcp/{}/p2p/{}", ports.alice_p2p, alice_peer_id
+        "/ip4/127.0.0.1/tcp/{ALICE_P2P}/p2p/{alice_peer_id}"
     );
 
     // ── Spawn Bob, Carol, Dave ────────────────────────────────────────────────
     let mut bob = spawn_node(
-        "bob", "qcb1bob", ports.bob, ports.bob_p2p, Some(&bootstrap_addr), &dirs,
+        "bob", "qcb1bob", BOB_API, BOB_P2P, Some(&bootstrap_addr), &dirs,
     );
     let mut carol = spawn_node(
-        "carol", "qcb1carol", ports.carol, ports.carol_p2p, Some(&bootstrap_addr), &dirs,
+        "carol", "qcb1carol", CAROL_API, CAROL_P2P, Some(&bootstrap_addr), &dirs,
     );
     let mut dave = spawn_node(
-        "dave", DAVE_ADDR, ports.dave, ports.dave_p2p, Some(&bootstrap_addr), &dirs,
+        "dave", DAVE_ADDR, DAVE_API, DAVE_P2P, Some(&bootstrap_addr), &dirs,
     );
 
     // ── Wait for all four to start and reach height 3 (liveness start) ───────
-    for &p in &[ports.bob, ports.carol, ports.dave] {
-        wait_api_ready(p, deadline);
+    for (name, port) in [("bob", BOB_API), ("carol", CAROL_API), ("dave", DAVE_API)] {
+        println!("[startup] waiting for {name} API on port {port}…");
+        wait_api_ready(port, deadline);
+        println!("[startup] {name} ready.");
     }
     println!("[E-01] All four nodes ready. Waiting for height {} (liveness start)…",
              DAVE_KILL_HEIGHT - 1);
     wait_for_height(
-        &[ports.alice, ports.bob, ports.carol, ports.dave],
+        &[ALICE_API, BOB_API, CAROL_API, DAVE_API],
         DAVE_KILL_HEIGHT - 1,
         deadline,
     );
 
     // E-01 check: Dave is in the active set before being killed.
-    let active_before = active_validator_ids(ports.alice);
+    let active_before = active_validator_ids(ALICE_API);
     println!("[E-01] Active validators at height {}: {:?}", DAVE_KILL_HEIGHT - 1, active_before);
     assert!(
         active_before.iter().any(|id| id == DAVE_ADDR),
@@ -335,7 +358,7 @@ fn validator_eviction_genesis_no_exemption() {
     println!("[E-01] PASS — Dave is Active before kill, no false jailing during network formation.");
 
     // Dave's genesis balance before kill (baseline for E-04).
-    let dave_balance_before = balance_of(ports.alice, DAVE_ADDR);
+    let dave_balance_before = balance_of(ALICE_API, DAVE_ADDR);
     println!("[E-04 baseline] Dave balance = {} uqcb", dave_balance_before);
     assert!(
         dave_balance_before > 0,
@@ -345,11 +368,11 @@ fn validator_eviction_genesis_no_exemption() {
     // ── E-02: Kill Dave at height DAVE_KILL_HEIGHT ────────────────────────────
     // Wait for the surviving nodes to reach the kill height so Dave has
     // already contributed to those blocks (avoiding false credit).
-    wait_for_height(&[ports.alice, ports.bob, ports.carol], DAVE_KILL_HEIGHT, deadline);
+    wait_for_height(&[ALICE_API, BOB_API, CAROL_API], DAVE_KILL_HEIGHT, deadline);
     println!("[E-02] Killing Dave's node at height {}…", DAVE_KILL_HEIGHT);
     dave.kill().expect("kill dave");
     let _ = dave.wait();
-    wait_port_down(ports.dave, deadline);
+    wait_port_down(DAVE_API, deadline);
     println!("[E-02] Dave's node is down.");
 
     // ── E-02: Wait for Dave to be jailed (absent from /api/validators) ───────
@@ -358,12 +381,12 @@ fn validator_eviction_genesis_no_exemption() {
     loop {
         assert!(Instant::now() < deadline,
             "E-02 FAIL: Dave was not jailed by height {}", JAIL_OBSERVED_BY_HEIGHT);
-        let h = height_of(ports.alice);
+        let h = height_of(ALICE_API);
         assert!(
             h <= JAIL_OBSERVED_BY_HEIGHT,
             "E-02 FAIL: reached height {} without Dave being jailed", h
         );
-        let active = active_validator_ids(ports.alice);
+        let active = active_validator_ids(ALICE_API);
         if !active.iter().any(|id| id == DAVE_ADDR) {
             dave_jailed_height = h;
             println!("[E-02] PASS — Dave absent from active set at height {}. Active: {:?}",
@@ -386,17 +409,16 @@ fn validator_eviction_genesis_no_exemption() {
     );
 
     // E-03 supplemental: confirm Dave's API is still unreachable (still down).
-    use std::net::TcpStream;
     assert!(
         TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", ports.dave).parse().unwrap(),
+            &format!("127.0.0.1:{DAVE_API}").parse().unwrap(),
             Duration::from_millis(300),
         ).is_err(),
         "E-03: Dave's API port came back up unexpectedly"
     );
 
     // ── E-04: Dave's stake balance is unchanged ───────────────────────────────
-    let dave_balance_after = balance_of(ports.alice, DAVE_ADDR);
+    let dave_balance_after = balance_of(ALICE_API, DAVE_ADDR);
     println!("[E-04] Dave balance after jailing = {} uqcb (was {})",
              dave_balance_after, dave_balance_before);
     assert_eq!(
