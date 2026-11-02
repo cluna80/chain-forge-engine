@@ -2023,6 +2023,36 @@ mod tests {
         assert!(err.contains("validator_epoch_blocks"), "{err}");
     }
 
+    // ── compute_genesis_hash: the single definition (H0-8), now also used by the
+    //    persistence manifest (H0-3b). These pin the properties persistence relies on.
+
+    #[test]
+    fn compute_genesis_hash_ignores_file_formatting_and_key_order() {
+        let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let pretty = cfg.to_json_pretty().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        let mut entries: Vec<_> = v.as_object().unwrap().iter().collect();
+        entries.reverse();
+        let reordered = format!("{{{}}}", entries.iter()
+            .map(|(k, val)| format!("\"{k}\":{val}")).collect::<Vec<_>>().join(","));
+        assert_ne!(pretty, reordered);
+        let a = GenesisConfig::from_json(&pretty).unwrap();
+        let b = GenesisConfig::from_json(&reordered).unwrap();
+        assert_eq!(compute_genesis_hash(&a), compute_genesis_hash(&b));
+        assert_eq!(compute_genesis_hash(&a), compute_genesis_hash(&cfg));
+    }
+
+    #[test]
+    fn compute_genesis_hash_changes_when_a_field_changes_and_is_64_lowercase_hex() {
+        let a = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let mut b = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        b.genesis_time = format!("{}-changed", b.genesis_time);
+        assert_ne!(compute_genesis_hash(&a), compute_genesis_hash(&b));
+        let hex = compute_genesis_hash(&a);
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    }
+
     #[test]
     fn genesis_hash_width_resolves() {
         let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
