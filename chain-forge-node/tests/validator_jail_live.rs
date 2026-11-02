@@ -241,6 +241,46 @@ fn agree(ports: &[u16], timeout: Duration) -> (u64, String) {
     panic!("nodes never reached the same height and state root within {timeout:?}; last views: {last}");
 }
 
+// ── Evidence helpers independent of the HTTP API ──────────────────────────────
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            while let Some(&n) = chars.peek() { chars.next(); if n == 'm' { break; } }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// (height, round) for every block the node's CURRENT log says it proposed.
+fn proposals_logged(log_dir: &PathBuf, name: &str) -> Vec<(u64, u32)> {
+    let text = std::fs::read_to_string(log_dir.join(format!("{name}.log"))).unwrap_or_default();
+    strip_ansi(&text).lines()
+        .filter(|l| l.contains("block proposed (multi-node)"))
+        .filter_map(|l| {
+            let num = |key: &str| l.split(key).nth(1)
+                .map(|r| r.chars().take_while(char::is_ascii_digit).collect::<String>());
+            Some((num("height=")?.parse().ok()?, num("round=")?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The committee the node itself wrote to disk after its last commit.
+fn persisted_committee(log_dir: &PathBuf, name: &str) -> Vec<String> {
+    let p = log_dir.join(format!("data-{}", name.trim_start_matches("qcb1")))
+        .join("persist").join("live_validator_set.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("cannot read {p:?}: {e}"))).unwrap();
+    let mut ids: Vec<String> = v["validators"].as_array().unwrap().iter()
+        .map(|x| x["id"].as_str().unwrap().to_string()).collect();
+    ids.sort();
+    ids
+}
+
 // ── Tx builders ───────────────────────────────────────────────────────────────
 
 fn bond_tx(sender: &str, nonce_val: u64, amount: u64) -> Transaction {
@@ -446,7 +486,33 @@ fn validator_jail_live() {
     assert!(wait_until(Duration::from_secs(120), || height(alice) >= h_down + 6),
             "JL-08: chain did not resume after bob returned");
     let (h8, _) = agree(&api, Duration::from_secs(90));
-    say(format!("✓ JL-08: bob restarted; jail record and committee preserved; chain resumed (height {h8})"));
+
+    // Four independent views of the committee must agree after the restart:
+    //  1. GET /api/validators          (asserted above, on bob)
+    //  2. the file bob persisted        (below)
+    //  3. GET /api/validators/status    (Dave Jailed, asserted above)
+    //  4. the consensus ENGINE itself: who it lets propose which (height, round).
+    let three = ["qcb1alice", "qcb1bob", "qcb1carol"];
+    assert!(wait_until(Duration::from_secs(120), || height(alice) >= h8 + 9), "JL-08: chain stalled after resuming");
+    assert_eq!(persisted_committee(&tmp, "qcb1bob"), three, "JL-08: bob's persisted committee");
+    for &p in &api { assert_eq!(committee(p), three, "JL-08: API committee on port {p}"); }
+    let mut engine_checked = std::collections::BTreeSet::new();
+    for n in LIVE_NODES {
+        for (h, r) in proposals_logged(&tmp, n) {
+            if h <= h_down + 1 { continue; }
+            let expected = three[((h + r as u64) % 3) as usize];
+            assert_eq!(n, expected,
+                "JL-08: {n} proposed height {h} round {r}, but a 3-seat engine assigns that to {expected} \
+                 (the engine still holds a different committee)");
+            engine_checked.insert(h);
+        }
+    }
+    assert!(engine_checked.len() >= 4,
+        "JL-08: only {} post-restart proposals in the logs; cannot infer the engine's committee",
+        engine_checked.len());
+    say(format!("✓ JL-08: bob restarted; engine rotation ({} proposals), persisted file, /api/validators and \
+        /api/validators/status all agree on the 3-seat committee with Dave Jailed; chain resumed (height {h8})",
+        engine_checked.len()));
 
     // ── JL-09: expiry is not reinstatement ───────────────────────────────────
     let expiry_height = (unjail_after + 2) * EPOCH_BLOCKS;
