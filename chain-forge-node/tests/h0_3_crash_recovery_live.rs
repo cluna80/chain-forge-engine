@@ -36,6 +36,8 @@ mod h0_3_crash_recovery_live {
         write_snapshot, load_snapshot, check_signing_compatibility,
     };
 
+    fn test_root() -> String { "cd".repeat(32) }
+
     fn test_identity() -> SnapshotIdentity {
         SnapshotIdentity { chain_id: "test-chain".into(), genesis_hash: "ab".repeat(32) }
     }
@@ -500,7 +502,7 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write a valid generation-based snapshot.
-        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity(), &test_root()).unwrap();
 
         // Corrupt state.json in the committed generation directory.
         let corrupt = b"{ \"height\": 999, \"accounts\": CORRUPT_NOT_JSON }";
@@ -526,7 +528,7 @@ mod h0_3_crash_recovery_live {
     #[test]
     fn c_03_truncated_state_json_refuses_start() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity(), &test_root()).unwrap();
 
         // Overwrite with a truncated prefix.
         let truncated = b"{ \"height\": 5, \"accounts\": {";
@@ -556,7 +558,7 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write a valid gen-000001 first so CURRENT exists.
-        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity(), &test_root()).unwrap();
 
         // Simulate a partial gen-000002: create the directory and write
         // state.json but never write identity.json or the manifest.
@@ -589,7 +591,7 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write a valid snapshot at height 10 then tamper with chain_store.
-        write_snapshot(dir.path(), 10, &valid_contents(10), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 10, &valid_contents(10), &test_identity(), &test_root()).unwrap();
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
 
         // Overwrite chain_store.json with height-9 data (mismatches manifest hash).
@@ -697,7 +699,7 @@ mod h0_3_crash_recovery_live {
 
         // Step 1: committed snapshot at height 10
         let contents = valid_contents(10);
-        let gen = write_snapshot(&data_dir, 10, &contents, &test_identity()).unwrap();
+        let gen = write_snapshot(&data_dir, 10, &contents, &test_identity(), &test_root()).unwrap();
         write_current(&data_dir, &gen).unwrap();
 
         // Step 2: write ahead-of-state guard to the authoritative path
@@ -1170,7 +1172,7 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write gen-000001 successfully.
-        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity(), &test_root()).unwrap();
 
         // Simulate a crash during gen-000002: create the directory and write
         // some files, but do NOT call write_snapshot (CURRENT stays at gen-000001).
@@ -1197,9 +1199,9 @@ mod h0_3_crash_recovery_live {
     fn c_09_generation_pruning_retains_n_minus_1() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        write_snapshot(dir.path(), 1, &valid_contents(1), &test_identity()).unwrap(); // gen-000001
-        write_snapshot(dir.path(), 2, &valid_contents(2), &test_identity()).unwrap(); // gen-000002
-        write_snapshot(dir.path(), 3, &valid_contents(3), &test_identity()).unwrap(); // gen-000003
+        write_snapshot(dir.path(), 1, &valid_contents(1), &test_identity(), &test_root()).unwrap(); // gen-000001
+        write_snapshot(dir.path(), 2, &valid_contents(2), &test_identity(), &test_root()).unwrap(); // gen-000002
+        write_snapshot(dir.path(), 3, &valid_contents(3), &test_identity(), &test_root()).unwrap(); // gen-000003
 
         // gen-000001 (N-2) must be gone.
         assert!(
@@ -1225,7 +1227,7 @@ mod h0_3_crash_recovery_live {
     #[test]
     fn c_10_manifest_hash_mismatch_is_detected() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_snapshot(dir.path(), 7, &valid_contents(7), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 7, &valid_contents(7), &test_identity(), &test_root()).unwrap();
 
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         // Overwrite agents.json with different content (same size to pass

@@ -776,6 +776,46 @@ mod tests {
         assert_eq!(s.get_raw("meta-new"), None);
     }
 
+    /// H0-3b gap 4 / KNOWN_ISSUES §13, scenario B. The loader now requires the
+    /// root rebuilt from a snapshot to equal the root the live node recorded.
+    /// §13 says a tree root can depend on deletion history, and
+    /// `rollback_checkpoint` is the only production deletion. So: drive real
+    /// rollbacks that remove accounts and metadata, interleaved with ordinary
+    /// writes, and ask whether a store restored from `export_snapshot()`
+    /// reproduces the live root after each round.
+    #[test]
+    fn restoring_a_snapshot_reproduces_the_live_root_after_rollbacks() {
+        let mut live = seeded();
+        let mut checked = 0;
+        for round in 0..12u32 {
+            // A failed transaction: creates an account and metadata, then rolls back.
+            live.begin_checkpoint();
+            live.transfer("qcb1a", &format!("qcb1tmp{round}"), "uqcb", 3).unwrap();
+            live.set_raw(&format!("tmp-meta-{round}"), "x");
+            live.get_account_mut("qcb1b").unwrap().credit("uqcb", 1);
+            live.refresh_leaf("qcb1b");
+            live.rollback_checkpoint();
+
+            // A successful one: keeps its writes.
+            live.begin_checkpoint();
+            live.transfer("qcb1a", &format!("qcb1keep{round}"), "uqcb", 2).unwrap();
+            live.set_raw(&format!("keep-meta-{round}"), "y");
+            live.commit_checkpoint();
+
+            let mut restored = StateStore::new(live.width);
+            restored.restore_snapshot(live.export_snapshot());
+            assert_eq!(
+                restored.current_root().map(str::to_string),
+                live.current_root().map(str::to_string),
+                "round {round}: a store restored from the live snapshot must reproduce the live root \
+                 (if this fails, KNOWN_ISSUES §13 is reachable through rollback_checkpoint and the \
+                 H0-3b restored-root check would refuse a node's own snapshot)"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 12);
+    }
+
     #[test]
     fn committed_checkpoint_keeps_writes_and_later_rollback_is_a_noop() {
         let mut s = seeded();

@@ -2174,7 +2174,7 @@ impl Node {
         push("live_validator_set.json",
              serde_json::to_string_pretty(self.consensus.validator_set()))?;
 
-        match crate::persistence::write_snapshot(dir, height, &contents, &self.snapshot_identity()) {
+        match crate::persistence::write_snapshot(dir, height, &contents, &self.snapshot_identity(), &self.live_state_root()) {
             Ok(gen) => { tracing::debug!(height, %gen, "state persisted (generation-based)"); Ok(()) }
             Err(e)  => Err(format!("persist_state: snapshot write failed at height {height}: {e}")),
         }
@@ -2185,6 +2185,12 @@ impl Node {
     /// snapshot written under another chain or genesis is caught by the loader.
     fn snapshot_identity(&self) -> crate::persistence::SnapshotIdentity {
         snapshot_identity_of(&self.genesis)
+    }
+
+    /// The live tree's root as recorded in a manifest: 64 hex, an empty tree is 64 zeros.
+    fn live_state_root(&self) -> String {
+        self.state.current_root().map(str::to_string)
+            .unwrap_or_else(|| crate::persistence::EMPTY_STATE_ROOT.to_string())
     }
 
     /// Rebuild `bond_owner_bindings` from persistent StateStore metadata.
@@ -2224,7 +2230,16 @@ impl Node {
         // ── 0. Pre-H0-3 (legacy) layout: migrate strictly, or refuse ─────────
         // A directory with the old persist/*.json files and no CURRENT is
         // committed state, not a fresh node. It must never start from genesis.
-        match crate::persistence::migrate_legacy(dir, &self.snapshot_identity()) {
+        let width = self.genesis.hash_width();
+        match crate::persistence::migrate_legacy(dir, &self.snapshot_identity(), |state_bytes| {
+            // The root the legacy state REBUILDS to, computed on a scratch store.
+            let snap: chain_forge_state::StateSnapshot = serde_json::from_slice(state_bytes)
+                .map_err(|e| format!("cannot parse legacy state.json: {e}"))?;
+            let mut scratch = chain_forge_state::StateStore::new(width.map_err(|e| e.to_string())?);
+            scratch.restore_snapshot(snap);
+            Ok(scratch.current_root().map(str::to_string)
+                .unwrap_or_else(|| crate::persistence::EMPTY_STATE_ROOT.to_string()))
+        }) {
             Ok(Some(gen)) => tracing::warn!(%gen,
                 "migrated a pre-H0-3 data directory to the generation layout; \
                  legacy files archived under persist/{}", crate::persistence::LEGACY_ARCHIVE_DIR),
@@ -2255,6 +2270,7 @@ impl Node {
 
         let height     = snap_contents.height;
         let generation = snap_contents.generation.clone();
+        let manifest_root = snap_contents.state_root.clone();
 
         // ── 2. Check signing-history compatibility ──────────────────────────
         // NOTE: the authoritative signing record lives in data_dir/persist/,
@@ -2336,6 +2352,17 @@ impl Node {
             let snap: chain_forge_state::StateSnapshot =
                 serde_json::from_slice(required!("state.json"))?;
             self.state.restore_snapshot(snap);
+
+            // Gap 4: the restored state must reproduce the root the manifest
+            // recorded. The file hashes prove the bytes are what was written; only
+            // this proves the content still produces the committed root.
+            let restored_root = self.live_state_root();
+            if !restored_root.eq_ignore_ascii_case(&manifest_root) {
+                return Err(format!(
+                    "state_root mismatch at height {height} (generation {generation}): the \
+                     manifest recorded state_root {manifest_root} but the restored state \
+                     produces {restored_root}").into());
+            }
 
             if let Some(id) = optional_parse!("identity.json", _) {
                 self.identity = id;
@@ -7541,7 +7568,8 @@ mod tests {
         let contents: Vec<(&str, Vec<u8>)> = crate::persistence::SNAPSHOT_FILES.iter()
             .map(|&n| (n, files[n].clone())).collect();
         crate::persistence::write_snapshot(&dir, snap.height, &contents,
-            &super::snapshot_identity_of(&chain_forge_core::GenesisConfig::from_json(GENESIS).unwrap())).unwrap();
+            &super::snapshot_identity_of(&chain_forge_core::GenesisConfig::from_json(GENESIS).unwrap()),
+            &snap.state_root).unwrap();
 
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
