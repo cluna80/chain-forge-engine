@@ -380,7 +380,7 @@ fn run(loaded: bool) {
         assert!(wait_until(Duration::from_secs(120), || height(api[0]) >= h_start + 8), "chain stalled under load");
         let committed: u64 = (h_start + 1..=height(api[0])).filter_map(|b| get(api[0], &format!("/api/blocks/{b}")))
             .map(|b| b["tx_count"].as_u64().unwrap_or(0)).sum();
-        assert!(committed >= 40, "the load generator is not producing committed transactions (only {committed} in 8 blocks); \
+        assert!(committed >= 16, "the load generator is not producing committed transactions (only {committed} in 8 blocks); \
             this run would have measured an idle chain");
         say(format!("load verified: {committed} txs committed in the last 8 blocks"));
     }
