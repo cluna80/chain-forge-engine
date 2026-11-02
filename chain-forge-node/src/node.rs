@@ -7173,6 +7173,44 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// STATE-PERF end-to-end safety net: real blocks with transfers through the full commit path
+        /// (execution, fees, state tree) must yield exactly these state roots. Captured from the
+        /// ORIGINAL tree implementation; the lookup optimisation must not move them.
+        const STATE_PERF_NODE_HEIGHTS: [u64; 5] = [0, 9, 24, 59, 119];
+        const STATE_PERF_NODE_GOLDEN: [&str; 5] = [
+            "625fc0157801a190c021640ea6bdbdb38fd45f7020e2e999157a31208972dcef",
+            "400e8e6d6c473a8248269a9be52d9c86b09a7ad7aa1ae07a7cae059192b4be6a",
+            "357457b718880c1db5a88f63648a7e3b941b9de644c0c4982e4d6a5a49657306",
+            "ab3ef465e911e98c7a84d61e4e3df528a8ef2cd188a59f24ed6e0c9be5faa924",
+            "9d9986847b0fc68fabb8c0cf4049bdc1ce7cefa9a82d67159eacae8cc72993b2",
+        ];
+
+        async fn state_perf_node_roots() -> Vec<String> {
+            let mut n = liveness_node(1_000_000).await;
+            let mut nonce = 0;
+            let mut out = vec![];
+            for h in 0..=*STATE_PERF_NODE_HEIGHTS.last().unwrap() {
+                commit_with_txs(&mut n, h, 5, &mut nonce).await;
+                if STATE_PERF_NODE_HEIGHTS.contains(&h) {
+                    out.push(n.state.current_root().expect("a committed block has a root").to_string());
+                }
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn state_perf_node_state_roots_are_golden() {
+            let (a, b) = (state_perf_node_roots().await, state_perf_node_roots().await);
+            assert_eq!(a, b, "state roots must be deterministic run to run");
+            if std::env::var("CF_CAPTURE_GOLDEN").is_ok() {
+                for r in &a { println!("NODEGOLDEN {r}"); }
+                return;
+            }
+            for (i, h) in STATE_PERF_NODE_HEIGHTS.iter().enumerate() {
+                assert_eq!(a[i], STATE_PERF_NODE_GOLDEN[i], "state root diverged from the original implementation at height {h}");
+            }
+        }
+
         /// What does today's recovery do with a torn or missing file? Prints the outcome.
         #[tokio::test]
         #[ignore = "PERSIST-001 durability audit; run explicitly with --ignored --nocapture"]
