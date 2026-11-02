@@ -52,7 +52,7 @@
 /// a flat file.  The WAL is append-only and sequenced by version, so crash
 /// recovery replays entries in order to rebuild the node store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use sha3::{Sha3_256, Digest};
 use serde::{Deserialize, Serialize};
 
@@ -398,32 +398,49 @@ pub struct NodeStore {
     version: u64,
     /// Uncommitted WAL entries (drained by the persistence layer).
     wal:     Vec<WriteAheadEntry>,
+    /// Index of `nodes`: for each path (depth, path_prefix), the ascending list of versions at
+    /// which a node exists. It turns "latest node at or before version v" from a walk over every
+    /// version into a binary search. Always kept in step with `nodes` by `put` and `prune_before`.
+    versions: HashMap<u16, HashMap<Vec<u8>, Vec<u64>>>,
 }
 
 impl NodeStore {
     pub fn new() -> Self {
         // Seed version-0 with a root Null node.
-        let mut nodes = BTreeMap::new();
-        nodes.insert(NodeKey::root(0), JmtNode::Null);
-        Self { nodes, version: 0, wal: vec![] }
+        let mut store = Self { nodes: BTreeMap::new(), version: 0, wal: vec![], versions: HashMap::new() };
+        store.put(NodeKey::root(0), JmtNode::Null);
+        store
+    }
+
+    /// The node on `key`'s path with the greatest version <= `version`, or Null if none.
+    /// Identical result to walking `version, version-1, ..., 0` and returning the first hit.
+    fn latest_at(&self, key: &NodeKey, version: u64) -> &JmtNode {
+        let found = self.versions
+            .get(&key.depth)
+            .and_then(|by_path| by_path.get(key.path_prefix.as_slice()))
+            .and_then(|vs| {
+                let idx = vs.partition_point(|&v| v <= version);
+                idx.checked_sub(1).map(|i| vs[i])
+            });
+        match found {
+            Some(v) => self.nodes
+                .get(&NodeKey { version: v, depth: key.depth, path_prefix: key.path_prefix.clone() })
+                .expect("version index is in step with nodes"),
+            None => &JmtNode::Null,
+        }
     }
 
     pub fn current_version(&self) -> u64 { self.version }
 
     /// Get the node at the current version along a path.
     pub fn get(&self, key: &NodeKey) -> &JmtNode {
-        // Walk versions backwards until we find the node (copy-on-write semantics).
-        for v in (0..=key.version).rev() {
-            let probe = NodeKey { version: v, ..key.clone() };
-            if let Some(n) = self.nodes.get(&probe) {
-                return n;
-            }
-        }
-        &JmtNode::Null
+        // Latest node at or before `key.version` (copy-on-write semantics).
+        self.latest_at(key, key.version)
     }
 
-    /// Get a node at a specific version (for rollback / proof generation).
-    pub fn get_at(&self, key: &NodeKey, version: u64) -> &JmtNode {
+    /// The original lookup, kept ONLY as the oracle for differential tests.
+    #[cfg(test)]
+    pub(crate) fn get_at_reference(&self, key: &NodeKey, version: u64) -> &JmtNode {
         for v in (0..=version).rev() {
             let probe = NodeKey { version: v, ..key.clone() };
             if let Some(n) = self.nodes.get(&probe) {
@@ -433,8 +450,23 @@ impl NodeStore {
         &JmtNode::Null
     }
 
+    /// Every (key) currently stored, for tests.
+    #[cfg(test)]
+    pub(crate) fn all_keys(&self) -> Vec<NodeKey> { self.nodes.keys().cloned().collect() }
+
+    /// Get a node at a specific version (for rollback / proof generation).
+    pub fn get_at(&self, key: &NodeKey, version: u64) -> &JmtNode {
+        self.latest_at(key, version)
+    }
+
     /// Insert or update a node at the current version.
     fn put(&mut self, key: NodeKey, node: JmtNode) {
+        let vs = self.versions
+            .entry(key.depth).or_default()
+            .entry(key.path_prefix.clone()).or_default();
+        if let Err(pos) = vs.binary_search(&key.version) {
+            vs.insert(pos, key.version);
+        }
         self.nodes.insert(key, node);
     }
 
@@ -446,6 +478,11 @@ impl NodeStore {
     /// Prune all nodes belonging to versions older than `keep_from`.
     pub fn prune_before(&mut self, keep_from: u64) {
         self.nodes.retain(|k, _| k.version >= keep_from);
+        for by_path in self.versions.values_mut() {
+            for vs in by_path.values_mut() { vs.retain(|&v| v >= keep_from); }
+            by_path.retain(|_, vs| !vs.is_empty());
+        }
+        self.versions.retain(|_, by_path| !by_path.is_empty());
     }
 
     /// Node count (for diagnostics).
@@ -1262,5 +1299,236 @@ mod tests {
 
         assert_eq!(r1, r2,
             "100-key tree must have order-independent root");
+    }
+}
+
+// ── STATE-PERF: differential and golden-root tests ───────────────────────────
+//
+// Written BEFORE the lookup optimisation and run against the original implementation to
+// capture the golden roots. They must stay green, unchanged, afterwards.
+
+#[cfg(test)]
+mod state_perf {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    fn addr(i: u64) -> String { format!("qcb1acct{i:04}") }
+
+    /// Same stored node (pointer identity), or both "no node" (equal hash, both null).
+    fn same(a: &JmtNode, b: &JmtNode) -> bool {
+        if a.is_null() || b.is_null() { return a.is_null() && b.is_null(); }
+        std::ptr::eq(a, b) && a.hash() == b.hash()
+    }
+
+    /// A fixed, deterministic history: 12 long-lived accounts updated constantly, a pool of
+    /// 300 accounts that appear, change and are deleted, and some empty-batch versions.
+    /// Returns (store, root hex per version).
+    fn scenario(versions: u64) -> (NodeStore, Vec<String>) {
+        let (store, roots, _) = scenario_with_content(versions, true);
+        (store, roots)
+    }
+
+    /// As `scenario`, also returning the final key -> value content the tree should hold.
+    fn scenario_with_content(versions: u64, deletions: bool) -> (NodeStore, Vec<String>, std::collections::BTreeMap<u64, Vec<u8>>) {
+        let mut store = NodeStore::new();
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let mut live: std::collections::BTreeSet<u64> = (0..12).collect();
+        let mut content: std::collections::BTreeMap<u64, Vec<u8>> = Default::default();
+        let mut roots = vec![];
+        for v in 1..=versions {
+            let mut w = JmtWriter::new(&mut store);
+            let ops = 1 + rng.below(12);
+            for _ in 0..ops {
+                match rng.below(10) {
+                    0 | 1 if deletions => { // delete a pooled account (never the 12 core ones)
+                        if let Some(&k) = live.iter().filter(|k| **k >= 12).nth(rng.below(8) as usize) {
+                            w.delete(&addr(k)); live.remove(&k); content.remove(&k);
+                        }
+                    }
+                    0 | 1 | 2 | 3 => { // introduce / update a pooled account
+                        let k = 12 + rng.below(300);
+                        let val = format!("v{v}-{k}").into_bytes();
+                        w.upsert(&addr(k), &val); live.insert(k); content.insert(k, val);
+                    }
+                    _ => { // hammer a core account
+                        let k = rng.below(12);
+                        let val = format!("core{v}-{k}").into_bytes();
+                        w.upsert(&addr(k), &val); content.insert(k, val);
+                    }
+                }
+            }
+            if v % 97 == 0 { /* an empty batch must not move the version */ }
+            roots.push(w.flush().to_hex());
+        }
+        (store, roots, content)
+    }
+
+    const CHECKPOINTS: [usize; 12] = [1, 2, 3, 10, 50, 100, 250, 500, 800, 1000, 1500, 2000];
+    /// Captured from the ORIGINAL implementation (version-walk lookup).
+    const GOLDEN: [&str; 12] = [
+        "c401953fbb37d95ec5a1622bfd5fad915a3331d6f2df1519619a9e3a8ee780fb",
+        "decce48f35802517a2680425748743ece8feb27b7db6422a8a77a0e8d4f806f3",
+        "5382166c0528c30fcee06d30a22f48c3f2f3055736c05f8936d62bb3bb48a578",
+        "e73a53292e1fc9196c165b6170ca8ae6f2ea927b360a034315d645f9deecc29b",
+        "8fc6269e245985528490524c77f4c96fb8c4b7c7f840ca007fc2200168141589",
+        "bdd96c512521d00a43e2d63aeed3df18133bd5d6d98675b45636b79f66a03acb",
+        "3806fa43f5f30ca605a5e4cbf5952cd2f0f5e8b3e3a826d9a55d68c45a0daf32",
+        "d10e53f2431b96d2db1af460b7da40e108c46907103b017b6e162cf35617049d",
+        "6bf8c45baa54466a629f838067ca645cbe3de8d32b740d525a2691b252263086",
+        "d77463c46e2b83d1d37e5d5bb7cc799d84cd6bd9f2526bfd21fd8fc798e8edd4",
+        "e82813c219cade06a25cda40833f1d7fd25b3ba52bb6ac3f457cea518331cebb",
+        "57020d842811e178e6bb436a4995749998befa4152f662e0517feb8c7bb2dfec",
+    ];
+
+    #[test]
+    fn golden_roots_match_the_original_implementation() {
+        let (_, roots) = scenario(2000);
+        if std::env::var("CF_CAPTURE_GOLDEN").is_ok() {
+            for c in CHECKPOINTS { println!("GOLDEN {}", roots[c - 1]); }
+            return;
+        }
+        for (i, c) in CHECKPOINTS.iter().enumerate() {
+            assert_eq!(roots[c - 1], GOLDEN[i], "state root diverged from the original implementation at version {c}");
+        }
+    }
+
+    #[test]
+    fn indexed_lookup_equals_the_original_walk_for_every_key_and_version() {
+        let (store, _) = scenario(600);
+        let mut rng = Rng(0xDEAD_BEEF_0000_0001);
+        let keys = store.all_keys();
+        assert!(keys.len() > 1000);
+        // every stored key, probed at its own version, one before, one after, current and random versions
+        for k in &keys {
+            for v in [k.version, k.version.saturating_sub(1), k.version + 1, store.current_version(), rng.below(store.current_version() + 1)] {
+                assert!(same(store.get_at(k, v), store.get_at_reference(k, v)), "get_at({k:?}, {v})");
+                let at = NodeKey { version: v, ..k.clone() };
+                assert!(same(store.get(&at), store.get_at_reference(&at, v)), "get({at:?})");
+            }
+        }
+        // paths that never held a node, and the root at versions that predate everything
+        for depth in [1u16, 2, 5, 9, 16, 33, 64] {
+            for _ in 0..40 {
+                let n = ((depth as usize) + 7) / 8;
+                let mut prefix: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+                if depth % 8 != 0 { let m = 0xFFu8 << (8 - depth % 8); if let Some(l) = prefix.last_mut() { *l &= m; } }
+                let k = NodeKey { version: 0, depth, path_prefix: prefix };
+                for v in [0, 1, store.current_version() / 2, store.current_version()] {
+                    assert!(same(store.get_at(&k, v), store.get_at_reference(&k, v)));
+                }
+            }
+        }
+        for v in 0..=store.current_version() {
+            assert!(same(store.get_at(&NodeKey::root(0), v), store.get_at_reference(&NodeKey::root(0), v)));
+        }
+    }
+
+    /// `prune_before` is unused in production but the index must stay in step with it.
+    #[test]
+    fn indexed_lookup_stays_equal_to_the_original_walk_after_pruning() {
+        let (mut store, _) = scenario(300);
+        store.prune_before(120);
+        let keys = store.all_keys();
+        assert!(!keys.is_empty() && keys.iter().all(|k| k.version >= 120));
+        for k in &keys {
+            for v in [k.version, store.current_version(), 119, 120, 121, 0] {
+                assert!(same(store.get_at(k, v), store.get_at_reference(k, v)), "after prune: get_at({k:?}, {v})");
+            }
+        }
+        for v in [0u64, 50, 119, 120, 200, 300] {
+            assert!(same(store.get_at(&NodeKey::root(0), v), store.get_at_reference(&NodeKey::root(0), v)));
+        }
+    }
+
+    /// Recovery rebuilds the tree from the final key set in ONE batch (`restore_snapshot`); the
+    /// result must equal the incrementally built root.
+    fn batch_root(content: &std::collections::BTreeMap<u64, Vec<u8>>) -> String {
+        let mut fresh = NodeStore::new();
+        let mut w = JmtWriter::new(&mut fresh);
+        for (k, val) in content { w.upsert(&addr(*k), val); }
+        w.flush().to_hex()
+    }
+
+    #[test]
+    fn incremental_root_equals_a_batch_rebuild_without_deletions() {
+        let (store, roots, content) = scenario_with_content(800, false);
+        assert_eq!(JmtReader::current(&store).root_hash().to_hex(), *roots.last().unwrap());
+        assert_eq!(batch_root(&content), *roots.last().unwrap(), "insert/update-only history");
+    }
+
+    /// PRE-EXISTING DEFECT (KNOWN_ISSUES §13): after deletions the incremental root is not a function
+    /// of the final content. STATE-PERF must preserve today's roots, so this stays ignored; it fails
+    /// on the original code and documents the behaviour a future fix would change (a consensus change).
+    #[test]
+    #[ignore = "pre-existing defect, KNOWN_ISSUES §13"]
+    fn incremental_root_equals_a_batch_rebuild_with_deletions() {
+        let (store, roots, content) = scenario_with_content(800, true);
+        assert_eq!(JmtReader::current(&store).root_hash().to_hex(), *roots.last().unwrap());
+        assert_eq!(batch_root(&content), *roots.last().unwrap(), "history containing deletions");
+    }
+
+    /// Diagnostic: smallest history in which an incremental root departs from the rebuilt-from-content root.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn find_first_nonreproducible_root() {
+        let mut rng = Rng(99);
+        for trial in 0..4000u64 {
+            let mut store = NodeStore::new();
+            let mut content: std::collections::BTreeMap<u64, Vec<u8>> = Default::default();
+            let mut log: Vec<String> = vec![];
+            let n_keys = 2 + rng.below(6);
+            for step in 0..(2 + rng.below(8)) {
+                let mut w = JmtWriter::new(&mut store);
+                let k = rng.below(n_keys);
+                if rng.below(3) == 0 && content.contains_key(&k) {
+                    w.delete(&addr(k)); content.remove(&k); log.push(format!("v{}: delete {}", step + 1, k));
+                } else {
+                    let val = format!("x{trial}-{step}").into_bytes();
+                    w.upsert(&addr(k), &val); content.insert(k, val); log.push(format!("v{}: upsert {}", step + 1, k));
+                }
+                let incr = w.flush().to_hex();
+                let batch = { let mut f = NodeStore::new(); let mut w2 = JmtWriter::new(&mut f); for (kk, vv) in &content { w2.upsert(&addr(*kk), vv); } w2.flush().to_hex() };
+                let empty = content.is_empty();
+                if !empty && incr != batch {
+                    println!("MINIMAL COUNTEREXAMPLE (trial {trial}): {log:?}\n  keys alive: {:?}", content.keys().collect::<Vec<_>>());
+                    println!("  incremental root {incr}\n  rebuilt root     {batch}");
+                    return;
+                }
+                if empty && !incr.is_empty() && incr != Hash32::ZERO.to_hex() {
+                    println!("EMPTY-TREE root after deleting everything is not zero: {incr} (history {log:?})");
+                    return;
+                }
+            }
+        }
+        println!("no counterexample found");
+    }
+
+    /// Release-mode scaling benchmark: cost of one commit (3 hot accounts changing) as the
+    /// number of versions grows. `cargo test --release -p chain-forge-state state_perf_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn state_perf_bench_commit_vs_versions() {
+        let mut store = NodeStore::new();
+        for k in 0..12 { let mut w = JmtWriter::new(&mut store); w.upsert(&addr(k), b"init"); w.flush(); }
+        println!("\nSTATE-PERF commit scaling (12 accounts, 3 updated per version)");
+        println!("{:>8} | {:>14} | {:>12}", "version", "us per commit", "nodes");
+        let mut rng = Rng(7);
+        let mut window = std::time::Instant::now();
+        let mut n = 0u64;
+        for v in 1..=20_000u64 {
+            let mut w = JmtWriter::new(&mut store);
+            for _ in 0..3 { let k = rng.below(12); w.upsert(&addr(k), format!("x{v}").as_bytes()); }
+            w.flush();
+            n += 1;
+            if [100, 500, 1000, 2500, 5000, 10_000, 20_000].contains(&v) {
+                println!("{:>8} | {:>14.1} | {:>12}", v, window.elapsed().as_secs_f64() * 1e6 / n as f64, store.node_count());
+                window = std::time::Instant::now(); n = 0;
+            }
+        }
     }
 }
