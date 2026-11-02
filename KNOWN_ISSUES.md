@@ -533,6 +533,14 @@ current version) lookups, and in a tree where few accounts change per block almo
 old. `prune_before` exists but is never called, and cannot be used as a fix: unchanged nodes must
 be found at their old versions.
 
+Windows/BossKing 2026-11-02, same release profile (35 s): commit 18.6 / 33.5 / 59.9 / 134 / 266 ms at heights
+25 / 50 / 100 / 200 / 300 (persist_state() 8.1 / 13.5 / 24.2 / 49.2 / 75.0 ms = 44% -> 28%); temp+fsync+rename
+of the compact store 8.8 ms at height 300. Same linear shape as the sandbox, and FASTER at height 300 (266 ms
+vs 503 ms). So the in-process release profile does not show a Windows penalty. The 6x slowdown seen in the
+live loaded run (§8/§9: debug build, four node processes, real network) is therefore NOT yet attributed to
+the tree lookup or to persistence; the tree share on Windows has not been sampled (gdb was only run in the
+sandbox).
+
 Not fixed here (state-store change; PERSIST-001 is profiling and design only). A fix must not
 change any state root: it can be verified by running the existing state tests plus a differential
 test (old lookup vs. indexed lookup over the same update sequence) asserting identical roots.
