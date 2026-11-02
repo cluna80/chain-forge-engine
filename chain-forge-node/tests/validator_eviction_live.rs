@@ -398,7 +398,8 @@ fn validator_eviction_live() {
     println!("   Eve identity: Verified.");
 
     // ── EV-02 setup: Eve bonds (smaller than genesis validators) ─────────────
-    let eve_n0 = nonce(ports.alice_api, EVE_ADDR);
+    // Eve's RegisterIdentity consumed nonce 0; track nonces explicitly.
+    let eve_n0 = 1u64;
     let r = submit_and_wait(ports.alice_api, &bond_tx(EVE_ADDR, eve_n0, EVE_BOND),
                             Duration::from_secs(20));
     assert!(r["success"].as_bool().unwrap_or(false), "Eve BondValidator failed: {r}");
@@ -423,7 +424,7 @@ fn validator_eviction_live() {
     println!("   ✓ EV-02: genesis validators unaffected by Eve's admission (voting_power={eve_vp}).");
 
     // ── EV-01: Eve unbonds → evicted at next epoch boundary ──────────────────
-    let eve_n1 = nonce(ports.alice_api, EVE_ADDR);
+    let eve_n1 = eve_n0 + 1;
     let r = submit_and_wait(ports.alice_api, &unbond_tx(EVE_ADDR, eve_n1),
                             Duration::from_secs(20));
     assert!(r["success"].as_bool().unwrap_or(false), "Eve UnbondValidator failed: {r}");
