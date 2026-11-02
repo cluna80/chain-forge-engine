@@ -2214,7 +2214,17 @@ impl Node {
         // ── 1. Load and validate the committed snapshot ──────────────────────
         let snap_contents = match crate::persistence::load_snapshot(dir) {
             Err(crate::persistence::PersistError::Fresh) | Ok(None) => {
-                return PersistStartup::Fresh;
+                // D6: a signing guard that has signed above the first height
+                // proves chain state existed. Starting from genesis would let
+                // this validator sign again at heights it already signed.
+                match crate::persistence::guard_proves_missing_state(dir) {
+                    Ok(None) => return PersistStartup::Fresh,
+                    Ok(Some(guard_height)) => return PersistStartup::Fatal { error: format!(
+                        "consensus signing history exists (last signed height {guard_height}) \
+                         but no chain state was found — refusing to start from genesis; \
+                         restore the chain state or start with a clean data directory") },
+                    Err(e) => return PersistStartup::Fatal { error: e.to_string() },
+                }
             }
             Err(e) => {
                 return PersistStartup::Fatal { error: e.to_string() };
@@ -13941,8 +13951,10 @@ mod p02a_gaps {
         let (n, r) = restart(&dir).await;
         match r {
             PersistStartup::Fatal { ref error } => {
-                assert!(error.contains("live_validator_set") || error.contains("validator"),
-                    "the refusal must name the missing validator set: {error}");
+                assert!(error.contains("live_validator_set.json missing")
+                        && error.contains("restore the file or start with a clean data directory"),
+                    "the refusal must tell the operator what to do: {error}");
+                assert!(!error.contains("--reset-data"), "D3 is not implemented; do not mention its flag");
             }
             PersistStartup::Restored { .. } => {
                 let after = n.consensus.validator_set();
@@ -13999,6 +14011,20 @@ mod p02a_gaps {
         std::fs::create_dir_all(dir.join("persist")).unwrap();
         std::fs::write(dir.join("persist").join("consensus_signing.json"), b"{ not json").unwrap();
         let _ = restart(&dir).await;
+    }
+
+    /// G1c — SAFETY NET (the refinement of D6 that G1 needs). A validator may
+    /// legitimately sign the FIRST block (height 0) before any commit has
+    /// written state. A guard at height 0 with no chain state is therefore a
+    /// valid restart, not a lost-state condition.
+    #[tokio::test]
+    async fn g1c_guard_at_the_first_height_with_no_chain_state_is_fresh() {
+        let dir = tmp("g1c");
+        std::fs::create_dir_all(dir.join("persist")).unwrap();
+        write_guard(&dir, 0);
+        let (_n, r) = restart(&dir).await;
+        assert!(matches!(r, PersistStartup::Fresh), "got {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// G3 — SAFETY NET. Nothing on disk at all is Fresh (genesis allowed).

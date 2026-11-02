@@ -91,6 +91,9 @@ impl std::fmt::Display for PersistError {
                 write!(f, "generation '{gen}' has no manifest.json — incomplete write"),
             PersistError::CorruptManifest { gen, detail } =>
                 write!(f, "generation '{gen}' manifest.json is corrupt: {detail}"),
+            PersistError::MissingFile { gen, file } if gen == "legacy" =>
+                write!(f, "{file} missing from the pre-H0-3 data directory — restore the file \
+                           or start with a clean data directory"),
             PersistError::MissingFile { gen, file } =>
                 write!(f, "generation '{gen}' is missing required file '{file}'"),
             PersistError::HashMismatch { gen, file } =>
@@ -101,7 +104,7 @@ impl std::fmt::Display for PersistError {
                 write!(f, "generation '{gen}' height inconsistency: {detail}"),
             PersistError::SigningHistoryConflict { detail } =>
                 write!(f, "consensus signing history conflicts with restored state: {detail} \
-                           — signing blocked; run with --force-unsafe-signing-recovery to override"),
+                           — restore the chain state from a peer or start with a clean data directory"),
             PersistError::Io(e) =>
                 write!(f, "I/O error during persistence: {e}"),
         }
@@ -490,6 +493,14 @@ pub fn migrate_legacy(data_dir: &Path) -> Result<Option<String>, PersistError> {
         detail: "no numeric `height` field".into(),
     })?;
 
+    // ORDER MATTERS — do not reorder. `write_snapshot` writes `CURRENT` LAST, so
+    // the generation is complete and verified before anything points at it.
+    // A crash before that leaves the legacy files untouched and `CURRENT`
+    // absent: the next start simply migrates again. A crash AFTER it but before
+    // the archive move below leaves `CURRENT` on a valid generation: the next
+    // start loads it (`migrate_legacy` returns early once `CURRENT` exists) and
+    // the stale legacy files are ignored. Moving the files BEFORE `CURRENT`
+    // exists would lose the only copy of the state on a crash.
     let gen = write_snapshot(data_dir, height, &contents)?;
 
     // The new generation exists and CURRENT points at it. Archive (move) the
@@ -500,6 +511,34 @@ pub fn migrate_legacy(data_dir: &Path) -> Result<Option<String>, PersistError> {
         std::fs::rename(persist.join(name), archive.join(name)).map_err(PersistError::Io)?;
     }
     Ok(Some(gen))
+}
+
+/// D6: does the consensus signing guard prove that chain state must exist?
+///
+/// Returns `Ok(Some(h))` when `persist/consensus_signing.json` exists and its
+/// last signed height `h` is above the first decidable height (0): signing at
+/// height >= 1 is only possible after height 0 was committed and persisted, so
+/// a guard like that with NO chain state means the state was lost.
+/// Returns `Ok(None)` when there is no guard, or the guard has never signed, or
+/// it last signed at height 0 — a validator may legitimately vote on the first
+/// block before its first commit writes any state. An unreadable guard is an
+/// error (the guard cannot be proven empty).
+pub fn guard_proves_missing_state(data_dir: &Path) -> Result<Option<u64>, PersistError> {
+    let path = data_dir.join("persist").join("consensus_signing.json");
+    if !path.exists() { return Ok(None); }
+    let text = std::fs::read_to_string(&path).map_err(PersistError::Io)?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        PersistError::SigningHistoryConflict { detail: format!("consensus_signing.json unreadable: {e}") }
+    })?;
+    match &v["last"] {
+        serde_json::Value::Array(a) => match a.first().and_then(|h| h.as_u64()) {
+            Some(h) if h > 0 => Ok(Some(h)),
+            Some(_) => Ok(None),
+            None => Err(PersistError::SigningHistoryConflict {
+                detail: "consensus_signing.json: 'last' has no numeric height".into() }),
+        },
+        _ => Ok(None),
+    }
 }
 
 // ── signing history compatibility ─────────────────────────────────────────────
