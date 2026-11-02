@@ -507,7 +507,7 @@ the loss of the node's chain. This is also the baseline PERSIST-001 must beat, n
 
 ## §12  State tree lookups walk back through every version (commit cost grows linearly with height)
 
-**Status: OPEN — found 2026-11-02 by sampling a release build (PERSIST-001 P-01). This, not persistence, is the dominant commit-time growth.**
+**Status: FIXED ON BRANCH `feat/state-perf-jmt-index` (sandbox-verified; NOT merged; Windows regression pending). Originally found 2026-11-02 by sampling a release build (PERSIST-001 P-01).**
 
 Release-mode profile (same in-process 4-validator loop, 10 transfers per block, persistence ON; `persist001_profile_commit_path`):
 
@@ -549,3 +549,54 @@ kept only for proofs/rollback), making `get` O(1).
 
 Consequence for PERSIST-001: persistence is the second cost (whole-store JSON rewrite, ~14-20% of a
 release commit at heights 300-600 and linear in height) and, separately, is not atomic (§11).
+
+**STATE-PERF result (branch `feat/state-perf-jmt-index`, sandbox, release builds)**
+`NodeStore` now keeps an index of the versions at which each path has a node; `get`/`get_at` binary-search it
+instead of probing every version. `nodes`, serialization and the rebuild logic are unchanged.
+
+Safety net, written and run against the ORIGINAL code first (commit d79c81f), unchanged afterwards:
+- golden state roots at 12 checkpoints of a deterministic 2,000-version tree history (updates, deletions,
+  new accounts) captured from the original implementation;
+- every stored key probed at its own, neighbouring, current and random versions: the indexed result is the
+  same stored node (pointer identity) as the original walk, also after `prune_before`;
+- insert/update-only history: incremental root equals a one-batch rebuild (the restart-recovery shape);
+- node level: 120 real blocks of transfers through execution, fees and the tree give byte-identical state
+  roots at heights 0/9/24/59/119, deterministic run to run.
+All of these pass on the optimized code. State crate 73 passed; execution crate 141 passed; node unit suite
+280 passed with the one known unrelated failure (§7).
+
+Tree-only release benchmark (12 accounts, 3 updates per version), microseconds per commit:
+| Versions | Original | Indexed |
+| --- | --- | --- |
+| 100 | 49.7 | 35.9 |
+| 1,000 | 303.7 | 40.1 |
+| 5,000 | 2,461.9 | 41.4 |
+| 10,000 | 7,353.5 | 36.9 |
+| 20,000 | 21,565.4 | 29.6 |
+
+End-to-end release commit profile (in-process 4 validators, 10 transfers/block, persistence on), median commit:
+| Height | Before | After |
+| --- | --- | --- |
+| 100 | 78.4 ms | 29.9 ms |
+| 300 | 503.0 ms | 104.1 ms |
+| 600 | 1,152 ms | 176.5 ms |
+What remains is persistence (persist_state() = 157 of 176 ms at height 600), i.e. PERSIST-001.
+
+---
+
+## §13  Tree root after deletions depends on history (not a function of the final content)
+
+**Status: OPEN — pre-existing; found 2026-11-02 while building STATE-PERF's differential tests. NOT changed by STATE-PERF (it must reproduce today's roots). Needs an owner decision: fixing it changes state roots.**
+
+Minimal counterexample on the ORIGINAL code (`find_first_nonreproducible_root`, ignored diagnostic):
+upsert A, upsert B, delete A, delete B (tree empty), upsert C, upsert C, upsert A. The incremental root differs from the root
+of a fresh tree built in one batch from the same final content {A, C}. Without deletions the two always agree (tested).
+Likely mechanism: a delete marks nodes stale but does not write an explicit empty node, so the version lookup can
+resurrect pre-deletion nodes.
+
+Why it matters: `StateStore::rollback_checkpoint` removes an account a rolled-back transaction had created (the only
+production deletion), and its comment says the root is a function of the leaves. Recovery rebuilds the tree in ONE batch
+(`restore_snapshot`). If a history contained such a deletion, a node that restarted could compute a different root than
+nodes that did not. Not reproduced end to end here; needs a focused test through `StateStore` and a decision. All nodes
+that see the same operations in the same order agree with each other, so this is a restart/rebuild and history-dependence
+risk, not a disagreement between healthy running nodes.

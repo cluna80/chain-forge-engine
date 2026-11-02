@@ -52,7 +52,7 @@
 /// a flat file.  The WAL is append-only and sequenced by version, so crash
 /// recovery replays entries in order to rebuild the node store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use sha3::{Sha3_256, Digest};
 use serde::{Deserialize, Serialize};
 
@@ -398,28 +398,44 @@ pub struct NodeStore {
     version: u64,
     /// Uncommitted WAL entries (drained by the persistence layer).
     wal:     Vec<WriteAheadEntry>,
+    /// Index of `nodes`: for each path (depth, path_prefix), the ascending list of versions at
+    /// which a node exists. It turns "latest node at or before version v" from a walk over every
+    /// version into a binary search. Always kept in step with `nodes` by `put` and `prune_before`.
+    versions: HashMap<u16, HashMap<Vec<u8>, Vec<u64>>>,
 }
 
 impl NodeStore {
     pub fn new() -> Self {
         // Seed version-0 with a root Null node.
-        let mut nodes = BTreeMap::new();
-        nodes.insert(NodeKey::root(0), JmtNode::Null);
-        Self { nodes, version: 0, wal: vec![] }
+        let mut store = Self { nodes: BTreeMap::new(), version: 0, wal: vec![], versions: HashMap::new() };
+        store.put(NodeKey::root(0), JmtNode::Null);
+        store
+    }
+
+    /// The node on `key`'s path with the greatest version <= `version`, or Null if none.
+    /// Identical result to walking `version, version-1, ..., 0` and returning the first hit.
+    fn latest_at(&self, key: &NodeKey, version: u64) -> &JmtNode {
+        let found = self.versions
+            .get(&key.depth)
+            .and_then(|by_path| by_path.get(key.path_prefix.as_slice()))
+            .and_then(|vs| {
+                let idx = vs.partition_point(|&v| v <= version);
+                idx.checked_sub(1).map(|i| vs[i])
+            });
+        match found {
+            Some(v) => self.nodes
+                .get(&NodeKey { version: v, depth: key.depth, path_prefix: key.path_prefix.clone() })
+                .expect("version index is in step with nodes"),
+            None => &JmtNode::Null,
+        }
     }
 
     pub fn current_version(&self) -> u64 { self.version }
 
     /// Get the node at the current version along a path.
     pub fn get(&self, key: &NodeKey) -> &JmtNode {
-        // Walk versions backwards until we find the node (copy-on-write semantics).
-        for v in (0..=key.version).rev() {
-            let probe = NodeKey { version: v, ..key.clone() };
-            if let Some(n) = self.nodes.get(&probe) {
-                return n;
-            }
-        }
-        &JmtNode::Null
+        // Latest node at or before `key.version` (copy-on-write semantics).
+        self.latest_at(key, key.version)
     }
 
     /// The original lookup, kept ONLY as the oracle for differential tests.
@@ -440,17 +456,17 @@ impl NodeStore {
 
     /// Get a node at a specific version (for rollback / proof generation).
     pub fn get_at(&self, key: &NodeKey, version: u64) -> &JmtNode {
-        for v in (0..=version).rev() {
-            let probe = NodeKey { version: v, ..key.clone() };
-            if let Some(n) = self.nodes.get(&probe) {
-                return n;
-            }
-        }
-        &JmtNode::Null
+        self.latest_at(key, version)
     }
 
     /// Insert or update a node at the current version.
     fn put(&mut self, key: NodeKey, node: JmtNode) {
+        let vs = self.versions
+            .entry(key.depth).or_default()
+            .entry(key.path_prefix.clone()).or_default();
+        if let Err(pos) = vs.binary_search(&key.version) {
+            vs.insert(pos, key.version);
+        }
         self.nodes.insert(key, node);
     }
 
@@ -462,6 +478,11 @@ impl NodeStore {
     /// Prune all nodes belonging to versions older than `keep_from`.
     pub fn prune_before(&mut self, keep_from: u64) {
         self.nodes.retain(|k, _| k.version >= keep_from);
+        for by_path in self.versions.values_mut() {
+            for vs in by_path.values_mut() { vs.retain(|&v| v >= keep_from); }
+            by_path.retain(|_, vs| !vs.is_empty());
+        }
+        self.versions.retain(|_, by_path| !by_path.is_empty());
     }
 
     /// Node count (for diagnostics).
@@ -1403,6 +1424,23 @@ mod state_perf {
             }
         }
         for v in 0..=store.current_version() {
+            assert!(same(store.get_at(&NodeKey::root(0), v), store.get_at_reference(&NodeKey::root(0), v)));
+        }
+    }
+
+    /// `prune_before` is unused in production but the index must stay in step with it.
+    #[test]
+    fn indexed_lookup_stays_equal_to_the_original_walk_after_pruning() {
+        let (mut store, _) = scenario(300);
+        store.prune_before(120);
+        let keys = store.all_keys();
+        assert!(!keys.is_empty() && keys.iter().all(|k| k.version >= 120));
+        for k in &keys {
+            for v in [k.version, store.current_version(), 119, 120, 121, 0] {
+                assert!(same(store.get_at(k, v), store.get_at_reference(k, v)), "after prune: get_at({k:?}, {v})");
+            }
+        }
+        for v in [0u64, 50, 119, 120, 200, 300] {
             assert!(same(store.get_at(&NodeKey::root(0), v), store.get_at_reference(&NodeKey::root(0), v)));
         }
     }
