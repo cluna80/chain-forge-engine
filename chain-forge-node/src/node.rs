@@ -2280,18 +2280,9 @@ impl Node {
                 }
 
                 ex.validator_status = self.validator_status_snapshot();
-
-                // Validators: use the live consensus set (restored from
-                // live_validator_set.json), which carries real public keys.
-                {
-                    let live = self.consensus.validator_set();
-                    ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
-                        id:           v.id.0.clone(),
-                        voting_power: v.voting_power,
-                        pop_verified: v.pop_verified,
-                        consensus_pubkey: hex::encode(&v.public_key),
-                    }).collect();
-                }
+                // `validator_powers` is filled below, after `reset_to_height`
+                // applies the persisted committee: at this point the engine
+                // still holds the genesis-seeded set.
 
                 // Blocks + txs: walk chain_store in ascending height order so
                 // push_front leaves them newest-first (matching live behaviour).
@@ -2407,6 +2398,20 @@ impl Node {
             }
             // Before this validator can vote again: its lock and last signature.
             self.restore_sign_guard();
+
+            // Serve the committee the engine now holds (restored from
+            // live_validator_set.json, real public keys), not the genesis-seeded
+            // one it held while the explorer was rebuilt above.
+            {
+                let live = self.consensus.validator_set();
+                self.explorer.lock().unwrap().validator_powers = live.validators.iter()
+                    .map(|v| ValidatorPowerSummary {
+                        id:           v.id.0.clone(),
+                        voting_power: v.voting_power,
+                        pop_verified: v.pop_verified,
+                        consensus_pubkey: hex::encode(&v.public_key),
+                    }).collect();
+            }
 
             // Populate NodeStatus with the restored state root so that callers
             // that read status.state_root immediately after load_persisted_state
@@ -6788,13 +6793,17 @@ mod tests {
 
         /// A node with a 100-block liveness window (the genesis minimum) that
         /// jails a validator missing over 20% of it, on `epoch_blocks`-block epochs.
-        async fn liveness_node(epoch_blocks: u64) -> Node {
+        fn liveness_json() -> String {
             let json = GENESIS.replace(
                 r#""personhood_weighted": true }"#,
                 r#""personhood_weighted": true, "liveness": { "window_blocks": 100, "max_missed_pct": 20, "start_height": 0 } }"#,
             );
             assert!(json.contains("window_blocks"));
-            let mut n = Node::new(&json, None).await.unwrap();
+            json
+        }
+
+        async fn liveness_node(epoch_blocks: u64) -> Node {
+            let mut n = Node::new(&liveness_json(), None).await.unwrap();
             n.validator_epoch_blocks = epoch_blocks;
             n
         }
@@ -6902,6 +6911,38 @@ mod tests {
             assert_eq!(serde_json::to_value(&a.validator_registry.get("qcb1dave").unwrap().jail_records).unwrap(),
                        serde_json::to_value(&b.validator_registry.get("qcb1dave").unwrap().jail_records).unwrap());
             assert_eq!(a.state.current_root(), b.state.current_root(), "state roots must agree");
+        }
+
+        /// A restarted node must serve the committee it persisted. Found by the
+        /// live test (JL-08): the explorer snapshot was taken before the
+        /// persisted set replaced the genesis-seeded one, so a removed jailed
+        /// validator reappeared in GET /api/validators.
+        #[tokio::test]
+        async fn restart_serves_the_persisted_committee_not_the_genesis_one() {
+            let dir = std::env::temp_dir().join(format!("cf-jail-restart-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut n = liveness_node(10).await;
+            n.set_data_dir(dir.clone()).unwrap();
+            let mut prev = None;
+            drive_live(&mut n, 0..4, &mut prev, true).await;
+            let epoch = n.identity.clock.current_epoch;
+            n.validator_registry.jail("qcb1dave", "liveness failure", epoch).unwrap();
+            drive_live(&mut n, 4..11, &mut prev, true).await;
+            assert_eq!(seated(&n), ["qcb1alice", "qcb1bob", "qcb1carol"]);
+
+            let mut r = Node::new(&liveness_json(), None).await.unwrap();
+            r.validator_epoch_blocks = 10;
+            r.set_data_dir(dir.clone()).unwrap();
+            assert!(r.load_persisted_state());
+            assert_eq!(seated(&r), ["qcb1alice", "qcb1bob", "qcb1carol"], "engine set after restart");
+            let mut served: Vec<String> = r.explorer.lock().unwrap().validator_powers.iter()
+                .map(|v| v.id.clone()).collect();
+            served.sort();
+            assert_eq!(served, ["qcb1alice", "qcb1bob", "qcb1carol"], "GET /api/validators after restart");
+            let status = r.explorer.lock().unwrap().validator_status.iter()
+                .find(|v| v.id == "qcb1dave").map(|v| v.status.clone());
+            assert_eq!(status.as_deref(), Some("Jailed"), "GET /api/validators/status after restart");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// Enforcement must never leave the chain with no committee at all.
