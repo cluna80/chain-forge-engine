@@ -410,6 +410,22 @@ participating; at ~35% omission a 20% threshold over 100 blocks jails it
 
 ---
 
+
+**Windows loaded run on the merged `main` (2026-11-02, BossKing/MINGW64, `b9f1e7e`, `validator_precommit_delay_loaded_live`, 304 s; 16 throttled accounts, one tx in flight each).** This is the first valid Windows loaded run (the first attempt, run in parallel, was invalid). Dave precommitted on time every block; only the arrival was delayed.
+
+| Delay | Dave's precommits in committed evidence | Window misses |
+| --- | --- | --- |
+| 0 ms | 14/14 | 0 |
+| 500 ms | 12/14 | 2 |
+| 900 ms | 10/14 | 4 (29%) |
+| 1200 ms | 7/14 | 7 |
+| 1500 ms | 4/14 | 10 |
+| 2200 ms | 3/14 | 11 |
+| 3000 ms | 4/14 | 10 |
+| 0 ms (control, at the end) | 11/14 | 3 |
+
+First delay at which at least half were omitted: **1200 ms** (idle chain: 3000 ms, unchanged in shape from the earlier Windows idle run). The commit-to-proposal interval while Dave's precommit was missing was 1064–1706 ms, the gate. Consequence for the policy question: on a loaded chain, sustained lateness of roughly 500–900 ms already produces 14–29% omission, i.e. above the 20% threshold, so a healthy but late validator would be jailed if automatic suspension were enabled. The control row shows the effect is not only added delay: the block interval drifted 1.9x (1071 to 2077 ms) over the run, which is §9. **Automatic suspension stays disabled.** The Windows numbers match the sandbox finding that the loaded collection window is about 1 s.
+
 ## §9  Per-block persistence cost grows with chain length (blocks slow down under load)
 
 **Status: OPEN — pre-existing; found 2026-11-02 while measuring a loaded chain. Not fixed by P-02a (#48): every block still rewrites and fsyncs all eight files, and the cost has not been re-measured. PERSIST-001 P-02b is the planned fix.**
