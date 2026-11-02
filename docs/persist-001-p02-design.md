@@ -180,3 +180,21 @@ PR #41 (`security/h0-3-atomic-state-persistence`, open, never merged) already im
 **Integration facts:** #41 diverges from `main` by 13/15 commits; a merge dry-run conflicts only in `ROADMAP.md` and `chain-forge-node/Cargo.toml` (`node.rs` merges automatically). It changes `persist_state()` to return `Result` and `load_persisted_state()` to return `PersistStartup`; the H0-11 branch has 40 call sites (mostly tests) that would need updating, so #41 should land before H0-11.
 
 **Consequence for P-02:** P-02a shrinks to "rebase #41, close gaps 1-5 and 7, correct the ROADMAP". P-02b (journal, cost) is unchanged.
+
+## 14. Decisions from the P-02a review (2026-11-02) and a named follow-on gap
+
+Owner decisions recorded while fixing PR #41's gaps (tests: `p02a_gaps` in `chain-forge-node/src/node.rs`):
+
+- **L3 (legacy directory without `live_validator_set.json`): Fatal**, never reconstructed. Message: "live_validator_set.json missing from the pre-H0-3 data directory — restore the file or start with a clean data directory". Option A (provable genesis-only reconstruction) was rejected: devnet data is not worth the surface for a wrong reconstruction.
+- **L4** (migrate, restart, same root) stays inside L1.
+- **D6 refinement:** a signing guard with no chain state is Fatal only when the guard last signed above height 0; a guard at height 0 is a valid restart before the first commit (test G1c). The reverse (chain state, no guard) is valid (G2): the guard is created on the first vote.
+- **Gap 6 (guard ahead of state): abstain, do not exit.** The node stays up, signs nothing at heights <= the guard height, and resumes when `commit_block` applies a block at height >= the guard height. Block-driven, never timer-driven (A1-A4).
+- **No messages may name a flag that does not exist.** `--reset-data` (D3) and `--force-unsafe-signing-recovery` are not mentioned until implemented.
+- **N-1 generation:** a damaged committed generation is Fatal; there is no silent fallback to N-1.
+- **Gap 7 (cost):** not optimised now; measure after P-02a lands.
+
+### Named follow-on gap: unguarded proposal signing
+
+**Risk:** the double-sign guard covers votes only. `sign_and_register_own_proposal` signs a proposal without consulting any persisted record, so a validator that signed a proposal for (height, round), crashed, and restarts could sign a *different* proposal for the same (height, round) — equivocation by the proposer. Pre-existing, not introduced by PR #41. It matters more now that a node with its guard ahead of state stays up instead of exiting.
+
+**Status:** deliberately NOT fixed on the P-02a branch (scope). Open as a follow-on item after P-02a merges.
