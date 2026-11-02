@@ -435,16 +435,12 @@ pub enum PersistStartup {
     /// CURRENT points at a committed snapshot that is corrupt or incomplete.
     /// The node MUST NOT start from genesis; it should exit with an error.
     Fatal { error: String },
-    /// The consensus signing guard is ahead of the restored state height.
-    /// Starting as a validator is unsafe until the node has synced up to
-    /// the guard height from peers.
-    SigningBlocked { guard_height: u64, state_height: u64 },
 }
 
 impl PersistStartup {
     /// Returns `true` if state was successfully loaded (`Restored`) or if there
-    /// was no prior state (`Fresh`). Returns `false` for `Fatal` and
-    /// `SigningBlocked`.
+    /// was no prior state (`Fresh`). Returns `false` for `Fatal`.
+    /// (nothing else: a guard ahead of the state is `Restored` — the node abstains).
     ///
     /// Used by internal unit tests that pre-date the typed API.  Production
     /// code (`main.rs`) should always match on the full enum.
@@ -567,6 +563,12 @@ pub struct Node {
     last_regossip: Option<std::time::Instant>,
     /// Persisted double-sign guard (see `SignGuard`).
     sign_guard: SignGuard,
+    /// Gap 6: the guard was ahead of the restored state at startup. While
+    /// `Some(g)` this validator signs nothing at a height <= g (it may already
+    /// have signed there) but keeps receiving, forwarding and applying blocks.
+    /// Cleared by `recheck_signing_abstention` once a block at height >= g is
+    /// committed locally. Never set from a timer.
+    signing_abstain_until: Option<u64>,
     /// Proposals/votes for the next height, replayed through the full
     /// handlers (payload and signature checks included) after the commit.
     next_height_msgs: Vec<NextHeightMsg>,
@@ -1528,6 +1530,7 @@ impl Node {
             pending_propose: None,
             last_regossip: None,
             sign_guard: SignGuard::default(),
+            signing_abstain_until: None,
             next_height_msgs: Vec::new(),
             last_sync_request: None,
             pocd_config,
@@ -2195,7 +2198,6 @@ impl Node {
     /// - `Fresh`          — no CURRENT pointer; caller should start genesis.
     /// - `Restored`       — valid snapshot loaded; node is at `height`.
     /// - `Fatal`          — corrupt/incomplete committed snapshot; must exit.
-    /// - `SigningBlocked` — guard ahead of state; validator signing unsafe.
     ///
     /// Never silently falls back to genesis on any error.
     pub fn load_persisted_state(&mut self) -> PersistStartup {
@@ -2244,6 +2246,7 @@ impl Node {
         // data_dir/consensus_signing.json does NOT exist; reading it would
         // silently skip the check.
         let signing_path = dir.join("persist").join("consensus_signing.json");
+        let mut abstain_until: Option<u64> = None;
         if signing_path.exists() {
             match std::fs::read_to_string(&signing_path)
                 .map_err(|e| e.to_string())
@@ -2254,7 +2257,13 @@ impl Node {
                         Ok(crate::persistence::SigningCompatibility::GuardAheadOfState {
                             guard_height, state_height
                         }) => {
-                            return PersistStartup::SigningBlocked { guard_height, state_height };
+                            // Do NOT exit: an exited node is a dead validator
+                            // slot and cannot sync. Abstain until state catches up.
+                            tracing::warn!(
+                                guard_height, state_height,
+                                "guard ahead of chain state, abstaining from signing"
+                            );
+                            abstain_until = Some(guard_height);
                         }
                         Ok(crate::persistence::SigningCompatibility::GuardBehindState {
                             guard_height, ..
@@ -2530,7 +2539,10 @@ impl Node {
             Ok(())
         };
         match load() {
-            Ok(()) => PersistStartup::Restored { height, generation },
+            Ok(()) => {
+                self.signing_abstain_until = abstain_until;
+                PersistStartup::Restored { height, generation }
+            }
             Err(e) => {
                 // Any parse error on a hash-verified file is unexpected but
                 // must not be silently ignored. Return Fatal so main.rs exits.
@@ -4961,8 +4973,27 @@ impl Node {
             return Err(e);
         }
 
+        self.recheck_signing_abstention(cert.height);
         Ok(())
     }
+
+    /// Gap 6: end signing abstention once block application has caught the state
+    /// up to the guard's height. Called from `commit_block` (block application),
+    /// never from a timer.
+    fn recheck_signing_abstention(&mut self, committed_height: u64) {
+        if let Some(g) = self.signing_abstain_until {
+            if committed_height >= g {
+                info!(committed_height, guard_height = g,
+                      "chain state caught up to the signing guard: resuming signing");
+                self.signing_abstain_until = None;
+            } else {
+                debug!(committed_height, guard_height = g, "still abstaining from signing");
+            }
+        }
+    }
+
+    /// Height up to which this node is abstaining from signing (`None` = signing normally).
+    pub fn signing_abstaining_until(&self) -> Option<u64> { self.signing_abstain_until }
 
     /// Verify a `CommitCertificate` against the validator set that was
     /// actually in force at `cert.height` -- NOT whatever validator set is
@@ -5292,6 +5323,13 @@ impl Node {
         if self.signing_key.is_none() {
             debug!("no signing key loaded: not casting");
             return;
+        }
+        if let Some(g) = self.signing_abstain_until {
+            if vote.height <= g {
+                warn!(height = vote.height, guard_height = g,
+                      "abstaining from signing: guard is ahead of chain state");
+                return;
+            }
         }
         match self.sign_guard.check(&vote) {
             Err(e) => {
@@ -6780,6 +6818,32 @@ mod tests {
             assert_eq!(obs.consensus.current_height(), 0, "height unchanged");
             assert!(obs.chain_store.is_empty(), "block not recorded");
             assert!(obs.last_commit_evidence.is_none(), "no evidence derived from a refused block");
+        }
+
+        /// Gap 6 / A4: abstention ends because BLOCKS WERE APPLIED, via
+        /// `commit_block`, not because of time. Heights below the guard keep
+        /// the node abstaining; committing a block at height >= the guard
+        /// height resumes signing.
+        #[tokio::test]
+        async fn a4_commit_block_ends_signing_abstention_when_state_reaches_the_guard() {
+            let mut obs = Node::new(GENESIS, None).await.unwrap();
+            obs.signing_abstain_until = Some(2);
+            let mut prev: Option<CommitCertificate> = None;
+            for h in 0..=2u64 {
+                assert_eq!(obs.signing_abstaining_until(), Some(2),
+                    "still abstaining before h{h} is applied (guard height 2)");
+                let root = obs.state.current_root().map(str::to_string);
+                let p = proposal(h, payload(prev.as_ref(), root.as_deref()));
+                deliver(&mut obs, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+                assert_eq!(obs.status.lock().unwrap().height, h, "observer must commit h{h}");
+                prev = Some(evidence(h, &p.block_hash, &VALS));
+                if h < 2 {
+                    assert_eq!(obs.signing_abstaining_until(), Some(2),
+                        "committed h{h} < guard height 2: must keep abstaining");
+                }
+            }
+            assert_eq!(obs.signing_abstaining_until(), None,
+                "committed h2 >= guard height 2: signing must resume");
         }
 
         // ── Epoch rewards from committed evidence ───────────────────────────
@@ -13840,18 +13904,12 @@ mod tests {
         restarted.set_data_dir(data_dir.clone()).unwrap();
         let result = restarted.load_persisted_state();
 
-        // Must be SigningBlocked — if it returns Restored, the guard was missed.
-        assert!(
-            matches!(
-                result,
-                PersistStartup::SigningBlocked {
-                    guard_height: gh,
-                    state_height: sh,
-                } if gh == guard_height && sh == state_height
-            ),
-            "load_persisted_state must return SigningBlocked when persist/consensus_signing.json \
-             has guard_height ({guard_height}) > state_height ({state_height}); got {result:?}"
-        );
+        // The guard at persist/ must be READ (not missed): the node now starts and
+        // abstains (gap 6), so the proof it was read is the abstention marker.
+        assert!(result.is_restored(), "guard ahead of state must start, got {result:?}");
+        assert_eq!(restarted.signing_abstaining_until(), Some(guard_height),
+            "load_persisted_state must read persist/consensus_signing.json: guard_height \
+             ({guard_height}) > state_height ({state_height}) means abstain until {guard_height}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14120,16 +14178,17 @@ mod p02a_gaps {
 
     // ── Gap 6: guard AHEAD of the state: abstain, do not exit ───────────────
 
-    /// A1 — EXPECTED TO FAIL today (returns SigningBlocked, main.rs exits).
+    /// A1 — was failing: SigningBlocked made main.rs exit.
     /// The node must stay up: load reports Restored, not a startup refusal.
     #[tokio::test]
     async fn a1_guard_ahead_of_state_starts_instead_of_exiting() {
         let dir = tmp("a1");
         let h = { let n = build_chain(&dir).await; n.persist_state().unwrap(); height_of(&n) };
         write_guard(&dir, h + 5);
-        let (_n, r) = restart(&dir).await;
+        let (n, r) = restart(&dir).await;
         assert!(r.is_restored(),
             "guard ahead of state must NOT stop the node (it must abstain and sync); got {r:?}");
+        assert_eq!(n.signing_abstaining_until(), Some(h + 5), "node must record that it is abstaining");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

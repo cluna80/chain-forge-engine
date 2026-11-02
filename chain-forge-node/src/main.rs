@@ -208,6 +208,10 @@ async fn main() {
                     crate::node::PersistStartup::Restored { height, generation } => {
                         info!(dir = %dir.display(), height, %generation,
                               "resumed from persisted state");
+                        if let Some(g) = node.signing_abstaining_until() {
+                            tracing::warn!(guard_height = g, state_height = height,
+                                "guard ahead of chain state, abstaining from signing until state reaches it");
+                        }
                     }
                     crate::node::PersistStartup::Fatal { error } => {
                         tracing::error!(
@@ -216,17 +220,6 @@ async fn main() {
                             "FATAL: committed snapshot is corrupt or incomplete — \
                              refusing to start from genesis (H0-3 fail-closed). \
                              Restore from a backup or use a clean data directory."
-                        );
-                        std::process::exit(1);
-                    }
-                    crate::node::PersistStartup::SigningBlocked { guard_height, state_height } => {
-                        tracing::error!(
-                            guard_height,
-                            state_height,
-                            "FATAL: consensus signing guard is ahead of restored state — \
-                             this node may have voted on blocks not reflected in the snapshot. \
-                             Signing is blocked. Sync from peers to catch up to guard height \
-                             before resuming validator operation."
                         );
                         std::process::exit(1);
                     }
