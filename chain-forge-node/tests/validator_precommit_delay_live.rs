@@ -178,7 +178,7 @@ struct Ev { ts_ms: u64, kind: &'static str, validator: String, height: u64 }
 fn trace(dir: &PathBuf, node: &str) -> Vec<Ev> {
     let text = strip_ansi(&std::fs::read_to_string(dir.join(format!("{node}.log"))).unwrap_or_default());
     let field = |l: &str, k: &str| l.split(k).nth(1).map(|r| r.chars().take_while(|c| !c.is_whitespace()).collect::<String>());
-    text.lines().filter(|l| l.contains("cf_fault")).filter_map(|l| {
+    text.lines().filter_map(|l| {
         let kind = ["sent precommit", "recv precommit", "defer precommit", "deliver precommit"].into_iter()
             .find(|k| l.contains(k))?;
         Some(Ev {
@@ -190,7 +190,7 @@ fn trace(dir: &PathBuf, node: &str) -> Vec<Ev> {
     }).collect()
 }
 
-struct Row { delay: u64, blocks: u64, sent: u64, received: u64, in_time: u64, included: u64, omitted: u64, counted: u64, mismatches: Vec<String>, median_margin: i64 }
+struct Row { delay: u64, blocks: u64, own: u64, sent: u64, received: u64, in_time: u64, included: u64, omitted: u64, counted: u64, mismatches: Vec<String>, median_margin: i64 }
 
 #[test]
 fn validator_precommit_delay_live() {
@@ -239,7 +239,7 @@ fn validator_precommit_delay_live() {
         // Stage data for evidence of blocks h0..h1-1 (published in blocks h0+1..h1).
         let dave_trace = trace(&tmp, DAVE);
         let node_traces: Vec<(&str, Vec<Ev>)> = NAMES.iter().map(|n| (*n, trace(&tmp, n))).collect();
-        let mut row = Row { delay, blocks: h1 - h0, sent: 0, received: 0, in_time: 0, included: 0, omitted: 0, counted: miss1 - miss0,
+        let mut row = Row { delay, blocks: h1 - h0, own: 0, sent: 0, received: 0, in_time: 0, included: 0, omitted: 0, counted: miss1 - miss0,
                             mismatches: vec![], median_margin: 0 };
         let mut margins = vec![];
         for hh in h0..h1 {
@@ -251,7 +251,7 @@ fn validator_precommit_delay_live() {
             if included { row.included += 1 } else { row.omitted += 1 }
             let sent = dave_trace.iter().any(|e| e.kind == "sent" && e.height == hh);
             if sent { row.sent += 1 }
-            if proposer == DAVE { row.in_time += 1; row.received += 1; continue; } // his own precommit needs no network path
+            if proposer == DAVE { row.own += 1; continue; } // his own precommit needs no network path
             let evs = &node_traces.iter().find(|(n, _)| *n == proposer).unwrap().1;
             let recv = evs.iter().find(|e| e.kind == "recv" && e.validator == DAVE && e.height == hh);
             let arrival = evs.iter().find(|e| e.kind == "deliver" && e.validator == DAVE && e.height == hh).or(recv);
@@ -272,11 +272,13 @@ fn validator_precommit_delay_live() {
     std::fs::write(&control, "off").unwrap();
 
     println!("\n── Per-stage counts for Dave's precommit (per block, healthy validator) ─");
-    println!("   delay   blocks  1 sent  2 received  3 in time  4 included  5 counted-as-miss  omitted   median margin (propose - arrival)");
+    println!("   Blocks Dave proposed himself are excluded from stages 2-3 (his own precommit needs no network path)");
+    println!("   delay   blocks  own  1 sent  2 received  3 in time  4 included  5 counted-as-miss  omitted   median margin (propose - arrival)");
     for r in &rows {
-        println!("   {:>4}ms  {:>5}  {:>6}  {:>10}  {:>9}  {:>10}  {:>17}  {:>7}   {:>6} ms",
-            r.delay, r.blocks, r.sent, r.received, r.in_time, r.included, r.counted, r.omitted, r.median_margin);
+        println!("   {:>4}ms  {:>5}  {:>3}  {:>6}  {:>10}  {:>9}  {:>10}  {:>17}  {:>7}   {:>6} ms",
+            r.delay, r.blocks, r.own, r.sent, r.received, r.in_time, r.included, r.counted, r.omitted, r.median_margin);
     }
+    println!("   (4 included counts Dave-proposed blocks too; omission is judged over blocks - own)");
     for r in &rows {
         if !r.mismatches.is_empty() {
             println!("   note: delay {} ms: {} block(s) where 'in time' (by log clocks) disagreed with 'included': {:?}", r.delay, r.mismatches.len(), &r.mismatches[..r.mismatches.len().min(3)]);
@@ -290,12 +292,13 @@ fn validator_precommit_delay_live() {
     assert_eq!(rows[0].omitted, 0, "no delay: never omitted");
     assert_eq!(rows[1].omitted, 0, "500 ms is inside the collection window: never omitted");
     let last = rows.last().unwrap();
-    assert!(last.omitted * 10 >= last.blocks * 9, "a 4.5 s delay should be omitted from >= 90% of blocks, got {}/{}", last.omitted, last.blocks);
+    let networked = last.blocks - last.own;
+    assert!(last.omitted * 10 >= networked * 9, "a 4.5 s delay should be omitted from >= 90% of networked blocks, got {}/{}", last.omitted, networked);
     let dave = get(api[0], "/api/validators/status").and_then(|v| v.as_array().cloned()).unwrap()
         .into_iter().find(|v| v["id"].as_str() == Some(DAVE)).unwrap();
     assert_eq!(dave["status"].as_str(), Some("Active"), "Dave must not be jailed during the experiment");
 
-    let cliff = rows.iter().find(|r| r.omitted * 2 >= r.blocks).map(|r| r.delay);
+    let cliff = rows.iter().find(|r| r.omitted * 2 >= r.blocks - r.own).map(|r| r.delay);
     println!("\n── Summary ──────────────────────────────────────────────────────────");
     println!("   Dave precommitted on time every block; only its ARRIVAL was delayed.");
     println!("   Delay at which >= half of his precommits were omitted from committed evidence: {}",
