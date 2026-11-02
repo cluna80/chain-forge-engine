@@ -30,7 +30,7 @@
 ///   - The identity oracle (that's chain-forge-identity)
 ///   - Execution of the change (the node applies it after on_execute() is called)
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 // -- Error --------------------------------------------------------------------
@@ -258,7 +258,7 @@ pub struct Proposal {
     pub submitted_epoch:  u64,
     pub voting_end_epoch: u64,
     /// Votes cast: voter address -> choice.
-    pub votes:            HashMap<String, VoteChoice>,
+    pub votes:            BTreeMap<String, VoteChoice>,
     /// Snapshot of verified human count at submission time.
     /// Used for quorum calculation — prevents gaming by changing
     /// the population between submission and tally.
@@ -281,7 +281,7 @@ impl Proposal {
             status:           ProposalStatus::Voting,
             submitted_epoch,
             voting_end_epoch: submitted_epoch + voting_period,
-            votes:            HashMap::new(),
+            votes:            BTreeMap::new(),
             verified_humans_at_submission: verified_humans,
         }
     }
@@ -321,9 +321,10 @@ impl Proposal {
 // -- GovernanceModule ---------------------------------------------------------
 
 /// The on-chain governance module for QCB Chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceModule {
     config:    GovernanceConfig,
-    proposals: HashMap<u64, Proposal>,
+    proposals: BTreeMap<u64, Proposal>,
     next_id:   u64,
 }
 
@@ -331,7 +332,7 @@ impl GovernanceModule {
     pub fn new(config: GovernanceConfig) -> Self {
         Self {
             config,
-            proposals: HashMap::new(),
+            proposals: BTreeMap::new(),
             next_id:   1,
         }
     }
