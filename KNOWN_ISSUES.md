@@ -494,6 +494,10 @@ identity.json truncated, live_validator_set.json truncated: **all fall back to g
 (status height 0, engine height 0) with only that log line. validators.json missing: loads
 "successfully" at height 11 with a registry rebuilt from genesis (silently inconsistent).
 
+Windows/BossKing 2026-11-02 reproduces the audit exactly (debug build, 16.8 s): the same seven files fall
+back to genesis (status height 0, engine height 0) and `validators.json` missing resumes at status
+height 11 / engine height 12.
+
 Why it matters: H0-3 is marked complete for "consistent after an unclean shutdown at any block
 height"; the audit shows a crash MID-WRITE (torn file) is not covered by the load path. The
 double-sign guard is atomic and would refuse conflicting votes, which limits the safety damage but not
