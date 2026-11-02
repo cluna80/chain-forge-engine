@@ -135,7 +135,7 @@ pub struct SnapshotManifest {
     /// `chain_id` of the genesis the writing node was running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<String>,
-    /// `chain_forge_core::genesis_hash_hex` of that genesis (64 hex chars).
+    /// `chain_forge_core::compute_genesis_hash` of that genesis (64 lowercase hex chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_hash: Option<String>,
     /// The state root (64 hex; an empty tree is 64 zeros) of the live tree when

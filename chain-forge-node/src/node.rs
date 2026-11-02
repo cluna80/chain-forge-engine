@@ -463,11 +463,12 @@ impl PersistStartup {
 }
 
 /// The snapshot identity of a genesis: its `chain_id` and the shared
-/// `chain_forge_core::genesis_hash_hex` (the one definition, reused by H0-8).
+/// `chain_forge_core::compute_genesis_hash` (the single definition, from H0-8; it also
+/// feeds the peer handshake and the transaction signing domain, so it must not be forked).
 pub(crate) fn snapshot_identity_of(genesis: &GenesisConfig) -> crate::persistence::SnapshotIdentity {
     crate::persistence::SnapshotIdentity {
         chain_id:     genesis.chain_id.clone(),
-        genesis_hash: chain_forge_core::genesis_hash_hex(genesis),
+        genesis_hash: chain_forge_core::compute_genesis_hash(genesis),
     }
 }
 
@@ -14343,7 +14344,7 @@ mod p02a_gaps {
         // Constraint: the recorded identity comes from the genesis the node was
         // RUNNING, through the one shared function — not from anything else.
         let g = chain_forge_core::GenesisConfig::from_json(GENESIS).unwrap();
-        assert_eq!(gh, chain_forge_core::genesis_hash_hex(&g), "genesis_hash must be the shared function's value for the running genesis");
+        assert_eq!(gh, chain_forge_core::compute_genesis_hash(&g), "genesis_hash must be compute_genesis_hash's value for the running genesis");
         assert_eq!(m["chain_id"].as_str().unwrap(), g.chain_id);
         assert!(restart_with(&dir, GENESIS).await.is_restored(), "same genesis must restore");
         let _ = std::fs::remove_dir_all(&dir);

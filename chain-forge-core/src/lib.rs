@@ -268,59 +268,6 @@ impl std::fmt::Display for Address {
 // These structs mirror the JSON produced by the Chain Forge wizard exactly.
 // Field names use serde rename_all = "snake_case" to match the JSON keys.
 
-/// Canonical JSON for a value: object keys sorted bytewise (UTF-8), no
-/// whitespace, arrays in order. Identical for any key order or formatting of
-/// the same data. Used for hashes that must agree across nodes and releases.
-pub fn canonical_json(value: &serde_json::Value) -> String {
-    fn write(v: &serde_json::Value, out: &mut String) {
-        match v {
-            serde_json::Value::Object(m) => {
-                let mut keys: Vec<&String> = m.keys().collect();
-                keys.sort();
-                out.push('{');
-                for (i, k) in keys.iter().enumerate() {
-                    if i > 0 { out.push(','); }
-                    out.push_str(&serde_json::to_string(k).expect("string serializes"));
-                    out.push(':');
-                    write(&m[k.as_str()], out);
-                }
-                out.push('}');
-            }
-            serde_json::Value::Array(a) => {
-                out.push('[');
-                for (i, x) in a.iter().enumerate() {
-                    if i > 0 { out.push(','); }
-                    write(x, out);
-                }
-                out.push(']');
-            }
-            other => out.push_str(&serde_json::to_string(other).expect("scalar serializes")),
-        }
-    }
-    let mut out = String::new();
-    write(value, &mut out);
-    out
-}
-
-/// The single definition of a chain's genesis hash: SHA-256 over the UTF-8
-/// bytes of the canonical JSON (sorted keys, no whitespace) of the parsed
-/// `GenesisConfig`. Whitespace and key order in the genesis file do not matter;
-/// any change to a field this node understands does. Fields the node ignores
-/// (unknown keys) are not part of the hash. Persistence and the H0-8 peer check
-/// must both use this function and never re-implement it.
-pub fn genesis_hash(genesis: &GenesisConfig) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let value = serde_json::to_value(genesis).expect("GenesisConfig serializes");
-    let mut h = Sha256::new();
-    h.update(canonical_json(&value).as_bytes());
-    h.finalize().into()
-}
-
-/// `genesis_hash` as 64 lowercase hex characters.
-pub fn genesis_hash_hex(genesis: &GenesisConfig) -> String {
-    genesis_hash(genesis).iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisConfig {
     pub chain_id:        String,
@@ -2028,20 +1975,13 @@ mod tests {
         assert!(err.contains("validator_epoch_blocks"), "{err}");
     }
 
-    // ── genesis_hash: the single shared definition (H0-3b, reused by H0-8) ──
+    // ── compute_genesis_hash: the single definition (H0-8), now also used by the
+    //    persistence manifest (H0-3b). These pin the properties persistence relies on.
 
     #[test]
-    fn canonical_json_sorts_keys_and_has_no_whitespace() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{ "b": [1, {"y": 2, "x": 1}], "a": "z" , "c": null }"#).unwrap();
-        assert_eq!(canonical_json(&v), r#"{"a":"z","b":[1,{"x":1,"y":2}],"c":null}"#);
-    }
-
-    #[test]
-    fn genesis_hash_ignores_formatting_and_key_order() {
+    fn compute_genesis_hash_ignores_file_formatting_and_key_order() {
         let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
         let pretty = cfg.to_json_pretty().unwrap();
-        // Re-serialize compactly with the top-level keys reversed.
         let v: serde_json::Value = serde_json::from_str(&pretty).unwrap();
         let mut entries: Vec<_> = v.as_object().unwrap().iter().collect();
         entries.reverse();
@@ -2050,17 +1990,17 @@ mod tests {
         assert_ne!(pretty, reordered);
         let a = GenesisConfig::from_json(&pretty).unwrap();
         let b = GenesisConfig::from_json(&reordered).unwrap();
-        assert_eq!(genesis_hash(&a), genesis_hash(&b));
-        assert_eq!(genesis_hash(&a), genesis_hash(&cfg));
+        assert_eq!(compute_genesis_hash(&a), compute_genesis_hash(&b));
+        assert_eq!(compute_genesis_hash(&a), compute_genesis_hash(&cfg));
     }
 
     #[test]
-    fn genesis_hash_changes_when_a_field_changes_and_is_64_hex() {
+    fn compute_genesis_hash_changes_when_a_field_changes_and_is_64_lowercase_hex() {
         let a = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
         let mut b = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
         b.genesis_time = format!("{}-changed", b.genesis_time);
-        assert_ne!(genesis_hash(&a), genesis_hash(&b));
-        let hex = genesis_hash_hex(&a);
+        assert_ne!(compute_genesis_hash(&a), compute_genesis_hash(&b));
+        let hex = compute_genesis_hash(&a);
         assert_eq!(hex.len(), 64);
         assert!(hex.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
     }
