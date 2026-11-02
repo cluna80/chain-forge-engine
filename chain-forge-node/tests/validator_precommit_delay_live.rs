@@ -339,7 +339,13 @@ fn delays_for(default: &[u64]) -> Vec<u64> {
         .unwrap_or_else(|| default.to_vec())
 }
 
+/// The idle and loaded experiments each start four nodes and are timing measurements:
+/// running them at the same time (cargo runs tests in parallel) doubles the load on the
+/// machine and invalidates both. They take this lock so they always run one after the other.
+static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run(loaded: bool) {
+    let _exclusive = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
     if !node_bin().exists() { eprintln!("SKIP: node binary missing"); return; }
     let delays = delays_for(if loaded { &LOADED_DELAYS_MS } else { &IDLE_DELAYS_MS });
     let t0 = Instant::now();
@@ -500,11 +506,14 @@ fn run(loaded: bool) {
             rows.iter().filter(|r| r.omitted > 0).map(|r| r.since_commit).collect::<Vec<_>>());
     }
     if !loaded {
-        assert_eq!(rows[0].omitted, 0, "no delay: never omitted");
-        assert_eq!(rows[1].omitted, 0, "500 ms is inside the collection window: never omitted");
-        let last = rows.last().unwrap();
-        let networked = last.blocks - last.own;
-        assert!(last.omitted * 10 >= networked * 9, "a 4.5 s delay should be omitted from >= 90% of networked blocks, got {}/{}", last.omitted, networked);
+        // Looked up by delay so a CF_DELAY_TEST_DELAYS override cannot cause a false failure.
+        for r in rows.iter().filter(|r| r.delay <= 500) {
+            assert_eq!(r.omitted, 0, "{} ms is inside the idle collection window: never omitted", r.delay);
+        }
+        for r in rows.iter().filter(|r| r.delay >= 4000) {
+            let networked = r.blocks - r.own;
+            assert!(r.omitted * 10 >= networked * 9, "a {} ms delay should be omitted from >= 90% of networked blocks, got {}/{}", r.delay, r.omitted, networked);
+        }
     }
     let dave = get(api[0], "/api/validators/status").and_then(|v| v.as_array().cloned()).unwrap()
         .into_iter().find(|v| v["id"].as_str() == Some(DAVE)).unwrap();
