@@ -5559,6 +5559,13 @@ impl Node {
         let payload = self.block_payload(height);
         let txs = payload.txs.clone();
         let tx_bytes = payload.encode();
+        #[cfg(feature = "fault-injection")]
+        info!(target: "cf_fault", height, round,
+              mempool = self.mempool.len(),
+              since_commit_ms = self.last_commit_at.map_or(0, |t| t.elapsed().as_millis() as u64),
+              evidence_precommits = payload.last_commit.as_ref().map_or(0, |c| c.precommits.len()),
+              included_txs = txs.len(),
+              "propose context");
         let parent = BlockHash(format!("genesis_h{height}"));
         match self.consensus.propose(height, round, parent, tx_bytes).await {
             Ok(proposal) => {
@@ -5589,6 +5596,13 @@ impl Node {
         let payload = self.block_payload(height);
         let txs = payload.txs.clone();
         let tx_bytes = payload.encode();
+        #[cfg(feature = "fault-injection")]
+        info!(target: "cf_fault", height, round,
+              mempool = self.mempool.len(),
+              since_commit_ms = self.last_commit_at.map_or(0, |t| t.elapsed().as_millis() as u64),
+              evidence_precommits = payload.last_commit.as_ref().map_or(0, |c| c.precommits.len()),
+              included_txs = txs.len(),
+              "propose context");
 
         let proposal = self.consensus
             .propose(height, round, parent_hash, tx_bytes)
