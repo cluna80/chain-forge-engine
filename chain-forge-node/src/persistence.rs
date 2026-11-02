@@ -435,6 +435,73 @@ pub fn load_snapshot(data_dir: &Path) -> Result<Option<SnapshotContents>, Persis
     }))
 }
 
+// ── legacy (pre-H0-3) data directory migration ───────────────────────────────
+
+/// Subdirectory of `persist/` that receives the legacy files after a
+/// successful migration. They are moved, never deleted.
+pub const LEGACY_ARCHIVE_DIR: &str = "legacy-pre-h0-3";
+
+/// True if `<data_dir>/persist/` holds any file of the pre-H0-3 layout.
+fn has_legacy_files(data_dir: &Path) -> bool {
+    let persist = data_dir.join("persist");
+    SNAPSHOT_FILES.iter().any(|f| persist.join(f).exists())
+}
+
+/// Migrate a pre-H0-3 data directory (eight pretty-JSON files directly under
+/// `persist/`, no `CURRENT`) into the generation layout.
+///
+/// Strict by design: a legacy directory is committed state, so it either
+/// migrates completely or the node refuses to start. It never becomes a
+/// fresh genesis start.
+///   * every one of the eight files must exist (any absent file is
+///     `MissingFile`, including `state.json`, and `live_validator_set.json`);
+///   * every file must parse as JSON (`CorruptFile`);
+///   * `state.json` must carry a numeric `height`.
+/// The migrated generation is then verified by the ordinary `load_snapshot`
+/// path (hashes, manifest, height cross-checks). On success the legacy files
+/// are moved to `persist/legacy-pre-h0-3/`.
+///
+/// Returns `Ok(None)` when `CURRENT` already exists (nothing to migrate) or
+/// when no legacy file is present (a genuinely fresh directory).
+pub fn migrate_legacy(data_dir: &Path) -> Result<Option<String>, PersistError> {
+    if read_current(data_dir).map_err(PersistError::Io)?.is_some() { return Ok(None); }
+    if !has_legacy_files(data_dir) { return Ok(None); }
+
+    let persist = data_dir.join("persist");
+    let mut contents: Vec<(&str, Vec<u8>)> = Vec::with_capacity(SNAPSHOT_FILES.len());
+    let mut height: Option<u64> = None;
+    for &name in SNAPSHOT_FILES {
+        let path = persist.join(name);
+        if !path.exists() {
+            return Err(PersistError::MissingFile { gen: "legacy".into(), file: name.into() });
+        }
+        let bytes = std::fs::read(&path).map_err(PersistError::Io)?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            PersistError::CorruptFile { gen: "legacy".into(), file: name.into(), detail: e.to_string() }
+        })?;
+        if name == "state.json" {
+            height = value["height"].as_u64();
+        }
+        contents.push((name, bytes));
+    }
+    let height = height.ok_or_else(|| PersistError::CorruptFile {
+        gen: "legacy".into(),
+        file: "state.json".into(),
+        detail: "no numeric `height` field".into(),
+    })?;
+
+    let gen = write_snapshot(data_dir, height, &contents)?;
+
+    // The new generation exists and CURRENT points at it. Archive (move) the
+    // legacy files so a future start cannot mistake them for current state.
+    let archive = persist.join(LEGACY_ARCHIVE_DIR);
+    std::fs::create_dir_all(&archive).map_err(PersistError::Io)?;
+    for &name in SNAPSHOT_FILES {
+        std::fs::rename(persist.join(name), archive.join(name)).map_err(PersistError::Io)?;
+    }
+    Ok(Some(gen))
+}
+
 // ── signing history compatibility ─────────────────────────────────────────────
 
 /// Validate that the consensus signing guard is compatible with the restored
