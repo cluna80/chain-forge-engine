@@ -329,8 +329,25 @@ fn validator_eviction_live() {
                 "node{i} ({}) API did not come up on :{p}\n--- last 40 log lines ---\n{}\n---",
                 node_names[i], tail_log(&tmp, node_names[i], 40));
     }
-    assert!(wait_for_height(ports.alice_api, 3, Duration::from_secs(30)),
-            "devnet did not reach height 3");
+    // Poll all 4 nodes; require all of them to reach height 3 (same as validator_key_live).
+    // Give 60 s — Windows under concurrent test load can be slow to form consensus.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let hs: Vec<u64> = all_api.iter().map(|&p| height(p)).collect();
+        print!("\r   heights: alice={} bob={} carol={} dave={}   ",
+               hs[0], hs[1], hs[2], hs[3]);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if hs.iter().all(|&h| h >= 3) { println!(); break; }
+        if Instant::now() >= deadline {
+            println!();
+            for (i, name) in node_names.iter().enumerate() {
+                eprintln!("--- {} log tail ---\n{}", name, tail_log(&tmp, name, 40));
+            }
+            panic!("devnet did not reach height 3 within 60s (heights: alice={} bob={} carol={} dave={})",
+                   hs[0], hs[1], hs[2], hs[3]);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
     println!("   Devnet ready at height {}.", height(ports.alice_api));
 
     // ── Phase 0b: genesis validators bond so quorum stays correct ────────────
