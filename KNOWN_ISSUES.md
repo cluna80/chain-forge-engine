@@ -565,6 +565,12 @@ Safety net, written and run against the ORIGINAL code first (commit d79c81f), un
 All of these pass on the optimized code. State crate 73 passed; execution crate 141 passed; node unit suite
 280 passed with the one known unrelated failure (§7).
 
+Live multi-node checks on the optimized build (sandbox, 4 real node processes): `validator_jail_live` JL-01..JL-09
+PASSED (643 s) with state roots IDENTICAL to the pre-change runs at JL-01 (`51136494701f`), JL-06 (`eebbee537f59`)
+and JL-09 (`33362db6f1e0`), including Dave replaying the whole chain from peers to the same state;
+`validator_eviction_live` EV-01..EV-03 PASSED (95 s), same root as the pre-change sandbox run (`1f2b492f...`).
+Windows regression of this branch: pending.
+
 Tree-only release benchmark (12 accounts, 3 updates per version), microseconds per commit:
 | Versions | Original | Indexed |
 | --- | --- | --- |
