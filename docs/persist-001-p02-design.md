@@ -159,3 +159,24 @@ Durable state alone is not enough: after a crash a validator must not be able to
 - Whether `NodeStore`'s `wal` is persisted or usable for delta journalling.
 - Directory-fsync behaviour on Windows through the standard library.
 - Whether any tooling or test reads the legacy `persist/*.json` file names directly.
+
+## 13. Relationship to PR #41 (H0-3 atomic persistence) — review 2026-11-02
+
+PR #41 (`security/h0-3-atomic-state-persistence`, open, never merged) already implements most of P-02a, and `main`'s ROADMAP marks H0-3 ✅ on the strength of it although the code is not on `main`. Review of `persistence.rs` and its `node.rs`/`main.rs` use, read from the branch (not run here):
+
+**Matches P-02a:** generation directories under `snapshots/`; `manifest.json` written last with per-file SHA-256 and size; `CURRENT` updated atomically; the previous generation kept (N, N-1); load verifies every file and cross-checks the manifest height against `state.json` and `chain_store.json`; a damaged or missing committed generation, a lost `CURRENT` beside existing generations, and an unreadable signing guard are all fatal (`exit(1)`); snapshot write errors halt consensus instead of being ignored; a guard ahead of the state blocks signing.
+
+**Gaps against P-02 (to close before or while merging):**
+1. **Legacy data directories.** No migration. A directory with the old `persist/*.json` files and no `CURRENT` loads as `Fresh` and silently starts from genesis (verified by reading `load_snapshot`). Violates the key invariant for every existing devnet directory (§7).
+2. **D6.** The `Fresh` path returns before the signing guard is examined, so a guard with no chain state is not fatal. A chain state with no guard is also accepted (`if signing_path.exists()`).
+3. **D5.** The manifest has no `format_version`, chain id or genesis hash.
+4. **No root check.** The restored state root is not compared with a recorded root.
+5. **Windows.** `fsync_dir` is a no-op off Unix on the assumption that the NTFS journal gives the same guarantee. Unverified (§12); retry/backoff for transient sharing violations is also absent.
+6. **Recovery never uses N-1.** It is kept, but a damaged current generation is fatal. That agrees with §6 (a damaged committed generation is CORRUPT); the retained generation then serves only operator recovery. Confirm intent.
+7. **`GuardAheadOfState`** exits the process with "sync from peers", but an exited node cannot sync. §8.1 rule 4 (re-vote the same block or abstain) is not what it does. Needs a decision.
+8. **Cost (§9) is not addressed** and probably worsens per-block latency: eight files are each written, fsynced and hashed every block, on the consensus loop. Not measured.
+9. **Scope.** The PR also adds an unrelated `--expect-peers` flag and changes the node constructor.
+
+**Integration facts:** #41 diverges from `main` by 13/15 commits; a merge dry-run conflicts only in `ROADMAP.md` and `chain-forge-node/Cargo.toml` (`node.rs` merges automatically). It changes `persist_state()` to return `Result` and `load_persisted_state()` to return `PersistStartup`; the H0-11 branch has 40 call sites (mostly tests) that would need updating, so #41 should land before H0-11.
+
+**Consequence for P-02:** P-02a shrinks to "rebase #41, close gaps 1-5 and 7, correct the ROADMAP". P-02b (journal, cost) is unchanged.
