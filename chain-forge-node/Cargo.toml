@@ -115,6 +115,10 @@ name = "validator_jail_live"
 path = "tests/validator_jail_live.rs"
 
 [[test]]
+name = "validator_liveness_integrity_live"
+path = "tests/validator_liveness_integrity_live.rs"
+
+[[test]]
 name = "dis_parity"
 path = "tests/dis_parity.rs"
 

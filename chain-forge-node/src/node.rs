@@ -6945,6 +6945,85 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        // -- H0-11B evidence integrity (FP-02): late precommits ----------------
+
+        fn precommitters(c: &CommitCertificate) -> std::collections::BTreeSet<String> {
+            c.precommits.iter().map(|v| v.validator.0.clone()).collect()
+        }
+
+        /// Commit height 0 with three precommits; Dave's arrives afterwards.
+        async fn node_with_dave_late() -> (Node, BlockProposal, Vote) {
+            let mut n = liveness_node(1_000).await;
+            let root = n.state.current_root().map(str::to_string);
+            let p0 = proposal(0, payload(None, root.as_deref()));
+            deliver(&mut n, &p0, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            let evidence = n.last_commit_evidence.clone().expect("block 0 committed");
+            assert!(!precommitters(&evidence).contains("qcb1dave"), "Dave has not precommitted yet");
+            let late = signed_vote(CHAIN, VoteType::Precommit, 0, 0, "qcb1dave", p0.block_hash.clone());
+            (n, p0, late)
+        }
+
+        /// A valid precommit that reaches the proposer before it builds the next
+        /// block is published as evidence of participation.
+        #[tokio::test]
+        async fn late_precommit_before_the_next_proposal_is_published() {
+            let (mut n, _, late) = node_with_dave_late().await;
+            n.absorb_late_precommit(&late);
+            let lc = n.block_payload(1).last_commit.expect("height 1 carries evidence");
+            assert!(precommitters(&lc).contains("qcb1dave"), "{:?}", precommitters(&lc));
+        }
+
+        /// The same valid precommit, arriving after the proposal was built, is
+        /// absent from that block's committed evidence -- so a LIVE validator is
+        /// recorded as a miss. Timing alone changes the liveness record.
+        #[tokio::test]
+        async fn late_precommit_after_the_proposal_is_built_counts_as_a_miss() {
+            // Control: the precommit arrives in time.
+            let (mut n, _, late) = node_with_dave_late().await;
+            n.absorb_late_precommit(&late);
+            let tx_data = n.block_payload(1).encode();
+            deliver(&mut n, &proposal(1, tx_data), &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert_eq!(n.slasher.liveness_snapshot("qcb1dave"), Some((1, 0)), "in time: no miss");
+
+            // Same precommit, a moment too late.
+            let (mut n, _, late) = node_with_dave_late().await;
+            let tx_data = n.block_payload(1).encode();
+            n.absorb_late_precommit(&late);
+            deliver(&mut n, &proposal(1, tx_data), &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert_eq!(n.slasher.liveness_snapshot("qcb1dave"), Some((1, 100)),
+                "too late: the live validator is recorded as having missed the block");
+            assert_eq!(n.slasher.liveness_snapshot("qcb1alice"), Some((1, 0)));
+        }
+
+        /// The proposer waits for every power-holding validator's precommit, but
+        /// only up to COMMIT_GATHER_MS after its own commit.
+        #[tokio::test]
+        async fn proposer_waits_for_the_missing_precommit_only_up_to_the_gather_window() {
+            let (mut n, _, late) = node_with_dave_late().await;
+            n.last_commit_at = Some(std::time::Instant::now());
+            assert!(!n.last_commit_ready(), "3 of 4 precommits just in: keep waiting for the fourth");
+
+            let past = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(COMMIT_GATHER_MS as u64 + 50)).unwrap();
+            n.last_commit_at = Some(past);
+            assert!(n.last_commit_ready(), "after COMMIT_GATHER_MS the proposer gives up on the missing precommit");
+
+            n.absorb_late_precommit(&late);
+            n.last_commit_at = Some(std::time::Instant::now());
+            assert!(n.last_commit_ready(), "all four in: no need to wait");
+        }
+
+        /// Only a precommit for the SAME round that committed is absorbed; a
+        /// validator that precommitted in another round is recorded as missing.
+        #[tokio::test]
+        async fn precommit_from_another_round_is_not_published() {
+            let (mut n, p0, _) = node_with_dave_late().await;
+            let other_round = signed_vote(CHAIN, VoteType::Precommit, 0, 1, "qcb1dave", p0.block_hash.clone());
+            n.absorb_late_precommit(&other_round);
+            let lc = n.block_payload(1).last_commit.unwrap();
+            assert!(!precommitters(&lc).contains("qcb1dave"));
+        }
+
         /// Enforcement must never leave the chain with no committee at all.
         #[tokio::test]
         async fn jailing_every_validator_never_empties_the_committee() {
