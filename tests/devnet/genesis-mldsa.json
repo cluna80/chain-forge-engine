@@ -26,7 +26,8 @@
     "parallel_execution": false,
     "gas_model": "dynamic",
     "require_signatures": true,
-    "_comment": "require_signatures: true is the key difference from genesis-val002.json — this fixture enforces ML-DSA-65 signature verification on all non-admin tx types (P0-3/P0-6 acceptance criteria)."
+    "_comment": "require_signatures: true is the key difference from genesis-val002.json — this fixture enforces ML-DSA-65 signature verification on all non-admin tx types (P0-3/P0-6 acceptance criteria).",
+    "allow_zero_recovery_timelock": true
   },
   "cryptography": {
     "signature_scheme": "hybrid",

@@ -680,6 +680,20 @@ pub struct GenesisExecution {
     /// Defaults to 70% validators / 20% treasury / 10% burn.
     #[serde(default)]
     pub fee_distribution_bps: Option<FeeDistributionBps>,
+
+    /// DIS-003E: number of blocks a pending recovery must remain unchallenged
+    /// before the block-end sweep activates it.  MUST be nonzero in production.
+    /// Defaults to 0 when absent (not present in genesis), which will cause
+    /// `ExecutionConfig::from_genesis` to panic unless
+    /// `allow_zero_recovery_timelock` is also set to true.
+    #[serde(default)]
+    pub recovery_timelock_blocks: u64,
+
+    /// DIS-003E: explicit opt-in to allow `recovery_timelock_blocks = 0`.
+    /// Set `true` only in dev/test genesis files. Production genesis MUST
+    /// omit this (defaults to `false`) and set a nonzero timelock.
+    #[serde(default)]
+    pub allow_zero_recovery_timelock: bool,
 }
 
 /// Basis-point split for collected transaction fees.
@@ -1080,6 +1094,23 @@ impl GenesisConfig {
         self.cryptography.validator_scheme == "ml-dsa-65"
     }
 
+    /// DIS-003E: the recovery timelock in blocks. Hard validation: the node
+    /// refuses to start on `Err`. A timelock of 0 (recovery takes effect
+    /// immediately) is refused unless `execution.allow_zero_recovery_timelock`
+    /// opts in, which only dev/test genesis files may do.
+    pub fn recovery_timelock_blocks(&self) -> Result<u64, String> {
+        let e = &self.execution;
+        if e.recovery_timelock_blocks == 0 && !e.allow_zero_recovery_timelock {
+            return Err(format!(
+                "DIS-003E: genesis chain_id={} has execution.recovery_timelock_blocks = 0 \
+                 but allow_zero_recovery_timelock is not set; production genesis must set \
+                 a nonzero timelock (dev/test only: allow_zero_recovery_timelock = true)",
+                self.chain_id
+            ));
+        }
+        Ok(e.recovery_timelock_blocks)
+    }
+
     /// Resolve `cryptography.signature_scheme` into the account signature
     /// policy. Hard validation: the node refuses to start on `Err`, so an
     /// unknown scheme, or a PQ-only chain whose algorithm has no live
@@ -1294,6 +1325,23 @@ mod tests {
         ] {
             assert!(genesis_with_liveness(Some(bad.clone())).liveness_params().is_err(), "{bad}");
         }
+    }
+
+    // -- DIS-003E recovery timelock ------------------------------------------
+
+    fn genesis_with_timelock(blocks: u64, allow_zero: Option<bool>) -> GenesisConfig {
+        let mut v: serde_json::Value = serde_json::from_str(minimal_genesis_json()).unwrap();
+        v["execution"]["recovery_timelock_blocks"] = blocks.into();
+        if let Some(a) = allow_zero { v["execution"]["allow_zero_recovery_timelock"] = a.into(); }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn zero_recovery_timelock_needs_an_explicit_opt_in() {
+        assert!(genesis_with_timelock(0, None).recovery_timelock_blocks().is_err());
+        assert!(genesis_with_timelock(0, Some(false)).recovery_timelock_blocks().is_err());
+        assert_eq!(genesis_with_timelock(0, Some(true)).recovery_timelock_blocks(), Ok(0));
+        assert_eq!(genesis_with_timelock(720, None).recovery_timelock_blocks(), Ok(720));
     }
 
     // -- Account signature policy (cryptography.signature_scheme) -------------

@@ -304,6 +304,15 @@ pub struct AccountSummary {
     /// and UpdateGuardianPolicy. Never reset to zero.
     #[serde(default)]
     pub policy_generation: u64,
+    /// DIS-003E: pending two-phase key recovery, or null if none.
+    /// Set by RecoverAccountKey; cleared on activation or after EnrollRecoveryPolicy
+    /// auto-cancels it.  `cancelled: true` means the window closed without activation.
+    #[serde(default)]
+    pub pending_recovery: Option<chain_forge_state::PendingRecovery>,
+    /// DIS-002A/B/003E: hex-encoded current account public key, or empty string if unbound.
+    /// Updated by RotateAccountKey and by the sweep_pending_recoveries activation sweep.
+    #[serde(default)]
+    pub public_key: String,
 }
 
 /// Voting-power snapshot for one validator.
@@ -815,6 +824,8 @@ pub(crate) fn tx_kind_label(body: &chain_forge_execution::TxBody) -> &'static st
         TxBody::RevokeRecoveryPolicy             => "revoke_recovery_policy",
         // DIS-003B: guardian set replacement
         TxBody::UpdateGuardianPolicy { .. }      => "update_guardian_policy",
+        // DIS-003E: cancel a pending recovery
+        TxBody::CancelRecovery                   => "cancel_recovery",
     }
 }
 
@@ -876,6 +887,7 @@ impl Node {
         // boot into a validator set that can never vote.
         genesis.validate_validator_keys().map_err(NodeError::Genesis)?;
         genesis.account_signature_policy().map_err(NodeError::Genesis)?;
+        genesis.recovery_timelock_blocks().map_err(NodeError::Genesis)?;
 
         // Hard error, in every environment: an accepted-but-nonsensical
         // `validator_bonding` override (zero minimum bond, zero epoch
@@ -1512,6 +1524,8 @@ impl Node {
                     attested_by:       vec![],
                     key_version:    acct.key_version,
                     policy_generation: acct.policy_generation,
+                    pending_recovery: acct.pending_recovery.clone(),
+                    public_key: acct.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
         }
@@ -2445,6 +2459,8 @@ impl Node {
                         attested_by:       att_by,
                         key_version:    a.key_version,
                     policy_generation: a.policy_generation,
+                        pending_recovery: a.pending_recovery.clone(),
+                        public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                     });
                 }
 
@@ -4990,6 +5006,8 @@ impl Node {
                     attested_by:       att_by,
                     key_version:    a.key_version,
                     policy_generation: a.policy_generation,
+                    pending_recovery: a.pending_recovery.clone(),
+                    public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
 
@@ -6273,6 +6291,8 @@ impl Node {
                     attested_by:       att_by,
                     key_version:    a.key_version,
                     policy_generation: a.policy_generation,
+                    pending_recovery: a.pending_recovery.clone(),
+                    public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
 
@@ -6314,7 +6334,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
@@ -9655,7 +9675,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 5, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": true },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": true, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "cs001-p7-net", "p2p_port": 27100, "rpc_port": 27101, "bootstrap_nodes": [], "peer_discovery": "bootstrap", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },
@@ -12896,7 +12916,7 @@ mod tests {
         "native_token": { "name": "QuarkCharm", "symbol": "QCB", "denom": "uqcb", "max_supply": "210000000" },
         "address_prefix": "qcb",
         "consensus": { "type": "proof-of-stake", "validator_set_size": 4, "block_time_ms": 1000, "personhood_weighted": true },
-        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false },
+        "execution": { "state_model": "account", "parallel_execution": false, "gas_model": "dynamic", "require_signatures": false, "allow_zero_recovery_timelock": true },
         "cryptography": { "signature_scheme": "hybrid", "pqc_algorithm": "ml-dsa", "migration_trigger": "nist-guidance", "hash_width": 256, "validator_scheme": "pqc-native" },
         "network": { "network_id": "qcb-devnet", "p2p_port": 26656, "rpc_port": 26657, "bootstrap_nodes": [], "peer_discovery": "mdns", "max_peers": 10 },
         "limits": { "max_block_bytes": 1048576, "max_tx_bytes": 65536, "block_gas_limit": 10000000, "mempool_size": 100, "mempool_ttl_seconds": 60 },

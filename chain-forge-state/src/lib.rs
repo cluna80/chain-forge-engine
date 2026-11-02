@@ -95,6 +95,43 @@ pub struct AccountState {
     /// policy that happens to share the same guardian set.
     #[serde(default)]
     pub policy_generation: u64,
+    /// DIS-003E: pending two-phase recovery commit. Set when a valid
+    /// `RecoverAccountKey` tx is accepted. Cleared (and key replaced) by the
+    /// block-end sweep at `activation_height` if not cancelled, or cleared with
+    /// `cancelled = true` by a `CancelRecovery` tx from the current account key.
+    #[serde(default)]
+    pub pending_recovery: Option<PendingRecovery>,
+}
+
+/// DIS-003E: a pending two-phase recovery, set when a valid `RecoverAccountKey`
+/// tx is accepted and the chain has a nonzero `recovery_timelock_blocks`.
+/// The block-end sweep at `activation_height` activates it (replacing the key)
+/// unless `cancelled = true` has been set by a `CancelRecovery` tx.
+///
+/// Once `cancelled = true`, no code path may clear that flag back to false.
+/// A new recovery requires a new `RecoverAccountKey` submission.
+///
+/// `PendingRecovery` is persisted to chain state and survives node restarts;
+/// every validator's sweep at `activation_height` produces an identical result
+/// (deterministic activation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingRecovery {
+    /// The replacement ML-DSA-65 public key proposed by the recovery tx.
+    pub new_public_key:   Vec<u8>,
+    /// Must be "ml-dsa-65".
+    pub new_key_scheme:   String,
+    /// The `key_version` value that will be set on activation (current + 1).
+    pub key_version:      u32,
+    /// Block height at which this recovery was submitted.
+    pub submitted_at_height: u64,
+    /// Block height at or after which the sweep may activate this recovery.
+    /// Equals `submitted_at_height + recovery_timelock_blocks`.
+    pub activation_height:   u64,
+    /// The `policy_id` from the `RecoverAccountKey` tx (for audit trail).
+    pub policy_id: u64,
+    /// Set to `true` by a valid `CancelRecovery` tx. Once true, cannot be
+    /// cleared — the sweep ignores cancelled recoveries permanently.
+    pub cancelled: bool,
 }
 
 /// An enrolled threshold-guardian recovery policy for lost-device recovery.
@@ -139,6 +176,7 @@ impl AccountState {
             escrow: None,
             recovery_policy: None,
             policy_generation: 0,
+            pending_recovery: None,
         }
     }
 
@@ -157,6 +195,7 @@ impl AccountState {
             escrow: None,
             recovery_policy: None,
             policy_generation: 0,
+            pending_recovery: None,
         }
     }
 

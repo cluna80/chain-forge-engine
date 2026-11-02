@@ -25,7 +25,8 @@
     "state_model": "account",
     "parallel_execution": false,
     "gas_model": "dynamic",
-    "require_signatures": false
+    "require_signatures": false,
+    "allow_zero_recovery_timelock": true
   },
   "cryptography": {
     "signature_scheme": "pqc-native",
