@@ -66,6 +66,10 @@ zk-vrc = ["chain-forge-personhood"]
 # weaker than production (identity.insecure_dev_identity_overrides).
 # Never enable for testnet or mainnet builds.
 insecure-dev-quorum = ["chain-forge-core/insecure-dev-quorum"]
+# Test-only: lets integration tests delay a validator's precommit arrival at a
+# node (see src/fault.rs). Inert unless CF_FAULT_CONTROL_FILE is set. Never enable
+# for testnet or mainnet builds.
+fault-injection = []
 default = ["real-network"]
 
 [dev-dependencies]
@@ -111,6 +115,18 @@ name = "validator_key_live"
 path = "tests/validator_key_live.rs"
 
 [[test]]
+name = "validator_eviction_live"
+path = "tests/validator_eviction_live.rs"
+
+[[test]]
+name = "validator_jail_live"
+path = "tests/validator_jail_live.rs"
+
+[[test]]
+name = "validator_liveness_integrity_live"
+path = "tests/validator_liveness_integrity_live.rs"
+
+[[test]]
 name = "dis_parity"
 path = "tests/dis_parity.rs"
 
@@ -137,3 +153,7 @@ path = "tests/h0_8_genesis_peer_verification_live.rs"
 [[test]]
 name = "h0_3_crash_recovery_live"
 path = "tests/h0_3_crash_recovery_live.rs"
+
+[[test]]
+name = "validator_precommit_delay_live"
+path = "tests/validator_precommit_delay_live.rs"

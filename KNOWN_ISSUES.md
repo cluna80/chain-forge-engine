@@ -215,6 +215,343 @@ This issue must be resolved before any of the following:
 
 ---
 
+## §6  `adversarial_gossip` integration test does not compile
+
+**Status: OPEN — pre-existing; found 2026-11-02 during H0-11B, reproduced on unmodified HEAD `f61f09c`**
+
+`cargo test -p chain-forge-node --test adversarial_gossip --no-run` fails:
+`error[E0063]: missing field 'genesis_hash' in initializer of 'NetworkConfig'`.
+`NetworkConfig` gained a `genesis_hash` field with the H0-8 genesis-hash peer
+check (`616bf0e`, `8fa0ecc`); `chain-forge-node/tests/adversarial_gossip.rs`
+was not updated. Until it is, `cargo test -p chain-forge-node` (no `--test`)
+cannot build every target, and its adversarial gossip coverage is not running.
+
+**Fix:** initialise `genesis_hash` in the test's `NetworkConfig` (and decide
+what value an adversarial peer should present).
+
+---
+
+## §7  `cs001_p7_mldsa_tx_accepted_during_and_after_migration` fails
+
+**Status: FIXED on `main` by #44 (`c26f572`, the test now sends from the key-derived address). Node suite: 0 failures since. Text below is the original finding (found 2026-11-02 during H0-11B, reproduced on `f61f09c`).**
+
+`node::tests::cs001_p7_mldsa_tx_accepted_during_and_after_migration` fails at
+the "ML-DSA-65 tx must be accepted during grace window" assertion with:
+`qcb1pquser has no bound key and is not derived from the signing key ...;
+bind the account's ML-DSA key in genesis or send from the derived address`.
+This looks like fallout from ML-DSA-only user accounts
+(`b43e973`, `signature_scheme = "pqc-native"`): the test sends from an
+account with no bound ML-DSA key. Unrelated to validator, jail or liveness
+code. It is the only failure in the node unit suite (274 of 275 pass).
+
+**Fix:** bind `qcb1pquser`'s ML-DSA key in the test genesis, or send from the
+derived address; then confirm the grace-window behaviour the test intends.
+
+---
+
+## §8  Liveness jailing can mis-jail a healthy validator that is merely late
+
+**Status: OPEN — measured 2026-11-02 (H0-11B evidence integrity). Automatic suspension must stay disabled in production genesis until a policy decision is made.**
+
+**Mechanism (confirmed in code, `node.rs` tests `late_precommit_*`; Windows 4 of 4, 2026-11-02)**
+Liveness is judged from the committed `last_commit` evidence the proposer
+assembled. The proposer waits for every power-holding validator's precommit,
+but only up to `COMMIT_GATHER_MS` (1,000 ms) after its own commit. A valid
+precommit that arrives after the proposer builds the next block is omitted
+and the live validator is recorded as a miss (`(1 observed, 100% missed)` vs
+`(1, 0%)` for the same vote arriving in time). A precommit for a different
+round than the one that committed is never published. Validators check the
+evidence is valid, not that it is complete.
+
+**What the policy does with a miss pattern**
+(real `LivenessWindow`, 100-block window, 20% threshold, f = 1, 4 validators; Windows 5 of 5, tables identical to the sandbox;
+`chain-forge-slashing/tests/liveness_false_positive.rs`)
+- Independent omission per block, P(jailed within 2,000 blocks):
+  0–5%: ~0%; 10%: 2.2%; 15%: 74%; ≥20%: 100%. A sharp cliff near 12–15%.
+- One isolated outage: ≤21 blocks never jails, ≥25 always does (~45 s at 2 s/block).
+- Byzantine proposers: ≤ f always-omitting proposers are fully discounted;
+  2 or more jail a healthy validator 100% of the time; 1 plus 10% honest-slow
+  noise jailed it in 22% of trials. The discount does not cover f + 1, nor
+  combined Byzantine and honest lateness.
+- A genuinely offline validator is jailed ~21 blocks after the window is full.
+
+**Measured on a real (loopback) 4-node network**
+(`validator_liveness_integrity_live`, sandbox 575 s; Windows/BossKing-confirmed 2026-11-02, 561 s, identical results)
+Worst plain miss for any healthy validator over a full 100-block window:
+0% idle, 0% under light load; all four nodes served identical validator
+status (including liveness windows) and state roots at 9 same-height checks.
+Limits: loopback only, so this bounds behaviour on a good network and says
+nothing about WAN delay; the "loaded" phase was light (a single sender can
+keep about one tx per block in flight under the nonce-gap guard; block time
+stayed ~2.4 s), so it did not exercise the 1 s collection window.
+
+**Measured with injected arrival delay** (`validator_precommit_delay_live`,
+cargo feature `fault-injection`, sandbox 2026-11-02; healthy Dave signs and
+sends on time, only its ARRIVAL at the other nodes is delayed; idle chain)
+Each row is 18 blocks; "omitted" is over blocks Dave did not propose himself.
+
+| Arrival delay | Reached proposer before it built the block | In committed evidence | Window recorded miss | Median margin (proposal built minus arrival) |
+| --- | --- | --- | --- | --- |
+| 0 ms | 13 of 13 | 18 of 18 | 0 | 2,147 ms |
+| 500 ms | 14 of 14 | 18 of 18 | 0 | 1,601 ms |
+| 900 ms | 14 of 14 | 18 of 18 | 0 | 1,202 ms |
+| 1,500 ms | 13 of 13 | 18 of 18 | 0 | 601 ms |
+| 2,200 ms | 5 of 13 | 10 of 18 | 8 | -104 ms |
+| 3,000 ms | 0 of 13 | 5 of 18 | 13 | -899 ms |
+| 4,500 ms | 1 of 14 (see note) | 4 of 18 | 14 | -2,400 ms |
+
+Windows/BossKing 2026-11-02 (`validator_precommit_delay_live`, 399.7 s) matches:
+omitted from committed evidence (all counted as misses by the window) 0 of 18 at
+0/500/900/1,500 ms; 6 of 18 at 2,200 ms (median margin +9 ms); 14 of 18 at
+3,000 ms; 13 of 18 at 4,500 ms. Median margin at zero delay 2,162 ms. The
+half-way point fell at 2,200 ms in the sandbox and just above it on Windows:
+the transition is gradual across roughly 2.1-3 s, so "the cliff" depends on the
+cut-off used, not on one sharp number.
+
+Findings: (1) Stages agree end to end: whenever a precommit reached the
+proposer before it built the block it was included, otherwise it was omitted,
+and the liveness window recorded a miss for exactly the omitted blocks.
+(2) On an idle chain the effective collection window is about 2.1 s (margin
+at zero delay is ~2.15 s and falls one-for-one with injected delay), not the
+1,000 ms `COMMIT_GATHER_MS`: the proposer also idles ~2 s with an empty
+mempool. Omission begins just beyond that and is nearly total by 3 s.
+(3) The cliff is therefore a property of proposer timing. With traffic the
+proposer builds sooner (1 s gate), so the tolerance should shrink; NOT yet
+measured. (4) One 4,500 ms row disagreed (arrival logged before the delayed
+delivery was written when the log was read: a measurement-edge artifact).
+
+Windows/BossKing, staggered load (commit af15c4a): idle PASSED (407 s; omitted 0 of 13-14 up to 1,500 ms,
+3 of 14 at 2,200 ms, 14 of 14 at 3,000 ms, 13 of 13 at 4,500 ms; interval 2.3 -> 2.6 s). Loaded run FAILED
+its 4x drift guard: median block interval 845 ms -> 1,148 / 1,618 / 1,760 / 2,935 / 3,482 / 5,148 ms
+(worst 6.1x) as the chain grew by only ~1,500 txs / ~170 blocks. Rows up to 1,500 ms ran at <= 2.9 s
+blocks and show omitted 0 of 11 (0 ms), 0 of 10 (500), 5 of 11 (900), 3 of 11 (1,200), 5 of 11 (1,500);
+later rows and the closing control (1 of 13 omitted at 0 ms delay) ran on a 3.5-5 s chain and are NOT
+usable for the cutoff. No omission was unattributed. Windows degrades much faster than the sandbox
+under identical load, which makes §9 (whole-chain rewrite on every commit) the practical blocker for
+any sustained-load measurement on the development platform.
+
+Sandbox, reduced load (16 accounts, ~1.6 tx/s, commit af15c4a+): PASSED (321 s); mempool non-empty at
+>= 60% of proposals in every row; block interval 1.4 s -> 1.3 s (worst 2.6 s, 1.9x); omitted 0 of 10
+(0 ms), 0 of 10 (500), 4 of 11 (900), 4 of 11 (1,200), 6 of 10 (1,500), 10 of 10 (2,200), 10 of 10
+(3,000), 0 of 10 (closing control); commit-to-proposal 851-1,074 ms in rows with omissions. Not yet
+run on Windows. Note the load is deliberately light (2-4 txs per block); this does not prove the
+evidence policy is safe under sustained production load (§9 prevents measuring that on one machine).
+
+Sandbox rerun after staggering the load (commit following 96e39d1; PASSED, 320 s; mempool
+non-empty at >= 60% of proposals in every row incl. the first; block-interval drift 1.7x,
+1.2 s -> 2.0 s worst): networked blocks omitted 0 of 11 (0 ms), 0 of 10 (500), 4 of 11 (900),
+6 of 10 (1,200), 6 of 10 (1,500), 11 of 11 (2,200), 10 of 10 (3,000), 0 of 11 (closing 0 ms
+control). Commit-to-proposal in the rows with omissions: 803 / 888 / 1,035 / 1,046 / 1,057 ms.
+Half omitted at 1,200 ms. This is the cleanest loaded sweep so far; the Windows run of this
+exact version is not yet done.
+
+Windows/BossKing, experiments serialized (commit 1bc5eab): idle experiment PASSED (396 s):
+omitted 0 of 13-14 up to 1,500 ms, 8 of 14 at 2,200 ms, 14 of 14 at 3,000 ms, 13 of 13 at
+4,500 ms; block interval flat at 2.3-2.4 s. Loaded experiment completed all eight rows but
+FAILED its own load bar on the first row (mempool non-empty at 8 of 14 proposals, bar 60%;
+all 32 load accounts started in one wave). Its data, with that caveat and a 2.0x block-
+interval drift (1.7 s -> 3.3 s): networked blocks omitted 0 of 10 (0 ms), 0 of 11 (500),
+2 of 10 (900), 5 of 10 (1,200), 4 of 10 (1,500), 8 of 11 (2,200), 9 of 11 (3,000), and
+0 of 10 for the closing 0 ms control; commit-to-proposal 1,081 / 1,100 / 1,051 / 1,047 ms
+in the 1,200 / 1,500 / 2,200 / 3,000 ms rows (the ~1 s gate). Same direction and the same
+gate as the sandbox; exact fractions differ, as expected.
+
+Windows/BossKing 2026-11-02 idle experiment of the instrumented test (427 s) passed
+and agrees with the sandbox (0 of 13-14 omitted up to 1,500 ms; 7 of 13 at 2,200 ms;
+13 of 13 at 3,000 and 4,500 ms; block interval 2.3-3.0 s). It ran at the same time
+as the loaded experiment because cargo runs tests in parallel, so treat it as
+confirmed in direction; the tests now serialize themselves (commit 1bc5eab). The
+loaded experiment's Windows run is INVALID for the same reason (eight nodes at
+once; interval 2.2 s -> 5.4 s) and must be rerun on its own.
+
+**Measured on a LOADED chain** (`validator_precommit_delay_loaded_live`, sandbox
+2026-11-02; mempool non-empty at the proposer in >= 60% of blocks in every row,
+~4.6 tx/s from 32 throttled accounts, ~5-11 txs per block). 14 blocks per row;
+"networked" = blocks Dave did not propose himself. Block interval drifted
+1.3 s -> 2.1 s (1.8x, worst 2.4 s) over the run because per-block persistence
+cost grows with chain length (§9), so rows are not strictly comparable; the
+first and last zero-delay controls both omitted 0 of 10.
+
+| Arrival delay | Omitted from committed evidence | Median commit-to-proposal |
+| --- | --- | --- |
+| 0 ms | 0 of 10 | 1,297 ms |
+| 500 ms | 0 of 10 | 1,016 ms |
+| 900 ms | 1 of 11 | 1,065 ms |
+| 1,200 ms | 3 of 11 | 1,188 ms |
+| 1,500 ms | 6 of 10 | 1,058 ms |
+| 2,200 ms | 8 of 10 | 1,085 ms |
+| 3,000 ms | 11 of 11 | 1,041 ms |
+| 0 ms (control, end) | 0 of 10 | 454 ms |
+
+Findings: (5) Under load the proposer gives up on a missing precommit about
+1.04-1.19 s after its own commit (the 1,000 ms `COMMIT_GATHER_MS` gate), in
+every row where anything was omitted, so the safe arrival window is about 1 s,
+half the idle chain's ~2.1 s. (6) Omission starts near 900 ms and passes half at
+1,500 ms; the exact fraction at a given delay varies run to run with how busy
+the proposer's event loop is (an earlier loaded run gave 12 of 13 at 1,500 ms,
+another 8 of 14). Treat the transition as ~0.9-1.5 s, not a sharp edge.
+(7) Every omission was attributable to the cutoff (received by the proposer,
+arrived after the block was built), the liveness window recorded a miss for
+exactly the omitted blocks, and all four nodes agreed on committed evidence
+and on the liveness state after every row.
+
+Consequence: a validator whose precommits regularly arrive more than ~1 s
+after the proposer's commit, on a busy chain, accumulates misses while fully
+participating; at ~35% omission a 20% threshold over 100 blocks jails it
+(see the policy cliff above).
+
+**Open decisions**
+1. Whether to require the policy to tolerate a measured WAN delay profile
+   (needs delay-injected or multi-host measurement).
+2. Whether the evidence rule should change (e.g. count a validator present if
+   its precommit appears in any committed block's evidence within N blocks).
+3. Whether the threshold/window should change; not decided here.
+4. The quorum-protection rule (removing a validator from 4 seats leaves f = 0).
+
+---
+
+## §9  Per-block persistence cost grows with chain length (blocks slow down under load)
+
+**Status: OPEN — pre-existing; found 2026-11-02 while measuring a loaded chain. Not fixed by P-02a (#48): every block still rewrites and fsyncs all eight files, and the cost has not been re-measured. PERSIST-001 P-02b is the planned fix.**
+
+`persist_state()` (called at the end of every `commit_block`) re-serializes
+the entire `chain_store` with `to_string_pretty` and rewrites it synchronously,
+on the consensus event loop, alongside several other whole-state files. The
+cost therefore grows with chain length and block size.
+
+Observed (4 local nodes, 40 single-in-flight senders, ~15-30 txs/block, no
+round timeouts, no warnings): `chain_store.json` reached 27 MB by height ~190,
+and the mean commit interval grew steadily from ~1.2 s (heights 25-75) to
+3.3 s (100-125), 5.3 s (125-150), 6.1 s (150-175) and 7.8 s (175-200). An idle
+chain stays at ~2.4 s/block. Block production, vote handling and the
+collection of late precommits all share that blocked loop.
+
+Effects: a sustained-load devnet slows quadratically; any timing-based
+measurement (e.g. the late-precommit window in §8) drifts unless the run is
+kept short or light. **Not fixed here** (outside H0-11B); candidate fixes are
+incremental/append-only block persistence and off-loop writes.
+
+---
+
+## §10  API nonce cache never leaves the NO_PRIOR_TX sentinel (101-transaction lifetime cap, no ingress replay check)
+
+**Status: OPEN — pre-existing; found 2026-11-02 (two load tests stalled at exactly 101 txs per account)**
+
+`Node` seeds `nonce_cache` with `u64::MAX` (`NO_PRIOR_TX`) for every account
+that has not committed a transaction, including every genesis account and
+every funded recipient. After a block executes, the cache is updated with
+`if tx_nonce >= entry { *entry = tx_nonce }`. No nonce is `>= u64::MAX`, so a
+sentinel entry is never replaced. `f1_nonce_rejected(NO_PRIOR_TX, n)` then
+rejects every `n > MAX_NONCE_GAP (100)` forever.
+
+Observed: 8 fresh accounts, one transaction in flight each, queued exactly
+808 = 8 x 101 transactions and then every further submission was refused,
+although the chain kept committing and the accounts had funds.
+
+Effects: (1) any account is capped at 101 API-submitted transactions over its
+lifetime; (2) for such accounts ingress replay protection is effectively off
+(execution still enforces nonces, so this alone does not endanger funds).
+
+**Not fixed here.** Likely fix: treat a `u64::MAX` entry as "unset" in the
+update (`if *entry == u64::MAX || tx_nonce >= *entry`), with tests for both
+the cap and the ingress replay check.
+
+**PERSIST-001 P-01 profile (read-only; 2026-11-02, sandbox, DEBUG build — release pending)**
+`persist001_profile_commit_path` (ignored test, no production change): 4-validator in-process
+commit path, 10 transfers per block, persistence on.
+
+| Height | Median commit | chain_store.json | Serialize (pretty) | Write | persist_state() total |
+| --- | --- | --- | --- | --- | --- |
+| 25 | 378 ms | 2.5 MB | 83 ms | 4 ms | 113 ms |
+| 100 | 697 ms | 9.8 MB | 301 ms | 8 ms | 254 ms |
+| 200 | 1,345 ms | 19.5 MB | 435 ms | 14 ms | 463 ms |
+| 300 | 2,096 ms | 29.2 MB | 732 ms | 24 ms | 730 ms |
+
+- Cost is linear in height and dominated by SERIALIZATION, not the disk write (732 ms vs 24 ms at
+  height 300). Compact (non-pretty) serialization is ~2.4x cheaper (306 ms), still linear.
+- The chain store is ~97 KB per block for 10 transfers: block payload and signatures are Vec<u8>,
+  which JSON writes as arrays of numbers.
+- persist_state() is NOT the whole story. With persistence off (control) the same loop still goes
+  243 ms (h25) -> 391 (h100) -> 806 (h200) -> 1,165 ms (h300): roughly 56% of the height-300 commit
+  is other work that also grows with chain length. Not yet located.
+- A temp+fsync+rename write of the compact store cost 112 ms at height 300 (fsync is not the
+  main cost).
+
+---
+
+## §11  `persist_state` is not atomic and a failed load looks like a fresh start
+
+**Status: FIXED on `main` by #48 (P-02a, `467b1ae`): snapshots are atomic generations with a checksummed manifest, a damaged or incomplete committed store is `Fatal` instead of a genesis start, legacy directories migrate strictly or refuse, and a signing guard with no chain state is refused. See P02A-W1 for the Windows validation and what it does not show (power-loss durability untested). The text below is the original finding (2026-11-02, while scoping PERSIST-001); the `persist001_audit_torn_files` measurement is kept as an ignored test of the OLD behaviour.**
+
+`persist_state()` rewrites eight files in place with `std::fs::write` (truncate + write), with no
+temp file, fsync or rename, and ignores write errors. Only the double-sign guard uses `write_atomic`.
+`load_persisted_state()` logs "could not load persisted state — starting from genesis" on a parse
+error and returns false; `main.rs` treats false as "no persisted state found — starting from genesis".
+
+Audit (`persist001_audit_torn_files`, 12 committed blocks, one file damaged at a time):
+state.json truncated or emptied, chain_store.json truncated or emptied, slashing.json truncated,
+identity.json truncated, live_validator_set.json truncated: **all fall back to genesis**
+(status height 0, engine height 0) with only that log line. validators.json missing: loads
+"successfully" at height 11 with a registry rebuilt from genesis (silently inconsistent).
+
+Windows/BossKing 2026-11-02 reproduces the audit exactly (debug build, 16.8 s): the same seven files fall
+back to genesis (status height 0, engine height 0) and `validators.json` missing resumes at status
+height 11 / engine height 12.
+
+Why it matters: H0-3 is marked complete for "consistent after an unclean shutdown at any block
+height"; the audit shows a crash MID-WRITE (torn file) is not covered by the load path. The
+double-sign guard is atomic and would refuse conflicting votes, which limits the safety damage but not
+the loss of the node's chain. This is also the baseline PERSIST-001 must beat, not merely preserve.
+
+---
+
+## §12  State tree lookups walk back through every version (commit cost grows linearly with height)
+
+**Status: FIXED on `main` by #46 (`ca87fc1`, one file, `chain-forge-state/src/jmt.rs`): indexed lookup, identical roots. Windows: release benchmark flat at 30–33 µs per commit from 100 to 20,000 versions. The text below is the original finding (2026-11-02, PERSIST-001 P-01).**
+
+Release-mode profile (same in-process 4-validator loop, 10 transfers per block, persistence ON; `persist001_profile_commit_path`):
+
+| Height | Median commit | persist_state() | Share |
+| --- | --- | --- | --- |
+| 25 | 16 ms | 9 ms | 56% |
+| 100 | 78 ms | 28 ms | 36% |
+| 300 | 503 ms | 95 ms | 19% |
+| 600 | 1,152 ms | 165 ms | 14% |
+
+(The debug build is ~13x slower in serialization, which exaggerated persistence's share in §9.)
+
+Sampling the running release binary with gdb (36 stack samples across heights ~300-700): **32 of 36
+samples (89%) were inside `chain_forge_state::jmt::rebuild_subtree` / `create_internal_node`**,
+and the innermost frames in those 32 were BTreeMap `get` and key comparisons (`memcmp`) under
+`NodeStore::get`. Only 4 of 36 were in `persist_state` (2 in the file write).
+
+Cause (`chain-forge-state/src/jmt.rs`): `NodeStore::get` and `get_at` do
+`for v in (0..=key.version).rev() { probe = NodeKey{version: v, ..key.clone()}; nodes.get(&probe) }`,
+i.e. one allocation-and-BTreeMap-probe per version back to the version where that node was last
+written. `rebuild_subtree` calls it for every unchanged sibling, so a commit costs O(depth x
+current version) lookups, and in a tree where few accounts change per block almost every node is
+old. `prune_before` exists but is never called, and cannot be used as a fix: unchanged nodes must
+be found at their old versions.
+
+Windows/BossKing 2026-11-02, same release profile (35 s): commit 18.6 / 33.5 / 59.9 / 134 / 266 ms at heights
+25 / 50 / 100 / 200 / 300 (persist_state() 8.1 / 13.5 / 24.2 / 49.2 / 75.0 ms = 44% -> 28%); temp+fsync+rename
+of the compact store 8.8 ms at height 300. Same linear shape as the sandbox, and FASTER at height 300 (266 ms
+vs 503 ms). So the in-process release profile does not show a Windows penalty. The 6x slowdown seen in the
+live loaded run (§8/§9: debug build, four node processes, real network) is therefore NOT yet attributed to
+the tree lookup or to persistence; the tree share on Windows has not been sampled (gdb was only run in the
+sandbox).
+
+Not fixed here (state-store change; PERSIST-001 is profiling and design only). A fix must not
+change any state root: it can be verified by running the existing state tests plus a differential
+test (old lookup vs. indexed lookup over the same update sequence) asserting identical roots.
+Candidate: a per-path index of the latest version (or latest node per path, with older versions
+kept only for proofs/rollback), making `get` O(1).
+
+Consequence for PERSIST-001: persistence is the second cost (whole-store JSON rewrite, ~14-20% of a
+release commit at heights 300-600 and linear in height) and, separately, is not atomic (§11).
+
+---
+
 ## P02A-W1  P-02a Windows validation, and one unexplained `h0_3_crash_recovery_live` failure
 
 **Status: RECORDED 2026-11-02 — not a P-02a defect as far as can be told; cause UNCONFIRMED.**

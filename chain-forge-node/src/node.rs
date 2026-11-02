@@ -242,6 +242,14 @@ pub fn select_block_txs(
 
 // -- Explorer state (shared with the API, Section 9.1) -------------------------
 
+/// Sorted, de-duplicated ids of the validators whose precommits a certificate carries.
+fn commit_signers(c: &chain_forge_consensus::CommitCertificate) -> Vec<String> {
+    let mut ids: Vec<String> = c.precommits.iter().map(|v| v.validator.0.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// One block's summary for the explorer.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockSummary {
@@ -255,6 +263,12 @@ pub struct BlockSummary {
     pub timestamp_ms: u64,
     pub tx_count:   usize,
     pub tx_ids:     Vec<String>,
+    /// Who proposed the block.
+    pub proposer:   String,
+    /// Validators whose precommits the proposer published as evidence for the
+    /// PREVIOUS block (the committed `last_commit`), sorted. Liveness is judged
+    /// from exactly this set.
+    pub last_commit_signers: Vec<String>,
 }
 
 /// One transaction's summary for the explorer.
@@ -326,9 +340,29 @@ pub struct ValidatorPowerSummary {
     pub consensus_pubkey: String,
 }
 
+/// Registry-side view of a validator for GET /api/validators/status: its
+/// lifecycle status, bond, jail record and liveness window. Read-only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ValidatorStatusSummary {
+    pub id:                  String,
+    pub status:              String,
+    pub bonded_uqcb:         u64,
+    pub jail_count:          usize,
+    pub jailed_epoch:        Option<u64>,
+    pub unjail_after:        Option<u64>,
+    /// Jail period elapsed: eligible to request reinstatement, not reinstated.
+    pub jail_expired:        bool,
+    pub liveness_observed:   usize,
+    pub liveness_missed_pct: u32,
+    /// Unrounded number of missed blocks in the current window.
+    pub liveness_missed:     usize,
+}
+
 /// Explorer state, updated by the node on each committed block.
 #[derive(Debug, Default)]
 pub struct ExplorerState {
+    /// Registry status of every known validator. Updated every block.
+    pub validator_status: Vec<ValidatorStatusSummary>,
     /// Most recent blocks, newest first. Capped at MAX_RECENT_BLOCKS.
     pub blocks: std::collections::VecDeque<BlockSummary>,
     /// tx id -> summary.
@@ -684,6 +718,8 @@ pub struct Node {
     last_commit_evidence: Option<chain_forge_consensus::CommitCertificate>,
     /// When the last block committed (for COMMIT_GATHER_MS).
     last_commit_at: Option<std::time::Instant>,
+    #[cfg(feature = "fault-injection")]
+    fault: crate::fault::FaultInjection,
 
     // ── Deterministic block-height validator-set epochs ──────────────────────
 
@@ -1586,6 +1622,8 @@ impl Node {
             last_committed_timestamp_ms: 0,
             last_commit_evidence: None,
             last_commit_at: None,
+            #[cfg(feature = "fault-injection")]
+            fault: crate::fault::FaultInjection::from_env(),
             validator_epoch_blocks,
             min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
@@ -2468,17 +2506,10 @@ impl Node {
                     });
                 }
 
-                // Validators: use the live consensus set (restored from
-                // live_validator_set.json), which carries real public keys.
-                {
-                    let live = self.consensus.validator_set();
-                    ex.validator_powers = live.validators.iter().map(|v| ValidatorPowerSummary {
-                        id:           v.id.0.clone(),
-                        voting_power: v.voting_power,
-                        pop_verified: v.pop_verified,
-                        consensus_pubkey: hex::encode(&v.public_key),
-                    }).collect();
-                }
+                ex.validator_status = self.validator_status_snapshot();
+                // `validator_powers` is filled below, after `reset_to_height`
+                // applies the persisted committee: at this point the engine
+                // still holds the genesis-seeded set.
 
                 // Blocks + txs: walk chain_store in ascending height order so
                 // push_front leaves them newest-first (matching live behaviour).
@@ -2524,6 +2555,9 @@ impl Node {
                         timestamp_ms: proposal.timestamp_ms,
                         tx_count:     tx_ids.len(),
                         tx_ids,
+                        proposer:     proposal.proposer.0.clone(),
+                        last_commit_signers: BlockPayload::decode(&proposal.tx_data).last_commit
+                            .as_ref().map(commit_signers).unwrap_or_default(),
                     });
                 }
                 // Ensure newest-first ordering after the loop.
@@ -2599,6 +2633,20 @@ impl Node {
             }
             // Before this validator can vote again: its lock and last signature.
             self.restore_sign_guard();
+
+            // Serve the committee the engine now holds (restored from
+            // live_validator_set.json, real public keys), not the genesis-seeded
+            // one it held while the explorer was rebuilt above.
+            {
+                let live = self.consensus.validator_set();
+                self.explorer.lock().unwrap().validator_powers = live.validators.iter()
+                    .map(|v| ValidatorPowerSummary {
+                        id:           v.id.0.clone(),
+                        voting_power: v.voting_power,
+                        pop_verified: v.pop_verified,
+                        consensus_pubkey: hex::encode(&v.public_key),
+                    }).collect();
+            }
 
             // Populate NodeStatus with the restored state root so that callers
             // that read status.state_root immediately after load_persisted_state
@@ -3072,6 +3120,9 @@ impl Node {
                                 return Ok(());
                             }
                         };
+
+                        #[cfg(feature = "fault-injection")]
+                        if self.fault.on_vote(&vote, &msg) { return Ok(()); }
 
                         // H0-2: a precommit for the block we just committed that
                         // arrived after our quorum still counts as participation
@@ -4000,6 +4051,32 @@ impl Node {
         self.pending_evidence.retain(|p| !evidence.iter().any(|ev| ev.validator_id == p.validator_id));
     }
 
+    /// Snapshot of every validator's registry status for GET /api/validators/status.
+    fn validator_status_snapshot(&self) -> Vec<ValidatorStatusSummary> {
+        let epoch = self.identity.clock.current_epoch;
+        let mut out: Vec<ValidatorStatusSummary> = self.validator_registry.all_validators()
+            .into_iter()
+            .map(|r| {
+                let last = r.jail_records.last();
+                let (observed, missed) = self.slasher.liveness_snapshot(&r.id.0).unwrap_or((0, 0));
+                ValidatorStatusSummary {
+                    id:                  r.id.0.clone(),
+                    status:              format!("{:?}", r.status),
+                    bonded_uqcb:         r.bonded_uqcb.min(u64::MAX as u128) as u64,
+                    jail_count:          r.jail_records.len(),
+                    jailed_epoch:        last.map(|j| j.jailed_epoch),
+                    unjail_after:        last.map(|j| j.unjail_after),
+                    jail_expired:        r.jail_expired(epoch),
+                    liveness_observed:   observed,
+                    liveness_missed_pct: missed,
+                    liveness_missed:     self.slasher.liveness_missed(&r.id.0).unwrap_or(0),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
     /// Record liveness participation for every validator from committed
     /// `last_commit` evidence (H0-2), against the validator set effective at
     /// the evidence's height. A validator absent from the evidence is recorded
@@ -4033,8 +4110,12 @@ impl Node {
         // BFT fault tolerance for this set: f = floor((n - 1) / 3).
         let byzantine_f = all_validators.len().saturating_sub(1) / 3;
 
+        // `height` is the evidence's height (what `liveness_start_height` is
+        // measured against). Jail records are stamped with the validator epoch
+        // of the block being committed -- `advance_epoch_to` has already run
+        // for it -- so `jail_duration_epochs` counts epochs, not blocks.
         let height = cert.height;
-        let epoch  = height; // epoch == height until per-epoch batching is wired
+        let epoch  = self.identity.clock.current_epoch;
 
         for vid in &all_validators {
             let signed = signers.contains(vid);
@@ -4642,6 +4723,14 @@ impl Node {
                 if already_seated.contains(addr) {
                     continue;
                 }
+                // A jailed validator keeps its bond but not its seat: only an
+                // explicit reinstatement may seat it again, never jail expiry.
+                if self.validator_registry.get(addr)
+                    .map(|r| r.status == chain_forge_validators::ValidatorStatus::Jailed)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 info!(
                     validator = %addr,
                     bonded_uqcb = *bonded_uqcb,
@@ -4678,6 +4767,86 @@ impl Node {
                 admitted += 1;
                 any_changed = true;
             }
+            // Pass 3: evict validators whose bonded stake dropped below the
+            // minimum threshold (e.g. they submitted UnbondValidator and their
+            // bond account is now zero).
+            //
+            // Rule: a validator with a `validator-bond:{addr}` account whose
+            // balance < min_bond_uqcb is evicted.  Validators with NO bond
+            // account are genesis-seeded and are exempt from this rule; only
+            // sustained liveness failure or equivocation can remove them.
+            {
+                let native_denom = self.executor.native_denom().to_string();
+                let min_bond     = self.min_bond_uqcb as u128;
+                let to_evict: Vec<String> = updated_vs.validators.iter()
+                    .filter(|v| {
+                        let bond_acct = format!(
+                            "{}{}",
+                            chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX,
+                            v.id.0,
+                        );
+                        match self.state.get_account(&bond_acct) {
+                            Ok(acct) => acct.balance_of(&native_denom) < min_bond,
+                            Err(_)   => false, // no bond account → genesis-seeded → exempt
+                        }
+                    })
+                    .map(|v| v.id.0.clone())
+                    .collect();
+
+                for addr in &to_evict {
+                    info!(
+                        validator = %addr,
+                        min_bond_uqcb = min_bond,
+                        "epoch boundary: evicting validator (bond below minimum)"
+                    );
+                    updated_vs.validators.retain(|v| &v.id.0 != addr);
+                    // Mirror into the registry so liveness/reward queries stay
+                    // consistent: zero the recorded stake and demote to Candidate.
+                    let epoch = self.identity.clock.current_epoch;
+                    if let Err(e) = self.validator_registry.update_stake(addr, 0) {
+                        warn!(validator = %addr, error = %e,
+                              "eviction: registry stake update failed");
+                    }
+                    // revoke_pop() demotes Active → Candidate and clears
+                    // pop_verified so the validator is not immediately re-seated
+                    // by the PoP refresh sweep that follows this block.
+                    if let Err(e) = self.validator_registry.revoke_pop(addr, epoch) {
+                        warn!(validator = %addr, error = %e,
+                              "eviction: registry revoke_pop failed");
+                    }
+                    any_changed = true;
+                }
+            }
+
+            // Pass 4: jail enforcement. A validator jailed since the last
+            // boundary (liveness failure) turns Jailed in the registry at once,
+            // but the committee finalising blocks changes only here, at the
+            // deterministic epoch boundary, identically on every node. Its
+            // bond is untouched (no slashing). It is not re-seated by Pass 2,
+            // nor by jail expiry. If enforcing would leave no committee at
+            // all, the whole transition is deferred.
+            {
+                let jailed: Vec<String> = updated_vs.validators.iter()
+                    .filter(|v| self.validator_registry.get(&v.id.0)
+                        .map(|r| r.status == chain_forge_validators::ValidatorStatus::Jailed)
+                        .unwrap_or(false))
+                    .map(|v| v.id.0.clone())
+                    .collect();
+                if !jailed.is_empty() {
+                    if jailed.len() == updated_vs.validators.len() {
+                        warn!(jailed = jailed.len(),
+                              "epoch boundary: jail enforcement deferred -- it would empty the validator set");
+                    } else {
+                        for addr in &jailed {
+                            info!(validator = %addr,
+                                  "epoch boundary: removing jailed validator from the active set");
+                            updated_vs.validators.retain(|v| &v.id.0 != addr);
+                        }
+                        any_changed = true;
+                    }
+                }
+            }
+
             if any_changed {
                 updated_vs.height = cert.height;
                 let _ = self.consensus.update_validator_set(updated_vs);
@@ -4988,6 +5157,8 @@ impl Node {
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
                 tx_ids,
+                proposer:     proposal.proposer.0.clone(),
+                last_commit_signers: participation.as_ref().map(commit_signers).unwrap_or_default(),
             });
             while ex.blocks.len() > MAX_RECENT_BLOCKS {
                 ex.blocks.pop_back();
@@ -5058,6 +5229,7 @@ impl Node {
         if let Some(lc) = &participation {
             self.check_liveness_after_commit(lc, &proposal.proposer.0);
         }
+        self.explorer.lock().unwrap().validator_status = self.validator_status_snapshot();
 
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
@@ -5446,6 +5618,10 @@ impl Node {
                 }
             }
         }
+        #[cfg(feature = "fault-injection")]
+        if vote.vote_type == VoteType::Precommit {
+            info!(target: "cf_fault", height = vote.height, round = vote.round, "sent precommit");
+        }
         let _ = self.network.publish(OutboundMessage {
             topic:   GossipTopic::ConsensusVote,
             payload: serde_json::to_vec(&vote).unwrap_or_default(),
@@ -5558,6 +5734,10 @@ impl Node {
     /// Engine-driven consensus tick: fire due timers, replay buffered
     /// next-height messages, propose when asked, and re-gossip.
     async fn consensus_tick(&mut self) {
+        #[cfg(feature = "fault-injection")]
+        for m in self.fault.take_due() {
+            let _ = Box::pin(self.handle_event(NetworkEvent::Message(m))).await;
+        }
         let now = std::time::Instant::now();
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.consensus_timers)
             .into_iter().partition(|t| t.0 <= now);
@@ -5668,6 +5848,13 @@ impl Node {
         let payload = self.block_payload(height);
         let txs = payload.txs.clone();
         let tx_bytes = payload.encode();
+        #[cfg(feature = "fault-injection")]
+        info!(target: "cf_fault", height, round,
+              mempool = self.mempool.len(),
+              since_commit_ms = self.last_commit_at.map_or(0, |t| t.elapsed().as_millis() as u64),
+              evidence_precommits = payload.last_commit.as_ref().map_or(0, |c| c.precommits.len()),
+              included_txs = txs.len(),
+              "propose context");
         let parent = BlockHash(format!("genesis_h{height}"));
         match self.consensus.propose(height, round, parent, tx_bytes).await {
             Ok(proposal) => {
@@ -5698,6 +5885,13 @@ impl Node {
         let payload = self.block_payload(height);
         let txs = payload.txs.clone();
         let tx_bytes = payload.encode();
+        #[cfg(feature = "fault-injection")]
+        info!(target: "cf_fault", height, round,
+              mempool = self.mempool.len(),
+              since_commit_ms = self.last_commit_at.map_or(0, |t| t.elapsed().as_millis() as u64),
+              evidence_precommits = payload.last_commit.as_ref().map_or(0, |c| c.precommits.len()),
+              included_txs = txs.len(),
+              "propose context");
 
         let proposal = self.consensus
             .propose(height, round, parent_hash, tx_bytes)
@@ -6271,6 +6465,8 @@ impl Node {
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
                 tx_ids,
+                proposer:     proposal.proposer.0.clone(),
+                last_commit_signers: vec![],
             });
             while ex.blocks.len() > MAX_RECENT_BLOCKS {
                 ex.blocks.pop_back();
@@ -6299,6 +6495,8 @@ impl Node {
                     public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
+
+            ex.validator_status = self.validator_status_snapshot();
 
             // Sync validator power snapshot for GET /api/validators.
             // Use the live consensus ValidatorSet so registered consensus
@@ -6901,6 +7099,426 @@ mod tests {
             let dave = obs.validator_registry.get("qcb1dave").unwrap();
             assert_eq!(dave.status, chain_forge_validators::ValidatorStatus::Jailed);
             assert_eq!(dave.bonded_uqcb, bonded, "jailed for liveness, stake intact");
+        }
+
+        // -- H0-11B phase 1: jail enforcement and epoch accounting ------------
+
+        /// Commit `heights` on `n`, taking each proposer from the node's *live*
+        /// validator set (the fixed `proposer()` rotation assumes four seats).
+        /// Alice, Bob and Carol always precommit; evidence names every seated
+        /// validator except Dave unless `dave_signs`.
+        async fn drive_live(
+            n: &mut Node, heights: std::ops::Range<u64>,
+            prev: &mut Option<CommitCertificate>, dave_signs: bool,
+        ) {
+            for h in heights {
+                let mut seated: Vec<String> = n.consensus.validator_set().validators.iter()
+                    .map(|v| v.id.0.clone()).collect();
+                seated.sort();
+                let who = seated[(h as usize) % seated.len()].clone();
+                let root = n.state.current_root().map(str::to_string);
+                let parent = BlockHash(format!("genesis_h{h}"));
+                let tx_data = payload(prev.as_ref(), root.as_deref());
+                let p = sign_as_proposer(BlockProposal {
+                    height: h, round: 0, proposer: ValidatorId(who),
+                    block_hash: compute_block_hash(CHAIN, h, &parent, &tx_data),
+                    parent_hash: parent, timestamp_ms: 0, tx_data,
+                    signature: vec![], pol_round: None,
+                });
+                deliver(n, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+                assert_eq!(n.status.lock().unwrap().height, h, "node must commit h{h}");
+                let signers: Vec<&str> = seated.iter().map(String::as_str)
+                    .filter(|v| dave_signs || *v != "qcb1dave").collect();
+                *prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+        }
+
+        /// A node with a 100-block liveness window (the genesis minimum) that
+        /// jails a validator missing over 20% of it, on `epoch_blocks`-block epochs.
+        fn liveness_json() -> String {
+            let json = GENESIS.replace(
+                r#""personhood_weighted": true }"#,
+                r#""personhood_weighted": true, "liveness": { "window_blocks": 100, "max_missed_pct": 20, "start_height": 0 } }"#,
+            );
+            assert!(json.contains("window_blocks"));
+            json
+        }
+
+        async fn liveness_node(epoch_blocks: u64) -> Node {
+            let mut n = Node::new(&liveness_json(), None).await.unwrap();
+            n.validator_epoch_blocks = epoch_blocks;
+            n
+        }
+
+        fn seated(n: &Node) -> Vec<String> {
+            let mut ids: Vec<String> = n.consensus.validator_set().validators.iter()
+                .map(|v| v.id.0.clone()).collect();
+            ids.sort();
+            ids
+        }
+
+        fn dave_status(n: &Node) -> chain_forge_validators::ValidatorStatus {
+            n.validator_registry.get("qcb1dave").unwrap().status.clone()
+        }
+
+        /// Commit blocks until the liveness window jails Dave; returns the next height.
+        async fn run_until_dave_is_jailed(n: &mut Node, prev: &mut Option<CommitCertificate>) -> u64 {
+            let mut h = 0;
+            while dave_status(n) != chain_forge_validators::ValidatorStatus::Jailed {
+                assert!(h < 400, "Dave must be jailed by liveness failure within 400 blocks");
+                drive_live(n, h..h + 1, prev, false).await;
+                h += 1;
+            }
+            h
+        }
+
+        /// Defect 1: a jailed validator kept its consensus seat and power
+        /// forever. The registry flips to Jailed at once, but the committee
+        /// finalising blocks may only change at the next epoch boundary.
+        #[tokio::test]
+        async fn jailed_validator_leaves_the_consensus_set_at_the_next_epoch_boundary() {
+            let mut n = liveness_node(10).await;
+            let mut prev = None;
+            drive_live(&mut n, 0..4, &mut prev, true).await;
+            let bonded = n.validator_registry.get("qcb1dave").unwrap().bonded_uqcb;
+            let epoch = n.identity.clock.current_epoch;
+            n.validator_registry.jail("qcb1dave", "liveness failure", epoch).unwrap();
+
+            // Rest of epoch 0: the committee does not change under the block in flight.
+            drive_live(&mut n, 4..10, &mut prev, true).await;
+            assert_eq!(seated(&n).len(), 4, "the committee must not change mid-epoch");
+
+            // Block 10 opens epoch 1: the transition applies here.
+            drive_live(&mut n, 10..11, &mut prev, true).await;
+            assert_eq!(seated(&n), ["qcb1alice", "qcb1bob", "qcb1carol"],
+                "a jailed validator must hold no consensus seat after the epoch boundary");
+            assert!(n.historical_validator_sets[&10].validators.iter().any(|v| v.id.0 == "qcb1dave"),
+                "the set that finalised block 10 stays recorded as it was");
+            assert_eq!(dave_status(&n), chain_forge_validators::ValidatorStatus::Jailed);
+            assert_eq!(n.validator_registry.get("qcb1dave").unwrap().bonded_uqcb, bonded,
+                "jailing never burns stake");
+        }
+
+        /// Defect 2: liveness jailing stamped `epoch = height`, so a jail
+        /// configured as 10 epochs lasted 10 blocks.
+        #[tokio::test]
+        async fn jail_is_stamped_and_counted_in_epochs_not_block_heights() {
+            let mut n = liveness_node(4).await;
+            let mut prev = None;
+            let h = run_until_dave_is_jailed(&mut n, &mut prev).await;
+            let epoch = n.identity.clock.current_epoch;
+            let jail = n.validator_registry.get("qcb1dave").unwrap().jail_records.last().unwrap().clone();
+
+            assert!(h > 4 * 10, "the jail must land well past epoch 10 for this test to mean anything (h={h})");
+            assert_eq!(jail.jailed_epoch, epoch,
+                "jail must be stamped with the validator epoch, not the block height {h}");
+            assert_eq!(jail.unjail_after, epoch + 10, "a 10-epoch jail expires 10 epochs later");
+        }
+
+        /// Expiry makes a validator eligible to ask for reinstatement; it must
+        /// neither restore its seat nor change its status.
+        #[tokio::test]
+        async fn jail_expiry_does_not_reinstate_a_validator() {
+            let mut n = liveness_node(4).await;
+            let mut prev = None;
+            let mut h = run_until_dave_is_jailed(&mut n, &mut prev).await;
+            let unjail_after = n.validator_registry.get("qcb1dave").unwrap()
+                .jail_records.last().unwrap().unjail_after;
+
+            while n.identity.clock.current_epoch <= unjail_after + 1 {
+                drive_live(&mut n, h..h + 1, &mut prev, false).await;
+                h += 1;
+            }
+            let epoch = n.identity.clock.current_epoch;
+            let dave = n.validator_registry.get("qcb1dave").unwrap();
+            assert!(dave.jail_expired(epoch), "epoch {epoch} is past unjail_after {unjail_after}");
+            assert_eq!(dave.status, chain_forge_validators::ValidatorStatus::Jailed,
+                "expiry must not reinstate");
+            assert_eq!(seated(&n), ["qcb1alice", "qcb1bob", "qcb1carol"],
+                "an expired jail still holds no seat; only an explicit reinstatement may restore it");
+        }
+
+        /// Two nodes fed the same chain agree on the committee, the jail
+        /// records and the state root.
+        #[tokio::test]
+        async fn jail_enforcement_is_deterministic_across_nodes() {
+            let (mut a, mut b) = (liveness_node(4).await, liveness_node(4).await);
+            let (mut pa, mut pb) = (None, None);
+            let h = run_until_dave_is_jailed(&mut a, &mut pa).await;
+            assert_eq!(run_until_dave_is_jailed(&mut b, &mut pb).await, h);
+            drive_live(&mut a, h..h + 12, &mut pa, false).await;
+            drive_live(&mut b, h..h + 12, &mut pb, false).await;
+            assert_eq!(seated(&a), seated(&b));
+            assert_eq!(seated(&a), ["qcb1alice", "qcb1bob", "qcb1carol"]);
+            assert_eq!(serde_json::to_value(&a.validator_registry.get("qcb1dave").unwrap().jail_records).unwrap(),
+                       serde_json::to_value(&b.validator_registry.get("qcb1dave").unwrap().jail_records).unwrap());
+            assert_eq!(a.state.current_root(), b.state.current_root(), "state roots must agree");
+        }
+
+        /// A restarted node must serve the committee it persisted. Found by the
+        /// live test (JL-08): the explorer snapshot was taken before the
+        /// persisted set replaced the genesis-seeded one, so a removed jailed
+        /// validator reappeared in GET /api/validators.
+        #[tokio::test]
+        async fn restart_serves_the_persisted_committee_not_the_genesis_one() {
+            let dir = std::env::temp_dir().join(format!("cf-jail-restart-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut n = liveness_node(10).await;
+            n.set_data_dir(dir.clone()).unwrap();
+            let mut prev = None;
+            drive_live(&mut n, 0..4, &mut prev, true).await;
+            let epoch = n.identity.clock.current_epoch;
+            n.validator_registry.jail("qcb1dave", "liveness failure", epoch).unwrap();
+            drive_live(&mut n, 4..11, &mut prev, true).await;
+            assert_eq!(seated(&n), ["qcb1alice", "qcb1bob", "qcb1carol"]);
+
+            let mut r = Node::new(&liveness_json(), None).await.unwrap();
+            r.validator_epoch_blocks = 10;
+            r.set_data_dir(dir.clone()).unwrap();
+            assert!(r.load_persisted_state().is_restored());
+            assert_eq!(seated(&r), ["qcb1alice", "qcb1bob", "qcb1carol"], "engine set after restart");
+            let mut served: Vec<String> = r.explorer.lock().unwrap().validator_powers.iter()
+                .map(|v| v.id.clone()).collect();
+            served.sort();
+            assert_eq!(served, ["qcb1alice", "qcb1bob", "qcb1carol"], "GET /api/validators after restart");
+            let status = r.explorer.lock().unwrap().validator_status.iter()
+                .find(|v| v.id == "qcb1dave").map(|v| v.status.clone());
+            assert_eq!(status.as_deref(), Some("Jailed"), "GET /api/validators/status after restart");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // -- H0-11B evidence integrity (FP-02): late precommits ----------------
+
+        fn precommitters(c: &CommitCertificate) -> std::collections::BTreeSet<String> {
+            c.precommits.iter().map(|v| v.validator.0.clone()).collect()
+        }
+
+        /// Commit height 0 with three precommits; Dave's arrives afterwards.
+        async fn node_with_dave_late() -> (Node, BlockProposal, Vote) {
+            let mut n = liveness_node(1_000).await;
+            let root = n.state.current_root().map(str::to_string);
+            let p0 = proposal(0, payload(None, root.as_deref()));
+            deliver(&mut n, &p0, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            let evidence = n.last_commit_evidence.clone().expect("block 0 committed");
+            assert!(!precommitters(&evidence).contains("qcb1dave"), "Dave has not precommitted yet");
+            let late = signed_vote(CHAIN, VoteType::Precommit, 0, 0, "qcb1dave", p0.block_hash.clone());
+            (n, p0, late)
+        }
+
+        /// A valid precommit that reaches the proposer before it builds the next
+        /// block is published as evidence of participation.
+        #[tokio::test]
+        async fn late_precommit_before_the_next_proposal_is_published() {
+            let (mut n, _, late) = node_with_dave_late().await;
+            n.absorb_late_precommit(&late);
+            let lc = n.block_payload(1).last_commit.expect("height 1 carries evidence");
+            assert!(precommitters(&lc).contains("qcb1dave"), "{:?}", precommitters(&lc));
+        }
+
+        /// The same valid precommit, arriving after the proposal was built, is
+        /// absent from that block's committed evidence -- so a LIVE validator is
+        /// recorded as a miss. Timing alone changes the liveness record.
+        #[tokio::test]
+        async fn late_precommit_after_the_proposal_is_built_counts_as_a_miss() {
+            // Control: the precommit arrives in time.
+            let (mut n, _, late) = node_with_dave_late().await;
+            n.absorb_late_precommit(&late);
+            let tx_data = n.block_payload(1).encode();
+            deliver(&mut n, &proposal(1, tx_data), &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert_eq!(n.slasher.liveness_snapshot("qcb1dave"), Some((1, 0)), "in time: no miss");
+
+            // Same precommit, a moment too late.
+            let (mut n, _, late) = node_with_dave_late().await;
+            let tx_data = n.block_payload(1).encode();
+            n.absorb_late_precommit(&late);
+            deliver(&mut n, &proposal(1, tx_data), &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+            assert_eq!(n.slasher.liveness_snapshot("qcb1dave"), Some((1, 100)),
+                "too late: the live validator is recorded as having missed the block");
+            assert_eq!(n.slasher.liveness_snapshot("qcb1alice"), Some((1, 0)));
+        }
+
+        /// The proposer waits for every power-holding validator's precommit, but
+        /// only up to COMMIT_GATHER_MS after its own commit.
+        #[tokio::test]
+        async fn proposer_waits_for_the_missing_precommit_only_up_to_the_gather_window() {
+            let (mut n, _, late) = node_with_dave_late().await;
+            n.last_commit_at = Some(std::time::Instant::now());
+            assert!(!n.last_commit_ready(), "3 of 4 precommits just in: keep waiting for the fourth");
+
+            let past = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(COMMIT_GATHER_MS as u64 + 50)).unwrap();
+            n.last_commit_at = Some(past);
+            assert!(n.last_commit_ready(), "after COMMIT_GATHER_MS the proposer gives up on the missing precommit");
+
+            n.absorb_late_precommit(&late);
+            n.last_commit_at = Some(std::time::Instant::now());
+            assert!(n.last_commit_ready(), "all four in: no need to wait");
+        }
+
+        /// Only a precommit for the SAME round that committed is absorbed; a
+        /// validator that precommitted in another round is recorded as missing.
+        #[tokio::test]
+        async fn precommit_from_another_round_is_not_published() {
+            let (mut n, p0, _) = node_with_dave_late().await;
+            let other_round = signed_vote(CHAIN, VoteType::Precommit, 0, 1, "qcb1dave", p0.block_hash.clone());
+            n.absorb_late_precommit(&other_round);
+            let lc = n.block_payload(1).last_commit.unwrap();
+            assert!(!precommitters(&lc).contains("qcb1dave"));
+        }
+
+        // -- PERSIST-001 P-01: READ-ONLY profile of the commit-to-disk path -------------
+        //
+        // `#[ignore]`d measurements, not assertions. They replicate persist_state()'s
+        // per-file work from outside so nothing in production code changes.
+        //   cargo test -p chain-forge-node --bin chain-forge-node persist001 -- --ignored --nocapture
+
+        fn ms_of<T>(f: impl FnOnce() -> T) -> (T, f64) {
+            let t = std::time::Instant::now();
+            let r = f();
+            (r, t.elapsed().as_secs_f64() * 1000.0)
+        }
+
+        /// One block carrying `k` transfers, committed through the real path (incl. persist_state).
+        async fn commit_with_txs(n: &mut Node, h: u64, k: u64, nonce: &mut u64) -> f64 {
+            for _ in 0..k {
+                let mut tx = Transaction::transfer(&format!("p-{nonce}"), "qcb1alice", "qcb1bob", "uqcb", 1, *nonce);
+                tx.sign(&ClassicalScheme.generate_keypair("qcb1alice").unwrap(), CHAIN).unwrap();
+                n.mempool.push(tx);
+                *nonce += 1;
+            }
+            let tx_data = n.block_payload(h).encode();
+            let p = proposal(h, tx_data);
+            let t = std::time::Instant::now();
+            deliver(n, &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(n.status.lock().unwrap().height, h, "must commit h{h}");
+            ms
+        }
+
+        /// (bytes, serialize ms, write ms) per file, mirroring persist_state().
+        fn persist_breakdown(n: &Node, dir: &std::path::Path) -> Vec<(&'static str, usize, f64, f64)> {
+            let mut out = vec![];
+            macro_rules! cost {
+                ($name:expr, $val:expr) => {{
+                    let (json, ser) = ms_of(|| serde_json::to_string_pretty($val).unwrap());
+                    let (_, wr) = ms_of(|| std::fs::write(dir.join($name), &json));
+                    out.push(($name, json.len(), ser, wr));
+                }};
+            }
+            let snap = n.state.export_snapshot();
+            cost!("state.json", &snap);
+            cost!("identity.json", &n.identity);
+            cost!("validators.json", &n.validator_registry);
+            cost!("agents.json", &n.agents);
+            cost!("slashing.json", &n.slasher);
+            cost!("chain_store.json", &n.chain_store);
+            cost!("historical_validator_sets.json", &n.historical_validator_sets);
+            cost!("live_validator_set.json", n.consensus.validator_set());
+            out
+        }
+
+        #[tokio::test]
+        #[ignore = "PERSIST-001 profiling; run explicitly with --ignored --nocapture"]
+        async fn persist001_profile_commit_path() {
+            let max: u64 = std::env::var("CF_PERSIST_PROFILE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+            let k: u64 = std::env::var("CF_PERSIST_PROFILE_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+            let dir = std::env::temp_dir().join(format!("cf-persist001-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut n = liveness_node(1_000_000).await;
+            // CF_PERSIST_PROFILE_NODISK=1 runs the identical loop with persistence off, to separate
+            // persist_state() from the rest of the commit path.
+            let nodisk = std::env::var("CF_PERSIST_PROFILE_NODISK").is_ok();
+            if !nodisk { n.set_data_dir(dir.clone()).unwrap(); } else { std::fs::create_dir_all(dir.join("persist")).unwrap(); }
+            let persist = dir.join("persist");
+            let samples: Vec<u64> = [25u64, 50, 100, 200, 300, 450, 600, 800, 1000].into_iter().filter(|h| *h <= max).collect();
+            let (mut nonce, mut recent): (u64, Vec<f64>) = (0, vec![]);
+
+            println!("\nPERSIST-001 P-01: {k} transfers per block, in-process 4-validator commit path, data dir {dir:?}");
+            println!("{:>6} | {:>9} | {:>10} {:>9} {:>9} | {:>10} {:>9} | {:>11} {:>10} {:>10} | {:>9}",
+                "height", "commit ms", "chain MB", "ser ms", "write ms", "others ser", "others wr",
+                "compact ser", "atomic wr", "persist()", "B/block");
+            for h in 0..=max {
+                let ms = commit_with_txs(&mut n, h, k, &mut nonce).await;
+                recent.push(ms);
+                if samples.contains(&h) {
+                    let w: Vec<f64> = recent.iter().rev().take(10).copied().collect();
+                    let commit = { let mut v = w.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+                    let parts = persist_breakdown(&n, &persist);
+                    let cs = parts.iter().find(|p| p.0 == "chain_store.json").unwrap();
+                    let (oser, owr): (f64, f64) = parts.iter().filter(|p| p.0 != "chain_store.json")
+                        .fold((0.0, 0.0), |a, p| (a.0 + p.2, a.1 + p.3));
+                    let (_, compact) = ms_of(|| serde_json::to_string(&n.chain_store).unwrap());
+                    let bytes = serde_json::to_vec(&n.chain_store).unwrap();
+                    let (_, atomic) = ms_of(|| write_atomic(&persist.join("chain_store.atomic-probe"), &bytes).unwrap());
+                    let best = (0..3).map(|_| ms_of(|| n.persist_state()).1).fold(f64::MAX, f64::min);
+                    println!("{:>6} | {:>9.1} | {:>10.2} {:>9.1} {:>9.1} | {:>10.1} {:>9.1} | {:>11.1} {:>10.1} {:>10.1} | {:>9}",
+                        h, commit, cs.1 as f64 / 1e6, cs.2, cs.3, oser, owr, compact, atomic, best, cs.1 / (h as usize + 1));
+                }
+            }
+            println!("\ncolumns: commit ms = median of the last 10 real commits (includes persist_state);");
+            println!("chain MB/ser/write = chain_store.json (pretty JSON, rewritten whole every commit); others = the other 7 files;");
+            println!("compact ser = same data serialized without pretty-printing; atomic wr = temp+fsync+rename of the compact bytes;");
+            println!("persist() = one full persist_state() call (best of 3).");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// What does today's recovery do with a torn or missing file? Prints the outcome.
+        #[tokio::test]
+        #[ignore = "PERSIST-001 durability audit; run explicitly with --ignored --nocapture"]
+        async fn persist001_audit_torn_files() {
+            async fn fresh_with_state(dir: &std::path::Path, blocks: u64) -> Node {
+                let _ = std::fs::remove_dir_all(dir);
+                let mut n = liveness_node(1_000_000).await;
+                n.set_data_dir(dir.to_path_buf()).unwrap();
+                let mut nonce = 0;
+                for h in 0..blocks { commit_with_txs(&mut n, h, 2, &mut nonce).await; }
+                n
+            }
+            let base = std::env::temp_dir().join(format!("cf-persist001-audit-{}", std::process::id()));
+            println!("\nPERSIST-001 durability audit (what load_persisted_state does today):");
+            for (label, file, how) in [
+                ("state.json truncated to half",            "state.json",       "half"),
+                ("state.json emptied (crash right after create)", "state.json", "empty"),
+                ("chain_store.json truncated to half",      "chain_store.json", "half"),
+                ("chain_store.json emptied",                "chain_store.json", "empty"),
+                ("slashing.json truncated to half",         "slashing.json",    "half"),
+                ("identity.json truncated to half",         "identity.json",    "half"),
+                ("live_validator_set.json truncated to half","live_validator_set.json", "half"),
+                ("validators.json missing",                 "validators.json",  "delete"),
+            ] {
+                let dir = base.join(file.replace('.', "_")).join(how);
+                let n = fresh_with_state(&dir, 12).await;
+                drop(n);
+                let path = dir.join("persist").join(file);
+                let bytes = std::fs::read(&path).unwrap();
+                match how {
+                    "half"   => std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap(),
+                    "empty"  => std::fs::write(&path, b"").unwrap(),
+                    _        => std::fs::remove_file(&path).unwrap(),
+                }
+                let mut r = liveness_node(1_000_000).await;
+                r.set_data_dir(dir.clone()).unwrap();
+                let loaded = r.load_persisted_state().is_restored();
+                let h = r.status.lock().unwrap().height;
+                let engine_h = r.consensus.current_height();
+                println!("  {label:<48} load_persisted_state() = {loaded:<5}  status height {h:>3}  engine height {engine_h:>3}  -> {}",
+                    if loaded { "resumed (possibly with inconsistent parts)" } else { "FELL BACK TO GENESIS (main.rs logs \"no persisted state found\")" });
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Enforcement must never leave the chain with no committee at all.
+        #[tokio::test]
+        async fn jailing_every_validator_never_empties_the_committee() {
+            let mut n = liveness_node(10).await;
+            let mut prev = None;
+            drive_live(&mut n, 0..4, &mut prev, true).await;
+            let epoch = n.identity.clock.current_epoch;
+            for v in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+                n.validator_registry.jail(v, "liveness failure", epoch).unwrap();
+            }
+            drive_live(&mut n, 4..11, &mut prev, true).await;
+            assert_eq!(seated(&n).len(), 4, "the transition is deferred rather than emptying the set");
         }
 
         /// H0-1 fail-stop: a block that reached quorum elsewhere (partition
