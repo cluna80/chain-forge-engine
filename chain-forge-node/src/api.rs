@@ -705,6 +705,11 @@ pub async fn serve(
                         // GET /api/qrc — QRC monetary engine metrics (Section 9.1)
                         let cm = qrc_metrics.lock().unwrap();
                         http_200_json(&serde_json::to_string(&*cm).unwrap_or_default())
+                    } else if first_line.starts_with("GET /api/validators/status") {
+                        // GET /api/validators/status — registry status, bond, jail
+                        // record and liveness window of every known validator.
+                        let ex = explorer.lock().unwrap();
+                        http_200_json(&serde_json::to_string(&ex.validator_status).unwrap_or_default())
                     } else if first_line.starts_with("GET /api/validators") {
                         // GET /api/validators — current validator set with voting powers.
                         // Returns the personhood-weighted set from the last committed block.

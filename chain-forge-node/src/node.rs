@@ -316,9 +316,27 @@ pub struct ValidatorPowerSummary {
     pub consensus_pubkey: String,
 }
 
+/// Registry-side view of a validator for GET /api/validators/status: its
+/// lifecycle status, bond, jail record and liveness window. Read-only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ValidatorStatusSummary {
+    pub id:                  String,
+    pub status:              String,
+    pub bonded_uqcb:         u64,
+    pub jail_count:          usize,
+    pub jailed_epoch:        Option<u64>,
+    pub unjail_after:        Option<u64>,
+    /// Jail period elapsed: eligible to request reinstatement, not reinstated.
+    pub jail_expired:        bool,
+    pub liveness_observed:   usize,
+    pub liveness_missed_pct: u32,
+}
+
 /// Explorer state, updated by the node on each committed block.
 #[derive(Debug, Default)]
 pub struct ExplorerState {
+    /// Registry status of every known validator. Updated every block.
+    pub validator_status: Vec<ValidatorStatusSummary>,
     /// Most recent blocks, newest first. Capped at MAX_RECENT_BLOCKS.
     pub blocks: std::collections::VecDeque<BlockSummary>,
     /// tx id -> summary.
@@ -2261,6 +2279,8 @@ impl Node {
                     });
                 }
 
+                ex.validator_status = self.validator_status_snapshot();
+
                 // Validators: use the live consensus set (restored from
                 // live_validator_set.json), which carries real public keys.
                 {
@@ -3747,6 +3767,31 @@ impl Node {
         self.pending_evidence.retain(|p| !evidence.iter().any(|ev| ev.validator_id == p.validator_id));
     }
 
+    /// Snapshot of every validator's registry status for GET /api/validators/status.
+    fn validator_status_snapshot(&self) -> Vec<ValidatorStatusSummary> {
+        let epoch = self.identity.clock.current_epoch;
+        let mut out: Vec<ValidatorStatusSummary> = self.validator_registry.all_validators()
+            .into_iter()
+            .map(|r| {
+                let last = r.jail_records.last();
+                let (observed, missed) = self.slasher.liveness_snapshot(&r.id.0).unwrap_or((0, 0));
+                ValidatorStatusSummary {
+                    id:                  r.id.0.clone(),
+                    status:              format!("{:?}", r.status),
+                    bonded_uqcb:         r.bonded_uqcb.min(u64::MAX as u128) as u64,
+                    jail_count:          r.jail_records.len(),
+                    jailed_epoch:        last.map(|j| j.jailed_epoch),
+                    unjail_after:        last.map(|j| j.unjail_after),
+                    jail_expired:        r.jail_expired(epoch),
+                    liveness_observed:   observed,
+                    liveness_missed_pct: missed,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
     /// Record liveness participation for every validator from committed
     /// `last_commit` evidence (H0-2), against the validator set effective at
     /// the evidence's height. A validator absent from the evidence is recorded
@@ -4897,6 +4942,7 @@ impl Node {
         if let Some(lc) = &participation {
             self.check_liveness_after_commit(lc, &proposal.proposer.0);
         }
+        self.explorer.lock().unwrap().validator_status = self.validator_status_snapshot();
 
         // Write state to disk so a restarted node resumes from this height
         // rather than replaying from genesis. No-op when data_dir is None.
@@ -6102,6 +6148,8 @@ impl Node {
                     public_key: a.public_key.as_ref().map(hex::encode).unwrap_or_default(),
                 });
             }
+
+            ex.validator_status = self.validator_status_snapshot();
 
             // Sync validator power snapshot for GET /api/validators.
             // Use the live consensus ValidatorSet so registered consensus

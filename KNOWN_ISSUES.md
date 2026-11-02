@@ -212,3 +212,37 @@ This issue must be resolved before any of the following:
 (`governance_vote_signing_bytes`, `propose_change_with_votes`,
 `revoke_with_votes`), all call sites in
 `chain-forge-personhood/src/bin/governance_authority_demo.rs`.
+
+---
+
+## §6  `adversarial_gossip` integration test does not compile
+
+**Status: OPEN — pre-existing; found 2026-11-02 during H0-11B, reproduced on unmodified HEAD `f61f09c`**
+
+`cargo test -p chain-forge-node --test adversarial_gossip --no-run` fails:
+`error[E0063]: missing field 'genesis_hash' in initializer of 'NetworkConfig'`.
+`NetworkConfig` gained a `genesis_hash` field with the H0-8 genesis-hash peer
+check (`616bf0e`, `8fa0ecc`); `chain-forge-node/tests/adversarial_gossip.rs`
+was not updated. Until it is, `cargo test -p chain-forge-node` (no `--test`)
+cannot build every target, and its adversarial gossip coverage is not running.
+
+**Fix:** initialise `genesis_hash` in the test's `NetworkConfig` (and decide
+what value an adversarial peer should present).
+
+---
+
+## §7  `cs001_p7_mldsa_tx_accepted_during_and_after_migration` fails
+
+**Status: OPEN — pre-existing; found 2026-11-02 during H0-11B, reproduced on unmodified HEAD `f61f09c`**
+
+`node::tests::cs001_p7_mldsa_tx_accepted_during_and_after_migration` fails at
+the "ML-DSA-65 tx must be accepted during grace window" assertion with:
+`qcb1pquser has no bound key and is not derived from the signing key ...;
+bind the account's ML-DSA key in genesis or send from the derived address`.
+This looks like fallout from ML-DSA-only user accounts
+(`b43e973`, `signature_scheme = "pqc-native"`): the test sends from an
+account with no bound ML-DSA key. Unrelated to validator, jail or liveness
+code. It is the only failure in the node unit suite (274 of 275 pass).
+
+**Fix:** bind `qcb1pquser`'s ML-DSA key in the test genesis, or send from the
+derived address; then confirm the grace-window behaviour the test intends.

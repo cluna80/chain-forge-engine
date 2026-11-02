@@ -502,6 +502,12 @@ impl SlashingModule {
     /// if `current_height < liveness_start_height` the call is a no-op and
     /// always returns `Ok(None)`.  This gives the gossip mesh time to form
     /// before any liveness penalties are applied (KNOWN_ISSUES §2 fix).
+    /// Read-only liveness view for status APIs: (observations currently in the
+    /// window, plain missed percentage). `None` before the first observation.
+    pub fn liveness_snapshot(&self, validator_id: &str) -> Option<(usize, u32)> {
+        self.liveness_windows.get(validator_id).map(|w| (w.observed(), w.missed_pct()))
+    }
+
     pub fn record_block(
         &mut self,
         validator_id:   &str,

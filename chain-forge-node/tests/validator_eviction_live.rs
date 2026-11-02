@@ -221,7 +221,7 @@ fn wait_for_height(port: u16, target: u64, timeout: Duration) -> bool {
 }
 
 fn nonce(port: u16, addr: &str) -> u64 {
-    http_get(port, &format!("/api/account/{addr}"))
+    http_get(port, &format!("/api/accounts/{addr}"))
         .and_then(|v| v["nonce"].as_u64())
         .unwrap_or(0)
 }
