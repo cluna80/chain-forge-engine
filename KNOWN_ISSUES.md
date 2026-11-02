@@ -276,7 +276,7 @@ evidence is valid, not that it is complete.
 - A genuinely offline validator is jailed ~21 blocks after the window is full.
 
 **Measured on a real (loopback) 4-node network**
-(`validator_liveness_integrity_live`, sandbox 2026-11-02, 575 s)
+(`validator_liveness_integrity_live`, sandbox 575 s; Windows/BossKing-confirmed 2026-11-02, 561 s, identical results)
 Worst plain miss for any healthy validator over a full 100-block window:
 0% idle, 0% under light load; all four nodes served identical validator
 status (including liveness windows) and state roots at 9 same-height checks.
