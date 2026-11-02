@@ -572,8 +572,10 @@ and JL-09 (`33362db6f1e0`), including Dave replaying the whole chain from peers 
 Windows/BossKing regression of this branch, 2026-11-02 (so far): node unit suite 280 passed, 1 failed (the known
 unrelated `cs001_p7`, same message as before this work), which includes `state_perf_node_state_roots_are_golden`
 and the restart and recovery tests; `validator_jail_live` JL-01..JL-09 PASSED (627 s) with state roots IDENTICAL
-to the pre-change Windows run (`51136494701f`, `eebbee537f59`, `33362db6f1e0`). Still to report from Windows:
-`chain-forge-state` tests, the release tree benchmark, and `validator_eviction_live`.
+to the pre-change Windows run (`51136494701f`, `eebbee537f59`, `33362db6f1e0`). Also Windows: `chain-forge-state` 73 passed / 3 ignored; release tree benchmark flat at 32.0 / 32.8 / 34.9 /
+33.2 / 40.0 / 38.2 / 33.5 us per commit at 100 / 500 / 1,000 / 2,500 / 5,000 / 10,000 / 20,000 versions (no pre-change
+Windows tree benchmark was taken; the original's 21.6 ms at 20,000 versions is a sandbox figure). Still to report
+from Windows: `validator_eviction_live`.
 
 Tree-only release benchmark (12 accounts, 3 updates per version), microseconds per commit:
 | Versions | Original | Indexed |
