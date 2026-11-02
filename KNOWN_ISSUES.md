@@ -320,6 +320,14 @@ proposer builds sooner (1 s gate), so the tolerance should shrink; NOT yet
 measured. (4) One 4,500 ms row disagreed (arrival logged before the delayed
 delivery was written when the log was read: a measurement-edge artifact).
 
+Sandbox rerun after staggering the load (commit following 96e39d1; PASSED, 320 s; mempool
+non-empty at >= 60% of proposals in every row incl. the first; block-interval drift 1.7x,
+1.2 s -> 2.0 s worst): networked blocks omitted 0 of 11 (0 ms), 0 of 10 (500), 4 of 11 (900),
+6 of 10 (1,200), 6 of 10 (1,500), 11 of 11 (2,200), 10 of 10 (3,000), 0 of 11 (closing 0 ms
+control). Commit-to-proposal in the rows with omissions: 803 / 888 / 1,035 / 1,046 / 1,057 ms.
+Half omitted at 1,200 ms. This is the cleanest loaded sweep so far; the Windows run of this
+exact version is not yet done.
+
 Windows/BossKing, experiments serialized (commit 1bc5eab): idle experiment PASSED (396 s):
 omitted 0 of 13-14 up to 1,500 ms, 8 of 14 at 2,200 ms, 14 of 14 at 3,000 ms, 13 of 13 at
 4,500 ms; block interval flat at 2.3-2.4 s. Loaded experiment completed all eight rows but
