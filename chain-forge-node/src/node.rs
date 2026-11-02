@@ -6123,7 +6123,7 @@ impl Node {
 mod tests {
     use super::*;
 
-    const GENESIS: &str = r#"{
+    pub(super) const GENESIS: &str = r#"{
         "chain_id": "qcb-testnet-1",
         "chain_name": "QuarkCharmBit",
         "engine_version": "0.1.0",
@@ -13787,6 +13787,299 @@ mod tests {
              has guard_height ({guard_height}) > state_height ({state_height}); got {result:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+
+// ───────────────────────────────────────────────────────────────────────────
+// H0-3b / P-02a — failing tests written FIRST against PR #41's code.
+// Gap 1: legacy data directories must never silently start from genesis.
+// Gap 2: signing-guard / chain-state combinations (D6).
+// Gap 6: a guard ahead of the state must abstain, not exit.
+// Tests marked "EXPECTED TO FAIL" document the defect and must flip with the
+// fix; tests marked "SAFETY NET" pass today and must keep passing.
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod p02a_gaps {
+    use super::*;
+
+    const GENESIS: &str = super::tests::GENESIS;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("cf-p02a-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// A node that committed two blocks. Returns (state root, height).
+    async fn build_chain(dir: &std::path::Path) -> Node {
+        let mut node = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        node.set_data_dir(dir.to_path_buf()).unwrap();
+        let g = chain_forge_consensus::BlockHash("0000000000000000".into());
+        let c0 = node.propose_block(g).await.unwrap();
+        node.propose_block(c0.block_hash).await.unwrap();
+        node
+    }
+
+    fn root_of(n: &Node) -> String { n.state.current_root().unwrap_or("").to_string() }
+    fn height_of(n: &Node) -> u64 { n.state.export_snapshot().height }
+
+    /// The pre-H0-3 on-disk layout, byte for byte what the old `persist_state`
+    /// wrote: eight pretty-JSON files directly under `<dir>/persist/`.
+    fn write_legacy_layout(node: &Node, dir: &std::path::Path, skip: &[&str]) {
+        let persist = dir.join("persist");
+        std::fs::create_dir_all(&persist).unwrap();
+        let snap = node.state.export_snapshot();
+        let files: Vec<(&str, String)> = vec![
+            ("state.json",      serde_json::to_string_pretty(&snap).unwrap()),
+            ("identity.json",   serde_json::to_string_pretty(&node.identity).unwrap()),
+            ("validators.json", serde_json::to_string_pretty(&node.validator_registry).unwrap()),
+            ("agents.json",     serde_json::to_string_pretty(&node.agents).unwrap()),
+            ("slashing.json",   serde_json::to_string_pretty(&node.slasher).unwrap()),
+            ("chain_store.json",serde_json::to_string_pretty(&node.chain_store).unwrap()),
+            ("historical_validator_sets.json", serde_json::to_string_pretty(&node.historical_validator_sets).unwrap()),
+            ("live_validator_set.json", serde_json::to_string_pretty(node.consensus.validator_set()).unwrap()),
+        ];
+        for (name, json) in files {
+            if !skip.contains(&name) { std::fs::write(persist.join(name), json).unwrap(); }
+        }
+    }
+
+    fn write_guard(dir: &std::path::Path, last_height: u64) {
+        let persist = dir.join("persist");
+        std::fs::create_dir_all(&persist).unwrap();
+        std::fs::write(
+            persist.join("consensus_signing.json"),
+            serde_json::json!({ "last": [last_height, 0, 2], "votes": [], "lock": null }).to_string(),
+        ).unwrap();
+    }
+
+    async fn restart(dir: &std::path::Path) -> (Node, PersistStartup) {
+        let mut n = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        n.set_data_dir(dir.to_path_buf()).unwrap();
+        let r = n.load_persisted_state();
+        (n, r)
+    }
+
+    fn vote(height: u64, hash: &str) -> Vote {
+        Vote {
+            vote_type: VoteType::Precommit, height, round: 0,
+            validator: chain_forge_consensus::ValidatorId("qcb1alice".into()),
+            block_hash: Some(chain_forge_consensus::BlockHash(hash.into())),
+            signature: vec![], scheme: "classical".into(),
+        }
+    }
+
+    // ── Gap 1: legacy data directories ──────────────────────────────────────
+
+    /// L1 — EXPECTED TO FAIL today (loads as Fresh = silent genesis).
+    /// A valid legacy directory is migrated: Restored at the same height and
+    /// root, a CURRENT generation now exists, and a SECOND restart (now from
+    /// the new layout) reproduces the same root.
+    #[tokio::test]
+    async fn l1_valid_legacy_directory_is_restored_not_started_from_genesis() {
+        let dir = tmp("l1");
+        let (h, root) = { let n = build_chain(&dir).await; write_legacy_layout(&n, &dir, &[]); (height_of(&n), root_of(&n)) };
+        assert!(h > 0);
+
+        let (n, r) = restart(&dir).await;
+        assert!(matches!(r, PersistStartup::Restored { height, .. } if height == h),
+            "a valid legacy directory must be restored at height {h}, got {r:?}");
+        assert_eq!(root_of(&n), root, "state root must survive the migration unchanged");
+        assert!(crate::persistence::read_current(&dir).unwrap().is_some(),
+            "migration must write a CURRENT generation");
+
+        let (n2, r2) = restart(&dir).await;
+        assert!(r2.is_restored(), "second restart (new layout) must restore, got {r2:?}");
+        assert_eq!(root_of(&n2), root, "root identical after the second restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L2 — EXPECTED TO FAIL today (Fresh). A damaged legacy file is Fatal.
+    #[tokio::test]
+    async fn l2_damaged_legacy_directory_refuses_to_start() {
+        for victim in ["state.json", "chain_store.json", "identity.json", "slashing.json"] {
+            let dir = tmp(&format!("l2-{}", victim.replace('.', "_")));
+            { let n = build_chain(&dir).await; write_legacy_layout(&n, &dir, &[]); }
+            let p = dir.join("persist").join(victim);
+            let bytes = std::fs::read(&p).unwrap();
+            std::fs::write(&p, &bytes[..bytes.len() / 2]).unwrap(); // torn write
+
+            let (_n, r) = restart(&dir).await;
+            assert!(matches!(r, PersistStartup::Fatal { .. }),
+                "legacy {victim} truncated: must be Fatal (never Fresh/genesis), got {r:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// L3 — EXPECTED TO FAIL today (Fresh). The one allowed legacy gap: a
+    /// directory that predates CF-VAL-KEY-002 has no live_validator_set.json.
+    /// The outcome must be EXPLICIT and must never be a silently empty or
+    /// keyless validator set: either Fatal with a clear message, or Restored
+    /// with the validator set reconstructed (non-empty, every key present, and
+    /// equal to the pre-restart committee).
+    #[tokio::test]
+    async fn l3_legacy_without_live_validator_set_is_explicit_never_empty() {
+        let dir = tmp("l3");
+        let before = {
+            let n = build_chain(&dir).await;
+            write_legacy_layout(&n, &dir, &["live_validator_set.json"]);
+            n.consensus.validator_set().clone()
+        };
+        let (n, r) = restart(&dir).await;
+        match r {
+            PersistStartup::Fatal { ref error } => {
+                assert!(error.contains("live_validator_set") || error.contains("validator"),
+                    "the refusal must name the missing validator set: {error}");
+            }
+            PersistStartup::Restored { .. } => {
+                let after = n.consensus.validator_set();
+                assert!(!after.validators.is_empty(), "validator set must not be empty");
+                for v in &after.validators {
+                    assert!(!v.public_key.is_empty(), "validator {} lost its key", v.id);
+                }
+                assert_eq!(after.validators.len(), before.validators.len(), "committee size must match");
+                for (a, b) in after.validators.iter().zip(before.validators.iter()) {
+                    assert_eq!((&a.id, a.voting_power, &a.public_key), (&b.id, b.voting_power, &b.public_key));
+                }
+            }
+            other => panic!("must be Fatal or a faithfully reconstructed Restored, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L5 — EXPECTED TO FAIL today. Any OTHER missing legacy component
+    /// (validators.json was the audit's silently-inconsistent case) is Fatal.
+    #[tokio::test]
+    async fn l5_legacy_missing_a_required_component_is_fatal() {
+        for victim in ["validators.json", "identity.json", "chain_store.json", "historical_validator_sets.json"] {
+            let dir = tmp(&format!("l5-{}", victim.replace('.', "_")));
+            { let n = build_chain(&dir).await; write_legacy_layout(&n, &dir, &[victim]); }
+            let (_n, r) = restart(&dir).await;
+            assert!(matches!(r, PersistStartup::Fatal { .. }),
+                "legacy directory missing {victim} must be Fatal, got {r:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // ── Gap 2: signing guard x chain state (D6) ─────────────────────────────
+
+    /// G1 — EXPECTED TO FAIL today (Fresh returns before the guard is read).
+    #[tokio::test]
+    async fn g1_guard_present_but_no_chain_state_is_fatal() {
+        let dir = tmp("g1");
+        std::fs::create_dir_all(dir.join("persist")).unwrap();
+        write_guard(&dir, 7);
+        let (_n, r) = restart(&dir).await;
+        assert!(matches!(r, PersistStartup::Fatal { .. }),
+            "a signing guard with no chain state must never start from genesis, got {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G1b — SAFETY NET (corrected after the first run). An UNREADABLE guard
+    /// already fails closed: `restore_sign_guard` panics inside `set_data_dir`
+    /// ("refusing to start a validator that may be locked"), before any load.
+    /// Kept so the fix cannot weaken it into a silent genesis start.
+    #[tokio::test]
+    #[should_panic(expected = "unreadable")]
+    async fn g1b_unreadable_guard_refuses_to_start() {
+        let dir = tmp("g1b");
+        std::fs::create_dir_all(dir.join("persist")).unwrap();
+        std::fs::write(dir.join("persist").join("consensus_signing.json"), b"{ not json").unwrap();
+        let _ = restart(&dir).await;
+    }
+
+    /// G3 — SAFETY NET. Nothing on disk at all is Fresh (genesis allowed).
+    #[tokio::test]
+    async fn g3_empty_directory_is_fresh() {
+        let dir = tmp("g3");
+        let (_n, r) = restart(&dir).await;
+        assert!(matches!(r, PersistStartup::Fresh), "got {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G4 — SAFETY NET. Consistent guard + chain state restores.
+    #[tokio::test]
+    async fn g4_consistent_guard_and_state_is_restored() {
+        let dir = tmp("g4");
+        let h = { let n = build_chain(&dir).await; n.persist_state().unwrap(); height_of(&n) };
+        write_guard(&dir, h);
+        let (_n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "got {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G2 — SAFETY NET, deliberately NOT the reverse of D6. Chain state with
+    /// NO guard file must restore: a node that has never voted (an observer, or
+    /// a validator before its first vote) legitimately has no guard. Making
+    /// this fatal would brick every non-validator node. (Raised for owner review.)
+    #[tokio::test]
+    async fn g2_chain_state_without_a_guard_file_is_restored() {
+        let dir = tmp("g2");
+        { let n = build_chain(&dir).await; n.persist_state().unwrap(); }
+        assert!(!dir.join("persist").join("consensus_signing.json").exists());
+        let (_n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "got {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G6 — SAFETY NET. Guard behind state restores (guard advancement on
+    /// resume is checked separately once the fix defines it).
+    #[tokio::test]
+    async fn g6_guard_behind_state_is_restored() {
+        let dir = tmp("g6");
+        let h = { let n = build_chain(&dir).await; n.persist_state().unwrap(); height_of(&n) };
+        write_guard(&dir, h.saturating_sub(1));
+        let (_n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "got {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Gap 6: guard AHEAD of the state: abstain, do not exit ───────────────
+
+    /// A1 — EXPECTED TO FAIL today (returns SigningBlocked, main.rs exits).
+    /// The node must stay up: load reports Restored, not a startup refusal.
+    #[tokio::test]
+    async fn a1_guard_ahead_of_state_starts_instead_of_exiting() {
+        let dir = tmp("a1");
+        let h = { let n = build_chain(&dir).await; n.persist_state().unwrap(); height_of(&n) };
+        write_guard(&dir, h + 5);
+        let (_n, r) = restart(&dir).await;
+        assert!(r.is_restored(),
+            "guard ahead of state must NOT stop the node (it must abstain and sync); got {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A2 — passes once A1 passes (today it cannot even be reached). While the
+    /// guard is ahead the node must not sign anything at or below the guard's
+    /// height unless it is the exact vote already signed (re-send), and must
+    /// refuse a conflicting vote.
+    #[tokio::test]
+    async fn a2_while_guard_is_ahead_no_conflicting_signature_is_possible() {
+        let dir = tmp("a2");
+        let h = { let n = build_chain(&dir).await; n.persist_state().unwrap(); height_of(&n) };
+        write_guard(&dir, h + 5);
+        let (n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "precondition (A1): {r:?}");
+        for height in (h + 1)..=(h + 5) {
+            assert!(n.sign_guard.check(&vote(height, "any-block")).is_err(),
+                "height {height} is at or below the guard: signing must be refused");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A3 — passes once A1 passes. Resume: above the guard's height signing is
+    /// allowed again, so abstention ends by itself once the node is past it.
+    #[tokio::test]
+    async fn a3_above_the_guard_height_signing_resumes() {
+        let dir = tmp("a3");
+        let h = { let n = build_chain(&dir).await; n.persist_state().unwrap(); height_of(&n) };
+        write_guard(&dir, h + 5);
+        let (n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "precondition (A1): {r:?}");
+        assert!(matches!(n.sign_guard.check(&vote(h + 6, "next-block")), Ok(None)),
+            "a vote above the guard height must be signable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
