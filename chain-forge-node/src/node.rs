@@ -3780,8 +3780,12 @@ impl Node {
         // BFT fault tolerance for this set: f = floor((n - 1) / 3).
         let byzantine_f = all_validators.len().saturating_sub(1) / 3;
 
+        // `height` is the evidence's height (what `liveness_start_height` is
+        // measured against). Jail records are stamped with the validator epoch
+        // of the block being committed -- `advance_epoch_to` has already run
+        // for it -- so `jail_duration_epochs` counts epochs, not blocks.
         let height = cert.height;
-        let epoch  = height; // epoch == height until per-epoch batching is wired
+        let epoch  = self.identity.clock.current_epoch;
 
         for vid in &all_validators {
             let signed = signers.contains(vid);
@@ -4389,6 +4393,14 @@ impl Node {
                 if already_seated.contains(addr) {
                     continue;
                 }
+                // A jailed validator keeps its bond but not its seat: only an
+                // explicit reinstatement may seat it again, never jail expiry.
+                if self.validator_registry.get(addr)
+                    .map(|r| r.status == chain_forge_validators::ValidatorStatus::Jailed)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 info!(
                     validator = %addr,
                     bonded_uqcb = *bonded_uqcb,
@@ -4473,6 +4485,35 @@ impl Node {
                               "eviction: registry revoke_pop failed");
                     }
                     any_changed = true;
+                }
+            }
+
+            // Pass 4: jail enforcement. A validator jailed since the last
+            // boundary (liveness failure) turns Jailed in the registry at once,
+            // but the committee finalising blocks changes only here, at the
+            // deterministic epoch boundary, identically on every node. Its
+            // bond is untouched (no slashing). It is not re-seated by Pass 2,
+            // nor by jail expiry. If enforcing would leave no committee at
+            // all, the whole transition is deferred.
+            {
+                let jailed: Vec<String> = updated_vs.validators.iter()
+                    .filter(|v| self.validator_registry.get(&v.id.0)
+                        .map(|r| r.status == chain_forge_validators::ValidatorStatus::Jailed)
+                        .unwrap_or(false))
+                    .map(|v| v.id.0.clone())
+                    .collect();
+                if !jailed.is_empty() {
+                    if jailed.len() == updated_vs.validators.len() {
+                        warn!(jailed = jailed.len(),
+                              "epoch boundary: jail enforcement deferred -- it would empty the validator set");
+                    } else {
+                        for addr in &jailed {
+                            info!(validator = %addr,
+                                  "epoch boundary: removing jailed validator from the active set");
+                            updated_vs.validators.retain(|v| &v.id.0 != addr);
+                        }
+                        any_changed = true;
+                    }
                 }
             }
 
@@ -6663,6 +6704,170 @@ mod tests {
             let dave = obs.validator_registry.get("qcb1dave").unwrap();
             assert_eq!(dave.status, chain_forge_validators::ValidatorStatus::Jailed);
             assert_eq!(dave.bonded_uqcb, bonded, "jailed for liveness, stake intact");
+        }
+
+        // -- H0-11B phase 1: jail enforcement and epoch accounting ------------
+
+        /// Commit `heights` on `n`, taking each proposer from the node's *live*
+        /// validator set (the fixed `proposer()` rotation assumes four seats).
+        /// Alice, Bob and Carol always precommit; evidence names every seated
+        /// validator except Dave unless `dave_signs`.
+        async fn drive_live(
+            n: &mut Node, heights: std::ops::Range<u64>,
+            prev: &mut Option<CommitCertificate>, dave_signs: bool,
+        ) {
+            for h in heights {
+                let mut seated: Vec<String> = n.consensus.validator_set().validators.iter()
+                    .map(|v| v.id.0.clone()).collect();
+                seated.sort();
+                let who = seated[(h as usize) % seated.len()].clone();
+                let root = n.state.current_root().map(str::to_string);
+                let parent = BlockHash(format!("genesis_h{h}"));
+                let tx_data = payload(prev.as_ref(), root.as_deref());
+                let p = sign_as_proposer(BlockProposal {
+                    height: h, round: 0, proposer: ValidatorId(who),
+                    block_hash: compute_block_hash(CHAIN, h, &parent, &tx_data),
+                    parent_hash: parent, timestamp_ms: 0, tx_data,
+                    signature: vec![], pol_round: None,
+                });
+                deliver(n, &p, &["qcb1alice", "qcb1bob", "qcb1carol"]).await;
+                assert_eq!(n.status.lock().unwrap().height, h, "node must commit h{h}");
+                let signers: Vec<&str> = seated.iter().map(String::as_str)
+                    .filter(|v| dave_signs || *v != "qcb1dave").collect();
+                *prev = Some(evidence(h, &p.block_hash, &signers));
+            }
+        }
+
+        /// A node with a 100-block liveness window (the genesis minimum) that
+        /// jails a validator missing over 20% of it, on `epoch_blocks`-block epochs.
+        async fn liveness_node(epoch_blocks: u64) -> Node {
+            let json = GENESIS.replace(
+                r#""personhood_weighted": true }"#,
+                r#""personhood_weighted": true, "liveness": { "window_blocks": 100, "max_missed_pct": 20, "start_height": 0 } }"#,
+            );
+            assert!(json.contains("window_blocks"));
+            let mut n = Node::new(&json, None).await.unwrap();
+            n.validator_epoch_blocks = epoch_blocks;
+            n
+        }
+
+        fn seated(n: &Node) -> Vec<String> {
+            let mut ids: Vec<String> = n.consensus.validator_set().validators.iter()
+                .map(|v| v.id.0.clone()).collect();
+            ids.sort();
+            ids
+        }
+
+        fn dave_status(n: &Node) -> chain_forge_validators::ValidatorStatus {
+            n.validator_registry.get("qcb1dave").unwrap().status.clone()
+        }
+
+        /// Commit blocks until the liveness window jails Dave; returns the next height.
+        async fn run_until_dave_is_jailed(n: &mut Node, prev: &mut Option<CommitCertificate>) -> u64 {
+            let mut h = 0;
+            while dave_status(n) != chain_forge_validators::ValidatorStatus::Jailed {
+                assert!(h < 400, "Dave must be jailed by liveness failure within 400 blocks");
+                drive_live(n, h..h + 1, prev, false).await;
+                h += 1;
+            }
+            h
+        }
+
+        /// Defect 1: a jailed validator kept its consensus seat and power
+        /// forever. The registry flips to Jailed at once, but the committee
+        /// finalising blocks may only change at the next epoch boundary.
+        #[tokio::test]
+        async fn jailed_validator_leaves_the_consensus_set_at_the_next_epoch_boundary() {
+            let mut n = liveness_node(10).await;
+            let mut prev = None;
+            drive_live(&mut n, 0..4, &mut prev, true).await;
+            let bonded = n.validator_registry.get("qcb1dave").unwrap().bonded_uqcb;
+            let epoch = n.identity.clock.current_epoch;
+            n.validator_registry.jail("qcb1dave", "liveness failure", epoch).unwrap();
+
+            // Rest of epoch 0: the committee does not change under the block in flight.
+            drive_live(&mut n, 4..10, &mut prev, true).await;
+            assert_eq!(seated(&n).len(), 4, "the committee must not change mid-epoch");
+
+            // Block 10 opens epoch 1: the transition applies here.
+            drive_live(&mut n, 10..11, &mut prev, true).await;
+            assert_eq!(seated(&n), ["qcb1alice", "qcb1bob", "qcb1carol"],
+                "a jailed validator must hold no consensus seat after the epoch boundary");
+            assert!(n.historical_validator_sets[&10].validators.iter().any(|v| v.id.0 == "qcb1dave"),
+                "the set that finalised block 10 stays recorded as it was");
+            assert_eq!(dave_status(&n), chain_forge_validators::ValidatorStatus::Jailed);
+            assert_eq!(n.validator_registry.get("qcb1dave").unwrap().bonded_uqcb, bonded,
+                "jailing never burns stake");
+        }
+
+        /// Defect 2: liveness jailing stamped `epoch = height`, so a jail
+        /// configured as 10 epochs lasted 10 blocks.
+        #[tokio::test]
+        async fn jail_is_stamped_and_counted_in_epochs_not_block_heights() {
+            let mut n = liveness_node(4).await;
+            let mut prev = None;
+            let h = run_until_dave_is_jailed(&mut n, &mut prev).await;
+            let epoch = n.identity.clock.current_epoch;
+            let jail = n.validator_registry.get("qcb1dave").unwrap().jail_records.last().unwrap().clone();
+
+            assert!(h > 4 * 10, "the jail must land well past epoch 10 for this test to mean anything (h={h})");
+            assert_eq!(jail.jailed_epoch, epoch,
+                "jail must be stamped with the validator epoch, not the block height {h}");
+            assert_eq!(jail.unjail_after, epoch + 10, "a 10-epoch jail expires 10 epochs later");
+        }
+
+        /// Expiry makes a validator eligible to ask for reinstatement; it must
+        /// neither restore its seat nor change its status.
+        #[tokio::test]
+        async fn jail_expiry_does_not_reinstate_a_validator() {
+            let mut n = liveness_node(4).await;
+            let mut prev = None;
+            let mut h = run_until_dave_is_jailed(&mut n, &mut prev).await;
+            let unjail_after = n.validator_registry.get("qcb1dave").unwrap()
+                .jail_records.last().unwrap().unjail_after;
+
+            while n.identity.clock.current_epoch <= unjail_after + 1 {
+                drive_live(&mut n, h..h + 1, &mut prev, false).await;
+                h += 1;
+            }
+            let epoch = n.identity.clock.current_epoch;
+            let dave = n.validator_registry.get("qcb1dave").unwrap();
+            assert!(dave.jail_expired(epoch), "epoch {epoch} is past unjail_after {unjail_after}");
+            assert_eq!(dave.status, chain_forge_validators::ValidatorStatus::Jailed,
+                "expiry must not reinstate");
+            assert_eq!(seated(&n), ["qcb1alice", "qcb1bob", "qcb1carol"],
+                "an expired jail still holds no seat; only an explicit reinstatement may restore it");
+        }
+
+        /// Two nodes fed the same chain agree on the committee, the jail
+        /// records and the state root.
+        #[tokio::test]
+        async fn jail_enforcement_is_deterministic_across_nodes() {
+            let (mut a, mut b) = (liveness_node(4).await, liveness_node(4).await);
+            let (mut pa, mut pb) = (None, None);
+            let h = run_until_dave_is_jailed(&mut a, &mut pa).await;
+            assert_eq!(run_until_dave_is_jailed(&mut b, &mut pb).await, h);
+            drive_live(&mut a, h..h + 12, &mut pa, false).await;
+            drive_live(&mut b, h..h + 12, &mut pb, false).await;
+            assert_eq!(seated(&a), seated(&b));
+            assert_eq!(seated(&a), ["qcb1alice", "qcb1bob", "qcb1carol"]);
+            assert_eq!(serde_json::to_value(&a.validator_registry.get("qcb1dave").unwrap().jail_records).unwrap(),
+                       serde_json::to_value(&b.validator_registry.get("qcb1dave").unwrap().jail_records).unwrap());
+            assert_eq!(a.state.current_root(), b.state.current_root(), "state roots must agree");
+        }
+
+        /// Enforcement must never leave the chain with no committee at all.
+        #[tokio::test]
+        async fn jailing_every_validator_never_empties_the_committee() {
+            let mut n = liveness_node(10).await;
+            let mut prev = None;
+            drive_live(&mut n, 0..4, &mut prev, true).await;
+            let epoch = n.identity.clock.current_epoch;
+            for v in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+                n.validator_registry.jail(v, "liveness failure", epoch).unwrap();
+            }
+            drive_live(&mut n, 4..11, &mut prev, true).await;
+            assert_eq!(seated(&n).len(), 4, "the transition is deferred rather than emptying the set");
         }
 
         /// H0-1 fail-stop: a block that reached quorum elsewhere (partition
