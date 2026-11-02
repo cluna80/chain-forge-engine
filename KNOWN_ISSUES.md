@@ -285,6 +285,33 @@ nothing about WAN delay; the "loaded" phase was light (a single sender can
 keep about one tx per block in flight under the nonce-gap guard; block time
 stayed ~2.4 s), so it did not exercise the 1 s collection window.
 
+**Measured with injected arrival delay** (`validator_precommit_delay_live`,
+cargo feature `fault-injection`, sandbox 2026-11-02; healthy Dave signs and
+sends on time, only its ARRIVAL at the other nodes is delayed; idle chain)
+Each row is 18 blocks; "omitted" is over blocks Dave did not propose himself.
+
+| Arrival delay | Reached proposer before it built the block | In committed evidence | Window recorded miss | Median margin (proposal built minus arrival) |
+| --- | --- | --- | --- | --- |
+| 0 ms | 13 of 13 | 18 of 18 | 0 | 2,147 ms |
+| 500 ms | 14 of 14 | 18 of 18 | 0 | 1,601 ms |
+| 900 ms | 14 of 14 | 18 of 18 | 0 | 1,202 ms |
+| 1,500 ms | 13 of 13 | 18 of 18 | 0 | 601 ms |
+| 2,200 ms | 5 of 13 | 10 of 18 | 8 | -104 ms |
+| 3,000 ms | 0 of 13 | 5 of 18 | 13 | -899 ms |
+| 4,500 ms | 1 of 14 (see note) | 4 of 18 | 14 | -2,400 ms |
+
+Findings: (1) Stages agree end to end: whenever a precommit reached the
+proposer before it built the block it was included, otherwise it was omitted,
+and the liveness window recorded a miss for exactly the omitted blocks.
+(2) On an idle chain the effective collection window is about 2.1 s (margin
+at zero delay is ~2.15 s and falls one-for-one with injected delay), not the
+1,000 ms `COMMIT_GATHER_MS`: the proposer also idles ~2 s with an empty
+mempool. Omission begins just beyond that and is nearly total by 3 s.
+(3) The cliff is therefore a property of proposer timing. With traffic the
+proposer builds sooner (1 s gate), so the tolerance should shrink; NOT yet
+measured. (4) One 4,500 ms row disagreed (arrival logged before the delayed
+delivery was written when the log was read: a measurement-edge artifact).
+
 **Open decisions**
 1. Whether to require the policy to tolerate a measured WAN delay profile
    (needs delay-injected or multi-host measurement).
