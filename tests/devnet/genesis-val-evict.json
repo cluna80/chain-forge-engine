@@ -67,35 +67,35 @@
       "address": "qcb1alice",
       "balance": "1100000000",
       "role": "validator",
-      "public_key": "e1cb252a0db0514e8e639a5d20755a66af385deae8f1b44932c97845d5cc856e"
+      "public_key": "6caccc4ade33a11be12161375e7b487ed2d5201d6aaf1eae84114b47125178d8"
     },
     {
       "label": "Bob",
       "address": "qcb1bob",
       "balance": "1100000000",
       "role": "validator",
-      "public_key": "92eb29af99ec7629c13d4b9e15a588434783ba97a7ff1a7f18eb31c6d077e856"
+      "public_key": "65288338497d3f0653040eb1b887a85e9e9320c0c0c3dfcf979aefe6a6809fb0"
     },
     {
       "label": "Carol",
       "address": "qcb1carol",
       "balance": "1100000000",
       "role": "validator",
-      "public_key": "318e1213c8da2c7b01d31d55d1239ff0518e5811ba57e4077925dcbf35a5600a"
+      "public_key": "f95ff18493d936fb90afb7fb4cbfe5607712336984d305e8926c3240a2aad692"
     },
     {
       "label": "Dave",
       "address": "qcb1dave",
       "balance": "1100000000",
       "role": "validator",
-      "public_key": "ae1c44b845f7309694870b923926dd3db641e4e5a5ec7fb75180b74cc8aabc1d"
+      "public_key": "4f95a9904121fb5d0f040e82d4fbd953b8b76b728a026bed0fba52aaa45256f0"
     },
     {
       "label": "Eve",
       "address": "qcb1eve",
       "balance": "10000000",
       "role": "candidate",
-      "public_key": "0c9e2c95f2db67d3d8a3325381f48fd19158cdd355a1eb11a59e4d7888e1b73a"
+      "public_key": "1bda5a2f4ab36a814484acb058b00cd5909c50eecc68eda1a5e4029f149338d8"
     }
   ],
   "attestation_coordinator": "qcb1alice",
