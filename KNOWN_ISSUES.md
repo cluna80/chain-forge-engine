@@ -253,7 +253,7 @@ derived address; then confirm the grace-window behaviour the test intends.
 
 **Status: OPEN — measured 2026-11-02 (H0-11B evidence integrity). Automatic suspension must stay disabled in production genesis until a policy decision is made.**
 
-**Mechanism (confirmed in code, `node.rs` tests `late_precommit_*`)**
+**Mechanism (confirmed in code, `node.rs` tests `late_precommit_*`; Windows 4 of 4, 2026-11-02)**
 Liveness is judged from the committed `last_commit` evidence the proposer
 assembled. The proposer waits for every power-holding validator's precommit,
 but only up to `COMMIT_GATHER_MS` (1,000 ms) after its own commit. A valid
@@ -264,7 +264,7 @@ round than the one that committed is never published. Validators check the
 evidence is valid, not that it is complete.
 
 **What the policy does with a miss pattern**
-(real `LivenessWindow`, 100-block window, 20% threshold, f = 1, 4 validators;
+(real `LivenessWindow`, 100-block window, 20% threshold, f = 1, 4 validators; Windows 5 of 5, tables identical to the sandbox;
 `chain-forge-slashing/tests/liveness_false_positive.rs`)
 - Independent omission per block, P(jailed within 2,000 blocks):
   0–5%: ~0%; 10%: 2.2%; 15%: 74%; ≥20%: 100%. A sharp cliff near 12–15%.
