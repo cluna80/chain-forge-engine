@@ -355,11 +355,14 @@ fn validator_eviction_live() {
     // voting power proportional to stake so Eve's small bond can't skew quorum.
     let genesis_addrs = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
     let genesis_ports = [ports.alice_api, ports.bob_api, ports.carol_api, ports.dave_api];
-    for (addr, &p) in genesis_addrs.iter().zip(genesis_ports.iter()) {
+    // Track the nonce each genesis validator has consumed; starts at 0 (genesis state).
+    let mut genesis_nonces = [0u64; 4];
+    for (i, (addr, &p)) in genesis_addrs.iter().zip(genesis_ports.iter()).enumerate() {
         let n = nonce(p, addr);
         let r = submit_and_wait(p, &bond_tx(addr, n, GENESIS_BOND), Duration::from_secs(20));
         assert!(r["success"].as_bool().unwrap_or(false),
                 "Phase-0b bond for {addr} failed: {r}");
+        genesis_nonces[i] = n + 1; // next nonce for this validator after the bond tx
     }
     println!("   Phase-0b bonds complete.");
 
@@ -383,12 +386,14 @@ fn validator_eviction_live() {
     assert!(r["success"].as_bool().unwrap_or(false), "Eve RegisterIdentity failed: {r}");
 
     // Alice, Bob, Carol attest Eve (3 attestations → Verified).
-    for (attester, &p) in genesis_addrs[..3].iter().zip(genesis_ports[..3].iter()) {
-        let n = nonce(p, attester);
+    // Use the tracked nonces (each already sent 1 Bond tx in Phase-0b).
+    for (i, (attester, &p)) in genesis_addrs[..3].iter().zip(genesis_ports[..3].iter()).enumerate() {
+        let n = genesis_nonces[i];
         let tx = attest_tx(attester, n, EVE_ADDR);
         let r = submit_and_wait(p, &tx, Duration::from_secs(20));
         assert!(r["success"].as_bool().unwrap_or(false),
                 "{attester} Attest for Eve failed: {r}");
+        genesis_nonces[i] += 1;
     }
     println!("   Eve identity: Verified.");
 
