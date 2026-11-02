@@ -212,3 +212,29 @@ This issue must be resolved before any of the following:
 (`governance_vote_signing_bytes`, `propose_change_with_votes`,
 `revoke_with_votes`), all call sites in
 `chain-forge-personhood/src/bin/governance_authority_demo.rs`.
+
+---
+
+## P02A-W1  P-02a Windows validation, and one unexplained `h0_3_crash_recovery_live` failure
+
+**Status: RECORDED 2026-11-02 — not a P-02a defect as far as can be told; cause UNCONFIRMED.**
+(Numbered P02A-W1 rather than §6 so it does not collide with the §6-§13 entries on the unmerged H0-11 branch.)
+
+Validated on Windows / BossKing (MINGW64), commit `5fc1941` (branch `feat/p02a-gaps-rebased`; later commits are docs only):
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p chain-forge-core` | 62 passed |
+| `cargo test -p chain-forge-state` | 74 passed, 3 ignored |
+| `cargo test -p chain-forge-node --bin chain-forge-node` | 325 passed, 1 failed (`cs001_p7_mldsa_tx_accepted_during_and_after_migration`, the known failure, identical on `main`) |
+| `h0_3_crash_recovery_live`, whole file, 8 parallel runs + 1 `--test-threads=1` | 12 passed in 7 parallel runs and the serial run; **11 passed, 1 failed in one parallel run** (`c_01_clean_restart_preserves_state`) |
+| `h0_3_crash_recovery_live c_01`, alone, twice | passed (15 s each) |
+| `h0_8_genesis_peer_verification_live` | 7 passed |
+
+What the Windows run shows: the node suite includes the directory-fsync tests (D1, D2, D6), so `flush_dir_windows` (`FILE_FLAG_BACKUP_SEMANTICS` + `FlushFileBuffers`) ran and succeeded, and the live tests commit a snapshot through it on every block. It does **not** show that a rename survives power loss on NTFS; that was not tested.
+
+**The anomaly.** In one of the first two parallel runs after a fresh build and an Avast exception, C-01 failed. The failure message was not captured. The next 8 runs of the same test (alone, serial and 4 parallel) all passed, and ran in about 15 s each. The two slow runs (42.6 s and 58.0 s) were the first two after the rebuild; the failing one was the 58 s run. The test waits up to 20 s for the API port and 30 s for height.
+
+**Suspected cause (UNCONFIRMED):** antivirus (Avast) scanning a freshly built node executable, or machine load right after a rebuild, delaying startup past the 20 s port wait. A second candidate: the test's `free_port()` binds port 0, which hands out ephemeral-range ports and can collide on Windows (the cause of an earlier jail-test failure, os error 10048). Neither was observed. A persistence defect would be expected to fail repeatedly, and it did not.
+
+**Not changed.** The test file was deliberately NOT hardened on the P-02a branch (separate change after merge: ports outside the ephemeral range and more wait margin). If C-01 fails again, capture the log (`... -- --nocapture 2>&1 | tee c01.log`) and grep for `panicked`, `FATAL`, `10048`.
