@@ -300,6 +300,14 @@ Each row is 18 blocks; "omitted" is over blocks Dave did not propose himself.
 | 3,000 ms | 0 of 13 | 5 of 18 | 13 | -899 ms |
 | 4,500 ms | 1 of 14 (see note) | 4 of 18 | 14 | -2,400 ms |
 
+Windows/BossKing 2026-11-02 (`validator_precommit_delay_live`, 399.7 s) matches:
+omitted from committed evidence (all counted as misses by the window) 0 of 18 at
+0/500/900/1,500 ms; 6 of 18 at 2,200 ms (median margin +9 ms); 14 of 18 at
+3,000 ms; 13 of 18 at 4,500 ms. Median margin at zero delay 2,162 ms. The
+half-way point fell at 2,200 ms in the sandbox and just above it on Windows:
+the transition is gradual across roughly 2.1-3 s, so "the cliff" depends on the
+cut-off used, not on one sharp number.
+
 Findings: (1) Stages agree end to end: whenever a precommit reached the
 proposer before it built the block it was included, otherwise it was omitted,
 and the liveness window recorded a miss for exactly the omitted blocks.
