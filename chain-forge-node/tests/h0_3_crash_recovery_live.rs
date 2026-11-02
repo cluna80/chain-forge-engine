@@ -32,9 +32,13 @@ mod h0_3_crash_recovery_live {
     use std::net::TcpStream;
     use std::time::Duration;
     use chain_forge_node::persistence::{
-        PersistError, SigningCompatibility, SNAPSHOT_FILES,
+        PersistError, SigningCompatibility, SnapshotIdentity, SNAPSHOT_FILES,
         write_snapshot, load_snapshot, check_signing_compatibility,
     };
+
+    fn test_identity() -> SnapshotIdentity {
+        SnapshotIdentity { chain_id: "test-chain".into(), genesis_hash: "ab".repeat(32) }
+    }
 
     // ── shared HTTP helpers (no external crates, matches devnet_4node style) ──
 
@@ -496,7 +500,7 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write a valid generation-based snapshot.
-        write_snapshot(dir.path(), 5, &valid_contents(5)).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
 
         // Corrupt state.json in the committed generation directory.
         let corrupt = b"{ \"height\": 999, \"accounts\": CORRUPT_NOT_JSON }";
@@ -504,7 +508,7 @@ mod h0_3_crash_recovery_live {
         std::fs::write(gen_dir.join("state.json"), corrupt).unwrap();
 
         // load_snapshot must detect the hash mismatch and refuse.
-        let result = load_snapshot(dir.path());
+        let result = load_snapshot(dir.path(), &test_identity());
         assert!(
             matches!(result, Err(PersistError::HashMismatch { .. })),
             "corrupted state.json must produce HashMismatch, got: {:?}",
@@ -522,14 +526,14 @@ mod h0_3_crash_recovery_live {
     #[test]
     fn c_03_truncated_state_json_refuses_start() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_snapshot(dir.path(), 5, &valid_contents(5)).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
 
         // Overwrite with a truncated prefix.
         let truncated = b"{ \"height\": 5, \"accounts\": {";
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         std::fs::write(gen_dir.join("state.json"), truncated).unwrap();
 
-        let result = load_snapshot(dir.path());
+        let result = load_snapshot(dir.path(), &test_identity());
         assert!(
             matches!(result, Err(PersistError::HashMismatch { .. })),
             "truncated state.json must produce HashMismatch, got: {:?}",
@@ -552,7 +556,7 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write a valid gen-000001 first so CURRENT exists.
-        write_snapshot(dir.path(), 5, &valid_contents(5)).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
 
         // Simulate a partial gen-000002: create the directory and write
         // state.json but never write identity.json or the manifest.
@@ -562,7 +566,7 @@ mod h0_3_crash_recovery_live {
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         std::fs::remove_file(gen_dir.join("identity.json")).unwrap();
 
-        let result = load_snapshot(dir.path());
+        let result = load_snapshot(dir.path(), &test_identity());
         assert!(
             matches!(result, Err(PersistError::MissingFile { .. })),
             "missing identity.json must produce MissingFile, got: {:?}",
@@ -585,14 +589,14 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write a valid snapshot at height 10 then tamper with chain_store.
-        write_snapshot(dir.path(), 10, &valid_contents(10)).unwrap();
+        write_snapshot(dir.path(), 10, &valid_contents(10), &test_identity()).unwrap();
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
 
         // Overwrite chain_store.json with height-9 data (mismatches manifest hash).
         let chain_store_9 = make_chain_store_json(9);
         std::fs::write(gen_dir.join("chain_store.json"), &chain_store_9).unwrap();
 
-        let result = load_snapshot(dir.path());
+        let result = load_snapshot(dir.path(), &test_identity());
         assert!(
             matches!(
                 result,
@@ -693,7 +697,7 @@ mod h0_3_crash_recovery_live {
 
         // Step 1: committed snapshot at height 10
         let contents = valid_contents(10);
-        let gen = write_snapshot(&data_dir, 10, &contents).unwrap();
+        let gen = write_snapshot(&data_dir, 10, &contents, &test_identity()).unwrap();
         write_current(&data_dir, &gen).unwrap();
 
         // Step 2: write ahead-of-state guard to the authoritative path
@@ -1166,7 +1170,7 @@ mod h0_3_crash_recovery_live {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Write gen-000001 successfully.
-        write_snapshot(dir.path(), 5, &valid_contents(5)).unwrap();
+        write_snapshot(dir.path(), 5, &valid_contents(5), &test_identity()).unwrap();
 
         // Simulate a crash during gen-000002: create the directory and write
         // some files, but do NOT call write_snapshot (CURRENT stays at gen-000001).
@@ -1178,7 +1182,7 @@ mod h0_3_crash_recovery_live {
 
         // On restart, load_snapshot must serve gen-000001 (the last committed
         // generation), not the partial gen-000002.
-        let snap = load_snapshot(dir.path())
+        let snap = load_snapshot(dir.path(), &test_identity())
             .expect("load must succeed")
             .expect("committed snapshot must be found");
         assert_eq!(snap.generation, "gen-000001", "must load the committed generation");
@@ -1193,9 +1197,9 @@ mod h0_3_crash_recovery_live {
     fn c_09_generation_pruning_retains_n_minus_1() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        write_snapshot(dir.path(), 1, &valid_contents(1)).unwrap(); // gen-000001
-        write_snapshot(dir.path(), 2, &valid_contents(2)).unwrap(); // gen-000002
-        write_snapshot(dir.path(), 3, &valid_contents(3)).unwrap(); // gen-000003
+        write_snapshot(dir.path(), 1, &valid_contents(1), &test_identity()).unwrap(); // gen-000001
+        write_snapshot(dir.path(), 2, &valid_contents(2), &test_identity()).unwrap(); // gen-000002
+        write_snapshot(dir.path(), 3, &valid_contents(3), &test_identity()).unwrap(); // gen-000003
 
         // gen-000001 (N-2) must be gone.
         assert!(
@@ -1208,7 +1212,7 @@ mod h0_3_crash_recovery_live {
             "gen-000002 (N-1) must be retained as a fallback"
         );
         // gen-000003 (N) is the live committed generation.
-        let snap = load_snapshot(dir.path()).unwrap().unwrap();
+        let snap = load_snapshot(dir.path(), &test_identity()).unwrap().unwrap();
         assert_eq!(snap.generation, "gen-000003");
         assert_eq!(snap.height, 3);
     }
@@ -1221,14 +1225,14 @@ mod h0_3_crash_recovery_live {
     #[test]
     fn c_10_manifest_hash_mismatch_is_detected() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_snapshot(dir.path(), 7, &valid_contents(7)).unwrap();
+        write_snapshot(dir.path(), 7, &valid_contents(7), &test_identity()).unwrap();
 
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         // Overwrite agents.json with different content (same size to pass
         // a naive size check, but different hash).
         std::fs::write(gen_dir.join("agents.json"), b"{\"_tampered\":true}").unwrap();
 
-        let result = load_snapshot(dir.path());
+        let result = load_snapshot(dir.path(), &test_identity());
         assert!(
             matches!(result, Err(PersistError::HashMismatch { .. })),
             "tampered agents.json must produce HashMismatch"

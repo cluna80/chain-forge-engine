@@ -76,6 +76,10 @@ pub enum PersistError {
     /// A signing history entry conflicts with the restored consensus state.
     /// Signing is blocked until an explicit recovery is performed.
     SigningHistoryConflict { detail: String },
+    /// The manifest is of a format, chain or genesis this node must not load
+    /// (missing/unknown `format_version`, blank or mismatched `chain_id` /
+    /// `genesis_hash`). `detail` is the operator-facing text.
+    IncompatibleManifest { gen: String, detail: String },
     /// A low-level I/O error.
     Io(std::io::Error),
 }
@@ -105,6 +109,8 @@ impl std::fmt::Display for PersistError {
             PersistError::SigningHistoryConflict { detail } =>
                 write!(f, "consensus signing history conflicts with restored state: {detail} \
                            — restore the chain state from a peer or start with a clean data directory"),
+            PersistError::IncompatibleManifest { gen, detail } =>
+                write!(f, "generation '{gen}': {detail}"),
             PersistError::Io(e) =>
                 write!(f, "I/O error during persistence: {e}"),
         }
@@ -121,12 +127,85 @@ impl From<std::io::Error> for PersistError {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotManifest {
+    /// Storage format of this generation. Written as `FORMAT_VERSION`. `None`
+    /// only when parsing a manifest written by a pre-H0-3b node, which the
+    /// loader refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<u64>,
+    /// `chain_id` of the genesis the writing node was running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
+    /// `chain_forge_core::genesis_hash_hex` of that genesis (64 hex chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_hash: Option<String>,
     /// The committed block height this snapshot captures.
     pub height: u64,
     /// Generation label, e.g. "gen-000042".
     pub generation: String,
     /// Per-file integrity records.
     pub files: Vec<FileEntry>,
+}
+
+/// The storage format this node reads and writes. Bump on any incompatible
+/// change; a node refuses every other version (no downgrade, no silent upgrade).
+pub const FORMAT_VERSION: u64 = 1;
+
+/// Who a snapshot belongs to. Always derived from the genesis the node is
+/// RUNNING (`Node::snapshot_identity`) — never from a flag, file or environment
+/// variable — so a mismatch at startup is caught by the loader's comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotIdentity {
+    pub chain_id:     String,
+    /// 64 lowercase hex characters.
+    pub genesis_hash: String,
+}
+
+impl SnapshotIdentity {
+    /// An identity that could match anything is not an identity.
+    fn validate(&self) -> Result<(), String> {
+        if self.chain_id.trim().is_empty() { return Err("chain_id is blank".into()); }
+        if !is_hash_hex(&self.genesis_hash) { return Err("genesis_hash is not 64 hex characters".into()); }
+        Ok(())
+    }
+}
+
+fn is_hash_hex(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) }
+
+/// Refuse a manifest that is of another format, chain or genesis. Order:
+/// format_version, chain_id, genesis_hash. Blank, whitespace-only or missing
+/// identity fields are refused outright (never a wildcard).
+fn check_manifest_identity(m: &SnapshotManifest, gen: &str, expected: &SnapshotIdentity)
+    -> Result<(), PersistError>
+{
+    let bad = |detail: String| PersistError::IncompatibleManifest { gen: gen.to_string(), detail };
+    match m.format_version {
+        None => return Err(bad(
+            "generation manifest missing format_version — written by a pre-H0-3b node; \
+             start with a clean data directory".into())),
+        Some(v) if v != FORMAT_VERSION => return Err(bad(format!(
+            "manifest format_version {v} is not supported by this node (it reads format_version \
+             {FORMAT_VERSION}); start with a clean data directory"))),
+        Some(_) => {}
+    }
+    match m.chain_id.as_deref() {
+        None => return Err(bad("manifest chain_id is missing".into())),
+        Some(c) if c.trim().is_empty() => return Err(bad("manifest chain_id is blank".into())),
+        Some(c) if c != expected.chain_id => return Err(bad(format!(
+            "manifest chain_id '{c}' does not match this node's chain_id '{}' — this data \
+             belongs to another chain", expected.chain_id))),
+        Some(_) => {}
+    }
+    match m.genesis_hash.as_deref() {
+        None => return Err(bad("manifest genesis_hash is missing".into())),
+        Some(h) if h.trim().is_empty() => return Err(bad("manifest genesis_hash is blank".into())),
+        Some(h) if !is_hash_hex(h) => return Err(bad(format!(
+            "manifest genesis_hash '{h}' is not 64 hex characters"))),
+        Some(h) if !h.eq_ignore_ascii_case(&expected.genesis_hash) => return Err(bad(format!(
+            "manifest genesis_hash {h} does not match this node's genesis_hash {} — this data \
+             was written under a different genesis", expected.genesis_hash))),
+        Some(_) => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -240,7 +319,11 @@ pub fn write_snapshot(
     data_dir: &Path,
     height: u64,
     contents: &[(&str, Vec<u8>)],
+    identity: &SnapshotIdentity,
 ) -> Result<String, PersistError> {
+    // Never write a wildcard identity: it would be accepted by any chain.
+    identity.validate().map_err(|why| PersistError::Io(
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("snapshot identity: {why}"))))?;
     let snaps = data_dir.join("snapshots");
     std::fs::create_dir_all(&snaps)?;
 
@@ -267,7 +350,14 @@ pub fn write_snapshot(
     fsync_dir(&gen_dir)?;
 
     // Write manifest.json last — its presence is the commit signal.
-    let manifest = SnapshotManifest { height, generation: gen.clone(), files: file_entries };
+    let manifest = SnapshotManifest {
+        format_version: Some(FORMAT_VERSION),
+        chain_id:       Some(identity.chain_id.clone()),
+        genesis_hash:   Some(identity.genesis_hash.clone()),
+        height,
+        generation: gen.clone(),
+        files: file_entries,
+    };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     write_atomic_bytes(&gen_dir.join("manifest.json"), &manifest_bytes)?;
@@ -305,7 +395,9 @@ pub struct SnapshotContents {
 /// - `Ok(Some(contents))` — valid snapshot found and verified.
 /// - `Ok(None)` — fresh directory (CURRENT absent).
 /// - `Err(PersistError::*)` — corrupted/incomplete snapshot; node must NOT start.
-pub fn load_snapshot(data_dir: &Path) -> Result<Option<SnapshotContents>, PersistError> {
+pub fn load_snapshot(data_dir: &Path, expected: &SnapshotIdentity)
+    -> Result<Option<SnapshotContents>, PersistError>
+{
     let gen_label_str = match read_current(data_dir)
         .map_err(PersistError::Io)? {
         None => {
@@ -356,6 +448,9 @@ pub fn load_snapshot(data_dir: &Path) -> Result<Option<SnapshotContents>, Persis
             gen: gen_label_str.clone(),
             detail: e.to_string(),
         })?;
+
+    // Format, chain and genesis are checked BEFORE any file is trusted.
+    check_manifest_identity(&manifest, &gen_label_str, expected)?;
 
     // Verify each file.
     let mut file_map = std::collections::HashMap::new();
@@ -466,7 +561,7 @@ fn has_legacy_files(data_dir: &Path) -> bool {
 ///
 /// Returns `Ok(None)` when `CURRENT` already exists (nothing to migrate) or
 /// when no legacy file is present (a genuinely fresh directory).
-pub fn migrate_legacy(data_dir: &Path) -> Result<Option<String>, PersistError> {
+pub fn migrate_legacy(data_dir: &Path, identity: &SnapshotIdentity) -> Result<Option<String>, PersistError> {
     if read_current(data_dir).map_err(PersistError::Io)?.is_some() { return Ok(None); }
     if !has_legacy_files(data_dir) { return Ok(None); }
 
@@ -501,7 +596,7 @@ pub fn migrate_legacy(data_dir: &Path) -> Result<Option<String>, PersistError> {
     // start loads it (`migrate_legacy` returns early once `CURRENT` exists) and
     // the stale legacy files are ignored. Moving the files BEFORE `CURRENT`
     // exists would lose the only copy of the state on a crash.
-    let gen = write_snapshot(data_dir, height, &contents)?;
+    let gen = write_snapshot(data_dir, height, &contents, identity)?;
 
     // The new generation exists and CURRENT points at it. Archive (move) the
     // legacy files so a future start cannot mistake them for current state.
@@ -629,6 +724,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn test_identity() -> SnapshotIdentity {
+        SnapshotIdentity { chain_id: "test-chain".into(), genesis_hash: "ab".repeat(32) }
+    }
+
     fn make_temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }
@@ -665,17 +764,17 @@ mod tests {
     #[test]
     fn round_trip_fresh_dir() {
         let dir = make_temp_dir();
-        assert!(matches!(load_snapshot(dir.path()), Ok(None)), "fresh dir must return Ok(None)");
+        assert!(matches!(load_snapshot(dir.path(), &test_identity()), Ok(None)), "fresh dir must return Ok(None)");
     }
 
     #[test]
     fn round_trip_single_generation() {
         let dir = make_temp_dir();
         let contents = dummy_contents(5);
-        let gen = write_snapshot(dir.path(), 5, &contents).unwrap();
+        let gen = write_snapshot(dir.path(), 5, &contents, &test_identity()).unwrap();
         assert_eq!(gen, "gen-000001");
 
-        let snap = load_snapshot(dir.path()).unwrap().expect("should have snapshot");
+        let snap = load_snapshot(dir.path(), &test_identity()).unwrap().expect("should have snapshot");
         assert_eq!(snap.height, 5);
         assert_eq!(snap.generation, "gen-000001");
         assert!(snap.files.contains_key("state.json"));
@@ -684,11 +783,11 @@ mod tests {
     #[test]
     fn second_write_increments_generation() {
         let dir = make_temp_dir();
-        write_snapshot(dir.path(), 5, &dummy_contents(5)).unwrap();
-        let gen2 = write_snapshot(dir.path(), 6, &dummy_contents(6)).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
+        let gen2 = write_snapshot(dir.path(), 6, &dummy_contents(6), &test_identity()).unwrap();
         assert_eq!(gen2, "gen-000002");
 
-        let snap = load_snapshot(dir.path()).unwrap().expect("snapshot");
+        let snap = load_snapshot(dir.path(), &test_identity()).unwrap().expect("snapshot");
         assert_eq!(snap.height, 6);
         assert_eq!(snap.generation, "gen-000002");
     }
@@ -696,9 +795,9 @@ mod tests {
     #[test]
     fn gen_minus_2_is_pruned() {
         let dir = make_temp_dir();
-        write_snapshot(dir.path(), 1, &dummy_contents(1)).unwrap(); // gen-000001
-        write_snapshot(dir.path(), 2, &dummy_contents(2)).unwrap(); // gen-000002
-        write_snapshot(dir.path(), 3, &dummy_contents(3)).unwrap(); // gen-000003 → prunes gen-000001
+        write_snapshot(dir.path(), 1, &dummy_contents(1), &test_identity()).unwrap(); // gen-000001
+        write_snapshot(dir.path(), 2, &dummy_contents(2), &test_identity()).unwrap(); // gen-000002
+        write_snapshot(dir.path(), 3, &dummy_contents(3), &test_identity()).unwrap(); // gen-000003 → prunes gen-000001
         assert!(!dir.path().join("snapshots").join("gen-000001").exists(),
                 "gen-000001 should have been pruned");
         assert!(dir.path().join("snapshots").join("gen-000002").exists(),
@@ -713,7 +812,7 @@ mod tests {
         // Write CURRENT manually pointing at a non-existent dir.
         std::fs::write(dir.path().join("CURRENT"), "gen-000099").unwrap();
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::MissingGeneration { .. })
         ));
     }
@@ -726,7 +825,7 @@ mod tests {
         std::fs::write(dir.path().join("CURRENT"), "gen-000001").unwrap();
         // No manifest.json.
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::MissingManifest { .. })
         ));
     }
@@ -739,7 +838,7 @@ mod tests {
         std::fs::write(dir.path().join("CURRENT"), "gen-000001").unwrap();
         std::fs::write(gen_dir.join("manifest.json"), b"NOT_JSON").unwrap();
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::CorruptManifest { .. })
         ));
     }
@@ -748,11 +847,11 @@ mod tests {
     fn load_missing_file_is_error() {
         let dir = make_temp_dir();
         // Write a valid snapshot then delete one file from the generation dir.
-        write_snapshot(dir.path(), 5, &dummy_contents(5)).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         std::fs::remove_file(gen_dir.join("identity.json")).unwrap();
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::MissingFile { .. })
         ));
     }
@@ -760,12 +859,12 @@ mod tests {
     #[test]
     fn load_hash_mismatch_is_error() {
         let dir = make_temp_dir();
-        write_snapshot(dir.path(), 5, &dummy_contents(5)).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
         // Corrupt identity.json after it was written.
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         std::fs::write(gen_dir.join("identity.json"), b"CORRUPTED").unwrap();
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::HashMismatch { .. })
         ));
     }
@@ -783,9 +882,9 @@ mod tests {
         }
         // write_snapshot uses the height param for the manifest, but state.json
         // says 3 — this should be caught by load_snapshot's cross-check.
-        write_snapshot(dir.path(), 5, &contents).unwrap();
+        write_snapshot(dir.path(), 5, &contents, &test_identity()).unwrap();
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::HeightMismatch { .. })
         ));
     }
@@ -805,9 +904,9 @@ mod tests {
                 *bytes = make_valid_state_json(5);
             }
         }
-        write_snapshot(dir.path(), 5, &contents).unwrap();
+        write_snapshot(dir.path(), 5, &contents, &test_identity()).unwrap();
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::HeightMismatch { .. })
         ));
     }
@@ -911,7 +1010,7 @@ mod tests {
         std::fs::create_dir_all(snaps.join("gen-000001")).unwrap();
 
         assert!(matches!(
-            load_snapshot(dir.path()),
+            load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::CorruptManifest { .. })
         ), "orphaned gen dir without CURRENT must be detected as fatal");
     }
@@ -921,7 +1020,7 @@ mod tests {
         // Empty snapshots/ with no CURRENT and no gen dirs → fresh install.
         let dir = make_temp_dir();
         std::fs::create_dir_all(dir.path().join("snapshots")).unwrap();
-        assert!(load_snapshot(dir.path()).unwrap().is_none(),
+        assert!(load_snapshot(dir.path(), &test_identity()).unwrap().is_none(),
             "empty snapshots/ with no CURRENT must be treated as fresh");
     }
 
@@ -931,7 +1030,7 @@ mod tests {
     fn current_not_updated_on_interrupted_write() {
         let dir = make_temp_dir();
         // Write gen-000001 successfully.
-        write_snapshot(dir.path(), 5, &dummy_contents(5)).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
 
         // Simulate crash during gen-000002 write: create the directory and write
         // some files, but do NOT call write_snapshot (so CURRENT stays on gen-000001).
@@ -941,7 +1040,7 @@ mod tests {
         // CURRENT still points at gen-000001.
 
         // Load must return the committed gen-000001, not the partial gen-000002.
-        let snap = load_snapshot(dir.path()).unwrap().expect("should have snapshot");
+        let snap = load_snapshot(dir.path(), &test_identity()).unwrap().expect("should have snapshot");
         assert_eq!(snap.generation, "gen-000001");
         assert_eq!(snap.height, 5);
     }
