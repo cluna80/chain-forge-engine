@@ -569,7 +569,11 @@ Live multi-node checks on the optimized build (sandbox, 4 real node processes): 
 PASSED (643 s) with state roots IDENTICAL to the pre-change runs at JL-01 (`51136494701f`), JL-06 (`eebbee537f59`)
 and JL-09 (`33362db6f1e0`), including Dave replaying the whole chain from peers to the same state;
 `validator_eviction_live` EV-01..EV-03 PASSED (95 s), same root as the pre-change sandbox run (`1f2b492f...`).
-Windows regression of this branch: pending.
+Windows/BossKing regression of this branch, 2026-11-02 (so far): node unit suite 280 passed, 1 failed (the known
+unrelated `cs001_p7`, same message as before this work), which includes `state_perf_node_state_roots_are_golden`
+and the restart and recovery tests; `validator_jail_live` JL-01..JL-09 PASSED (627 s) with state roots IDENTICAL
+to the pre-change Windows run (`51136494701f`, `eebbee537f59`, `33362db6f1e0`). Still to report from Windows:
+`chain-forge-state` tests, the release tree benchmark, and `validator_eviction_live`.
 
 Tree-only release benchmark (12 accounts, 3 updates per version), microseconds per commit:
 | Versions | Original | Indexed |
