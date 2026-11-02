@@ -7077,6 +7077,147 @@ mod tests {
             assert!(!precommitters(&lc).contains("qcb1dave"));
         }
 
+        // -- PERSIST-001 P-01: READ-ONLY profile of the commit-to-disk path -------------
+        //
+        // `#[ignore]`d measurements, not assertions. They replicate persist_state()'s
+        // per-file work from outside so nothing in production code changes.
+        //   cargo test -p chain-forge-node --bin chain-forge-node persist001 -- --ignored --nocapture
+
+        fn ms_of<T>(f: impl FnOnce() -> T) -> (T, f64) {
+            let t = std::time::Instant::now();
+            let r = f();
+            (r, t.elapsed().as_secs_f64() * 1000.0)
+        }
+
+        /// One block carrying `k` transfers, committed through the real path (incl. persist_state).
+        async fn commit_with_txs(n: &mut Node, h: u64, k: u64, nonce: &mut u64) -> f64 {
+            for _ in 0..k {
+                let mut tx = Transaction::transfer(&format!("p-{nonce}"), "qcb1alice", "qcb1bob", "uqcb", 1, *nonce);
+                tx.sign(&ClassicalScheme.generate_keypair("qcb1alice").unwrap(), CHAIN).unwrap();
+                n.mempool.push(tx);
+                *nonce += 1;
+            }
+            let tx_data = n.block_payload(h).encode();
+            let p = proposal(h, tx_data);
+            let t = std::time::Instant::now();
+            deliver(n, &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(n.status.lock().unwrap().height, h, "must commit h{h}");
+            ms
+        }
+
+        /// (bytes, serialize ms, write ms) per file, mirroring persist_state().
+        fn persist_breakdown(n: &Node, dir: &std::path::Path) -> Vec<(&'static str, usize, f64, f64)> {
+            let mut out = vec![];
+            macro_rules! cost {
+                ($name:expr, $val:expr) => {{
+                    let (json, ser) = ms_of(|| serde_json::to_string_pretty($val).unwrap());
+                    let (_, wr) = ms_of(|| std::fs::write(dir.join($name), &json));
+                    out.push(($name, json.len(), ser, wr));
+                }};
+            }
+            let snap = n.state.export_snapshot();
+            cost!("state.json", &snap);
+            cost!("identity.json", &n.identity);
+            cost!("validators.json", &n.validator_registry);
+            cost!("agents.json", &n.agents);
+            cost!("slashing.json", &n.slasher);
+            cost!("chain_store.json", &n.chain_store);
+            cost!("historical_validator_sets.json", &n.historical_validator_sets);
+            cost!("live_validator_set.json", n.consensus.validator_set());
+            out
+        }
+
+        #[tokio::test]
+        #[ignore = "PERSIST-001 profiling; run explicitly with --ignored --nocapture"]
+        async fn persist001_profile_commit_path() {
+            let max: u64 = std::env::var("CF_PERSIST_PROFILE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+            let k: u64 = std::env::var("CF_PERSIST_PROFILE_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+            let dir = std::env::temp_dir().join(format!("cf-persist001-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut n = liveness_node(1_000_000).await;
+            // CF_PERSIST_PROFILE_NODISK=1 runs the identical loop with persistence off, to separate
+            // persist_state() from the rest of the commit path.
+            let nodisk = std::env::var("CF_PERSIST_PROFILE_NODISK").is_ok();
+            if !nodisk { n.set_data_dir(dir.clone()).unwrap(); } else { std::fs::create_dir_all(dir.join("persist")).unwrap(); }
+            let persist = dir.join("persist");
+            let samples: Vec<u64> = [25u64, 50, 100, 200, 300, 450, 600, 800, 1000].into_iter().filter(|h| *h <= max).collect();
+            let (mut nonce, mut recent): (u64, Vec<f64>) = (0, vec![]);
+
+            println!("\nPERSIST-001 P-01: {k} transfers per block, in-process 4-validator commit path, data dir {dir:?}");
+            println!("{:>6} | {:>9} | {:>10} {:>9} {:>9} | {:>10} {:>9} | {:>11} {:>10} {:>10} | {:>9}",
+                "height", "commit ms", "chain MB", "ser ms", "write ms", "others ser", "others wr",
+                "compact ser", "atomic wr", "persist()", "B/block");
+            for h in 0..=max {
+                let ms = commit_with_txs(&mut n, h, k, &mut nonce).await;
+                recent.push(ms);
+                if samples.contains(&h) {
+                    let w: Vec<f64> = recent.iter().rev().take(10).copied().collect();
+                    let commit = { let mut v = w.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+                    let parts = persist_breakdown(&n, &persist);
+                    let cs = parts.iter().find(|p| p.0 == "chain_store.json").unwrap();
+                    let (oser, owr): (f64, f64) = parts.iter().filter(|p| p.0 != "chain_store.json")
+                        .fold((0.0, 0.0), |a, p| (a.0 + p.2, a.1 + p.3));
+                    let (_, compact) = ms_of(|| serde_json::to_string(&n.chain_store).unwrap());
+                    let bytes = serde_json::to_vec(&n.chain_store).unwrap();
+                    let (_, atomic) = ms_of(|| write_atomic(&persist.join("chain_store.atomic-probe"), &bytes).unwrap());
+                    let best = (0..3).map(|_| ms_of(|| n.persist_state()).1).fold(f64::MAX, f64::min);
+                    println!("{:>6} | {:>9.1} | {:>10.2} {:>9.1} {:>9.1} | {:>10.1} {:>9.1} | {:>11.1} {:>10.1} {:>10.1} | {:>9}",
+                        h, commit, cs.1 as f64 / 1e6, cs.2, cs.3, oser, owr, compact, atomic, best, cs.1 / (h as usize + 1));
+                }
+            }
+            println!("\ncolumns: commit ms = median of the last 10 real commits (includes persist_state);");
+            println!("chain MB/ser/write = chain_store.json (pretty JSON, rewritten whole every commit); others = the other 7 files;");
+            println!("compact ser = same data serialized without pretty-printing; atomic wr = temp+fsync+rename of the compact bytes;");
+            println!("persist() = one full persist_state() call (best of 3).");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// What does today's recovery do with a torn or missing file? Prints the outcome.
+        #[tokio::test]
+        #[ignore = "PERSIST-001 durability audit; run explicitly with --ignored --nocapture"]
+        async fn persist001_audit_torn_files() {
+            async fn fresh_with_state(dir: &std::path::Path, blocks: u64) -> Node {
+                let _ = std::fs::remove_dir_all(dir);
+                let mut n = liveness_node(1_000_000).await;
+                n.set_data_dir(dir.to_path_buf()).unwrap();
+                let mut nonce = 0;
+                for h in 0..blocks { commit_with_txs(&mut n, h, 2, &mut nonce).await; }
+                n
+            }
+            let base = std::env::temp_dir().join(format!("cf-persist001-audit-{}", std::process::id()));
+            println!("\nPERSIST-001 durability audit (what load_persisted_state does today):");
+            for (label, file, how) in [
+                ("state.json truncated to half",            "state.json",       "half"),
+                ("state.json emptied (crash right after create)", "state.json", "empty"),
+                ("chain_store.json truncated to half",      "chain_store.json", "half"),
+                ("chain_store.json emptied",                "chain_store.json", "empty"),
+                ("slashing.json truncated to half",         "slashing.json",    "half"),
+                ("identity.json truncated to half",         "identity.json",    "half"),
+                ("live_validator_set.json truncated to half","live_validator_set.json", "half"),
+                ("validators.json missing",                 "validators.json",  "delete"),
+            ] {
+                let dir = base.join(file.replace('.', "_")).join(how);
+                let n = fresh_with_state(&dir, 12).await;
+                drop(n);
+                let path = dir.join("persist").join(file);
+                let bytes = std::fs::read(&path).unwrap();
+                match how {
+                    "half"   => std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap(),
+                    "empty"  => std::fs::write(&path, b"").unwrap(),
+                    _        => std::fs::remove_file(&path).unwrap(),
+                }
+                let mut r = liveness_node(1_000_000).await;
+                r.set_data_dir(dir.clone()).unwrap();
+                let loaded = r.load_persisted_state();
+                let h = r.status.lock().unwrap().height;
+                let engine_h = r.consensus.current_height();
+                println!("  {label:<48} load_persisted_state() = {loaded:<5}  status height {h:>3}  engine height {engine_h:>3}  -> {}",
+                    if loaded { "resumed (possibly with inconsistent parts)" } else { "FELL BACK TO GENESIS (main.rs logs \"no persisted state found\")" });
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
         /// Enforcement must never leave the chain with no committee at all.
         #[tokio::test]
         async fn jailing_every_validator_never_empties_the_committee() {
