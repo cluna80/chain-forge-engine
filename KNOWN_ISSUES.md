@@ -227,13 +227,13 @@ Validated on Windows / BossKing (MINGW64), commit `5fc1941` (branch `feat/p02a-g
 | `cargo test -p chain-forge-core` | 62 passed |
 | `cargo test -p chain-forge-state` | 74 passed, 3 ignored |
 | `cargo test -p chain-forge-node --bin chain-forge-node` | 325 passed, 1 failed (`cs001_p7_mldsa_tx_accepted_during_and_after_migration`, the known failure, identical on `main`) |
-| `h0_3_crash_recovery_live`, whole file, 8 parallel runs + 1 `--test-threads=1` | 12 passed in 7 parallel runs and the serial run; **11 passed, 1 failed in one parallel run** (`c_01_clean_restart_preserves_state`) |
+| `h0_3_crash_recovery_live`, whole file: 6 parallel runs + 1 `--test-threads=1` (7 runs) | 12 passed in 5 parallel runs and the serial run; **11 passed, 1 failed in one parallel run** (`c_01_clean_restart_preserves_state`) |
 | `h0_3_crash_recovery_live c_01`, alone, twice | passed (15 s each) |
 | `h0_8_genesis_peer_verification_live` | 7 passed |
 
 What the Windows run shows: the node suite includes the directory-fsync tests (D1, D2, D6), so `flush_dir_windows` (`FILE_FLAG_BACKUP_SEMANTICS` + `FlushFileBuffers`) ran and succeeded, and the live tests commit a snapshot through it on every block. It does **not** show that a rename survives power loss on NTFS; that was not tested.
 
-**The anomaly.** In one of the first two parallel runs after a fresh build and an Avast exception, C-01 failed. The failure message was not captured. The next 8 runs of the same test (alone, serial and 4 parallel) all passed, and ran in about 15 s each. The two slow runs (42.6 s and 58.0 s) were the first two after the rebuild; the failing one was the 58 s run. The test waits up to 20 s for the API port and 30 s for height.
+**The anomaly.** In one of the first two parallel runs after a fresh build and an Avast exception, C-01 failed. The failure message was not captured. The next 7 runs of the same test (C-01 alone twice, the serial whole-file run, and 4 parallel whole-file runs) all passed; the 4 parallel and 2 single runs took about 15 s each. In total C-01 ran 9 times (7 whole-file runs, 2 alone): 1 failure, 8 passes. The two slow runs (42.6 s and 58.0 s) were the first two after the rebuild; the failing one was the 58 s run. The test waits up to 20 s for the API port and 30 s for height.
 
 **Suspected cause (UNCONFIRMED):** antivirus (Avast) scanning a freshly built node executable, or machine load right after a rebuild, delaying startup past the 20 s port wait. A second candidate: the test's `free_port()` binds port 0, which hands out ephemeral-range ports and can collide on Windows (the cause of an earlier jail-test failure, os error 10048). Neither was observed. A persistence defect would be expected to fail repeatedly, and it did not.
 
