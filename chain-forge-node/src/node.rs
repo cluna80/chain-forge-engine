@@ -2200,6 +2200,17 @@ impl Node {
             return PersistStartup::Fresh;
         };
 
+        // ── 0. Pre-H0-3 (legacy) layout: migrate strictly, or refuse ─────────
+        // A directory with the old persist/*.json files and no CURRENT is
+        // committed state, not a fresh node. It must never start from genesis.
+        match crate::persistence::migrate_legacy(dir) {
+            Ok(Some(gen)) => tracing::warn!(%gen,
+                "migrated a pre-H0-3 data directory to the generation layout; \
+                 legacy files archived under persist/{}", crate::persistence::LEGACY_ARCHIVE_DIR),
+            Ok(None) => {}
+            Err(e) => return PersistStartup::Fatal { error: format!("legacy data directory: {e}") },
+        }
+
         // ── 1. Load and validate the committed snapshot ──────────────────────
         let snap_contents = match crate::persistence::load_snapshot(dir) {
             Err(crate::persistence::PersistError::Fresh) | Ok(None) => {
