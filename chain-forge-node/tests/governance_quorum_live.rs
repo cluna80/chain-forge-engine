@@ -603,90 +603,85 @@ fn governance_quorum_live() {
 
     let mut act_nonce = current_nonce(port, COORDINATOR);
 
-    // GQ-01: ordinary, 0 voters → must fail (quorum not met).
+    // Helper: extract activate_change event string from a tx result.
+    let act_event = |resp: &serde_json::Value| -> String {
+        resp["events"].as_array()
+            .and_then(|arr| arr.iter().find_map(|v| {
+                let s = v.as_str()?;
+                if s.contains("activate_change") { Some(s.to_owned()) } else { None }
+            }))
+            .unwrap_or_default()
+    };
+
+    // GQ-01: ordinary, 0 voters → ActivateChange tx commits but proposal status=Failed (quorum).
     let gq01_act = submit_and_wait(
         port, "gov-act-01", COORDINATOR, act_nonce,
         json!({ "ActivateChange": { "proposal_id": 1u64 } }), 500_000,
         Duration::from_secs(20),
     );
     act_nonce += 1;
-    assert!(
-        !gq01_act["success"].as_bool().unwrap_or(true),
-        "GQ-01: activation must fail (no voters), got: {gq01_act}"
-    );
-    let err01 = gq01_act["error"].as_str().unwrap_or("");
-    assert!(
-        err01.contains("quorum") || err01.contains("Quorum"),
-        "GQ-01: expected quorum failure, got: {gq01_act}"
-    );
-    println!("   ✓ GQ-01 failed quorum as expected: {err01}");
+    assert!(gq01_act["success"].as_bool().unwrap_or(false),
+        "GQ-01: ActivateChange tx itself failed: {gq01_act}");
+    let ev01 = act_event(&gq01_act);
+    assert!(ev01.contains("Failed") && (ev01.contains("quorum") || ev01.contains("Quorum")),
+        "GQ-01: expected quorum failure in events, got: {gq01_act}");
+    println!("   ✓ GQ-01 failed quorum as expected: {ev01}");
 
-    // GQ-02: ordinary, 1 voter yes → must succeed (PassedOrdinary).
+    // GQ-02: ordinary, 1 voter yes → proposal status=PassedOrdinary.
     let gq02_act = submit_and_wait(
         port, "gov-act-02", COORDINATOR, act_nonce,
         json!({ "ActivateChange": { "proposal_id": 2u64 } }), 500_000,
         Duration::from_secs(20),
     );
     act_nonce += 1;
-    assert!(
-        gq02_act["success"].as_bool().unwrap_or(false),
-        "GQ-02: activation must succeed, got: {gq02_act}"
-    );
-    let events02 = gq02_act["events"].as_array()
-        .map(|e| e.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let passed02 = events02.iter().any(|e| e.contains("Passed") || e.contains("activate_change"));
-    assert!(passed02, "GQ-02: expected Passed in events, got: {gq02_act}");
-    println!("   ✓ GQ-02 passed ordinary as expected.");
+    assert!(gq02_act["success"].as_bool().unwrap_or(false),
+        "GQ-02: ActivateChange tx failed: {gq02_act}");
+    let ev02 = act_event(&gq02_act);
+    assert!(ev02.contains("Passed") && !ev02.contains("Failed"),
+        "GQ-02: expected Passed in events, got: {gq02_act}");
+    println!("   ✓ GQ-02 passed ordinary as expected: {ev02}");
 
-    // GQ-03: constitutional, 9 voters → must fail (abs_min=10).
+    // GQ-03: constitutional, 9 voters → proposal status=Failed (abs_min=10).
     let gq03_act = submit_and_wait(
         port, "gov-act-03", COORDINATOR, act_nonce,
         json!({ "ActivateChange": { "proposal_id": 3u64 } }), 500_000,
         Duration::from_secs(20),
     );
     act_nonce += 1;
-    assert!(
-        !gq03_act["success"].as_bool().unwrap_or(true),
-        "GQ-03: activation must fail (abs_min), got: {gq03_act}"
-    );
-    let err03 = gq03_act["error"].as_str().unwrap_or("");
-    assert!(
-        err03.contains("absolute minimum") || err03.contains("abs") || err03.contains("minimum"),
-        "GQ-03: expected abs_min failure, got: {gq03_act}"
-    );
-    println!("   ✓ GQ-03 failed abs_min as expected: {err03}");
+    assert!(gq03_act["success"].as_bool().unwrap_or(false),
+        "GQ-03: ActivateChange tx itself failed: {gq03_act}");
+    let ev03 = act_event(&gq03_act);
+    assert!(ev03.contains("Failed"),
+        "GQ-03: expected Failed in events (abs_min not met), got: {gq03_act}");
+    println!("   ✓ GQ-03 failed abs_min as expected: {ev03}");
 
-    // GQ-04: constitutional, 11 voters ≥67% yes → must succeed (PassedConstitutional).
+    // GQ-04: constitutional, 11 voters ≥67% yes → proposal status=PassedConstitutional.
     let gq04_act = submit_and_wait(
         port, "gov-act-04", COORDINATOR, act_nonce,
         json!({ "ActivateChange": { "proposal_id": 4u64 } }), 500_000,
         Duration::from_secs(20),
     );
     act_nonce += 1;
-    assert!(
-        gq04_act["success"].as_bool().unwrap_or(false),
-        "GQ-04: activation must succeed (constitutional), got: {gq04_act}"
-    );
-    println!("   ✓ GQ-04 passed constitutional as expected.");
+    assert!(gq04_act["success"].as_bool().unwrap_or(false),
+        "GQ-04: ActivateChange tx failed: {gq04_act}");
+    let ev04 = act_event(&gq04_act);
+    assert!(ev04.contains("Passed") && !ev04.contains("Failed"),
+        "GQ-04: expected Passed in events (constitutional), got: {gq04_act}");
+    println!("   ✓ GQ-04 passed constitutional as expected: {ev04}");
 
-    // GQ-05: ordinary, 1 voter no → must fail (0% approval < 51%).
+    // GQ-05: ordinary, 1 voter no → proposal status=Failed (0% approval < 51%).
     let gq05_act = submit_and_wait(
         port, "gov-act-05", COORDINATOR, act_nonce,
         json!({ "ActivateChange": { "proposal_id": 5u64 } }), 500_000,
         Duration::from_secs(20),
     );
     act_nonce += 1;
-    assert!(
-        !gq05_act["success"].as_bool().unwrap_or(true),
-        "GQ-05: activation must fail (approval threshold), got: {gq05_act}"
-    );
-    let err05 = gq05_act["error"].as_str().unwrap_or("");
-    assert!(
-        err05.contains("approval") || err05.contains("Approval"),
-        "GQ-05: expected approval failure, got: {gq05_act}"
-    );
-    println!("   ✓ GQ-05 failed approval as expected: {err05}");
+    assert!(gq05_act["success"].as_bool().unwrap_or(false),
+        "GQ-05: ActivateChange tx itself failed: {gq05_act}");
+    let ev05 = act_event(&gq05_act);
+    assert!(ev05.contains("Failed") && (ev05.contains("approval") || ev05.contains("Approval")),
+        "GQ-05: expected approval failure in events, got: {gq05_act}");
+    println!("   ✓ GQ-05 failed approval as expected: {ev05}");
 
     // GQ-06: activate after voting period with 0 votes → fails quorum
     // (the early activation already confirmed the VotingActive rejection above).
