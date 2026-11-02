@@ -57,6 +57,9 @@ pub struct NodeStatus {
     /// True when this chain runs identity parameters weaker than production
     /// under the explicit devnet-only opt-in. Reduced Sybil resistance.
     pub insecure_dev_identity_overrides: bool,
+    /// The node's libp2p peer ID as a base58-encoded string.
+    /// Set once the P2P network starts; None before startup.
+    pub local_peer_id: Option<String>,
 }
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
@@ -1145,6 +1148,7 @@ impl Node {
             attestation_quorum,
             attestation_cap_per_window,
             insecure_dev_identity_overrides: insecure_identity,
+            local_peer_id:  None,
         }));
 
         let validator_id = validator_address.map(ValidatorId);
@@ -2685,14 +2689,21 @@ impl Node {
         let mut consensus_interval = tokio::time::interval(
             tokio::time::Duration::from_millis(CONSENSUS_TICK_MS)
         );
-        if self.consensus.drives_own_votes() && self.has_bootstrap_peers {
+        // Every validator runs its own round clock. The old guard also required
+        // `has_bootstrap_peers`, which is false for the seed node (started with
+        // no --bootstrap arg). That meant the seed node never fired round
+        // timeouts and could not advance a round on its own. When any other
+        // validator went offline, the seed node stalled the chain permanently.
+        // The correct predicate is drives_own_votes() alone: any active
+        // validator must run its round timers regardless of peer discovery mode.
+        if self.consensus.drives_own_votes() {
             self.consensus.start();
             self.drive_consensus().await;
         }
         let mut running = true;
         while running {
             tokio::select! {
-                _ = consensus_interval.tick(), if self.consensus.drives_own_votes() && self.has_bootstrap_peers => {
+                _ = consensus_interval.tick(), if self.consensus.drives_own_votes() => {
                     self.consensus_tick().await;
                 }
 
@@ -2767,13 +2778,21 @@ impl Node {
                     // peers configured at all -- a genuinely standalone node.
                     // Use the runtime-resolved flag (which accounts for
                     // --bootstrap CLI peers merged in addition to genesis).
-                    let expects_peers = self.has_bootstrap_peers;
+                    // Also treat a multi-validator genesis as "expecting peers"
+                    // even when this node IS the bootstrap seed and therefore
+                    // has no --bootstrap arg itself: a 4-node chain should
+                    // never run in solo/synthetic-vote mode, including on the
+                    // seed node.  Solo mode is only correct for a genuinely
+                    // single-validator chain (validator_set_size == 1).
+                    let genesis_validators = self.consensus.validator_set().validators.len();
+                    let expects_peers = self.has_bootstrap_peers || genesis_validators > 1;
 
                     if peer_count == 0 && !expects_peers {
                         // No real peers, none expected: solo devnet convenience
                         // path, unchanged from Phase 0. The proposer synthesises
                         // every genesis validator's vote itself and commits in
                         // one call, since there is no one else to actually vote.
+                        // Only reached when validator_set_size == 1.
                         if self.genesis.environment.mode == "devnet" {
                             let parent = chain_forge_consensus::BlockHash(
                                 format!("genesis_h{height}")
@@ -2917,6 +2936,14 @@ impl Node {
         match event {
             NetworkEvent::Started { local_addr, peer_id } => {
                 info!(local_addr = %local_addr, peer_id = %peer_id, "P2P network started");
+                // Store the full base58 peer ID so the HTTP API can expose it.
+                // PeerId's Display impl shows only 8 chars (for log lines); we
+                // need peer_id.0 (the underlying String) for bootstrap multiaddrs.
+                if let Ok(mut s) = self.status.lock() {
+                    if s.local_peer_id.is_none() {
+                        s.local_peer_id = Some(peer_id.0.clone());
+                    }
+                }
             }
 
             NetworkEvent::Message(msg) => {

@@ -200,6 +200,7 @@ Nothing merges until these pass and the owner reviews the combined tree. All PRs
 - ❓ Open (economics spec): values for `bond_min`, `k`, `premium_cap`; the per-human bond limit (whitepaper §3.3).
 
 ### Other follow-ups
+- ✅ **Consensus liveness under a permanent validator crash** (#43, Windows-confirmed 2026-11-01). On `main` before #43, one crashed validator could halt a 4-validator chain: only nodes started with `--bootstrap` ran round timers, so the seed node never advanced a round. A seed node alone also fell into the solo synthetic-vote path and exited. Fixes: every validator runs its round timers; a multi-validator chain never uses solo mode. Live `liveness_under_crash_live` L-01..L-03 (Dave killed for good; Alice, Bob and Carol reach height 20); fails with the old timer gate. The existing crash test restarted the crashed node, which hid the bug.
 - ✅ `attestation_guard_live` / `attestation_coordinator_gate` — fixed in PR #40 (2026-10-31, Windows-confirmed). Root cause: Attest submitted before RegisterIdentity committed; added pre-Attest wait for `registered=true` on all nodes + post-Attest `attestation_count>=1` assertion.
 - ✅ Genesis-hash peer agreement (H0-8) — Windows-confirmed 2026-10-31 (`616bf0e`); per-tx identity/agent clone performance still ⬜.
 - ⬜ Proposers don't budget gas. `block_gas_limit` is enforced per block at execution (txs past the limit are recorded as failed), so a tx that would exceed this block's gas is failed instead of waiting for the next block. Corrects the #34 note that said per-block gas was not enforced.
