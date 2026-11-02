@@ -320,6 +320,17 @@ proposer builds sooner (1 s gate), so the tolerance should shrink; NOT yet
 measured. (4) One 4,500 ms row disagreed (arrival logged before the delayed
 delivery was written when the log was read: a measurement-edge artifact).
 
+Windows/BossKing, experiments serialized (commit 1bc5eab): idle experiment PASSED (396 s):
+omitted 0 of 13-14 up to 1,500 ms, 8 of 14 at 2,200 ms, 14 of 14 at 3,000 ms, 13 of 13 at
+4,500 ms; block interval flat at 2.3-2.4 s. Loaded experiment completed all eight rows but
+FAILED its own load bar on the first row (mempool non-empty at 8 of 14 proposals, bar 60%;
+all 32 load accounts started in one wave). Its data, with that caveat and a 2.0x block-
+interval drift (1.7 s -> 3.3 s): networked blocks omitted 0 of 10 (0 ms), 0 of 11 (500),
+2 of 10 (900), 5 of 10 (1,200), 4 of 10 (1,500), 8 of 11 (2,200), 9 of 11 (3,000), and
+0 of 10 for the closing 0 ms control; commit-to-proposal 1,081 / 1,100 / 1,051 / 1,047 ms
+in the 1,200 / 1,500 / 2,200 / 3,000 ms rows (the ~1 s gate). Same direction and the same
+gate as the sandbox; exact fractions differ, as expected.
+
 Windows/BossKing 2026-11-02 idle experiment of the instrumented test (427 s) passed
 and agrees with the sandbox (0 of 13-14 omitted up to 1,500 ms; 7 of 13 at 2,200 ms;
 13 of 13 at 3,000 and 4,500 ms; block interval 2.3-3.0 s). It ran at the same time

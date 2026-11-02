@@ -301,12 +301,16 @@ fn start_load(api: Vec<u16>) -> (Arc<AtomicBool>, std::thread::JoinHandle<u64>) 
     let handle = std::thread::spawn(move || {
         let mut sent: Vec<Option<(u64, Instant)>> = vec![None; LOAD_ACCOUNTS];
         let mut queued = 0u64;
+        let started = Instant::now();
         while !flag.load(Ordering::Relaxed) {
             for k in 0..LOAD_ACCOUNTS {
                 if flag.load(Ordering::Relaxed) { break; }
                 let (addr, port) = (load_addr(k), api[k % 4]);
                 let committed = nonce(port, &addr);
                 if committed >= LOAD_TXS_PER_ACCOUNT { continue; }
+                // Stagger the first send across the spacing interval so the accounts do not move in
+                // one wave (waves leave some proposals with an empty mempool).
+                if sent[k].is_none() && started.elapsed() < LOAD_MIN_SPACING * k as u32 / LOAD_ACCOUNTS as u32 { continue; }
                 let due = match sent[k] {
                     None => true,
                     Some((n, at)) => (committed > n && at.elapsed() >= LOAD_MIN_SPACING) || at.elapsed() > Duration::from_secs(14),
@@ -394,6 +398,9 @@ fn run(loaded: bool) {
         assert!(committed >= 16, "the load generator is not producing committed transactions (only {committed} in 8 blocks); \
             this run would have measured an idle chain");
         say(format!("load verified: {committed} txs committed in the last 8 blocks"));
+        // Let the staggered accounts reach their steady cycle before the first scenario.
+        let h_warm = height(api[0]);
+        assert!(wait_until(Duration::from_secs(120), || height(api[0]) >= h_warm + 10), "chain stalled during load warm-up");
     }
 
     // Shorter scenarios under load: per-block persistence cost grows with chain length (KNOWN_ISSUES §9).
