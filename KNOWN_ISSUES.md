@@ -574,8 +574,13 @@ unrelated `cs001_p7`, same message as before this work), which includes `state_p
 and the restart and recovery tests; `validator_jail_live` JL-01..JL-09 PASSED (627 s) with state roots IDENTICAL
 to the pre-change Windows run (`51136494701f`, `eebbee537f59`, `33362db6f1e0`). Also Windows: `chain-forge-state` 73 passed / 3 ignored; release tree benchmark flat at 32.0 / 32.8 / 34.9 /
 33.2 / 40.0 / 38.2 / 33.5 us per commit at 100 / 500 / 1,000 / 2,500 / 5,000 / 10,000 / 20,000 versions (no pre-change
-Windows tree benchmark was taken; the original's 21.6 ms at 20,000 versions is a sandbox figure). Still to report
-from Windows: `validator_eviction_live`.
+Windows tree benchmark was taken; the original's 21.6 ms at 20,000 versions is a sandbox figure). `validator_eviction_live` EV-01..EV-03 PASSED
+(89.2 s) with final state root `48d58b5f...`, IDENTICAL to the pre-change Windows eviction run. Windows regression of
+this branch: COMPLETE (not merged; awaiting owner confirmation). Cross-platform note: the golden roots captured on Linux
+(tree history, 120-block node run) and the jail-live roots are identical on Windows, so the tree is platform-
+deterministic there. The eviction test's final root differs between Linux (`1f2b492f...`) and Windows (`48d58b5f...`)
+both before and after this change; the likeliest cause is that the test reads the root a few blocks past a height
+target whose block timing differs by platform, but that is unverified.
 
 Tree-only release benchmark (12 accounts, 3 updates per version), microseconds per commit:
 | Versions | Original | Indexed |
