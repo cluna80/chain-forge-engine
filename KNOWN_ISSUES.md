@@ -581,7 +581,12 @@ ephemeral range, which the other nodes' outgoing connections also use, and then 
 kept running (and committing) with no API, so the test's status query read height 0. A test-harness defect unrelated to
 the state tree; fixed by choosing ports below the ephemeral range in the jail, integrity and eviction live tests, and by
 making the jail test's restart check require the restarted node's own "HTTP API listening" line. Observation, not
-changed: a node whose API fails to bind logs an ERROR and keeps running as a validator. Original note: Windows
+changed: a node whose API fails to bind logs an ERROR and keeps running as a validator. **CLEAN RERUN, Windows/MINGW64, 2026-11-02, commit 4962b29 (port fix):** `validator_jail_live` JL-01..JL-09 PASSED
+(637.60 s; roots `eebbee537f59` at JL-06 and `33362db6f1e0` at JL-09, identical to pre-change; Dave's and Bob's restarts
+verified) and `validator_eviction_live` EV-01..EV-03 PASSED (89.52 s; root `48d58b5f...`, identical to pre-change).
+The intermittent build failures and silent stops on that machine were Avast (IDP.Generic heuristic) blocking freshly
+built test executables, an environment issue unrelated to the code; the eviction exe had to be built in a fresh target
+directory. Branch still not merged pending owner decision. Original note: Windows
 regression of
 this branch: NOT CLEAN. A second Windows `validator_jail_live` run FAILED (781 s) at "Dave never caught up (dave 0 vs
 alice 244)": Dave's own log tail shows him committing blocks 235-244 with state root `33362db6f1e0...` (correct), while
