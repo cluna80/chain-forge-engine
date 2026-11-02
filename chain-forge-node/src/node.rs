@@ -10016,7 +10016,14 @@ mod tests {
         // all five P7 genesis validators already have classical keys bound.
         // "qcb1pquser" is funded here so it can pay gas for the ML-DSA txs.
         let eda    = p7_eda_tx("eda-p7-mldsa", "qcb1alice", 0, 10, &alice_kp);
-        let fund   = p7_signed_transfer("fund-pquser", "qcb1alice", "qcb1pquser", 500_000, 1, &alice_kp);
+        // First use of an ML-DSA key must come from the address it derives
+        // (account-ownership rule, #39), so fund that address.
+        let pquser_kp = MlDsaScheme.generate_keypair("qcb1pquser-p7-mldsa")
+            .expect("ML-DSA keygen for qcb1pquser");
+        let pquser = chain_forge_core::Address::from_public_key_schemed(
+            &pquser_kp.public_key, "qcb", HashWidth::Bits256, chain_forge_core::AddressScheme::PostQuantum,
+        ).as_str().to_string();
+        let fund   = p7_signed_transfer("fund-pquser", "qcb1alice", &pquser, 500_000, 1, &alice_kp);
         node.submit_tx(eda);
         node.submit_tx(fund);
         let genesis_hash = chain_forge_consensus::BlockHash("0000000000000000".into());
@@ -10038,12 +10045,9 @@ mod tests {
         // now-bound key.  We therefore generate once and pass the same keypair
         // to both p7_mldsa_transfer_with_kp calls.
         use chain_forge_crypto::MlDsaScheme;
-        let pquser_kp = MlDsaScheme.generate_keypair("qcb1pquser-p7-mldsa")
-            .expect("ML-DSA keygen for qcb1pquser");
-
         // ── Accepted during grace window (epoch 55 ≤ cutoff 59) ──────────────
         node.identity.clock.current_epoch = 55;
-        let mldsa_tx = p7_mldsa_transfer_with_kp("mldsa-grace", "qcb1pquser", 0, &pquser_kp);
+        let mldsa_tx = p7_mldsa_transfer_with_kp("mldsa-grace", &pquser, 0, &pquser_kp);
         let r = node.executor.execute_tx_with_identity(
             &mldsa_tx, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
@@ -10057,7 +10061,7 @@ mod tests {
         // A second ML-DSA tx from the same account (same keypair, nonce 1) must
         // still succeed even after the classical Ed25519 hard cutoff.
         node.identity.clock.current_epoch = 61;
-        let mldsa_tx2 = p7_mldsa_transfer_with_kp("mldsa-post-cutoff", "qcb1pquser", 1, &pquser_kp);
+        let mldsa_tx2 = p7_mldsa_transfer_with_kp("mldsa-post-cutoff", &pquser, 1, &pquser_kp);
         let r2 = node.executor.execute_tx_with_identity(
             &mldsa_tx2, &mut node.state, &mut node.identity, &mut node.agents, 0,
         );
