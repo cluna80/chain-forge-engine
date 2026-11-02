@@ -320,6 +320,42 @@ proposer builds sooner (1 s gate), so the tolerance should shrink; NOT yet
 measured. (4) One 4,500 ms row disagreed (arrival logged before the delayed
 delivery was written when the log was read: a measurement-edge artifact).
 
+**Measured on a LOADED chain** (`validator_precommit_delay_loaded_live`, sandbox
+2026-11-02; mempool non-empty at the proposer in >= 60% of blocks in every row,
+~4.6 tx/s from 32 throttled accounts, ~5-11 txs per block). 14 blocks per row;
+"networked" = blocks Dave did not propose himself. Block interval drifted
+1.3 s -> 2.1 s (1.8x, worst 2.4 s) over the run because per-block persistence
+cost grows with chain length (§9), so rows are not strictly comparable; the
+first and last zero-delay controls both omitted 0 of 10.
+
+| Arrival delay | Omitted from committed evidence | Median commit-to-proposal |
+| --- | --- | --- |
+| 0 ms | 0 of 10 | 1,297 ms |
+| 500 ms | 0 of 10 | 1,016 ms |
+| 900 ms | 1 of 11 | 1,065 ms |
+| 1,200 ms | 3 of 11 | 1,188 ms |
+| 1,500 ms | 6 of 10 | 1,058 ms |
+| 2,200 ms | 8 of 10 | 1,085 ms |
+| 3,000 ms | 11 of 11 | 1,041 ms |
+| 0 ms (control, end) | 0 of 10 | 454 ms |
+
+Findings: (5) Under load the proposer gives up on a missing precommit about
+1.04-1.19 s after its own commit (the 1,000 ms `COMMIT_GATHER_MS` gate), in
+every row where anything was omitted, so the safe arrival window is about 1 s,
+half the idle chain's ~2.1 s. (6) Omission starts near 900 ms and passes half at
+1,500 ms; the exact fraction at a given delay varies run to run with how busy
+the proposer's event loop is (an earlier loaded run gave 12 of 13 at 1,500 ms,
+another 8 of 14). Treat the transition as ~0.9-1.5 s, not a sharp edge.
+(7) Every omission was attributable to the cutoff (received by the proposer,
+arrived after the block was built), the liveness window recorded a miss for
+exactly the omitted blocks, and all four nodes agreed on committed evidence
+and on the liveness state after every row.
+
+Consequence: a validator whose precommits regularly arrive more than ~1 s
+after the proposer's commit, on a busy chain, accumulates misses while fully
+participating; at ~35% omission a 20% threshold over 100 blocks jails it
+(see the policy cliff above).
+
 **Open decisions**
 1. Whether to require the policy to tolerate a measured WAN delay profile
    (needs delay-injected or multi-host measurement).
