@@ -198,3 +198,16 @@ Owner decisions recorded while fixing PR #41's gaps (tests: `p02a_gaps` in `chai
 **Risk:** the double-sign guard covers votes only. `sign_and_register_own_proposal` signs a proposal without consulting any persisted record, so a validator that signed a proposal for (height, round), crashed, and restarts could sign a *different* proposal for the same (height, round) — equivocation by the proposer. Pre-existing, not introduced by PR #41. It matters more now that a node with its guard ahead of state stays up instead of exiting.
 
 **Status:** deliberately NOT fixed on the P-02a branch (scope). Open as a follow-on item after P-02a merges.
+
+## 15. Gap 5 — directory fsync: what was fixed, what is NOT verified (2026-11-02)
+
+**Fixed on Linux (tests D1, D2):**
+- `snapshots/` is now fsynced after `gen-N` is complete and before `CURRENT` is renamed. Before, `CURRENT` could become durable ahead of the directory entry it names.
+- The signing guard's atomic write now fsyncs `persist/` after the rename, and a failure withholds the vote. Before, a crash could lose `consensus_signing.json` after the vote it protects had been sent.
+- A failed directory fsync is a returned error (D3, D4, D5): the snapshot write fails, `CURRENT` is not advanced, and `persist_state` reports it.
+
+**Windows — implemented, NOT verified.** `fsync_dir` opens the directory with `FILE_FLAG_BACKUP_SEMANTICS` and calls `FlushFileBuffers` (`File::sync_all`); the handle is closed on drop, including on the error path. This branch type-checks for `x86_64-pc-windows-gnu` in isolation but has not been compiled or run on Windows. The Windows validation run can show only that the call **succeeds** (no `ACCESS_DENIED`) and that the node restarts and restores correctly. It cannot show that a rename survives power loss on NTFS; that is not tested and should not be claimed.
+
+**Known gap — transient sharing violations.** An antivirus or indexer can briefly hold a file or directory (`ERROR_SHARING_VIOLATION`, the Avast case seen on the build machine), making a create, rename or directory flush fail. Persistence deliberately has **no retry**: the failure is returned, the commit fails loudly, and the node halts consensus. **A retry policy is a separate decision and requires a Windows run to validate. Nobody should add one without going through that gate.** This cannot be unit tested here and is exercised only by the Windows run.
+
+**Not covered by a new test:** `commit_block`'s handling of a failed `persist_state` (it logs "halting consensus" and returns `Err`). That path exists in PR #41 and was not changed by P-02a.
