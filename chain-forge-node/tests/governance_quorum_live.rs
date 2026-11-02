@@ -691,11 +691,12 @@ fn governance_quorum_live() {
         json!({ "ActivateChange": { "proposal_id": 6u64 } }), 500_000,
         Duration::from_secs(20),
     );
-    assert!(
-        !gq06_late["success"].as_bool().unwrap_or(true),
-        "GQ-06: late activation must fail (0 voters = quorum fail), got: {gq06_late}"
-    );
-    println!("   ✓ GQ-06 late activation failed as expected (early rejection already confirmed).");
+    assert!(gq06_late["success"].as_bool().unwrap_or(false),
+        "GQ-06: ActivateChange tx itself failed: {gq06_late}");
+    let ev06 = act_event(&gq06_late);
+    assert!(ev06.contains("Failed") && (ev06.contains("quorum") || ev06.contains("Quorum")),
+        "GQ-06: expected quorum failure in events, got: {gq06_late}");
+    println!("   ✓ GQ-06 late activation failed quorum as expected: {ev06}");
 
     // ── Verify state root is consistent across all 4 nodes ───────────────────
     let roots: Vec<String> = ports.all().iter().map(|&p| state_root(p)).collect();
