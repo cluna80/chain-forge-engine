@@ -4425,6 +4425,57 @@ impl Node {
                 admitted += 1;
                 any_changed = true;
             }
+            // Pass 3: evict validators whose bonded stake dropped below the
+            // minimum threshold (e.g. they submitted UnbondValidator and their
+            // bond account is now zero).
+            //
+            // Rule: a validator with a `validator-bond:{addr}` account whose
+            // balance < min_bond_uqcb is evicted.  Validators with NO bond
+            // account are genesis-seeded and are exempt from this rule; only
+            // sustained liveness failure or equivocation can remove them.
+            {
+                let native_denom = self.executor.native_denom().to_string();
+                let min_bond     = self.min_bond_uqcb as u128;
+                let to_evict: Vec<String> = updated_vs.validators.iter()
+                    .filter(|v| {
+                        let bond_acct = format!(
+                            "{}{}",
+                            chain_forge_execution::validator_bond::BOND_ACCOUNT_PREFIX,
+                            v.id.0,
+                        );
+                        match self.state.get_account(&bond_acct) {
+                            Ok(acct) => acct.balance_of(&native_denom) < min_bond,
+                            Err(_)   => false, // no bond account → genesis-seeded → exempt
+                        }
+                    })
+                    .map(|v| v.id.0.clone())
+                    .collect();
+
+                for addr in &to_evict {
+                    info!(
+                        validator = %addr,
+                        min_bond_uqcb = min_bond,
+                        "epoch boundary: evicting validator (bond below minimum)"
+                    );
+                    updated_vs.validators.retain(|v| &v.id.0 != addr);
+                    // Mirror into the registry so liveness/reward queries stay
+                    // consistent: zero the recorded stake and demote to Candidate.
+                    let epoch = self.identity.clock.current_epoch;
+                    if let Err(e) = self.validator_registry.update_stake(addr, 0) {
+                        warn!(validator = %addr, error = %e,
+                              "eviction: registry stake update failed");
+                    }
+                    // revoke_pop() demotes Active → Candidate and clears
+                    // pop_verified so the validator is not immediately re-seated
+                    // by the PoP refresh sweep that follows this block.
+                    if let Err(e) = self.validator_registry.revoke_pop(addr, epoch) {
+                        warn!(validator = %addr, error = %e,
+                              "eviction: registry revoke_pop failed");
+                    }
+                    any_changed = true;
+                }
+            }
+
             if any_changed {
                 updated_vs.height = cert.height;
                 let _ = self.consensus.update_validator_set(updated_vs);
