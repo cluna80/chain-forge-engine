@@ -437,6 +437,13 @@ impl ValidatorRecord {
         tracing::warn!(id = %self.id, reason, "validator jailed");
     }
 
+    /// True once the jail period has run out. Expiry only makes the validator
+    /// eligible to ask for reinstatement; it never changes `status` or power.
+    pub fn jail_expired(&self, epoch: u64) -> bool {
+        self.status == ValidatorStatus::Jailed
+            && self.jail_records.last().map_or(false, |j| epoch >= j.unjail_after)
+    }
+
     /// Unjail (return to Candidate; must re-verify to become Active again).
     pub fn unjail(&mut self, epoch: u64) -> ValResult<()> {
         if self.status != ValidatorStatus::Jailed {
@@ -1920,6 +1927,24 @@ mod tests {
 
         assert!(reg.unjail("val1", 6).is_err()); // too soon (need epoch 15)
         assert!(reg.unjail("val1", 15).is_ok()); // ok
+    }
+
+    #[test]
+    fn jail_expiry_makes_a_validator_eligible_but_does_not_reinstate_it() {
+        let mut reg = registry();
+        reg.register(req("val1", "qcb1val1", ENTRY_STAKE_UQCB), 0).unwrap();
+        reg.confirm_pop("val1", VerificationTier::Verified, 1).unwrap();
+        reg.jail("val1", "test", 5).unwrap(); // unjail_after = 5 + jail_duration_epochs (10)
+
+        assert!(!reg.get("val1").unwrap().jail_expired(14));
+        assert!(reg.get("val1").unwrap().jail_expired(15));
+        assert!(reg.get("val1").unwrap().jail_expired(1_000));
+        assert_eq!(reg.get("val1").unwrap().status, ValidatorStatus::Jailed,
+            "expiry alone must not change status");
+        assert_eq!(reg.total_active(), 0, "an expired jail still holds no active seat");
+
+        reg.unjail("val1", 15).unwrap();
+        assert!(!reg.get("val1").unwrap().jail_expired(15), "not jailed any more");
     }
 
     #[test]
