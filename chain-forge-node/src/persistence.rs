@@ -138,6 +138,12 @@ pub struct SnapshotManifest {
     /// `chain_forge_core::genesis_hash_hex` of that genesis (64 hex chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_hash: Option<String>,
+    /// The state root (64 hex; an empty tree is 64 zeros) of the live tree when
+    /// this generation was written. The loader requires the restored state to
+    /// reproduce it. `None` only when parsing a manifest that lacks it, which
+    /// the loader refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_root: Option<String>,
     /// The committed block height this snapshot captures.
     pub height: u64,
     /// Generation label, e.g. "gen-000042".
@@ -166,6 +172,21 @@ impl SnapshotIdentity {
         if self.chain_id.trim().is_empty() { return Err("chain_id is blank".into()); }
         if !is_hash_hex(&self.genesis_hash) { return Err("genesis_hash is not 64 hex characters".into()); }
         Ok(())
+    }
+}
+
+/// The state root of an empty tree: 64 zeros. A root is never absent.
+pub const EMPTY_STATE_ROOT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The manifest's `state_root`, validated: present, not blank, 64 hex.
+fn manifest_state_root(m: &SnapshotManifest, gen: &str) -> Result<String, PersistError> {
+    let bad = |detail: String| PersistError::IncompatibleManifest { gen: gen.to_string(), detail };
+    match m.state_root.as_deref() {
+        None => Err(bad("manifest state_root is missing — a manifest without a root offers no \
+                         integrity guarantee; start with a clean data directory".into())),
+        Some(r) if r.trim().is_empty() => Err(bad("manifest state_root is blank".into())),
+        Some(r) if !is_hash_hex(r) => Err(bad(format!("manifest state_root '{r}' is not 64 hex characters"))),
+        Some(r) => Ok(r.to_ascii_lowercase()),
     }
 }
 
@@ -320,7 +341,12 @@ pub fn write_snapshot(
     height: u64,
     contents: &[(&str, Vec<u8>)],
     identity: &SnapshotIdentity,
+    state_root: &str,
 ) -> Result<String, PersistError> {
+    if !is_hash_hex(state_root) {
+        return Err(PersistError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            format!("snapshot state_root '{state_root}' is not 64 hex characters"))));
+    }
     // Never write a wildcard identity: it would be accepted by any chain.
     identity.validate().map_err(|why| PersistError::Io(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("snapshot identity: {why}"))))?;
@@ -354,6 +380,7 @@ pub fn write_snapshot(
         format_version: Some(FORMAT_VERSION),
         chain_id:       Some(identity.chain_id.clone()),
         genesis_hash:   Some(identity.genesis_hash.clone()),
+        state_root:     Some(state_root.to_ascii_lowercase()),
         height,
         generation: gen.clone(),
         files: file_entries,
@@ -383,6 +410,9 @@ pub fn write_snapshot(
 
 /// Contents of a validated snapshot, ready to be restored into the node.
 pub struct SnapshotContents {
+    /// The manifest's validated `state_root` (lowercase 64 hex). The CALLER must
+    /// compare it with the root the restored state actually produces.
+    pub state_root: String,
     pub height: u64,
     pub generation: String,
     /// Raw JSON bytes for each file, indexed by filename.
@@ -451,6 +481,8 @@ pub fn load_snapshot(data_dir: &Path, expected: &SnapshotIdentity)
 
     // Format, chain and genesis are checked BEFORE any file is trusted.
     check_manifest_identity(&manifest, &gen_label_str, expected)?;
+
+    let state_root = manifest_state_root(&manifest, &gen_label_str)?;
 
     // Verify each file.
     let mut file_map = std::collections::HashMap::new();
@@ -527,6 +559,7 @@ pub fn load_snapshot(data_dir: &Path, expected: &SnapshotIdentity)
     }
 
     Ok(Some(SnapshotContents {
+        state_root,
         height: manifest.height,
         generation: gen_label_str,
         files: file_map,
@@ -561,7 +594,11 @@ fn has_legacy_files(data_dir: &Path) -> bool {
 ///
 /// Returns `Ok(None)` when `CURRENT` already exists (nothing to migrate) or
 /// when no legacy file is present (a genuinely fresh directory).
-pub fn migrate_legacy(data_dir: &Path, identity: &SnapshotIdentity) -> Result<Option<String>, PersistError> {
+pub fn migrate_legacy(
+    data_dir: &Path,
+    identity: &SnapshotIdentity,
+    restored_root_of: impl FnOnce(&[u8]) -> Result<String, String>,
+) -> Result<Option<String>, PersistError> {
     if read_current(data_dir).map_err(PersistError::Io)?.is_some() { return Ok(None); }
     if !has_legacy_files(data_dir) { return Ok(None); }
 
@@ -596,7 +633,13 @@ pub fn migrate_legacy(data_dir: &Path, identity: &SnapshotIdentity) -> Result<Op
     // start loads it (`migrate_legacy` returns early once `CURRENT` exists) and
     // the stale legacy files are ignored. Moving the files BEFORE `CURRENT`
     // exists would lose the only copy of the state on a crash.
-    let gen = write_snapshot(data_dir, height, &contents, identity)?;
+    // The legacy layout recorded no root. Record the root the legacy state
+    // REBUILDS to (what restore will produce), supplied by the caller from
+    // `state.json`'s bytes.
+    let state_bytes = &contents.iter().find(|(n, _)| *n == "state.json").expect("state.json present").1;
+    let state_root = restored_root_of(state_bytes).map_err(|detail| PersistError::CorruptFile {
+        gen: "legacy".into(), file: "state.json".into(), detail })?;
+    let gen = write_snapshot(data_dir, height, &contents, identity, &state_root)?;
 
     // The new generation exists and CURRENT points at it. Archive (move) the
     // legacy files so a future start cannot mistake them for current state.
@@ -724,6 +767,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn test_root() -> String { "cd".repeat(32) }
+
     fn test_identity() -> SnapshotIdentity {
         SnapshotIdentity { chain_id: "test-chain".into(), genesis_hash: "ab".repeat(32) }
     }
@@ -771,7 +816,7 @@ mod tests {
     fn round_trip_single_generation() {
         let dir = make_temp_dir();
         let contents = dummy_contents(5);
-        let gen = write_snapshot(dir.path(), 5, &contents, &test_identity()).unwrap();
+        let gen = write_snapshot(dir.path(), 5, &contents, &test_identity(), &test_root()).unwrap();
         assert_eq!(gen, "gen-000001");
 
         let snap = load_snapshot(dir.path(), &test_identity()).unwrap().expect("should have snapshot");
@@ -783,8 +828,8 @@ mod tests {
     #[test]
     fn second_write_increments_generation() {
         let dir = make_temp_dir();
-        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
-        let gen2 = write_snapshot(dir.path(), 6, &dummy_contents(6), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
+        let gen2 = write_snapshot(dir.path(), 6, &dummy_contents(6), &test_identity(), &test_root()).unwrap();
         assert_eq!(gen2, "gen-000002");
 
         let snap = load_snapshot(dir.path(), &test_identity()).unwrap().expect("snapshot");
@@ -795,9 +840,9 @@ mod tests {
     #[test]
     fn gen_minus_2_is_pruned() {
         let dir = make_temp_dir();
-        write_snapshot(dir.path(), 1, &dummy_contents(1), &test_identity()).unwrap(); // gen-000001
-        write_snapshot(dir.path(), 2, &dummy_contents(2), &test_identity()).unwrap(); // gen-000002
-        write_snapshot(dir.path(), 3, &dummy_contents(3), &test_identity()).unwrap(); // gen-000003 → prunes gen-000001
+        write_snapshot(dir.path(), 1, &dummy_contents(1), &test_identity(), &test_root()).unwrap(); // gen-000001
+        write_snapshot(dir.path(), 2, &dummy_contents(2), &test_identity(), &test_root()).unwrap(); // gen-000002
+        write_snapshot(dir.path(), 3, &dummy_contents(3), &test_identity(), &test_root()).unwrap(); // gen-000003 → prunes gen-000001
         assert!(!dir.path().join("snapshots").join("gen-000001").exists(),
                 "gen-000001 should have been pruned");
         assert!(dir.path().join("snapshots").join("gen-000002").exists(),
@@ -847,7 +892,7 @@ mod tests {
     fn load_missing_file_is_error() {
         let dir = make_temp_dir();
         // Write a valid snapshot then delete one file from the generation dir.
-        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         std::fs::remove_file(gen_dir.join("identity.json")).unwrap();
         assert!(matches!(
@@ -859,7 +904,7 @@ mod tests {
     #[test]
     fn load_hash_mismatch_is_error() {
         let dir = make_temp_dir();
-        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
         // Corrupt identity.json after it was written.
         let gen_dir = dir.path().join("snapshots").join("gen-000001");
         std::fs::write(gen_dir.join("identity.json"), b"CORRUPTED").unwrap();
@@ -882,7 +927,7 @@ mod tests {
         }
         // write_snapshot uses the height param for the manifest, but state.json
         // says 3 — this should be caught by load_snapshot's cross-check.
-        write_snapshot(dir.path(), 5, &contents, &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &contents, &test_identity(), &test_root()).unwrap();
         assert!(matches!(
             load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::HeightMismatch { .. })
@@ -904,7 +949,7 @@ mod tests {
                 *bytes = make_valid_state_json(5);
             }
         }
-        write_snapshot(dir.path(), 5, &contents, &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &contents, &test_identity(), &test_root()).unwrap();
         assert!(matches!(
             load_snapshot(dir.path(), &test_identity()),
             Err(PersistError::HeightMismatch { .. })
@@ -1030,7 +1075,7 @@ mod tests {
     fn current_not_updated_on_interrupted_write() {
         let dir = make_temp_dir();
         // Write gen-000001 successfully.
-        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity()).unwrap();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
 
         // Simulate crash during gen-000002 write: create the directory and write
         // some files, but do NOT call write_snapshot (so CURRENT stays on gen-000001).
