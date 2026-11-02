@@ -576,7 +576,10 @@ to the pre-change Windows run (`51136494701f`, `eebbee537f59`, `33362db6f1e0`). 
 33.2 / 40.0 / 38.2 / 33.5 us per commit at 100 / 500 / 1,000 / 2,500 / 5,000 / 10,000 / 20,000 versions (no pre-change
 Windows tree benchmark was taken; the original's 21.6 ms at 20,000 versions is a sandbox figure). `validator_eviction_live` EV-01..EV-03 PASSED
 (89.2 s) with final state root `48d58b5f...`, IDENTICAL to the pre-change Windows eviction run. Windows regression of
-this branch: COMPLETE (not merged; awaiting owner confirmation). Cross-platform note: the golden roots captured on Linux
+this branch: NOT CLEAN. A second Windows `validator_jail_live` run FAILED (781 s) at "Dave never caught up (dave 0 vs
+alice 244)": Dave's own log tail shows him committing blocks 235-244 with state root `33362db6f1e0...` (correct), while
+the test's `/api/status` query on Dave's port returned height 0 for 240 s after his restart. The first Windows run of the
+same test passed (627 s, identical roots). Not yet diagnosed; Dave's restart log is needed. Branch not merged. Cross-platform note: the golden roots captured on Linux
 (tree history, 120-block node run) and the jail-live roots are identical on Windows, so the tree is platform-
 deterministic there. The eviction test's final root differs between Linux (`1f2b492f...`) and Windows (`48d58b5f...`)
 both before and after this change; the likeliest cause is that the test reads the root a few blocks past a height
