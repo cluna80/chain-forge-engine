@@ -320,6 +320,14 @@ proposer builds sooner (1 s gate), so the tolerance should shrink; NOT yet
 measured. (4) One 4,500 ms row disagreed (arrival logged before the delayed
 delivery was written when the log was read: a measurement-edge artifact).
 
+Windows/BossKing 2026-11-02 idle experiment of the instrumented test (427 s) passed
+and agrees with the sandbox (0 of 13-14 omitted up to 1,500 ms; 7 of 13 at 2,200 ms;
+13 of 13 at 3,000 and 4,500 ms; block interval 2.3-3.0 s). It ran at the same time
+as the loaded experiment because cargo runs tests in parallel, so treat it as
+confirmed in direction; the tests now serialize themselves (commit 1bc5eab). The
+loaded experiment's Windows run is INVALID for the same reason (eight nodes at
+once; interval 2.2 s -> 5.4 s) and must be rerun on its own.
+
 **Measured on a LOADED chain** (`validator_precommit_delay_loaded_live`, sandbox
 2026-11-02; mempool non-empty at the proposer in >= 60% of blocks in every row,
 ~4.6 tx/s from 32 throttled accounts, ~5-11 txs per block). 14 blocks per row;
