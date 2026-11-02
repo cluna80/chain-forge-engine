@@ -277,6 +277,8 @@ fn sha256_hex(data: &[u8]) -> String {
 /// On Windows this is a no-op (directory fsyncs are not supported; atomic
 /// renames provide the same guarantee via the NTFS journal).
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    fsync_probe::on_fsync(path)?; // test seam only: records the call, may inject a failure
     #[cfg(unix)]
     {
         let f = std::fs::File::open(path)?;
@@ -285,6 +287,39 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// TEST SEAM (compiled only for unit tests; changes no behaviour). Records every
+/// directory fsync in order, and can make the one for a path ending in `suffix`
+/// fail. Thread-local, so it is only meaningful on a current-thread runtime
+/// (the default for `#[tokio::test]`).
+#[cfg(test)]
+pub(crate) mod fsync_probe {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static LOG: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub fn reset() {
+        LOG.with(|l| l.borrow_mut().clear());
+        FAIL.with(|f| *f.borrow_mut() = None);
+    }
+    /// Every directory fsync since `reset`, in call order.
+    pub fn calls() -> Vec<PathBuf> { LOG.with(|l| l.borrow().clone()) }
+    /// Make the directory fsync for any path ending in `suffix` fail with an I/O error.
+    pub fn fail_on(suffix: &str) { FAIL.with(|f| *f.borrow_mut() = Some(suffix.to_string())); }
+
+    pub(super) fn on_fsync(path: &Path) -> std::io::Result<()> {
+        LOG.with(|l| l.borrow_mut().push(path.to_path_buf()));
+        let hit = FAIL.with(|f| f.borrow().as_ref().map(|suf| path.ends_with(suf)).unwrap_or(false));
+        if hit {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected directory fsync failure"));
+        }
+        Ok(())
+    }
 }
 
 /// Format a generation label from a u64 counter.
@@ -1068,6 +1103,92 @@ mod tests {
         assert!(load_snapshot(dir.path(), &test_identity()).unwrap().is_none(),
             "empty snapshots/ with no CURRENT must be treated as fresh");
     }
+
+    // ── Gap 5: directory fsync ordering and error propagation ───────────────
+    //
+    // Written FIRST. The probe records each directory fsync in order. Findings
+    // that these tests pin on Linux: `snapshots/` is never fsynced after the new
+    // generation directory is created, so CURRENT can become durable before the
+    // directory entry it points at. Windows durability is NOT testable here; see
+    // the notes at the end of this block.
+
+    use super::fsync_probe;
+
+    /// D1 — EXPECTED TO FAIL. The generation directory's entry (in `snapshots/`)
+    /// must be durable BEFORE CURRENT is renamed to point at it, and the last
+    /// directory fsync must be the data dir that holds CURRENT.
+    #[test]
+    fn d1_snapshots_dir_is_fsynced_before_current_and_data_dir_last() {
+        let dir = make_temp_dir();
+        fsync_probe::reset();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
+        let calls = fsync_probe::calls();
+        let snaps = dir.path().join("snapshots");
+        let gen = snaps.join("gen-000001");
+        let pos = |p: &std::path::Path| calls.iter().position(|c| c == p);
+        // existing guarantees (must keep holding)
+        assert!(calls.iter().filter(|c| **c == gen).count() >= 2,
+            "gen dir fsynced after the files and again after the manifest: {calls:?}");
+        assert_eq!(calls.last(), Some(&dir.path().to_path_buf()),
+            "the data dir (CURRENT's directory) must be fsynced last: {calls:?}");
+        // the defect
+        let s = pos(&snaps).unwrap_or_else(|| panic!("snapshots/ is never fsynced: {calls:?}"));
+        let last_gen = calls.iter().rposition(|c| *c == gen).unwrap();
+        assert!(s > last_gen && s < calls.len() - 1,
+            "snapshots/ must be fsynced after the gen dir is complete and before CURRENT's \
+             directory: {calls:?}");
+    }
+
+    /// D3 — SAFETY NET. A failed directory fsync of the generation is an ERROR
+    /// from write_snapshot and CURRENT is not advanced: the commit did not happen.
+    #[test]
+    fn d3_a_failed_generation_fsync_is_an_error_and_current_is_not_advanced() {
+        let dir = make_temp_dir();
+        write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
+        assert_eq!(read_current(dir.path()).unwrap().as_deref(), Some("gen-000001"));
+        fsync_probe::reset();
+        fsync_probe::fail_on("gen-000002");
+        let err = write_snapshot(dir.path(), 6, &dummy_contents(6), &test_identity(), &test_root())
+            .expect_err("a failed directory fsync must fail the snapshot write");
+        assert!(matches!(err, PersistError::Io(_)), "{err}");
+        assert_eq!(read_current(dir.path()).unwrap().as_deref(), Some("gen-000001"),
+            "CURRENT must still point at the last committed generation");
+    }
+
+    /// D4 — SAFETY NET. A failure flushing the directory that holds CURRENT is
+    /// also an error (the caller halts consensus), never silently dropped.
+    #[test]
+    fn d4_a_failed_current_directory_fsync_is_an_error() {
+        let dir = make_temp_dir();
+        fsync_probe::reset();
+        let data_dir_name = dir.path().file_name().unwrap().to_string_lossy().to_string();
+        fsync_probe::fail_on(&data_dir_name);
+        let err = write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root())
+            .expect_err("a failed fsync of CURRENT's directory must be reported");
+        assert!(matches!(err, PersistError::Io(_)), "{err}");
+    }
+
+    /// D6 — fsync_dir on a directory that does not exist must be an ERROR on every
+    /// platform. Passes on Linux today. On Windows `fsync_dir` is a no-op that
+    /// returns Ok, so this FAILS there until the Windows branch really opens and
+    /// flushes the directory. (Demonstrated on the Windows validation run.)
+    #[test]
+    fn d6_fsync_of_a_missing_directory_is_an_error_on_every_platform() {
+        let dir = make_temp_dir();
+        let missing = dir.path().join("does-not-exist");
+        assert!(fsync_dir(&missing).is_err(), "fsync_dir must not swallow a missing directory");
+        assert!(fsync_dir(dir.path()).is_ok(), "fsync of an existing directory succeeds");
+    }
+
+    // Not unit-testable (documented gap, to be exercised by the Windows run):
+    //  * Windows durability. Whether FlushFileBuffers on a directory handle makes a
+    //    rename durable on NTFS is not something a test can prove; the Windows run
+    //    can show only that the call SUCCEEDS (no ACCESS_DENIED) and the node
+    //    restarts correctly. A power-loss test is out of scope.
+    //  * Transient sharing violations (ERROR_SHARING_VIOLATION, e.g. antivirus
+    //    holding a file during rename or create). The persistence code does not
+    //    retry; it fails the commit loudly and the node halts consensus. A retry
+    //    policy would need its own decision and a Windows run to exercise.
 
     // ── crash-resilience: CURRENT not updated on incomplete write ──────────
 

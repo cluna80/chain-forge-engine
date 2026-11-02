@@ -14537,4 +14537,37 @@ mod p02a_gaps {
         assert_eq!(root_of(&n), live_root);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── Gap 5 (node level): the signing guard and the snapshot error path ───
+
+    /// D2 — EXPECTED TO FAIL. The signing guard's rename must be made durable by
+    /// fsyncing `persist/` BEFORE the vote it protects is sent. Today the file is
+    /// synced but its directory is not, so a crash can lose the guard after the
+    /// vote has gone out — the double-sign window.
+    #[tokio::test]
+    async fn d2_persisting_the_signing_guard_fsyncs_its_directory() {
+        let dir = tmp("d2");
+        let mut n = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+        n.set_data_dir(dir.clone()).unwrap();
+        crate::persistence::fsync_probe::reset();
+        n.persist_sign_guard().unwrap();
+        let calls = crate::persistence::fsync_probe::calls();
+        assert!(calls.contains(&dir.join("persist")),
+            "persist/ must be fsynced after consensus_signing.json is renamed into it; got {calls:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D5 — SAFETY NET. A failed snapshot fsync surfaces from persist_state as an
+    /// error (commit_block turns it into "halting consensus"), never silently.
+    #[tokio::test]
+    async fn d5_persist_state_reports_a_failed_directory_fsync() {
+        let dir = tmp("d5");
+        let n = build_chain(&dir).await;
+        crate::persistence::fsync_probe::reset();
+        crate::persistence::fsync_probe::fail_on("gen-000001");
+        let err = n.persist_state().expect_err("a failed directory fsync must fail persist_state");
+        assert!(err.contains("snapshot write failed"), "{err}");
+        assert!(crate::persistence::read_current(&dir).unwrap().is_none(), "nothing was committed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
