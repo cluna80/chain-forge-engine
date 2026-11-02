@@ -270,7 +270,7 @@ fn fund_load_accounts(api: &[u16]) {
         let mut ids = vec![];
         for (who, port) in funders.iter() {
             if k >= LOAD_ACCOUNTS { break; }
-            let mut tx = Transaction::transfer(&format!("fund-{k}"), who, &load_addr(k), "uqcb", 5_000_000, nonce(*port, who));
+            let mut tx = Transaction::transfer(&format!("fund-{k}"), who, &load_addr(k), "uqcb", 50_000_000, nonce(*port, who));
             tx.sign(&ClassicalScheme.generate_keypair(who).unwrap(), CHAIN_ID).unwrap();
             let r = http("POST", *port, "/api/tx", &serde_json::to_string(&tx).unwrap()).unwrap_or_default();
             assert_eq!(r["status"].as_str(), Some("queued"), "funding tx {k} not queued: {r}");
