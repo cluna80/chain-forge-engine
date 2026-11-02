@@ -575,7 +575,14 @@ and the restart and recovery tests; `validator_jail_live` JL-01..JL-09 PASSED (6
 to the pre-change Windows run (`51136494701f`, `eebbee537f59`, `33362db6f1e0`). Also Windows: `chain-forge-state` 73 passed / 3 ignored; release tree benchmark flat at 32.0 / 32.8 / 34.9 /
 33.2 / 40.0 / 38.2 / 33.5 us per commit at 100 / 500 / 1,000 / 2,500 / 5,000 / 10,000 / 20,000 versions (no pre-change
 Windows tree benchmark was taken; the original's 21.6 ms at 20,000 versions is a sandbox figure). `validator_eviction_live` EV-01..EV-03 PASSED
-(89.2 s) with final state root `48d58b5f...`, IDENTICAL to the pre-change Windows eviction run. Windows regression of
+(89.2 s) with final state root `48d58b5f...`, IDENTICAL to the pre-change Windows eviction run. DIAGNOSED (Windows log of the failed run): Dave's restarted node resumed from persisted state correctly, then logged
+`ERROR failed to bind HTTP API port port=58617 ... (os error 10048)`. The test had taken its ports from the OS
+ephemeral range, which the other nodes' outgoing connections also use, and then restarted Dave on his old port; the node
+kept running (and committing) with no API, so the test's status query read height 0. A test-harness defect unrelated to
+the state tree; fixed by choosing ports below the ephemeral range in the jail, integrity and eviction live tests, and by
+making the jail test's restart check require the restarted node's own "HTTP API listening" line. Observation, not
+changed: a node whose API fails to bind logs an ERROR and keeps running as a validator. Original note: Windows
+regression of
 this branch: NOT CLEAN. A second Windows `validator_jail_live` run FAILED (781 s) at "Dave never caught up (dave 0 vs
 alice 244)": Dave's own log tail shows him committing blocks 235-244 with state root `33362db6f1e0...` (correct), while
 the test's `/api/status` query on Dave's port returned height 0 for 240 s after his restart. The first Windows run of the

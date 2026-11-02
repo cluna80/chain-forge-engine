@@ -56,8 +56,17 @@ const LIVE_NODES:    [&str; 3] = ["qcb1alice", "qcb1bob", "qcb1carol"];
 
 // ── Paths and processes ───────────────────────────────────────────────────────
 
+/// Ports below the OS ephemeral range (Linux 32768+, Windows 49152+): the other nodes' outgoing
+/// connections draw from the ephemeral range, and a node restarted on its old API port can find it taken.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let start = 20_000 + (std::process::id() % 8_000) as u16;
+    loop {
+        let p = start + NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(p < 32_000, "no free port found");
+        if TcpListener::bind(("127.0.0.1", p)).is_ok() { return p; }
+    }
 }
 
 fn repo_root() -> PathBuf {
@@ -281,6 +290,20 @@ fn persisted_committee(log_dir: &PathBuf, name: &str) -> Vec<String> {
     ids
 }
 
+/// True once the node started with this log reports its API listening on `port`. Panics if its bind
+/// failed (a foreign listener on the port would otherwise satisfy a plain connect check).
+fn api_listening(log_dir: &PathBuf, name: &str, port: u16, timeout: Duration) -> bool {
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        let text = strip_ansi(&std::fs::read_to_string(log_dir.join(format!("{name}.log"))).unwrap_or_default());
+        assert!(!text.contains("failed to bind HTTP API"),
+            "{name}: its API could not bind port {port}\n{}", tail_log(log_dir, name, 20));
+        if text.contains(&format!("HTTP API listening port={port}")) { return true; }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 // ── Tx builders ───────────────────────────────────────────────────────────────
 
 fn bond_tx(sender: &str, nonce_val: u64, amount: u64) -> Transaction {
@@ -459,7 +482,7 @@ fn validator_jail_live() {
 
     // ── Bring Dave back, healthy: he must replay the chain and stay out ──────
     nodes[3] = Some(spawn(&specs[3], &tmp));
-    assert!(port_open(dave, Duration::from_secs(30)), "Dave did not restart\n{}", tail_log(&tmp, DAVE, 40));
+    assert!(api_listening(&tmp, DAVE, dave, Duration::from_secs(30)), "Dave did not restart\n{}", tail_log(&tmp, DAVE, 40));
     assert!(wait_until(Duration::from_secs(240), || height(dave) + 3 >= height(alice)),
             "Dave never caught up (dave {} vs alice {})\n{}", height(dave), height(alice), tail_log(&tmp, DAVE, 40));
     let (h_all, _) = agree(&api, Duration::from_secs(90));
@@ -475,7 +498,7 @@ fn validator_jail_live() {
     say(format!("  bob down: chain {} (3-validator committee needs all three)",
         if advanced_without_bob { "STILL ADVANCED" } else { "halted, as expected for f=0" }));
     nodes[1] = Some(spawn(&specs[1], &tmp));
-    assert!(port_open(bob, Duration::from_secs(30)), "bob did not restart\n{}", tail_log(&tmp, "qcb1bob", 40));
+    assert!(api_listening(&tmp, "qcb1bob", bob, Duration::from_secs(30)), "bob did not restart\n{}", tail_log(&tmp, "qcb1bob", 40));
     assert!(wait_until(Duration::from_secs(60), || is_jailed(bob, DAVE)),
             "JL-08: bob forgot Dave's jail across a restart\n{}", tail_log(&tmp, "qcb1bob", 40));
     let after = status_of(bob, DAVE).unwrap();
