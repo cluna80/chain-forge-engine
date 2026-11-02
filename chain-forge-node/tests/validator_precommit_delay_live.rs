@@ -254,9 +254,13 @@ fn assert_evidence_agrees(api: &[u16], h0: u64, h1: u64) {
     }
 }
 
-// Small on purpose: persist_state rewrites the whole chain store every commit (KNOWN_ISSUES §9),
+// Light on purpose: persist_state rewrites the whole chain store every commit (KNOWN_ISSUES §9),
 // so a heavy load slows the chain during the run and makes the scenarios incomparable.
-const LOAD_ACCOUNTS: usize = 8;
+// Many accounts, each throttled and capped: the API's nonce cache never leaves its NO_PRIOR_TX
+// sentinel (KNOWN_ISSUES §10), so an account can send at most 101 txs through the API.
+const LOAD_ACCOUNTS: usize = 32;
+const LOAD_TXS_PER_ACCOUNT: u64 = 95;
+const LOAD_MIN_SPACING: Duration = Duration::from_secs(7);
 
 fn load_addr(k: usize) -> String { format!("qcb1ld{k:02}") }
 
@@ -302,9 +306,10 @@ fn start_load(api: Vec<u16>) -> (Arc<AtomicBool>, std::thread::JoinHandle<u64>) 
                 if flag.load(Ordering::Relaxed) { break; }
                 let (addr, port) = (load_addr(k), api[k % 4]);
                 let committed = nonce(port, &addr);
+                if committed >= LOAD_TXS_PER_ACCOUNT { continue; }
                 let due = match sent[k] {
                     None => true,
-                    Some((n, at)) => committed > n || at.elapsed() > Duration::from_secs(8),
+                    Some((n, at)) => (committed > n && at.elapsed() >= LOAD_MIN_SPACING) || at.elapsed() > Duration::from_secs(14),
                 };
                 if !due { continue; }
                 let mut tx = Transaction::transfer(&format!("ld-{addr}-{committed}"), &addr, "qcb1alice", "uqcb", 1, committed);

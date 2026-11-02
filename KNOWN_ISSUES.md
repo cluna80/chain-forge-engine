@@ -350,3 +350,28 @@ Effects: a sustained-load devnet slows quadratically; any timing-based
 measurement (e.g. the late-precommit window in §8) drifts unless the run is
 kept short or light. **Not fixed here** (outside H0-11B); candidate fixes are
 incremental/append-only block persistence and off-loop writes.
+
+---
+
+## §10  API nonce cache never leaves the NO_PRIOR_TX sentinel (101-transaction lifetime cap, no ingress replay check)
+
+**Status: OPEN — pre-existing; found 2026-11-02 (two load tests stalled at exactly 101 txs per account)**
+
+`Node` seeds `nonce_cache` with `u64::MAX` (`NO_PRIOR_TX`) for every account
+that has not committed a transaction, including every genesis account and
+every funded recipient. After a block executes, the cache is updated with
+`if tx_nonce >= entry { *entry = tx_nonce }`. No nonce is `>= u64::MAX`, so a
+sentinel entry is never replaced. `f1_nonce_rejected(NO_PRIOR_TX, n)` then
+rejects every `n > MAX_NONCE_GAP (100)` forever.
+
+Observed: 8 fresh accounts, one transaction in flight each, queued exactly
+808 = 8 x 101 transactions and then every further submission was refused,
+although the chain kept committing and the accounts had funds.
+
+Effects: (1) any account is capped at 101 API-submitted transactions over its
+lifetime; (2) for such accounts ingress replay protection is effectively off
+(execution still enforces nonces, so this alone does not endanger funds).
+
+**Not fixed here.** Likely fix: treat a `u64::MAX` entry as "unset" in the
+update (`if *entry == u64::MAX || tx_nonce >= *entry`), with tests for both
+the cap and the ingress replay check.
