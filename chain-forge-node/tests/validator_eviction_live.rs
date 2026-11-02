@@ -111,7 +111,11 @@ impl Drop for NodeHandle {
     }
 }
 
-fn spawn_node(name: &str, api: u16, p2p: u16, log_dir: &PathBuf, peers: &[u16]) -> NodeHandle {
+fn spawn_node(
+    name: &str, api: u16, p2p: u16,
+    log_dir: &PathBuf, data_dir: &PathBuf, peers: &[u16],
+) -> NodeHandle {
+    std::fs::create_dir_all(data_dir).unwrap();
     let log = std::fs::File::create(log_dir.join(format!("{name}.log"))).unwrap();
     let bootstrap: Vec<String> = peers.iter().map(|&p| format!("/ip4/127.0.0.1/tcp/{p}")).collect();
     let mut cmd = Command::new(node_bin());
@@ -119,6 +123,7 @@ fn spawn_node(name: &str, api: u16, p2p: u16, log_dir: &PathBuf, peers: &[u16]) 
        .arg("--validator").arg(name)
        .arg("--api-port").arg(api.to_string())
        .arg("--p2p-port").arg(p2p.to_string())
+       .arg("--data-dir").arg(data_dir)
        .arg("--key-file").arg(key_file(name.strip_prefix("qcb1").unwrap_or(name)));
     for addr in &bootstrap { cmd.arg("--bootstrap").arg(addr); }
     cmd.stdout(log.try_clone().unwrap()).stderr(log).stdin(Stdio::null());
@@ -126,16 +131,31 @@ fn spawn_node(name: &str, api: u16, p2p: u16, log_dir: &PathBuf, peers: &[u16]) 
 }
 
 fn spawn_devnet(ports: &Ports, log_dir: &PathBuf) -> Vec<NodeHandle> {
-    vec![
-        spawn_node("qcb1alice", ports.alice_api, ports.alice_p2p, log_dir,
-                   &[ports.bob_p2p, ports.carol_p2p, ports.dave_p2p]),
-        spawn_node("qcb1bob",   ports.bob_api,   ports.bob_p2p,   log_dir,
-                   &[ports.alice_p2p, ports.carol_p2p, ports.dave_p2p]),
-        spawn_node("qcb1carol", ports.carol_api, ports.carol_p2p, log_dir,
-                   &[ports.alice_p2p, ports.bob_p2p, ports.dave_p2p]),
-        spawn_node("qcb1dave",  ports.dave_api,  ports.dave_p2p,  log_dir,
-                   &[ports.alice_p2p, ports.bob_p2p, ports.carol_p2p]),
-    ]
+    let names = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+    let peers_list = [
+        vec![ports.bob_p2p, ports.carol_p2p, ports.dave_p2p],
+        vec![ports.alice_p2p, ports.carol_p2p, ports.dave_p2p],
+        vec![ports.alice_p2p, ports.bob_p2p, ports.dave_p2p],
+        vec![ports.alice_p2p, ports.bob_p2p, ports.carol_p2p],
+    ];
+    let api_ports  = [ports.alice_api, ports.bob_api, ports.carol_api, ports.dave_api];
+    let p2p_ports  = [ports.alice_p2p, ports.bob_p2p, ports.carol_p2p, ports.dave_p2p];
+    names.iter().enumerate().map(|(i, &name)| {
+        let data_dir = log_dir.join(format!("data-{}", name.strip_prefix("qcb1").unwrap_or(name)));
+        spawn_node(name, api_ports[i], p2p_ports[i], log_dir, &data_dir, &peers_list[i])
+    }).collect()
+}
+
+/// Read the last `n` lines of a log file for diagnostic output.
+fn tail_log(log_dir: &PathBuf, name: &str, n: usize) -> String {
+    let path = log_dir.join(format!("{name}.log"));
+    std::fs::read_to_string(&path)
+        .map(|s| {
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            lines[start..].join("\n")
+        })
+        .unwrap_or_else(|_| format!("<log not found: {path:?}>"))
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -303,9 +323,11 @@ fn validator_eviction_live() {
     // ── Start 4-node devnet ───────────────────────────────────────────────────
     let _nodes = spawn_devnet(&ports, &tmp);
     let all_api = ports.all_api();
+    let node_names = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
     for (i, &p) in all_api.iter().enumerate() {
         assert!(poll_ready(p, Duration::from_secs(30)),
-                "node{i} API did not come up on :{p}");
+                "node{i} ({}) API did not come up on :{p}\n--- last 40 log lines ---\n{}\n---",
+                node_names[i], tail_log(&tmp, node_names[i], 40));
     }
     assert!(wait_for_height(ports.alice_api, 3, Duration::from_secs(30)),
             "devnet did not reach height 3");
