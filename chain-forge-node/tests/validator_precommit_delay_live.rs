@@ -48,7 +48,18 @@ const DAVE: &str = "qcb1dave";
 const BLOCKS_PER_SCENARIO: u64 = 18;
 const DELAYS_MS: [u64; 7] = [0, 500, 900, 1500, 2200, 3000, 4500];
 
-fn free_port() -> u16 { TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
+/// Ports below the OS ephemeral range: outgoing connections made by the
+/// other nodes while they start can otherwise grab a port picked here.
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let start = 20_000 + (std::process::id() % 8_000) as u16;
+    loop {
+        let p = start + NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(p < 32_000, "no free port found");
+        if TcpListener::bind(("127.0.0.1", p)).is_ok() { return p; }
+    }
+}
 fn repo_root() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf() }
 fn node_bin() -> PathBuf {
     let target = std::env::var("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|_| repo_root().join("target"));
