@@ -498,3 +498,42 @@ Why it matters: H0-3 is marked complete for "consistent after an unclean shutdow
 height"; the audit shows a crash MID-WRITE (torn file) is not covered by the load path. The
 double-sign guard is atomic and would refuse conflicting votes, which limits the safety damage but not
 the loss of the node's chain. This is also the baseline PERSIST-001 must beat, not merely preserve.
+
+---
+
+## §12  State tree lookups walk back through every version (commit cost grows linearly with height)
+
+**Status: OPEN — found 2026-11-02 by sampling a release build (PERSIST-001 P-01). This, not persistence, is the dominant commit-time growth.**
+
+Release-mode profile (same in-process 4-validator loop, 10 transfers per block, persistence ON; `persist001_profile_commit_path`):
+
+| Height | Median commit | persist_state() | Share |
+| --- | --- | --- | --- |
+| 25 | 16 ms | 9 ms | 56% |
+| 100 | 78 ms | 28 ms | 36% |
+| 300 | 503 ms | 95 ms | 19% |
+| 600 | 1,152 ms | 165 ms | 14% |
+
+(The debug build is ~13x slower in serialization, which exaggerated persistence's share in §9.)
+
+Sampling the running release binary with gdb (36 stack samples across heights ~300-700): **32 of 36
+samples (89%) were inside `chain_forge_state::jmt::rebuild_subtree` / `create_internal_node`**,
+and the innermost frames in those 32 were BTreeMap `get` and key comparisons (`memcmp`) under
+`NodeStore::get`. Only 4 of 36 were in `persist_state` (2 in the file write).
+
+Cause (`chain-forge-state/src/jmt.rs`): `NodeStore::get` and `get_at` do
+`for v in (0..=key.version).rev() { probe = NodeKey{version: v, ..key.clone()}; nodes.get(&probe) }`,
+i.e. one allocation-and-BTreeMap-probe per version back to the version where that node was last
+written. `rebuild_subtree` calls it for every unchanged sibling, so a commit costs O(depth x
+current version) lookups, and in a tree where few accounts change per block almost every node is
+old. `prune_before` exists but is never called, and cannot be used as a fix: unchanged nodes must
+be found at their old versions.
+
+Not fixed here (state-store change; PERSIST-001 is profiling and design only). A fix must not
+change any state root: it can be verified by running the existing state tests plus a differential
+test (old lookup vs. indexed lookup over the same update sequence) asserting identical roots.
+Candidate: a per-path index of the latest version (or latest node per path, with older versions
+kept only for proofs/rollback), making `get` O(1).
+
+Consequence for PERSIST-001: persistence is the second cost (whole-store JSON rewrite, ~14-20% of a
+release commit at heights 300-600 and linear in height) and, separately, is not atomic (§11).
