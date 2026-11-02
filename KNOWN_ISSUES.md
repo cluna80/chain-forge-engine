@@ -330,6 +330,13 @@ usable for the cutoff. No omission was unattributed. Windows degrades much faste
 under identical load, which makes §9 (whole-chain rewrite on every commit) the practical blocker for
 any sustained-load measurement on the development platform.
 
+Sandbox, reduced load (16 accounts, ~1.6 tx/s, commit af15c4a+): PASSED (321 s); mempool non-empty at
+>= 60% of proposals in every row; block interval 1.4 s -> 1.3 s (worst 2.6 s, 1.9x); omitted 0 of 10
+(0 ms), 0 of 10 (500), 4 of 11 (900), 4 of 11 (1,200), 6 of 10 (1,500), 10 of 10 (2,200), 10 of 10
+(3,000), 0 of 10 (closing control); commit-to-proposal 851-1,074 ms in rows with omissions. Not yet
+run on Windows. Note the load is deliberately light (2-4 txs per block); this does not prove the
+evidence policy is safe under sustained production load (§9 prevents measuring that on one machine).
+
 Sandbox rerun after staggering the load (commit following 96e39d1; PASSED, 320 s; mempool
 non-empty at >= 60% of proposals in every row incl. the first; block-interval drift 1.7x,
 1.2 s -> 2.0 s worst): networked blocks omitted 0 of 11 (0 ms), 0 of 10 (500), 4 of 11 (900),
@@ -448,3 +455,46 @@ lifetime; (2) for such accounts ingress replay protection is effectively off
 **Not fixed here.** Likely fix: treat a `u64::MAX` entry as "unset" in the
 update (`if *entry == u64::MAX || tx_nonce >= *entry`), with tests for both
 the cap and the ingress replay check.
+
+**PERSIST-001 P-01 profile (read-only; 2026-11-02, sandbox, DEBUG build — release pending)**
+`persist001_profile_commit_path` (ignored test, no production change): 4-validator in-process
+commit path, 10 transfers per block, persistence on.
+
+| Height | Median commit | chain_store.json | Serialize (pretty) | Write | persist_state() total |
+| --- | --- | --- | --- | --- | --- |
+| 25 | 378 ms | 2.5 MB | 83 ms | 4 ms | 113 ms |
+| 100 | 697 ms | 9.8 MB | 301 ms | 8 ms | 254 ms |
+| 200 | 1,345 ms | 19.5 MB | 435 ms | 14 ms | 463 ms |
+| 300 | 2,096 ms | 29.2 MB | 732 ms | 24 ms | 730 ms |
+
+- Cost is linear in height and dominated by SERIALIZATION, not the disk write (732 ms vs 24 ms at
+  height 300). Compact (non-pretty) serialization is ~2.4x cheaper (306 ms), still linear.
+- The chain store is ~97 KB per block for 10 transfers: block payload and signatures are Vec<u8>,
+  which JSON writes as arrays of numbers.
+- persist_state() is NOT the whole story. With persistence off (control) the same loop still goes
+  243 ms (h25) -> 391 (h100) -> 806 (h200) -> 1,165 ms (h300): roughly 56% of the height-300 commit
+  is other work that also grows with chain length. Not yet located.
+- A temp+fsync+rename write of the compact store cost 112 ms at height 300 (fsync is not the
+  main cost).
+
+---
+
+## §11  `persist_state` is not atomic and a failed load looks like a fresh start
+
+**Status: OPEN — found 2026-11-02 while scoping PERSIST-001; needs an owner decision on H0-3 scope**
+
+`persist_state()` rewrites eight files in place with `std::fs::write` (truncate + write), with no
+temp file, fsync or rename, and ignores write errors. Only the double-sign guard uses `write_atomic`.
+`load_persisted_state()` logs "could not load persisted state — starting from genesis" on a parse
+error and returns false; `main.rs` treats false as "no persisted state found — starting from genesis".
+
+Audit (`persist001_audit_torn_files`, 12 committed blocks, one file damaged at a time):
+state.json truncated or emptied, chain_store.json truncated or emptied, slashing.json truncated,
+identity.json truncated, live_validator_set.json truncated: **all fall back to genesis**
+(status height 0, engine height 0) with only that log line. validators.json missing: loads
+"successfully" at height 11 with a registry rebuilt from genesis (silently inconsistent).
+
+Why it matters: H0-3 is marked complete for "consistent after an unclean shutdown at any block
+height"; the audit shows a crash MID-WRITE (torn file) is not covered by the load path. The
+double-sign guard is atomic and would refuse conflicting votes, which limits the safety damage but not
+the loss of the node's chain. This is also the baseline PERSIST-001 must beat, not merely preserve.
