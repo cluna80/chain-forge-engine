@@ -238,3 +238,16 @@ What the Windows run shows: the node suite includes the directory-fsync tests (D
 **Suspected cause (UNCONFIRMED):** antivirus (Avast) scanning a freshly built node executable, or machine load right after a rebuild, delaying startup past the 20 s port wait. A second candidate: the test's `free_port()` binds port 0, which hands out ephemeral-range ports and can collide on Windows (the cause of an earlier jail-test failure, os error 10048). Neither was observed. A persistence defect would be expected to fail repeatedly, and it did not.
 
 **Not changed.** The test file was deliberately NOT hardened on the P-02a branch (separate change after merge: ports outside the ephemeral range and more wait margin). If C-01 fails again, capture the log (`... -- --nocapture 2>&1 | tee c01.log`) and grep for `panicked`, `FATAL`, `10048`.
+
+---
+
+## GOV-Q1  Governance quorum: misleading failure wording, vacuous quorum at zero population, floating point in the decision
+
+**Status: OPEN, follow-up only. Found 2026-11-02 while reviewing the H0-12 Windows run (`governance_quorum_live`). Not a correctness failure: every GQ-01..GQ-06 outcome is correct. Not changed in code.** Code: `chain-forge-governance/src/lib.rs`, `GovernanceConfig::qcb_default` and the tally around line 467.
+
+1. **The "4%" is the configured value, not a rounding artifact.** `ordinary_quorum_pct = 4` (a deliberate margin above the 3% floor; constitutional is 7 above 6), pinned by `ordinary_quorum_floor_is_above_3pct_sybil_threshold`.
+2. **The message can mislead on small populations.** The required voters are `ceil(verified * pct / 100)`, so the effective threshold is above the configured percentage when the population is small (11 verified humans: 1 voter, which is 9.1%), yet the message prints "need 4% (1 voters)". Grammar aside ("1 voters"), a reader may think one voter is 4%. Suggested wording: "need 4% of 11 verified humans (at least 1 voter), got 0".
+3. **Quorum is vacuous at zero population.** With `verified_humans_at_submission == 0`, `needed_voters` is 0, so the quorum check passes with no participants. Such a proposal still fails on the approval check (0.0% < 51%) and, for constitutional changes, on the absolute minimum of 10 voters, so nothing can pass. This rests on those later checks rather than on an explicit rule; either reject proposals submitted at zero population or document it.
+4. **Floating point in a consensus decision.** The quorum (`f64` multiply, divide, `ceil`) and the approval comparison (`yes / decisive * 100.0 < threshold`) use `f64`. A comparison against integer arithmetic found **zero mismatches** for quorum percentages 4 and 7 with verified populations 0..200,000, and for approval thresholds 51 and 67 with 1..2,000 decisive votes. The ranges are bounded and the thresholds are configurable, so integer arithmetic (`(verified * pct + 99) / 100`, `yes * 100 < threshold * decisive`) is the recommended hardening for consensus-critical code.
+
+Not blocking H0-12 (merged as #52). Fix as a separate, tested change.
