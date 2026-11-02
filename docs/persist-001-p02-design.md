@@ -103,14 +103,28 @@ Each row becomes a test (§9). "Refuse" means non-zero exit with the explicit er
 - **Downgrade hazard.** The previous binary reading the new layout finds no `state.json` and would silently start from genesis. Mitigation: the new layout writes a `persist/README-FORMAT-V2` marker and the release notes state "no downgrade"; confirm in review that no operator tooling relies on the old file names.
 - Rollback path: legacy files are retained until the second successful generation is committed.
 
-## 8. Decisions needed from the owner
+## 8. Decisions (owner positions recorded 2026-11-02; implementation NOT yet authorised)
 
-- **D1.** Per-block fsync before voting on the next height, or after (and optionally group commit)?
-- **D2.** Generations retained, *K* (proposal: 2).
-- **D3.** Deliberate reset: an explicit CLI flag (proposed name `--reset-data`), refused unless the directory is explicitly named, that archives rather than deletes the old data.
-- **D4.** Is an embedded database (Option 3) acceptable as a future dependency?
-- **D5.** No-downgrade policy confirmed?
-- **D6.** Is "signing guard present, chain state absent" fatal (proposed) or an operator-confirmed condition?
+| # | Decision | Position | Condition |
+| --- | --- | --- | --- |
+| D1 | Durability ordering | Approved | Persist and fsync the required state before advancing to the next height. The exact durable commit boundary is step 5 of §5 (generation rename plus parent fsync). |
+| D2 | Generations retained | Approved provisionally: 2 | An interrupted update must never destroy the last valid generation. A new generation is staged beside the old one; the old one is pruned only after the new `CURRENT` is durable **and** the new generation has been read back and its checksums verified. |
+| D3 | Deliberate reset | Approved | Explicit `--reset-data` flag, archives (does not delete) existing data, requires operator confirmation. Never automatic. |
+| D4 | Embedded database | Deferred | Revisit only if profiling shows Options 1-2 are insufficient. |
+| D5 | Downgrade | Approved | Reject incompatible older or newer storage formats (`format_version`); document the migration path. |
+| D6 | Signing guard without chain state | Approved | Existing signing guard with missing chain state is a fatal startup error (class CORRUPT). The reverse (chain state, no guard) is also fatal. |
+
+**Key invariant:** a node never silently restarts from genesis when previously committed storage is corrupted or missing.
+
+### 8.1 Coordination of crash recovery and double-signing prevention
+
+Durable state alone is not enough: after a crash a validator must not be able to sign a message that conflicts with one it signed before. The ordering rules are:
+
+1. **Guard before signature.** A vote or proposal is signed and sent only after the signing guard recording it is durable (`write_atomic` plus directory fsync; the directory fsync is an addition to today's code).
+2. **State before next height (D1).** No vote or proposal for height *h+1* is produced until the generation for height *h* is durable. The guard may therefore be newer than the chain state (a vote cast for a block that was not yet persisted), never older than any signature the node has emitted.
+3. **Recovery load order.** (a) Classify the data directory (§1) using the guard and the chain state *together*. (b) Load chain state to the last COMMITTED generation, which may be height *h* or *h-1* after a crash. (c) Load the guard unconditionally, and refuse to start if it is unreadable (already the case) or inconsistent with the chain state (D6). (d) Resume consensus at the loaded height; the guard's lock and last-signed record prevent conflicting messages for heights or rounds already signed, including a height the chain state has rolled back past.
+4. **Rolled-back height.** If the chain state recovers to *h-1* while the guard shows a signature at height *h*, the node must re-vote for the same block at *h* or abstain, never sign a different one. This case needs an explicit test (§9 item 9).
+5. The guard file must outlive `--reset-data` handling: resetting chain data while keeping a guard is refused (D3 plus D6); a deliberate full reset archives both.
 
 ## 9. Test plan (written first, against the current code where they demonstrate the defect)
 
@@ -122,6 +136,8 @@ Each row becomes a test (§9). "Refuse" means non-zero exit with the explicit er
 6. **Migration tests:** a legacy directory (valid, torn, missing optional file) migrates, or refuses, as §7 states; round trip preserves the root.
 7. **Windows specifics:** directory flush uses a handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; `rename` over an existing file; bounded retry with an explicit error on transient sharing violations (antivirus, as seen with LNK1104 and the Avast block). This must be validated on Windows before ✅ (CLAUDE.md policy).
 8. **Cost:** repeat the §9 loaded-chain measurement; commit interval must stay flat to chain length for P-02b.
+
+9. **Guard and recovery:** crash after signing a vote at *h* but before generation *h* is durable; restart at *h-1*; assert the node cannot sign a conflicting message at *h*, and that missing-guard and missing-chain-state combinations are refused (D6).
 
 ## 10. Risks and dependencies
 
