@@ -6,6 +6,9 @@
 qcb-genesis.json
 
 keys/
+# Un-ignore the devnet test fixture directory so dis003d fixtures can be tracked.
+# These are pre-generated deterministic keypairs for integration tests only —
+# not real signing keys.
 !chain-forge-node/tests/devnet/keys/
 !chain-forge-node/tests/devnet/keys/dis003d-*.key.json
 !chain-forge-node/tests/devnet/keys/dis003d-new-key-*.key.json

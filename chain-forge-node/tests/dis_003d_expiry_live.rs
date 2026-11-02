@@ -37,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
+use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
 use chain_forge_execution::{
     Transaction, TxBody, GuardianAuth,
     account_key_rotation_signing_bytes,
@@ -53,6 +53,96 @@ const SEED_PILOT: &str = "dis003d-pilot-device-seed-000000000000000000000000001"
 const SEED_G1:    &str = "dis003d-guardian-1-seed-000000000000000000000000000010";
 const SEED_G2:    &str = "dis003d-guardian-2-seed-000000000000000000000000000020";
 const SEED_G3:    &str = "dis003d-guardian-3-seed-000000000000000000000000000030";
+
+// Seed → fixture file stem mapping (stored in tests/devnet/keys/).
+// ML-DSA keygen in pqcrypto-dilithium is randomised per process; the fixture
+// files pin each seed to a specific keypair so the genesis public key and the
+// signing key in the test always match across processes.
+const SEED_FIXTURE_NAMES: &[(&str, &str)] = &[
+    // Genesis-bound keys: must match genesis-dis003d.json public keys exactly.
+    (SEED_PILOT, "dis003d-pilot"),
+    (SEED_G1,    "dis003d-guardian1"),
+    (SEED_G2,    "dis003d-guardian2"),
+    (SEED_G3,    "dis003d-guardian3"),
+    // Rotation keys: used as the new key in each fixture's recover_account_key tx,
+    // then immediately re-enrolled as the active signing key.  Must be
+    // cross-process deterministic even though they are not genesis-constrained.
+    ("dis003d-new-key-f01-seed-000000000000000000000001", "dis003d-new-key-f01"),
+    ("dis003d-new-key-f02-seed-000000000000000000000002", "dis003d-new-key-f02"),
+    ("dis003d-new-key-f03-seed-000000000000000000000003", "dis003d-new-key-f03"),
+    ("dis003d-new-key-f04-seed-000000000000000000000004", "dis003d-new-key-f04"),
+    ("dis003d-new-key-f05-seed-000000000000000000000005", "dis003d-new-key-f05"),
+    ("dis003d-new-key-f06-seed-000000000000000000000006", "dis003d-new-key-f06"),
+    ("dis003d-new-key-f07-seed-000000000000000000000007", "dis003d-new-key-f07"),
+];
+
+/// Load a pinned keypair from `tests/devnet/keys/<name>.key.json`.
+///
+/// # Panics
+/// Panics on any problem: missing file, bad JSON, wrong key sizes, or an
+/// unrecognised seed.  There is NO fallback to `generate_keypair` — that
+/// produces a random key that will never match the genesis public key stored
+/// in `genesis-dis003d.json`, causing opaque auth failures later.
+fn load_fixture_keypair(seed: &str) -> KeyPair {
+    let (_, name) = SEED_FIXTURE_NAMES
+        .iter()
+        .find(|(s, _)| *s == seed)
+        .unwrap_or_else(|| panic!(
+            "load_fixture_keypair: no fixture registered for seed {:?}. \
+             Add an entry to SEED_FIXTURE_NAMES and generate a fixture file.",
+            seed
+        ));
+
+    let path = manifest_dir()
+        .join("tests")
+        .join("devnet")
+        .join("keys")
+        .join(format!("{name}.key.json"));
+
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!(
+        "fixture {name}: cannot read {:?}: {e}. \
+         Run `cargo run --example gen_dis003d_fixture` (in chain-forge-crypto) \
+         to regenerate and commit the fixture files.",
+        path
+    ));
+
+    let obj = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|e| panic!(
+        "fixture {name}: JSON parse error in {:?}: {e}", path
+    ));
+
+    let pk_hex = obj["public_key"].as_str().unwrap_or_else(|| panic!(
+        "fixture {name}: missing \"public_key\" field"
+    ));
+    let sk_hex = obj["private_key"].as_str().unwrap_or_else(|| panic!(
+        "fixture {name}: missing \"private_key\" field"
+    ));
+
+    fn from_hex(h: &str) -> Vec<u8> {
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0))
+            .collect()
+    }
+
+    let pk = from_hex(pk_hex);
+    let sk = from_hex(sk_hex);
+
+    if pk.len() != 1952 {
+        panic!("fixture {name}: bad pk len {} (want 1952)", pk.len());
+    }
+    if sk.len() != 4032 {
+        panic!(
+            "fixture {name}: bad sk len {} (want 4032). \
+             The fixture was probably generated against the Linux system \
+             dilithium3 library instead of the bundled PQClean C source. \
+             Regenerate with an isolated pqcrypto-dilithium 0.5.0 build.",
+            sk.len()
+        );
+    }
+
+    eprintln!("[fixture] loaded {name}: pk={}B sk={}B", pk.len(), sk.len());
+    KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk }
+}
 
 // ── Port helpers ──────────────────────────────────────────────────────────────
 
@@ -161,18 +251,41 @@ fn spawn_devnet(ports: &Ports) -> [NodeHandle; 4] {
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
 
+/// Raw HTTP/1.0 request helper.
+///
+/// Sends headers and body as two separate writes so the server can open
+/// its receive window before the full body is in-flight — important on
+/// Windows where the loopback TCP send buffer is small (~8 KiB) and a
+/// single write_all of a 100 KB+ recovery tx can block waiting for the
+/// server to drain, while the server's body-read timeout is ticking.
+///
+/// Read timeout scales with body size: 15 s base + 1 s per 4 KB, so a
+/// 100 KB ML-DSA recovery tx gets ~40 s to arrive and be processed.
 fn http_raw(method: &str, port: u16, path: &str, body: Option<&str>) -> Option<(u16, String)> {
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().unwrap(),
         Duration::from_millis(500),
     ).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(15_000))).ok()?;
-    let req = if let Some(b) = body {
-        format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())
+    // Scale read timeout with body size so large recovery transactions
+    // (100 KB+ JSON) have enough time to be written, received, and processed.
+    let body_len = body.map(|b| b.len()).unwrap_or(0);
+    let read_ms  = 15_000u64 + (body_len as u64 / 4_096) * 1_000;
+    stream.set_read_timeout(Some(Duration::from_millis(read_ms))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(30))).ok()?;
+
+    // Write headers first, then body as a separate write.
+    // This lets the server start reading the headers (and open its TCP
+    // receive window) before we have finished sending the body bytes.
+    let headers = if let Some(b) = body {
+        format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b.len())
     } else {
         format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
     };
-    stream.write_all(req.as_bytes()).ok()?;
+    stream.write_all(headers.as_bytes()).ok()?;
+    if let Some(b) = body {
+        stream.write_all(b.as_bytes()).ok()?;
+    }
+
     let mut buf = String::new();
     stream.read_to_string(&mut buf).ok()?;
     let status = buf.lines().next()
@@ -203,7 +316,15 @@ fn poll_ready(port: u16, timeout: Duration) -> bool {
 }
 
 fn submit_tx(port: u16, json: &str) -> serde_json::Value {
-    api_post(port, "/api/tx", json).1
+    let body_len = json.len();
+    let (status, val) = api_post(port, "/api/tx", json);
+    if val.is_null() {
+        eprintln!("[submit_tx] WARNING: null response from port {port} \
+                   (body={body_len} bytes, http_status={status}) — \
+                   server may have timed out reading the body or closed \
+                   the connection before responding.");
+    }
+    val
 }
 
 fn wait_tx_result(port: u16, tx_id: &str, timeout: Duration) -> Option<serde_json::Value> {
@@ -250,7 +371,7 @@ fn current_height(port: u16) -> u64 {
 
 fn ml_dsa_tx(seed: &str, sender: &str, nonce: u64, body: TxBody,
              tx_id: &str, gas: u64) -> Transaction {
-    let kp        = MlDsaScheme.generate_keypair(seed).expect("keygen");
+    let kp        = load_fixture_keypair(seed);
     let body_json = serde_json::to_string(&body).expect("body serialise");
     let msg       = mldsa_tx_prehash(CHAIN_ID, body_json.as_bytes());
     let sig       = MlDsaScheme.sign(&msg, &kp).expect("sign");
@@ -286,14 +407,14 @@ fn build_recover(
     assert_eq!(guardian_seeds.len(), expires_per_guardian.len(),
         "guardian_seeds and expires_per_guardian must have equal length");
 
-    let new_kp  = MlDsaScheme.generate_keypair(new_seed).expect("new keygen");
+    let new_kp  = load_fixture_keypair(new_seed);
     let pop_msg = account_key_rotation_signing_bytes(CHAIN_ID, sender, key_version, &new_kp.public_key);
     let pop_sig = MlDsaScheme.sign(&pop_msg, &new_kp).expect("PoP sign");
 
     let guardian_signatures: Vec<GuardianAuth> = guardian_seeds.iter()
         .zip(expires_per_guardian.iter())
         .map(|(&gs, &exp)| {
-            let gkp     = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
+            let gkp     = load_fixture_keypair(gs);
             let rec_msg = recovery_domain_signing_bytes(
                 CHAIN_ID, sender, key_version, &new_kp.public_key, policy_id, exp,
             );
@@ -305,7 +426,7 @@ fn build_recover(
             }
         }).collect();
 
-    let kp_sender = MlDsaScheme.generate_keypair(SEED_PILOT).expect("sender keygen");
+    let kp_sender = load_fixture_keypair(SEED_PILOT);
     let body      = TxBody::RecoverAccountKey {
         new_public_key:      new_kp.public_key.clone(),
         new_key_scheme:      "ml-dsa-65".to_string(),
@@ -342,12 +463,12 @@ fn build_recover_tampered_expiry(
     policy_id:        u64,
     tx_id:            &str,
 ) -> Transaction {
-    let new_kp  = MlDsaScheme.generate_keypair(new_seed).expect("new keygen");
+    let new_kp  = load_fixture_keypair(new_seed);
     let pop_msg = account_key_rotation_signing_bytes(CHAIN_ID, sender, key_version, &new_kp.public_key);
     let pop_sig = MlDsaScheme.sign(&pop_msg, &new_kp).expect("PoP sign");
 
     let guardian_signatures: Vec<GuardianAuth> = guardian_seeds.iter().map(|&gs| {
-        let gkp     = MlDsaScheme.generate_keypair(gs).expect("guardian keygen");
+        let gkp     = load_fixture_keypair(gs);
         // Sign over `signed_expiry` but present `presented_expiry` in the field.
         let rec_msg = recovery_domain_signing_bytes(
             CHAIN_ID, sender, key_version, &new_kp.public_key, policy_id, signed_expiry,
@@ -360,7 +481,7 @@ fn build_recover_tampered_expiry(
         }
     }).collect();
 
-    let kp_sender = MlDsaScheme.generate_keypair(SEED_PILOT).expect("sender keygen");
+    let kp_sender = load_fixture_keypair(SEED_PILOT);
     let body      = TxBody::RecoverAccountKey {
         new_public_key:      new_kp.public_key.clone(),
         new_key_scheme:      "ml-dsa-65".to_string(),
@@ -419,9 +540,9 @@ fn dis_003d_expiry_live() {
     println!("✓ F-00 passed (413 for {} bytes)", max_tx_bytes + 1);
 
     // ── Derive guardian public keys ───────────────────────────────────────────
-    let g1_pk = MlDsaScheme.generate_keypair(SEED_G1).expect("g1").public_key;
-    let g2_pk = MlDsaScheme.generate_keypair(SEED_G2).expect("g2").public_key;
-    let g3_pk = MlDsaScheme.generate_keypair(SEED_G3).expect("g3").public_key;
+    let g1_pk = load_fixture_keypair(SEED_G1).public_key;
+    let g2_pk = load_fixture_keypair(SEED_G2).public_key;
+    let g3_pk = load_fixture_keypair(SEED_G3).public_key;
 
     // ── Enroll a 2-of-3 recovery policy ──────────────────────────────────────
     let nonce0 = current_nonce(port, PILOT_ADDR);

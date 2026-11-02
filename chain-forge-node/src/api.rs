@@ -181,8 +181,19 @@ pub async fn serve(
                     // and closing with body bytes still unread makes Windows
                     // reset the connection (os error 10054 on the client).
                     let max_body = max_body_bytes(precheck.max_tx_bytes);
+                    // Body-read timeout scales with the declared body limit so
+                    // large-but-valid transactions (e.g. a 10-guardian ML-DSA
+                    // recovery tx at ~221 KB) are not rejected by the server
+                    // before the OS has finished delivering the TCP segments on
+                    // Windows. Formula: 5 s base + 1 s per 16 KiB, capped at
+                    // 60 s. For the default 64 KiB limit this is still 9 s;
+                    // for the DIS-003 256 KiB limit it is 21 s.
+                    let body_read_secs = {
+                        let extra = max_body.saturating_div(16_384) as u64;
+                        5u64.saturating_add(extra).min(60)
+                    };
                     let read = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(body_read_secs),
                         read_request(&mut stream, max_body),
                     ).await;
                     let buf = match read {
