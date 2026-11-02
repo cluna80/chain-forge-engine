@@ -530,44 +530,55 @@ fn governance_quorum_live() {
         "GQ-02: vote failed: {gq02_vote}");
     println!("   GQ-02: voter1 voted yes.");
 
-    // GQ-03: voters 1..9 vote yes on proposal 3 (9 constitutional votes,
-    // meets quorum % but fails abs_min = 10).
-    for i in 0..9 {
-        let voter_addr = VOTERS[i];
-        let vn = current_nonce(port, voter_addr);
-        let vid = format!("gov-v03-{i}");
-        let r = submit_and_wait(
-            port, &vid, voter_addr, vn,
-            json!({ "VoteOnProposal": { "proposal_id": 3u64, "choice": "yes" } }), 500_000,
-            Duration::from_secs(20),
-        );
-        assert!(r["success"].as_bool().unwrap_or(false),
-            "GQ-03: vote {i} failed: {r}");
+    // GQ-03: voters 1..9 vote yes on proposal 3 in parallel.
+    // Each voter has an independent nonce so concurrent submission is safe.
+    {
+        let handles: Vec<_> = (0..9usize).map(|i| {
+            let voter = VOTERS[i].to_owned();
+            let vid   = format!("gov-v03-{i}");
+            std::thread::spawn(move || -> serde_json::Value {
+                let vn = current_nonce(port, &voter);
+                submit_and_wait(port, &vid, &voter, vn,
+                    json!({ "VoteOnProposal": { "proposal_id": 3u64, "choice": "yes" } }),
+                    500_000, Duration::from_secs(30))
+            })
+        }).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            let r = h.join().expect("GQ-03 vote thread panicked");
+            assert!(r["success"].as_bool().unwrap_or(false),
+                "GQ-03: vote {i} failed: {r}");
+        }
     }
     println!("   GQ-03: 9 voters voted yes.");
 
-    // GQ-04: all 11 voters vote on proposal 4 (8 yes, 3 no = 72.7% > 67%).
-    // proposer also votes.
-    let all_gov_voters: Vec<&str> = {
-        let mut v = vec![PROPOSER];
-        v.extend_from_slice(VOTERS);
-        v
-    };
-    for (i, addr) in all_gov_voters.iter().enumerate() {
-        let choice = if i < 8 { "yes" } else { "no" };
-        let vn = current_nonce(port, addr);
-        let vid = format!("gov-v04-{i}");
-        let r = submit_and_wait(
-            port, &vid, addr, vn,
-            json!({ "VoteOnProposal": { "proposal_id": 4u64, "choice": choice } }), 500_000,
-            Duration::from_secs(20),
-        );
-        assert!(r["success"].as_bool().unwrap_or(false),
-            "GQ-04: vote {i} ({addr}) failed: {r}");
+    // GQ-04: proposer + all 10 voters vote in parallel (8 yes, 3 no = 72.7% > 67%).
+    {
+        let all_gov_voters: Vec<String> = {
+            let mut v = vec![PROPOSER.to_owned()];
+            v.extend(VOTERS.iter().map(|s| s.to_string()));
+            v
+        };
+        let handles: Vec<_> = all_gov_voters.into_iter().enumerate().map(|(i, addr)| {
+            let choice = if i < 8 { "yes" } else { "no" };
+            let vid = format!("gov-v04-{i}");
+            std::thread::spawn(move || -> (usize, String, serde_json::Value) {
+                let vn = current_nonce(port, &addr);
+                let r = submit_and_wait(port, &vid, &addr, vn,
+                    json!({ "VoteOnProposal": { "proposal_id": 4u64, "choice": choice } }),
+                    500_000, Duration::from_secs(30));
+                (i, addr, r)
+            })
+        }).collect();
+        for h in handles {
+            let (i, addr, r) = h.join().expect("GQ-04 vote thread panicked");
+            assert!(r["success"].as_bool().unwrap_or(false),
+                "GQ-04: vote {i} ({addr}) failed: {r}");
+        }
     }
     println!("   GQ-04: 11 voters voted (8 yes, 3 no).");
 
-    // GQ-05: voter1 votes no on proposal 5 (1 voter, 0 yes → 0% approval).
+    // GQ-05: voter1 votes no on proposal 5 (quorum met but 0% approval).
+    // voter1's nonce is now after their GQ-02 + GQ-03 + GQ-04 votes.
     let v1_nonce2 = current_nonce(port, VOTERS[0]);
     let gq05_vote = submit_and_wait(
         port, "gov-v05-1", VOTERS[0], v1_nonce2,
