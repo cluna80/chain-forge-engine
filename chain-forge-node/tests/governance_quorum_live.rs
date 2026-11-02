@@ -84,19 +84,15 @@ fn manifest_dir() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")) }
 fn repo_root()    -> PathBuf { manifest_dir().parent().unwrap().to_path_buf() }
 
 fn node_bin() -> PathBuf {
+    // Always use the debug binary — this test requires --features insecure-dev-quorum
+    // which is only compiled into the debug build.  A release binary (built without
+    // that feature) will reject the low attestation_quorum in the test genesis and
+    // silently crash before writing any logs.
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| repo_root().join("target"));
     let exe = format!("chain-forge-node{}", std::env::consts::EXE_SUFFIX);
-    let d = target.join("debug").join(&exe);
-    let r = target.join("release").join(&exe);
-    match (d.metadata().and_then(|m| m.modified()),
-           r.metadata().and_then(|m| m.modified())) {
-        (Ok(dt), Ok(rt)) => if dt >= rt { d } else { r },
-        (Ok(_), Err(_))  => d,
-        (Err(_), Ok(_))  => r,
-        _                => d,
-    }
+    target.join("debug").join(exe)
 }
 
 fn genesis_path() -> PathBuf {
@@ -435,7 +431,7 @@ fn governance_quorum_live() {
     // With validator_epoch_blocks=1, all proposals get the same
     // voting_end_epoch so we only need to wait ONE voting period.
 
-    let proposer_nonce_base = current_nonce(port, PROPOSER);
+    let _proposer_nonce_base = current_nonce(port, PROPOSER);
 
     // Proposals are submitted sequentially. Each proposal must commit before the
     // next is sent because the proposer's nonce must match committed state.
