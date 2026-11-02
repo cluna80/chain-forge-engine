@@ -152,7 +152,14 @@ fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> 
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // Make the rename durable. For the signing guard this is what stops a crash
+    // from losing `consensus_signing.json` AFTER the vote it protects was sent.
+    // A failure here is returned: the caller withholds the vote.
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => crate::persistence::fsync_dir(dir),
+        _ => Ok(()),
+    }
 }
 
 /// Release gate 4: most evidence items one block may carry.

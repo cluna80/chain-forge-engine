@@ -273,20 +273,59 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// fsync the directory itself so that rename operations within it are durable.
-/// On Windows this is a no-op (directory fsyncs are not supported; atomic
-/// renames provide the same guarantee via the NTFS journal).
-fn fsync_dir(path: &Path) -> std::io::Result<()> {
+/// Flush a directory so that renames and creations inside it are durable.
+/// Errors are REAL errors: a missing directory, a failed open or a failed flush
+/// is returned, never swallowed, and the caller (`write_snapshot`,
+/// `write_current`, the signing-guard write) propagates it so the commit fails
+/// loudly and the node halts consensus rather than continuing on a snapshot or
+/// guard it cannot prove durable.
+///
+/// * Unix: open the directory and `fsync` it.
+/// * Windows: open the directory with `FILE_FLAG_BACKUP_SEMANTICS` (required to
+///   open a directory handle) and `FlushFileBuffers` it (`File::sync_all`). The
+///   handle is owned by a `File`, so it is closed when it drops, including on
+///   the error path. NOT VERIFIED beyond "the call succeeds": whether this makes
+///   a rename durable across power loss on NTFS is not something a test can
+///   prove; the Windows validation run shows only that it does not fail.
+///
+/// KNOWN GAP — transient sharing violations. On Windows an antivirus or indexer
+/// can briefly hold a file or directory open (ERROR_SHARING_VIOLATION), making a
+/// create, rename or this flush fail. There is deliberately NO retry here: the
+/// failure surfaces as an error. Adding a retry policy is a SEPARATE DECISION and
+/// must be validated by a Windows run (see docs/persist-001-p02-design.md §15);
+/// do not add one without going through that gate.
+pub(crate) fn fsync_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     fsync_probe::on_fsync(path)?; // test seam only: records the call, may inject a failure
     #[cfg(unix)]
     {
-        let f = std::fs::File::open(path)?;
-        f.sync_all()?;
+        std::fs::File::open(path)?.sync_all()
     }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    #[cfg(windows)]
+    {
+        flush_dir_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Windows directory flush: `CreateFileW(FILE_FLAG_BACKUP_SEMANTICS)` +
+/// `FlushFileBuffers`. `FlushFileBuffers` needs write access to the handle.
+#[cfg(windows)]
+fn flush_dir_windows(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    // The `File` owns the handle: it is closed on drop whether `sync_all`
+    // succeeds or fails, so nothing leaks on the error path.
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    dir.sync_all()
 }
 
 /// TEST SEAM (compiled only for unit tests; changes no behaviour). Records every
@@ -338,11 +377,9 @@ pub fn read_current(data_dir: &Path) -> std::io::Result<Option<String>> {
 
 /// Write `<data_dir>/CURRENT` atomically, pointing to `gen_label`.
 ///
-/// After the atomic rename of the CURRENT tmp file, we fsync `data_dir`
-/// itself so the rename is durable on Linux (POSIX requires an explicit
-/// directory fsync to guarantee a rename survives a crash).  On Windows
-/// the NTFS journal provides the same guarantee without an explicit fsync,
-/// so the `fsync_dir` call is a no-op there.
+/// After the atomic rename of the CURRENT tmp file, `data_dir` itself is
+/// flushed so the rename is durable (POSIX requires an explicit directory fsync
+/// to guarantee a rename survives a crash; on Windows see `fsync_dir`).
 pub fn write_current(data_dir: &Path, gen: &str) -> std::io::Result<()> {
     write_atomic_bytes(&data_dir.join("CURRENT"), gen.as_bytes())?;
     // Durability: flush the directory entry for the CURRENT rename.
@@ -426,6 +463,11 @@ pub fn write_snapshot(
 
     // Fsync the generation directory again so the manifest rename is durable.
     fsync_dir(&gen_dir)?;
+
+    // Make the generation directory's own entry (in snapshots/) durable BEFORE
+    // CURRENT is renamed to point at it. Without this, CURRENT could survive a
+    // crash while the directory it names does not.
+    fsync_dir(&snaps)?;
 
     // Update CURRENT atomically.
     write_current(data_dir, &gen)?;
