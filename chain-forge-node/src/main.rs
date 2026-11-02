@@ -22,6 +22,8 @@
 /// Roadmap Phase 0-1 (Section 11).
 
 mod node;
+#[cfg(feature = "fault-injection")]
+mod fault;
 mod api;
 mod auth;
 pub mod gossip_proof;

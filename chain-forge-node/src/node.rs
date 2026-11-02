@@ -232,6 +232,14 @@ pub fn select_block_txs(
 
 // -- Explorer state (shared with the API, Section 9.1) -------------------------
 
+/// Sorted, de-duplicated ids of the validators whose precommits a certificate carries.
+fn commit_signers(c: &chain_forge_consensus::CommitCertificate) -> Vec<String> {
+    let mut ids: Vec<String> = c.precommits.iter().map(|v| v.validator.0.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// One block's summary for the explorer.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockSummary {
@@ -245,6 +253,12 @@ pub struct BlockSummary {
     pub timestamp_ms: u64,
     pub tx_count:   usize,
     pub tx_ids:     Vec<String>,
+    /// Who proposed the block.
+    pub proposer:   String,
+    /// Validators whose precommits the proposer published as evidence for the
+    /// PREVIOUS block (the committed `last_commit`), sorted. Liveness is judged
+    /// from exactly this set.
+    pub last_commit_signers: Vec<String>,
 }
 
 /// One transaction's summary for the explorer.
@@ -330,6 +344,8 @@ pub struct ValidatorStatusSummary {
     pub jail_expired:        bool,
     pub liveness_observed:   usize,
     pub liveness_missed_pct: u32,
+    /// Unrounded number of missed blocks in the current window.
+    pub liveness_missed:     usize,
 }
 
 /// Explorer state, updated by the node on each committed block.
@@ -645,6 +661,8 @@ pub struct Node {
     last_commit_evidence: Option<chain_forge_consensus::CommitCertificate>,
     /// When the last block committed (for COMMIT_GATHER_MS).
     last_commit_at: Option<std::time::Instant>,
+    #[cfg(feature = "fault-injection")]
+    fault: crate::fault::FaultInjection,
 
     // ── Deterministic block-height validator-set epochs ──────────────────────
 
@@ -1544,6 +1562,8 @@ impl Node {
             last_committed_timestamp_ms: 0,
             last_commit_evidence: None,
             last_commit_at: None,
+            #[cfg(feature = "fault-injection")]
+            fault: crate::fault::FaultInjection::from_env(),
             validator_epoch_blocks,
             min_bond_uqcb,
             historical_validator_sets: std::collections::BTreeMap::new(),
@@ -2328,6 +2348,9 @@ impl Node {
                         timestamp_ms: proposal.timestamp_ms,
                         tx_count:     tx_ids.len(),
                         tx_ids,
+                        proposer:     proposal.proposer.0.clone(),
+                        last_commit_signers: BlockPayload::decode(&proposal.tx_data).last_commit
+                            .as_ref().map(commit_signers).unwrap_or_default(),
                     });
                 }
                 // Ensure newest-first ordering after the loop.
@@ -2844,6 +2867,9 @@ impl Node {
                                 return Ok(());
                             }
                         };
+
+                        #[cfg(feature = "fault-injection")]
+                        if self.fault.on_vote(&vote, &msg) { return Ok(()); }
 
                         // H0-2: a precommit for the block we just committed that
                         // arrived after our quorum still counts as participation
@@ -3790,6 +3816,7 @@ impl Node {
                     jail_expired:        r.jail_expired(epoch),
                     liveness_observed:   observed,
                     liveness_missed_pct: missed,
+                    liveness_missed:     self.slasher.liveness_missed(&r.id.0).unwrap_or(0),
                 }
             })
             .collect();
@@ -4877,6 +4904,8 @@ impl Node {
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
                 tx_ids,
+                proposer:     proposal.proposer.0.clone(),
+                last_commit_signers: participation.as_ref().map(commit_signers).unwrap_or_default(),
             });
             while ex.blocks.len() > MAX_RECENT_BLOCKS {
                 ex.blocks.pop_back();
@@ -5300,6 +5329,10 @@ impl Node {
                 }
             }
         }
+        #[cfg(feature = "fault-injection")]
+        if vote.vote_type == VoteType::Precommit {
+            info!(target: "cf_fault", height = vote.height, round = vote.round, "sent precommit");
+        }
         let _ = self.network.publish(OutboundMessage {
             topic:   GossipTopic::ConsensusVote,
             payload: serde_json::to_vec(&vote).unwrap_or_default(),
@@ -5412,6 +5445,10 @@ impl Node {
     /// Engine-driven consensus tick: fire due timers, replay buffered
     /// next-height messages, propose when asked, and re-gossip.
     async fn consensus_tick(&mut self) {
+        #[cfg(feature = "fault-injection")]
+        for m in self.fault.take_due() {
+            let _ = Box::pin(self.handle_event(NetworkEvent::Message(m))).await;
+        }
         let now = std::time::Instant::now();
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.consensus_timers)
             .into_iter().partition(|t| t.0 <= now);
@@ -6125,6 +6162,8 @@ impl Node {
                 timestamp_ms: block_ts,
                 tx_count:     tx_ids.len(),
                 tx_ids,
+                proposer:     proposal.proposer.0.clone(),
+                last_commit_signers: vec![],
             });
             while ex.blocks.len() > MAX_RECENT_BLOCKS {
                 ex.blocks.pop_back();
