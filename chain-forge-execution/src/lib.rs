@@ -40,6 +40,7 @@ use chain_forge_state::{StateStore, StateError};
 use chain_forge_identity::IdentityStore;
 use chain_forge_agents::{AgentStore, AgentType, SpendingLimits};
 use chain_forge_pocd::DiscoveryRegistry;
+use chain_forge_governance::{GovernanceModule, GovernanceConfig, ProposalKind, VoteChoice};
 
 /// Validator Onboarding — Permissionless Entry via Stake Bond. See
 /// ROADMAP.md, "Validator Onboarding" section.
@@ -378,6 +379,10 @@ impl GasModel {
                     TxBody::UpdateGuardianPolicy { .. } => op_multiplier * 5,
                     // CancelRecovery: simple state flag write.
                     TxBody::CancelRecovery => op_multiplier * 2,
+                    // H0-12 governance tx types.
+                    TxBody::ProposeChange { .. }  => op_multiplier * 8,
+                    TxBody::VoteOnProposal { .. } => op_multiplier * 4,
+                    TxBody::ActivateChange { .. } => op_multiplier * 6,
                     // Resource Job Lifecycle: 4 state-machine tx types.
                 };
                 base_fee_per_byte * tx_bytes + op_cost
@@ -915,6 +920,48 @@ pub enum TxBody {
         /// New threshold (must satisfy 1 ≤ threshold ≤ new_guardians.len()).
         new_threshold: u32,
     },
+
+    // ── H0-12: On-chain governance (GovernanceModule wired to execution) ──────
+
+    /// Submit a new governance proposal.
+    ///
+    /// Sender must be Verified or Established tier (enforced at execution).
+    /// Snapshots verified-human count at submission for quorum calculation;
+    /// this prevents gaming by changing the population between submit and tally.
+    ///
+    /// Returns the proposal ID as an event field.
+    ProposeChange {
+        /// What this proposal intends to change (ProposalKind JSON-serialized).
+        /// Stored verbatim; the governance module validates the kind.
+        kind_json: String,
+    },
+
+    /// Cast a vote on an open governance proposal.
+    ///
+    /// Sender must be Verified or Established tier.
+    /// Duplicate votes, votes on closed proposals, and votes after the
+    /// voting deadline are all rejected.
+    ///
+    /// Abstain counts toward quorum but not toward the approval ratio.
+    VoteOnProposal {
+        proposal_id: u64,
+        /// "yes" | "no" | "abstain" (case-insensitive)
+        choice: String,
+    },
+
+    /// Tally and (if passing) execute a governance proposal.
+    ///
+    /// May be called by any sender once the voting period has ended.
+    /// If the proposal passes all three protections (quorum, approval,
+    /// absolute minimum), its status advances to PassedOrdinary or
+    /// PassedConstitutional. For ordinary proposals, execution is
+    /// immediate; constitutional proposals observe the mandatory wait.
+    ///
+    /// If the proposal fails any protection it is marked Failed — the
+    /// state change is recorded, no other mutation occurs.
+    ActivateChange {
+        proposal_id: u64,
+    },
 }
 
 /// One guardian's authorization for a `RecoverAccountKey` transaction.
@@ -980,6 +1027,10 @@ impl TxBody {
             TxBody::RevokeRecoveryPolicy            => "RevokeRecoveryPolicy",
             TxBody::UpdateGuardianPolicy { .. }     => "UpdateGuardianPolicy",
             TxBody::CancelRecovery                  => "CancelRecovery",
+            // H0-12 governance
+            TxBody::ProposeChange { .. }            => "ProposeChange",
+            TxBody::VoteOnProposal { .. }           => "VoteOnProposal",
+            TxBody::ActivateChange { .. }           => "ActivateChange",
         }
     }
 }
@@ -1285,6 +1336,10 @@ impl Transaction {
                 new_guardians.iter().map(|g| g.len()).sum::<usize>() + 16
             }
             TxBody::CancelRecovery => 8,
+            // H0-12 governance
+            TxBody::ProposeChange { kind_json } => kind_json.len() + 8,
+            TxBody::VoteOnProposal { choice, .. } => choice.len() + 16,
+            TxBody::ActivateChange { .. } => 8,
         };
         self.sender.len() + 8 + body_size + self.signature.len()
     }
@@ -2348,6 +2403,10 @@ pub fn required_module(body: &TxBody) -> Option<&'static str> {
         TxBody::RevokeRecoveryPolicy            => None,
         TxBody::UpdateGuardianPolicy { .. }     => None,
         TxBody::CancelRecovery                  => None,
+        // H0-12: governance tx require identity (tier check).
+        TxBody::ProposeChange { .. }            => Some("identity"),
+        TxBody::VoteOnProposal { .. }           => Some("identity"),
+        TxBody::ActivateChange { .. }           => None, // any sender can tally
     }
 }
 
@@ -2533,6 +2592,26 @@ fn bind_key_if_unbound(config: &ExecutionConfig, tx: &Transaction, state: &mut S
 }
 
 /// DIS-002A: Execute a RotateAccountKey transaction.
+// ── H0-12: Governance state persistence helpers ───────────────────────────────
+
+const GOV_MODULE_STATE_KEY: &str = "gov:module";
+
+/// Load the governance module from raw KV state, or return a fresh default.
+fn load_governance_module(state: &StateStore) -> GovernanceModule {
+    state.get_raw(GOV_MODULE_STATE_KEY)
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| GovernanceModule::new(GovernanceConfig::qcb_default()))
+}
+
+/// Persist the governance module to raw KV state.
+fn save_governance_module(state: &mut StateStore, gov: &GovernanceModule) {
+    if let Ok(json) = serde_json::to_string(gov) {
+        state.set_raw(GOV_MODULE_STATE_KEY, &json);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 ///
 /// Called from both the simple and the full (identity-aware) executor.
 /// Authorization (outer pq_signature checks) is already done by
@@ -4564,6 +4643,102 @@ impl Executor {
                 Ok(())
             }
 
+            // ── H0-12: On-chain governance ────────────────────────────────────
+
+            TxBody::ProposeChange { kind_json } => {
+                // Sender must be Verified or Established tier.
+                let tier = identity.get(&tx.sender)
+                    .map(|r| r.charm.tier.clone())
+                    .unwrap_or(chain_forge_identity::VerificationTier::Provisional);
+                if !matches!(
+                    tier,
+                    chain_forge_identity::VerificationTier::Verified
+                    | chain_forge_identity::VerificationTier::Established
+                ) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("ProposeChange: sender {} must be Verified or Established tier", tx.sender),
+                    );
+                }
+                let kind: ProposalKind = match serde_json::from_str(kind_json) {
+                    Ok(k) => k,
+                    Err(e) => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("ProposeChange: invalid kind_json: {e}"),
+                    ),
+                };
+                let current_epoch = identity.clock.current_epoch;
+                let verified_humans = identity.verified_count() as u64;
+                let mut gov = load_governance_module(state);
+                let proposal_id = gov.submit(tx.sender.clone(), kind, current_epoch, verified_humans);
+                save_governance_module(state, &gov);
+                events.push(format!(
+                    "propose_change: proposal_id={} proposer={} epoch={} verified_humans={}",
+                    proposal_id, tx.sender, current_epoch, verified_humans
+                ));
+                Ok(())
+            }
+
+            TxBody::VoteOnProposal { proposal_id, choice } => {
+                // Sender must be Verified or Established tier.
+                let tier = identity.get(&tx.sender)
+                    .map(|r| r.charm.tier.clone())
+                    .unwrap_or(chain_forge_identity::VerificationTier::Provisional);
+                if !matches!(
+                    tier,
+                    chain_forge_identity::VerificationTier::Verified
+                    | chain_forge_identity::VerificationTier::Established
+                ) {
+                    return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("VoteOnProposal: sender {} must be Verified or Established tier", tx.sender),
+                    );
+                }
+                let vote_choice = match choice.to_ascii_lowercase().as_str() {
+                    "yes"     => VoteChoice::Yes,
+                    "no"      => VoteChoice::No,
+                    "abstain" => VoteChoice::Abstain,
+                    other => return TransactionResult::err(
+                        tx.id.clone(), gas_required, tx.gas_limit,
+                        format!("VoteOnProposal: unknown choice '{other}'; must be yes|no|abstain"),
+                    ),
+                };
+                let current_epoch = identity.clock.current_epoch;
+                let mut gov = load_governance_module(state);
+                match gov.vote(*proposal_id, tx.sender.clone(), vote_choice, current_epoch) {
+                    Ok(()) => {
+                        save_governance_module(state, &gov);
+                        events.push(format!(
+                            "vote_on_proposal: proposal_id={} voter={} choice={}",
+                            proposal_id, tx.sender, choice
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+
+            TxBody::ActivateChange { proposal_id } => {
+                let current_epoch = identity.clock.current_epoch;
+                let mut gov = load_governance_module(state);
+                match gov.tally(*proposal_id, current_epoch) {
+                    Ok(status) => {
+                        save_governance_module(state, &gov);
+                        events.push(format!(
+                            "activate_change: proposal_id={} status={}",
+                            proposal_id, status
+                        ));
+                        // For PassedOrdinary, immediately mark executed.
+                        if matches!(status, chain_forge_governance::ProposalStatus::PassedOrdinary) {
+                            let _ = gov.execute(*proposal_id, current_epoch);
+                            save_governance_module(state, &gov);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+
             // ── PoCD Research Reward Settlement (Change Set L) ────────────────
             TxBody::ClaimResearchReward {
                 claim_id,
@@ -4962,6 +5137,12 @@ impl Executor {
             // DIS-003E: cancel a pending recovery (must be signed by current key).
             TxBody::CancelRecovery => {
                 execute_cancel_recovery(tx, state)
+            }
+            // H0-12: governance tx require identity-aware executor.
+            TxBody::ProposeChange { .. }
+            | TxBody::VoteOnProposal { .. }
+            | TxBody::ActivateChange { .. } => {
+                Err("governance transaction requires identity-aware executor".to_string())
             }
         };
 

@@ -832,6 +832,7 @@ dependencies = [
  "chain-forge-agents",
  "chain-forge-core",
  "chain-forge-crypto",
+ "chain-forge-governance",
  "chain-forge-identity",
  "chain-forge-pocd",
  "chain-forge-state",
