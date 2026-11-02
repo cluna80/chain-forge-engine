@@ -270,15 +270,34 @@ fn proposals_logged(log_dir: &PathBuf, name: &str) -> Vec<(u64, u32)> {
 }
 
 /// The committee the node itself wrote to disk after its last commit.
+///
+/// Since #48 a node persists atomic generations: `CURRENT` names the committed
+/// generation and the committee is `snapshots/<gen>/live_validator_set.json`
+/// (not `persist/live_validator_set.json`, the pre-H0-3 layout). A running node
+/// can commit and prune between reading `CURRENT` and reading the file, so the
+/// pair is retried a few times; a stopped node (the case JL-08 checks) is stable.
 fn persisted_committee(log_dir: &PathBuf, name: &str) -> Vec<String> {
-    let p = log_dir.join(format!("data-{}", name.trim_start_matches("qcb1")))
-        .join("persist").join("live_validator_set.json");
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p)
-        .unwrap_or_else(|e| panic!("cannot read {p:?}: {e}"))).unwrap();
-    let mut ids: Vec<String> = v["validators"].as_array().unwrap().iter()
-        .map(|x| x["id"].as_str().unwrap().to_string()).collect();
-    ids.sort();
-    ids
+    let data = log_dir.join(format!("data-{}", name.trim_start_matches("qcb1")));
+    let mut last_err = String::new();
+    for _ in 0..8 {
+        let attempt = (|| -> Result<serde_json::Value, String> {
+            let gen = std::fs::read_to_string(data.join("CURRENT"))
+                .map_err(|e| format!("cannot read CURRENT in {data:?}: {e}"))?;
+            let p = data.join("snapshots").join(gen.trim()).join("live_validator_set.json");
+            let text = std::fs::read_to_string(&p).map_err(|e| format!("cannot read {p:?}: {e}"))?;
+            serde_json::from_str(&text).map_err(|e| format!("cannot parse {p:?}: {e}"))
+        })();
+        match attempt {
+            Ok(v) => {
+                let mut ids: Vec<String> = v["validators"].as_array().unwrap().iter()
+                    .map(|x| x["id"].as_str().unwrap().to_string()).collect();
+                ids.sort();
+                return ids;
+            }
+            Err(e) => { last_err = e; std::thread::sleep(Duration::from_millis(250)); }
+        }
+    }
+    panic!("persisted committee of {name}: {last_err}");
 }
 
 // ── Tx builders ───────────────────────────────────────────────────────────────
