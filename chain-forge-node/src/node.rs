@@ -14337,4 +14337,131 @@ mod p02a_gaps {
             }
         }
     }
+
+    // ── Gap 4: the restored state root must equal the root the manifest recorded ──
+    //
+    // Written FIRST against the d6e1806 loader. The manifest records no root and
+    // restore_snapshot never compares one, so a state.json whose content does not
+    // match its root restores silently as long as its file hash is consistent.
+    // Decisions encoded: the manifest field is `state_root` (64 hex; an empty
+    // tree is 64 zeros, so a root is never absent); a missing, blank, whitespace
+    // or malformed `state_root` is REFUSED (a manifest without a root offers no
+    // integrity guarantee); a mismatch is Fatal and names the height and both roots.
+
+    fn sha256_hex_of(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Replace a file inside the CURRENT generation and make the manifest's
+    /// hash and size for it match — a state.json that is internally "valid"
+    /// as far as the file hash can tell.
+    fn rewrite_generation_file(dir: &std::path::Path, name: &str, bytes: Vec<u8>) {
+        let mpath = current_manifest_path(dir);
+        let gen_dir = mpath.parent().unwrap().to_path_buf();
+        std::fs::write(gen_dir.join(name), &bytes).unwrap();
+        edit_manifest(dir, |m| {
+            for f in m["files"].as_array_mut().unwrap() {
+                if f["name"] == name {
+                    f["sha256"] = serde_json::json!(sha256_hex_of(&bytes));
+                    f["size"]   = serde_json::json!(bytes.len());
+                }
+            }
+        });
+    }
+
+    /// R0 — EXPECTED TO FAIL. A normal write records the committed state root
+    /// (the live tree's root, 64 hex) and a normal restart restores it unchanged.
+    #[tokio::test]
+    async fn r0_manifest_records_the_state_root_and_a_normal_restart_matches_it() {
+        let dir = tmp("r0");
+        let live_root = { let n = build_chain(&dir).await; n.persist_state().unwrap(); root_of(&n) };
+        assert_eq!(live_root.len(), 64, "precondition: a committed chain has a root");
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(current_manifest_path(&dir)).unwrap()).unwrap();
+        assert_eq!(m["state_root"].as_str(), Some(live_root.as_str()), "manifest: {m}");
+        let (n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "got {r:?}");
+        assert_eq!(root_of(&n), live_root, "restored root equals the recorded root");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 — EXPECTED TO FAIL. A recorded root that does not match the state the
+    /// generation restores to is Fatal, naming the height and both roots.
+    #[tokio::test]
+    async fn r1_a_manifest_root_that_does_not_match_the_restored_state_is_fatal() {
+        let dir = tmp("r1");
+        let (live_root, h) = { let n = build_chain(&dir).await; n.persist_state().unwrap(); (root_of(&n), height_of(&n)) };
+        let wrong = "ab".repeat(32);
+        assert_ne!(wrong, live_root);
+        edit_manifest(&dir, |m| { m.insert("state_root".into(), serde_json::json!(wrong.clone())); });
+        let e = fatal_text(&restart_with(&dir, GENESIS).await);
+        assert!(e.contains("state_root"), "{e}");
+        assert!(e.contains(&format!("height {h}")), "must name the height: {e}");
+        assert!(e.contains(&wrong) && e.contains(&live_root), "must name both roots: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2 — EXPECTED TO FAIL. A format-1 manifest with NO state_root is refused,
+    /// not accepted: it offers no integrity guarantee.
+    #[tokio::test]
+    async fn r2_a_manifest_without_a_state_root_is_refused() {
+        let dir = tmp("r2");
+        { let n = build_chain(&dir).await; n.persist_state().unwrap(); }
+        edit_manifest(&dir, |m| { m.remove("state_root"); });
+        let e = fatal_text(&restart_with(&dir, GENESIS).await);
+        assert!(e.contains("state_root") && e.contains("missing"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3 — EXPECTED TO FAIL. Blank, whitespace-only and malformed roots are
+    /// refused (never a wildcard), and the refusal names the field.
+    #[tokio::test]
+    async fn r3_a_blank_whitespace_or_malformed_state_root_is_refused() {
+        for (tag, value) in [("empty", ""), ("whitespace", "   "), ("short", "abcd"), ("nonhex", &"zz".repeat(32)[..])] {
+            let dir = tmp(&format!("r3-{tag}"));
+            { let n = build_chain(&dir).await; n.persist_state().unwrap(); }
+            let v = value.to_string();
+            edit_manifest(&dir, move |m| { m.insert("state_root".into(), serde_json::json!(v)); });
+            let e = fatal_text(&restart_with(&dir, GENESIS).await);
+            assert!(e.contains("state_root"), "{tag}: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// R5 — EXPECTED TO FAIL. The point of the check: state.json's CONTENT is
+    /// altered and the manifest's hash and size for it are made to match (a bug,
+    /// or someone fixing up the manifest). The file hash is consistent, so only
+    /// the recorded root can notice that the accounts no longer produce it.
+    #[tokio::test]
+    async fn r5_state_content_that_no_longer_produces_the_recorded_root_is_fatal() {
+        let dir = tmp("r5");
+        let live_root = { let n = build_chain(&dir).await; n.persist_state().unwrap(); root_of(&n) };
+        let gen_dir = current_manifest_path(&dir).parent().unwrap().to_path_buf();
+        let mut st: serde_json::Value = serde_json::from_slice(&std::fs::read(gen_dir.join("state.json")).unwrap()).unwrap();
+        // Change one account's nonce: the file stays valid JSON and loads fine.
+        let accounts = st["accounts"].as_object_mut().unwrap();
+        let first = accounts.keys().next().cloned().expect("an account");
+        let nonce = accounts[&first]["nonce"].as_u64().unwrap_or(0);
+        accounts.get_mut(&first).unwrap()["nonce"] = serde_json::json!(nonce + 41);
+        rewrite_generation_file(&dir, "state.json", serde_json::to_vec_pretty(&st).unwrap());
+
+        let e = fatal_text(&restart_with(&dir, GENESIS).await);
+        assert!(e.contains("state_root") && e.contains(&live_root), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R6 — SAFETY NET. Rewriting a file with a consistent hash but the SAME
+    /// content must still restore: the check compares roots, not bytes.
+    #[tokio::test]
+    async fn r6_a_reformatted_but_equivalent_state_file_still_restores() {
+        let dir = tmp("r6");
+        let live_root = { let n = build_chain(&dir).await; n.persist_state().unwrap(); root_of(&n) };
+        let gen_dir = current_manifest_path(&dir).parent().unwrap().to_path_buf();
+        let st: serde_json::Value = serde_json::from_slice(&std::fs::read(gen_dir.join("state.json")).unwrap()).unwrap();
+        rewrite_generation_file(&dir, "state.json", serde_json::to_vec(&st).unwrap()); // compact, different bytes
+        let (n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "got {r:?}");
+        assert_eq!(root_of(&n), live_root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
