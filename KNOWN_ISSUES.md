@@ -320,6 +320,16 @@ proposer builds sooner (1 s gate), so the tolerance should shrink; NOT yet
 measured. (4) One 4,500 ms row disagreed (arrival logged before the delayed
 delivery was written when the log was read: a measurement-edge artifact).
 
+Windows/BossKing, staggered load (commit af15c4a): idle PASSED (407 s; omitted 0 of 13-14 up to 1,500 ms,
+3 of 14 at 2,200 ms, 14 of 14 at 3,000 ms, 13 of 13 at 4,500 ms; interval 2.3 -> 2.6 s). Loaded run FAILED
+its 4x drift guard: median block interval 845 ms -> 1,148 / 1,618 / 1,760 / 2,935 / 3,482 / 5,148 ms
+(worst 6.1x) as the chain grew by only ~1,500 txs / ~170 blocks. Rows up to 1,500 ms ran at <= 2.9 s
+blocks and show omitted 0 of 11 (0 ms), 0 of 10 (500), 5 of 11 (900), 3 of 11 (1,200), 5 of 11 (1,500);
+later rows and the closing control (1 of 13 omitted at 0 ms delay) ran on a 3.5-5 s chain and are NOT
+usable for the cutoff. No omission was unattributed. Windows degrades much faster than the sandbox
+under identical load, which makes §9 (whole-chain rewrite on every commit) the practical blocker for
+any sustained-load measurement on the development platform.
+
 Sandbox rerun after staggering the load (commit following 96e39d1; PASSED, 320 s; mempool
 non-empty at >= 60% of proposals in every row incl. the first; block-interval drift 1.7x,
 1.2 s -> 2.0 s worst): networked blocks omitted 0 of 11 (0 ms), 0 of 10 (500), 4 of 11 (900),

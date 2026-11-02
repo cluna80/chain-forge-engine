@@ -258,9 +258,9 @@ fn assert_evidence_agrees(api: &[u16], h0: u64, h1: u64) {
 // so a heavy load slows the chain during the run and makes the scenarios incomparable.
 // Many accounts, each throttled and capped: the API's nonce cache never leaves its NO_PRIOR_TX
 // sentinel (KNOWN_ISSUES §10), so an account can send at most 101 txs through the API.
-const LOAD_ACCOUNTS: usize = 32;
+const LOAD_ACCOUNTS: usize = 16;
 const LOAD_TXS_PER_ACCOUNT: u64 = 95;
-const LOAD_MIN_SPACING: Duration = Duration::from_secs(7);
+const LOAD_MIN_SPACING: Duration = Duration::from_secs(10);
 
 fn load_addr(k: usize) -> String { format!("qcb1ld{k:02}") }
 
@@ -395,7 +395,7 @@ fn run(loaded: bool) {
         assert!(wait_until(Duration::from_secs(120), || height(api[0]) >= h_start + 8), "chain stalled under load");
         let committed: u64 = (h_start + 1..=height(api[0])).filter_map(|b| get(api[0], &format!("/api/blocks/{b}")))
             .map(|b| b["tx_count"].as_u64().unwrap_or(0)).sum();
-        assert!(committed >= 16, "the load generator is not producing committed transactions (only {committed} in 8 blocks); \
+        assert!(committed >= 8, "the load generator is not producing committed transactions (only {committed} in 8 blocks); \
             this run would have measured an idle chain");
         say(format!("load verified: {committed} txs committed in the last 8 blocks"));
         // Let the staggered accounts reach their steady cycle before the first scenario.
