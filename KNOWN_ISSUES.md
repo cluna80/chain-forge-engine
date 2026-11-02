@@ -246,3 +246,49 @@ code. It is the only failure in the node unit suite (274 of 275 pass).
 
 **Fix:** bind `qcb1pquser`'s ML-DSA key in the test genesis, or send from the
 derived address; then confirm the grace-window behaviour the test intends.
+
+---
+
+## §8  Liveness jailing can mis-jail a healthy validator that is merely late
+
+**Status: OPEN — measured 2026-11-02 (H0-11B evidence integrity). Automatic suspension must stay disabled in production genesis until a policy decision is made.**
+
+**Mechanism (confirmed in code, `node.rs` tests `late_precommit_*`)**
+Liveness is judged from the committed `last_commit` evidence the proposer
+assembled. The proposer waits for every power-holding validator's precommit,
+but only up to `COMMIT_GATHER_MS` (1,000 ms) after its own commit. A valid
+precommit that arrives after the proposer builds the next block is omitted
+and the live validator is recorded as a miss (`(1 observed, 100% missed)` vs
+`(1, 0%)` for the same vote arriving in time). A precommit for a different
+round than the one that committed is never published. Validators check the
+evidence is valid, not that it is complete.
+
+**What the policy does with a miss pattern**
+(real `LivenessWindow`, 100-block window, 20% threshold, f = 1, 4 validators;
+`chain-forge-slashing/tests/liveness_false_positive.rs`)
+- Independent omission per block, P(jailed within 2,000 blocks):
+  0–5%: ~0%; 10%: 2.2%; 15%: 74%; ≥20%: 100%. A sharp cliff near 12–15%.
+- One isolated outage: ≤21 blocks never jails, ≥25 always does (~45 s at 2 s/block).
+- Byzantine proposers: ≤ f always-omitting proposers are fully discounted;
+  2 or more jail a healthy validator 100% of the time; 1 plus 10% honest-slow
+  noise jailed it in 22% of trials. The discount does not cover f + 1, nor
+  combined Byzantine and honest lateness.
+- A genuinely offline validator is jailed ~21 blocks after the window is full.
+
+**Measured on a real (loopback) 4-node network**
+(`validator_liveness_integrity_live`, sandbox 2026-11-02, 575 s)
+Worst plain miss for any healthy validator over a full 100-block window:
+0% idle, 0% under light load; all four nodes served identical validator
+status (including liveness windows) and state roots at 9 same-height checks.
+Limits: loopback only, so this bounds behaviour on a good network and says
+nothing about WAN delay; the "loaded" phase was light (a single sender can
+keep about one tx per block in flight under the nonce-gap guard; block time
+stayed ~2.4 s), so it did not exercise the 1 s collection window.
+
+**Open decisions**
+1. Whether to require the policy to tolerate a measured WAN delay profile
+   (needs delay-injected or multi-host measurement).
+2. Whether the evidence rule should change (e.g. count a validator present if
+   its precommit appears in any committed block's evidence within N blocks).
+3. Whether the threshold/window should change; not decided here.
+4. The quorum-protection rule (removing a validator from 4 seats leaves f = 0).
