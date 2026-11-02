@@ -455,6 +455,15 @@ impl PersistStartup {
     }
 }
 
+/// The snapshot identity of a genesis: its `chain_id` and the shared
+/// `chain_forge_core::genesis_hash_hex` (the one definition, reused by H0-8).
+pub(crate) fn snapshot_identity_of(genesis: &GenesisConfig) -> crate::persistence::SnapshotIdentity {
+    crate::persistence::SnapshotIdentity {
+        chain_id:     genesis.chain_id.clone(),
+        genesis_hash: chain_forge_core::genesis_hash_hex(genesis),
+    }
+}
+
 pub struct Node {
     genesis:   GenesisConfig,
     consensus: Box<dyn ConsensusEngine>,
@@ -2162,10 +2171,17 @@ impl Node {
         push("live_validator_set.json",
              serde_json::to_string_pretty(self.consensus.validator_set()))?;
 
-        match crate::persistence::write_snapshot(dir, height, &contents) {
+        match crate::persistence::write_snapshot(dir, height, &contents, &self.snapshot_identity()) {
             Ok(gen) => { tracing::debug!(height, %gen, "state persisted (generation-based)"); Ok(()) }
             Err(e)  => Err(format!("persist_state: snapshot write failed at height {height}: {e}")),
         }
+    }
+
+    /// Who this node's snapshots belong to: derived ONLY from the genesis this
+    /// node is running — never from a flag, file or environment variable — so a
+    /// snapshot written under another chain or genesis is caught by the loader.
+    fn snapshot_identity(&self) -> crate::persistence::SnapshotIdentity {
+        snapshot_identity_of(&self.genesis)
     }
 
     /// Rebuild `bond_owner_bindings` from persistent StateStore metadata.
@@ -2205,7 +2221,7 @@ impl Node {
         // ── 0. Pre-H0-3 (legacy) layout: migrate strictly, or refuse ─────────
         // A directory with the old persist/*.json files and no CURRENT is
         // committed state, not a fresh node. It must never start from genesis.
-        match crate::persistence::migrate_legacy(dir) {
+        match crate::persistence::migrate_legacy(dir, &self.snapshot_identity()) {
             Ok(Some(gen)) => tracing::warn!(%gen,
                 "migrated a pre-H0-3 data directory to the generation layout; \
                  legacy files archived under persist/{}", crate::persistence::LEGACY_ARCHIVE_DIR),
@@ -2214,7 +2230,7 @@ impl Node {
         }
 
         // ── 1. Load and validate the committed snapshot ──────────────────────
-        let snap_contents = match crate::persistence::load_snapshot(dir) {
+        let snap_contents = match crate::persistence::load_snapshot(dir, &self.snapshot_identity()) {
             Err(crate::persistence::PersistError::Fresh) | Ok(None) => {
                 // D6: a signing guard that has signed above the first height
                 // proves chain state existed. Starting from genesis would let
@@ -6847,13 +6863,18 @@ mod tests {
 
         /// A node on a 10-block epoch with a funded validator pool and the
         /// given reward threshold.
-        async fn rewards_node(min_pct: u32) -> Node {
+        fn rewards_genesis(min_pct: u32) -> String {
             let json = GENESIS
                 .replace(r#""personhood_weighted": true }"#, &format!(
                     r#""personhood_weighted": true, "rewards": {{ "min_participation_pct": {min_pct} }} }}"#))
                 .replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
         "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
             assert!(json.contains("min_participation_pct"));
+            json
+        }
+
+        async fn rewards_node(min_pct: u32) -> Node {
+            let json = rewards_genesis(min_pct);
             let mut n = Node::new(&json, None).await.unwrap();
             n.state.transfer("qcb1alice", "treasury:validator-pool", "uqcb", POOL).unwrap();
             n
@@ -6984,8 +7005,9 @@ mod tests {
                 drive(&mut [&mut first], local, 0..6, &mut prev, dave_offline).await;
                 first.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
             }
-            let json = GENESIS.replace(r#""custom_modules": [],"#, &format!(r#""custom_modules": [],
-        "validator_bonding": {{ "validator_epoch_blocks": {EPOCH} }},"#));
+            // Restart under the SAME genesis the data was written with (the loader
+            // refuses data written under a different genesis_hash).
+            let json = rewards_genesis(67);
             let mut restarted = Node::new(&json, None).await.unwrap();
             restarted.set_data_dir(dir.clone()).unwrap();
             assert!(restarted.load_persisted_state().is_restored(), "must load persisted state");
@@ -7466,14 +7488,15 @@ mod tests {
         // generation would (correctly) fail its manifest hash, so write a NEW
         // generation, through the real writer, whose slashing.json carries the
         // tampered policy: it is a validly committed snapshot with a wrong policy.
-        let snap = crate::persistence::load_snapshot(&dir).unwrap().expect("a committed generation");
+        let snap = crate::persistence::load_snapshot(&dir, &super::snapshot_identity_of(&chain_forge_core::GenesisConfig::from_json(GENESIS).unwrap())).unwrap().expect("a committed generation");
         let mut files = snap.files;
         let mut v: serde_json::Value = serde_json::from_slice(&files["slashing.json"]).unwrap();
         v["config"]["liveness_miss_pct_threshold"] = serde_json::json!(99);
         files.insert("slashing.json".to_string(), v.to_string().into_bytes());
         let contents: Vec<(&str, Vec<u8>)> = crate::persistence::SNAPSHOT_FILES.iter()
             .map(|&n| (n, files[n].clone())).collect();
-        crate::persistence::write_snapshot(&dir, snap.height, &contents).unwrap();
+        crate::persistence::write_snapshot(&dir, snap.height, &contents,
+            &super::snapshot_identity_of(&chain_forge_core::GenesisConfig::from_json(GENESIS).unwrap())).unwrap();
 
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
@@ -14237,6 +14260,11 @@ mod p02a_gaps {
         let gh = m["genesis_hash"].as_str().unwrap_or("");
         assert!(gh.len() == 64 && gh.bytes().all(|b| b.is_ascii_hexdigit()),
             "genesis_hash must be 64 hex characters (SHA-256), got {gh:?}");
+        // Constraint: the recorded identity comes from the genesis the node was
+        // RUNNING, through the one shared function — not from anything else.
+        let g = chain_forge_core::GenesisConfig::from_json(GENESIS).unwrap();
+        assert_eq!(gh, chain_forge_core::genesis_hash_hex(&g), "genesis_hash must be the shared function's value for the running genesis");
+        assert_eq!(m["chain_id"].as_str().unwrap(), g.chain_id);
         assert!(restart_with(&dir, GENESIS).await.is_restored(), "same genesis must restore");
         let _ = std::fs::remove_dir_all(&dir);
     }
