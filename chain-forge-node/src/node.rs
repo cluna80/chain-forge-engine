@@ -7507,11 +7507,18 @@ mod tests {
             node.propose_block(genesis_hash).await.unwrap();
             node.persist_state().unwrap_or_else(|e| panic!("persist_state in test: {e}"));
         }
-        // Tamper with the persisted policy.
-        let path = dir.join("persist").join("slashing.json");
-        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Tamper with the persisted policy. Editing a file inside the committed
+        // generation would (correctly) fail its manifest hash, so write a NEW
+        // generation, through the real writer, whose slashing.json carries the
+        // tampered policy: it is a validly committed snapshot with a wrong policy.
+        let snap = crate::persistence::load_snapshot(&dir).unwrap().expect("a committed generation");
+        let mut files = snap.files;
+        let mut v: serde_json::Value = serde_json::from_slice(&files["slashing.json"]).unwrap();
         v["config"]["liveness_miss_pct_threshold"] = serde_json::json!(99);
-        std::fs::write(&path, v.to_string()).unwrap();
+        files.insert("slashing.json".to_string(), v.to_string().into_bytes());
+        let contents: Vec<(&str, Vec<u8>)> = crate::persistence::SNAPSHOT_FILES.iter()
+            .map(|&n| (n, files[n].clone())).collect();
+        crate::persistence::write_snapshot(&dir, snap.height, &contents).unwrap();
 
         let mut restarted = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
         restarted.set_data_dir(dir.clone()).unwrap();
