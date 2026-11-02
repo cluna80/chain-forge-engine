@@ -327,3 +327,26 @@ delivery was written when the log was read: a measurement-edge artifact).
    its precommit appears in any committed block's evidence within N blocks).
 3. Whether the threshold/window should change; not decided here.
 4. The quorum-protection rule (removing a validator from 4 seats leaves f = 0).
+
+---
+
+## §9  Per-block persistence cost grows with chain length (blocks slow down under load)
+
+**Status: OPEN — pre-existing; found 2026-11-02 while measuring a loaded chain**
+
+`persist_state()` (called at the end of every `commit_block`) re-serializes
+the entire `chain_store` with `to_string_pretty` and rewrites it synchronously,
+on the consensus event loop, alongside several other whole-state files. The
+cost therefore grows with chain length and block size.
+
+Observed (4 local nodes, 40 single-in-flight senders, ~15-30 txs/block, no
+round timeouts, no warnings): `chain_store.json` reached 27 MB by height ~190,
+and the mean commit interval grew steadily from ~1.2 s (heights 25-75) to
+3.3 s (100-125), 5.3 s (125-150), 6.1 s (150-175) and 7.8 s (175-200). An idle
+chain stays at ~2.4 s/block. Block production, vote handling and the
+collection of late precommits all share that blocked loop.
+
+Effects: a sustained-load devnet slows quadratically; any timing-based
+measurement (e.g. the late-precommit window in §8) drifts unless the run is
+kept short or light. **Not fixed here** (outside H0-11B); candidate fixes are
+incremental/append-only block persistence and off-loop writes.

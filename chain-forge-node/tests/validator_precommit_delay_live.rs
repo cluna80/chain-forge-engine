@@ -57,7 +57,8 @@ const NAMES: [&str; 4]   = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
 const DAVE: &str = "qcb1dave";
 const BLOCKS_PER_SCENARIO: u64 = 18;
 const IDLE_DELAYS_MS: [u64; 7] = [0, 500, 900, 1500, 2200, 3000, 4500];
-const LOADED_DELAYS_MS: [u64; 7] = [0, 500, 900, 1200, 1500, 2200, 3000];
+// The trailing 0 is a control: it must look like the first 0, or the chain drifted.
+const LOADED_DELAYS_MS: [u64; 8] = [0, 500, 900, 1200, 1500, 2200, 3000, 0];
 
 /// Ports below the OS ephemeral range: outgoing connections made by the
 /// other nodes while they start can otherwise grab a port picked here.
@@ -253,7 +254,9 @@ fn assert_evidence_agrees(api: &[u16], h0: u64, h1: u64) {
     }
 }
 
-const LOAD_ACCOUNTS: usize = 40;
+// Small on purpose: persist_state rewrites the whole chain store every commit (KNOWN_ISSUES §9),
+// so a heavy load slows the chain during the run and makes the scenarios incomparable.
+const LOAD_ACCOUNTS: usize = 8;
 
 fn load_addr(k: usize) -> String { format!("qcb1ld{k:02}") }
 
@@ -475,6 +478,17 @@ fn run(loaded: bool) {
             assert!(r.loaded_proposals * 4 >= r.proposals_seen * 3,
                 "the chain was not loaded at delay {} ms: mempool non-empty at only {}/{} proposals", r.delay, r.loaded_proposals, r.proposals_seen);
         }
+    }
+    if loaded {
+        let base = rows[0].interval.max(1);
+        for r in &rows {
+            assert!(r.interval * 2 <= base * 3 + 600,
+                "the chain slowed during the experiment (median block interval {} ms at delay {} ms vs {} ms at the start); \
+                 scenarios are not comparable", r.interval, r.delay, rows[0].interval);
+        }
+        let (first, ctl) = (&rows[0], rows.last().unwrap());
+        println!("   control: delay 0 at start omitted {} of {}, at end {} of {} (block interval {} ms -> {} ms)",
+            first.omitted, first.blocks - first.own, ctl.omitted, ctl.blocks - ctl.own, first.interval, ctl.interval);
     }
     if !loaded {
         assert_eq!(rows[0].omitted, 0, "no delay: never omitted");
