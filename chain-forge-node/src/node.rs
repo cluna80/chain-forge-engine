@@ -14230,4 +14230,128 @@ mod p02a_gaps {
             "a vote above the guard height must be signable");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── Gap 3: manifest identity — format_version, chain_id, genesis_hash ───
+    //
+    // Written FIRST against the unmodified loader; every test here fails today
+    // because the manifest carries none of these fields and nothing checks them.
+    // The current format version is 1. Manifests are edited as plain JSON so the
+    // tests compile before the fix exists. The fix must name the failing field
+    // in the Fatal error. Owner decisions (2026-11-02): a manifest without
+    // `format_version` is REFUSED, not migrated; an empty / whitespace /
+    // missing `chain_id` or `genesis_hash` is REFUSED, never a wildcard.
+
+    const MISSING_FORMAT_MSG: &str = "generation manifest missing format_version — written by a pre-H0-3b node; start with a clean data directory";
+
+    fn current_manifest_path(dir: &std::path::Path) -> std::path::PathBuf {
+        let gen = crate::persistence::read_current(dir).unwrap().expect("CURRENT");
+        dir.join("snapshots").join(gen).join("manifest.json")
+    }
+
+    fn edit_manifest(dir: &std::path::Path, f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) {
+        let path = current_manifest_path(dir);
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        f(v.as_object_mut().unwrap());
+        std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+
+    async fn committed_dir(tag: &str) -> std::path::PathBuf {
+        let dir = tmp(tag);
+        { let n = build_chain(&dir).await; n.persist_state().unwrap(); }
+        dir
+    }
+
+    async fn restart_with(dir: &std::path::Path, genesis: &str) -> PersistStartup {
+        let mut n = Node::new(genesis, Some("qcb1alice".into())).await.unwrap();
+        n.set_data_dir(dir.to_path_buf()).unwrap();
+        n.load_persisted_state()
+    }
+
+    fn fatal_text(r: &PersistStartup) -> String {
+        match r { PersistStartup::Fatal { error } => error.clone(), other => panic!("expected Fatal, got {other:?}") }
+    }
+
+    /// F0 — EXPECTED TO FAIL. A normal write records the identity, and a normal
+    /// restart still works (the round trip the other tests are measured against).
+    #[tokio::test]
+    async fn f0_manifest_records_format_chain_and_genesis_and_round_trips() {
+        let dir = committed_dir("f0").await;
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(current_manifest_path(&dir)).unwrap()).unwrap();
+        assert_eq!(m["format_version"], serde_json::json!(1), "manifest: {m}");
+        assert_eq!(m["chain_id"], serde_json::json!("qcb-testnet-1"), "manifest: {m}");
+        let gh = m["genesis_hash"].as_str().unwrap_or("");
+        assert!(gh.len() == 64 && gh.bytes().all(|b| b.is_ascii_hexdigit()),
+            "genesis_hash must be 64 hex characters (SHA-256), got {gh:?}");
+        assert!(restart_with(&dir, GENESIS).await.is_restored(), "same genesis must restore");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1 — EXPECTED TO FAIL. A format version this node does not know is refused.
+    #[tokio::test]
+    async fn f1_unknown_future_format_version_is_refused() {
+        let dir = committed_dir("f1").await;
+        edit_manifest(&dir, |m| { m.insert("format_version".into(), serde_json::json!(999)); });
+        let e = fatal_text(&restart_with(&dir, GENESIS).await);
+        assert!(e.contains("format_version") && e.contains("999"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2 — EXPECTED TO FAIL. A manifest with no format_version (what PR #41
+    /// writes today) is refused, not migrated, with the exact operator text.
+    #[tokio::test]
+    async fn f2_manifest_without_format_version_is_refused_not_migrated() {
+        let dir = committed_dir("f2").await;
+        edit_manifest(&dir, |m| { m.remove("format_version"); });
+        let e = fatal_text(&restart_with(&dir, GENESIS).await);
+        assert!(e.contains(MISSING_FORMAT_MSG), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3 — EXPECTED TO FAIL. Data written for chain A must not load under chain B.
+    #[tokio::test]
+    async fn f3_a_different_chain_id_is_refused() {
+        let dir = committed_dir("f3").await;
+        let other = GENESIS.replace("qcb-testnet-1", "qcb-other-9");
+        let e = fatal_text(&restart_with(&dir, &other).await);
+        assert!(e.contains("chain_id") && e.contains("qcb-testnet-1") && e.contains("qcb-other-9"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4 — EXPECTED TO FAIL. Same chain_id, different genesis: refused. This is
+    /// the case chain_id alone cannot catch (a re-launched chain reusing its name).
+    #[tokio::test]
+    async fn f4_a_different_genesis_with_the_same_chain_id_is_refused() {
+        let dir = committed_dir("f4").await;
+        let other = GENESIS.replace("2026-09-16T00:00:00Z", "2026-09-17T00:00:00Z");
+        assert_ne!(other, GENESIS);
+        let e = fatal_text(&restart_with(&dir, &other).await);
+        assert!(e.contains("genesis_hash"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F5 — EXPECTED TO FAIL. With a KNOWN format_version, an empty, whitespace-only
+    /// or missing chain_id / genesis_hash is refused. It is never a wildcard match.
+    #[tokio::test]
+    async fn f5_empty_whitespace_or_missing_identity_is_refused_not_a_wildcard() {
+        for field in ["chain_id", "genesis_hash"] {
+            for case in ["empty", "whitespace", "missing"] {
+                let dir = committed_dir(&format!("f5-{field}-{case}")).await;
+                let (field_s, case_s) = (field.to_string(), case);
+                edit_manifest(&dir, move |m| {
+                    m.insert("format_version".into(), serde_json::json!(1));
+                    // Give BOTH fields a plausible value first so only one is wrong.
+                    m.insert("chain_id".into(), serde_json::json!("qcb-testnet-1"));
+                    m.insert("genesis_hash".into(), serde_json::json!("0".repeat(64)));
+                    match case_s {
+                        "empty"      => { m.insert(field_s, serde_json::json!("")); }
+                        "whitespace" => { m.insert(field_s, serde_json::json!("   ")); }
+                        _            => { m.remove(&field_s); }
+                    }
+                });
+                let e = fatal_text(&restart_with(&dir, GENESIS).await);
+                assert!(e.contains(field), "{field}/{case}: the refusal must name the field: {e}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
 }
