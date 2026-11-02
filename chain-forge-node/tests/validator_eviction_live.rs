@@ -38,7 +38,7 @@ use std::{
 };
 
 use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
-use chain_forge_execution::{Transaction, TxBody};
+use chain_forge_execution::{Transaction, TxBody, validator_key_registration_signing_bytes};
 
 const CHAIN_ID:    &str = "qcb-devnet-val-evict";
 const ALICE_ADDR:  &str = "qcb1alice";
@@ -283,6 +283,34 @@ fn unbond_tx(sender: &str, nonce_val: u64) -> Transaction {
     tx
 }
 
+/// RegisterValidatorKey: without a registered consensus key a bonded validator
+/// is admitted but stays at voting_power 0.
+fn register_key_tx(sender: &str, nonce_val: u64) -> Transaction {
+    let wallet_kp    = ClassicalScheme.generate_keypair(sender).unwrap();
+    let consensus_kp = ClassicalScheme.generate_keypair(&format!("{sender}-consensus")).unwrap();
+    let pop_msg = validator_key_registration_signing_bytes(CHAIN_ID, sender);
+    let pop_sig = ClassicalScheme.sign(&pop_msg, &consensus_kp).unwrap();
+    let mut tx = Transaction {
+        id:          format!("regkey-{sender}-{nonce_val}"),
+        sender:      sender.to_string(),
+        nonce:       nonce_val,
+        body:        TxBody::RegisterValidatorKey {
+            consensus_pubkey:    consensus_kp.public_key.clone(),
+            proof_of_possession: pop_sig.bytes,
+            scheme:              String::new(),
+            pop_version:         1,
+        },
+        gas_limit:   10_000,
+        signature:   vec![],
+        public_key:  vec![],
+        pq_signatures: vec![],
+        sig_scheme:    None,
+        pq_public_key: vec![],
+    };
+    tx.sign(&wallet_kp, CHAIN_ID).unwrap();
+    tx
+}
+
 fn register_identity_tx(sender: &str, nonce_val: u64) -> Transaction {
     let kp = ClassicalScheme.generate_keypair(sender).unwrap();
     let mut tx = Transaction::register_identity(
@@ -405,6 +433,12 @@ fn validator_eviction_live() {
     assert!(r["success"].as_bool().unwrap_or(false), "Eve BondValidator failed: {r}");
     println!("   Eve bonded {} uqcb.", EVE_BOND);
 
+    // Eve registers her consensus key (nonce 2) so she gets real voting power.
+    let r = submit_and_wait(ports.alice_api, &register_key_tx(EVE_ADDR, eve_n0 + 1),
+                            Duration::from_secs(20));
+    assert!(r["success"].as_bool().unwrap_or(false), "Eve RegisterValidatorKey failed: {r}");
+    println!("   Eve consensus key registered.");
+
     // Wait for epoch boundary where Eve is admitted.
     let h_eve_admit = height(ports.alice_api) + 6;
     assert!(wait_for_height(ports.alice_api, h_eve_admit, Duration::from_secs(30)),
@@ -424,7 +458,7 @@ fn validator_eviction_live() {
     println!("   ✓ EV-02: genesis validators unaffected by Eve's admission (voting_power={eve_vp}).");
 
     // ── EV-01: Eve unbonds → evicted at next epoch boundary ──────────────────
-    let eve_n1 = eve_n0 + 1;
+    let eve_n1 = eve_n0 + 2;
     let r = submit_and_wait(ports.alice_api, &unbond_tx(EVE_ADDR, eve_n1),
                             Duration::from_secs(20));
     assert!(r["success"].as_bool().unwrap_or(false), "Eve UnbondValidator failed: {r}");
