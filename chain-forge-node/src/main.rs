@@ -31,6 +31,10 @@ pub mod gossip_attestation;
 pub mod gossip_capacity;
 pub mod telemetry;
 pub mod persistence;
+pub mod blocklog;
+pub mod canon;
+pub mod dirlock;
+pub mod storage_v2;
 
 use std::path::PathBuf;
 use tracing::info;

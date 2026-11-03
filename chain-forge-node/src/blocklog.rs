@@ -141,6 +141,9 @@ fn segments(dir: &Path) -> std::io::Result<Vec<(u64, PathBuf)>> {
     Ok(v)
 }
 
+/// First segment's first height in `dir`, if any segment exists (used to classify a log-only directory).
+pub fn first_segment_height(dir: &Path) -> std::io::Result<Option<u64>> { Ok(segments(dir)?.first().map(|s| s.0)) }
+
 pub struct BlockLog {
     dir: PathBuf,
     kind: u8,
