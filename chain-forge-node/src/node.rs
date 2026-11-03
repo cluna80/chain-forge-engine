@@ -7674,6 +7674,31 @@ mod tests {
             assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// A generation whose hashes are all valid but whose descriptor names OLDER log tails than the committed
+        /// height must be refused: loading it would silently drop committed blocks from the logs while the
+        /// state (and the signing guard) are ahead.
+        #[tokio::test]
+        async fn v2_descriptor_older_than_the_committed_height_is_fatal() {
+            let dir = v2_tmp("desc-old"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..6 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            let (store, hvs) = (n.chain_store.clone(), n.historical_validator_sets.clone());
+            let ident = n.snapshot_identity(); let root = n.live_state_root(); drop(n);
+            let gen = std::fs::read_to_string(dir.join("CURRENT")).unwrap(); let gdir = dir.join("snapshots").join(gen.trim());
+            // hash chain tails at height 4 (one block behind the committed height 5), recomputed from the payloads
+            let tail_at = |kind: u8, upto: u64, payloads: Vec<(u64, Vec<u8>)>| { let mut prev = crate::blocklog::anchor_for(ident.genesis_hash.as_bytes(), kind);
+                for (h, p) in payloads { if h > upto { break; } prev = crate::blocklog::record_bytes(kind, h, &p, &prev).1; } hex::encode(prev) };
+            let bt = tail_at(crate::blocklog::KIND_BLOCK, 4, store.iter().map(|(h, (c, p))| (*h, crate::storage_v2::encode_block(c, p))).collect());
+            let ht = tail_at(crate::blocklog::KIND_VALIDATOR_SET, 4, hvs.iter().map(|(h, s)| (*h, crate::storage_v2::encode_vset(s))).collect());
+            let mut desc: crate::storage_v2::Descriptor = serde_json::from_slice(&std::fs::read(gdir.join("storage_descriptor.json")).unwrap()).unwrap();
+            (desc.block_tail_height, desc.block_tail_hash, desc.hvs_tail_height, desc.hvs_tail_hash) = (4, bt, 4, ht);
+            let mut files: Vec<(&str, Vec<u8>)> = crate::storage_v2::SMALL_FILES.iter().map(|f| (*f, std::fs::read(gdir.join(f)).unwrap())).collect();
+            files.push((crate::storage_v2::DESCRIPTOR_FILE, serde_json::to_vec_pretty(&desc).unwrap()));
+            crate::persistence::write_snapshot_format(&dir, 5, &files, &ident, &root, crate::persistence::FORMAT_VERSION_V2).unwrap();
+            let r = v2_node(&dir).await.load_persisted_state();
+            assert!(matches!(&r, PersistStartup::Fatal { error } if error.contains("do not match the committed height")), "got {:?}", match &r { PersistStartup::Fatal { error } => error.clone(), _ => "not fatal".into() });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// V2-6: ambiguous or mismatched layouts are refused and nothing is modified (no migration).
         #[tokio::test]
         async fn v2_layout_mismatches_are_refused_without_modifying_the_directory() {
