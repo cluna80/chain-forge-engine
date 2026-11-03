@@ -1,6 +1,6 @@
 # H0-11B — Liveness evidence, quorum protection and reinstatement: design memo
 
-**Status (2026-11-03): DESIGN ONLY. Owner decisions B1–B7 recorded in section 10; sections 6a–6b (A2 specification and Byzantine-resistance argument), 12 (unresolved security questions) and 13 (acceptance tests) added for owner review.** Nothing in this memo is implemented or enabled. **Automatic validator suspension stays disabled in production genesis.** No change to the evidence rule is implemented without separate owner approval. H0-11B and BIZ-PRE-5 stay open.
+**Status (2026-11-03, revised after owner decision on Q1): DESIGN ONLY. Owner decisions B1–B7 recorded in section 10; sections 6a–6b (A2 specification and Byzantine-resistance argument), 12 (unresolved security questions) and 13 (acceptance tests) added for owner review.** Nothing in this memo is implemented or enabled. **Automatic validator suspension stays disabled in production genesis.** No change to the evidence rule is implemented without separate owner approval. H0-11B and BIZ-PRE-5 stay open.
 **Depends on:** `docs/persist-001-p02-design.md` (section 16: the per-block persistence cost confounds every loaded-chain timing number below). **Related:** KNOWN_ISSUES §8 (measurements), §9 (cost), NODE-TOKIO-1 (runtime panic), ROADMAP rows H0-11, H0-11B, BIZ-PRE-5.
 
 ---
@@ -53,7 +53,7 @@ A rule that jails on (1) or (3) punishes a validator that is doing its job. The 
 - **R4 grace window:** how long after a block late evidence is still accepted.
 - **R5 conflicting or missing evidence:** a defined, deterministic outcome.
 - **R6 agreement:** every honest node reaches the same liveness decision from the same chain.
-- **R7:** a validator that was offline during height h and signs a precommit for h *afterwards* must **not** be counted as having been present.
+- **R7:** a validator that was offline during height h and signs a precommit for h *afterwards* must **not** earn full reliability credit for h. **Limitation (owner decision on Q1, 2026-11-03):** without a clock the chain cannot prove *when* a signature was made, so R7 is met by **tiering the evidence (section 6c), not by proving timeliness**: only evidence in the committed certificate for h earns full credit; attested late evidence is ambiguous and is never grounds for automatic jailing.
 - **R8:** measure actual duties, not merely inclusion in a proposer's certificate.
 - **R9:** requalification must demonstrate recovery.
 - **R10:** quorum protection is one deterministic epoch transition covering suspension and replacement admission, independent of bonded QCB.
@@ -101,7 +101,30 @@ Then `(h, v)` is credited as *present*. **Evaluation point:** the liveness windo
 - **C2, no false absence from a few omitting proposers.** An item is admissible in *any* of `G` consecutive blocks, so a Byzantine proposer cannot suppress it unless every proposer in the window is Byzantine. With deterministic round-robin and fewer than a third of seats Byzantine, `G >= f+1` consecutive proposers contain an honest one. (For stake- or personhood-weighted proposer selection the guarantee is probabilistic; see Q4.)
 - **C3, agreement.** Admissibility and finalisation are pure functions of committed blocks `<= h+G` and the recorded committee at `h`. Nodes that replay the same chain reach the same liveness window and the same jail height, including after restart (test A2-T6).
 - **C4, no inflation by attesters alone.** Byzantine attesters cannot raise `v` from absent to present: they are below one third and the honest ones will not attest to a signature they never received.
-- **What is *not* shown:** that a credited validator was online *when height h was decided*. C1 only places the signature in an honest validator's hands within `G` blocks. See Q1.
+- **C5, no punitive use of ambiguity.** By section 6c the jail rule's numerator counts M only; a Byzantine proposer or Byzantine attesters can move an entry between P, O and M only in the directions listed there, and cannot turn O into M for an honest validator when at least one honest proposer exists in the window (C2) and an honest attester received the signature (C1).
+- **What is *not* shown:** that an O entry's validator was online *when height h was decided*. C1 only places the signature in an honest validator's hands within `G` blocks; section 6c deliberately gives such an entry no credit. See Q1 (resolved in 6c) and Q2.
+
+## 6c. Security model: three kinds of evidence, and what each may be used for (owner decision on Q1, 2026-11-03)
+
+A2 receipt attestations are **not** definitive proof of timely signing. A signature carries no time, and an attestation says only that an honest validator held it by committed height `k_a`. The model therefore separates three things that earlier text ran together:
+
+| Tier | What it establishes | Source | May be used for |
+| --- | --- | --- | --- |
+| **V, cryptographic validity** | The signature is valid under `v`'s key for `(chain, h, r, block_hash)`. Says nothing about when it was made. | Signature check | Necessary for every other tier; nothing else |
+| **O, attested observation** | At least one honest validator held a valid signature by `v` for `h` by committed height `k_a <= h+G−1`. A *bounded observation*, **not** an independently verified signing time. | A2 (admissible item, section 6a) | Shielding `v` from being counted as missed; operator visibility |
+| **P, provably timely participation** | `v`'s precommit for `h` is in the committed `last_commit` certificate of block `h+1` (the existing path): the chain itself records it, from the proposer's collection window. | Committed certificate | Full reliability credit; reinstatement probation progress; any future reward eligibility |
+
+**A3 certificate evidence** (a signed consensus message by `v` in the committed evidence of a block in `h+1..h+G`) establishes that `v` took part in a *later* consensus event. It is participation evidence for that event, not for `h`. It is treated as tier O for height `h` (it shields, it does not earn credit). The owner's wording "A3 may establish participation in the relevant consensus event" is implemented exactly that way: A3 counts as full credit only for the height whose certificate contains the message, which is the existing path.
+
+**Three-valued accounting.** Each `(h, v)` entry of the liveness window is one of **P** (tier P), **O** (tier O only), or **M** (no admissible evidence by the evaluation point `h+G`).
+- The *missed percentage* used by the jail rule counts **M only**: `missed_pct = M / (P + O + M)`. **Ambiguous late evidence (O) is never counted as missed and so can never contribute to automatic jailing.**
+- *Reliability credit* counts **P only**. An O entry earns nothing: **retroactive historical signatures never automatically earn full reliability credit** (they do not advance probation, section 8, and are not "present" for any reward).
+- Entries that are O are tracked as a separate counter per validator and per window, and a window with a high O share raises an operator alarm (Q2). Alarm, not jail.
+- The robust (f-proposer-exclusion) rule is applied to P versus not-P as before, so a Byzantine proposer that omits a precommit turns a P into O or M, never into a false P.
+
+**Residual risk accepted by the owner's rule (stated, not hidden).** A validator that is really offline but backfills historical signatures within `G` blocks is O, not M, and is therefore not jailed automatically. It also earns no credit and is flagged. The remedies are the operator alarm, a bound on the O share of a window (an alarm threshold, set after measurement), and a human or governance review path. Automatic suspension stays disabled, so this is a monitoring gap, not a safety gap.
+
+**Updated limits of R7.** R7 is not "offline validators are never credited". It is: (1) a backfilled or attested-late signature **never** yields tier P; (2) it never causes a jail; (3) the chain makes no claim about the signing time of a tier-O item beyond "held by an honest validator by committed height `k_a`".
 
 ## 7. Quorum protection (one deterministic transition)
 
@@ -159,8 +182,8 @@ That any section-6 scheme is sufficient against a coordinated majority; that the
 
 ## 12. Unresolved security questions (for owner and reviewer)
 
-- **Q1, what "timely" means without a clock.** A2 proves that an honest validator held a valid signature for height `h` while at height `k_a <= h+G−1`. A validator that was *down* during `h` can still sign a precommit for the (public, committed) block `h` after it returns and have it attested within `G` blocks. So presence is credited at granularity `G` blocks, and requirement R7 ("offline during h, signs for h afterwards, must not be counted") holds **only for outages longer than `G` blocks**. Options: keep and state it; add the attester statement "held before I cast my precommit at height `k_a`" (rejects most backfilling, but also rejects the measured case, where the delayed precommit arrives after other nodes have already committed); or require `v` to have a timely consensus message within the window (A3 only, which cannot help a chronically late validator). **Decision needed.**
-- **Q2, backfill farming.** A validator could stay mostly offline and pay for presence by signing historical precommits cheaply within `G`. Are caps, rate limits per validator, or "presence by attestation counts at most X of the window" required?
+- **Q1, what "timely" means without a clock. Decided by the owner (2026-11-03), implemented in section 6c.** A2 is bounded observation evidence, not proof of signing time. Residual: an offline validator backfilling within `G` blocks is O, never jailed automatically, never credited; monitoring and review replace automatic punishment for that case.
+- **Q2, backfill farming (now the main residual risk).** With O never counted as missed, a mostly-offline validator can avoid automatic jailing by backfilling signatures within `G`. Section 6c gives it no credit and raises an alarm, but who acts on the alarm, and at what O-share threshold, is undecided; also whether a cap on O per window or per validator is needed.
 - **Q3, attestation size and work.** ML-DSA-65 signatures are 3,309 bytes. At an f+1 power threshold on a 100-member committee that is >100 KB per unbatched item. Batching by Merkle root is proposed; the verification cost on the commit path and the cap (16) are untested.
 - **Q4, proposer selection.** The omission argument (C2) assumes round-robin. For any weighted or randomised selection, `G` needs a probabilistic bound.
 - **Q5, deferral and the quorum denominator.** A deferred jailed validator that is truly offline still counts in the quorum denominator, so deferral can lower liveness while protecting `n' >= 4`. Decide the rule for an *eventual* forced removal, if any, and an operator alarm.
@@ -175,7 +198,13 @@ That any section-6 scheme is sufficient against a coordinated majority; that the
 | A2-T1 | Deterministic unit: fixed certificates plus items | Admissibility truth table for rules 1–5 (wrong height, wrong chain/epoch, non-member, duplicate attester, power exactly one third, just above one third, `k_a` out of range, future-height claim). |
 | A2-T2 | Forgery | No admissible item exists without `v`'s real signature; attester signatures from `<= f` Byzantine validators never reach the threshold (fails today: no mechanism). |
 | A2-T3 | Replay | The same item rejected on another chain, epoch or height (domain-separation bytes). |
-| A2-T4 | R7 boundary | Validator offline for `G+1` blocks and signing historical precommits afterwards is **not** credited; offline for fewer than `G` blocks is credited (states the Q1 limit explicitly). |
+| A2-T4 | Tiering boundary | A validator offline for `G+1` blocks and signing historical precommits afterwards yields **M** (no admissible evidence); one that signs within `G` yields **O**, never **P**. Neither is full credit. |
+| TIER-T1 | Missed percentage counts M only | A window of P, O and M entries: `missed_pct` ignores O; an all-O window never reaches the jail threshold (fails today: no O state). |
+| TIER-T2 | No retroactive credit | Probation progress and any credit counter advance on P only; a stream of attested-late signatures advances nothing. |
+| TIER-T3 | Ambiguity never jails | Property test over random P/O/M sequences and Byzantine proposer omissions: no jail is produced where the same sequence with O replaced by P would not jail only because of O. |
+| TIER-T4 | A3 handling | A message in a later block shields `h` (O) but never yields P for `h`. |
+| TIER-T5 | Alarm | A window with an O share above the alarm threshold produces the operator signal and no state change (no jail, no credit). |
+| TIER-T6 | Live | Re-run the loaded-delay experiment with tiers enabled in a test genesis: a late-but-live Dave is never jailed; an offline Dave (no signature at all) accumulates M and is jailed only in the test-policy genesis, never in production defaults. Windows run required before any ✅. |
 | A2-T5 | Proposer omission | `f` consecutive Byzantine proposers omitting the item still leave it admissible via an honest proposer within `G`. |
 | A2-T6 | Agreement | Replay the same chain on four in-process nodes and after a restart: identical windows and jail height. |
 | A2-T7 | Conflict | Two different `sig_digest` for one `(h, r, v)` are both inadmissible and produce equivocation evidence. |
