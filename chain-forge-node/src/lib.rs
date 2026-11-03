@@ -4,3 +4,6 @@
 /// `[lib]` target exists.  We expose only what tests need; the bulk of the
 /// crate lives in the [[bin]] targets.
 pub mod persistence;
+pub mod blocklog;
+pub mod canon;
+pub mod dirlock;
