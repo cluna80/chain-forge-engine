@@ -424,7 +424,26 @@ participating; at ~35% omission a 20% threshold over 100 blocks jails it
 | 3000 ms | 4/14 | 10 |
 | 0 ms (control, at the end) | 11/14 | 3 |
 
-First delay at which at least half were omitted: **1200 ms** (idle chain: 3000 ms, unchanged in shape from the earlier Windows idle run). The commit-to-proposal interval while Dave's precommit was missing was 1064–1706 ms, the gate. Consequence for the policy question: on a loaded chain, sustained lateness of roughly 500–900 ms already produces 14–29% omission, i.e. above the 20% threshold, so a healthy but late validator would be jailed if automatic suspension were enabled. The control row shows the effect is not only added delay: the block interval drifted 1.9x (1071 to 2077 ms) over the run, which is §9. **Automatic suspension stays disabled.** The Windows numbers match the sandbox finding that the loaded collection window is about 1 s.
+First delay at which at least half were omitted: **1200 ms** (idle chain: 3000 ms, unchanged in shape from the earlier Windows idle run). The commit-to-proposal interval while Dave's precommit was missing was 1064–1706 ms, the gate. **Correction (2026-11-03):** this paragraph originally said that sustained lateness of roughly 500–900 ms "already produces 14–29% omission, i.e. above the 20% threshold". That was wrong on its face (14% is below 20%) and the 900 ms point did not reproduce in the second run below (4/14 then 1/14). See the two-run comparison that follows. The control row shows the effect is not only added delay: the block interval drifted 1.9x (1071 to 2077 ms) over the run, which is §9. **Automatic suspension stays disabled.** The Windows numbers match the sandbox finding that the loaded collection window is about 1 s.
+
+**Second Windows loaded run, same test and load (2026-11-03, BossKing/MINGW64, merged `main` `385431f` with #58, `validator_precommit_delay_loaded_live`, 302 s).** Dave's precommit *arrival* delayed, signing on time:
+
+| Delay | Run 1 (`b9f1e7e`): in evidence / misses | Run 2 (`385431f`): in evidence / misses |
+| --- | --- | --- |
+| 0 ms | 14/14 / 0 | 14/14 / 0 |
+| 500 ms | 12/14 / 2 | 12/14 / 2 |
+| 900 ms | 10/14 / 4 (29%) | **13/14 / 1 (7%)** |
+| 1200 ms | 7/14 / 7 | 5/14 / 9 |
+| 1500 ms | 4/14 / 10 | 4/14 / 10 |
+| 2200 ms | 3/14 / 11 | 4/14 / 10 |
+| 3000 ms | 4/14 / 10 | 3/14 / 11 |
+| 0 ms (control, at the end) | 11/14 / 3 | 12/14 / 2 |
+
+**Idle chain, run 2 (`385431f`, 436 s), Dave's precommit omitted from committed evidence:** 0 of 18 at 0–1,500 ms; 1 of 18 at 2,200 ms; 14 of 18 at 3,000 ms; **14 of 18 at 4,500 ms**. Run 1's 4,500 ms idle figure was **not captured in this table** and is not inferred here. (Earlier sandbox/Windows runs elsewhere in this section record 13 of 18 at 4,500 ms on other commits; they are not run 1.)
+
+Block-interval drift: 1.9x (1071 to 2077 ms) in run 1, **1.6x (1269 to 2080 ms)** in run 2. Delay-0 control omissions at the end: 3 of 11 then 2 of 10. The commit-to-proposal interval while Dave's precommit was missing: 918–1690 ms in run 2.
+
+**What is stable and what is not, across the two runs.** Stable: at 0 ms nothing is omitted; at 500 ms 2/14 (14%, below a 20% threshold); at 1200 ms at least half are omitted (7/14 and 9/14); from 1500 ms about 70–80% are omitted. **Not stable: the 900 ms point (7% to 29%)**, which sits between the two regimes, so a single run cannot say whether a validator that is ~900 ms late is above or below a 20% threshold. The idle chain moved the same way: omissions at 2200 ms were 5/18 in the first Windows run on the older base and 1/18 now; half were omitted at 3000 ms in both. Consequence: **the transition from "harmless" to "mostly omitted" lies between about 900 and 1200 ms of lateness on a loaded chain, but its exact position varies run to run, and the block interval itself drifts 1.6–1.9x during the run (§9).** No threshold should be chosen from these tables; repeat the experiment after PERSIST-001 P-02b with several runs per setting. **Automatic suspension stays disabled.**
 
 ## §9  Per-block persistence cost grows with chain length (blocks slow down under load)
 
@@ -629,3 +648,16 @@ With Dave down on purpose, only Alice and Carol remained (2 of 4, below quorum),
 
 **Why it matters.** A validator node that dies or hangs on a runtime panic can stop a chain that is already at its quorum margin, and the process went silent without exiting loudly. **Not changed.** Suggested follow-ups, none done: check tokio's upstream tracker and changelog for this assertion; try a newer tokio; decide whether the node binary should abort the process on a runtime-thread panic (so a supervisor restarts it) instead of continuing; if it recurs, capture `RUST_BACKTRACE=full` and the node's state at the time. The test failure it caused was a false negative for `validator_jail_live`, not a defect in the jail logic.
 
+---
+
+## EVICT-ROOT-1  The eviction live test's printed state root is not a cross-run constant
+
+**Status: OPEN (documentation corrected 2026-11-03; no code defect found). Found while investigating a Linux/Windows root difference (`48d58b5f…` vs `1f2b492f…`).**
+
+`validator_eviction_live` prints the state root at whatever height it happens to finish (EV-03). That root depends on the heights at which Eve's transactions land and on epoch-boundary accounting, both of which vary with timing, so two correct runs can print different roots.
+
+**Evidence (Linux sandbox, same binary, same genesis, three consecutive runs, per-height roots dumped):** run A finished at height **32** with root `48d58b5f…`; runs B and C finished at height **33** with root `1f2b492f…`, and their per-height roots already differ from run A's from height 5 onward (different blocks carried the transactions). Run A's root equals the Windows value recorded in the ROADMAP; a Windows run on the v2 storage branch (2026-11-03, `ca4d0e2`) also finished at height 32 with `48d58b5f…`. So there is no evidence of a platform difference, and equal roots from different runs prove determinism only when the final heights are equal.
+
+**What still holds:** EV-03's real assertion, that all four nodes report the same root within one run, passed in every run (v1, v2, `main`, Linux and Windows).
+
+**Consequences:** earlier ROADMAP wording ("same state root `48d58b5f…`") has been softened. For regression comparisons use (a) the same final height, or (b) the per-height roots; `validator_eviction_live` now prints `final heights sampled` and, with `CF_EVICT_DUMP_ROOTS=<file>`, writes every height's root and the genesis file's size and CR count (change on the storage-v2 PR #65, not yet on `main`). The jail test's roots (`51136494701f`, `eebbee537f59`, `33362db6f1e0`) were identical across all recorded runs and platforms because its transactions are submitted at deterministic points.
