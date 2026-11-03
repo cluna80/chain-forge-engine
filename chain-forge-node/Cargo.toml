@@ -157,6 +157,9 @@ path = "tests/h0_3_crash_recovery_live.rs"
 [[test]]
 name = "storage_v2_live"
 path = "tests/storage_v2_live.rs"
+# The crash points are compiled only into fault-injection builds; without the feature this test would wait
+# for an abort that never comes.
+required-features = ["fault-injection"]
 
 [[test]]
 name = "validator_precommit_delay_live"
