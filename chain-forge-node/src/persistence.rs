@@ -272,15 +272,35 @@ fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Test-only crash points: `fault::arm(point)` makes the next `write_snapshot_format` return an error right
-/// after `point` (nothing later executes), which is what a crash at that boundary leaves on disk.
-#[cfg(test)]
+/// Crash points for the storage-v2 commit boundaries. In unit tests `fault::arm(point)` makes the next
+/// `write_snapshot_format` return an error right after `point` (nothing later executes). In a build with the
+/// `fault-injection` feature the node also reads `CF_FAULT_V2_CRASH_POINT` / `CF_FAULT_V2_CRASH_HEIGHT` and
+/// aborts the PROCESS (no destructors, no cleanup) at that point once the committing height reaches the given
+/// height. Neither exists in a normal build.
+#[cfg(any(test, feature = "fault-injection"))]
+#[allow(dead_code)]
 pub(crate) mod fault {
     use std::cell::Cell;
     thread_local! { static STOP: Cell<Option<&'static str>> = const { Cell::new(None) }; }
     pub(crate) fn arm(point: &'static str) { STOP.with(|s| s.set(Some(point))); }
     pub(crate) fn disarm() { STOP.with(|s| s.set(None)); }
+    #[cfg(feature = "fault-injection")]
+    static HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Record the height being committed (fault-injection builds).
+    pub(crate) fn set_height(_h: u64) {
+        #[cfg(feature = "fault-injection")]
+        HEIGHT.store(_h, std::sync::atomic::Ordering::SeqCst);
+    }
     pub(crate) fn hit(point: &'static str) -> std::io::Result<()> {
+        #[cfg(feature = "fault-injection")]
+        if std::env::var("CF_FAULT_V2_CRASH_POINT").ok().as_deref() == Some(point) {
+            let at: u64 = std::env::var("CF_FAULT_V2_CRASH_HEIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+            let h = HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+            if h >= at {
+                eprintln!("cf_fault: crashing the process at {point} while committing height {h}");
+                std::process::abort();
+            }
+        }
         STOP.with(|s| if s.get() == Some(point) { s.set(None); Err(std::io::Error::new(std::io::ErrorKind::Other, format!("injected crash after {point}"))) } else { Ok(()) })
     }
 }
@@ -477,7 +497,7 @@ pub fn write_snapshot_format(
     // Fsync the generation directory so all renames are durable before writing
     // the manifest.
     fsync_dir(&gen_dir)?;
-    #[cfg(test)] fault::hit("gen_files_written")?;
+    #[cfg(any(test, feature = "fault-injection"))] fault::hit("gen_files_written")?;
 
     // Write manifest.json last — its presence is the commit signal.
     let manifest = SnapshotManifest {
@@ -492,7 +512,7 @@ pub fn write_snapshot_format(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     write_atomic_bytes(&gen_dir.join("manifest.json"), &manifest_bytes)?;
-    #[cfg(test)] fault::hit("manifest_written")?;
+    #[cfg(any(test, feature = "fault-injection"))] fault::hit("manifest_written")?;
 
     // Fsync the generation directory again so the manifest rename is durable.
     fsync_dir(&gen_dir)?;
@@ -504,7 +524,7 @@ pub fn write_snapshot_format(
 
     // Update CURRENT atomically.
     write_current(data_dir, &gen)?;
-    #[cfg(test)] fault::hit("current_written")?;
+    #[cfg(any(test, feature = "fault-injection"))] fault::hit("current_written")?;
 
     // Prune the generation two steps back (keep N and N-1).
     if next_num >= 2 {

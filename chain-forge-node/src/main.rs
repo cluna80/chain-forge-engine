@@ -61,6 +61,9 @@ struct Args {
     /// into).  Prevents the solo-devnet auto-commit path from firing while peers
     /// are still dialling in.
     expect_peers: bool,
+    /// EXPERIMENTAL, test-only. Select storage format 2 (two append-only logs). Default OFF. Requires `--data-dir`;
+    /// a data directory of the other format is refused, never converted.
+    storage_v2: bool,
 }
 
 fn parse_args() -> Args {
@@ -73,6 +76,7 @@ fn parse_args() -> Args {
     let mut data_dir: Option<std::path::PathBuf> = None;
     let mut bootstrap_peers: Vec<String> = Vec::new();
     let mut expect_peers = false;
+    let mut storage_v2 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -112,6 +116,9 @@ fn parse_args() -> Args {
             "--expect-peers" => {
                 expect_peers = true;
             }
+            "--storage-v2-experimental" => {
+                storage_v2 = true;
+            }
             "--help" | "-h" => {
                 println!("chain-forge-node");
                 println!("  --genesis <path>     Path to genesis.json (default: genesis.json)");
@@ -121,6 +128,7 @@ fn parse_args() -> Args {
                 println!("  --key-file <path>    Path to this validator's *.key.json file (for signing)");
                 println!("  --data-dir <path>    Directory to persist chain state (default: memory-only)");
                 println!("                       (needed to run multiple local nodes)");
+                println!("  --storage-v2-experimental  TEST ONLY: storage format 2 (default off; never converts an existing directory)");
                 println!("  --bootstrap <addr>   Extra bootstrap peer (libp2p multiaddr, e.g. /ip4/127.0.0.1/tcp/27001)");
                 println!("                       Repeatable: --bootstrap A --bootstrap B");
                 std::process::exit(0);
@@ -130,7 +138,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { genesis_path, validator_address, api_port, p2p_port, key_file, data_dir, bootstrap_peers, expect_peers }
+    Args { genesis_path, validator_address, api_port, p2p_port, key_file, data_dir, bootstrap_peers, expect_peers, storage_v2 }
 }
 
 #[tokio::main]
@@ -204,7 +212,20 @@ async fn main() {
         account_signature_policy: node.account_signature_policy(),
     };
     // Set the data directory for state persistence.
+    if args.storage_v2 && args.data_dir.is_none() {
+        tracing::error!("FATAL: --storage-v2-experimental requires --data-dir");
+        std::process::exit(1);
+    }
     if let Some(ref dir) = args.data_dir {
+        if args.storage_v2 {
+            if let Err(e) = node.set_storage_v2(true) {
+                tracing::error!(error = %e, "FATAL: cannot select storage format 2");
+                std::process::exit(1);
+            }
+            info!(dir = %dir.display(), "storage format: v2 (EXPERIMENTAL, test-only; two append-only logs)");
+        } else {
+            info!(dir = %dir.display(), "storage format: v1 (default)");
+        }
         match node.set_data_dir(dir.clone()) {
             Ok(()) => {
                 match node.load_persisted_state() {
@@ -230,6 +251,12 @@ async fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+            // Storage v2 holds an exclusive lock on the directory: failing to take it must stop the node, never
+            // continue memory-only (a second process on the same directory could otherwise sign without persistence).
+            Err(e) if args.storage_v2 => {
+                tracing::error!(error = %e, "FATAL: cannot use the data directory in storage v2 (is another node running on it?)");
+                std::process::exit(1);
             }
             Err(e) => tracing::warn!(error = %e, "could not set data dir — running memory-only"),
         }

@@ -104,6 +104,7 @@ fn anchor(identity: &SnapshotIdentity, kind: u8) -> blocklog::Hash32 { blocklog:
 /// after `CURRENT` is durable. Any error is fatal for the caller.
 pub fn commit(dir: &Path, logs: &mut Option<V2Logs>, identity: &SnapshotIdentity, chain_store: &ChainStore, hvs: &VsetHistory,
               mut small: Vec<(&'static str, Vec<u8>)>, height: u64, state_root: &str) -> Result<(), String> {
+    #[cfg(any(test, feature = "fault-injection"))] persistence::fault::set_height(height);
     if logs.is_none() {
         let (Some(bf), Some(hf)) = (chain_store.keys().next().copied(), hvs.keys().next().copied()) else {
             return Err("v2 persist: nothing to persist (empty chain store or validator history)".into());
@@ -118,12 +119,12 @@ pub fn commit(dir: &Path, logs: &mut Option<V2Logs>, identity: &SnapshotIdentity
     for (h, (cert, p)) in chain_store.range(next..) {
         l.block.append(*h, &encode_block(cert, p)).map_err(|e| format!("v2 persist: block log append at {h}: {e}"))?;
     }
-    #[cfg(test)] persistence::fault::hit("block_log_appended").map_err(|e| e.to_string())?;
+    #[cfg(any(test, feature = "fault-injection"))] persistence::fault::hit("block_log_appended").map_err(|e| e.to_string())?;
     let next = l.hvs.tail().map(|t| t.height + 1).unwrap_or(l.hvs_first);
     for (h, set) in hvs.range(next..) {
         l.hvs.append(*h, &encode_vset(set)).map_err(|e| format!("v2 persist: history log append at {h}: {e}"))?;
     }
-    #[cfg(test)] persistence::fault::hit("hvs_log_appended").map_err(|e| e.to_string())?;
+    #[cfg(any(test, feature = "fault-injection"))] persistence::fault::hit("hvs_log_appended").map_err(|e| e.to_string())?;
     let (bt, ht) = (l.block.tail().cloned().ok_or("v2 persist: block log is empty")?, l.hvs.tail().cloned().ok_or("v2 persist: history log is empty")?);
     let desc = Descriptor { format: "p02b-storage-2".into(), block_first_height: l.block_first, block_tail_height: bt.height, block_tail_hash: hex::encode(bt.hash),
         hvs_first_height: l.hvs_first, hvs_tail_height: ht.height, hvs_tail_hash: hex::encode(ht.hash) };

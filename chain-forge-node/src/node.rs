@@ -7683,6 +7683,52 @@ mod tests {
             assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// Regression (v1 nodes, default storage): the proposal guard added in PR 2 must load guard files written
+        /// before it, leave them untouched until the node signs, then survive a restart and refuse conflicting proposals.
+        #[tokio::test]
+        async fn v1_proposal_guard_is_compatible_with_old_guard_files_and_survives_restarts() {
+            let dir = v2_tmp("v1-guard"); let mut n = liveness_node(1_000_000).await; n.set_data_dir(dir.clone()).unwrap(); let mut nonce = 0;
+            for h in 0..4 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            drop(n);
+            // a guard file exactly as the code before PR 2 wrote it: no "proposal" key at all
+            let vote = signed_vote(CHAIN, VoteType::Precommit, 3, 0, "qcb1alice", BlockHash("old-block".into()));
+            let old_json = serde_json::to_vec_pretty(&serde_json::json!({ "last": [3, 0, 2], "votes": [vote], "lock": null })).unwrap();
+            let gpath = dir.join("persist").join("consensus_signing.json");
+            std::fs::write(&gpath, &old_json).unwrap();
+            let mk = |h: u64, r: u32, hash: &str| BlockProposal { height: h, round: r, proposer: ValidatorId("qcb1alice".into()), block_hash: BlockHash(hash.into()),
+                parent_hash: BlockHash("p".into()), timestamp_ms: 0, tx_data: vec![], signature: vec![], pol_round: None };
+            let key = || ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+            // restart 1: the old file loads, state restores, nothing is rewritten at load time
+            let mut r = liveness_node(1_000_000).await; r.signing_key = Some(key()); r.set_data_dir(dir.clone()).unwrap();
+            assert_eq!(restart_height(r.load_persisted_state()), 3);
+            assert!(r.sign_guard.proposal.is_none() && r.sign_guard.last == Some((3, 0, 2)));
+            assert_eq!(std::fs::read(&gpath).unwrap(), old_json, "an old guard file is not rewritten by loading it");
+            assert!(r.sign_guard.check(&signed_vote(CHAIN, VoteType::Precommit, 3, 0, "qcb1alice", BlockHash("other".into()))).is_err(), "the old vote guard still refuses a conflicting vote");
+            // the node proposes: the guard is written (now with the new key) before the proposal is returned
+            let first = r.sign_and_register_own_proposal(mk(4, 0, "A")).await.expect("signs");
+            assert!(!first.signature.is_empty());
+            let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&gpath).unwrap()).unwrap();
+            assert_eq!(on_disk["proposal"]["block_hash"], "A", "the proposal is on disk before it could be sent");
+            assert_eq!(on_disk["last"], serde_json::json!([3, 0, 2]), "the vote guard fields are unchanged");
+            drop(r);
+            // restart 2: a conflicting proposal for the same (height, round) is refused; the identical one is re-sent unchanged
+            let mut r2 = liveness_node(1_000_000).await; r2.signing_key = Some(key()); r2.set_data_dir(dir.clone()).unwrap();
+            assert_eq!(restart_height(r2.load_persisted_state()), 3);
+            assert!(r2.sign_and_register_own_proposal(mk(4, 0, "B")).await.is_none(), "conflicting proposal after restart is withheld");
+            assert_eq!(r2.sign_and_register_own_proposal(mk(4, 0, "A")).await.unwrap().signature, first.signature, "identical proposal re-sends the stored signature");
+            assert!(r2.sign_and_register_own_proposal(mk(4, 1, "B")).await.is_some(), "a later round may propose a different block");
+            drop(r2);
+            // restart 3: the later round is remembered too; going back to round 0 is refused
+            let mut r3 = liveness_node(1_000_000).await; r3.signing_key = Some(key()); r3.set_data_dir(dir.clone()).unwrap(); r3.load_persisted_state();
+            assert!(r3.sign_and_register_own_proposal(mk(4, 0, "A")).await.is_none(), "below the last proposed (height, round)");
+            // a node WITHOUT a key behaves as before: no guard file change
+            let before = std::fs::read(&gpath).unwrap();
+            let mut nk = liveness_node(1_000_000).await; nk.set_data_dir(dir.clone()).unwrap();
+            let _ = nk.sign_and_register_own_proposal(mk(9, 0, "Z")).await;
+            assert_eq!(std::fs::read(&gpath).unwrap(), before, "a keyless node never touches the guard");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// A generation whose hashes are all valid but whose descriptor names OLDER log tails than the committed
         /// height must be refused: loading it would silently drop committed blocks from the logs while the
         /// state (and the signing guard) are ahead.
