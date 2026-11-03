@@ -648,3 +648,16 @@ With Dave down on purpose, only Alice and Carol remained (2 of 4, below quorum),
 
 **Why it matters.** A validator node that dies or hangs on a runtime panic can stop a chain that is already at its quorum margin, and the process went silent without exiting loudly. **Not changed.** Suggested follow-ups, none done: check tokio's upstream tracker and changelog for this assertion; try a newer tokio; decide whether the node binary should abort the process on a runtime-thread panic (so a supervisor restarts it) instead of continuing; if it recurs, capture `RUST_BACKTRACE=full` and the node's state at the time. The test failure it caused was a false negative for `validator_jail_live`, not a defect in the jail logic.
 
+---
+
+## EVICT-ROOT-1  The eviction live test's printed state root is not a cross-run constant
+
+**Status: OPEN (documentation corrected 2026-11-03; no code defect found). Found while investigating a Linux/Windows root difference (`48d58b5f…` vs `1f2b492f…`).**
+
+`validator_eviction_live` prints the state root at whatever height it happens to finish (EV-03). That root depends on the heights at which Eve's transactions land and on epoch-boundary accounting, both of which vary with timing, so two correct runs can print different roots.
+
+**Evidence (Linux sandbox, same binary, same genesis, three consecutive runs, per-height roots dumped):** run A finished at height **32** with root `48d58b5f…`; runs B and C finished at height **33** with root `1f2b492f…`, and their per-height roots already differ from run A's from height 5 onward (different blocks carried the transactions). Run A's root equals the Windows value recorded in the ROADMAP; a Windows run on the v2 storage branch (2026-11-03, `ca4d0e2`) also finished at height 32 with `48d58b5f…`. So there is no evidence of a platform difference, and equal roots from different runs prove determinism only when the final heights are equal.
+
+**What still holds:** EV-03's real assertion, that all four nodes report the same root within one run, passed in every run (v1, v2, `main`, Linux and Windows).
+
+**Consequences:** earlier ROADMAP wording ("same state root `48d58b5f…`") has been softened. For regression comparisons use (a) the same final height, or (b) the per-height roots; `validator_eviction_live` now prints `final heights sampled` and, with `CF_EVICT_DUMP_ROOTS=<file>`, writes every height's root and the genesis file's size and CR count (change on the storage-v2 PR #65, not yet on `main`). The jail test's roots (`51136494701f`, `eebbee537f59`, `33362db6f1e0`) were identical across all recorded runs and platforms because its transactions are submitted at deterministic points.
