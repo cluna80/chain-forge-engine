@@ -7,7 +7,7 @@ verified human identity rather than capital or computation. The native token is 
 coordinates verifiable distributed scientific computation, rewarding contributors from a
 pre-funded research treasury. The Digital Identity Stone (DIS) protocol provides
 holder-controlled, post-quantum cryptographic identity that works across independent vendors
-without a central authority. Chain Forge is the engine that runs it all — a ~50-crate Rust
+without a central authority. Chain Forge is the engine that creates it all — a ~50-crate Rust
 workspace with no borrowed consensus or state-machine code from any other chain.
 
 ---
