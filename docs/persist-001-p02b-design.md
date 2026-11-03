@@ -157,3 +157,32 @@ where `payload` is the canonical block bytes already used by the state (bytes, n
 ## 9. Not claimed
 
 That any option will meet a target that has not been measured; that sandbox numbers predict Windows; that the loaded-delay results will improve by a particular amount (the 900 ms point already varies between identical runs); or that crash durability under power loss on Windows is verified.
+
+## 10. M0 results — Linux sandbox, debug build (2026-11-03)
+
+**These are debug-build, Linux-sandbox measurements. They are not release-build numbers and not Windows (BossKing) numbers.** Both are still to be measured.
+
+**Pinned configuration.** Code: `main` `385431f` plus the `cfg(test)` instrumentation commit `b02b895` (branch `perf/p02b-m0`; the production write path is unchanged in non-test builds). Hardware: sandbox VM, Linux 6.18, 4-core Intel Xeon 2.8 GHz, 15 GB RAM, virtio disk. Profile: `dev` (unoptimized + debuginfo). Workload: in-process 4-validator commit path, 10 transfers per block; node 0 persists (disk run) and nodes 1–3 execute the same proposals with no disk; live state roots compared on every block. No networking: commit time is not a real block interval. Tests: `persist001_m0_baseline`, `persist001_m5_fsync_floor`.
+
+**Disk-backed run: 681 blocks** (stopped by its 45-minute cap, not by a failure).
+
+| Heights | Persist p50 | p95 | p99 | max | State persisted per block |
+| --- | --- | --- | --- | --- | --- |
+| 0–50 | 227 ms | 435 ms | 490 ms | 490 ms | 5.0 MB |
+| 50–100 | 706 ms | 865 ms | 939 ms | 939 ms | 9.9 MB |
+| 100–200 | 1,314 ms | 1,744 ms | 1,789 ms | 1,795 ms | 19.9 MB |
+| 200–300 | 2,269 ms | 2,718 ms | 2,734 ms | 3,643 ms | 29.9 MB |
+| 300–400 | 3,097 ms | 3,597 ms | 3,638 ms | 3,654 ms | 39.9 MB |
+| 400–500 | 4,104 ms | 4,691 ms | 5,468 ms | 5,782 ms | 49.8 MB |
+| 500–681 (late heights) | **5,457 ms** | **6,359 ms** | **6,784 ms** | 7,152 ms | **67.9 MB** at the final window |
+
+- **Commit-interval growth: 9.7×** (667 ms around height 50 to 6,451 ms at the end).
+- **Phase split** (median of the last 50 blocks): serialisation ≈ 2,009 ms; file write + fsync + hashing ≈ 4,061 ms; pruning the old generation ≈ 32 ms; `export_snapshot` 0.01 ms; state root 0.25 ms; manifest, `CURRENT` and the three directory fsyncs 0.2–0.8 ms each. The cost is the whole-chain rewrite, not the fsync sequence or manifest.
+- **State-root agreement:** the four nodes agreed on every block of the measured run (0 disagreements).
+- **Against the provisional targets:** growth ≤ 1.25× (measured 9.7×) and persistence p95 ≤ 50 ms / p99 ≤ 100 ms (measured 6,359 / 6,784 ms at late heights) are missed by large margins. The 20,000-block run **could not be reached** with the current design in this sandbox.
+
+**M5 fsync-only floor** (real `write_snapshot`, eight 1 KB files, 2,000 calls): p50 6.9 ms, **p95 10.1 ms**, p99 12.5 ms, max 171 ms. Phases (p50): files write+fsync+hash 3.9 ms, prune 1.1 ms, `CURRENT` 0.7 ms, manifest 0.5 ms, directory fsyncs 0.14–0.22 ms. With state size removed, the current number of fsyncs fits inside the 50 ms p95 target on this disk; Windows may differ.
+
+**No-disk control** (same workload, persistence off): commit p50 203–205 ms flat from height 0 to over 3,000, p99 ≤ 266 ms, all four nodes' roots agreeing on every block. Final result (capped at 90 minutes, so it does not reach 20,000 either): to be added when the run ends.
+
+**Not measured.** A release build; a live 4-node run with networking; Windows. Debug-build serialisation is likely overstated relative to release.
