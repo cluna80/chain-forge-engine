@@ -217,3 +217,49 @@ That any option will meet a target that has not been measured; that sandbox numb
 3. Cross-platform determinism is tested only on Linux; Windows has not been run.
 4. A second log (v2) doubles the number of commit-boundary files, so D1 ordering and recovery cases must be re-derived and tested for two logs.
 5. Production-size blocks, real networking, release-build timing and a 20,000-block run remain unmeasured.
+
+## 13. Option 2 prototype v2 — benchmark and validation (Linux sandbox; debug and release; 2026-11-03)
+
+**Experimental evidence, not production acceptance (owner, 2026-11-03).** Branch `proto/p02b-blocklog` at `ddfe570` (v2 benchmark and two-log recovery tests). Production persistence unchanged; nothing merged, migrated or wired into the node. Same sandbox hardware and the same workload as v1 and M0 (10 transfers per block, one executing node; M0's four-node agreement is not repeated). **Debug** = the `dev` profile used for M0 and v1; **release** = `--release`. Windows has not been run. The debug and release runs executed concurrently on the same 4-core VM and disk.
+
+**v2 = block log + a second append-only log for `historical_validator_sets`**, with the remaining small files and a descriptor (both log tails) written through the unchanged `write_snapshot` generation.
+
+| Build | Blocks | Persist p50 | p95 | p99 | max | Outliers |
+| --- | --- | --- | --- | --- | --- | --- |
+| Release | **20,001** (the 20,000 target reached, 321 s) | 11.0 ms | 17.2 ms | 22.8 ms | 2,395 ms | 18 blocks > 50 ms; 6 > 100 ms; 2 > 1 s (heights 16,907 and 16,908) |
+| Debug | 12,045 (50-minute cap; not 20,000) | 18.9 ms | 30.3 ms | 37.1 ms | 3,019 ms | 32 blocks > 50 ms; 6 > 100 ms; 2 > 1 s (heights 963 and 964) |
+
+Per height band (persist p50 / p95 / p99 ms; the owner's provisional targets are p95 ≤ 50, p99 ≤ 100):
+
+| Heights | Release | Debug |
+| --- | --- | --- |
+| 0–100 | 10.6 / 16.4 / 24.4 | 22.7 / 33.2 / 36.8 |
+| 1,000–2,500 | 10.2 / 15.4 / 19.8 | 19.4 / 32.1 / 41.9 |
+| 5,000–10,000 | 10.7 / 16.2 / 21.5 | 20.1 / 31.2 / 36.5 |
+| 10,000–15,000 | 11.6 / 17.9 / 23.5 | 16.5 / 25.2 / 30.4 |
+| 15,000–20,001 | 11.5 / 17.6 / 23.6 | n/a (run ended at 12,045) |
+
+**Is the remaining cost flat? Yes for the typical block; not for the worst block.**
+- **Growth:** persist p50 early (heights 100–600) to late (last 500) is **0.89×** release and **0.83×** debug (the owner's growth target is ≤ 1.25×). Bytes written per block are flat at about 58 KB in every band (the log record about 26 KB plus the small files). v1's linear growth from `historical_validator_sets.json` is gone.
+- **Block-log append** (append plus fsync, p50 / p99): release 1.1–1.4 / 3.3–4.4 ms; debug 3.7–5.0 / 7.7–19 ms. **Validator-history append:** release 0.35–0.45 / 1.4–2.8 ms; debug 0.54–0.67 / 1.6–2.6 ms. Neither grows with height.
+- **Dominant remaining cost** is the generation write (`snapshot_ms` p50 8–10 ms release, 11–15 ms debug): about 10 file fsyncs plus three directory fsyncs per block, close to the M5 fsync-only floor.
+- **Tail (new failure mode, see below):** a few blocks take 0.1–3 s; the p99 and p95 targets are met in every band, but the **maximum is not flat**.
+- **Provisional targets:** p95 ≤ 50 ms and p99 ≤ 100 ms are met in both builds on this disk; the 20,000-block target is met in release only; ratio ≤ 1.25× met. These are Linux-sandbox numbers on a virtual disk; the targets are **not** confirmed for Windows.
+
+**Recovery and replay at the final height** (debug, 12,045 blocks / release, 20,001 blocks):
+- Hash-chain verification of the block log: 19.4 s / 2.9 s; of the history log: 0.7 s / 0.1 s.
+- Full replay (deserialise every block and byte-compare with memory): 66.2 s / 8.6 s.
+- `recover` of **both logs against the manifest** (open, verify, truncate): 19.6 s / 2.8 s. Restart cost therefore grows linearly with chain length (about 1.6 ms per block debug, 0.14 ms release); a checkpoint or index would be needed to bound it.
+- Log sizes: block log 313.2 MB (26,001 B/block) at 12,045 blocks / 520.7 MB at 20,001; history log 859 B/block (10.3 MB / 17.2 MB).
+
+**Recovery consistency across both logs and the manifest (test `proto_v2_recovery_is_consistent_across_both_logs_and_the_manifest`, plus the 13 log unit tests and the v1 round-trip; all pass).**
+- Crash after the block-log append only; after both logs but before the manifest; a torn history record beyond the checkpoint; a torn block record beyond the checkpoint: in each case both logs return exactly to the committed checkpoint (never forward), the block is re-appended, and the checkpoint advances with both tails equal.
+- A flipped byte inside a committed record of either log, the history log shorter than the checkpoint, and a layout disagreement (descriptor names a history log the caller does not expect): all fatal.
+- Mutation check: with truncation to the committed tail disabled, two crash-recovery tests fail; the change was reverted.
+- D1 postcondition (committed descriptor equals both log tails when persistence returns) and the interrupted-write ordering are covered; **signing-guard interplay beyond the D1 ordering, power-loss durability, and Windows are not tested.**
+
+**New failure modes and risks found.**
+1. **Latency stalls.** In both builds there were short bursts (2–5 consecutive blocks) where every fsync phase slowed together (release heights 16,905–16,909 up to 2.4 s; debug 963–964 up to 3.0 s), unrelated to chain height; consistent with VM disk or host contention (the two runs shared the disk). A real validator would see these as missed gather windows. Needs a Windows run and an isolated sandbox run before any conclusion.
+2. **Two commit-boundary files** (two logs plus the manifest) need the D1 ordering and recovery cases kept in lock-step; the descriptor must name both tails and any disagreement is fatal (implemented in the prototype).
+3. **Restart/replay cost is O(chain)** (above).
+4. **Unmeasured:** Windows, networking, production-size blocks, power loss, compaction and checkpointing, migration from the P-02a layout, and any further per-height-growing component in other state files (only `chain_store` and `historical_validator_sets` were found).
