@@ -1,9 +1,11 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { getAddress } from "@/lib/keypair-store";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { getAddress, getUnlocked, type WalletKeypair } from "@/lib/keypair-store";
+import { mldsaSign } from "@/lib/mldsa";
 import {
   GAS_LIMIT,
-  ATTESTATION_QUORUM,
   type Activity,
   type Agent,
   type AgentAsk,
@@ -28,8 +30,10 @@ import {
   uid,
   fetchNodeIdentity,
   fetchNodeAccount,
+  probeNode,
   submitNodeTx,
   NODE_URL,
+  transferBodyJson,
 } from "@/lib/qattice";
 
 type State = {
@@ -62,7 +66,7 @@ type State = {
   attest: () => Promise<{ ok: true; tx_id: string } | { ok: false; error: string }>;
   claim: () => { ok: true } | { ok: false; error: string };
   castVote: (choice: "yes" | "no") => { ok: true } | { ok: false; error: string };
-  send: (to: string, amountUqcb: number) => Promise<{ ok: true; digest: string } | { ok: false; error: string }>;
+  send: (to: string, amountUqcb: number) => Promise<{ ok: true; digest: string; submitted: boolean } | { ok: false; error: string }>;
   pushChallenge: (c: Challenge) => void;
   loadFresh: () => void;
   loadBad: (kind: "expired" | "audience" | "scope") => void;
@@ -121,10 +125,10 @@ function base(): Omit<
     hydrated: false,
     tab: "home",
     moveMode: "send",
-    balanceUqcb: 12_480_000,
-    nonce: 7,
+    balanceUqcb: NODE_URL ? 0 : 12_480_000,
+    nonce: NODE_URL ? 0 : 7,
     tier: "provisional",
-    attestations: 1,
+    attestations: NODE_URL ? 0 : 1,
     attested_by: [],
     nodeConnected: null,
     nodeError: null,
@@ -160,6 +164,36 @@ function mark(list: Rehearsal[], key: Rehearsal) {
   return list.includes(key) ? list : [...list, key];
 }
 
+
+async function submitSigned(
+  kp: WalletKeypair,
+  nonce: number,
+  bodyJson: string,
+  id: string,
+): Promise<{ ok: true; tx_id: string; signature: string } | { ok: false; error: string }> {
+  let signature: string;
+  try {
+    const digest = sha256(new TextEncoder().encode(txPreimage(bodyJson)));
+    const sig = await mldsaSign(digest, hexToBytes(kp.private_key));
+    signature = bytesToHex(sig);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  if (!NODE_URL) return { ok: true, tx_id: id, signature };
+  const result = await submitNodeTx({
+    id,
+    sender: kp.address,
+    nonce,
+    gas_limit: GAS_LIMIT,
+    body: JSON.parse(bodyJson) as unknown,
+    sig_scheme: "MlDsa",
+    pq_signatures: [`mldsa65:${signature}`],
+    pq_public_key: kp.public_key,
+  });
+  if (!result.ok) return result;
+  return { ok: true, tx_id: result.tx_id, signature };
+}
+
 export const useWallet = create<State>()(
   persist(
     (set, get) => ({
@@ -169,109 +203,74 @@ export const useWallet = create<State>()(
       setMoveMode: (moveMode) => set({ moveMode }),
       reset: () => set({ ...base(), hydrated: true }),
       syncFromNode: async () => {
-        if (!NODE_URL) {
-          set({ nodeConnected: false, nodeError: "Set VITE_NODE_URL to connect to a live node." });
+        const probe = await probeNode(getAddress());
+        if (!probe.reachable) {
+          set({ nodeConnected: false, nodeError: probe.error });
           return;
         }
-        const address = getAddress();
-        const [identity, account] = await Promise.all([
-          fetchNodeIdentity(address),
-          fetchNodeAccount(address),
-        ]);
-        if (!identity && !account) {
-          set({ nodeConnected: false, nodeError: `Cannot reach node at ${NODE_URL}` });
-          return;
+        const update: Partial<State> = { nodeConnected: true, nodeError: probe.error };
+        if (probe.account) {
+          const raw = probe.account.balances?.uqcb ?? 0;
+          if (Number.isSafeInteger(raw)) update.balanceUqcb = raw;
+          else update.nodeError = "Node balance is outside the safe integer range.";
+          update.nonce = probe.account.nonce;
+          if (!probe.identity && probe.account.tier) update.tier = probe.account.tier.toLowerCase() as Tier;
+          if (probe.account.attestation_count != null) update.attestations = probe.account.attestation_count;
+        } else {
+          update.balanceUqcb = 0;
+          update.nonce = 0;
+          update.tier = "provisional";
+          update.attestations = 0;
         }
-        const update: Partial<State> = { nodeConnected: true, nodeError: null };
-        if (account) {
-          update.balanceUqcb = account.balances["uqcb"] ?? get().balanceUqcb;
-          update.nonce = account.nonce;
-        }
-        if (identity) {
-          update.attestations = identity.attestation_count;
-          update.attested_by = identity.attested_by;
-          if (identity.tier) update.tier = identity.tier.toLowerCase() as Tier;
+        if (probe.identity) {
+          update.attestations = probe.identity.attestation_count;
+          update.attested_by = probe.identity.attested_by;
+          update.tier = probe.identity.tier ? (probe.identity.tier.toLowerCase() as Tier) : "provisional";
         }
         set(update);
       },
       attest: async () => {
         const s = get();
         if (s.tier === "verified") return { ok: false, error: "Already verified." };
-        const addr = getAddress();
-        const chainId = (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle";
-        // Register identity first if not yet on-chain
-        const identity = await fetchNodeIdentity(addr);
-        let attestNonce = s.nonce;
+        const kp = getUnlocked();
+        if (!kp) return { ok: false, error: "Unlock the wallet before signing." };
+        if (!NODE_URL) {
+          return { ok: false, error: "Set VITE_NODE_URL. Attestation is a chain transaction, not a local rehearsal." };
+        }
+        const identity = await fetchNodeIdentity(kp.address);
+        let nonce = s.nonce;
+        const account = await fetchNodeAccount(kp.address);
+        if (account) nonce = account.nonce;
         if (!identity?.registered) {
-          const regResult = await submitNodeTx({
-            id: `reg-${addr}`,
-            chain_id: chainId,
-            sender: addr,
-            nonce: s.nonce,
-            gas_limit: GAS_LIMIT,
-            body: "RegisterIdentity",
-          });
-          if (!regResult.ok) {
-            // "already committed" means identity exists on chain — treat as success
-            const alreadyRegistered = regResult.error?.includes("already committed") || regResult.error?.includes("replay not permitted");
-            if (!alreadyRegistered) return { ok: false, error: `RegisterIdentity failed: ${regResult.error}` };
-            // identity already on chain; attest uses same nonce (reg was never consumed this run)
-            attestNonce = s.nonce;
+          const reg = await submitSigned(kp, nonce, '"RegisterIdentity"', `reg-${kp.address}-${nonce}`);
+          if (!reg.ok) {
+            const already =
+              reg.error.includes("already committed") ||
+              reg.error.includes("replay not permitted") ||
+              reg.error.includes("registered");
+            if (!already) return { ok: false, error: `RegisterIdentity failed: ${reg.error}` };
           } else {
-            // reg consumed nonce s.nonce, attest must use s.nonce + 1
-            attestNonce = s.nonce + 1;
+            nonce += 1;
+            await new Promise((r) => setTimeout(r, 1500));
+            const next = await fetchNodeAccount(kp.address);
+            if (next) nonce = next.nonce;
           }
-          // Wait briefly for the node to process before attesting
-          await new Promise(r => setTimeout(r, 2000));
         }
-        const body = { Attest: { claimant_id: addr } };
-        const result = await submitNodeTx({
-          id: `attest-${addr}-${attestNonce}`,
-          chain_id: chainId,
-          sender: addr,
-          nonce: attestNonce,
-          gas_limit: GAS_LIMIT,
-          body,
-        });
-        if (!result.ok) {
-          // fall back to local rehearsal if no node
-          if (!NODE_URL) {
-            const attestations = Math.min(ATTESTATION_QUORUM, s.attestations + 1);
-            const tier: Tier = attestations >= ATTESTATION_QUORUM ? "verified" : "provisional";
-            set({
-              attestations,
-              tier,
-              rehearsed: tier === "verified" ? mark(s.rehearsed, "verified") : s.rehearsed,
-              activity: [
-                {
-                  id: uid("act"),
-                  title: tier === "verified" ? "Verified tier" : "Attestation recorded",
-                  detail:
-                    tier === "verified"
-                      ? "Quorum of 3 reached in rehearsal."
-                      : `${attestations} of ${ATTESTATION_QUORUM} attestors.`,
-                  at: nowStamp(),
-                },
-                ...s.activity,
-              ],
-            });
-            return { ok: true, tx_id: "rehearsal" };
-          }
-          return result;
-        }
+        const bodyJson = JSON.stringify({ Attest: { claimant_id: kp.address } });
+        const result = await submitSigned(kp, nonce, bodyJson, `attest-${kp.address}-${nonce}`);
+        if (!result.ok) return result;
         set({
-          nonce: s.nonce + 1,
+          nonce: nonce + 1,
           activity: [
             {
               id: uid("act"),
               title: "Attest tx submitted",
-              detail: `tx ${result.tx_id}`,
+              detail: `tx ${result.tx_id} · mldsa65 ${result.signature.slice(0, 16)}`,
               at: nowStamp(),
             },
-            ...s.activity,
+            ...get().activity,
           ],
         });
-        // refresh identity from node after a short delay
         setTimeout(() => void get().syncFromNode(), 1500);
         return result;
       },
@@ -318,56 +317,52 @@ export const useWallet = create<State>()(
         const s = get();
         const dest = to.trim();
         if (!dest.startsWith("qcb1")) return { ok: false, error: "Recipient must be a qcb1 address." };
-        if (dest === getAddress()) return { ok: false, error: "That is this wallet." };
+        const kp = getUnlocked();
+        if (!kp) return { ok: false, error: "Unlock the wallet before signing." };
+        if (dest === kp.address) return { ok: false, error: "That is this wallet." };
         if (!Number.isInteger(amountUqcb) || amountUqcb <= 0) {
           return { ok: false, error: "Amount must be a positive whole number of uQCB." };
         }
-        if (amountUqcb > s.balanceUqcb) return { ok: false, error: "Balance is short." };
-        const body = { type: "Transfer", to: dest, amount: amountUqcb, denom: "uqcb" };
-        const bodyJson = JSON.stringify(body);
-        const digest = await sha256Hex(txPreimage(bodyJson));
+        if (NODE_URL && amountUqcb > s.balanceUqcb) return { ok: false, error: "Balance is short." };
+        let nonce = s.nonce;
         if (NODE_URL) {
-          const result = await submitNodeTx({
-            chain_id: (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID ?? "qcb-devnet-fee-settle",
-            sender: getAddress(),
-            nonce: s.nonce,
-            gas_limit: GAS_LIMIT,
-            body,
-          });
-          if (!result.ok) return result;
+          const account = await fetchNodeAccount(kp.address);
+          if (account) nonce = account.nonce;
+        }
+        const bodyJson = transferBodyJson(dest, amountUqcb);
+        const signed = await submitSigned(kp, nonce, bodyJson, `xfer-${nonce}-${uid("tx")}`);
+        if (!signed.ok) return signed;
+        if (!NODE_URL) {
           set({
-            balanceUqcb: s.balanceUqcb - amountUqcb,
-            nonce: s.nonce + 1,
             rehearsed: mark(s.rehearsed, "send"),
             activity: [
               {
                 id: uid("act"),
-                title: "Transfer submitted",
-                detail: `${amountUqcb.toLocaleString("en-US")} uQCB → ${dest} · tx ${result.tx_id}`,
+                title: "Transfer signed, not submitted",
+                detail: `${amountUqcb.toLocaleString("en-US")} uQCB → ${dest} · set VITE_NODE_URL to broadcast`,
                 at: nowStamp(),
               },
               ...s.activity,
             ],
           });
-          setTimeout(() => void get().syncFromNode(), 1500);
-          return { ok: true, digest: result.tx_id };
+          return { ok: true, digest: signed.signature, submitted: false };
         }
-        // rehearsal fallback (no node configured)
         set({
           balanceUqcb: s.balanceUqcb - amountUqcb,
-          nonce: s.nonce + 1,
+          nonce: nonce + 1,
           rehearsed: mark(s.rehearsed, "send"),
           activity: [
             {
               id: uid("act"),
-              title: "Transfer rehearsed",
-              detail: `${amountUqcb.toLocaleString("en-US")} uQCB · nonce ${s.nonce} · gas ${GAS_LIMIT} · ${digest.slice(0, 16)}`,
+              title: "Transfer submitted",
+              detail: `${amountUqcb.toLocaleString("en-US")} uQCB → ${dest} · tx ${signed.tx_id}`,
               at: nowStamp(),
             },
             ...s.activity,
           ],
         });
-        return { ok: true, digest };
+        setTimeout(() => void get().syncFromNode(), 1500);
+        return { ok: true, digest: signed.signature, submitted: true };
       },
       pushChallenge: (c) => set({ challenges: [c, ...get().challenges.filter((x) => x.id !== c.id)] }),
       loadFresh: () => {
@@ -389,12 +384,23 @@ export const useWallet = create<State>()(
         if (!c) return { ok: false, error: "Challenge is gone." };
         const review = reviewChallenge(c, s.vendors, nowStamp());
         if (!review.ok || !review.vendor) return { ok: false, error: review.reasons[0] ?? "Refused." };
-        const digest = await sha256Hex(disPreimage(c, review.vendor.fingerprint));
+        const kp = getUnlocked();
+        if (!kp) return { ok: false, error: "Unlock the wallet before signing." };
+        const transcript = disPreimage(c, review.vendor.fingerprint);
+        const digest = await sha256Hex(transcript);
+        let signature: string;
+        try {
+          const sig = await mldsaSign(new TextEncoder().encode(transcript), hexToBytes(kp.private_key));
+          signature = `mldsa65:${bytesToHex(sig)}`;
+        } catch (e) {
+          return { ok: false, error: e instanceof Error ? e.message : String(e) };
+        }
         const proof: Proof = {
           challengeId: c.id,
           vendorId: review.vendor.id,
           fingerprint: review.vendor.fingerprint,
           digest,
+          signature,
           at: nowStamp(),
           resource: c.resource,
           action: c.action,
@@ -422,7 +428,7 @@ export const useWallet = create<State>()(
             {
               id: uid("act"),
               title: "Session opened",
-              detail: `${review.vendor.name} · ${c.scopes.join(", ")} · QCB was not touched`,
+              detail: `${review.vendor.name} · ${c.scopes.join(", ")} · chain-key ML-DSA over DIS-KS-V1, not a vendor key`,
               at: opened,
             },
             ...s.activity,
@@ -694,14 +700,10 @@ export const useWallet = create<State>()(
       },
     }),
     {
-      name: "qattice-rehearsal-v1",
+      name: "qattice-wallet-v2",
       skipHydration: true,
       partialize: (s) => ({
         tab: s.tab,
-        balanceUqcb: s.balanceUqcb,
-        nonce: s.nonce,
-        tier: s.tier,
-        attestations: s.attestations,
         vendors: s.vendors,
         challenges: s.challenges,
         agents: s.agents,
