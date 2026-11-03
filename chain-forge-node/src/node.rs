@@ -1,6 +1,23 @@
 /// Node: the core runtime that wires all five crates together.
 
 use crate::telemetry::emit_attestation_event;
+
+/// PERSIST-001 P-02b M0: one `persist_state()` call's timing (test builds only).
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct M0Record {
+    pub height: u64,
+    pub export_ms: f64,
+    pub serialize_ms: f64,
+    pub root_ms: f64,
+    pub total_ms: f64,
+    pub bytes: usize,
+    pub phases: Vec<(&'static str, f64)>,
+}
+#[cfg(test)]
+thread_local! {
+    pub(crate) static M0_RECORD: std::cell::RefCell<Option<M0Record>> = const { std::cell::RefCell::new(None) };
+}
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn, error};
 
@@ -2212,8 +2229,10 @@ impl Node {
     /// after a restart that silently falls back to genesis.
     fn persist_state(&self) -> Result<(), String> {
         let Some(ref dir) = self.data_dir else { return Ok(()) };
+        #[cfg(test)] let m0_t0 = std::time::Instant::now();
         let snap   = self.state.export_snapshot();
         let height = snap.height;
+        #[cfg(test)] let m0_export_ms = m0_t0.elapsed().as_secs_f64() * 1000.0;
 
         // Serialise all 8 files.  Any serialisation failure is immediately
         // fatal: a partial contents list would produce an incomplete snapshot
@@ -2242,7 +2261,19 @@ impl Node {
         push("live_validator_set.json",
              serde_json::to_string_pretty(self.consensus.validator_set()))?;
 
-        match crate::persistence::write_snapshot(dir, height, &contents, &self.snapshot_identity(), &self.live_state_root()) {
+        #[cfg(test)] let m0_ser_ms = m0_t0.elapsed().as_secs_f64() * 1000.0 - m0_export_ms;
+        #[cfg(test)] let m0_t1 = std::time::Instant::now();
+        #[cfg(test)] let m0_identity = self.snapshot_identity();
+        #[cfg(test)] let m0_root = self.live_state_root();
+        #[cfg(test)] let m0_root_ms = m0_t1.elapsed().as_secs_f64() * 1000.0;
+        let m0_res = crate::persistence::write_snapshot(dir, height, &contents, &self.snapshot_identity(), &self.live_state_root());
+        #[cfg(test)] {
+            let _ = (&m0_identity, &m0_root);
+            let total = m0_t0.elapsed().as_secs_f64() * 1000.0 - m0_root_ms;
+            let bytes: usize = contents.iter().map(|c| c.1.len()).sum();
+            M0_RECORD.with(|r| *r.borrow_mut() = Some(M0Record { height, export_ms: m0_export_ms, serialize_ms: m0_ser_ms, root_ms: m0_root_ms, total_ms: total, bytes, phases: crate::persistence::m0::take() }));
+        }
+        match m0_res {
             Ok(gen) => { tracing::debug!(height, %gen, "state persisted (generation-based)"); Ok(()) }
             Err(e)  => Err(format!("persist_state: snapshot write failed at height {height}: {e}")),
         }
@@ -7459,6 +7490,96 @@ mod tests {
             println!("chain MB/ser/write = chain_store.json (pretty JSON, rewritten whole every commit); others = the other 7 files;");
             println!("compact ser = same data serialized without pretty-printing; atomic wr = temp+fsync+rename of the compact bytes;");
             println!("persist() = one full persist_state() call (best of 3).");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// PERSIST-001 P-02b M0: per-block latency baseline. Writes one CSV row per block to $CF_M0_CSV.
+        /// Env: CF_M0_BLOCKS (default 2000), CF_M0_TXS (10), CF_M0_NODISK, CF_M0_BUDGET_SECS (stop early), CF_M0_CSV.
+        /// Node 0 is the measured node (disk or no-disk); nodes 1..3 execute the same proposals with no disk,
+        /// and every block's live state root is compared across all four.
+        #[tokio::test]
+        #[ignore = "PERSIST-001 M0 baseline; run explicitly with --ignored --nocapture"]
+        async fn persist001_m0_baseline() {
+            use std::io::Write;
+            let max: u64 = std::env::var("CF_M0_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+            let k: u64 = std::env::var("CF_M0_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+            let budget: f64 = std::env::var("CF_M0_BUDGET_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(f64::MAX);
+            let nodisk = std::env::var("CF_M0_NODISK").is_ok();
+            let csv_path = std::env::var("CF_M0_CSV").unwrap_or_else(|_| "/tmp/cf-m0.csv".into());
+            let dir = std::env::temp_dir().join(format!("cf-m0-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut nodes = vec![liveness_node(1_000_000).await, liveness_node(1_000_000).await,
+                                 liveness_node(1_000_000).await, liveness_node(1_000_000).await];
+            if !nodisk { nodes[0].set_data_dir(dir.clone()).unwrap(); }
+            let mut csv = std::fs::File::create(&csv_path).unwrap();
+            writeln!(csv, "height,commit_ms,persist_total_ms,export_ms,serialize_ms,root_ms,bytes,files_write_fsync_sha,fsync_gen_dir,manifest_write,fsync_gen_dir2,fsync_snaps_dir,current_write,prune,other_nodes_ms,roots_agree,chain_store_bytes").unwrap();
+            let start = std::time::Instant::now();
+            let (mut nonce, mut disagreements, mut done) = (0u64, 0u64, 0u64);
+            for h in 0..=max {
+                for _ in 0..k {
+                    let mut tx = Transaction::transfer(&format!("m0-{nonce}"), "qcb1alice", "qcb1bob", "uqcb", 1, nonce);
+                    tx.sign(&ClassicalScheme.generate_keypair("qcb1alice").unwrap(), CHAIN).unwrap();
+                    nodes[0].mempool.push(tx);
+                    nonce += 1;
+                }
+                let tx_data = nodes[0].block_payload(h).encode();
+                let p = proposal(h, tx_data);
+                M0_RECORD.with(|r| *r.borrow_mut() = None);
+                let t = std::time::Instant::now();
+                deliver(&mut nodes[0], &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+                let commit_ms = t.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(nodes[0].status.lock().unwrap().height, h, "node 0 must commit h{h}");
+                let t2 = std::time::Instant::now();
+                for i in 1..4 {
+                    deliver(&mut nodes[i], &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+                    assert_eq!(nodes[i].status.lock().unwrap().height, h, "node {i} must commit h{h}");
+                }
+                let others_ms = t2.elapsed().as_secs_f64() * 1000.0;
+                let r0 = nodes[0].live_state_root();
+                let agree = (1..4).all(|i| nodes[i].live_state_root() == r0);
+                if !agree { disagreements += 1; }
+                let rec = M0_RECORD.with(|r| r.borrow().clone());
+                let ph = |name: &str| rec.as_ref().and_then(|r| r.phases.iter().find(|p| p.0 == name).map(|p| p.1)).unwrap_or(f64::NAN);
+                let (tot, ex, se, ro, by) = rec.as_ref().map(|r| (r.total_ms, r.export_ms, r.serialize_ms, r.root_ms, r.bytes)).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, 0));
+                let cs_bytes = if h % 500 == 0 { serde_json::to_vec_pretty(&nodes[0].chain_store).map(|v| v.len()).unwrap_or(0) } else { 0 };
+                writeln!(csv, "{h},{commit_ms:.3},{tot:.3},{ex:.3},{se:.3},{ro:.3},{by},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{others_ms:.3},{agree},{cs_bytes}",
+                    ph("files_write_fsync_sha"), ph("fsync_gen_dir"), ph("manifest_write"), ph("fsync_gen_dir2"), ph("fsync_snaps_dir"), ph("current_write"), ph("prune")).unwrap();
+                done = h + 1;
+                if h % 500 == 0 { println!("M0 h={h} commit={commit_ms:.1}ms persist={tot:.1}ms bytes={by} elapsed={:.0}s", start.elapsed().as_secs_f64()); }
+                if start.elapsed().as_secs_f64() > budget { println!("M0 budget reached at height {h}"); break; }
+            }
+            println!("M0 DONE blocks={done} elapsed={:.1}s root_disagreements={disagreements} nodisk={nodisk}", start.elapsed().as_secs_f64());
+            assert_eq!(disagreements, 0, "state roots must agree across the four nodes");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// M5: fsync-only floor. Runs the real write_snapshot with eight 1 KB files (no state growth), so the
+        /// cost is the fixed fsync/rename/manifest sequence only. Prints p50/p95/p99/max over $CF_M5_N calls.
+        #[test]
+        #[ignore = "PERSIST-001 M5 fsync-only baseline; run explicitly with --ignored --nocapture"]
+        fn persist001_m5_fsync_floor() {
+            let n: usize = std::env::var("CF_M5_N").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+            let dir = std::env::temp_dir().join(format!("cf-m5-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let names = ["state.json","identity.json","validators.json","agents.json","slashing.json","chain_store.json","historical_validator_sets.json","live_validator_set.json"];
+            let contents: Vec<(&str, Vec<u8>)> = names.iter().map(|nm| (*nm, vec![b'x'; 1024])).collect();
+            let genesis = GenesisConfig::from_json(&liveness_json()).unwrap();
+            let identity = snapshot_identity_of(&genesis);
+            let root = crate::persistence::EMPTY_STATE_ROOT.to_string();
+            let mut totals = vec![]; let mut by_phase: std::collections::BTreeMap<&str, Vec<f64>> = Default::default();
+            for i in 0..n {
+                let (r, ms) = ms_of(|| crate::persistence::write_snapshot(&dir, i as u64, &contents, &identity, &root));
+                r.unwrap(); totals.push(ms);
+                for (nm, v) in crate::persistence::m0::take() { by_phase.entry(nm).or_default().push(v); }
+            }
+            fn pct(v: &mut Vec<f64>, q: f64) -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[((v.len() as f64 - 1.0) * q).round() as usize] }
+            println!("M5 write_snapshot, 8 x 1 KB files, n={n}: p50={:.2} p95={:.2} p99={:.2} max={:.2} ms",
+                pct(&mut totals.clone(), 0.5), pct(&mut totals.clone(), 0.95), pct(&mut totals.clone(), 0.99), pct(&mut totals.clone(), 1.0));
+            for (nm, v) in by_phase.iter_mut() {
+                println!("  phase {nm:<24} p50={:.3} p95={:.3} p99={:.3} max={:.3}", pct(v, 0.5), pct(v, 0.95), pct(v, 0.99), pct(v, 1.0));
+            }
+            // fsync count per call: 8 file syncs + manifest + CURRENT = 10 file fsyncs, + 3 directory fsyncs = 13
             let _ = std::fs::remove_dir_all(&dir);
         }
 

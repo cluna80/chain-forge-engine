@@ -266,6 +266,29 @@ fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+
+/// PERSIST-001 P-02b M0: test-only phase timing. Compiled only under `cfg(test)`;
+/// the production write path is byte-for-byte what it was.
+#[cfg(test)]
+pub(crate) mod m0 {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+        pub(crate) static PHASES: RefCell<Vec<(&'static str, f64)>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(crate) fn start() { LAST.with(|l| l.set(Some(std::time::Instant::now()))); PHASES.with(|p| p.borrow_mut().clear()); }
+    pub(crate) fn lap(name: &'static str) {
+        let now = std::time::Instant::now();
+        LAST.with(|l| {
+            if let Some(prev) = l.get() {
+                PHASES.with(|p| p.borrow_mut().push((name, (now - prev).as_secs_f64() * 1000.0)));
+            }
+            l.set(Some(now));
+        });
+    }
+    pub(crate) fn take() -> Vec<(&'static str, f64)> { PHASES.with(|p| std::mem::take(&mut *p.borrow_mut())) }
+}
+
 /// Compute the SHA-256 hex digest of `data`.
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -422,6 +445,7 @@ pub fn write_snapshot(
     // Never write a wildcard identity: it would be accepted by any chain.
     identity.validate().map_err(|why| PersistError::Io(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("snapshot identity: {why}"))))?;
+    #[cfg(test)] m0::start();
     let snaps = data_dir.join("snapshots");
     std::fs::create_dir_all(&snaps)?;
 
@@ -443,9 +467,11 @@ pub fn write_snapshot(
         });
     }
 
+    #[cfg(test)] m0::lap("files_write_fsync_sha");
     // Fsync the generation directory so all renames are durable before writing
     // the manifest.
     fsync_dir(&gen_dir)?;
+    #[cfg(test)] m0::lap("fsync_gen_dir");
 
     // Write manifest.json last — its presence is the commit signal.
     let manifest = SnapshotManifest {
@@ -460,17 +486,21 @@ pub fn write_snapshot(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     write_atomic_bytes(&gen_dir.join("manifest.json"), &manifest_bytes)?;
+    #[cfg(test)] m0::lap("manifest_write");
 
     // Fsync the generation directory again so the manifest rename is durable.
     fsync_dir(&gen_dir)?;
+    #[cfg(test)] m0::lap("fsync_gen_dir2");
 
     // Make the generation directory's own entry (in snapshots/) durable BEFORE
     // CURRENT is renamed to point at it. Without this, CURRENT could survive a
     // crash while the directory it names does not.
     fsync_dir(&snaps)?;
+    #[cfg(test)] m0::lap("fsync_snaps_dir");
 
     // Update CURRENT atomically.
     write_current(data_dir, &gen)?;
+    #[cfg(test)] m0::lap("current_write");
 
     // Prune the generation two steps back (keep N and N-1).
     if next_num >= 2 {
@@ -479,6 +509,7 @@ pub fn write_snapshot(
             let _ = std::fs::remove_dir_all(&old); // best-effort; not fatal
         }
     }
+    #[cfg(test)] m0::lap("prune");
 
     Ok(gen)
 }
