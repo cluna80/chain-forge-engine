@@ -604,3 +604,28 @@ What the Windows run shows: the node suite includes the directory-fsync tests (D
 4. **Floating point in a consensus decision.** The quorum (`f64` multiply, divide, `ceil`) and the approval comparison (`yes / decisive * 100.0 < threshold`) use `f64`. A comparison against integer arithmetic found **zero mismatches** for quorum percentages 4 and 7 with verified populations 0..200,000, and for approval thresholds 51 and 67 with 1..2,000 decisive votes. The ranges are bounded and the thresholds are configurable, so integer arithmetic (`(verified * pct + 99) / 100`, `yes * 100 < threshold * decisive`) is the recommended hardening for consensus-critical code.
 
 Not blocking H0-12 (merged as #52). Fix as a separate, tested change.
+
+---
+
+## NODE-TOKIO-1  A node panicked inside tokio's time driver and went silent (once)
+
+**Status: OPEN — intermittent, seen once; cause UNKNOWN. Found 2026-11-02 in a Linux sandbox run of `validator_jail_live` on the branch of PR #58.**
+
+During the JL-02..JL-03 wait (Dave deliberately killed), **Bob's node panicked right after committing block 97** and logged nothing afterwards:
+
+```
+thread 'tokio-rt-worker' panicked at tokio-1.54.0/src/sync/task/atomic_waker.rs:324:17:
+assertion failed: old_state == WAKING
+  3: <tokio::sync::task::atomic_waker::AtomicWaker>::take_waker
+  4: <tokio::runtime::time::entry::StateCell>::fire
+  5: <tokio::runtime::time::entry::TimerHandle>::fire
+  6: <tokio::runtime::time::handle::Handle>::process_at_time
+  ...  <tokio::runtime::scheduler::multi_thread::worker::Context>::park / run
+```
+
+With Dave down on purpose, only Alice and Carol remained (2 of 4, below quorum), so the chain **stopped at height 97** and the test reported "JL-03: Dave was never jailed (max missed seen 86%)". Alice, Carol and Dave logged no panic, and the disk was not full. The next sandbox run of the identical tree **passed** (JL-01..JL-09, 660.03 s, no panic). Of the 8 sandbox jail-run log sets still on that machine (different code states), 1 contains a panic; none of the Windows runs (jail ×3, integrity, delay) has shown one.
+
+**What is and is not known.** The backtrace is entirely inside tokio's runtime (the time driver firing a timer on a parking worker); it contains no chain-forge frame, so it cannot be attributed to our code from this evidence. **Equally, tokio-only frames do not clear the application:** a primitive misused by our code or a dependency (for example a waker or timer handled in a way tokio does not permit) can fail an invariant inside the library, so the application is neither implicated nor excluded. The assertion is an internal invariant of tokio's timer state; it is a debug-build check (the sandbox and the live tests run debug builds). It could be a bug in tokio 1.54.0, or memory corruption by `unsafe` code elsewhere in the dependency tree; neither has been investigated or ruled out. It was not reproduced.
+
+**Why it matters.** A validator node that dies or hangs on a runtime panic can stop a chain that is already at its quorum margin, and the process went silent without exiting loudly. **Not changed.** Suggested follow-ups, none done: check tokio's upstream tracker and changelog for this assertion; try a newer tokio; decide whether the node binary should abort the process on a runtime-thread panic (so a supervisor restarts it) instead of continuing; if it recurs, capture `RUST_BACKTRACE=full` and the node's state at the time. The test failure it caused was a false negative for `validator_jail_live`, not a defect in the jail logic.
+
