@@ -657,6 +657,10 @@ pub struct Node {
     storage_v2: bool,
     v2_logs: std::sync::Mutex<Option<crate::storage_v2::V2Logs>>,
     dir_lock: Option<crate::dirlock::DataDirLock>,
+    /// PERSIST-HALT-1: set (one way) when a required persistence operation fails. A node in this state signs nothing,
+    /// commits nothing and stops its event loop; only a process restart (which re-runs the full recovery and signing-guard
+    /// checks) can resume participation. Never cleared in-process.
+    persistence_failed: Option<String>,
     /// Proposals/votes for the next height, replayed through the full
     /// handlers (payload and signature checks included) after the commit.
     next_height_msgs: Vec<NextHeightMsg>,
@@ -1634,6 +1638,7 @@ impl Node {
             storage_v2: false,
             v2_logs: std::sync::Mutex::new(None),
             dir_lock: None,
+            persistence_failed: None,
             next_height_msgs: Vec::new(),
             last_sync_request: None,
             pocd_config,
@@ -1900,9 +1905,29 @@ impl Node {
         self.peer_capacity_table.clone()
     }
 
+    /// Enter the terminal persistence-failed state (idempotent, one way). The failure is local: it is never turned into a
+    /// protocol-level penalty; the safe response is to stop participating.
+    fn latch_persistence_failure(&mut self, err: &str) {
+        if self.persistence_failed.is_none() {
+            error!(error = %err,
+                "FATAL: a required persistence operation failed. This node has STOPPED signing and committing and will not \
+                 resume in this process. Restart it only after checking the data directory; startup re-verifies the \
+                 committed state and the signing guard before any signature is possible.");
+            if let Ok(mut st) = self.status.lock() { st.is_running = false; }
+        }
+        self.persistence_failed = Some(err.to_string());
+    }
+
+    /// `true` once a persistence operation has failed in this process (terminal).
+    fn persistence_halted(&self) -> bool { self.persistence_failed.is_some() }
+
+    /// The persistence failure that stopped this node, if any.
+    pub fn persistence_failure(&self) -> Option<&str> { self.persistence_failed.as_deref() }
+
     /// Sign a Vote with this node's key, domain-separated by chain_id.
     /// No-op (leaves signature empty) if no signing key is loaded.
     fn sign_vote(&self, vote: &mut Vote) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1: no signature after a persistence failure
         let Some(ref kp) = self.signing_key else { return };
         let chain_id = self.genesis.chain_id.as_str();
         let bytes = vote_signing_bytes(
@@ -1917,6 +1942,7 @@ impl Node {
 
     /// Sign a BlockProposal with this node's key.
     fn sign_proposal(&self, proposal: &mut BlockProposal) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1: no signature after a persistence failure
         let Some(ref kp) = self.signing_key else { return };
         let chain_id = self.genesis.chain_id.as_str();
         let bytes = proposal_signing_bytes(
@@ -2857,6 +2883,10 @@ impl Node {
         }
         let mut running = true;
         while running {
+            if self.persistence_halted() {
+                error!("node event loop stopping: a persistence operation failed (PERSIST-HALT-1)");
+                break;
+            }
             tokio::select! {
                 _ = consensus_interval.tick(), if self.consensus.drives_own_votes() => {
                     self.consensus_tick().await;
@@ -2887,6 +2917,7 @@ impl Node {
                 }
 
                 _ = interval.tick() => {
+                    if self.persistence_halted() { continue; }    // PERSIST-HALT-1: no heartbeat-driven round change or nil vote
                     let height = self.consensus.current_height();
                     let peer_count = {
                         let s = self.status.lock().unwrap();
@@ -2969,6 +3000,7 @@ impl Node {
                                     if let Err(e) = self.persist_state() {
                                         tracing::error!(error = %e,
                                             "FATAL: snapshot write failed — halting event loop");
+                                        self.latch_persistence_failure(&e);
                                         running = false;
                                     }
                                 }
@@ -3099,6 +3131,10 @@ impl Node {
                         s.local_peer_id = Some(peer_id.0.clone());
                     }
                 }
+            }
+
+            NetworkEvent::Message(_) if self.persistence_halted() => {
+                // PERSIST-HALT-1: a node whose persistence failed accepts no consensus input.
             }
 
             NetworkEvent::Message(msg) => {
@@ -3835,6 +3871,7 @@ impl Node {
     /// everyone else forward immediately instead of a slow, uncoordinated
     /// drift that can easily never converge.
     async fn catch_up_round_if_behind(&mut self, height: u64, their_round: u32) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1: no local round advancement either
         let my_round = self.consensus.current_round();
         if height != self.consensus.current_height() || their_round <= my_round {
             return;
@@ -3889,6 +3926,7 @@ impl Node {
         &mut self,
         proposal: &BlockProposal,
     ) -> Result<Option<chain_forge_consensus::CommitCertificate>, String> {
+        if self.persistence_halted() { return Ok(None); } // PERSIST-HALT-1
         let Some(my_id) = self.validator_id.clone() else {
             return Ok(None);
         };
@@ -4245,6 +4283,10 @@ impl Node {
         cert: chain_forge_consensus::CommitCertificate,
         proposal: &BlockProposal,
     ) -> Result<(), String> {
+        // PERSIST-HALT-1: after a persistence failure this process commits nothing further.
+        if let Some(e) = &self.persistence_failed {
+            return Err(format!("refusing to commit: persistence failed earlier in this process ({e})"));
+        }
         // A commit means the round we were tracking is over -- clear the
         // propose-once guard so the next height starts clean.
         self.last_proposed = None;
@@ -5329,6 +5371,7 @@ impl Node {
             tracing::error!(error = %e,
                 "FATAL: snapshot write failed after commit — halting consensus to prevent \
                  double-signing on restart. Operator must fix the data directory.");
+            self.latch_persistence_failure(&e);       // PERSIST-HALT-1: the latch every signing path checks
             return Err(e);
         }
 
@@ -5636,6 +5679,7 @@ impl Node {
     async fn drive_consensus(&mut self) {
         let mut budget = 10_000usize;
         while let Some(action) = self.consensus.next_action() {
+            if self.persistence_halted() { break; }       // PERSIST-HALT-1: drop every queued action, e.g. the next height's votes
             budget -= 1;
             if budget == 0 {
                 warn!("consensus action budget exhausted; continuing on the next tick");
@@ -5679,6 +5723,7 @@ impl Node {
     /// Sign (through the double-sign guard), persist, broadcast, and feed
     /// back one of this validator's own votes.
     async fn cast_engine_vote(&mut self, mut vote: Vote) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1
         if self.signing_key.is_none() {
             debug!("no signing key loaded: not casting");
             return;
@@ -5703,6 +5748,9 @@ impl Node {
                     error!(error = %e, "cannot persist signing state: vote withheld");
                     return;
                 }
+                // fault-injection builds only: die right after the vote's guard is durable, before it is sent
+                #[cfg(feature = "fault-injection")]
+                crate::persistence::fault::hit_at("vote_guard_written", vote.height);
             }
         }
         #[cfg(feature = "fault-injection")]
@@ -5821,6 +5869,7 @@ impl Node {
     /// Engine-driven consensus tick: fire due timers, replay buffered
     /// next-height messages, propose when asked, and re-gossip.
     async fn consensus_tick(&mut self) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1
         #[cfg(feature = "fault-injection")]
         for m in self.fault.take_due() {
             let _ = Box::pin(self.handle_event(NetworkEvent::Message(m))).await;
@@ -5886,6 +5935,7 @@ impl Node {
     /// durable, or the node is abstaining. A node with a signing key signs a proposal only after the guard
     /// recording it is on disk (the same rule as votes); a node without a key (tests) is unchanged.
     async fn sign_and_register_own_proposal(&mut self, mut proposal: BlockProposal) -> Option<BlockProposal> {
+        if self.persistence_halted() { return None; }     // PERSIST-HALT-1
         if self.signing_key.is_some() {
             if let Some(g) = self.signing_abstain_until {
                 if proposal.height <= g {
@@ -5903,6 +5953,9 @@ impl Node {
                         error!(error = %e, "cannot persist signing state: proposal withheld");
                         return None;
                     }
+                    // fault-injection builds only: die right after the proposal's guard is durable, before it is sent
+                    #[cfg(feature = "fault-injection")]
+                    crate::persistence::fault::hit_at("proposal_guard_written", proposal.height);
                 }
             }
         } else {
@@ -7799,20 +7852,16 @@ mod tests {
             (after_failure, after_next)
         }
 
-        /// KNOWN FAILURE (KNOWN_ISSUES PERSIST-HALT-1, fix scoped for PR B): every `commit_block` caller on the multi-node path only
-        /// logs the error, so the validator keeps signing at h+1 after block h failed to persist. Run with `--ignored`.
+        /// PERSIST-HALT-1 regression: after block h fails to persist, the validator signs nothing at h+1 (it used to).
         #[tokio::test]
-        #[ignore = "known failure PERSIST-HALT-1: consensus does not halt after a persistence error; fix is in PR B"]
         async fn a_persistence_failure_stops_the_validator_signing_at_the_next_height_v1() {
             let (a, b) = persistence_failure_then_next_height(false).await;
             assert!(a.map_or(false, |l| l.0 == 1), "carol signed at height 1 before the failure: {a:?}");
             assert!(b.map_or(true, |l| l.0 <= 1), "carol must not sign at height 2 after a persistence failure at height 1; guard shows {b:?}");
         }
 
-        /// KNOWN FAILURE (KNOWN_ISSUES PERSIST-HALT-1, fix scoped for PR B): every `commit_block` caller on the multi-node path only
-        /// logs the error, so the validator keeps signing at h+1 after block h failed to persist. Run with `--ignored`.
+        /// PERSIST-HALT-1 regression: after block h fails to persist, the validator signs nothing at h+1 (it used to).
         #[tokio::test]
-        #[ignore = "known failure PERSIST-HALT-1: consensus does not halt after a persistence error; fix is in PR B"]
         async fn a_persistence_failure_stops_the_validator_signing_at_the_next_height_v2() {
             let (a, b) = persistence_failure_then_next_height(true).await;
             assert!(a.map_or(false, |l| l.0 == 1), "carol signed at height 1 before the failure: {a:?}");

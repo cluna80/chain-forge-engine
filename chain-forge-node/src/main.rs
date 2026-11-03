@@ -298,4 +298,10 @@ async fn main() {
 
     // Run the main event loop (blocks until node exits).
     node.run().await;
+
+    // PERSIST-HALT-1: a node stopped by a persistence failure must not look like a clean exit.
+    if let Some(e) = node.persistence_failure() {
+        tracing::error!(error = %e, "node stopped because a persistence operation failed; verify the data directory before restarting");
+        std::process::exit(2);
+    }
 }
