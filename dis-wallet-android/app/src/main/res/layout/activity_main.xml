@@ -83,33 +83,91 @@
             android:id="@+id/etChallenge"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Paste vendor challenge JSON here"
+            android:hint="Paste vendor challenge or transfer JSON"
             android:textColor="#E6EDF3"
             android:textColorHint="#484F58"
             android:background="@drawable/input_background"
             android:padding="16dp"
-            android:layout_marginBottom="16dp"
+            android:layout_marginBottom="12dp"
             android:inputType="textMultiLine"
-            android:minLines="4"
+            android:minLines="3"
             android:gravity="top"/>
 
         <Button
             android:id="@+id/btnScan"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="📷 Scan QR Code"
+            android:minHeight="48dp"
+            android:text="Scan QR code"
             android:backgroundTint="#6E40C9"
             android:textColor="#FFFFFF"
             android:layout_marginBottom="8dp"/>
 
         <Button
-            android:id="@+id/btnSign"
+            android:id="@+id/btnReview"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Sign with DIS"
+            android:minHeight="48dp"
+            android:text="Review"
             android:backgroundTint="#1F6FEB"
             android:textColor="#FFFFFF"
-            android:layout_marginBottom="24dp"/>
+            android:layout_marginBottom="16dp"/>
+
+        <LinearLayout
+            android:id="@+id/cardReview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/input_background"
+            android:padding="16dp"
+            android:layout_marginBottom="16dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tvReviewTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#58A6FF"
+                android:textSize="12sp"
+                android:letterSpacing="0.08"
+                android:layout_marginBottom="8dp"/>
+
+            <TextView
+                android:id="@+id/tvReviewBody"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#E6EDF3"
+                android:textSize="15sp"
+                android:layout_marginBottom="8dp"/>
+
+            <TextView
+                android:id="@+id/tvReviewWarn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#F85149"
+                android:textSize="14sp"
+                android:layout_marginBottom="12dp"
+                android:visibility="gone"/>
+
+            <Button
+                android:id="@+id/btnApprove"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
+                android:text="Sign this challenge"
+                android:backgroundTint="#238636"
+                android:textColor="#FFFFFF"
+                android:layout_marginBottom="8dp"/>
+
+            <Button
+                android:id="@+id/btnRefuse"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
+                android:text="Refuse"
+                android:backgroundTint="#30363D"
+                android:textColor="#E6EDF3"/>
+        </LinearLayout>
 
         <ProgressBar
             android:id="@+id/progressBar"
@@ -160,7 +218,7 @@
             android:id="@+id/btnServerAuth"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="🌐 Authenticate with Server"
+            android:text="Review server challenge"
             android:backgroundTint="#B08800"
             android:textColor="#FFFFFF"
             android:layout_marginBottom="8dp"/>
