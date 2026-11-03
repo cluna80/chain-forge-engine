@@ -7559,7 +7559,7 @@ mod tests {
             use sha2::{Digest, Sha256};
             Sha256::digest(n.snapshot_identity().genesis_hash.as_bytes()).into()
         }
-        struct ProtoRec { total_ms: f64, small_ser_ms: f64, log_ms: f64, snap_ms: f64, bytes: usize, phases: Vec<(&'static str, f64)> }
+        struct ProtoRec { total_ms: f64, small_ser_ms: f64, blk_ms: f64, hvs_ms: f64, log_ms: f64, snap_ms: f64, bytes: usize, phases: Vec<(&'static str, f64)> }
 
         /// The prototype commit boundary: (1) serialise the seven small files, (2) append every block above the
         /// log tail to the block log and fsync, (3) write the generation (small files + descriptor naming the
@@ -7586,6 +7586,8 @@ mod tests {
                 bytes += payload.len() + 8 + 4 + 1 + 8 + 64;
                 log.append(*h, &payload).map_err(|e| e.to_string())?;
             }
+            let blk_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let t_h = std::time::Instant::now();
             let tail = log.tail().cloned().ok_or("empty log")?;
             // historical_validator_sets grows by one validator set per height: it goes into its own append-only log
             // (prototype v2) instead of being rewritten whole into every generation.
@@ -7604,6 +7606,7 @@ mod tests {
                     bytes += v.len(); contents.push(("historical_validator_sets.json", v)); None
                 }
             };
+            let hvs_ms = t_h.elapsed().as_secs_f64() * 1000.0;
             let log_ms = t1.elapsed().as_secs_f64() * 1000.0;
             let descriptor = serde_json::json!({"format": "p02b-proto-2", "tail_height": tail.height, "tail_hash": hex::encode(tail.hash),
                 "hvs_tail_height": hvs_tail.as_ref().map(|t| t.height), "hvs_tail_hash": hvs_tail.as_ref().map(|t| hex::encode(t.hash))});
@@ -7612,7 +7615,7 @@ mod tests {
             crate::persistence::write_snapshot(dir, height, &contents, &n.snapshot_identity(), &n.live_state_root())
                 .map_err(|e| e.to_string())?;
             let snap_ms = t2.elapsed().as_secs_f64() * 1000.0;
-            Ok(ProtoRec { total_ms: t0.elapsed().as_secs_f64() * 1000.0, small_ser_ms, log_ms, snap_ms, bytes, phases: crate::persistence::m0::take() })
+            Ok(ProtoRec { total_ms: t0.elapsed().as_secs_f64() * 1000.0, small_ser_ms, blk_ms, hvs_ms, log_ms, snap_ms, bytes, phases: crate::persistence::m0::take() })
         }
 
         /// Read the committed descriptor from the latest generation (via CURRENT) as a log tail.
@@ -7622,6 +7625,82 @@ mod tests {
             let d: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("snapshots").join(gen).join("blocklog_descriptor.json")).ok()?).ok()?;
             let mut hash = [0u8; 32]; hash.copy_from_slice(&hex::decode(d["tail_hash"].as_str()?).ok()?);
             Some(crate::blocklog::Tail { height: d["tail_height"].as_u64()?, hash })
+        }
+
+        /// The committed descriptor of the latest generation: (block-log tail, validator-history tail).
+        fn proto_descriptor(dir: &std::path::Path) -> Result<(crate::blocklog::Tail, Option<crate::blocklog::Tail>), String> {
+            let cur = std::fs::read_to_string(dir.join("CURRENT")).map_err(|e| format!("CURRENT: {e}"))?;
+            let bytes = std::fs::read(dir.join("snapshots").join(cur.trim()).join("blocklog_descriptor.json")).map_err(|e| format!("descriptor: {e}"))?;
+            let d: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let mk = |h: &str, x: &str| -> Result<Option<crate::blocklog::Tail>, String> {
+                match (d[h].as_u64(), d[x].as_str()) {
+                    (Some(height), Some(hx)) => { let mut hash = [0u8; 32]; hash.copy_from_slice(&hex::decode(hx).map_err(|e| e.to_string())?); Ok(Some(crate::blocklog::Tail { height, hash })) }
+                    (None, None) => Ok(None),
+                    _ => Err("descriptor half-present".into()),
+                }
+            };
+            Ok((mk("tail_height", "tail_hash")?.ok_or("no block tail")?, mk("hvs_tail_height", "hvs_tail_hash")?))
+        }
+
+        /// Recover BOTH logs against the committed manifest/descriptor. Any inconsistency is fatal.
+        fn proto_recover(dir: &std::path::Path, anchor: crate::blocklog::Hash32, seg: u64, expect_hvs: bool)
+            -> Result<(crate::blocklog::BlockLog, Option<crate::blocklog::BlockLog>), String> {
+            let (bt, ht) = proto_descriptor(dir)?;
+            if expect_hvs != ht.is_some() { return Err("descriptor and log layout disagree about the validator-history log".into()); }
+            if let Some(h) = &ht { if h.height != bt.height { return Err(format!("history tail {} != block tail {}", h.height, bt.height)); } }
+            let b = crate::blocklog::BlockLog::recover(&dir.join("blocklog"), anchor, seg, Some(bt)).map_err(|e| e.to_string())?;
+            let h = match ht { Some(t) => Some(crate::blocklog::BlockLog::recover(&dir.join("hvslog"), anchor, seg, Some(t)).map_err(|e| e.to_string())?), None => None };
+            Ok((b, h))
+        }
+
+        /// Prototype v2: interrupted writes across BOTH logs and the manifest, then continue and stay consistent.
+        #[tokio::test]
+        async fn proto_v2_recovery_is_consistent_across_both_logs_and_the_manifest() {
+            let dir = std::env::temp_dir().join(format!("cf-proto-v2-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut n = liveness_node(1_000_000).await;
+            let anchor = proto_anchor(&n); let seg = 8u64; let mut nonce = 0u64;
+            let mut blog = crate::blocklog::BlockLog::create(&dir.join("blocklog"), anchor, seg).unwrap();
+            let mut hlog = crate::blocklog::BlockLog::create(&dir.join("hvslog"), anchor, seg).unwrap();
+            for h in 0..20u64 { commit_with_txs(&mut n, h, 2, &mut nonce).await; proto_persist(&n, &mut blog, Some(&mut hlog), &dir).unwrap(); }
+            let last_seg = |d: &str| { let mut v: Vec<_> = std::fs::read_dir(dir.join(d)).unwrap().map(|e| e.unwrap().path()).collect(); v.sort(); v.pop().unwrap() };
+            let append_block = |blog: &mut crate::blocklog::BlockLog, n: &Node, h: u64| { blog.append(h, &serde_json::to_vec(&n.chain_store[&h]).unwrap()).unwrap(); };
+            let append_hist = |hlog: &mut crate::blocklog::BlockLog, n: &Node, h: u64| { hlog.append(h, &serde_json::to_vec(&(h, &n.historical_validator_sets[&h])).unwrap()).unwrap(); };
+            // scenario kinds: 0 = crash after block-log append only; 1 = after both logs, before the manifest;
+            // 2 = torn history record beyond the checkpoint; 3 = torn block record beyond the checkpoint
+            for (k, h) in (20u64..24).enumerate() {
+                commit_with_txs(&mut n, h, 2, &mut nonce).await;
+                append_block(&mut blog, &n, h);
+                if k >= 1 { append_hist(&mut hlog, &n, h); }
+                drop(blog); drop(hlog);
+                if k == 2 { let p = last_seg("hvslog"); let l = std::fs::metadata(&p).unwrap().len(); std::fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(l - 17).unwrap(); }
+                if k == 3 { let p = last_seg("blocklog"); let l = std::fs::metadata(&p).unwrap().len(); std::fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(l - 9).unwrap(); }
+                let (b, hh) = proto_recover(&dir, anchor, seg, true).unwrap();
+                assert_eq!(b.tail().unwrap().height, h - 1, "scenario {k}: block log returns to the checkpoint, never forward");
+                assert_eq!(hh.as_ref().unwrap().tail().unwrap().height, h - 1, "scenario {k}: history log returns to the checkpoint");
+                blog = b; hlog = hh.unwrap();
+                // continue: the recovered logs accept the block again and the checkpoint advances consistently
+                proto_persist(&n, &mut blog, Some(&mut hlog), &dir).unwrap();
+                let (bt, ht) = proto_descriptor(&dir).unwrap();
+                assert_eq!((bt.height, ht.unwrap().height), (h, h));
+            }
+            assert_eq!(proto_replay_equals(&n, &dir.join("blocklog")).unwrap(), 24);
+            // damage INSIDE the committed region of either log is fatal
+            drop(blog); drop(hlog);
+            for d in ["hvslog", "blocklog"] {
+                let p = { let mut v: Vec<_> = std::fs::read_dir(dir.join(d)).unwrap().map(|e| e.unwrap().path()).collect(); v.sort(); v[0].clone() };
+                let orig = std::fs::read(&p).unwrap();
+                let mut bad = orig.clone(); bad[40] ^= 1; std::fs::write(&p, &bad).unwrap();
+                assert!(proto_recover(&dir, anchor, seg, true).is_err(), "{d}: flipped byte in a committed record must be fatal");
+                std::fs::write(&p, &orig).unwrap();
+                assert!(proto_recover(&dir, anchor, seg, true).is_ok());
+            }
+            // history log shorter than the checkpoint: fatal
+            { let p = last_seg("hvslog"); let orig = std::fs::read(&p).unwrap(); std::fs::write(&p, &orig[..orig.len() - 30]).unwrap();
+              assert!(proto_recover(&dir, anchor, seg, true).is_err(), "history log shorter than the checkpoint must be fatal"); std::fs::write(&p, &orig).unwrap(); }
+            // layout disagreement (checkpoint names a history log, caller expects none): fatal
+            assert!(proto_recover(&dir, anchor, seg, false).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// Replay the log into a chain_store map and prove it equals the in-memory one byte for byte.
@@ -7690,7 +7769,7 @@ mod tests {
             let use_hvs = std::env::var("CF_PB_HVS").is_ok();
             let mut hvs = if use_hvs { Some(crate::blocklog::BlockLog::create(&dir.join("hvslog"), proto_anchor(&nodes[0]), seg).unwrap()) } else { None };
             let mut csv = std::fs::File::create(&csv_path).unwrap();
-            writeln!(csv, "height,commit_ms,proto_total_ms,small_ser_ms,log_append_ms,snapshot_ms,bytes_written,files_write_fsync_sha,fsync_gen_dir,manifest_write,fsync_gen_dir2,fsync_snaps_dir,current_write,prune,roots_agree").unwrap();
+            writeln!(csv, "height,commit_ms,proto_total_ms,small_ser_ms,blk_append_ms,hvs_append_ms,log_append_ms,snapshot_ms,bytes_written,files_write_fsync_sha,fsync_gen_dir,manifest_write,fsync_gen_dir2,fsync_snaps_dir,current_write,prune,roots_agree").unwrap();
             let start = std::time::Instant::now(); let (mut nonce, mut bad, mut done) = (0u64, 0u64, 0u64);
             for h in 0..=max {
                 for _ in 0..k {
@@ -7708,8 +7787,8 @@ mod tests {
                 let agree = (1..nn).all(|i| nodes[i].live_state_root() == r0); if !agree { bad += 1; }
                 let r = proto_persist(&nodes[0], &mut log, hvs.as_mut(), &dir).unwrap();
                 let ph = |name: &str| r.phases.iter().find(|p| p.0 == name).map(|p| p.1).unwrap_or(f64::NAN);
-                writeln!(csv, "{h},{commit_ms:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{agree}",
-                    r.total_ms, r.small_ser_ms, r.log_ms, r.snap_ms, r.bytes, ph("files_write_fsync_sha"), ph("fsync_gen_dir"), ph("manifest_write"), ph("fsync_gen_dir2"), ph("fsync_snaps_dir"), ph("current_write"), ph("prune")).unwrap();
+                writeln!(csv, "{h},{commit_ms:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{agree}",
+                    r.total_ms, r.small_ser_ms, r.blk_ms, r.hvs_ms, r.log_ms, r.snap_ms, r.bytes, ph("files_write_fsync_sha"), ph("fsync_gen_dir"), ph("manifest_write"), ph("fsync_gen_dir2"), ph("fsync_snaps_dir"), ph("current_write"), ph("prune")).unwrap();
                 done = h + 1;
                 if h % 1000 == 0 { println!("PB h={h} commit={commit_ms:.1}ms proto={:.1}ms bytes={} elapsed={:.0}s", r.total_ms, r.bytes, start.elapsed().as_secs_f64()); }
                 if start.elapsed().as_secs_f64() > budget { println!("PB budget reached at height {h}"); break; }
@@ -7717,18 +7796,23 @@ mod tests {
             drop(log); drop(hvs);
             println!("PB DONE blocks={done} elapsed={:.1}s nodes={nn} root_disagreements={bad}", start.elapsed().as_secs_f64());
             // recovery / replay costs at the final height
-            let committed = proto_committed_tail(&dir).unwrap();
             let t = std::time::Instant::now();
             let cnt = proto_replay_equals(&nodes[0], &logdir).unwrap();
             println!("PB replay+deserialise+compare {cnt} blocks: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
             let t = std::time::Instant::now();
             let mut c = 0u64; crate::blocklog::BlockLog::replay(&logdir, proto_anchor(&nodes[0]), |_, _| c += 1).unwrap();
-            println!("PB replay (hash-chain verification only) {c} records: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+            println!("PB replay block log (hash-chain verification only) {c} records: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+            if use_hvs {
+                let t = std::time::Instant::now();
+                let mut c = 0u64; crate::blocklog::BlockLog::replay(&dir.join("hvslog"), proto_anchor(&nodes[0]), |_, _| c += 1).unwrap();
+                println!("PB replay history log (hash-chain verification only) {c} records: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+            }
             let t = std::time::Instant::now();
-            let l = crate::blocklog::BlockLog::recover(&logdir, proto_anchor(&nodes[0]), seg, Some(committed.clone())).unwrap();
-            println!("PB recover (open + verify + truncate to checkpoint): {:.0} ms, tail={}", t.elapsed().as_secs_f64() * 1000.0, l.tail().unwrap().height);
-            let sz: u64 = std::fs::read_dir(&logdir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
-            println!("PB log size on disk: {:.1} MB for {done} blocks ({} B/block)", sz as f64 / 1e6, sz / done.max(1));
+            let (b, hh) = proto_recover(&dir, proto_anchor(&nodes[0]), seg, use_hvs).unwrap();
+            println!("PB recover BOTH logs against the manifest (open + verify + truncate): {:.0} ms, tails={} / {:?}", t.elapsed().as_secs_f64() * 1000.0, b.tail().unwrap().height, hh.as_ref().map(|x| x.tail().unwrap().height));
+            let dsz = |d: &str| -> u64 { std::fs::read_dir(dir.join(d)).map(|r| r.map(|e| e.unwrap().metadata().unwrap().len()).sum()).unwrap_or(0) };
+            let (sb, sh) = (dsz("blocklog"), dsz("hvslog"));
+            println!("PB log sizes: block log {:.1} MB ({} B/block), history log {:.1} MB ({} B/block)", sb as f64 / 1e6, sb / done.max(1), sh as f64 / 1e6, sh / done.max(1));
             assert_eq!(bad, 0);
             let _ = std::fs::remove_dir_all(&dir);
         }
