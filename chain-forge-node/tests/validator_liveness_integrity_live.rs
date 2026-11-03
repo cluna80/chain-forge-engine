@@ -43,7 +43,18 @@ const CHAIN_ID:     &str = "qcb-devnet-val-jail";
 const GENESIS_BOND: u64  = 490_000_000;
 const NAMES: [&str; 4]   = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
 
-fn free_port() -> u16 { TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
+/// Ports below the OS ephemeral range (Linux 32768+, Windows 49152+): the other nodes' outgoing
+/// connections draw from the ephemeral range, and a node restarted on its old API port can find it taken.
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let start = 20_000 + (std::process::id() % 8_000) as u16;
+    loop {
+        let p = start + NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(p < 32_000, "no free port found");
+        if TcpListener::bind(("127.0.0.1", p)).is_ok() { return p; }
+    }
+}
 fn repo_root() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf() }
 fn node_bin() -> PathBuf {
     let target = std::env::var("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|_| repo_root().join("target"));
