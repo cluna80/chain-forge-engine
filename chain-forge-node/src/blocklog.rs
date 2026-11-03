@@ -15,6 +15,8 @@
 //!   hash and the kind, so a log written for another chain, genesis or kind never verifies.
 //! * `payload` is opaque bytes here (the canonical encoding is [`crate::canon`]; the consensus types'
 //!   encoders arrive in PR 2).
+//! * The caller supplies the log's `first_height` (explicit, not inferred); the first record must carry it and
+//!   heights must be consecutive thereafter. A log that starts elsewhere is corruption.
 //! * Segments: `seg-<first_height, 20 digits>.log`, rolled after `seg_records` records.
 //!
 //! # Commit rule
@@ -142,6 +144,7 @@ fn segments(dir: &Path) -> std::io::Result<Vec<(u64, PathBuf)>> {
 pub struct BlockLog {
     dir: PathBuf,
     kind: u8,
+    first_height: u64,
     seg_records: u64,
     tail: Option<Tail>,
     anchor: Hash32,
@@ -153,10 +156,10 @@ impl BlockLog {
     pub fn kind(&self) -> u8 { self.kind }
 
     /// Create an empty log in a new or empty directory (refuses a directory that already holds segments).
-    pub fn create(dir: &Path, kind: u8, anchor: Hash32, seg_records: u64) -> Result<Self, LogError> {
+    pub fn create(dir: &Path, kind: u8, anchor: Hash32, first_height: u64, seg_records: u64) -> Result<Self, LogError> {
         std::fs::create_dir_all(dir)?;
         if !segments(dir)?.is_empty() { return Err(LogError::AlreadyExists); }
-        Ok(BlockLog { dir: dir.to_path_buf(), kind, seg_records: seg_records.max(1), tail: None, anchor, cur: None })
+        Ok(BlockLog { dir: dir.to_path_buf(), kind, first_height, seg_records: seg_records.max(1), tail: None, anchor, cur: None })
     }
 
     /// Open an existing log for appending, recovering against the committed checkpoint `committed`.
@@ -167,24 +170,24 @@ impl BlockLog {
     /// * Valid records beyond the committed tail, a torn record beyond it, trailing garbage beyond it, or an
     ///   empty or damaged later segment are truncated or removed; the log is reopened exactly at the tail.
     /// * Idempotent: recovering twice gives the same result.
-    pub fn recover(dir: &Path, kind: u8, anchor: Hash32, seg_records: u64, committed: Option<Tail>) -> Result<Self, LogError> {
+    pub fn recover(dir: &Path, kind: u8, anchor: Hash32, first_height: u64, seg_records: u64, committed: Option<Tail>) -> Result<Self, LogError> {
         let segs = segments(dir)?;
         let seg_records = seg_records.max(1);
         let Some(c) = committed else {
             for (_, p) in &segs { std::fs::remove_file(p)?; }
             if dir.exists() { fsync_dir(dir)?; }
-            return Ok(BlockLog { dir: dir.to_path_buf(), kind, seg_records, tail: None, anchor, cur: None });
+            return Ok(BlockLog { dir: dir.to_path_buf(), kind, first_height, seg_records, tail: None, anchor, cur: None });
         };
         // (segment index, offset after the record, tail) for every valid record, in order.
         let mut index: Vec<(usize, u64, Tail)> = vec![];
         let mut damage: Option<(usize, u64, String)> = None;
-        let (mut prev, mut expect) = (anchor, None::<u64>);
+        let (mut prev, mut expect) = (anchor, first_height);
         for (i, (first, path)) in segs.iter().enumerate() {
-            if let Some(e) = expect { if *first != e { damage = Some((i, 0, format!("segment starts at {first}, expected {e}"))); break; } }
+            if *first != expect { damage = Some((i, 0, format!("segment starts at {first}, expected {expect}"))); break; }
             let mut bytes = vec![]; std::fs::File::open(path)?.read_to_end(&mut bytes)?;
-            let s = scan_bytes(&bytes, kind, prev, expect.unwrap_or(*first), |_, _| {});
+            let s = scan_bytes(&bytes, kind, prev, expect, |_, _| {});
             for r in &s.recs { index.push((i, r.end_off, r.tail.clone())); }
-            if let Some(r) = s.recs.last() { prev = r.tail.hash; expect = Some(r.tail.height + 1); }
+            if let Some(r) = s.recs.last() { prev = r.tail.hash; expect = r.tail.height + 1; }
             if let Some((o, why)) = s.damage { damage = Some((i, o, why)); break; }
         }
         let Some(pos) = index.iter().position(|(_, _, t)| t.height == c.height) else {
@@ -206,7 +209,7 @@ impl BlockLog {
         fsync_dir(dir)?;
         let count = index[..=pos].iter().filter(|(si, _, _)| *si == seg_i).count() as u64;
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
-        Ok(BlockLog { dir: dir.to_path_buf(), kind, seg_records, tail: Some(c), anchor, cur: Some((file, count)) })
+        Ok(BlockLog { dir: dir.to_path_buf(), kind, first_height, seg_records, tail: Some(c), anchor, cur: Some((file, count)) })
     }
 
     /// Append one record and make it durable (`sync_data`; directory fsync when a segment is created).
@@ -214,7 +217,8 @@ impl BlockLog {
     /// caller must treat any error as fatal (the on-disk tail is then resolved by `recover`).
     pub fn append(&mut self, height: u64, payload: &[u8]) -> Result<Tail, LogError> {
         if payload.len() as u64 > MAX_PAYLOAD { return Err(LogError::Corrupt { segment: String::new(), offset: 0, detail: "payload exceeds MAX_PAYLOAD".into() }); }
-        if let Some(t) = &self.tail { if height != t.height + 1 { return Err(LogError::Gap { expected: t.height + 1, got: height }); } }
+        let expected = self.tail.as_ref().map(|t| t.height + 1).unwrap_or(self.first_height);
+        if height != expected { return Err(LogError::Gap { expected, got: height }); }
         let prev = self.tail.as_ref().map(|t| t.hash).unwrap_or(self.anchor);
         let (bytes, h) = record_bytes(self.kind, height, payload, &prev);
         let roll = match &self.cur { Some((_, n)) => *n >= self.seg_records, None => true };
@@ -235,14 +239,14 @@ impl BlockLog {
 
     /// Read and verify the whole log from the anchor, calling `f(height, payload)` in order. Any damage is an
     /// error. Used for replay and full verification.
-    pub fn replay(dir: &Path, kind: u8, anchor: Hash32, mut f: impl FnMut(u64, &[u8])) -> Result<Option<Tail>, LogError> {
-        let (mut prev, mut expect, mut tail) = (anchor, None::<u64>, None);
+    pub fn replay(dir: &Path, kind: u8, anchor: Hash32, first_height: u64, mut f: impl FnMut(u64, &[u8])) -> Result<Option<Tail>, LogError> {
+        let (mut prev, mut expect, mut tail) = (anchor, first_height, None);
         for (first, path) in segments(dir)? {
-            if let Some(e) = expect { if first != e { return Err(LogError::Corrupt { segment: seg_name(first), offset: 0, detail: format!("segment starts at {first}, expected {e}") }); } }
+            if first != expect { return Err(LogError::Corrupt { segment: seg_name(first), offset: 0, detail: format!("segment starts at {first}, expected {expect}") }); }
             let mut bytes = vec![]; std::fs::File::open(&path)?.read_to_end(&mut bytes)?;
-            let s = scan_bytes(&bytes, kind, prev, expect.unwrap_or(first), &mut f);
+            let s = scan_bytes(&bytes, kind, prev, expect, &mut f);
             if let Some((off, why)) = s.damage { return Err(LogError::Corrupt { segment: seg_name(first), offset: off, detail: why }); }
-            if let Some(r) = s.recs.last() { prev = r.tail.hash; expect = Some(r.tail.height + 1); tail = Some(r.tail.clone()); }
+            if let Some(r) = s.recs.last() { prev = r.tail.hash; expect = r.tail.height + 1; tail = Some(r.tail.clone()); }
         }
         Ok(tail)
     }
@@ -260,12 +264,12 @@ mod tests {
     }
     fn payload(h: u64) -> Vec<u8> { format!("block-{h}-{}", "x".repeat((h % 17) as usize * 3)).into_bytes() }
     fn fill(dir: &Path, n: u64, seg: u64) -> Vec<Tail> {
-        let mut l = BlockLog::create(dir, K, anchor(), seg).unwrap();
+        let mut l = BlockLog::create(dir, K, anchor(), 0, seg).unwrap();
         (0..n).map(|h| l.append(h, &payload(h)).unwrap()).collect()
     }
     fn rec_len(h: u64) -> usize { HEADER_LEN + payload(h).len() + TRAILER_LEN }
     fn first_seg(dir: &Path) -> PathBuf { segments(dir).unwrap()[0].1.clone() }
-    fn rec(dir: &Path, committed: Option<Tail>, seg: u64) -> Result<BlockLog, LogError> { BlockLog::recover(dir, K, anchor(), seg, committed) }
+    fn rec(dir: &Path, committed: Option<Tail>, seg: u64) -> Result<BlockLog, LogError> { BlockLog::recover(dir, K, anchor(), 0, seg, committed) }
 
     // ── golden vectors: byte-identical on every platform; changing them is a format change ──
     #[test]
@@ -283,7 +287,7 @@ mod tests {
 
     #[test]
     fn a_log_written_to_disk_has_exactly_the_golden_bytes_and_tail() {
-        let d = tmp("goldfile"); let mut l = BlockLog::create(&d, K, anchor(), 100).unwrap();
+        let d = tmp("goldfile"); let mut l = BlockLog::create(&d, K, anchor(), 0, 100).unwrap();
         l.append(0, b"").unwrap(); l.append(1, &[b'x'; 5]).unwrap(); let t = l.append(2, &(0u8..10).collect::<Vec<_>>()).unwrap();
         assert_eq!(hex::encode(t.hash), "4b0fd02007f005ad54b06666c64d037237af2278b3f6995dd6d6550ccc7b0520");
         assert_eq!(std::fs::read(first_seg(&d)).unwrap().len(), (HEADER_LEN + TRAILER_LEN) * 3 + 15);
@@ -308,7 +312,7 @@ mod tests {
         let d = tmp("rt"); let tails = fill(&d, 25, 4);
         assert_eq!(segments(&d).unwrap().len(), 7);
         let mut seen = vec![];
-        let t = BlockLog::replay(&d, K, anchor(), |h, p| { assert_eq!(p, payload(h).as_slice()); seen.push(h); }).unwrap().unwrap();
+        let t = BlockLog::replay(&d, K, anchor(), 0, |h, p| { assert_eq!(p, payload(h).as_slice()); seen.push(h); }).unwrap().unwrap();
         assert_eq!(t, *tails.last().unwrap());
         assert_eq!(seen, (0..25).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&d);
@@ -324,7 +328,7 @@ mod tests {
 
     #[test]
     fn append_rejects_a_height_gap_and_leaves_the_tail_unchanged() {
-        let d = tmp("gap"); let mut l = BlockLog::create(&d, K, anchor(), 4).unwrap();
+        let d = tmp("gap"); let mut l = BlockLog::create(&d, K, anchor(), 0, 4).unwrap();
         let t0 = l.append(0, b"a").unwrap();
         assert!(matches!(l.append(2, b"c"), Err(LogError::Gap { expected: 1, got: 2 })));
         assert_eq!(l.tail(), Some(&t0));
@@ -335,16 +339,16 @@ mod tests {
     #[test]
     fn create_refuses_a_directory_that_already_holds_a_log() {
         let d = tmp("refuse"); fill(&d, 2, 4);
-        assert!(matches!(BlockLog::create(&d, K, anchor(), 4), Err(LogError::AlreadyExists)));
+        assert!(matches!(BlockLog::create(&d, K, anchor(), 0, 4), Err(LogError::AlreadyExists)));
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
     fn wrong_anchor_or_wrong_kind_is_rejected() {
         let d = tmp("anchor"); let tails = fill(&d, 3, 4);
-        assert!(BlockLog::recover(&d, K, [9u8; 32], 4, Some(tails[2].clone())).is_err());
-        assert!(BlockLog::recover(&d, KIND_VALIDATOR_SET, anchor(), 4, Some(tails[2].clone())).is_err());
-        assert!(BlockLog::replay(&d, KIND_VALIDATOR_SET, anchor_for(b"golden-genesis", KIND_VALIDATOR_SET), |_, _| {}).is_err());
+        assert!(BlockLog::recover(&d, K, [9u8; 32], 0, 4, Some(tails[2].clone())).is_err());
+        assert!(BlockLog::recover(&d, KIND_VALIDATOR_SET, anchor(), 0, 4, Some(tails[2].clone())).is_err());
+        assert!(BlockLog::replay(&d, KIND_VALIDATOR_SET, anchor_for(b"golden-genesis", KIND_VALIDATOR_SET), 0, |_, _| {}).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -362,7 +366,7 @@ mod tests {
             assert_eq!(l.tail(), Some(&committed), "cut at {cut}");
             assert_eq!(std::fs::metadata(&seg).unwrap().len() as usize, end4);
             l.append(5, &payload(5)).unwrap();
-            BlockLog::replay(&d, K, anchor(), |_, _| {}).unwrap();
+            BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).unwrap();
             std::fs::write(&seg, &full).unwrap();
         }
         let _ = std::fs::remove_dir_all(&d);
@@ -388,7 +392,7 @@ mod tests {
         for off in 0..len {
             let mut b = orig.clone(); b[start + off] ^= 0x01; std::fs::write(&seg, &b).unwrap();
             assert!(rec(&d, Some(tails[5].clone()), 100).is_err(), "recover: flip at +{off}");
-            assert!(BlockLog::replay(&d, K, anchor(), |_, _| {}).is_err(), "replay: flip at +{off}");
+            assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_err(), "replay: flip at +{off}");
         }
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -401,7 +405,7 @@ mod tests {
         assert_eq!(l.tail(), Some(&committed));
         assert_eq!(segments(&d).unwrap().len(), 2);
         assert_eq!(l.append(6, &payload(6)).unwrap().height, 6);
-        let mut n = 0; BlockLog::replay(&d, K, anchor(), |_, _| n += 1).unwrap(); assert_eq!(n, 7);
+        let mut n = 0; BlockLog::replay(&d, K, anchor(), 0, |_, _| n += 1).unwrap(); assert_eq!(n, 7);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -424,12 +428,12 @@ mod tests {
         assert!(matches!(rec(&d, Some(Tail { height: 7, hash: [1; 32] }), 4), Err(LogError::MissingCommitted { .. })));
         std::fs::remove_file(d.join(seg_name(4))).unwrap(); // the LAST segment deleted
         assert!(rec(&d, Some(tails[7].clone()), 4).is_err());
-        assert!(BlockLog::replay(&d, K, anchor(), |_, _| {}).is_ok(), "replay alone cannot see a missing tail segment; the checkpoint does");
+        assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_ok(), "replay alone cannot see a missing tail segment; the checkpoint does");
         let _ = std::fs::remove_dir_all(&d);
         let d = tmp("missing-mid"); let tails = fill(&d, 12, 4);
         std::fs::remove_file(d.join(seg_name(4))).unwrap(); // a MIDDLE segment deleted
         assert!(rec(&d, Some(tails[11].clone()), 4).is_err());
-        assert!(BlockLog::replay(&d, K, anchor(), |_, _| {}).is_err());
+        assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -451,12 +455,53 @@ mod tests {
         let bytes2: Vec<_> = segments(&d).unwrap().into_iter().map(|(_, p)| std::fs::read(p).unwrap()).collect();
         assert_eq!(bytes1, bytes2);
         for h in 7..12 { l.append(h, &payload(h)).unwrap(); }
-        let t = BlockLog::replay(&d, K, anchor(), |_, _| {}).unwrap().unwrap();
+        let t = BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).unwrap().unwrap();
         assert_eq!(t.height, 11);
         // and it equals a log written in one go
         let d2 = tmp("idem2"); let t2 = fill(&d2, 12, 4);
         assert_eq!(t, *t2.last().unwrap());
         let _ = std::fs::remove_dir_all(&d); let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// A record whose hashes are all VALID but whose height skips, repeats, or starts elsewhere is corruption: the
+    /// height rule, not the hash chain, is what catches a well-formed log with a missing block.
+    #[test]
+    fn valid_hash_chain_with_a_skipped_repeated_or_misplaced_height_is_fatal() {
+        for bad_heights in [[0u64, 1, 3], [0, 1, 1], [1, 2, 3]] {
+            let d = tmp("height"); std::fs::create_dir_all(&d).unwrap();
+            let mut bytes = vec![]; let mut prev = anchor(); let mut tails = vec![];
+            for h in bad_heights { let (b, hh) = record_bytes(K, h, b"p", &prev); bytes.extend_from_slice(&b); prev = hh; tails.push(Tail { height: h, hash: hh }); }
+            std::fs::write(d.join(seg_name(bad_heights[0])), &bytes).unwrap();
+            assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_err(), "replay must reject heights {bad_heights:?}");
+            assert!(rec(&d, Some(tails[2].clone()), 100).is_err(), "recover must reject heights {bad_heights:?}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn first_height_is_explicit_and_enforced() {
+        let d = tmp("first"); let mut l = BlockLog::create(&d, K, anchor(), 5, 4).unwrap();
+        assert!(matches!(l.append(0, b"x"), Err(LogError::Gap { expected: 5, got: 0 })));
+        let t = l.append(5, b"x").unwrap(); l.append(6, b"y").unwrap();
+        assert!(BlockLog::replay(&d, K, anchor(), 5, |_, _| {}).is_ok());
+        assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_err());
+        assert!(BlockLog::recover(&d, K, anchor(), 0, 4, Some(t.clone())).is_err());
+        assert!(BlockLog::recover(&d, K, anchor(), 5, 4, Some(t)).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A record with a valid self-hash spliced in from another position (wrong prev) is fatal.
+    #[test]
+    fn a_spliced_record_with_the_wrong_prev_hash_is_fatal() {
+        let d = tmp("splice"); std::fs::create_dir_all(&d).unwrap();
+        let mut bytes = vec![]; let (mut prev, mut hashes) = (anchor(), vec![]);
+        for h in 0..2u64 { let (b, hh) = record_bytes(K, h, b"p", &prev); bytes.extend_from_slice(&b); prev = hh; hashes.push(hh); }
+        let (b, hh) = record_bytes(K, 2, b"p", &hashes[0]); // links to record 0, skipping record 1
+        bytes.extend_from_slice(&b);
+        std::fs::write(d.join(seg_name(0)), &bytes).unwrap();
+        assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_err());
+        assert!(rec(&d, Some(Tail { height: 2, hash: hh }), 100).is_err());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Model-based random crash test: random segment sizes, random committed tail, random damage applied BEYOND the
@@ -495,7 +540,7 @@ mod tests {
                 let mut l = rec(&d, Some(committed.clone()), seg).unwrap_or_else(|e| panic!("case {case}: damage beyond the tail must recover: {e}"));
                 assert_eq!(l.tail(), Some(&committed), "case {case}");
                 l.append(committed.height + 1, &payload(committed.height + 1)).unwrap();
-                let t = BlockLog::replay(&d, K, anchor(), |_, _| {}).unwrap().unwrap();
+                let t = BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).unwrap().unwrap();
                 assert_eq!(t.height, committed.height + 1, "case {case}");
             }
             let _ = std::fs::remove_dir_all(&d);
