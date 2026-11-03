@@ -1,4 +1,4 @@
-# Qattice — Chain Forge Engine
+# Qattice — Built by Chain Forge Engine
 
 **Qattice** is a sovereign Layer-1 blockchain built from scratch in Rust. Its distinguishing
 feature is personhood-weighted Byzantine Fault Tolerant consensus: voting power derives from
