@@ -145,7 +145,7 @@ pub fn load(dir: &Path, identity: &SnapshotIdentity) -> Result<Option<Loaded>, S
         Layout::Fresh => return Ok(None),
         Layout::V1 => return Err("this data directory is storage format 1; this node is configured for storage v2 and never migrates automatically".into()),
         Layout::Ambiguous(why) => return Err(format!("ambiguous data directory layout: {why}")),
-        Layout::LogsOnly => return load_logs_only(dir, identity).map(|()| None),
+        Layout::LogsOnly => return verify_logs_only(dir, identity).map(|()| None),
         Layout::V2 => {}
     }
     let contents = persistence::load_snapshot_format(dir, identity, FORMAT_VERSION_V2).map_err(|e| e.to_string())?
@@ -179,8 +179,9 @@ pub fn load(dir: &Path, identity: &SnapshotIdentity) -> Result<Option<Loaded>, S
 }
 
 /// No committed generation but log segments exist: only a crash during the very first commit may leave this, and
-/// then each log holds at most one record. Anything else is refused (never silently deleted).
-fn load_logs_only(dir: &Path, identity: &SnapshotIdentity) -> Result<(), String> {
+/// then each log holds at most one record. Anything else is refused. **Read-only**: nothing is deleted here, so the
+/// caller can still refuse the start (signing guard) with the evidence intact; see [`discard_first_commit_logs`].
+fn verify_logs_only(dir: &Path, identity: &SnapshotIdentity) -> Result<(), String> {
     for (sub, kind) in [(BLOCKLOG_DIR, KIND_BLOCK), (HVSLOG_DIR, KIND_VALIDATOR_SET)] {
         let ld = dir.join(sub);
         let Some(first) = blocklog::first_segment_height(&ld).map_err(|e| e.to_string())? else { continue };
@@ -188,6 +189,13 @@ fn load_logs_only(dir: &Path, identity: &SnapshotIdentity) -> Result<(), String>
         BlockLog::replay(&ld, kind, anchor(identity, kind), first, |_, _| n += 1).map_err(|e| format!("{sub}: {e}"))?;
         if n > 1 { return Err(format!("{sub} holds {n} records but no generation is committed: refusing to delete it")); }
     }
+    Ok(())
+}
+
+/// Remove the (at most one-record) logs left by a crash during the very first commit. Call only after the
+/// signing-guard check has allowed a fresh start.
+pub fn discard_first_commit_logs(dir: &Path, identity: &SnapshotIdentity) -> Result<(), String> {
+    verify_logs_only(dir, identity)?;
     for (sub, kind) in [(BLOCKLOG_DIR, KIND_BLOCK), (HVSLOG_DIR, KIND_VALIDATOR_SET)] {
         BlockLog::recover(&dir.join(sub), kind, anchor(identity, kind), 0, SEG_RECORDS, None).map_err(|e| format!("{sub}: {e}"))?;
     }

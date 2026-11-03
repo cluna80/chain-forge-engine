@@ -2400,7 +2400,16 @@ impl Node {
                 // proves chain state existed. Starting from genesis would let
                 // this validator sign again at heights it already signed.
                 match crate::persistence::guard_proves_missing_state(dir) {
-                    Ok(None) => return PersistStartup::Fresh,
+                    Ok(None) => {
+                        // Storage v2: only now, after the guard allowed a fresh start, drop the orphaned
+                        // records of a crash during the very first commit.
+                        if self.storage_v2 && crate::persistence::v2_logs_present(dir) {
+                            if let Err(e) = crate::storage_v2::discard_first_commit_logs(dir, &self.snapshot_identity()) {
+                                return PersistStartup::Fatal { error: e };
+                            }
+                        }
+                        return PersistStartup::Fresh;
+                    }
                     Ok(Some(guard_height)) => return PersistStartup::Fatal { error: format!(
                         "consensus signing history exists (last signed height {guard_height}) \
                          but no chain state was found — refusing to start from genesis; \
@@ -7751,7 +7760,17 @@ mod tests {
             for h in 0..3 { commit_with_txs(&mut n, h, 1, &mut nonce).await; } drop(n);
             let _ = std::fs::remove_dir_all(dir2.join("snapshots")); let _ = std::fs::remove_file(dir2.join("CURRENT"));
             assert!(is_fatal(&v2_node(&dir2).await.load_persisted_state()));
-            for d in [dir, dir2] { let _ = std::fs::remove_dir_all(&d); }
+            // a guard above height 0 next to first-commit leftovers: refused, and the leftovers are NOT deleted
+            let dir3 = v2_tmp("orphan-guard"); let mut n = v2_node(&dir3).await; let mut nonce = 0;
+            let p = next_proposal(&mut n, 0, 1, &mut nonce);
+            crate::persistence::fault::arm("hvs_log_appended"); deliver_lenient(&mut n, &p).await; crate::persistence::fault::disarm();
+            let v = signed_vote(CHAIN, VoteType::Precommit, 3, 0, "qcb1alice", BlockHash("x".into()));
+            n.sign_guard.record(&v, None); n.persist_sign_guard().unwrap(); drop(n);
+            let bytes = |d: &std::path::Path| std::fs::read_dir(d.join("blocklog")).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect::<Vec<_>>();
+            let before = bytes(&dir3);
+            assert!(is_fatal(&v2_node(&dir3).await.load_persisted_state()));
+            assert_eq!(bytes(&dir3), before, "a refused start must not delete the orphaned log records");
+            for d in [dir, dir2, dir3] { let _ = std::fs::remove_dir_all(&d); }
         }
 
         /// V2-8: the data directory is exclusively locked by the OS; a stale LOCK file does not block.
