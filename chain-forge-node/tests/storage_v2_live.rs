@@ -17,6 +17,8 @@
 //! cargo test -p chain-forge-node --test storage_v2_live -- --nocapture --test-threads=1
 //! ```
 
+use chain_forge_crypto::{ClassicalScheme, SignatureScheme};
+use chain_forge_execution::Transaction;
 use std::{
     io::{BufRead, Write},
     net::{TcpListener, TcpStream},
@@ -70,6 +72,44 @@ fn wait_heights(ports: &[u16], target: u64, t: Duration) -> bool {
     }
     false
 }
+const CHAIN_ID: &str = "qcb-devnet-val-evict";
+
+fn post_tx(port: u16, tx: &Transaction) -> bool {
+    let Ok(mut s) = TcpStream::connect(format!("127.0.0.1:{port}")) else { return false };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let body = serde_json::to_string(tx).unwrap();
+    let req = format!("POST /api/tx HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    if s.write_all(req.as_bytes()).is_err() { return false; }
+    let mut buf = String::new();
+    let _ = std::io::Read::read_to_string(&mut s, &mut buf);
+    buf.contains("queued")
+}
+
+/// Sends one signed transfer (alice -> bob) per ~700 ms to `port` until dropped, so blocks carry transactions and
+/// the state root keeps changing (agreement on an unchanging root would prove little).
+struct Feeder { stop: std::sync::Arc<std::sync::atomic::AtomicBool>, h: Option<std::thread::JoinHandle<u64>> }
+impl Feeder {
+    fn start(port: u16) -> Feeder {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stop.clone();
+        let h = std::thread::spawn(move || {
+            let kp = ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+            let mut sent = 0u64;
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                let nonce = api_get(port, "/api/accounts/qcb1alice").and_then(|v| v["nonce"].as_u64()).unwrap_or(0);
+                let mut tx = Transaction::transfer(&format!("v2l-{nonce}-{sent}"), "qcb1alice", "qcb1bob", "uqcb", 1_000, nonce);
+                tx.sign(&kp, CHAIN_ID).unwrap();
+                if post_tx(port, &tx) { sent += 1; }
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            sent
+        });
+        Feeder { stop, h: Some(h) }
+    }
+    fn finish(mut self) -> u64 { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); self.h.take().unwrap().join().unwrap() }
+}
+impl Drop for Feeder { fn drop(&mut self) { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); } }
+
 fn strip_ansi(t: &str) -> String {
     let (mut out, mut esc) = (String::new(), false);
     for c in t.chars() { if c == '\x1b' { esc = true; continue; } if esc { if c == 'm' { esc = false; } continue; } out.push(c); }
@@ -149,6 +189,7 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
         println!("\n── V2L-1: Dave aborts at {point} while committing height {CRASH_AT} ──");
         let base = std::env::temp_dir().join(format!("cf-v2l1-{}-{point}", std::process::id()));
         let (mut nodes, p2p) = start_cluster(&base, &[("CF_FAULT_V2_CRASH_POINT", point), ("CF_FAULT_V2_CRASH_HEIGHT", &CRASH_AT.to_string())]);
+        let feeder = Feeder::start(nodes[0].api);
         // Dave dies by himself
         let d = Instant::now() + Duration::from_secs(120);
         let status = loop {
@@ -183,6 +224,10 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
         assert!(wait_heights(&all.iter().map(|n| n.api).collect::<Vec<_>>(), target, Duration::from_secs(60)));
         assert_roots_agree(&all, point);
         no_equivocation(&all);
+        let sent = feeder.finish();
+        assert!(sent >= 5, "{point}: only {sent} transactions were accepted: the state would not have moved");
+        let acc = api_get(nodes[0].api, "/api/accounts/qcb1alice").and_then(|v| v["nonce"].as_u64()).unwrap_or(0);
+        assert!(acc >= 5, "{point}: alice's nonce is {acc}: transactions did not commit");
         dave.kill9();
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -193,6 +238,8 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
 fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() {
     let base = std::env::temp_dir().join(format!("cf-v2l2-{}", std::process::id()));
     let (mut nodes, _p2p) = start_cluster(&base, &[]);
+    let feeder = Feeder::start(nodes[0].api);
+    let mut last_root = String::new();
     let all_ports = |ns: &Vec<Node>| ns.iter().map(|n| n.api).collect::<Vec<u16>>();
     for (round, (target, victim)) in [(5u64, 3usize), (15, 2), (30, 1)].into_iter().enumerate() {
         let name = nodes[victim].name;
@@ -224,7 +271,13 @@ fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() {
         let refs: Vec<&Node> = nodes.iter().collect();
         assert!(wait_heights(&all_ports(&nodes), target_h, Duration::from_secs(60)));
         assert_roots_agree(&refs, &format!("round {round}"));
+        let h = refs.iter().map(|n| height(n.api).unwrap_or(0)).min().unwrap();
+        let root = api_get(nodes[0].api, &format!("/api/blocks/{h}")).and_then(|j| j["state_root"].as_str().map(str::to_string)).unwrap_or_default();
+        assert_ne!(root, last_root, "round {round}: the state root did not change since the previous round (no transactions committing?)");
+        last_root = root;
     }
+    let sent = feeder.finish();
+    assert!(sent >= 20, "only {sent} transactions accepted over the run");
     let refs: Vec<&Node> = nodes.iter().collect();
     no_equivocation(&refs);
     let _ = std::fs::remove_dir_all(&base);
