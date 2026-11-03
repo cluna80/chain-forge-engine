@@ -155,6 +155,10 @@ pub struct SnapshotManifest {
 /// The storage format this node reads and writes. Bump on any incompatible
 /// change; a node refuses every other version (no downgrade, no silent upgrade).
 pub const FORMAT_VERSION: u64 = 1;
+/// Storage format 2 (default OFF; P-02b PR 2): chain blocks and validator-set history live in append-only
+/// logs, the generation carries the six small files plus `storage_descriptor.json`. A node reads exactly the
+/// format it is configured for and refuses the other; there is no automatic migration.
+pub const FORMAT_VERSION_V2: u64 = 2;
 
 /// Who a snapshot belongs to. Always derived from the genesis the node is
 /// RUNNING (`Node::snapshot_identity`) — never from a flag, file or environment
@@ -195,7 +199,7 @@ fn is_hash_hex(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_
 /// Refuse a manifest that is of another format, chain or genesis. Order:
 /// format_version, chain_id, genesis_hash. Blank, whitespace-only or missing
 /// identity fields are refused outright (never a wildcard).
-fn check_manifest_identity(m: &SnapshotManifest, gen: &str, expected: &SnapshotIdentity)
+fn check_manifest_identity(m: &SnapshotManifest, gen: &str, expected: &SnapshotIdentity, accepted_format: u64)
     -> Result<(), PersistError>
 {
     let bad = |detail: String| PersistError::IncompatibleManifest { gen: gen.to_string(), detail };
@@ -203,9 +207,11 @@ fn check_manifest_identity(m: &SnapshotManifest, gen: &str, expected: &SnapshotI
         None => return Err(bad(
             "generation manifest missing format_version — written by a pre-H0-3b node; \
              start with a clean data directory".into())),
-        Some(v) if v != FORMAT_VERSION => return Err(bad(format!(
+        Some(v) if v != accepted_format => return Err(bad(format!(
             "manifest format_version {v} is not supported by this node (it reads format_version \
-             {FORMAT_VERSION}); start with a clean data directory"))),
+             {accepted_format}); start with a clean data directory{}",
+            if v == FORMAT_VERSION_V2 { " or run the node with storage v2 enabled" }
+            else if accepted_format == FORMAT_VERSION_V2 { " (existing v1 data is never migrated automatically)" } else { "" }))),
         Some(_) => {}
     }
     match m.chain_id.as_deref() {
@@ -264,6 +270,39 @@ fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+/// Crash points for the storage-v2 commit boundaries. In unit tests `fault::arm(point)` makes the next
+/// `write_snapshot_format` return an error right after `point` (nothing later executes). In a build with the
+/// `fault-injection` feature the node also reads `CF_FAULT_V2_CRASH_POINT` / `CF_FAULT_V2_CRASH_HEIGHT` and
+/// aborts the PROCESS (no destructors, no cleanup) at that point once the committing height reaches the given
+/// height. Neither exists in a normal build.
+#[cfg(any(test, feature = "fault-injection"))]
+#[allow(dead_code)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    thread_local! { static STOP: Cell<Option<&'static str>> = const { Cell::new(None) }; }
+    pub(crate) fn arm(point: &'static str) { STOP.with(|s| s.set(Some(point))); }
+    pub(crate) fn disarm() { STOP.with(|s| s.set(None)); }
+    #[cfg(feature = "fault-injection")]
+    static HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Record the height being committed (fault-injection builds).
+    pub(crate) fn set_height(_h: u64) {
+        #[cfg(feature = "fault-injection")]
+        HEIGHT.store(_h, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(crate) fn hit(point: &'static str) -> std::io::Result<()> {
+        #[cfg(feature = "fault-injection")]
+        if std::env::var("CF_FAULT_V2_CRASH_POINT").ok().as_deref() == Some(point) {
+            let at: u64 = std::env::var("CF_FAULT_V2_CRASH_HEIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+            let h = HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+            if h >= at {
+                eprintln!("cf_fault: crashing the process at {point} while committing height {h}");
+                std::process::abort();
+            }
+        }
+        STOP.with(|s| if s.get() == Some(point) { s.set(None); Err(std::io::Error::new(std::io::ErrorKind::Other, format!("injected crash after {point}"))) } else { Ok(()) })
+    }
 }
 
 /// Compute the SHA-256 hex digest of `data`.
@@ -415,6 +454,18 @@ pub fn write_snapshot(
     identity: &SnapshotIdentity,
     state_root: &str,
 ) -> Result<String, PersistError> {
+    write_snapshot_format(data_dir, height, contents, identity, state_root, FORMAT_VERSION)
+}
+
+/// Same as [`write_snapshot`], stamping the manifest with `format_version`.
+pub fn write_snapshot_format(
+    data_dir: &Path,
+    height: u64,
+    contents: &[(&str, Vec<u8>)],
+    identity: &SnapshotIdentity,
+    state_root: &str,
+    format_version: u64,
+) -> Result<String, PersistError> {
     if !is_hash_hex(state_root) {
         return Err(PersistError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
             format!("snapshot state_root '{state_root}' is not 64 hex characters"))));
@@ -446,10 +497,11 @@ pub fn write_snapshot(
     // Fsync the generation directory so all renames are durable before writing
     // the manifest.
     fsync_dir(&gen_dir)?;
+    #[cfg(any(test, feature = "fault-injection"))] fault::hit("gen_files_written")?;
 
     // Write manifest.json last — its presence is the commit signal.
     let manifest = SnapshotManifest {
-        format_version: Some(FORMAT_VERSION),
+        format_version: Some(format_version),
         chain_id:       Some(identity.chain_id.clone()),
         genesis_hash:   Some(identity.genesis_hash.clone()),
         state_root:     Some(state_root.to_ascii_lowercase()),
@@ -460,6 +512,7 @@ pub fn write_snapshot(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     write_atomic_bytes(&gen_dir.join("manifest.json"), &manifest_bytes)?;
+    #[cfg(any(test, feature = "fault-injection"))] fault::hit("manifest_written")?;
 
     // Fsync the generation directory again so the manifest rename is durable.
     fsync_dir(&gen_dir)?;
@@ -471,6 +524,7 @@ pub fn write_snapshot(
 
     // Update CURRENT atomically.
     write_current(data_dir, &gen)?;
+    #[cfg(any(test, feature = "fault-injection"))] fault::hit("current_written")?;
 
     // Prune the generation two steps back (keep N and N-1).
     if next_num >= 2 {
@@ -503,6 +557,13 @@ pub struct SnapshotContents {
 /// - `Ok(None)` — fresh directory (CURRENT absent).
 /// - `Err(PersistError::*)` — corrupted/incomplete snapshot; node must NOT start.
 pub fn load_snapshot(data_dir: &Path, expected: &SnapshotIdentity)
+    -> Result<Option<SnapshotContents>, PersistError>
+{
+    load_snapshot_format(data_dir, expected, FORMAT_VERSION)
+}
+
+/// Same as [`load_snapshot`], accepting exactly `accepted_format`.
+pub fn load_snapshot_format(data_dir: &Path, expected: &SnapshotIdentity, accepted_format: u64)
     -> Result<Option<SnapshotContents>, PersistError>
 {
     let gen_label_str = match read_current(data_dir)
@@ -557,7 +618,7 @@ pub fn load_snapshot(data_dir: &Path, expected: &SnapshotIdentity)
         })?;
 
     // Format, chain and genesis are checked BEFORE any file is trusted.
-    check_manifest_identity(&manifest, &gen_label_str, expected)?;
+    check_manifest_identity(&manifest, &gen_label_str, expected, accepted_format)?;
 
     let state_root = manifest_state_root(&manifest, &gen_label_str)?;
 
@@ -641,6 +702,62 @@ pub fn load_snapshot(data_dir: &Path, expected: &SnapshotIdentity)
         generation: gen_label_str,
         files: file_map,
     }))
+}
+
+// ── layout classification (v1 / v2 / ambiguous) ──────────────────────────────
+
+/// True if `blocklog/` or `hvslog/` holds any segment (a v2 directory, or the leftovers of a v2 first commit).
+pub fn v2_logs_present(data_dir: &Path) -> bool {
+    log_dir_has_segments(&data_dir.join("blocklog")) || log_dir_has_segments(&data_dir.join("hvslog"))
+}
+
+/// What a data directory contains, decided BEFORE anything is loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layout {
+    /// No generation, no logs, no legacy files.
+    Fresh,
+    /// Committed generation with `format_version` 1 and no log directories.
+    V1,
+    /// Committed generation with `format_version` 2.
+    V2,
+    /// No committed generation but v2 log segments exist (a crash during the very first commit, or damage).
+    LogsOnly,
+    /// Anything ambiguous: v1 generation next to log directories, legacy files next to a v2 generation, an
+    /// unreadable manifest, or an unknown format. The caller must refuse to start.
+    Ambiguous(String),
+}
+
+fn log_dir_has_segments(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map(|r| r.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with("seg-"))).unwrap_or(false)
+}
+
+/// Classify `data_dir` without modifying it.
+pub fn classify_layout(data_dir: &Path) -> Layout {
+    let logs = log_dir_has_segments(&data_dir.join("blocklog")) || log_dir_has_segments(&data_dir.join("hvslog"));
+    let legacy = has_legacy_files(data_dir);
+    let cur = match read_current(data_dir) { Ok(c) => c, Err(e) => return Layout::Ambiguous(format!("CURRENT unreadable: {e}")) };
+    let Some(gen) = cur else {
+        let has_gens = std::fs::read_dir(data_dir.join("snapshots")).map(|r| r.filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("gen-"))).unwrap_or(false);
+        return match (logs, legacy, has_gens) {
+            (false, false, false) => Layout::Fresh,
+            (true, false, false) => Layout::LogsOnly,
+            (_, _, true) => Layout::Ambiguous("generation directories exist but CURRENT is absent".into()),
+            (_, true, false) => Layout::Ambiguous("legacy persist files next to log directories".into()),
+        };
+    };
+    let mpath = data_dir.join("snapshots").join(&gen).join("manifest.json");
+    let m: SnapshotManifest = match std::fs::read(&mpath).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+        Some(m) => m,
+        None => return Layout::Ambiguous(format!("manifest of {gen} is missing or unreadable")),
+    };
+    match m.format_version {
+        Some(FORMAT_VERSION) if logs => Layout::Ambiguous("a v1 generation is committed but v2 log directories exist".into()),
+        Some(FORMAT_VERSION) => Layout::V1,
+        Some(FORMAT_VERSION_V2) if legacy => Layout::Ambiguous("a v2 generation is committed but legacy persist files exist".into()),
+        Some(FORMAT_VERSION_V2) => Layout::V2,
+        other => Layout::Ambiguous(format!("unknown or missing format_version {other:?}")),
+    }
 }
 
 // ── legacy (pre-H0-3) data directory migration ───────────────────────────────
@@ -745,15 +862,18 @@ pub fn guard_proves_missing_state(data_dir: &Path) -> Result<Option<u64>, Persis
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         PersistError::SigningHistoryConflict { detail: format!("consensus_signing.json unreadable: {e}") }
     })?;
-    match &v["last"] {
+    // A signed PROPOSAL above the first height proves state existed just as a signed vote does.
+    let proposal_height = v["proposal"]["height"].as_u64().filter(|h| *h > 0);
+    let from_votes = match &v["last"] {
         serde_json::Value::Array(a) => match a.first().and_then(|h| h.as_u64()) {
-            Some(h) if h > 0 => Ok(Some(h)),
-            Some(_) => Ok(None),
-            None => Err(PersistError::SigningHistoryConflict {
+            Some(h) if h > 0 => Some(h),
+            Some(_) => None,
+            None => return Err(PersistError::SigningHistoryConflict {
                 detail: "consensus_signing.json: 'last' has no numeric height".into() }),
         },
-        _ => Ok(None),
-    }
+        _ => None,
+    };
+    Ok(from_votes.max(proposal_height))
 }
 
 // ── signing history compatibility ─────────────────────────────────────────────

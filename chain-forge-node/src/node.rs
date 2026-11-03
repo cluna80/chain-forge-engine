@@ -105,6 +105,11 @@ pub struct SignGuard {
     pub votes: Vec<Vote>,
     /// Engine lock state when the last vote was signed.
     pub lock:  Option<LockState>,
+    /// The last proposal this node signed (highest (height, round)). Written before the proposal leaves the
+    /// node, so a restart can never sign a different proposal for a (height, round) it already proposed.
+    /// Absent in guard files written before PR 2 (`serde(default)`), which load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<BlockProposal>,
 }
 
 impl SignGuard {
@@ -128,6 +133,22 @@ impl SignGuard {
             None => Err(format!("h{} r{} step {} is below the last signed {:?}", hrs.0, hrs.1, hrs.2, last)),
         }
     }
+
+    /// `Ok(Some(p))`: this exact proposal (same block hash) was already signed: re-send the stored copy.
+    /// `Ok(None)`: safe to sign. `Err`: a different proposal was signed for this (height, round), or the
+    /// position is below the last proposal.
+    pub fn check_proposal(&self, p: &BlockProposal) -> Result<Option<BlockProposal>, String> {
+        let Some(last) = &self.proposal else { return Ok(None) };
+        let (hr, lr) = ((p.height, p.round), (last.height, last.round));
+        if hr > lr { return Ok(None); }
+        if hr == lr {
+            return if last.block_hash == p.block_hash { Ok(Some(last.clone())) }
+            else { Err(format!("already proposed {} at h{} r{}; refusing to propose {}", last.block_hash, hr.0, hr.1, p.block_hash)) };
+        }
+        Err(format!("proposal h{} r{} is below the last proposed h{} r{}", hr.0, hr.1, lr.0, lr.1))
+    }
+
+    pub fn record_proposal(&mut self, p: &BlockProposal) { self.proposal = Some(p.clone()); }
 
     pub fn record(&mut self, vote: &Vote, lock: Option<LockState>) {
         self.last = Some((vote.height, vote.round, Self::step_of(vote)));
@@ -632,6 +653,10 @@ pub struct Node {
     /// Cleared by `recheck_signing_abstention` once a block at height >= g is
     /// committed locally. Never set from a timer.
     signing_abstain_until: Option<u64>,
+    /// Storage format 2 (default OFF). Set before `set_data_dir`; fresh directories only.
+    storage_v2: bool,
+    v2_logs: std::sync::Mutex<Option<crate::storage_v2::V2Logs>>,
+    dir_lock: Option<crate::dirlock::DataDirLock>,
     /// Proposals/votes for the next height, replayed through the full
     /// handlers (payload and signature checks included) after the commit.
     next_height_msgs: Vec<NextHeightMsg>,
@@ -1606,6 +1631,9 @@ impl Node {
             last_regossip: None,
             sign_guard: SignGuard::default(),
             signing_abstain_until: None,
+            storage_v2: false,
+            v2_logs: std::sync::Mutex::new(None),
+            dir_lock: None,
             next_height_msgs: Vec::new(),
             last_sync_request: None,
             pocd_config,
@@ -2063,7 +2091,19 @@ impl Node {
     /// Set the data directory for state persistence.
     /// Creates the persist subdirectory if needed. Safe to call before
     /// any blocks are committed; the first commit writes the initial files.
+    /// Opt in to storage format 2 (two append-only logs). Default is OFF; call before `set_data_dir`.
+    /// Never migrates an existing directory: a v1 directory is refused at load.
+    pub fn set_storage_v2(&mut self, on: bool) -> Result<(), String> {
+        if self.data_dir.is_some() { return Err("set_storage_v2 must be called before set_data_dir".into()); }
+        self.storage_v2 = on;
+        Ok(())
+    }
+
     pub fn set_data_dir(&mut self, dir: std::path::PathBuf) -> Result<(), String> {
+        if self.storage_v2 {
+            // OS-backed exclusive lock (flock / LockFileEx), held until the node is dropped or the process dies.
+            self.dir_lock = Some(crate::dirlock::DataDirLock::acquire(&dir).map_err(|e| e.to_string())?);
+        }
         let persist = dir.join("persist");
         std::fs::create_dir_all(&persist)
             .map_err(|e| format!("cannot create persist dir {:?}: {e}", persist))?;
@@ -2212,6 +2252,7 @@ impl Node {
     /// after a restart that silently falls back to genesis.
     fn persist_state(&self) -> Result<(), String> {
         let Some(ref dir) = self.data_dir else { return Ok(()) };
+        if self.storage_v2 { return self.persist_state_v2(dir); }
         let snap   = self.state.export_snapshot();
         let height = snap.height;
 
@@ -2246,6 +2287,24 @@ impl Node {
             Ok(gen) => { tracing::debug!(height, %gen, "state persisted (generation-based)"); Ok(()) }
             Err(e)  => Err(format!("persist_state: snapshot write failed at height {height}: {e}")),
         }
+    }
+
+    /// Storage format 2: block log, validator-history log, then the generation (see `storage_v2::commit`).
+    fn persist_state_v2(&self, dir: &std::path::Path) -> Result<(), String> {
+        let snap = self.state.export_snapshot();
+        let height = snap.height;
+        let ser = |name: &'static str, r: serde_json::Result<Vec<u8>>| r.map(|b| (name, b)).map_err(|e| format!("persist_state: serialise {name} failed: {e}"));
+        let small = vec![
+            ser("state.json", serde_json::to_vec_pretty(&snap))?,
+            ser("identity.json", serde_json::to_vec_pretty(&self.identity))?,
+            ser("validators.json", serde_json::to_vec_pretty(&self.validator_registry))?,
+            ser("agents.json", serde_json::to_vec_pretty(&self.agents))?,
+            ser("slashing.json", serde_json::to_vec_pretty(&self.slasher))?,
+            ser("live_validator_set.json", serde_json::to_vec_pretty(self.consensus.validator_set()))?,
+        ];
+        let mut logs = self.v2_logs.lock().map_err(|_| "v2 log state poisoned".to_string())?;
+        crate::storage_v2::commit(dir, &mut logs, &self.snapshot_identity(), &self.chain_store, &self.historical_validator_sets,
+                                  small, height, &self.live_state_root())
     }
 
     /// Who this node's snapshots belong to: derived ONLY from the genesis this
@@ -2295,11 +2354,18 @@ impl Node {
             return PersistStartup::Fresh;
         };
 
+        // A v1 node never touches a directory that holds v2 logs (ambiguous: refuse, do not guess).
+        if !self.storage_v2 && crate::persistence::v2_logs_present(dir) {
+            return PersistStartup::Fatal { error: "this data directory holds storage-v2 log directories (blocklog/hvslog) \
+                but this node is configured for storage v1; refusing to start (no automatic migration)".into() };
+        }
+
         // ── 0. Pre-H0-3 (legacy) layout: migrate strictly, or refuse ─────────
         // A directory with the old persist/*.json files and no CURRENT is
         // committed state, not a fresh node. It must never start from genesis.
+        // (Storage v2 never migrates: a legacy layout is ambiguous there and refused by `storage_v2::load`.)
         let width = self.genesis.hash_width();
-        match crate::persistence::migrate_legacy(dir, &self.snapshot_identity(), |state_bytes| {
+        if !self.storage_v2 { match crate::persistence::migrate_legacy(dir, &self.snapshot_identity(), |state_bytes| {
             // The root the legacy state REBUILDS to, computed on a scratch store.
             let snap: chain_forge_state::StateSnapshot = serde_json::from_slice(state_bytes)
                 .map_err(|e| format!("cannot parse legacy state.json: {e}"))?;
@@ -2313,16 +2379,37 @@ impl Node {
                  legacy files archived under persist/{}", crate::persistence::LEGACY_ARCHIVE_DIR),
             Ok(None) => {}
             Err(e) => return PersistStartup::Fatal { error: format!("legacy data directory: {e}") },
-        }
+        } }
 
         // ── 1. Load and validate the committed snapshot ──────────────────────
-        let snap_contents = match crate::persistence::load_snapshot(dir, &self.snapshot_identity()) {
+        let v2_loaded = if self.storage_v2 {
+            match crate::storage_v2::load(dir, &self.snapshot_identity()) {
+                Err(e) => return PersistStartup::Fatal { error: e },
+                Ok(l) => l,
+            }
+        } else { None };
+        let v1_result = if self.storage_v2 {
+            match v2_loaded {
+                Some(l) => { *self.v2_logs.lock().unwrap() = Some(l.logs); Ok(Some(l.contents)) }
+                None => Ok(None),
+            }
+        } else { crate::persistence::load_snapshot(dir, &self.snapshot_identity()) };
+        let snap_contents = match v1_result {
             Err(crate::persistence::PersistError::Fresh) | Ok(None) => {
                 // D6: a signing guard that has signed above the first height
                 // proves chain state existed. Starting from genesis would let
                 // this validator sign again at heights it already signed.
                 match crate::persistence::guard_proves_missing_state(dir) {
-                    Ok(None) => return PersistStartup::Fresh,
+                    Ok(None) => {
+                        // Storage v2: only now, after the guard allowed a fresh start, drop the orphaned
+                        // records of a crash during the very first commit.
+                        if self.storage_v2 && crate::persistence::v2_logs_present(dir) {
+                            if let Err(e) = crate::storage_v2::discard_first_commit_logs(dir, &self.snapshot_identity()) {
+                                return PersistStartup::Fatal { error: e };
+                            }
+                        }
+                        return PersistStartup::Fresh;
+                    }
                     Ok(Some(guard_height)) => return PersistStartup::Fatal { error: format!(
                         "consensus signing history exists (last signed height {guard_height}) \
                          but no chain state was found — refusing to start from genesis; \
@@ -5562,7 +5649,7 @@ impl Node {
                 ConsensusAction::Repropose(proposal) => {
                     info!(height = proposal.height, round = proposal.round, block_hash = %proposal.block_hash,
                           pol_round = ?proposal.pol_round, "re-proposing valid block");
-                    let proposal = self.sign_and_register_own_proposal(proposal).await;
+                    let Some(proposal) = self.sign_and_register_own_proposal(proposal).await else { continue };
                     self.pending_proposals.insert((proposal.height, proposal.round), proposal.clone());
                     let _ = self.network.publish(OutboundMessage {
                         topic:   GossipTopic::BlockProposal,
@@ -5794,12 +5881,37 @@ impl Node {
 
     /// Sign one of our own proposals and hand the signed copy to the engine
     /// (it replaces the unsigned one, so re-gossip is verifiable too).
-    async fn sign_and_register_own_proposal(&mut self, mut proposal: BlockProposal) -> BlockProposal {
-        self.sign_proposal(&mut proposal);
+    ///
+    /// Returns `None` when the proposal must NOT be sent: the guard refuses it, the guard cannot be made
+    /// durable, or the node is abstaining. A node with a signing key signs a proposal only after the guard
+    /// recording it is on disk (the same rule as votes); a node without a key (tests) is unchanged.
+    async fn sign_and_register_own_proposal(&mut self, mut proposal: BlockProposal) -> Option<BlockProposal> {
+        if self.signing_key.is_some() {
+            if let Some(g) = self.signing_abstain_until {
+                if proposal.height <= g {
+                    warn!(height = proposal.height, guard_height = g, "abstaining from proposing: guard is ahead of chain state");
+                    return None;
+                }
+            }
+            match self.sign_guard.check_proposal(&proposal) {
+                Err(e) => { error!(height = proposal.height, round = proposal.round, error = %e, "double-sign guard refused to sign a proposal"); return None; }
+                Ok(Some(signed)) => proposal = signed,
+                Ok(None) => {
+                    self.sign_proposal(&mut proposal);
+                    self.sign_guard.record_proposal(&proposal);
+                    if let Err(e) = self.persist_sign_guard() {
+                        error!(error = %e, "cannot persist signing state: proposal withheld");
+                        return None;
+                    }
+                }
+            }
+        } else {
+            self.sign_proposal(&mut proposal);
+        }
         if let Err(e) = self.consensus.receive_proposal(proposal.clone()).await {
             warn!(error = %e, "own signed proposal not accepted by the engine");
         }
-        proposal
+        Some(proposal)
     }
 
     /// The payload for a new block at `height`: evidence for h-1, this node's
@@ -5858,7 +5970,7 @@ impl Node {
         let parent = BlockHash(format!("genesis_h{height}"));
         match self.consensus.propose(height, round, parent, tx_bytes).await {
             Ok(proposal) => {
-                let proposal = self.sign_and_register_own_proposal(proposal).await;
+                let Some(proposal) = self.sign_and_register_own_proposal(proposal).await else { return };
                 info!(height, round, block_hash = %proposal.block_hash, txs = txs.len(), "block proposed (multi-node)");
                 self.pending_proposals.insert((height, round), proposal.clone());
                 let _ = self.network.publish(OutboundMessage {
@@ -7393,6 +7505,472 @@ mod tests {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             assert_eq!(n.status.lock().unwrap().height, h, "must commit h{h}");
             ms
+        }
+
+        // ══ PERSIST-001 P-02b PR 2: storage format 2 (default OFF) ══════════════════════════════════════
+        async fn v2_node(dir: &std::path::Path) -> Node {
+            let mut n = liveness_node(1_000_000).await;
+            n.set_storage_v2(true).unwrap();
+            n.set_data_dir(dir.to_path_buf()).unwrap();
+            n
+        }
+        fn v2_tmp(tag: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("cf-v2-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d); d
+        }
+        /// Like `deliver`, but a failing commit (injected crash) does not panic the test.
+        async fn deliver_lenient(node: &mut Node, p: &BlockProposal) {
+            let _ = node.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(p).unwrap())).await;
+            for t in [VoteType::Prevote, VoteType::Precommit] {
+                for v in ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"] {
+                    let vote = signed_vote(CHAIN, t.clone(), p.height, 0, v, p.block_hash.clone());
+                    let _ = node.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await;
+                }
+            }
+        }
+        fn next_proposal(n: &mut Node, h: u64, k: u64, nonce: &mut u64) -> BlockProposal {
+            for _ in 0..k {
+                let mut tx = Transaction::transfer(&format!("v2-{nonce}"), "qcb1alice", "qcb1bob", "uqcb", 1, *nonce);
+                tx.sign(&ClassicalScheme.generate_keypair("qcb1alice").unwrap(), CHAIN).unwrap();
+                n.mempool.push(tx); *nonce += 1;
+            }
+            proposal(h, n.block_payload(h).encode())
+        }
+        fn restart_height(r: PersistStartup) -> u64 {
+            match r { PersistStartup::Restored { height, .. } => height, PersistStartup::Fresh => panic!("Fresh, expected Restored"), PersistStartup::Fatal { error } => panic!("Fatal: {error}") }
+        }
+        fn is_fatal(r: &PersistStartup) -> bool { matches!(r, PersistStartup::Fatal { .. }) }
+
+        /// V2-9: pinned canonical bytes; identical on every platform (the Windows run is the check).
+        fn golden_block() -> (CommitCertificate, BlockProposal) {
+            let v = Vote { vote_type: VoteType::Precommit, height: 7, round: 1, validator: ValidatorId("v1".into()), block_hash: Some(BlockHash("bh7".into())),
+                           signature: vec![1, 2, 3], scheme: "classical".into() };
+            (CommitCertificate { height: 7, round: 1, block_hash: BlockHash("bh7".into()), precommits: vec![v] },
+             BlockProposal { height: 7, round: 1, proposer: ValidatorId("v1".into()), block_hash: BlockHash("bh7".into()), parent_hash: BlockHash("bh6".into()),
+                             timestamp_ms: 1000, tx_data: vec![9, 9], signature: vec![4, 5], pol_round: Some(0) })
+        }
+        #[test]
+        fn v2_canonical_block_and_validator_set_encodings_are_pinned() {
+            use crate::storage_v2::{encode_block, decode_block, encode_vset, decode_vset};
+            let (c, p) = golden_block();
+            let b = encode_block(&c, &p);
+            assert_eq!(hex::encode(&b), "0107000000000000000100000003000000000000006268370100000000000000010700000000000000010000000200000000000000763101030000000000000062683703000000000000000102030900000000000000636c6173736963616c0700000000000000010000000200000000000000763103000000000000006268370300000000000000626836e80300000000000002000000000000000909020000000000000004050100000000");
+            let (c2, p2) = decode_block(&b).unwrap();
+            assert_eq!(serde_json::to_vec(&(c, p)).unwrap(), serde_json::to_vec(&(c2, p2)).unwrap());
+            for cut in 0..b.len() { assert!(decode_block(&b[..cut]).is_err(), "truncated at {cut}"); }
+            let mut t = b.clone(); t.push(0); assert!(decode_block(&t).is_err());
+            let vs = chain_forge_consensus::ValidatorSet { height: 7, validators: vec![chain_forge_consensus::ValidatorInfo {
+                id: ValidatorId("v1".into()), voting_power: 10, pop_verified: true, public_key: vec![0xAA, 0xBB] }] };
+            let e = encode_vset(&vs);
+            assert_eq!(hex::encode(&e), "0107000000000000000100000000000000020000000000000076310a00000000000000010200000000000000aabb");
+            assert_eq!(serde_json::to_vec(&decode_vset(&e).unwrap()).unwrap(), serde_json::to_vec(&vs).unwrap());
+            for cut in 0..e.len() { assert!(decode_vset(&e[..cut]).is_err(), "truncated at {cut}"); }
+        }
+
+        /// V2-2: default OFF. Without opting in nothing v2 is created and the v1 files are written as before.
+        #[tokio::test]
+        async fn v2_is_off_by_default_and_the_v1_layout_is_unchanged() {
+            let dir = v2_tmp("default"); let mut n = liveness_node(1_000_000).await;
+            n.set_data_dir(dir.clone()).unwrap(); let mut nonce = 0;
+            for h in 0..3 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            let gen = std::fs::read_to_string(dir.join("CURRENT")).unwrap(); let g = dir.join("snapshots").join(gen.trim());
+            assert!(g.join("chain_store.json").exists() && g.join("historical_validator_sets.json").exists());
+            assert!(!g.join("storage_descriptor.json").exists());
+            for d in ["blocklog", "hvslog", "LOCK"] { assert!(!dir.join(d).exists(), "{d} must not exist in a v1 directory"); }
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(g.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(m["format_version"], 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// V2-1: persist, restart, identical state; both logs match the committed generation.
+        #[tokio::test]
+        async fn v2_round_trip_restores_identical_state_and_history() {
+            let dir = v2_tmp("rt"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..25 { commit_with_txs(&mut n, h, 2, &mut nonce).await; }
+            let (root, store, hvs) = (n.live_state_root(), serde_json::to_vec(&n.chain_store).unwrap(), serde_json::to_vec(&n.historical_validator_sets).unwrap());
+            drop(n);
+            let mut r = v2_node(&dir).await;
+            assert_eq!(restart_height(r.load_persisted_state()), 24);
+            assert_eq!(r.live_state_root(), root);
+            assert_eq!(serde_json::to_vec(&r.chain_store).unwrap(), store);
+            assert_eq!(serde_json::to_vec(&r.historical_validator_sets).unwrap(), hvs);
+            // the restored node keeps committing and persisting
+            let p = next_proposal(&mut r, 25, 2, &mut nonce); deliver(&mut r, &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+            drop(r); let mut r2 = v2_node(&dir).await; assert_eq!(restart_height(r2.load_persisted_state()), 25);
+            let m: serde_json::Value = { let gen = std::fs::read_to_string(dir.join("CURRENT")).unwrap(); serde_json::from_slice(&std::fs::read(dir.join("snapshots").join(gen.trim()).join("manifest.json")).unwrap()).unwrap() };
+            assert_eq!(m["format_version"], 2);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// V2-3: a crash at EVERY commit boundary. Before `CURRENT` is renamed the previous block is the committed
+        /// state; after it, the new block is. The logs are truncated to the committed tail, and the node continues.
+        #[tokio::test]
+        async fn v2_crash_at_every_commit_boundary_recovers_to_the_committed_block() {
+            for (point, committed_new) in [("block_log_appended", false), ("hvs_log_appended", false), ("gen_files_written", false),
+                                           ("manifest_written", false), ("current_written", true)] {
+                let dir = v2_tmp(&format!("crash-{point}")); let mut n = v2_node(&dir).await; let mut nonce = 0;
+                for h in 0..8 { commit_with_txs(&mut n, h, 2, &mut nonce).await; }
+                let p = next_proposal(&mut n, 8, 2, &mut nonce);
+                crate::persistence::fault::arm(point);
+                deliver_lenient(&mut n, &p).await;
+                crate::persistence::fault::disarm();
+                let root_with_new = n.live_state_root();
+                drop(n);                                   // the crash
+                // D1 ordering on disk at the crash: the logs are appended BEFORE the generation exists
+                let log_tail = |sub: &str, kind: u8| { let a = crate::blocklog::anchor_for(snapshot_identity_of(&GenesisConfig::from_json(&liveness_json()).unwrap()).genesis_hash.as_bytes(), kind);
+                    crate::blocklog::BlockLog::replay(&dir.join(sub), kind, a, 0, |_, _| {}).unwrap().map(|t| t.height) };
+                let want_block_tail = Some(8); let want_hvs_tail = if point == "block_log_appended" { Some(7) } else { Some(8) };
+                assert_eq!(log_tail("blocklog", crate::blocklog::KIND_BLOCK), want_block_tail, "{point}: block log is ahead of the checkpoint");
+                assert_eq!(log_tail("hvslog", crate::blocklog::KIND_VALIDATOR_SET), want_hvs_tail, "{point}: history log");
+                let mut r = v2_node(&dir).await;
+                let want = if committed_new { 8 } else { 7 };
+                assert_eq!(restart_height(r.load_persisted_state()), want, "crash after {point}");
+                assert_eq!(r.chain_store.keys().next_back().copied(), Some(want), "{point}: chain store");
+                assert_eq!(r.historical_validator_sets.keys().next_back().copied(), Some(want), "{point}: validator history");
+                if !committed_new {
+                    // the uncommitted block is re-committed from the same proposal; state converges to the pre-crash root
+                    deliver(&mut r, &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+                    assert_eq!(r.live_state_root(), root_with_new, "{point}: re-commit converges");
+                }
+                drop(r);
+                let mut r2 = v2_node(&dir).await;
+                assert_eq!(restart_height(r2.load_persisted_state()), 8, "{point}: second restart");
+                assert_eq!(r2.live_state_root(), root_with_new);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// A torn (partially appended) record in either log beyond the committed tail is removed; the node starts.
+        #[tokio::test]
+        async fn v2_torn_log_tail_beyond_the_checkpoint_is_truncated() {
+            for sub in ["blocklog", "hvslog"] {
+                let dir = v2_tmp(&format!("torn-{sub}")); let mut n = v2_node(&dir).await; let mut nonce = 0;
+                for h in 0..6 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+                drop(n);
+                let seg = std::fs::read_dir(dir.join(sub)).unwrap().map(|e| e.unwrap().path()).next().unwrap();
+                let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+                std::io::Write::write_all(&mut f, b"CFBL\x01\x01\x07\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff").unwrap(); drop(f);
+                let mut r = v2_node(&dir).await;
+                assert_eq!(restart_height(r.load_persisted_state()), 5, "{sub}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// V2-7: committed corruption and inconsistent logs are fatal (never repaired, never genesis).
+        #[tokio::test]
+        async fn v2_committed_corruption_and_inconsistent_storage_are_fatal() {
+            let build = |tag: &str| { let t = tag.to_string(); async move { let dir = v2_tmp(&t); let mut n = v2_node(&dir).await; let mut nonce = 0;
+                for h in 0..6 { commit_with_txs(&mut n, h, 1, &mut nonce).await; } drop(n); dir } };
+            let seg = |dir: &std::path::Path, sub: &str| std::fs::read_dir(dir.join(sub)).unwrap().map(|e| e.unwrap().path()).next().unwrap();
+            let gen_dir = |dir: &std::path::Path| dir.join("snapshots").join(std::fs::read_to_string(dir.join("CURRENT")).unwrap().trim());
+            // 1. a flipped byte inside a committed block record
+            let dir = build("f-flip").await; let sp = seg(&dir, "blocklog"); let mut b = std::fs::read(&sp).unwrap(); b[40] ^= 1; std::fs::write(&sp, b).unwrap();
+            assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
+            // 2. the validator-history log deleted
+            let dir = build("f-hvs").await; std::fs::remove_dir_all(dir.join("hvslog")).unwrap();
+            assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
+            // 3. the block log truncated below the committed tail
+            let dir = build("f-short").await; let sp = seg(&dir, "blocklog"); let b = std::fs::read(&sp).unwrap(); std::fs::write(&sp, &b[..b.len() - 50]).unwrap();
+            assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
+            // 4. the descriptor edited (its hash is in the manifest)
+            let dir = build("f-desc").await; let dp = gen_dir(&dir).join("storage_descriptor.json"); let t = std::fs::read_to_string(&dp).unwrap(); std::fs::write(&dp, t.replace("p02b", "p02c")).unwrap();
+            assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
+            // 5. CURRENT removed while generations and logs exist
+            let dir = build("f-cur").await; std::fs::remove_file(dir.join("CURRENT")).unwrap();
+            assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
+            // 6. a log from another genesis (wrong anchor): swap in the history log under the block log name is not possible; use a tampered record hash
+            let dir = build("f-hash").await; let sp = seg(&dir, "hvslog"); let mut b = std::fs::read(&sp).unwrap(); let n = b.len(); b[n - 1] ^= 1; std::fs::write(&sp, b).unwrap();
+            assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The interval between "the signing guard is durable" and "the block is committed", at EVERY commit
+        /// boundary. A vote and a proposal for height 8 are recorded in the guard (made durable before they would be
+        /// sent), then the commit of block 8 is interrupted. After restart the guard still refuses anything that
+        /// conflicts with what was authorised, abstention covers the uncommitted height, and re-committing the same
+        /// block clears it.
+        #[tokio::test]
+        async fn v2_guard_to_commit_interval_is_safe_at_every_boundary() {
+            for (point, committed) in [("block_log_appended", false), ("hvs_log_appended", false), ("gen_files_written", false),
+                                       ("manifest_written", false), ("current_written", true)] {
+                let dir = v2_tmp(&format!("g2c-{point}"));
+                let key = || ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+                let mut n = liveness_node(1_000_000).await; n.signing_key = Some(key()); n.set_storage_v2(true).unwrap(); n.set_data_dir(dir.clone()).unwrap();
+                let mut nonce = 0;
+                for h in 0..8 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+                let p = next_proposal(&mut n, 8, 1, &mut nonce);
+                // authorised before the commit: a precommit for this block, and this node's own proposal for (8, 0)
+                let vote = signed_vote(CHAIN, VoteType::Precommit, 8, 0, "qcb1alice", p.block_hash.clone());
+                n.sign_guard.record(&vote, None); n.persist_sign_guard().unwrap();
+                let signed = n.sign_and_register_own_proposal(p.clone()).await.expect("own proposal is signed and guarded");
+                crate::persistence::fault::arm(point); deliver_lenient(&mut n, &p).await; crate::persistence::fault::disarm();
+                drop(n);                                                      // the crash
+                let mut r = liveness_node(1_000_000).await; r.signing_key = Some(key()); r.set_storage_v2(true).unwrap(); r.set_data_dir(dir.clone()).unwrap();
+                let h = restart_height(r.load_persisted_state());
+                assert_eq!(h, if committed { 8 } else { 7 }, "{point}: restored height");
+                if committed { assert_eq!(r.signing_abstaining_until(), None, "{point}: guard == state, nothing to abstain from"); }
+                else { assert_eq!(r.signing_abstaining_until(), Some(8), "{point}: guard ahead of state, abstain through height 8"); }
+                // whatever was authorised is still remembered
+                let other_hash = BlockHash("a-different-block".into());
+                assert!(r.sign_guard.check(&signed_vote(CHAIN, VoteType::Precommit, 8, 0, "qcb1alice", other_hash.clone())).is_err(), "{point}: conflicting vote refused");
+                assert!(r.sign_guard.check(&vote).unwrap().is_some(), "{point}: identical vote is re-sent, not re-signed");
+                let mut conflicting = p.clone(); conflicting.block_hash = other_hash;
+                // the guard itself, independent of abstention
+                assert!(r.sign_guard.check_proposal(&conflicting).is_err(), "{point}: the guard refuses a conflicting proposal for (8, 0)");
+                assert_eq!(r.sign_guard.check_proposal(&p).unwrap().unwrap().signature, signed.signature, "{point}: the guard holds the stored signed proposal");
+                assert!(r.sign_and_register_own_proposal(conflicting).await.is_none(), "{point}: conflicting proposal withheld");
+                let resent = r.sign_and_register_own_proposal(p.clone()).await;
+                if committed { assert_eq!(resent.unwrap().signature, signed.signature, "{point}: identical proposal re-sent with the stored signature"); }
+                else { assert!(resent.is_none(), "{point}: an abstaining node does not propose at or below the guard height"); }
+                if !committed {
+                    // while abstaining the node signs nothing at or below the guard height (its own proposal here is the stored one)
+                    deliver(&mut r, &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+                    assert_eq!(r.signing_abstaining_until(), None, "{point}: abstention ends once the state reaches the guard height");
+                }
+                drop(r);
+                let mut r2 = liveness_node(1_000_000).await; r2.set_storage_v2(true).unwrap(); r2.set_data_dir(dir.clone()).unwrap();
+                assert_eq!(restart_height(r2.load_persisted_state()), 8, "{point}: second restart");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// A record whose append was interrupted at (almost) every byte offset, in either log: the node restarts at the
+        /// committed block, the file is cut back to the committed tail, and a complete record beyond the checkpoint
+        /// (the crash right after the append) is removed too.
+        #[tokio::test]
+        async fn v2_interrupted_record_write_at_many_offsets_in_either_log() {
+            let dir = v2_tmp("torn-offsets"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..6 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            let ident = n.snapshot_identity(); drop(n);
+            for (sub, kind) in [("blocklog", crate::blocklog::KIND_BLOCK), ("hvslog", crate::blocklog::KIND_VALIDATOR_SET)] {
+                let ld = dir.join(sub);
+                let seg = std::fs::read_dir(&ld).unwrap().map(|e| e.unwrap().path()).next().unwrap();
+                let orig = std::fs::read(&seg).unwrap();
+                let anchor = crate::blocklog::anchor_for(ident.genesis_hash.as_bytes(), kind);
+                let mut last_payload = vec![]; let first = 0u64;
+                let tail = crate::blocklog::BlockLog::replay(&ld, kind, anchor, first, |h, p| if h == 5 { last_payload = p.to_vec(); }).unwrap().unwrap();
+                let (next_rec, _) = crate::blocklog::record_bytes(kind, 6, &last_payload, &tail.hash);
+                let mut cuts: Vec<usize> = (0..=96.min(next_rec.len())).collect();
+                cuts.extend((97..next_rec.len()).step_by(211)); cuts.extend([next_rec.len() - 33, next_rec.len() - 32, next_rec.len() - 1, next_rec.len()]);
+                cuts.sort(); cuts.dedup();
+                for cut in cuts {
+                    let mut bytes = orig.clone(); bytes.extend_from_slice(&next_rec[..cut]); std::fs::write(&seg, &bytes).unwrap();
+                    let mut r = v2_node(&dir).await;
+                    assert_eq!(restart_height(r.load_persisted_state()), 5, "{sub}: partial record of {cut}/{} bytes", next_rec.len());
+                    assert_eq!(std::fs::read(&seg).unwrap(), orig, "{sub}: cut {cut}: the file is cut back to the committed tail");
+                    drop(r);
+                }
+                std::fs::write(&seg, &orig).unwrap();
+            }
+            // and a flipped byte anywhere in the LAST COMMITTED record of either log is fatal
+            for sub in ["blocklog", "hvslog"] {
+                let seg = std::fs::read_dir(dir.join(sub)).unwrap().map(|e| e.unwrap().path()).next().unwrap();
+                let orig = std::fs::read(&seg).unwrap();
+                for off in (1..96).chain([orig.len() / 2, orig.len() - 33, orig.len() - 1]) {
+                    let mut b = orig.clone(); let at = orig.len() - 1 - off.min(orig.len() - 1); b[at] ^= 0x80; std::fs::write(&seg, &b).unwrap();
+                    assert!(is_fatal(&v2_node(&dir).await.load_persisted_state()), "{sub}: flip at {at} must be fatal");
+                }
+                std::fs::write(&seg, &orig).unwrap();
+            }
+            assert_eq!(restart_height(v2_node(&dir).await.load_persisted_state()), 5);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Regression (v1 nodes, default storage): the proposal guard added in PR 2 must load guard files written
+        /// before it, leave them untouched until the node signs, then survive a restart and refuse conflicting proposals.
+        #[tokio::test]
+        async fn v1_proposal_guard_is_compatible_with_old_guard_files_and_survives_restarts() {
+            let dir = v2_tmp("v1-guard"); let mut n = liveness_node(1_000_000).await; n.set_data_dir(dir.clone()).unwrap(); let mut nonce = 0;
+            for h in 0..4 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            drop(n);
+            // a guard file exactly as the code before PR 2 wrote it: no "proposal" key at all
+            let vote = signed_vote(CHAIN, VoteType::Precommit, 3, 0, "qcb1alice", BlockHash("old-block".into()));
+            let old_json = serde_json::to_vec_pretty(&serde_json::json!({ "last": [3, 0, 2], "votes": [vote], "lock": null })).unwrap();
+            let gpath = dir.join("persist").join("consensus_signing.json");
+            std::fs::write(&gpath, &old_json).unwrap();
+            let mk = |h: u64, r: u32, hash: &str| BlockProposal { height: h, round: r, proposer: ValidatorId("qcb1alice".into()), block_hash: BlockHash(hash.into()),
+                parent_hash: BlockHash("p".into()), timestamp_ms: 0, tx_data: vec![], signature: vec![], pol_round: None };
+            let key = || ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+            // restart 1: the old file loads, state restores, nothing is rewritten at load time
+            let mut r = liveness_node(1_000_000).await; r.signing_key = Some(key()); r.set_data_dir(dir.clone()).unwrap();
+            assert_eq!(restart_height(r.load_persisted_state()), 3);
+            assert!(r.sign_guard.proposal.is_none() && r.sign_guard.last == Some((3, 0, 2)));
+            assert_eq!(std::fs::read(&gpath).unwrap(), old_json, "an old guard file is not rewritten by loading it");
+            assert!(r.sign_guard.check(&signed_vote(CHAIN, VoteType::Precommit, 3, 0, "qcb1alice", BlockHash("other".into()))).is_err(), "the old vote guard still refuses a conflicting vote");
+            // the node proposes: the guard is written (now with the new key) before the proposal is returned
+            let first = r.sign_and_register_own_proposal(mk(4, 0, "A")).await.expect("signs");
+            assert!(!first.signature.is_empty());
+            let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&gpath).unwrap()).unwrap();
+            assert_eq!(on_disk["proposal"]["block_hash"], "A", "the proposal is on disk before it could be sent");
+            assert_eq!(on_disk["last"], serde_json::json!([3, 0, 2]), "the vote guard fields are unchanged");
+            drop(r);
+            // restart 2: a conflicting proposal for the same (height, round) is refused; the identical one is re-sent unchanged
+            let mut r2 = liveness_node(1_000_000).await; r2.signing_key = Some(key()); r2.set_data_dir(dir.clone()).unwrap();
+            assert_eq!(restart_height(r2.load_persisted_state()), 3);
+            assert!(r2.sign_and_register_own_proposal(mk(4, 0, "B")).await.is_none(), "conflicting proposal after restart is withheld");
+            assert_eq!(r2.sign_and_register_own_proposal(mk(4, 0, "A")).await.unwrap().signature, first.signature, "identical proposal re-sends the stored signature");
+            assert!(r2.sign_and_register_own_proposal(mk(4, 1, "B")).await.is_some(), "a later round may propose a different block");
+            drop(r2);
+            // restart 3: the later round is remembered too; going back to round 0 is refused
+            let mut r3 = liveness_node(1_000_000).await; r3.signing_key = Some(key()); r3.set_data_dir(dir.clone()).unwrap(); r3.load_persisted_state();
+            assert!(r3.sign_and_register_own_proposal(mk(4, 0, "A")).await.is_none(), "below the last proposed (height, round)");
+            // a node WITHOUT a key behaves as before: no guard file change
+            let before = std::fs::read(&gpath).unwrap();
+            let mut nk = liveness_node(1_000_000).await; nk.set_data_dir(dir.clone()).unwrap();
+            let _ = nk.sign_and_register_own_proposal(mk(9, 0, "Z")).await;
+            assert_eq!(std::fs::read(&gpath).unwrap(), before, "a keyless node never touches the guard");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A generation whose hashes are all valid but whose descriptor names OLDER log tails than the committed
+        /// height must be refused: loading it would silently drop committed blocks from the logs while the
+        /// state (and the signing guard) are ahead.
+        #[tokio::test]
+        async fn v2_descriptor_older_than_the_committed_height_is_fatal() {
+            let dir = v2_tmp("desc-old"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..6 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            let (store, hvs) = (n.chain_store.clone(), n.historical_validator_sets.clone());
+            let ident = n.snapshot_identity(); let root = n.live_state_root(); drop(n);
+            let gen = std::fs::read_to_string(dir.join("CURRENT")).unwrap(); let gdir = dir.join("snapshots").join(gen.trim());
+            // hash chain tails at height 4 (one block behind the committed height 5), recomputed from the payloads
+            let tail_at = |kind: u8, upto: u64, payloads: Vec<(u64, Vec<u8>)>| { let mut prev = crate::blocklog::anchor_for(ident.genesis_hash.as_bytes(), kind);
+                for (h, p) in payloads { if h > upto { break; } prev = crate::blocklog::record_bytes(kind, h, &p, &prev).1; } hex::encode(prev) };
+            let bt = tail_at(crate::blocklog::KIND_BLOCK, 4, store.iter().map(|(h, (c, p))| (*h, crate::storage_v2::encode_block(c, p))).collect());
+            let ht = tail_at(crate::blocklog::KIND_VALIDATOR_SET, 4, hvs.iter().map(|(h, s)| (*h, crate::storage_v2::encode_vset(s))).collect());
+            let mut desc: crate::storage_v2::Descriptor = serde_json::from_slice(&std::fs::read(gdir.join("storage_descriptor.json")).unwrap()).unwrap();
+            (desc.block_tail_height, desc.block_tail_hash, desc.hvs_tail_height, desc.hvs_tail_hash) = (4, bt, 4, ht);
+            let mut files: Vec<(&str, Vec<u8>)> = crate::storage_v2::SMALL_FILES.iter().map(|f| (*f, std::fs::read(gdir.join(f)).unwrap())).collect();
+            files.push((crate::storage_v2::DESCRIPTOR_FILE, serde_json::to_vec_pretty(&desc).unwrap()));
+            crate::persistence::write_snapshot_format(&dir, 5, &files, &ident, &root, crate::persistence::FORMAT_VERSION_V2).unwrap();
+            let r = v2_node(&dir).await.load_persisted_state();
+            assert!(matches!(&r, PersistStartup::Fatal { error } if error.contains("do not match the committed height")), "got {:?}", match &r { PersistStartup::Fatal { error } => error.clone(), _ => "not fatal".into() });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// V2-6: ambiguous or mismatched layouts are refused and nothing is modified (no migration).
+        #[tokio::test]
+        async fn v2_layout_mismatches_are_refused_without_modifying_the_directory() {
+            let tree = |d: &std::path::Path| { fn walk(p: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) { for e in std::fs::read_dir(p).unwrap() { let e = e.unwrap().path();
+                if e.is_dir() { walk(&e, out) } else if e.file_name().unwrap() != "LOCK" { out.push((e.to_string_lossy().to_string(), std::fs::read(&e).unwrap())) } } }
+                let mut v = vec![]; walk(d, &mut v); v.sort(); v };
+            // a v1 directory opened by a v2 node
+            let dir = v2_tmp("mix-v1"); let mut n = liveness_node(1_000_000).await; n.set_data_dir(dir.clone()).unwrap(); let mut nonce = 0;
+            for h in 0..3 { commit_with_txs(&mut n, h, 1, &mut nonce).await; } drop(n);
+            let before = tree(&dir);
+            assert!(is_fatal(&v2_node(&dir).await.load_persisted_state()), "v2 node must refuse a v1 directory");
+            assert_eq!(tree(&dir), before, "a refused v1 directory is byte-for-byte untouched");
+            let _ = std::fs::remove_dir_all(&dir);
+            // a v2 directory opened by a v1 node
+            let dir = v2_tmp("mix-v2"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..3 { commit_with_txs(&mut n, h, 1, &mut nonce).await; } drop(n);
+            let before = tree(&dir);
+            let mut v1 = liveness_node(1_000_000).await; v1.set_data_dir(dir.clone()).unwrap();
+            assert!(is_fatal(&v1.load_persisted_state()), "v1 node must refuse a v2 directory");
+            assert_eq!(tree(&dir), before, "a refused v2 directory is byte-for-byte untouched");
+            // a v1 generation next to log directories (hand-built ambiguity)
+            let mixed = v2_tmp("mix-both"); let mut n = liveness_node(1_000_000).await; n.set_data_dir(mixed.clone()).unwrap(); let mut nonce = 0;
+            for h in 0..3 { commit_with_txs(&mut n, h, 1, &mut nonce).await; } drop(n);
+            std::fs::create_dir_all(mixed.join("blocklog")).unwrap(); std::fs::write(mixed.join("blocklog").join("seg-00000000000000000000.log"), b"x").unwrap();
+            assert!(is_fatal(&v2_node(&mixed).await.load_persisted_state()));
+            let mut v1b = liveness_node(1_000_000).await; v1b.set_data_dir(mixed.clone()).unwrap(); assert!(is_fatal(&v1b.load_persisted_state()));
+            // v2 generation next to legacy persist files
+            let leg = v2_tmp("mix-legacy"); let mut n = v2_node(&leg).await; let mut nonce = 0;
+            for h in 0..3 { commit_with_txs(&mut n, h, 1, &mut nonce).await; } drop(n);
+            std::fs::write(leg.join("persist").join("state.json"), b"{}").unwrap();
+            assert!(is_fatal(&v2_node(&leg).await.load_persisted_state()));
+            for d in [dir, mixed, leg] { let _ = std::fs::remove_dir_all(&d); }
+        }
+
+        /// A fresh v2 directory starts fresh; logs holding more than one record without a generation are refused.
+        #[tokio::test]
+        async fn v2_fresh_start_and_orphaned_logs() {
+            let dir = v2_tmp("fresh"); let mut n = v2_node(&dir).await;
+            assert!(matches!(n.load_persisted_state(), PersistStartup::Fresh)); drop(n);
+            // crash during the very first commit: one record in each log, no generation
+            let mut n = v2_node(&dir).await; let mut nonce = 0;
+            let p = next_proposal(&mut n, 0, 1, &mut nonce);
+            crate::persistence::fault::arm("hvs_log_appended"); deliver_lenient(&mut n, &p).await; crate::persistence::fault::disarm(); drop(n);
+            assert!(dir.join("blocklog").exists());
+            let mut r = v2_node(&dir).await; assert!(matches!(r.load_persisted_state(), PersistStartup::Fresh), "first-commit crash is a fresh start");
+            assert!(!std::fs::read_dir(dir.join("blocklog")).map(|mut d| d.next().is_some()).unwrap_or(false), "the orphaned record is removed");
+            drop(r);
+            // several records, no CURRENT and no generation: refuse to delete
+            let dir2 = v2_tmp("orphan"); let mut n = v2_node(&dir2).await; let mut nonce = 0;
+            for h in 0..3 { commit_with_txs(&mut n, h, 1, &mut nonce).await; } drop(n);
+            let _ = std::fs::remove_dir_all(dir2.join("snapshots")); let _ = std::fs::remove_file(dir2.join("CURRENT"));
+            assert!(is_fatal(&v2_node(&dir2).await.load_persisted_state()));
+            // a guard above height 0 next to first-commit leftovers: refused, and the leftovers are NOT deleted
+            let dir3 = v2_tmp("orphan-guard"); let mut n = v2_node(&dir3).await; let mut nonce = 0;
+            let p = next_proposal(&mut n, 0, 1, &mut nonce);
+            crate::persistence::fault::arm("hvs_log_appended"); deliver_lenient(&mut n, &p).await; crate::persistence::fault::disarm();
+            let v = signed_vote(CHAIN, VoteType::Precommit, 3, 0, "qcb1alice", BlockHash("x".into()));
+            n.sign_guard.record(&v, None); n.persist_sign_guard().unwrap(); drop(n);
+            let bytes = |d: &std::path::Path| std::fs::read_dir(d.join("blocklog")).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect::<Vec<_>>();
+            let before = bytes(&dir3);
+            assert!(is_fatal(&v2_node(&dir3).await.load_persisted_state()));
+            assert_eq!(bytes(&dir3), before, "a refused start must not delete the orphaned log records");
+            for d in [dir, dir2, dir3] { let _ = std::fs::remove_dir_all(&d); }
+        }
+
+        /// V2-8: the data directory is exclusively locked by the OS; a stale LOCK file does not block.
+        #[tokio::test]
+        async fn v2_data_dir_is_exclusively_locked() {
+            let dir = v2_tmp("lock"); let n = v2_node(&dir).await;
+            let mut second = liveness_node(1_000_000).await; second.set_storage_v2(true).unwrap();
+            assert!(second.set_data_dir(dir.clone()).is_err(), "a second node on the same directory must be refused");
+            drop(n);
+            let mut third = liveness_node(1_000_000).await; third.set_storage_v2(true).unwrap();
+            third.set_data_dir(dir.clone()).expect("lock is free after the first node is gone (stale LOCK file ignored)");
+            assert!(liveness_node(1_000_000).await.set_storage_v2(true).is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// V2-4: a vote was signed and its guard is durable, but the block never committed: after restart on
+        /// the v2 layout the node abstains up to the guard height and refuses a conflicting vote.
+        #[tokio::test]
+        async fn v2_guard_ahead_of_state_abstains_and_refuses_a_conflicting_vote() {
+            let dir = v2_tmp("guard"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..4 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            // the node signs a precommit for height 5 (state is at 3); the guard is persisted before it would be sent
+            let v = signed_vote(CHAIN, VoteType::Precommit, 5, 0, "qcb1alice", BlockHash("block-A".into()));
+            n.sign_guard.record(&v, None); n.persist_sign_guard().unwrap();
+            drop(n);
+            let mut r = v2_node(&dir).await;
+            assert_eq!(restart_height(r.load_persisted_state()), 3);
+            assert_eq!(r.signing_abstaining_until(), Some(5), "guard ahead of state: abstain through the guard height");
+            let conflicting = signed_vote(CHAIN, VoteType::Precommit, 5, 0, "qcb1alice", BlockHash("block-B".into()));
+            assert!(r.sign_guard.check(&conflicting).is_err(), "a conflicting vote at the same position is refused");
+            assert!(r.sign_guard.check(&v).unwrap().is_some(), "the identical vote may be re-sent");
+            // a guard above height 0 with no committed state is fatal on v2 as well
+            let dir2 = v2_tmp("guard-nostate"); let g = v2_node(&dir2).await; g.sign_guard.clone();
+            let mut g = g; g.sign_guard.record(&v, None); g.persist_sign_guard().unwrap(); drop(g);
+            assert!(is_fatal(&v2_node(&dir2).await.load_persisted_state()));
+            for d in [dir, dir2] { let _ = std::fs::remove_dir_all(&d); }
+        }
+
+        /// V2-5: proposal signing is covered by the guard (the previously unguarded path).
+        #[tokio::test]
+        async fn proposals_are_guarded_like_votes() {
+            let mk = |h: u64, r: u32, hash: &str| BlockProposal { height: h, round: r, proposer: ValidatorId("qcb1alice".into()), block_hash: BlockHash(hash.into()),
+                parent_hash: BlockHash("p".into()), timestamp_ms: 0, tx_data: vec![], signature: vec![7], pol_round: None };
+            let mut g = SignGuard::default();
+            assert!(g.check_proposal(&mk(5, 0, "A")).unwrap().is_none());
+            g.record_proposal(&mk(5, 0, "A"));
+            assert!(g.check_proposal(&mk(5, 0, "B")).is_err(), "a different block at the same (height, round) is refused");
+            assert_eq!(g.check_proposal(&mk(5, 0, "A")).unwrap().unwrap().block_hash.0, "A", "the identical proposal is re-sent, not re-signed");
+            assert!(g.check_proposal(&mk(4, 9, "C")).is_err(), "below the last proposal");
+            assert!(g.check_proposal(&mk(5, 1, "B")).unwrap().is_none(), "a later round may propose another block");
+            // durable across a restart, and a guard file written before this change still loads
+            let old: SignGuard = serde_json::from_str(r#"{"last":null,"votes":[],"lock":null}"#).unwrap(); assert!(old.proposal.is_none());
+            let dir = v2_tmp("pguard"); let mut n = v2_node(&dir).await; n.sign_guard.record_proposal(&mk(5, 0, "A")); n.persist_sign_guard().unwrap(); drop(n);
+            let n2 = v2_node(&dir).await; assert!(n2.sign_guard.check_proposal(&mk(5, 0, "B")).is_err(), "restart must not forget the signed proposal");
+            // the real path: a node with a key refuses to sign a different proposal for a (height, round) it already proposed
+            let mut node = liveness_node(1_000_000).await;
+            node.signing_key = Some(ClassicalScheme.generate_keypair("qcb1alice").unwrap());
+            let first = node.sign_and_register_own_proposal(mk(9, 0, "A")).await.expect("first proposal is signed");
+            assert!(!first.signature.is_empty());
+            assert!(node.sign_and_register_own_proposal(mk(9, 0, "B")).await.is_none(), "conflicting proposal is withheld");
+            assert_eq!(node.sign_and_register_own_proposal(mk(9, 0, "A")).await.unwrap().signature, first.signature, "identical proposal re-sends the stored signature");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// (bytes, serialize ms, write ms) per file, mirroring persist_state().

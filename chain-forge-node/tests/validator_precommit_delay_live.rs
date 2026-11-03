@@ -96,6 +96,8 @@ fn spawn(name: &str, api: u16, p2p: u16, peers: &[u16], dir: &PathBuf, control: 
     for p in peers { cmd.arg("--bootstrap").arg(format!("/ip4/127.0.0.1/tcp/{p}")); }
     // info for everything; the fault-injection trace target is info too.
     cmd.env("CF_FAULT_CONTROL_FILE", control).env("RUST_LOG", "info");
+    // Storage format 2 test switch (default OFF): CF_TEST_STORAGE_V2=1 runs this test on the experimental v2 layout.
+    if std::env::var_os("CF_TEST_STORAGE_V2").is_some() { cmd.arg("--storage-v2-experimental"); }
     cmd.stdout(log.try_clone().unwrap()).stderr(log).stdin(Stdio::null());
     NodeHandle(cmd.spawn().unwrap_or_else(|e| panic!("spawn {name}: {e}")))
 }
