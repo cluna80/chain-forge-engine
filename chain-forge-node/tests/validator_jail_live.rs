@@ -121,6 +121,8 @@ fn spawn(spec: &Spec, log_dir: &PathBuf) -> NodeHandle {
        .arg("--data-dir").arg(&data_dir)
        .arg("--key-file").arg(key_file(spec.name.trim_start_matches("qcb1")));
     for p in &spec.peers { cmd.arg("--bootstrap").arg(format!("/ip4/127.0.0.1/tcp/{p}")); }
+    // Storage format 2 test switch (default OFF): CF_TEST_STORAGE_V2=1 runs this test on the experimental v2 layout.
+    if std::env::var_os("CF_TEST_STORAGE_V2").is_some() { cmd.arg("--storage-v2-experimental"); }
     cmd.stdout(log.try_clone().unwrap()).stderr(log).stdin(Stdio::null());
     NodeHandle { proc: cmd.spawn().unwrap_or_else(|e| panic!("spawn {}: {e}", spec.name)) }
 }
