@@ -7683,6 +7683,98 @@ mod tests {
             assert!(is_fatal(&v2_node(&dir).await.load_persisted_state())); let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// The interval between "the signing guard is durable" and "the block is committed", at EVERY commit
+        /// boundary. A vote and a proposal for height 8 are recorded in the guard (made durable before they would be
+        /// sent), then the commit of block 8 is interrupted. After restart the guard still refuses anything that
+        /// conflicts with what was authorised, abstention covers the uncommitted height, and re-committing the same
+        /// block clears it.
+        #[tokio::test]
+        async fn v2_guard_to_commit_interval_is_safe_at_every_boundary() {
+            for (point, committed) in [("block_log_appended", false), ("hvs_log_appended", false), ("gen_files_written", false),
+                                       ("manifest_written", false), ("current_written", true)] {
+                let dir = v2_tmp(&format!("g2c-{point}"));
+                let key = || ClassicalScheme.generate_keypair("qcb1alice").unwrap();
+                let mut n = liveness_node(1_000_000).await; n.signing_key = Some(key()); n.set_storage_v2(true).unwrap(); n.set_data_dir(dir.clone()).unwrap();
+                let mut nonce = 0;
+                for h in 0..8 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+                let p = next_proposal(&mut n, 8, 1, &mut nonce);
+                // authorised before the commit: a precommit for this block, and this node's own proposal for (8, 0)
+                let vote = signed_vote(CHAIN, VoteType::Precommit, 8, 0, "qcb1alice", p.block_hash.clone());
+                n.sign_guard.record(&vote, None); n.persist_sign_guard().unwrap();
+                let signed = n.sign_and_register_own_proposal(p.clone()).await.expect("own proposal is signed and guarded");
+                crate::persistence::fault::arm(point); deliver_lenient(&mut n, &p).await; crate::persistence::fault::disarm();
+                drop(n);                                                      // the crash
+                let mut r = liveness_node(1_000_000).await; r.signing_key = Some(key()); r.set_storage_v2(true).unwrap(); r.set_data_dir(dir.clone()).unwrap();
+                let h = restart_height(r.load_persisted_state());
+                assert_eq!(h, if committed { 8 } else { 7 }, "{point}: restored height");
+                if committed { assert_eq!(r.signing_abstaining_until(), None, "{point}: guard == state, nothing to abstain from"); }
+                else { assert_eq!(r.signing_abstaining_until(), Some(8), "{point}: guard ahead of state, abstain through height 8"); }
+                // whatever was authorised is still remembered
+                let other_hash = BlockHash("a-different-block".into());
+                assert!(r.sign_guard.check(&signed_vote(CHAIN, VoteType::Precommit, 8, 0, "qcb1alice", other_hash.clone())).is_err(), "{point}: conflicting vote refused");
+                assert!(r.sign_guard.check(&vote).unwrap().is_some(), "{point}: identical vote is re-sent, not re-signed");
+                let mut conflicting = p.clone(); conflicting.block_hash = other_hash;
+                // the guard itself, independent of abstention
+                assert!(r.sign_guard.check_proposal(&conflicting).is_err(), "{point}: the guard refuses a conflicting proposal for (8, 0)");
+                assert_eq!(r.sign_guard.check_proposal(&p).unwrap().unwrap().signature, signed.signature, "{point}: the guard holds the stored signed proposal");
+                assert!(r.sign_and_register_own_proposal(conflicting).await.is_none(), "{point}: conflicting proposal withheld");
+                let resent = r.sign_and_register_own_proposal(p.clone()).await;
+                if committed { assert_eq!(resent.unwrap().signature, signed.signature, "{point}: identical proposal re-sent with the stored signature"); }
+                else { assert!(resent.is_none(), "{point}: an abstaining node does not propose at or below the guard height"); }
+                if !committed {
+                    // while abstaining the node signs nothing at or below the guard height (its own proposal here is the stored one)
+                    deliver(&mut r, &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+                    assert_eq!(r.signing_abstaining_until(), None, "{point}: abstention ends once the state reaches the guard height");
+                }
+                drop(r);
+                let mut r2 = liveness_node(1_000_000).await; r2.set_storage_v2(true).unwrap(); r2.set_data_dir(dir.clone()).unwrap();
+                assert_eq!(restart_height(r2.load_persisted_state()), 8, "{point}: second restart");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// A record whose append was interrupted at (almost) every byte offset, in either log: the node restarts at the
+        /// committed block, the file is cut back to the committed tail, and a complete record beyond the checkpoint
+        /// (the crash right after the append) is removed too.
+        #[tokio::test]
+        async fn v2_interrupted_record_write_at_many_offsets_in_either_log() {
+            let dir = v2_tmp("torn-offsets"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..6 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            let ident = n.snapshot_identity(); drop(n);
+            for (sub, kind) in [("blocklog", crate::blocklog::KIND_BLOCK), ("hvslog", crate::blocklog::KIND_VALIDATOR_SET)] {
+                let ld = dir.join(sub);
+                let seg = std::fs::read_dir(&ld).unwrap().map(|e| e.unwrap().path()).next().unwrap();
+                let orig = std::fs::read(&seg).unwrap();
+                let anchor = crate::blocklog::anchor_for(ident.genesis_hash.as_bytes(), kind);
+                let mut last_payload = vec![]; let first = 0u64;
+                let tail = crate::blocklog::BlockLog::replay(&ld, kind, anchor, first, |h, p| if h == 5 { last_payload = p.to_vec(); }).unwrap().unwrap();
+                let (next_rec, _) = crate::blocklog::record_bytes(kind, 6, &last_payload, &tail.hash);
+                let mut cuts: Vec<usize> = (0..=96.min(next_rec.len())).collect();
+                cuts.extend((97..next_rec.len()).step_by(211)); cuts.extend([next_rec.len() - 33, next_rec.len() - 32, next_rec.len() - 1, next_rec.len()]);
+                cuts.sort(); cuts.dedup();
+                for cut in cuts {
+                    let mut bytes = orig.clone(); bytes.extend_from_slice(&next_rec[..cut]); std::fs::write(&seg, &bytes).unwrap();
+                    let mut r = v2_node(&dir).await;
+                    assert_eq!(restart_height(r.load_persisted_state()), 5, "{sub}: partial record of {cut}/{} bytes", next_rec.len());
+                    assert_eq!(std::fs::read(&seg).unwrap(), orig, "{sub}: cut {cut}: the file is cut back to the committed tail");
+                    drop(r);
+                }
+                std::fs::write(&seg, &orig).unwrap();
+            }
+            // and a flipped byte anywhere in the LAST COMMITTED record of either log is fatal
+            for sub in ["blocklog", "hvslog"] {
+                let seg = std::fs::read_dir(dir.join(sub)).unwrap().map(|e| e.unwrap().path()).next().unwrap();
+                let orig = std::fs::read(&seg).unwrap();
+                for off in (1..96).chain([orig.len() / 2, orig.len() - 33, orig.len() - 1]) {
+                    let mut b = orig.clone(); let at = orig.len() - 1 - off.min(orig.len() - 1); b[at] ^= 0x80; std::fs::write(&seg, &b).unwrap();
+                    assert!(is_fatal(&v2_node(&dir).await.load_persisted_state()), "{sub}: flip at {at} must be fatal");
+                }
+                std::fs::write(&seg, &orig).unwrap();
+            }
+            assert_eq!(restart_height(v2_node(&dir).await.load_persisted_state()), 5);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// Regression (v1 nodes, default storage): the proposal guard added in PR 2 must load guard files written
         /// before it, leave them untouched until the node signs, then survive a restart and refuse conflicting proposals.
         #[tokio::test]

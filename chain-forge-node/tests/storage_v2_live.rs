@@ -217,6 +217,10 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
         let got = resumed_height(&dave.log).expect("resumed height in log");
         println!("   {point}: Dave resumed at height {got} (expected {want})");
         assert_eq!(got, want, "{point}: Dave resumed at the wrong committed height");
+        // Dave had already signed his precommit for height 6 (the guard is durable before the vote leaves the node).
+        // Before CURRENT the committed state is height 5, so the guard is ahead and he must abstain; after CURRENT it is not.
+        let abstains = log.contains("abstaining from signing");
+        assert_eq!(abstains, point != "current_written", "{point}: abstention on restart (guard ahead of state) was {abstains}");
         // catches up and agrees
         let target = height(nodes[0].api).unwrap();
         assert!(wait_heights(&[dave.api], target, Duration::from_secs(120)), "{point}: Dave did not catch up to {target}");

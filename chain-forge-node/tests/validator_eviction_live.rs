@@ -505,6 +505,28 @@ fn validator_eviction_live() {
         assert_eq!(r, r0, "EV-03 FAIL: node{i} state root {r} != node0 {r0}");
     }
     println!("   ✓ EV-03: state root consistent: {r0}");
+    println!("   final heights sampled: {:?}", all_api.iter().map(|&p| height(p)).collect::<Vec<_>>());
+
+    // Optional diagnostic (CF_EVICT_DUMP_ROOTS=<file>): per-height state roots of node0 plus the genesis file's
+    // size and CR count, so two platforms can be compared at IDENTICAL heights. The test samples the root at
+    // whatever height it happens to be when it finishes, so equal code can print different roots.
+    if let Some(path) = std::env::var_os("CF_EVICT_DUMP_ROOTS") {
+        let gbytes = std::fs::read(genesis_path()).unwrap_or_default();
+        let top = height(ports.alice_api);
+        let mut per_height = serde_json::Map::new();
+        for h in 0..=top {
+            if let Some(b) = http_get(ports.alice_api, &format!("/api/blocks/{h}")) {
+                per_height.insert(h.to_string(), serde_json::json!({
+                    "state_root": b["state_root"], "block_hash": b["block_hash"], "tx_count": b["tx_count"].clone(),
+                    "proposer": b["proposer"].clone() }));
+            }
+        }
+        let dump = serde_json::json!({
+            "genesis_file_bytes": gbytes.len(), "genesis_file_cr_count": gbytes.iter().filter(|&&c| c == b'\r').count(),
+            "final_height_node0": top, "final_root_node0": r0, "blocks": per_height });
+        std::fs::write(&path, serde_json::to_vec_pretty(&dump).unwrap()).unwrap();
+        println!("   root dump written to {:?}", path);
+    }
 
     println!("\n── Summary ──────────────────────────────────────────────────────────");
     println!("   ✓ EV-01: UnbondValidator → evicted from active set at epoch boundary");
