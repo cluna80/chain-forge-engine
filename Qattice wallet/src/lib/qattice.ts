@@ -1,5 +1,9 @@
 export const UQCB = 1_000_000;
-export const CHAIN_ID = "qcb-testnet-4node";
+/** Genesis chain id. Override with VITE_CHAIN_ID only when the node is not qcb-testnet-4node. */
+export const CHAIN_ID: string =
+  (typeof import.meta !== "undefined" &&
+    (import.meta as { env?: Record<string, string> }).env?.VITE_CHAIN_ID) ||
+  "qcb-testnet-4node";
 export const ADDRESS = "qcb1pq1k4rm7w4llet9h0lder2charm";
 export const TX_DOMAIN = "chain-forge/pq-tx/v1";
 
@@ -26,23 +30,38 @@ export type NodeAccount = {
   address: string;
   nonce: number;
   balances: Record<string, number>;
+  tier?: string | null;
+  attestation_count?: number;
+  attested_by?: string[];
+};
+
+export type NodeProbe = {
+  reachable: boolean;
+  identity: NodeIdentity | null;
+  account: NodeAccount | null;
+  error: string | null;
 };
 
 export type NodeTxResult =
   | { ok: true; tx_id: string }
   | { ok: false; error: string };
 
-async function nodeGet<T>(path: string): Promise<T | null> {
-  if (!NODE_URL) return null;
+async function nodeCall<T>(path: string): Promise<{ status: number; data: T | null }> {
+  if (!NODE_URL) return { status: 0, data: null };
   try {
     const res = await fetch(`${NODE_URL}${path}`, {
       headers: { Accept: "application/json" },
     });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
+    if (!res.ok) return { status: res.status, data: null };
+    return { status: res.status, data: (await res.json()) as T };
   } catch {
-    return null;
+    return { status: 0, data: null };
   }
+}
+
+async function nodeGet<T>(path: string): Promise<T | null> {
+  const res = await nodeCall<T>(path);
+  return res.status === 200 ? res.data : null;
 }
 
 export async function fetchNodeIdentity(address: string): Promise<NodeIdentity | null> {
@@ -51,6 +70,27 @@ export async function fetchNodeIdentity(address: string): Promise<NodeIdentity |
 
 export async function fetchNodeAccount(address: string): Promise<NodeAccount | null> {
   return nodeGet<NodeAccount>(`/api/accounts/${address}`);
+}
+
+/** 404 is reachable (address missing). status 0 is a network failure. */
+export async function probeNode(address: string): Promise<NodeProbe> {
+  if (!NODE_URL) {
+    return { reachable: false, identity: null, account: null, error: "Set VITE_NODE_URL to connect to a live node." };
+  }
+  const [identity, account] = await Promise.all([
+    nodeCall<NodeIdentity>(`/api/identity/${address}`),
+    nodeCall<NodeAccount>(`/api/accounts/${address}`),
+  ]);
+  if (identity.status === 0 && account.status === 0) {
+    return { reachable: false, identity: null, account: null, error: `Cannot reach node at ${NODE_URL}` };
+  }
+  const missing = identity.status === 404 && account.status === 404;
+  return {
+    reachable: true,
+    identity: identity.status === 200 ? identity.data : null,
+    account: account.status === 200 ? account.data : null,
+    error: missing ? "This address is not on the node yet." : null,
+  };
 }
 
 export async function submitNodeTx(body: Record<string, unknown>): Promise<NodeTxResult> {
@@ -111,6 +151,8 @@ export type Proof = {
   vendorId: string;
   fingerprint: string;
   digest: string;
+  /** mldsa65:<hex> over the DIS-KS-V1 transcript, signed by the chain account key. */
+  signature?: string;
   at: number;
   resource: string;
   action: string;
@@ -229,6 +271,11 @@ export async function sha256Hex(message: string) {
 
 export function txPreimage(bodyJson: string) {
   return `${TX_DOMAIN}\n${CHAIN_ID}\n${bodyJson}`;
+}
+
+/** serde_json externally tagged TxBody::Transfer { to, denom, amount }. */
+export function transferBodyJson(to: string, amountUqcb: number) {
+  return JSON.stringify({ Transfer: { to, denom: "uqcb", amount: amountUqcb } });
 }
 
 export function disPreimage(c: Challenge, vendorFingerprint: string) {
@@ -375,7 +422,7 @@ export const SPEC: SpecItem[] = [
     group: "next",
     title: "Signed transaction envelope",
     detail:
-      "Prehash is SHA-256 of chain-forge/pq-tx/v1, the chain id, and the tx body. Submit only SignedTxEnvelope — id, sender, nonce, body, gas_limit, signature tagged mldsa65 — to POST /api/tx.",
+      "Prehash is SHA-256 of chain-forge/pq-tx/v1, the chain id, and the canonical body. ML-DSA-65 signs that 32-byte digest. POST /api/tx gets sig_scheme MlDsa, pq_signatures [mldsa65:hex], and pq_public_key. The Ed25519 signature field is omitted.",
     surface: "move",
     rehearsal: "send",
   },
@@ -479,7 +526,7 @@ export const SPEC: SpecItem[] = [
     group: "gate",
     title: "Hybrid TLS and real enrollment",
     detail:
-      "Vendor origins still need post-quantum hybrid TLS. Enrollment must be RP-authenticated. Conformance vectors still need a non-Rust client. This rehearsal records intent and digests only — it does not emit ML-DSA signatures.",
+      "Vendor origins still need post-quantum hybrid TLS, and enrollment must be RP-authenticated. Chain transactions are ML-DSA-65. A Stone signature is the chain account over the DIS-KS-V1 transcript, not a per-vendor DIS key and not DIS-AUTH-V1.",
   },
 ];
 

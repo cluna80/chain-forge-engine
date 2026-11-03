@@ -9,3 +9,7 @@ android/.gradle/
 android/app/build/
 android/build/
 android/local.properties
+
+# Build output and app-builder workspace. Not part of the wallet.
+.vercel/
+.grok/

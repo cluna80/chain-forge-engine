@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import QRCode from "qrcode";
 import { toast } from "sonner";
-import { getAddress } from "@/lib/keypair-store";
+import { getAddress, keyStorageKind } from "@/lib/keypair-store";
 import {
   ATTESTATION_QUORUM,
   CHAIN_ID,
@@ -18,6 +18,7 @@ import {
   parseChallenge,
   reviewChallenge,
   shortAddress,
+  transferBodyJson,
   txPreimage,
   type Challenge,
   type SpecGroup,
@@ -92,7 +93,10 @@ export function HomeScreen({ go }: { go: (tab: Tab) => void }) {
             <Mark className="h-7 w-7" />
             <h1 className="font-display text-3xl font-medium tracking-tight text-parchment">Qattice</h1>
           </div>
-          <p className="mt-1 text-sm text-mist">{NODE_URL ? "Live wallet" : "Rehearsal wallet"} · keys stay on the phone</p>
+          <p className="mt-1 text-sm text-mist">{NODE_URL ? "Live wallet" : "Not connected"} · the chain key stays in this browser</p>
+          {keyStorageKind() === "plaintext" ? (
+            <p className="mt-1 text-xs text-clay">This private key is still stored without a passphrase. Import it again to encrypt it.</p>
+          ) : null}
         </div>
         <div className="flex flex-col items-end gap-1">
           <p className="rounded-full border border-line px-3 py-1 text-xs text-mist">{CHAIN_ID.replace("qcb-", "")}</p>
@@ -106,8 +110,14 @@ export function HomeScreen({ go }: { go: (tab: Tab) => void }) {
       </header>
 
       <div>
-        <p className="font-display text-4xl font-medium tracking-tight text-parchment">{formatQcb(balance)}</p>
-        <p className="mt-1 text-sm text-mist">QCB · {formatUqcb(balance)}</p>
+        {NODE_URL && nodeConnected === null ? (
+          <p className="font-display text-4xl font-medium tracking-tight text-parchment">Reading the node…</p>
+        ) : (
+          <p className="font-display text-4xl font-medium tracking-tight text-parchment">{formatQcb(balance)}</p>
+        )}
+        <p className="mt-1 text-sm text-mist">
+          {nodeError ? nodeError : `QCB · ${formatUqcb(balance)}`}
+        </p>
       </div>
 
       <button
@@ -139,7 +149,7 @@ export function HomeScreen({ go }: { go: (tab: Tab) => void }) {
               onClick={() =>
                 void attest().then((r) => {
                   if (!r.ok) toast(r.error);
-                  else toast(NODE_URL ? "Attest tx submitted" : "Attestation recorded");
+                  else toast("Attest tx submitted");
                 })
               }
             >
@@ -318,15 +328,15 @@ export function StoneScreen() {
 
       {proof ? (
         <Card>
-          <SectionLabel>Last rehearsal proof</SectionLabel>
+          <SectionLabel>Last Stone signature</SectionLabel>
           <p className="mt-2 text-sm text-mist">
-            Digest over {DIS_DOMAIN}, not an ML-DSA signature. The phone wallet still does the real sign.
+            ML-DSA-65 by the chain account over the {DIS_DOMAIN} transcript. Not a per-vendor DIS key, and not DIS-AUTH-V1.
           </p>
           <dl className="mt-2">
             <Row k="Vendor" v={proof.vendorId} />
             <Row k="Key" v={proof.fingerprint} />
             <Row k="Resource" v={`${proof.resource} · ${proof.action}`} />
-            <Row k="SHA-256" v={proof.digest} />
+            <Row k="Signature" v={proof.signature ?? proof.digest} />
           </dl>
           <div className="mt-3">
             <GhostButton
@@ -337,7 +347,7 @@ export function StoneScreen() {
                       domain: DIS_DOMAIN,
                       suite: "ML-DSA-65",
                       ...proof,
-                      note: "rehearsal digest, not a signature",
+                      note: "chain account over DIS-KS-V1, not a vendor DIS key",
                     },
                     null,
                     2,
@@ -577,15 +587,10 @@ export function MoveScreen() {
   const [error, setError] = useState("");
   const [reviewing, setReviewing] = useState(false);
   const [digest, setDigest] = useState("");
+  const [submitted, setSubmitted] = useState(false);
 
   const uqcb = qcbToUqcb(amount);
-  const body = {
-    type: "Transfer",
-    to: to.trim(),
-    amount: uqcb ?? 0,
-    denom: "uqcb",
-  };
-  const bodyJson = JSON.stringify(body);
+  const bodyJson = uqcb == null ? "" : transferBodyJson(to.trim(), uqcb);
 
   return (
     <div className="space-y-6">
@@ -595,7 +600,7 @@ export function MoveScreen() {
           {mode === "send" ? "Send" : "Receive"}
         </h2>
         <p className="mt-2 text-sm text-mist">
-          Available {formatQcb(balance)} QCB. Nonce {nonce}. Nothing here is broadcast to the devnet.
+          Available {formatQcb(balance)} QCB. Nonce {nonce}. {NODE_URL ? "Submit goes to the node." : "VITE_NODE_URL is unset, so a signature stays on this device."}
         </p>
       </div>
 
@@ -673,7 +678,7 @@ export function MoveScreen() {
           </dl>
           <pre className="mt-3 overflow-x-auto rounded-xl bg-raised p-3 font-mono text-xs text-mist">{txPreimage(bodyJson)}</pre>
           <p className="mt-3 text-sm text-mist">
-            The real wallet signs that preimage with ML-DSA-65 and submits only the envelope to /api/tx.
+            Sign is SHA-256 of that preimage, then ML-DSA-65. The node checks pq_signatures, not an Ed25519 signature field.
           </p>
           <div className="mt-4">
             <PrimaryButton
@@ -684,12 +689,13 @@ export function MoveScreen() {
                     return;
                   }
                   setDigest(r.digest);
+                  setSubmitted(r.submitted);
                   setReviewing(false);
-                  toast("Transfer recorded");
+                  toast(r.submitted ? "Transfer submitted" : "Signed locally. Not submitted.");
                 })
               }
             >
-              Record rehearsal send
+              {NODE_URL ? "Sign and submit" : "Sign, do not submit"}
             </PrimaryButton>
           </div>
         </Card>
@@ -697,9 +703,13 @@ export function MoveScreen() {
 
       {digest ? (
         <Card>
-          <SectionLabel>Rehearsal digest</SectionLabel>
-          <p className="mt-2 font-mono text-sm break-all text-parchment">{digest}</p>
-          <p className="mt-2 text-sm text-mist">SHA-256 of the preimage. Not a signature, and not submitted.</p>
+          <SectionLabel>{submitted ? "Submitted signature" : "Signature, not submitted"}</SectionLabel>
+          <p className="mt-2 font-mono text-sm break-all text-parchment">mldsa65:{digest.slice(0, 32)}…</p>
+          <p className="mt-2 text-sm text-mist">
+            {submitted
+              ? "ML-DSA-65 over the canonical transfer body. The node accepted the envelope."
+              : "ML-DSA-65 over the canonical transfer body. Set VITE_NODE_URL to broadcast it."}
+          </p>
         </Card>
       ) : null}
     </div>

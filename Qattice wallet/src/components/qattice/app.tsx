@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { Toaster } from "sonner";
 import { ArrowLeftRight, Bot, Fingerprint, Hexagon, ListChecks } from "lucide-react";
 import type { Tab } from "@/lib/qattice";
-import { loadKeypair } from "@/lib/keypair-store";
+import { keypairStatus } from "@/lib/keypair-store";
 import { useWallet } from "@/lib/wallet-store";
 import { AgentsScreen, HomeScreen, MoveScreen, SpecScreen, StoneScreen } from "@/components/qattice/screens";
-import { InitWallet } from "@/components/qattice/init-wallet";
+import { InitWallet, UnlockWallet } from "@/components/qattice/init-wallet";
 
 const NAV: { id: Tab; label: string; icon: typeof Hexagon }[] = [
   { id: "home", label: "Home", icon: Hexagon },
@@ -15,17 +15,34 @@ const NAV: { id: Tab; label: string; icon: typeof Hexagon }[] = [
   { id: "spec", label: "Spec", icon: ListChecks },
 ];
 
+type Phase = "loading" | "init" | "unlock" | "ready";
+
 export function QatticeApp() {
   const tab = useWallet((s) => s.tab);
   const setTab = useWallet((s) => s.setTab);
-  const [initialized, setInitialized] = useState(() => loadKeypair() !== null);
+  const [phase, setPhase] = useState<Phase>("loading");
 
   useEffect(() => {
-    void useWallet.persist.rehydrate();
+    const status = keypairStatus();
+    if (status === "none") {
+      setPhase("init");
+      return;
+    }
+    if (status === "locked") {
+      setPhase("unlock");
+      return;
+    }
+    void openWallet(setPhase);
   }, []);
 
-  if (!initialized) {
-    return <InitWallet onDone={() => setInitialized(true)} />;
+  if (phase === "loading") {
+    return <div className="lattice min-h-dvh text-mist flex items-center justify-center text-sm">Opening wallet…</div>;
+  }
+  if (phase === "init") {
+    return <InitWallet onDone={() => void openWallet(setPhase)} />;
+  }
+  if (phase === "unlock") {
+    return <UnlockWallet onDone={() => void openWallet(setPhase)} />;
   }
 
   function go(next: Tab) {
@@ -74,4 +91,10 @@ export function QatticeApp() {
       />
     </div>
   );
+}
+
+async function openWallet(setPhase: (phase: Phase) => void) {
+  await useWallet.persist.rehydrate();
+  setPhase("ready");
+  void useWallet.getState().syncFromNode();
 }
