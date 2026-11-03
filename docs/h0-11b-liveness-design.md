@@ -119,10 +119,20 @@ A2 receipt attestations are **not** definitive proof of timely signing. A signat
 **Three-valued accounting.** Each `(h, v)` entry of the liveness window is one of **P** (tier P), **O** (tier O only), or **M** (no admissible evidence by the evaluation point `h+G`).
 - The *missed percentage* used by the jail rule counts **M only**: `missed_pct = M / (P + O + M)`. **Ambiguous late evidence (O) is never counted as missed and so can never contribute to automatic jailing.**
 - *Reliability credit* counts **P only**. An O entry earns nothing: **retroactive historical signatures never automatically earn full reliability credit** (they do not advance probation, section 8, and are not "present" for any reward).
-- Entries that are O are tracked as a separate counter per validator and per window, and a window with a high O share raises an operator alarm (Q2). Alarm, not jail.
+- Entries that are O are tracked as a separate counter per validator and per window, and monitoring thresholds (below) raise non-punitive alerts. Alert, not jail.
 - The robust (f-proposer-exclusion) rule is applied to P versus not-P as before, so a Byzantine proposer that omits a precommit turns a P into O or M, never into a false P.
 
-**Residual risk accepted by the owner's rule (stated, not hidden).** A validator that is really offline but backfills historical signatures within `G` blocks is O, not M, and is therefore not jailed automatically. It also earns no credit and is flagged. The remedies are the operator alarm, a bound on the O share of a window (an alarm threshold, set after measurement), and a human or governance review path. Automatic suspension stays disabled, so this is a monitoring gap, not a safety gap.
+**Monitoring thresholds for tier O (owner decision on Q2, 2026-11-03; PROVISIONAL, operational, not consensus rules).** Computed per validator over a **rolling window of 500 eligible heights** (a height is eligible once its entry is finalised at `h+G`; heights where the validator was not in the committee do not count):
+- **Minimum evidence:** at least **100 eligible observations** in the window, otherwise no alert is evaluated.
+- **O share >= 5%:** *warning*. **O share >= 15%:** *critical alert*. (`O share = O / (P + O + M)` over the eligible entries.)
+- **10 consecutive O entries:** an additional *warning*, independent of the share.
+- **Recipients:** the validator's operator and the network monitoring infrastructure (delivery mechanism to be specified; an API field and a log line are the minimum).
+- **Alerts are nonpunitive.** An alert must not, alone or in combination, cause jailing, slashing, removal, a voting-power change, a missed-block count or any change to consensus state. Alerts are computed from committed data, but they are an off-chain operational output; they are not part of the state root.
+- **Calibration required.** These numbers are provisional and must be calibrated after P-02b and live-network measurements (the loaded-delay data is confounded by persistence cost and cannot set them).
+
+**M is not proof of non-participation.** M means *no admissible evidence was found by the evaluation point*. It is not a finding that the validator did not sign or was offline: the validator may have signed and the signature never reached an honest node and a proposer in the window. The memo keeps the two apart everywhere: P (provably recorded participation), O (attested but ambiguous), M (missing admissible evidence), and "proven nonparticipation", which this design never claims and no tier encodes.
+
+**Residual risk accepted by the owner's rule (stated, not hidden).** A validator that is really offline but backfills historical signatures within `G` blocks is O, not M, and is therefore not jailed automatically. It also earns no credit and is flagged. The remedies are the non-punitive monitoring thresholds above and a human or governance review path. Automatic suspension stays disabled, so this is a monitoring gap, not a safety gap.
 
 **Updated limits of R7.** R7 is not "offline validators are never credited". It is: (1) a backfilled or attested-late signature **never** yields tier P; (2) it never causes a jail; (3) the chain makes no claim about the signing time of a tier-O item beyond "held by an honest validator by committed height `k_a`".
 
@@ -183,7 +193,7 @@ That any section-6 scheme is sufficient against a coordinated majority; that the
 ## 12. Unresolved security questions (for owner and reviewer)
 
 - **Q1, what "timely" means without a clock. Decided by the owner (2026-11-03), implemented in section 6c.** A2 is bounded observation evidence, not proof of signing time. Residual: an offline validator backfilling within `G` blocks is O, never jailed automatically, never credited; monitoring and review replace automatic punishment for that case.
-- **Q2, backfill farming (now the main residual risk).** With O never counted as missed, a mostly-offline validator can avoid automatic jailing by backfilling signatures within `G`. Section 6c gives it no credit and raises an alarm, but who acts on the alarm, and at what O-share threshold, is undecided; also whether a cap on O per window or per validator is needed.
+- **Q2, backfill farming. Thresholds decided provisionally by the owner (2026-11-03), section 6c.** Residual: alerts are nonpunitive, so a mostly-offline validator that backfills within `G` is never jailed automatically; who acts on a critical alert, and the calibration of 5% / 15% / 10-consecutive, remain open until P-02b and live-network data exist.
 - **Q3, attestation size and work.** ML-DSA-65 signatures are 3,309 bytes. At an f+1 power threshold on a 100-member committee that is >100 KB per unbatched item. Batching by Merkle root is proposed; the verification cost on the commit path and the cap (16) are untested.
 - **Q4, proposer selection.** The omission argument (C2) assumes round-robin. For any weighted or randomised selection, `G` needs a probabilistic bound.
 - **Q5, deferral and the quorum denominator.** A deferred jailed validator that is truly offline still counts in the quorum denominator, so deferral can lower liveness while protecting `n' >= 4`. Decide the rule for an *eventual* forced removal, if any, and an operator alarm.
@@ -203,7 +213,7 @@ That any section-6 scheme is sufficient against a coordinated majority; that the
 | TIER-T2 | No retroactive credit | Probation progress and any credit counter advance on P only; a stream of attested-late signatures advances nothing. |
 | TIER-T3 | Ambiguity never jails | Property test over random P/O/M sequences and Byzantine proposer omissions: no jail is produced where the same sequence with O replaced by P would not jail only because of O. |
 | TIER-T4 | A3 handling | A message in a later block shields `h` (O) but never yields P for `h`. |
-| TIER-T5 | Alarm | A window with an O share above the alarm threshold produces the operator signal and no state change (no jail, no credit). |
+| TIER-T5 | Alerts | Over a rolling 500-eligible-height window: no alert below 100 observations; warning at O share 5%, critical at 15%; an extra warning at 10 consecutive O; each alert leaves state root, jail status, stake and voting power unchanged. |
 | TIER-T6 | Live | Re-run the loaded-delay experiment with tiers enabled in a test genesis: a late-but-live Dave is never jailed; an offline Dave (no signature at all) accumulates M and is jailed only in the test-policy genesis, never in production defaults. Windows run required before any ✅. |
 | A2-T5 | Proposer omission | `f` consecutive Byzantine proposers omitting the item still leave it admissible via an honest proposer within `G`. |
 | A2-T6 | Agreement | Replay the same chain on four in-process nodes and after a restart: identical windows and jail height. |
