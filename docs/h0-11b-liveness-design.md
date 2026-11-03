@@ -25,16 +25,16 @@ All references are to `main` `385431f`.
 
 ## 3. What the measurements show, and what they do not
 
-Windows, merged `main` `b9f1e7e`, 2026-11-02 (KNOWN_ISSUES §8; only Dave's precommit *arrival* is delayed, he signs on time):
+Windows, merged `main`, two runs of the same test and load: `b9f1e7e` (2026-11-02) and `385431f` (2026-11-03) (KNOWN_ISSUES §8; only Dave's precommit *arrival* is delayed, he signs on time):
 
 | Chain | First omissions | Half of his networked precommits omitted |
 | --- | --- | --- |
-| idle | 2200 ms (5/18) | 3000 ms |
-| loaded (16 accounts) | 500 ms (2/14); 900 ms: 4/14 = **29%** | 1200 ms (7/14) |
+| idle | 2200 ms (5/18 in run 1, 1/18 in run 2) | 3000 ms (both runs) |
+| loaded (16 accounts) | 500 ms: 2/14 = 14% (both runs). **900 ms: 4/14 = 29% in run 1, 1/14 = 7% in run 2, not stable** | 1200 ms (7/14 in run 1, 9/14 in run 2) |
 
 Healthy validators on a loopback devnet: worst plain miss 0% idle and loaded (integrity test, 652 s).
 
-**These numbers are confounded.** During the loaded run the block interval drifted **1.9×** (1071 to 2077 ms) from per-block persistence cost, and the delay-0 control at the end omitted 3 of 11 precommits with no added delay. So the loaded miss rates mix (1) arrival lateness against the proposer's collection window and (2) the cost that stretches the interval and moves that window. **No threshold may be chosen from them until PERSIST-001 P-02b has been measured** (persistence memo, section 16). The tests also cannot say what a WAN does.
+**These numbers are confounded and not repeatable at the 900 ms point.** During the loaded runs the block interval drifted **1.9×** (1071 to 2077 ms) in run 1 and **1.6×** (1269 to 2080 ms) in run 2 from per-block persistence cost, and the delay-0 control at the end omitted 3 of 11 (run 1) and 2 of 10 (run 2) precommits with no added delay. The transition from harmless to mostly omitted lies between about 900 and 1200 ms, but its exact position varies run to run. So the loaded miss rates mix (1) arrival lateness against the proposer's collection window and (2) the cost that stretches the interval and moves that window. **No threshold may be chosen from them until PERSIST-001 P-02b has been measured** (persistence memo, section 16). The tests also cannot say what a WAN does.
 
 ## 4. The problem
 
@@ -97,7 +97,7 @@ Proposed: an explicit `ResumeValidator` transaction, valid only after jail expir
 4. Quorum-protection transition tests: 4 seats with one jailed and a bonded candidate available (replacement restores n' = 4); no candidate (deferral, Q2 ordering); two jails at once.
 5. Reinstatement: expiry does not reseat; probation requires N observed blocks; a relapse escalates the jail.
 6. The existing `liveness_false_positive`, `late_precommit` and `validator_liveness_integrity_live` suites stay green as regression tests.
-7. **After P-02b:** repeat `validator_precommit_delay_loaded_live` with the same load and compare the drift ratio (1.9× above) and the delay-0 control, then decide the thresholds.
+7. **After P-02b:** repeat `validator_precommit_delay_loaded_live` with the same load and compare the drift ratio (1.9× and 1.6× above) and the delay-0 control, then decide the thresholds.
 8. Windows runs of every live test, per the project rule.
 
 ## 9a. Sequencing and dependencies
