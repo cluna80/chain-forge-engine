@@ -7565,7 +7565,7 @@ mod tests {
         /// log tail to the block log and fsync, (3) write the generation (small files + descriptor naming the
         /// log tail) through the UNCHANGED production `write_snapshot`. Returns only after the manifest and
         /// `CURRENT` are durable, i.e. the point at which D1 allows voting at the next height.
-        fn proto_persist(n: &Node, log: &mut crate::blocklog::BlockLog, dir: &std::path::Path) -> Result<ProtoRec, String> {
+        fn proto_persist(n: &Node, log: &mut crate::blocklog::BlockLog, hvs: Option<&mut crate::blocklog::BlockLog>, dir: &std::path::Path) -> Result<ProtoRec, String> {
             let t0 = std::time::Instant::now();
             let snap = n.state.export_snapshot();
             let height = snap.height;
@@ -7575,7 +7575,6 @@ mod tests {
                 ("validators.json", serde_json::to_vec_pretty(&n.validator_registry).map_err(|e| e.to_string())?),
                 ("agents.json", serde_json::to_vec_pretty(&n.agents).map_err(|e| e.to_string())?),
                 ("slashing.json", serde_json::to_vec_pretty(&n.slasher).map_err(|e| e.to_string())?),
-                ("historical_validator_sets.json", serde_json::to_vec_pretty(&n.historical_validator_sets).map_err(|e| e.to_string())?),
                 ("live_validator_set.json", serde_json::to_vec_pretty(n.consensus.validator_set()).map_err(|e| e.to_string())?),
             ];
             let small_ser_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -7587,9 +7586,27 @@ mod tests {
                 bytes += payload.len() + 8 + 4 + 1 + 8 + 64;
                 log.append(*h, &payload).map_err(|e| e.to_string())?;
             }
-            let log_ms = t1.elapsed().as_secs_f64() * 1000.0;
             let tail = log.tail().cloned().ok_or("empty log")?;
-            let descriptor = serde_json::json!({"format": "p02b-proto-1", "tail_height": tail.height, "tail_hash": hex::encode(tail.hash)});
+            // historical_validator_sets grows by one validator set per height: it goes into its own append-only log
+            // (prototype v2) instead of being rewritten whole into every generation.
+            let hvs_tail = match hvs {
+                Some(h) => {
+                    let nexth = h.tail().map(|t| t.height + 1).unwrap_or(0);
+                    for (ht, set) in n.historical_validator_sets.range(nexth..) {
+                        let payload = serde_json::to_vec(&(ht, set)).map_err(|e| e.to_string())?;
+                        bytes += payload.len() + 8 + 4 + 1 + 8 + 64;
+                        h.append(*ht, &payload).map_err(|e| e.to_string())?;
+                    }
+                    h.tail().cloned()
+                }
+                None => {
+                    let v = serde_json::to_vec_pretty(&n.historical_validator_sets).map_err(|e| e.to_string())?;
+                    bytes += v.len(); contents.push(("historical_validator_sets.json", v)); None
+                }
+            };
+            let log_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let descriptor = serde_json::json!({"format": "p02b-proto-2", "tail_height": tail.height, "tail_hash": hex::encode(tail.hash),
+                "hvs_tail_height": hvs_tail.as_ref().map(|t| t.height), "hvs_tail_hash": hvs_tail.as_ref().map(|t| hex::encode(t.hash))});
             contents.push(("blocklog_descriptor.json", serde_json::to_vec_pretty(&descriptor).unwrap()));
             let t2 = std::time::Instant::now();
             crate::persistence::write_snapshot(dir, height, &contents, &n.snapshot_identity(), &n.live_state_root())
@@ -7630,7 +7647,7 @@ mod tests {
             let mut log = crate::blocklog::BlockLog::create(&logdir, proto_anchor(&n), 8).unwrap();
             for h in 0..30u64 {
                 commit_with_txs(&mut n, h, 3, &mut nonce).await;
-                proto_persist(&n, &mut log, &dir).unwrap();
+                proto_persist(&n, &mut log, None, &dir).unwrap();
                 // D1 postcondition: when the persist call returns, the committed descriptor IS the log tail.
                 assert_eq!(proto_committed_tail(&dir).as_ref(), log.tail());
                 assert_eq!(log.tail().unwrap().height, h);
@@ -7670,6 +7687,8 @@ mod tests {
             let mut nodes = vec![]; for _ in 0..nn { nodes.push(liveness_node(1_000_000).await); }
             let logdir = dir.join("blocklog");
             let mut log = crate::blocklog::BlockLog::create(&logdir, proto_anchor(&nodes[0]), seg).unwrap();
+            let use_hvs = std::env::var("CF_PB_HVS").is_ok();
+            let mut hvs = if use_hvs { Some(crate::blocklog::BlockLog::create(&dir.join("hvslog"), proto_anchor(&nodes[0]), seg).unwrap()) } else { None };
             let mut csv = std::fs::File::create(&csv_path).unwrap();
             writeln!(csv, "height,commit_ms,proto_total_ms,small_ser_ms,log_append_ms,snapshot_ms,bytes_written,files_write_fsync_sha,fsync_gen_dir,manifest_write,fsync_gen_dir2,fsync_snaps_dir,current_write,prune,roots_agree").unwrap();
             let start = std::time::Instant::now(); let (mut nonce, mut bad, mut done) = (0u64, 0u64, 0u64);
@@ -7687,7 +7706,7 @@ mod tests {
                 for i in 1..nn { deliver(&mut nodes[i], &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await; }
                 let r0 = nodes[0].live_state_root();
                 let agree = (1..nn).all(|i| nodes[i].live_state_root() == r0); if !agree { bad += 1; }
-                let r = proto_persist(&nodes[0], &mut log, &dir).unwrap();
+                let r = proto_persist(&nodes[0], &mut log, hvs.as_mut(), &dir).unwrap();
                 let ph = |name: &str| r.phases.iter().find(|p| p.0 == name).map(|p| p.1).unwrap_or(f64::NAN);
                 writeln!(csv, "{h},{commit_ms:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{agree}",
                     r.total_ms, r.small_ser_ms, r.log_ms, r.snap_ms, r.bytes, ph("files_write_fsync_sha"), ph("fsync_gen_dir"), ph("manifest_write"), ph("fsync_gen_dir2"), ph("fsync_snaps_dir"), ph("current_write"), ph("prune")).unwrap();
@@ -7695,7 +7714,7 @@ mod tests {
                 if h % 1000 == 0 { println!("PB h={h} commit={commit_ms:.1}ms proto={:.1}ms bytes={} elapsed={:.0}s", r.total_ms, r.bytes, start.elapsed().as_secs_f64()); }
                 if start.elapsed().as_secs_f64() > budget { println!("PB budget reached at height {h}"); break; }
             }
-            drop(log);
+            drop(log); drop(hvs);
             println!("PB DONE blocks={done} elapsed={:.1}s nodes={nn} root_disagreements={bad}", start.elapsed().as_secs_f64());
             // recovery / replay costs at the final height
             let committed = proto_committed_tail(&dir).unwrap();
