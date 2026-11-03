@@ -466,6 +466,8 @@ pub fn write_snapshot_format(
     state_root: &str,
     format_version: u64,
 ) -> Result<String, PersistError> {
+    // Crash points are keyed on the height being committed; record it here so every storage format (v1 and v2) is covered.
+    #[cfg(any(test, feature = "fault-injection"))] fault::set_height(height);
     if !is_hash_hex(state_root) {
         return Err(PersistError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
             format!("snapshot state_root '{state_root}' is not 64 hex characters"))));
