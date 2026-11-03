@@ -183,6 +183,37 @@ That any option will meet a target that has not been measured; that sandbox numb
 
 **M5 fsync-only floor** (real `write_snapshot`, eight 1 KB files, 2,000 calls): p50 6.9 ms, **p95 10.1 ms**, p99 12.5 ms, max 171 ms. Phases (p50): files write+fsync+hash 3.9 ms, prune 1.1 ms, `CURRENT` 0.7 ms, manifest 0.5 ms, directory fsyncs 0.14–0.22 ms. With state size removed, the current number of fsyncs fits inside the 50 ms p95 target on this disk; Windows may differ.
 
-**No-disk control** (same workload, persistence off): commit p50 203–205 ms flat from height 0 to over 3,000, p99 ≤ 266 ms, all four nodes' roots agreeing on every block. Final result (capped at 90 minutes, so it does not reach 20,000 either): to be added when the run ends.
+**No-disk control** (same workload, persistence off): commit p50 203–205 ms flat from height 0 to over 3,000, p99 ≤ 266 ms, all four nodes' roots agreeing on every block. **Final: 6,453 blocks in 5,400 s (stopped by the 90-minute cap, not 20,000).** Commit p50 203 / 203 / 198 / 186 ms over heights 0–1,000 / 1,000–3,000 / 3,000–5,000 / 5,000–6,453 (p99 251 / 263 / 256 / 233 ms, max 335 ms): **no growth**. All four nodes' roots agreed on every block.
 
 **Not measured.** A release build; a live 4-node run with networking; Windows. Debug-build serialisation is likely overstated relative to release.
+
+## 11. Option 2 prototype v1 — first benchmark (Linux sandbox, **debug build**, exploratory; 2026-11-03)
+
+**Owner position (2026-11-03): the prototype and its 20,000-block run are not essential for closing Phase 0.5; they answer whether the append-only log is a viable fix.** Branch `proto/p02b-blocklog` (v1 `225e6f4`, v2 `4af285e`); not merged, not wired into the node, production `persist_state` untouched. Same hardware, workload and debug profile as M0 §10, but **one** executing node (not four), so state-root agreement is not re-demonstrated here; the prototype does not touch consensus.
+
+**v1 moved only `chain_store` into the block log.** Run: 4,229 blocks (stopped by the 50-minute cap; **the 20,000-block target was not reached**).
+
+| Heights | Persist p50 | p95 | p99 | max | Bytes written per block |
+| --- | --- | --- | --- | --- | --- |
+| 0–100 | 26 ms | 38 ms | 50 ms | 126 ms | 0.30 MB |
+| 500–1,000 | 188 ms | 265 ms | 312 ms | 354 ms | 2.5 MB |
+| 1,000–2,000 | 365 ms | 490 ms | 536 ms | 587 ms | 5.0 MB |
+| 2,000–3,000 | 579 ms | 704 ms | 785 ms | 1,021 ms | 7.4 MB |
+| 3,000–4,000 | 802 ms | 919 ms | 974 ms | 1,245 ms | 9.9 MB |
+| 4,000–4,229 | 923 ms | 998 ms | 1,041 ms | 1,079 ms | 10.5 MB |
+
+- **The log itself is flat:** the append plus fsync of one block stayed at about 3.6 ms p50 from the first block to the last. Cost per block of the log is O(block), as designed.
+- **v1 still misses the targets and still grows** (p95 998 ms at height ~4,200 versus the 50 ms target). Cause found by this run: **`historical_validator_sets.json` also grows by about 2.4 KB per block** (one validator set per height, 7.6 MB by height ~3,100) and v1 still rewrote it whole in every generation. Serialising the small files (p50 316 ms) and writing them (snapshot p50 592 ms) are now the cost. M0 §10's "only `chain_store.json` grows" expectation (M2) was wrong; the design in §4a did not account for it.
+- **Compared with M0 at similar heights:** at ~500 blocks M0 persisted in 4,100–5,500 ms writing about 50 MB; v1 took 188–265 ms writing 2.5 MB. The improvement is large (about 20×) but not the flat curve required.
+- **Log size on disk:** 109.8 MB for 4,229 blocks (about 26 KB per block, compact JSON).
+- **Recovery and replay costs at 4,229 blocks (debug):** hash-chain verification only 6.4 s; replay plus deserialise plus byte-compare with memory 22.3 s; `recover` (open, verify, truncate to the checkpoint) 6.7 s. Restart cost is O(chain) in this prototype; checkpointing or an index would be needed to bound it.
+- **Prototype v2** (`4af285e`) logs `historical_validator_sets` in a second append-only log. It compiles and its round-trip test passes; **its benchmark has not been run**, and a release build and the 20,000-block run have not been run either.
+
+**Crash-safety tests (all pass, 14):** golden record bytes; append/replay across segments; identical bytes for identical inputs; height gap rejected; torn last record beyond the committed tail truncated at every byte offset; torn record inside the committed region fatal; a flipped byte in each position of a committed record fatal (recovery and replay); log ahead of the checkpoint truncated including later segments; empty new segment after a crash in roll removed; missing or mismatched committed tail fatal (last segment, middle segment, wrong hash, wrong anchor); nothing committed removes everything; `create` refuses an existing log; plus one end-to-end test on real blocks (D1 postcondition: the committed descriptor equals the log tail when persistence returns; log-ahead crash recovers to the checkpoint, never forward). **Not tested:** power-loss durability, Windows, signing-guard interplay beyond the D1 postcondition, state re-execution replay, migration.
+
+## 12. Remaining risks (prototype)
+1. Every file in a generation must be audited for growth with height; at least `historical_validator_sets.json` grows linearly (M2 should be re-run per file at several heights, not assumed).
+2. Restart and replay cost is O(chain) (§11), so checkpointing/pruning needs a design.
+3. Cross-platform determinism is tested only on Linux; Windows has not been run.
+4. A second log (v2) doubles the number of commit-boundary files, so D1 ordering and recovery cases must be re-derived and tested for two logs.
+5. Production-size blocks, real networking, release-build timing and a 20,000-block run remain unmeasured.
