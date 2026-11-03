@@ -447,7 +447,7 @@ Block-interval drift: 1.9x (1071 to 2077 ms) in run 1, **1.6x (1269 to 2080 ms)*
 
 ## §9  Per-block persistence cost grows with chain length (blocks slow down under load)
 
-**Status: OPEN — pre-existing; found 2026-11-02 while measuring a loaded chain. Not fixed by P-02a (#48): every block still rewrites and fsyncs all eight files, and the cost has not been re-measured. PERSIST-001 P-02b is the planned fix.**
+**Status: OPEN for the default storage (v1); ADDRESSED in the experimental storage v2 (default off, test-only; #64, #65, Windows-validated for crash recovery, not yet for production use).** Original status: OPEN — pre-existing; found 2026-11-02 while measuring a loaded chain. Not fixed by P-02a (#48): every block still rewrites and fsyncs all eight files, and the cost has not been re-measured. PERSIST-001 P-02b is the planned fix.**
 
 `persist_state()` (called at the end of every `commit_block`) re-serializes
 the entire `chain_store` with `to_string_pretty` and rewrites it synchronously,
@@ -661,3 +661,35 @@ With Dave down on purpose, only Alice and Carol remained (2 of 4, below quorum),
 **What still holds:** EV-03's real assertion, that all four nodes report the same root within one run, passed in every run (v1, v2, `main`, Linux and Windows).
 
 **Consequences:** earlier ROADMAP wording ("same state root `48d58b5f…`") has been softened. For regression comparisons use (a) the same final height, or (b) the per-height roots; `validator_eviction_live` now prints `final heights sampled` and, with `CF_EVICT_DUMP_ROOTS=<file>`, writes every height's root and the genesis file's size and CR count (change on the storage-v2 PR #65, not yet on `main`). The jail test's roots (`51136494701f`, `eebbee537f59`, `33362db6f1e0`) were identical across all recorded runs and platforms because its transactions are submitted at deterministic points.
+
+---
+
+## PERSIST-HALT-1  A persistence failure does not stop the validator from signing at the next height
+
+**Status: OPEN — found 2026-11-03 by the H0-3b gap analysis; reproduced on BOTH storage formats; failing tests committed `#[ignore]`d; fix scoped for PR B (owner approved the scope 2026-11-03).**
+
+`commit_block` returns `Err("FATAL: snapshot write failed after commit — halting consensus to prevent double-signing on restart…")` when persisting block h fails, and the design (D1: no vote or proposal for h+1 until h is durable; "a failed write halts consensus") relies on that. But every caller on the multi-node path only **logs** the error and carries on: the engine's `Commit` action, the deferred-proposal commit, the quorum-via-own-vote and quorum-via-peer-vote commits, and the sync replay (`node.rs`, `drive_consensus` and `handle_event`). Nothing records the failure, and `cast_engine_vote` and `sign_and_register_own_proposal` do not check one. Only the single-node devnet path stops (`running = false`).
+
+**Reproduction (two tests, `node::tests::h0_participation::a_persistence_failure_stops_the_validator_signing_at_the_next_height_v1` and `_v2`, run with `--ignored`):** a validator commits block 0, persisting block 1 fails (injected at `manifest_written`), the network moves on, and the validator **signs at height 2** (`sign_guard.last = (2, 0, 2)`) on both formats.
+
+**Impact:** not an equivocation (the guard is made durable before any signature, and a restart abstains until it reaches the guard height), but it breaks the documented D1 rule: a validator whose disk is failing keeps voting and proposing from state it has not made durable, and after a crash it restarts behind its own guard (a liveness cost, bounded by sync). **Not changed yet.** **Fix (PR B, to be approved before coding):** a one-way "persistence failed" flag set by `commit_block` on any persistence error, checked before any vote or proposal is signed and by the event loop, never cleared in-process; the two tests then become normal tests.
+
+---
+
+## PERSIST-APPEND-1  A failed log append can be buried by a later append
+
+**Status: OPEN — found 2026-11-03; low severity (defence in depth); failing test committed `#[ignore]`d; hardening scoped for PR B.**
+
+If a `BlockLog::append` fails midway (full disk, failing device), the segment keeps the torn bytes while the in-memory tail does not advance. A later append on the same handle writes after those bytes, so the log no longer verifies and a restart rejects it as damage inside the committed region. Today this cannot happen only because a persistence error is supposed to stop the node (see PERSIST-HALT-1, which is not yet true). Test: `blocklog::tests::a_failed_append_followed_by_another_append_must_not_leave_an_unverifiable_log` (`--ignored`). **Fix (PR B):** refuse further appends after a failed one, or cut the segment back to the last record boundary it had already made durable; never remove committed data, and never be treated as permission to continue after the error (the node stays fatal).
+
+---
+
+## H0-3-FIXTURE-1  The H0-3 live tests C-01 and C-07 could not start after DIS-003E (#45)
+
+**Status: FIXED in PR A (2026-11-03).** `genesis-1node-crash.json` and `genesis-4node-crash.json` lacked `execution.allow_zero_recovery_timelock`, so the node refused to start ("DIS-003E … allow_zero_recovery_timelock is not set"). On `main` the H0-3 live suite was 10 passed, 2 failed (C-01, C-07); with the flag added to both fixtures it is 12/12 on Linux. The earlier Windows "12/12" runs predate #45. A Windows re-run is required before this counts for H0-3b; P02A-W1 (the unexplained C-01 anomaly) stays open and is investigated through that re-run.
+
+---
+
+## GUARD-ID-1  The signing guard file carries no chain or genesis identity
+
+**Status: OPEN — informational; predates this work.** `consensus_signing.json` is not bound to a `chain_id` or genesis hash, unlike the generation manifest. A guard copied between data directories can only make a node more conservative (it refuses or abstains), so no unsafe case is known, but the binding is absent. Not changed.
