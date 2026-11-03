@@ -7553,6 +7553,167 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        // ── PERSIST-001 P-02b Option 2 PROTOTYPE (test-only; production persist_state is untouched) ──
+        type ProtoBlock = (chain_forge_consensus::CommitCertificate, BlockProposal);
+        fn proto_anchor(n: &Node) -> crate::blocklog::Hash32 {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(n.snapshot_identity().genesis_hash.as_bytes()).into()
+        }
+        struct ProtoRec { total_ms: f64, small_ser_ms: f64, log_ms: f64, snap_ms: f64, bytes: usize, phases: Vec<(&'static str, f64)> }
+
+        /// The prototype commit boundary: (1) serialise the seven small files, (2) append every block above the
+        /// log tail to the block log and fsync, (3) write the generation (small files + descriptor naming the
+        /// log tail) through the UNCHANGED production `write_snapshot`. Returns only after the manifest and
+        /// `CURRENT` are durable, i.e. the point at which D1 allows voting at the next height.
+        fn proto_persist(n: &Node, log: &mut crate::blocklog::BlockLog, dir: &std::path::Path) -> Result<ProtoRec, String> {
+            let t0 = std::time::Instant::now();
+            let snap = n.state.export_snapshot();
+            let height = snap.height;
+            let mut contents: Vec<(&'static str, Vec<u8>)> = vec![
+                ("state.json", serde_json::to_vec_pretty(&snap).map_err(|e| e.to_string())?),
+                ("identity.json", serde_json::to_vec_pretty(&n.identity).map_err(|e| e.to_string())?),
+                ("validators.json", serde_json::to_vec_pretty(&n.validator_registry).map_err(|e| e.to_string())?),
+                ("agents.json", serde_json::to_vec_pretty(&n.agents).map_err(|e| e.to_string())?),
+                ("slashing.json", serde_json::to_vec_pretty(&n.slasher).map_err(|e| e.to_string())?),
+                ("historical_validator_sets.json", serde_json::to_vec_pretty(&n.historical_validator_sets).map_err(|e| e.to_string())?),
+                ("live_validator_set.json", serde_json::to_vec_pretty(n.consensus.validator_set()).map_err(|e| e.to_string())?),
+            ];
+            let small_ser_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = std::time::Instant::now();
+            let mut bytes = contents.iter().map(|c| c.1.len()).sum::<usize>();
+            let next = log.tail().map(|t| t.height + 1).unwrap_or(0);
+            for (h, blk) in n.chain_store.range(next..) {
+                let payload = serde_json::to_vec(blk).map_err(|e| e.to_string())?;
+                bytes += payload.len() + 8 + 4 + 1 + 8 + 64;
+                log.append(*h, &payload).map_err(|e| e.to_string())?;
+            }
+            let log_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let tail = log.tail().cloned().ok_or("empty log")?;
+            let descriptor = serde_json::json!({"format": "p02b-proto-1", "tail_height": tail.height, "tail_hash": hex::encode(tail.hash)});
+            contents.push(("blocklog_descriptor.json", serde_json::to_vec_pretty(&descriptor).unwrap()));
+            let t2 = std::time::Instant::now();
+            crate::persistence::write_snapshot(dir, height, &contents, &n.snapshot_identity(), &n.live_state_root())
+                .map_err(|e| e.to_string())?;
+            let snap_ms = t2.elapsed().as_secs_f64() * 1000.0;
+            Ok(ProtoRec { total_ms: t0.elapsed().as_secs_f64() * 1000.0, small_ser_ms, log_ms, snap_ms, bytes, phases: crate::persistence::m0::take() })
+        }
+
+        /// Read the committed descriptor from the latest generation (via CURRENT) as a log tail.
+        fn proto_committed_tail(dir: &std::path::Path) -> Option<crate::blocklog::Tail> {
+            let cur = std::fs::read_to_string(dir.join("CURRENT")).ok()?;
+            let gen = cur.trim();
+            let d: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("snapshots").join(gen).join("blocklog_descriptor.json")).ok()?).ok()?;
+            let mut hash = [0u8; 32]; hash.copy_from_slice(&hex::decode(d["tail_hash"].as_str()?).ok()?);
+            Some(crate::blocklog::Tail { height: d["tail_height"].as_u64()?, hash })
+        }
+
+        /// Replay the log into a chain_store map and prove it equals the in-memory one byte for byte.
+        fn proto_replay_equals(n: &Node, logdir: &std::path::Path) -> Result<u64, String> {
+            let mut got: std::collections::BTreeMap<u64, ProtoBlock> = Default::default();
+            crate::blocklog::BlockLog::replay(logdir, proto_anchor(n), |h, p| {
+                got.insert(h, serde_json::from_slice(p).expect("payload deserialises"));
+            }).map_err(|e| e.to_string())?;
+            if got.len() != n.chain_store.len() { return Err(format!("replayed {} blocks, memory has {}", got.len(), n.chain_store.len())); }
+            for (h, blk) in &n.chain_store {
+                if serde_json::to_vec(&got[h]).unwrap() != serde_json::to_vec(blk).unwrap() { return Err(format!("block {h} differs after replay")); }
+            }
+            Ok(got.len() as u64)
+        }
+
+        #[tokio::test]
+        async fn proto_blocklog_persists_replays_and_recovers_real_blocks() {
+            let dir = std::env::temp_dir().join(format!("cf-proto-rt-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut n = liveness_node(1_000_000).await;
+            let (mut nonce, _) = (0u64, 0);
+            let logdir = dir.join("blocklog");
+            let mut log = crate::blocklog::BlockLog::create(&logdir, proto_anchor(&n), 8).unwrap();
+            for h in 0..30u64 {
+                commit_with_txs(&mut n, h, 3, &mut nonce).await;
+                proto_persist(&n, &mut log, &dir).unwrap();
+                // D1 postcondition: when the persist call returns, the committed descriptor IS the log tail.
+                assert_eq!(proto_committed_tail(&dir).as_ref(), log.tail());
+                assert_eq!(log.tail().unwrap().height, h);
+            }
+            assert_eq!(proto_replay_equals(&n, &logdir).unwrap(), 30);
+            // serialisation is deterministic: the same block serialises to the same bytes twice
+            let blk = &n.chain_store[&7];
+            assert_eq!(serde_json::to_vec(blk).unwrap(), serde_json::to_vec(blk).unwrap());
+            // crash AFTER the log append but BEFORE the generation commit: log is ahead of the checkpoint by one block
+            commit_with_txs(&mut n, 30, 3, &mut nonce).await;
+            let ahead = n.chain_store[&30].clone();
+            log.append(30, &serde_json::to_vec(&ahead).unwrap()).unwrap(); // log record durable, no manifest
+            drop(log);
+            let committed = proto_committed_tail(&dir).unwrap();
+            assert_eq!(committed.height, 29);
+            let log = crate::blocklog::BlockLog::recover(&logdir, proto_anchor(&n), 8, Some(committed.clone())).unwrap();
+            assert_eq!(log.tail(), Some(&committed), "recovery returns to the committed checkpoint, never forward");
+            let mut seen = 0; crate::blocklog::BlockLog::replay(&logdir, proto_anchor(&n), |_, _| seen += 1).unwrap();
+            assert_eq!(seen, 30);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Prototype benchmark. Env: CF_PB_BLOCKS (20000), CF_PB_TXS (10), CF_PB_NODES (1..4, default 1),
+        /// CF_PB_BUDGET_SECS, CF_PB_SEG (records per segment, 1000), CF_PB_CSV. Same workload as M0.
+        #[tokio::test]
+        #[ignore = "PERSIST-001 P-02b prototype benchmark; run explicitly with --ignored --nocapture"]
+        async fn persist001_proto_bench() {
+            use std::io::Write;
+            let max: u64 = std::env::var("CF_PB_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+            let k: u64 = std::env::var("CF_PB_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+            let nn: usize = std::env::var("CF_PB_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 4);
+            let seg: u64 = std::env::var("CF_PB_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+            let budget: f64 = std::env::var("CF_PB_BUDGET_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(f64::MAX);
+            let csv_path = std::env::var("CF_PB_CSV").unwrap_or_else(|_| "/tmp/cf-pb.csv".into());
+            let dir = std::env::temp_dir().join(format!("cf-pb-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut nodes = vec![]; for _ in 0..nn { nodes.push(liveness_node(1_000_000).await); }
+            let logdir = dir.join("blocklog");
+            let mut log = crate::blocklog::BlockLog::create(&logdir, proto_anchor(&nodes[0]), seg).unwrap();
+            let mut csv = std::fs::File::create(&csv_path).unwrap();
+            writeln!(csv, "height,commit_ms,proto_total_ms,small_ser_ms,log_append_ms,snapshot_ms,bytes_written,files_write_fsync_sha,fsync_gen_dir,manifest_write,fsync_gen_dir2,fsync_snaps_dir,current_write,prune,roots_agree").unwrap();
+            let start = std::time::Instant::now(); let (mut nonce, mut bad, mut done) = (0u64, 0u64, 0u64);
+            for h in 0..=max {
+                for _ in 0..k {
+                    let mut tx = Transaction::transfer(&format!("pb-{nonce}"), "qcb1alice", "qcb1bob", "uqcb", 1, nonce);
+                    tx.sign(&ClassicalScheme.generate_keypair("qcb1alice").unwrap(), CHAIN).unwrap();
+                    nodes[0].mempool.push(tx); nonce += 1;
+                }
+                let p = proposal(h, nodes[0].block_payload(h).encode());
+                let t = std::time::Instant::now();
+                deliver(&mut nodes[0], &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+                let commit_ms = t.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(nodes[0].status.lock().unwrap().height, h);
+                for i in 1..nn { deliver(&mut nodes[i], &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await; }
+                let r0 = nodes[0].live_state_root();
+                let agree = (1..nn).all(|i| nodes[i].live_state_root() == r0); if !agree { bad += 1; }
+                let r = proto_persist(&nodes[0], &mut log, &dir).unwrap();
+                let ph = |name: &str| r.phases.iter().find(|p| p.0 == name).map(|p| p.1).unwrap_or(f64::NAN);
+                writeln!(csv, "{h},{commit_ms:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{agree}",
+                    r.total_ms, r.small_ser_ms, r.log_ms, r.snap_ms, r.bytes, ph("files_write_fsync_sha"), ph("fsync_gen_dir"), ph("manifest_write"), ph("fsync_gen_dir2"), ph("fsync_snaps_dir"), ph("current_write"), ph("prune")).unwrap();
+                done = h + 1;
+                if h % 1000 == 0 { println!("PB h={h} commit={commit_ms:.1}ms proto={:.1}ms bytes={} elapsed={:.0}s", r.total_ms, r.bytes, start.elapsed().as_secs_f64()); }
+                if start.elapsed().as_secs_f64() > budget { println!("PB budget reached at height {h}"); break; }
+            }
+            drop(log);
+            println!("PB DONE blocks={done} elapsed={:.1}s nodes={nn} root_disagreements={bad}", start.elapsed().as_secs_f64());
+            // recovery / replay costs at the final height
+            let committed = proto_committed_tail(&dir).unwrap();
+            let t = std::time::Instant::now();
+            let cnt = proto_replay_equals(&nodes[0], &logdir).unwrap();
+            println!("PB replay+deserialise+compare {cnt} blocks: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+            let t = std::time::Instant::now();
+            let mut c = 0u64; crate::blocklog::BlockLog::replay(&logdir, proto_anchor(&nodes[0]), |_, _| c += 1).unwrap();
+            println!("PB replay (hash-chain verification only) {c} records: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+            let t = std::time::Instant::now();
+            let l = crate::blocklog::BlockLog::recover(&logdir, proto_anchor(&nodes[0]), seg, Some(committed.clone())).unwrap();
+            println!("PB recover (open + verify + truncate to checkpoint): {:.0} ms, tail={}", t.elapsed().as_secs_f64() * 1000.0, l.tail().unwrap().height);
+            let sz: u64 = std::fs::read_dir(&logdir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
+            println!("PB log size on disk: {:.1} MB for {done} blocks ({} B/block)", sz as f64 / 1e6, sz / done.max(1));
+            assert_eq!(bad, 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// M5: fsync-only floor. Runs the real write_snapshot with eight 1 KB files (no state growth), so the
         /// cost is the fixed fsync/rename/manifest sequence only. Prints p50/p95/p99/max over $CF_M5_N calls.
         #[test]
