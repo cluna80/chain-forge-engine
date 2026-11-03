@@ -30,8 +30,8 @@ fn node_bin() -> PathBuf {
     let target = std::env::var("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|_| repo_root().join("target"));
     target.join("debug").join(format!("chain-forge-node{}", std::env::consts::EXE_SUFFIX))
 }
-fn genesis() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/devnet/genesis-4node-crash.json") }
-fn key(name: &str) -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/devnet/keys").join(format!("{name}.key.json")) }
+fn genesis() -> PathBuf { repo_root().join("tests/devnet/genesis-val-evict.json") }
+fn key(name: &str) -> PathBuf { repo_root().join("tests/devnet/keys").join(format!("{name}.key.json")) }
 
 /// Ports below the OS ephemeral range (see validator_jail_live).
 fn free_port() -> u16 {
@@ -77,50 +77,42 @@ fn strip_ansi(t: &str) -> String {
 }
 fn read_log(p: &PathBuf) -> String { strip_ansi(&std::fs::read_to_string(p).unwrap_or_default()) }
 
-struct Node { name: &'static str, child: Option<Child>, api: u16, p2p: u16, data: PathBuf, log: PathBuf }
+struct Node { name: &'static str, child: Option<Child>, api: u16, p2p: u16, data: PathBuf, log: PathBuf, peers: Vec<u16> }
 impl Drop for Node { fn drop(&mut self) { if let Some(c) = self.child.as_mut() { let _ = c.kill(); let _ = c.wait(); } } }
 impl Node {
     fn kill9(&mut self) { if let Some(mut c) = self.child.take() { let _ = c.kill(); let _ = c.wait(); } }
 }
 
-fn spawn(name: &'static str, data: &PathBuf, log: &PathBuf, bootstrap: Option<&str>, envs: &[(&str, &str)]) -> Node {
+fn spawn(name: &'static str, data: &PathBuf, log: &PathBuf, p2p: u16, peers: &[u16], envs: &[(&str, &str)]) -> Node {
     std::fs::create_dir_all(data).unwrap();
-    let (api, p2p) = (free_port(), free_port());
+    let api = free_port();
     let f = std::fs::File::create(log).unwrap();
     let mut cmd = Command::new(node_bin());
     cmd.args(["--genesis", genesis().to_str().unwrap(), "--validator", &format!("qcb1{name}"),
               "--key-file", key(name).to_str().unwrap(), "--data-dir", data.to_str().unwrap(),
               "--api-port", &api.to_string(), "--p2p-port", &p2p.to_string(), "--storage-v2-experimental"]);
-    match bootstrap { Some(b) => { cmd.args(["--bootstrap", b]); } None => { cmd.arg("--expect-peers"); } }
+    for q in peers { cmd.args(["--bootstrap", &format!("/ip4/127.0.0.1/tcp/{q}")]); }
     for (k, v) in envs { cmd.env(k, v); }
     let child = cmd.stdout(f.try_clone().unwrap()).stderr(f).stdin(Stdio::null()).spawn().unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-    Node { name, child: Some(child), api, p2p, data: data.clone(), log: log.clone() }
-}
-
-fn peer_id(log: &PathBuf, t: Duration) -> String {
-    let d = Instant::now() + t;
-    loop {
-        if let Some(id) = read_log(log).lines().filter(|l| l.contains("P2P listening")).find_map(|l| l.split("peer=").nth(1))
-            .map(|r| r.split_whitespace().next().unwrap_or("").to_string()).filter(|i| i.starts_with("12D3")) { return id; }
-        assert!(Instant::now() < d, "no libp2p peer id in {log:?}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    Node { name, child: Some(child), api, p2p, data: data.clone(), log: log.clone(), peers: peers.to_vec() }
 }
 
 fn dump(n: &Node) { let t = read_log(&n.log); let l: Vec<&str> = t.lines().collect(); eprintln!("── {} log (last 40) ──", n.name); for x in &l[l.len().saturating_sub(40)..] { eprintln!("{x}"); } }
 
-/// Alice (anchor), Bob, Carol, Dave; `dave_env` is applied to Dave only.
-fn start_cluster(base: &PathBuf, dave_env: &[(&str, &str)]) -> (Vec<Node>, String) {
+/// Alice, Bob, Carol, Dave in a full mesh; `dave_env` is applied to Dave only. Returns the nodes and their p2p ports.
+fn start_cluster(base: &PathBuf, dave_env: &[(&str, &str)]) -> (Vec<Node>, Vec<u16>) {
     let _ = std::fs::remove_dir_all(base);
     let logs = base.join("logs"); std::fs::create_dir_all(&logs).unwrap();
-    let alice = spawn("alice", &base.join("alice"), &logs.join("alice.log"), None, &[]);
-    assert!(wait_port(alice.api, Duration::from_secs(30)), "alice API never opened");
-    let boot = format!("/ip4/127.0.0.1/tcp/{}/p2p/{}", alice.p2p, peer_id(&alice.log, Duration::from_secs(20)));
-    let bob = spawn("bob", &base.join("bob"), &logs.join("bob.log"), Some(&boot), &[]);
-    let carol = spawn("carol", &base.join("carol"), &logs.join("carol.log"), Some(&boot), &[]);
-    let dave = spawn("dave", &base.join("dave"), &logs.join("dave.log"), Some(&boot), dave_env);
-    for n in [&bob, &carol, &dave] { assert!(wait_port(n.api, Duration::from_secs(30)), "{} API never opened", n.name); }
-    (vec![alice, bob, carol, dave], boot)
+    let p2p: Vec<u16> = (0..4).map(|_| free_port()).collect();
+    let names = ["alice", "bob", "carol", "dave"];
+    let mut nodes = vec![];
+    for i in 0..4 {
+        let peers: Vec<u16> = (0..4).filter(|&j| j != i).map(|j| p2p[j]).collect();
+        let env: &[(&str, &str)] = if i == 3 { dave_env } else { &[] };
+        nodes.push(spawn(names[i], &base.join(names[i]), &logs.join(format!("{}.log", names[i])), p2p[i], &peers, env));
+    }
+    for n in &nodes { assert!(wait_port(n.api, Duration::from_secs(30)), "{} API never opened", n.name); }
+    (nodes, p2p)
 }
 
 /// All listed nodes serve the same state root for the block at the lowest common height.
@@ -156,7 +148,7 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
     for point in ["block_log_appended", "hvs_log_appended", "gen_files_written", "manifest_written", "current_written"] {
         println!("\n── V2L-1: Dave aborts at {point} while committing height {CRASH_AT} ──");
         let base = std::env::temp_dir().join(format!("cf-v2l1-{}-{point}", std::process::id()));
-        let (mut nodes, boot) = start_cluster(&base, &[("CF_FAULT_V2_CRASH_POINT", point), ("CF_FAULT_V2_CRASH_HEIGHT", &CRASH_AT.to_string())]);
+        let (mut nodes, p2p) = start_cluster(&base, &[("CF_FAULT_V2_CRASH_POINT", point), ("CF_FAULT_V2_CRASH_HEIGHT", &CRASH_AT.to_string())]);
         // Dave dies by himself
         let d = Instant::now() + Duration::from_secs(120);
         let status = loop {
@@ -173,7 +165,8 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
         let surv: Vec<u16> = nodes[..3].iter().map(|n| n.api).collect();
         assert!(wait_heights(&surv, CRASH_AT + 4, Duration::from_secs(90)), "{point}: survivors did not advance without Dave");
         // restart Dave on the SAME data directory, no crash env
-        let mut dave = spawn("dave", &nodes[3].data.clone(), &nodes[3].log.with_file_name("dave2.log"), Some(&boot), &[]);
+        let mut dave = spawn("dave", &nodes[3].data.clone(), &nodes[3].log.with_file_name("dave2.log"), nodes[3].p2p, &nodes[3].peers.clone(), &[]);
+        let _ = &p2p;
         assert!(wait_port(dave.api, Duration::from_secs(30)), "{point}: restarted Dave's API never opened (lock or recovery failure)");
         std::thread::sleep(Duration::from_secs(1));
         let log = read_log(&dave.log);
@@ -199,7 +192,7 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
 #[test]
 fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() {
     let base = std::env::temp_dir().join(format!("cf-v2l2-{}", std::process::id()));
-    let (mut nodes, boot) = start_cluster(&base, &[]);
+    let (mut nodes, _p2p) = start_cluster(&base, &[]);
     let all_ports = |ns: &Vec<Node>| ns.iter().map(|n| n.api).collect::<Vec<u16>>();
     for (round, (target, victim)) in [(5u64, 3usize), (15, 2), (30, 1)].into_iter().enumerate() {
         let name = nodes[victim].name;
@@ -210,7 +203,8 @@ fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() {
         let surv: Vec<u16> = nodes.iter().enumerate().filter(|(i, n)| *i != victim && n.child.is_some()).map(|(_, n)| n.api).collect();
         assert!(wait_heights(&surv, at_kill + 3, Duration::from_secs(90)), "round {round}: survivors did not advance without {name}");
         let (data, log) = (nodes[victim].data.clone(), nodes[victim].log.with_file_name(format!("{name}-r{round}.log")));
-        let mut back = spawn(name, &data, &log, Some(&boot), &[]);
+        let (own_p2p, peers) = (nodes[victim].p2p, nodes[victim].peers.clone());
+        let mut back = spawn(name, &data, &log, own_p2p, &peers, &[]);
         assert!(wait_port(back.api, Duration::from_secs(30)), "round {round}: restarted {name} API never opened");
         std::thread::sleep(Duration::from_secs(1));
         let text = read_log(&back.log);
@@ -220,7 +214,7 @@ fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() {
         let target_h = height(nodes[0].api).unwrap();
         assert!(wait_heights(&[back.api], target_h, Duration::from_secs(120)), "round {round}: {name} did not catch up");
         // the OS lock: a SECOND process on this running node's directory is refused
-        let mut second = spawn(name, &data, &log.with_file_name(format!("{name}-r{round}-dup.log")), Some(&boot), &[]);
+        let mut second = spawn(name, &data, &log.with_file_name(format!("{name}-r{round}-dup.log")), free_port(), &peers, &[]);
         let d = Instant::now() + Duration::from_secs(30);
         let code = loop { if let Some(s) = second.child.as_mut().unwrap().try_wait().unwrap() { break s; } assert!(Instant::now() < d, "round {round}: a second process on a locked directory kept running"); std::thread::sleep(Duration::from_millis(200)); };
         second.child = None;
