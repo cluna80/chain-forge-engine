@@ -7848,7 +7848,14 @@ mod tests {
             // sanity: the untouched copy restores
             { let d = case("ok"); assert_eq!(restart_height(v2_node(&d).await.load_persisted_state()), 5); let _ = std::fs::remove_dir_all(&d); }
             // 1. a small file changed (hash mismatch)
-            { let d = case("tamper"); let f = current_gen_dir(&d).join("identity.json"); let mut b = std::fs::read(&f).unwrap(); b.push(b' '); std::fs::write(&f, b).unwrap(); refused(d, "a tampered small file").await; }
+            // (a) one byte appended: the SIZE check catches it. (b) one letter changed in place, same size and still valid JSON:
+            // only the SHA-256 check can catch it, and the restored state would otherwise load.
+            { let d = case("tamper"); let f = current_gen_dir(&d).join("identity.json"); let mut b = std::fs::read(&f).unwrap(); b.push(b' '); std::fs::write(&f, b).unwrap(); refused(d, "a small file with an appended byte").await; }
+            { let d = case("tamper-same-size"); let g = current_gen_dir(&d);
+              let name = crate::storage_v2::SMALL_FILES.iter().find(|n| { let t = std::fs::read_to_string(g.join(n)).unwrap(); t.contains("qcb1alice") }).expect("a small file names qcb1alice");
+              let f = g.join(name); let t = std::fs::read_to_string(&f).unwrap(); let at = t.find("qcb1alice").unwrap() + 8;      // the final 'e'
+              let mut b = t.into_bytes(); let before = b.len(); b[at] = b'f'; assert_eq!(b.len(), before);
+              std::fs::write(&f, b).unwrap(); refused(d, "a same-size, still-valid edit of a small file (SHA-256 check)").await; }
             // 2. a small file missing
             { let d = case("missing"); std::fs::remove_file(current_gen_dir(&d).join("agents.json")).unwrap(); refused(d, "a missing small file").await; }
             // 3. manifest damaged, 4. manifest missing
