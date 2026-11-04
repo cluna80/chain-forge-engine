@@ -59,6 +59,7 @@ use chain_forge_execution::{Transaction, TxBody};
 
 const CHAIN_ID:    &str = "qcb-devnet-mldsa";
 const SENDER_ADDR: &str = "qcb1sender";
+const SENDER_SEED: &str = "p0-3-sender-seed";
 const RECV_ADDR:   &str = "qcb1recv";
 
 // ── Port allocation ───────────────────────────────────────────────────────────
@@ -117,9 +118,18 @@ fn node_binary() -> PathBuf {
 
 #[path = "common/consensus_keys.rs"]
 mod consensus_keys;
+#[path = "common/live_genesis.rs"]
+mod live_genesis;
 
 fn genesis_path() -> PathBuf {
-    consensus_keys::genesis(&repo_root().join("tests").join("devnet").join("genesis-mldsa.json"))
+    // Patched once per process: the sender's ML-DSA key is random per process (see common/live_genesis.rs).
+    static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let patched = live_genesis::with_ml_dsa_keys(
+            &repo_root().join("tests").join("devnet").join("genesis-mldsa.json"), "mldsa-tx",
+            &[(SENDER_ADDR, SENDER_SEED)]);
+        consensus_keys::genesis(&patched)
+    }).clone()
 }
 
 fn key_file(label: &str) -> PathBuf {
@@ -446,7 +456,7 @@ fn mldsa_tx_signing_enforcement() {
 
     eprintln!("\n── P0-3: Valid ML-DSA-65 signed Transfer → accepted and finalized ────");
 
-    let seed = "p0-3-sender-seed";
+    let seed = SENDER_SEED;
     let (tx, _pk) = build_mldsa_transfer(seed, SENDER_ADDR, 0, RECV_ADDR, 100_000);
     let tx_id     = tx.id.clone();
     let tx_json   = serde_json::to_string(&tx).expect("tx serialise");

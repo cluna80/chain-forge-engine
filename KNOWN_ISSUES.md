@@ -638,6 +638,16 @@ Not blocking H0-12 (merged as #52). Fix as a separate, tested change.
 
 ---
 
+## LIVE-MLDSA-KEYS-1  Five live suites failed since 2026-10-29: static genesis ML-DSA keys vs per-process random test keys
+
+**Status: FIXED in this PR (Linux 5/5 passing; Windows pending). Found 2026-11-04 while validating S1 (PR #74); the five suites fail identically on unmodified `main` `61e02c6`.** `dis_002a_key_rotation_live`, `dis_002b_migration_live`, `dis_003a_policy_lifecycle_live`, `dis_003c_replay_attack_live` and `mldsa_tx_live` all failed at their first transaction with "ML-DSA signature verification failed" (each within about 9 s, on Linux and Windows).
+
+**Root cause.** Commit `721c166` (2026-10-29, "production keys come from the OS RNG, never seeded keygen") made `MlDsaScheme::generate_keypair(seed)` return one random key per seed per process. These tests sign with seeded keys, but their static genesis files pre-bind the account's ML-DSA public key (the ML-DSA account-ownership fix binds named accounts in genesis), so a freshly started test process can never sign for those accounts. The suites that kept passing (`dis_002b_recovery`, `dis_003b`, `dis_003d`, `dis_003e`) already write a patched genesis with the live key.
+
+**Fix (tests only; no node, genesis-file or protocol change).** New `chain-forge-node/tests/common/live_genesis.rs`: `with_ml_dsa_keys(template, tag, [(address, seed)])` copies the genesis to a temp file with each listed account's `public_key` replaced by the key the test signs with (and panics if the account is missing or has no pre-bound key, so a wrong mapping cannot pass silently). The five tests call it once per process: `dis002a` qcb1user/SEED_A; `dis002b` qcb1pilot/SEED_A; `dis003a` qcb1pilot/SEED_A; `dis003c` qcb1pilot/SEED_PILOT and qcb1victim/SEED_VICTIM; `mldsa_tx` qcb1sender/`SENDER_SEED`.
+
+**Consequence for earlier evidence.** The ROADMAP's earlier Windows ✅ for `mldsa_tx_live` (P0-3..P0-6) and the DIS-002A/002B/003A/003C suites predate 2026-10-29; they must be re-confirmed on Windows after this fix.
+
 ## EVICT-ROOT-1  The eviction live test's printed state root is not a cross-run constant
 
 **Status: OPEN (documentation corrected 2026-11-03; no code defect found). Found while investigating a Linux/Windows root difference (`48d58b5f…` vs `1f2b492f…`).**
