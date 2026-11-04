@@ -8,12 +8,13 @@
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 BASE=baf7345a59a71df53715224c875a9fd7472f9617   # origin/main the results were produced on
-BR=FETCH_HEAD                                    # branch with the snippets (fetched above)
+BR=refs/remotes/origin/docs/state-commit-2-audit  # branch with the snippets
 WT="$ROOT/../sc2-scratch-wt"
 OUT="$ROOT/../sc2-scratch-results.txt"
 PY=python; command -v py >/dev/null 2>&1 && PY="py -3"
 
 git fetch -q origin main
+git fetch -q origin docs/state-commit-2-audit:refs/remotes/origin/docs/state-commit-2-audit
 git cat-file -e "$BASE^{commit}" || { echo "base commit $BASE not found; run: git fetch origin main"; exit 1; }
 [ -e "$WT" ] && { echo "$WT already exists; remove it first: git worktree remove --force \"$WT\""; exit 1; }
 git worktree add -q --detach "$WT" "$BASE"
