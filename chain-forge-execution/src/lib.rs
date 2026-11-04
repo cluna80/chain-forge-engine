@@ -5624,6 +5624,22 @@ mod tests {
         exec.config.gas_model.calculate_gas(tx) as u128
     }
 
+
+    // ── SC2-A: STATE-COMMIT-2 desired-behavior test (ignored until admission rules land) ──
+    #[test]
+    #[ignore = "SC2-A/E5: no address/denom length validation at the executor; admission (O8) rules are tracked in the SC2-B/O8 PR"]
+    fn sc2a_e5_overlength_address_and_denom_are_rejected() {
+        let (exec, mut state) = setup();
+        let long_addr = format!("qcb1{}", "a".repeat(296));
+        let long_denom = format!("u{}", "d".repeat(99));
+        state.get_account_mut("qcb1alice").unwrap().credit(&long_denom, 1_000);
+        state.refresh_leaf("qcb1alice");
+        let r1 = exec.execute_tx(&Transaction::transfer("t1", "qcb1alice", &long_addr, "uqcb", 1_000, 0), &mut state, 0);
+        let r2 = exec.execute_tx(&Transaction::transfer("t2", "qcb1alice", "qcb1bob", &long_denom, 10, 1), &mut state, 0);
+        assert!(!r1.success, "address of 300 bytes must be rejected");
+        assert!(!r2.success, "denom of 100 bytes must be rejected");
+    }
+
     #[test]
     fn transfer_tx_succeeds() {
         let (exec, mut state) = setup();
