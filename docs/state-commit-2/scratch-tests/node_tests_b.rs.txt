@@ -1,0 +1,80 @@
+
+    // ── STATE-COMMIT-2 scratch reproduction (NOT for merge) ─────────────────────
+    fn sc2_gen_file(dir: &std::path::Path, name: &str) -> Vec<u8> {
+        let mpath = current_manifest_path(dir);
+        std::fs::read(mpath.parent().unwrap().join(name)).unwrap()
+    }
+    fn sc2_mutate(v: &mut serde_json::Value, key: &str, f: &dyn Fn(&serde_json::Value) -> Option<serde_json::Value>) -> usize {
+        let mut n = 0;
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, x) in m.iter_mut() {
+                    if k == key { if let Some(nv) = f(x) { *x = nv; n += 1; continue; } }
+                    n += sc2_mutate(x, key, f);
+                }
+            }
+            serde_json::Value::Array(a) => for x in a { n += sc2_mutate(x, key, f); },
+            _ => {}
+        }
+        n
+    }
+
+    /// SC2-T2: validators.json edited + manifest hash recomputed.
+    #[tokio::test]
+    async fn sc2_scratch_validator_state_tamper_on_restore() {
+        let dir = tmp("sc2-val");
+        let (orig_bond, root) = { let n = build_chain(&dir).await; n.persist_state().unwrap();
+            (n.validator_registry.get("qcb1alice").map(|r| r.bonded_uqcb).ok(), root_of(&n)) };
+        let mut v: serde_json::Value = serde_json::from_slice(&sc2_gen_file(&dir, "validators.json")).unwrap();
+        let changed = sc2_mutate(&mut v, "bonded_uqcb", &|x| x.as_u64().map(|b| serde_json::json!(b + 123_456_789)));
+        rewrite_generation_file(&dir, "validators.json", serde_json::to_vec(&v).unwrap());
+        let (n, r) = restart(&dir).await;
+        let new_bond = n.validator_registry.get("qcb1alice").map(|r| r.bonded_uqcb).ok();
+        println!("SC2-RESULT validator-tamper: fields_changed={changed} restored={} orig_bond={orig_bond:?} restored_bond={new_bond:?} root_equal={}",
+            r.is_restored(), root_of(&n) == root);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(changed > 0, "mutation must hit the file");
+        assert!(r.is_restored(), "hypothesis: tampered validators.json is accepted");
+        assert_ne!(orig_bond, new_bond);
+    }
+
+    /// SC2-T3: identity.json edited + manifest hash recomputed.
+    #[tokio::test]
+    async fn sc2_scratch_identity_state_tamper_on_restore() {
+        let dir = tmp("sc2-id");
+        let (orig, root) = { let n = build_chain(&dir).await; n.persist_state().unwrap();
+            (format!("{:?}", n.identity.get("qcb1alice").map(|r| r.charm.tier.clone())), root_of(&n)) };
+        let mut v: serde_json::Value = serde_json::from_slice(&sc2_gen_file(&dir, "identity.json")).unwrap();
+        let changed = sc2_mutate(&mut v, "tier", &|x| match x.as_str() { Some("Provisional") | Some("Verified") => Some(serde_json::json!("Established")), _ => None });
+        rewrite_generation_file(&dir, "identity.json", serde_json::to_vec(&v).unwrap());
+        let (n, r) = restart(&dir).await;
+        let new = format!("{:?}", n.identity.get("qcb1alice").map(|r| r.charm.tier.clone()));
+        println!("SC2-RESULT identity-tamper: fields_changed={changed} restored={} orig_tier={orig} restored_tier={new} root_equal={}",
+            r.is_restored(), root_of(&n) == root);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(changed > 0, "mutation must hit the file");
+        assert!(r.is_restored(), "hypothesis: tampered identity.json is accepted");
+    }
+
+    /// SC2-T4: agents.json index corrupted (by_address points at a bogus id).
+    #[tokio::test]
+    async fn sc2_scratch_agent_index_reconstruction() {
+        use chain_forge_agents::{AgentCapability, AgentType, SpendingLimits};
+        let dir = tmp("sc2-ag");
+        {
+            let mut n = build_chain(&dir).await;
+            n.agents.register("a1".into(), "qcb1agent1".into(), "qcb1alice".into(), vec![AgentCapability::ReadState],
+                SpendingLimits::unlimited(), None, "d".into(), AgentType::Native, 0).unwrap();
+            n.persist_state().unwrap();
+        }
+        let mut v: serde_json::Value = serde_json::from_slice(&sc2_gen_file(&dir, "agents.json")).unwrap();
+        let has_index = v.get("by_address").is_some();
+        let changed = sc2_mutate(&mut v, "by_address", &|_| Some(serde_json::json!({"qcb1agent1": "nonexistent"})));
+        rewrite_generation_file(&dir, "agents.json", serde_json::to_vec(&v).unwrap());
+        let (n, r) = restart(&dir).await;
+        let by_addr = n.agents.get_by_address("qcb1agent1").map(|a| a.agent_id.clone());
+        let by_id_ok = n.agents.get("a1").is_ok();
+        println!("SC2-RESULT agent-index: index_serialized={has_index} fields_changed={changed} restored={} get_by_address={:?} get_by_id_ok={by_id_ok}",
+            r.is_restored(), by_addr.as_ref().map_err(|e| e.to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }

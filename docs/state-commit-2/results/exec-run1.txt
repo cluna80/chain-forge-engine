@@ -1,0 +1,4 @@
+SC2-RESULT overlength: addr300_success=true new_acct_leaf_len=Some(317) denom100_success=true bob_leaf_len=Some(131) addr70000_success=true err3=None
+test tests::sc2_scratch_overlength_address_and_denom ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out
+(run once; executor-level `execute_tx`, which does not see the HTTP body limit)

@@ -34,15 +34,18 @@ Columns: **A** affects authorization / transitions / eligibility / power / rewar
 | 9 | `AgentStore` records (status, capabilities, limits, per-epoch and lifetime spend, tx count) | yes (spend limits, capability checks) | no | no | Auth | yes | no | Commit |
 | 10 | `AgentStore.by_address`, `by_sponsor` indices | yes (lookup) | no | **yes**: rebuilt from `agents` | Cache | yes | no | Rule (rebuild on load, never trust the file) |
 | 11 | `ValidatorRecord.bonded_uqcb, status, pop_verified, verification_tier, commission, keys, registration_seq` | **yes** (seating, power) | no | partly (`pop_verified` and tier are derived from identity; bond from bonded txs) | Auth | yes | no | Commit |
-| 12 | `ValidatorRecord.blocks_proposed` and other counters | possible (rewards) | no | partly | Auth or Cache | yes | no | Needs classification (open question) |
+| 12 | `ValidatorRecord.blocks_proposed / blocks_missed` | **no**: `ValidatorRegistry::record_block` has no caller outside tests (READ); liveness slashing uses `SlashingModule::record_block` (node.rs ~4247) | no | – | Dead/unused counter | n/a | n/a | None now. If wired later it becomes Auth and must be committed |
 | 13 | `ValidatorRegistry.min_bond` | yes | n/a | yes (genesis) | Cache | n/a | **yes** (re-set from genesis on load) | None |
 | 14 | `live_validator_set.json` | **yes** (consensus view after restart, including keys and power) | no | partly (`build_validator_set(height)` is the documented fallback) | Auth for restart | yes | **no** | Commit or Rule (see §5) |
 | 15 | `historical_validator_sets.json` | yes (verifying old commits and evidence) | no | partly | Auth | yes | no | Commit (digest per height) |
 | 16 | `slashing.json` windows, history, jailed flags | yes (jail, slash, eligibility) | no | partly (from committed evidence) | Auth | yes | no | Commit |
 | 17 | Slashing policy / config | yes | n/a | yes (genesis) | Cache | n/a | **yes** (re-installed from genesis) | None |
 | 18 | `chain_store.json` (block, cert) history | consensus (last_commit evidence) | no (block hashes only chain forward) | no | Auth for history | yes | no | None or Rule (cert verification on load) |
-| 19 | Governance `GovernanceModule{config, proposals: BTreeMap, next_id}` | yes | **unconfirmed** (see §7) | – | Auth | – | – | Audit |
+| 19 | Governance module (`gov:module`, JSON blob via `set_raw`) | yes | **yes**, as a `meta:` leaf (execution `~2597–2610`) | – | Auth | no | yes (root) | None for coverage; encoding caveat in §12 |
 | 20 | `meta:*` entries (e.g. `claim:{id}` replay keys) | yes (replay prevention) | **yes** | – | Auth | no | yes | None |
+| 20b | `crypto_migration:active`, `pq_consensus_activation_epoch`, address-binding keys (`set_raw`) | yes | yes (`meta:`) | – | Auth | no | yes | None |
+| 20c | `claim:{id}` research-reward replay guard | yes | **yes, as an ACCOUNT** (not `meta:`; see §8 correction) | – | Auth | no | yes | Needs O8 decision |
+| 20d | PoCD `DiscoveryRegistry` (challenges, receipts, seen proof ids; HashMaps) | **no today**: its only consumer, epoch reward distribution, is disabled (`if let (true, …)` is `(false, …)`, execution `~5361`) | no | – | Node-local, gossip-fed, not persisted | n/a | n/a | None now; commit or remove before any consumer is re-enabled |
 | 21 | ExplorerState and other API caches | no | no | yes (rebuilt from `chain_store` + state on restore) | Local | harmless | n/a | None |
 | 22 | Consensus signing guard (`persist/consensus_signing.json`) | safety (double-sign) | no | no | Local, safety-critical | n/a | **yes** (fail-closed on unreadable; abstains if guard is ahead) | None |
 
@@ -120,8 +123,7 @@ This is a recommendation, not a decision; owner choice.
 - Genesis must record the profile (or default to the legacy one) so that the genesis hash is stable. Any change to genesis fields requires a separate owner decision.
 - No change to signing bytes or `TxBody`.
 - Chain Forge is not modified. Anything generic belongs in a separate Chain Forge proposal.
-- Governance (row 19) was not audited to the end: `GovernanceModule` uses `BTreeMap` (deterministic), but whether its state is persisted into the tree or a side file was **not verified**. This remains open.
-- Row 12: whether `blocks_proposed` and similar counters feed rewards was not verified.
+- Governance state is already inside the root (row 19); its only weakness is the encoding (§12).
 
 ## 8. O8 size-bound reconciliation (no encoding change)
 
@@ -136,7 +138,7 @@ O8 proposals (PR #82/#84): address 1..256, role ≤64, denom 1..64, ≤256 balan
 | Role ≤64 | Observed values ≤9 chars (`validator`) | Consistent with data. Enforcement at set-time not located. |
 | ≤256 balance entries | Genesis files carry a single `balance`; no multi-denom accounts observed | Unverified against live chains. |
 | Leaf ≤32768 | Largest plausible leaf (ML-DSA key 1952 plus guardians) is far smaller | Consistent. |
-| `claim:*` | These are `meta:` entries, not accounts | **Earlier worry resolved**: they do not hit the address bound. |
+| `claim:{id}` | **CORRECTION of the earlier draft.** `claim:{id}` is created as an *account*: `AccountState::new(claim_key, claim_record_json)` (execution `~4950`), so a JSON audit record is stored in the `role` field | Address = `claim:` + 64 hex ≈ 70 bytes (inside 256). **Role = a JSON object well over 64 bytes** (six ID/hash fields, amounts, tx id). O8's `role ≤ 64` would reject every settled claim at v2 encoding. The v1 leaf omits `role`, so today this is invisible. |
 
 Consequence to flag for the owner (not changed here): a v2 encoder that rejects over-bound fields would turn a currently-accepted transaction into a leaf-encoding failure at state-commit time. Either enforce the bound at transaction admission **before** activation, or define the failure behaviour. Both are owner decisions.
 
@@ -155,6 +157,76 @@ All `*_live` tests below follow the CLAUDE.md rule: ✅ only after Windows confi
 
 ## 10. Open items and limits
 
-- Not read to the end: governance persistence, `blocks_proposed` reward use, PoCD registry, `load_snapshot` signature/MAC fields, storage v2.
-- Nothing here was compiled or run beyond reading source. All severities are proposals.
+- §1–§10 are source-reading conclusions (with the corrections above). §11 records what was **run**.
+- All severities are proposals.
 - Owner decisions needed: remediation order (§6), activation mechanism, O8 enforcement point (§8), whether R5 is in scope.
+
+---
+
+# Review-round update (owner direction on 79d6a1d)
+
+## 11. Experimental results vs source-reading conclusions
+
+Method: tests inserted into a throwaway worktree of `origin/main@baf7345` (no production edit, no golden baseline touched), run in the Linux sandbox with `-j 2`.
+Source: `docs/state-commit-2/scratch-tests/*.rs.txt`. Captured output: `docs/state-commit-2/results/`.
+**Sandbox only. Per CLAUDE.md nothing below is ✅ until Windows confirms** (command in `docs/state-commit-2/README.md`).
+
+| ID | Claim | Source reading said | Experiment | Status |
+|---|---|---|---|---|
+| E1 | Account tier mirror stale after epoch lapse | stale (§4) | Genesis validator Alice: identity tier `Provisional` after `advance_epoch_to` + `propose_block` (registry sweep ran); account charm tier still `Verified`; leaf bytes and state root **unchanged**. 3 identical runs | **Confirmed in sandbox** |
+| E2 | `validators.json` edited (4 `bonded_uqcb` fields +123,456,789) with manifest SHA-256/size recomputed is accepted | accepted (SC2-3) | `is_restored() == true`; Alice bond 1,000,000 → 124,456,789; state root identical. 3 identical runs | **Confirmed in sandbox** |
+| E3 | `identity.json` edited (4 `tier` fields → `Established`) with manifest recomputed is accepted | accepted | `is_restored() == true`; Alice tier `Verified` → `Established`; root identical. 3 runs | **Confirmed in sandbox** |
+| E4 | Agent `by_address` index is trusted from disk | index trusted (row 10) | `by_address` **is serialized**. A corrupted entry restores without error; `get_by_address("qcb1agent1")` → `Err("agent nonexistent not found")` while `get("a1")` succeeds. 3 runs | **Confirmed in sandbox** (index not rebuilt) |
+| E5 | No address/denom length limit | none found by grep | `execute_tx`: 300-byte address transfer **succeeded** (new account leaf 317 bytes); 100-byte denom **succeeded**; 70,000-byte address **succeeded**. 1 run | **Confirmed at executor level.** The HTTP layer caps the body by `max_tx_bytes` (`api.rs ~183`, 65,536 in shipped templates). Other ingress (gossip, direct block proposal) was not tested |
+
+Not demonstrated: any cross-node exploit; that E2/E3 survive the signing guard or p2p sync; anything on Windows.
+E2/E3 need write access to the data directory. They show the manifest hash is an integrity check, not an authenticity check.
+
+## 12. Supplementary audit results (source reading unless marked)
+
+- **Governance**: inside the root as `meta:gov:module` (JSON text of `GovernanceModule`, `BTreeMap` collections). Caveat: the commitment is over `serde_json` text, so a serde or field-order change silently changes the root. A canonical encoding removes that coupling.
+- **Reward counters**: `blocks_proposed/blocks_missed` are never incremented outside tests. Rewards use committed evidence (`node.rs ~4375–4425`) and slashing windows. Not authoritative today.
+- **PoCD**: three `HashMap/HashSet`s fed by gossip (`node.rs ~3497`), not in `SNAPSHOT_FILES`, lost at restart; the reward consumer is compiled out by a constant `false`. Node-local and non-consensus *today*. `ClaimResearchReward` uses the `claim:` account, not the registry.
+- **Settlement state**: replay guard `claim:{id}` is an account (correction in §8). Treasury and recipient balances are ordinary accounts (in the root).
+- **Manifest authentication**: fields are `format_version, chain_id, genesis_hash, state_root, height, generation, files[sha256,size]`. No signature or MAC field. `genesis_hash` binds a directory to a chain, not to a writer. The v2 block-log hash chain is anchored with `anchor_for(genesis_hash, kind)` (public inputs): it detects corruption, not a deliberate rewrite by someone who can compute it.
+- **storage v2** (default off): replays both logs, verifies the hash chain and descriptor tails, strict-decodes every record, fails closed on ambiguity (`storage_v2.rs ~142–175`). It feeds the **same** restore path, so identity/validators/agents/slashing get exactly the v1 checks. Block and validator-set *history* logs are chained; the live validator set is not.
+- **Non-canonical serialization (matters for R2)**: `IdentityStore`, `ValidatorRegistry`, `SlashingModule` hold `HashMap/HashSet` (`records`, `validators`, `liveness_windows`, `equivocation_set`, `sybil_confirmations`, …). Their `serde_json` output is not order-stable, so **hashing the current JSON files is not a valid commitment**.
+- **QRC flag (no action here)**: `AgentRecord` persists `epoch_spend_uqrc` / `lifetime_spend_uqrc`. R2 encodings should use unit-neutral tags. Renaming persisted fields is a separate owner decision.
+
+## 13. Proposed implementation sequence (nothing authorized)
+
+Gate: Phase 0.5 alongside ACCT-LEAF-1. Each step is its own reviewed PR; Windows confirmation before closing.
+
+1. **SC2-A (tests only)**: promote E1–E5 into permanent characterization tests. No behavior change.
+2. **SC2-B (design freeze)**: owner review of `docs/STATE-COMMIT-2-R2-authority-state-architecture.md`, decisions Q1–Q8, O8 reconciliation (§14).
+3. **SC2-C (vectors)**: byte-level vectors and an independent Python encoder for authority records (PR-A method). No Rust.
+4. **SC2-D (R4, no root change)**: restore-time re-derivation of caches (indices, `pop_verified`); refuse on mismatch. Closes E4; partly mitigates E2/E3 (incoherent edits only).
+5. **SC2-E (fresh-v2-genesis)**: admission and genesis validators first, then authority tree plus `meta` root leaf and the ACCT-LEAF-1 v2 leaf under one genesis commitment profile.
+6. **SC2-F (optional, separate)**: R5 manifest signing.
+R1 is superseded by SC2-E on v2 chains and is only needed if a legacy-profile chain must keep running.
+
+## 14. O8 reconciliation (revised; encoding unchanged)
+
+Owner rule: no encoding limit without a matching validation rule. Validation rules found for address, denom, role, balance count and key size: **none** beyond signature-scheme checks and the HTTP body limit (grep-based; not exhaustive).
+
+| O8 bound | Real data / rule | Needed before adoption |
+|---|---|---|
+| address 1..256 | genesis ≤ 22; `claim:` ≈ 70; executor accepts 300 and 70,000 (E5) | admission rule in `Transfer` and every account-creating op, genesis validation, pre-activation scan |
+| denom 1..64 | executor accepts 100 (E5); seen: `uqcb`, `settled` | same |
+| role ≤ 64 | genesis ≤ 9; **claim accounts store a JSON blob in `role` (> 64)** | a real bound ≥ the blob, or move the claim record out of `role` (changes state; separate decision) |
+| ≤ 256 balances | single-denom accounts in all genesis files | admission rule on first credit of a new denom |
+| keys ≤ 4096 | 32 / 1952 / ≈1984 | none beyond scheme checks |
+| guardians 1..64 | `MAX_GUARDIANS = 10` enforced | consistent (looser) |
+| leaf ≤ 32768 | breached by unbounded role/address | follows from the above |
+
+Under fresh-v2-genesis, ship admission and genesis validators **before** the encoder so a bound can never be hit by an admitted transaction.
+
+## 15. Acceptance tests (additions to §9)
+
+All `*_live` style; ✅ only after Windows confirmation.
+- **T-AUTH-ROOT-DETERMINISM**: shuffle `HashMap` insertion order across identity/validator/agent/slashing stores; authority root byte-identical.
+- **T-AUTH-RESTORE-TAMPER**: E2/E3 become refusals under the v2 profile.
+- **T-AUTH-DERIVED-CHECK**: edit a derived field (agent index, `pop_verified`) → restore refuses.
+- **T-AUTH-ORDER**: rollover + sweep + evidence in one block; root computed after all authority mutations; two nodes agree.
+- **T-CLAIM-ROLE**: a settled claim encodes under the final role rule.
+- **T-LEGACY-PROFILE**: legacy genesis yields today's roots (S0/S1/S2 corpora unchanged).
