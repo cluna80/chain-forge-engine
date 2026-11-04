@@ -1931,6 +1931,43 @@ fn tx_signature_scheme(tx: &Transaction) -> Option<&'static str> {
 /// exempt: it is authenticated by its guardians' ML-DSA signatures, and its
 /// new key must already be ML-DSA-65. This checks the scheme only; the
 /// signature itself is verified by execution.
+/// O8 mempool-admission bounds (STATE-COMMIT-2). Rejects transactions whose
+/// sender, or whose body names an account address or denomination, is empty or
+/// longer than `chain_forge_core::MAX_ADDRESS_BYTES` / `MAX_DENOM_BYTES`.
+///
+/// Scope and limits: covers `sender`, `Transfer{to,denom}`, `Burn{denom}`,
+/// `SponsorAgent/RevokeAgent{agent_address}`, `RegisterAgent{agent_address}`,
+/// `SpawnChildAgent{child_agent_address}` and `ClaimResearchReward{recipient}`.
+/// It is a MEMPOOL rule: the executor does not call it, so a block built by
+/// another node can still carry such a transaction. Making it a consensus rule
+/// changes state transitions and needs an activation decision.
+pub fn check_admission_bounds(tx: &Transaction) -> Result<(), String> {
+    use chain_forge_core::{MAX_ADDRESS_BYTES, MAX_DENOM_BYTES};
+    fn addr(what: &str, v: &str) -> Result<(), String> {
+        if v.is_empty() || v.len() > MAX_ADDRESS_BYTES {
+            return Err(format!("{what}: address length {} is outside 1..={MAX_ADDRESS_BYTES} bytes", v.len()));
+        }
+        Ok(())
+    }
+    fn denom(what: &str, v: &str) -> Result<(), String> {
+        if v.is_empty() || v.len() > MAX_DENOM_BYTES {
+            return Err(format!("{what}: denom length {} is outside 1..={MAX_DENOM_BYTES} bytes", v.len()));
+        }
+        Ok(())
+    }
+    addr("sender", &tx.sender)?;
+    match &tx.body {
+        TxBody::Transfer { to, denom: d, .. } => { addr("Transfer.to", to)?; denom("Transfer.denom", d)?; }
+        TxBody::Burn { denom: d, .. } => denom("Burn.denom", d)?,
+        TxBody::SponsorAgent { agent_address } | TxBody::RevokeAgent { agent_address } => addr("agent_address", agent_address)?,
+        TxBody::RegisterAgent { agent_address, .. } => addr("RegisterAgent.agent_address", agent_address)?,
+        TxBody::SpawnChildAgent { child_agent_address, .. } => addr("SpawnChildAgent.child_agent_address", child_agent_address)?,
+        TxBody::ClaimResearchReward { recipient, .. } => addr("ClaimResearchReward.recipient", recipient)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn check_account_signature_policy(
     tx: &Transaction,
     policy: chain_forge_core::AccountSignaturePolicy,
@@ -5622,6 +5659,26 @@ mod tests {
     /// fee debit: `expected_balance = start - amount - gas_for(&exec, &tx)`.
     fn gas_for(exec: &Executor, tx: &Transaction) -> u128 {
         exec.config.gas_model.calculate_gas(tx) as u128
+    }
+
+    #[test]
+    fn o8_admission_bounds_accept_limits_and_reject_beyond() {
+        use chain_forge_core::{MAX_ADDRESS_BYTES, MAX_DENOM_BYTES};
+        let a = |n: usize| "a".repeat(n);
+        let d = |n: usize| "d".repeat(n);
+        let ok = Transaction::transfer("t", &a(MAX_ADDRESS_BYTES), &a(MAX_ADDRESS_BYTES), &d(MAX_DENOM_BYTES), 1, 0);
+        assert!(check_admission_bounds(&ok).is_ok(), "limits are inclusive");
+        for (tx, what) in [
+            (Transaction::transfer("t", &a(MAX_ADDRESS_BYTES + 1), "b", "uqcb", 1, 0), "sender"),
+            (Transaction::transfer("t", "a", &a(MAX_ADDRESS_BYTES + 1), "uqcb", 1, 0), "Transfer.to"),
+            (Transaction::transfer("t", "a", "b", &d(MAX_DENOM_BYTES + 1), 1, 0), "Transfer.denom"),
+            (Transaction::transfer("t", "a", "", "uqcb", 1, 0), "Transfer.to"),
+            (Transaction::transfer("t", "a", "b", "", 1, 0), "Transfer.denom"),
+            (Transaction::burn("t", "a", &d(MAX_DENOM_BYTES + 1), 1, 0), "Burn.denom"),
+        ] {
+            let e = check_admission_bounds(&tx).expect_err(what);
+            assert!(e.contains(what), "{what}: {e}");
+        }
     }
 
     #[test]

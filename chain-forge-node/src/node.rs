@@ -2803,6 +2803,10 @@ impl Node {
             debug!(tx_id = %tx.id, error = %e, "transaction refused by the account signature policy");
             return false;
         }
+        if let Err(e) = chain_forge_execution::check_admission_bounds(&tx) {
+            debug!(tx_id = %tx.id, error = %e, "transaction refused by the O8 admission bounds");
+            return false;
+        }
         if self.mempool.iter().any(|t| t.id == tx.id) {
             return false;
         }
@@ -14773,6 +14777,16 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn o8_mempool_refuses_overlength_address_and_denom_but_admits_normal_tx() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let long_addr = format!("qcb1{}", "a".repeat(300));
+        let long_denom = format!("u{}", "d".repeat(100));
+        assert!(!node.submit_tx(Transaction::transfer("o8-a", "qcb1alice", &long_addr, "uqcb", 1, 0)));
+        assert!(!node.submit_tx(Transaction::transfer("o8-d", "qcb1alice", "qcb1bob", &long_denom, 1, 0)));
+        assert!(node.submit_tx(Transaction::transfer("o8-ok", "qcb1alice", "qcb1bob", "uqcb", 1, 0)), "a normal transfer is still admitted");
     }
 
     #[tokio::test]
