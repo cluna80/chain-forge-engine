@@ -14775,6 +14775,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── SC2-A: STATE-COMMIT-2 desired-behavior tests (ignored until the fix lands) ──
+    // Each asserts the behavior we WANT. Today they fail; `cargo test -- --ignored sc2a_` shows that.
+    // Evidence of the current behavior: docs/state-commit-2/ (E1) and docs/STATE-COMMIT-2-audit.md §11.
+    #[tokio::test]
+    #[ignore = "SC2-A/E1: account tier mirror goes stale after epoch lapse; fixed by the v2 authority profile (audit §4, §13)"]
+    async fn sc2a_e1_account_tier_matches_identity_tier_after_epoch_lapse() {
+        use chain_forge_identity::LIVENESS_EPOCH_WINDOW;
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let target = LIVENESS_EPOCH_WINDOW + 2;
+        node.identity.lapse_only("qcb1alice", target);
+        for a in ["qcb1bob", "qcb1carol", "qcb1dave"] { node.identity.stay_lively(a, target); }
+        assert!(node.identity.advance_epoch_to(target));
+        node.propose_block(chain_forge_consensus::BlockHash("h0".into())).await.unwrap();
+        let id_tier = node.identity.get("qcb1alice").unwrap().charm.tier.clone();
+        let acct_tier = node.state.get_account("qcb1alice").unwrap().charm.as_ref().map(|c| c.tier.clone());
+        assert_eq!(acct_tier, Some(id_tier), "committed account tier must equal the authoritative identity tier");
+    }
+
     #[tokio::test]
     async fn sweep_does_not_restore_validator_with_downgraded_identity() {
         // Invariant C (two-layer enforcement):
@@ -16290,5 +16308,73 @@ mod p02a_gaps {
         assert!(err.contains("snapshot write failed"), "{err}");
         assert!(crate::persistence::read_current(&dir).unwrap().is_none(), "nothing was committed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── SC2-A: STATE-COMMIT-2 desired-behavior tests (ignored until the fix lands) ──
+    fn sc2a_gen_file(dir: &std::path::Path, name: &str) -> Vec<u8> {
+        let mpath = current_manifest_path(dir);
+        std::fs::read(mpath.parent().unwrap().join(name)).unwrap()
+    }
+    fn sc2a_mutate(v: &mut serde_json::Value, key: &str, f: &dyn Fn(&serde_json::Value) -> Option<serde_json::Value>) -> usize {
+        let mut n = 0;
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, x) in m.iter_mut() {
+                    if k == key { if let Some(nv) = f(x) { *x = nv; n += 1; continue; } }
+                    n += sc2a_mutate(x, key, f);
+                }
+            }
+            serde_json::Value::Array(a) => for x in a { n += sc2a_mutate(x, key, f); },
+            _ => {}
+        }
+        n
+    }
+
+    #[tokio::test]
+    #[ignore = "SC2-A/E2: validators.json edited with a recomputed manifest hash is accepted; needs SC2-D/SC2-E"]
+    async fn sc2a_e2_tampered_validators_file_is_refused_on_restore() {
+        let dir = tmp("sc2a-val");
+        { let n = build_chain(&dir).await; n.persist_state().unwrap(); }
+        let mut v: serde_json::Value = serde_json::from_slice(&sc2a_gen_file(&dir, "validators.json")).unwrap();
+        let changed = sc2a_mutate(&mut v, "bonded_uqcb", &|x| x.as_u64().map(|b| serde_json::json!(b + 123_456_789)));
+        assert!(changed > 0, "mutation must hit the file");
+        rewrite_generation_file(&dir, "validators.json", serde_json::to_vec(&v).unwrap());
+        let (_n, r) = restart(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!r.is_restored(), "a validators.json that no longer matches the committed state must be refused");
+    }
+
+    #[tokio::test]
+    #[ignore = "SC2-A/E3: identity.json edited with a recomputed manifest hash is accepted; needs SC2-D/SC2-E"]
+    async fn sc2a_e3_tampered_identity_file_is_refused_on_restore() {
+        let dir = tmp("sc2a-id");
+        { let n = build_chain(&dir).await; n.persist_state().unwrap(); }
+        let mut v: serde_json::Value = serde_json::from_slice(&sc2a_gen_file(&dir, "identity.json")).unwrap();
+        let changed = sc2a_mutate(&mut v, "tier", &|x| match x.as_str() { Some("Provisional") | Some("Verified") => Some(serde_json::json!("Established")), _ => None });
+        assert!(changed > 0, "mutation must hit the file");
+        rewrite_generation_file(&dir, "identity.json", serde_json::to_vec(&v).unwrap());
+        let (_n, r) = restart(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!r.is_restored(), "an identity.json that no longer matches the committed state must be refused");
+    }
+
+    #[tokio::test]
+    #[ignore = "SC2-A/E4: AgentStore.by_address is trusted from disk instead of rebuilt; fixed by SC2-D"]
+    async fn sc2a_e4_agent_address_index_is_rebuilt_on_restore() {
+        use chain_forge_agents::{AgentCapability, AgentType, SpendingLimits};
+        let dir = tmp("sc2a-ag");
+        {
+            let mut n = build_chain(&dir).await;
+            n.agents.register("a1".into(), "qcb1agent1".into(), "qcb1alice".into(), vec![AgentCapability::ReadState],
+                SpendingLimits::unlimited(), None, "d".into(), AgentType::Native, 0).unwrap();
+            n.persist_state().unwrap();
+        }
+        let mut v: serde_json::Value = serde_json::from_slice(&sc2a_gen_file(&dir, "agents.json")).unwrap();
+        assert!(sc2a_mutate(&mut v, "by_address", &|_| Some(serde_json::json!({"qcb1agent1": "nonexistent"}))) > 0);
+        rewrite_generation_file(&dir, "agents.json", serde_json::to_vec(&v).unwrap());
+        let (n, r) = restart(&dir).await;
+        let ok = n.agents.get_by_address("qcb1agent1").is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!r.is_restored() || ok, "restore must either refuse or rebuild the index so get_by_address works");
     }
 }
