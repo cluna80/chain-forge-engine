@@ -676,6 +676,15 @@ With Dave down on purpose, only Alice and Carol remained (2 of 4, below quorum),
 
 ---
 
+
+## PERSIST-HALT-1b  A failed signing-guard write must stop the validator signing (owner decision 2026-11-04)
+
+The first PR B latch covered a failed **block** persist. A failed **signing-guard** write (`persist/consensus_signing.json`) only withheld that one vote or proposal; the next message could be signed. The guard is the consensus safety boundary, so any failed guard write now latches the same one-way, process-local `persistence_failed` state: all vote, proposal, commit, tick and event-loop paths refuse (including `sign_vote`/`sign_proposal`, so no caller can bypass it), `status.is_running` becomes false, `main` exits with code 2, and there is **no automatic recovery**: a new process must start on a usable data directory, re-verify the guard and the committed chain state, and only then sign. The latch never jails the validator and never changes voting power (a local storage fault stops participation; it is not misbehaviour). v1 and v2 share the same code path. Tests: `a_failed_signing_guard_write_for_a_vote_latches_the_node_and_stops_all_signing`, `a_failed_signing_guard_write_for_a_proposal_latches_the_node`, `successful_guard_writes_never_latch_and_survive_a_restart` (both formats; mutation-checked at both latch sites). Linux-validated; Windows pending.
+
+## PERSIST-DIR-1  A node given an unusable `--data-dir` ran memory-only (v1)
+
+`main.rs` logged a warning and continued without persistence when `set_data_dir` failed on the default storage, so a restarted validator could sign with no signing guard and no committed state. **Fixed in PR B:** it now logs `FATAL` and exits non-zero (v2 already refused). Tests: `v1_/v2_a_node_with_an_unusable_data_dir_refuses_to_start` (`storage_v2_live`). Linux-validated; Windows pending.
+
 ## PERSIST-APPEND-1  A failed log append can be buried by a later append
 
 **Status: FIXED in PR B (2026-11-03; Linux-validated; Windows validation pending). Found 2026-11-03; low severity (defence in depth); the failing test was first committed `#[ignore]`d (PR A) and is now a normal regression test.**
