@@ -25,18 +25,18 @@ for f in node_tests_a exec_tests node_tests_b; do git show "$BR:$D/$f.rs.txt" > 
 
 ( cd "$WT" && $PY - <<'PY'
 def ins_before(path, marker, text):
-    s = open(path, newline=None).read()
+    s = open(path, encoding='utf-8', newline=None).read()
     assert s.count(marker) == 1, (path, marker[:50])
     i = s.index(marker)
-    open(path, 'w', newline='\n').write(s[:i] + text + "\n" + s[i:])
-a = open('node_tests_a.snippet').read()
-b = open('node_tests_b.snippet').read()
-e = open('exec_tests.snippet').read()
+    open(path, 'w', encoding='utf-8', newline='\n').write(s[:i] + text + "\n" + s[i:])
+a = open('node_tests_a.snippet', encoding='utf-8').read()
+b = open('node_tests_b.snippet', encoding='utf-8').read()
+e = open('exec_tests.snippet', encoding='utf-8').read()
 n = 'chain-forge-node/src/node.rs'
 ins_before(n, '    #[tokio::test]\n    async fn sweep_does_not_restore_validator_with_downgraded_identity', a)
-s = open(n, newline=None).read().rstrip()
+s = open(n, encoding='utf-8', newline=None).read().rstrip()
 assert s.endswith('}')
-open(n, 'w', newline='\n').write(s[:-1] + b + "}\n")
+open(n, 'w', encoding='utf-8', newline='\n').write(s[:-1] + b + "}\n")
 ins_before('chain-forge-execution/src/lib.rs', '    #[test]\n    fn transfer_tx_succeeds()', e)
 PY
 )
