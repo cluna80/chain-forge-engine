@@ -41,7 +41,7 @@ version     = "0.1.0"
 edition     = "2021"
 authors     = ["cluna80"]
 license     = "MIT"
-repository  = "https://github.com/cluna80/chain-forge-engine"
+repository  = "https://github.com/cluna80/Qattice"
 
 [workspace.dependencies]
 tokio       = { version = "1", features = ["full"] }

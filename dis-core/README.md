@@ -1,6 +1,6 @@
 # DIS Core — Decentralized Identity Signing Protocol
 
-[![CI](https://github.com/cluna80/chain-forge-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/cluna80/chain-forge-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/cluna80/Qattice/actions/workflows/ci.yml/badge.svg)](https://github.com/cluna80/Qattice/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![PQ Safe](https://img.shields.io/badge/post--quantum-ML--DSA--65-green)
 
@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dis-core = { git = "https://github.com/cluna80/chain-forge-engine", subdirectory = "dis-core" }
+dis-core = { git = "https://github.com/cluna80/Qattice", subdirectory = "dis-core" }
 ```
 
 ```rust
@@ -71,7 +71,7 @@ let transcript = canonical_request(&request)?;
 
 ## Part of Qattice
 
-DIS is the authentication layer of [Qattice](https://github.com/cluna80/chain-forge-engine) — a post-quantum blockchain built from scratch. DIS is also available as a standalone protocol for any vendor who needs post-quantum authentication.
+DIS is the authentication layer of [Qattice](https://github.com/cluna80/Qattice) — a post-quantum blockchain built from scratch. DIS is also available as a standalone protocol for any vendor who needs post-quantum authentication.
 
 ---
 
