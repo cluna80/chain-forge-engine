@@ -1,5 +1,7 @@
 # Chain Forge / Qattice — Engineering Roadmap
 
+> **Repository name:** this repository was renamed from `chain-forge-engine` to `Qattice` on 2026-11-04 (`https://github.com/cluna80/Qattice`; GitHub redirects the old URL). Entries below that say `chain-forge-engine` record the name at the time the evidence was produced and are left as written. Qattice and Chain Forge are now separate projects; the `chain-forge-*` crate names are legacy internal identifiers.
+
 > **How to use this doc**: This is the running reference for what's done, what's next, and what's on the horizon. Update it when a milestone ships. Cross-reference the whitepaper (`QCB-Chain-Whitepaper-v2.md`) for economic design rationale; this doc is the engineering view.
 
 ---
