@@ -3281,6 +3281,10 @@ pub trait TxModule: Send + Sync {
         state:        &mut StateStore,
         block_height: u64,
     ) -> Option<Result<(), String>>;
+
+    /// Called once per completed block, after all transactions and before fee distribution and commit, so anything the
+    /// hook changes is part of that block's state root. Modules are called in registration order. Default: nothing.
+    fn on_block_end(&self, _config: &ExecutionConfig, _state: &mut StateStore, _block_height: u64) {}
 }
 
 /// DIS account-key rotation and recovery transactions (DIS-002A/002B/003A/003E).
@@ -3344,6 +3348,12 @@ impl TxModule for DisModule {
             _ => return None,
         })
     }
+
+    /// DIS-003E block-end sweep: activate unchallenged pending recoveries (runs AFTER all txs, so a CancelRecovery in the same
+    /// block has fired, and BEFORE commit, so activation is in the state root).
+    fn on_block_end(&self, _config: &ExecutionConfig, state: &mut StateStore, block_height: u64) {
+        sweep_pending_recoveries(state, block_height);
+    }
 }
 
 impl Executor {
@@ -3355,6 +3365,13 @@ impl Executor {
     /// An executor with an explicit module list (empty = a core-only executor that refuses module-owned transactions).
     pub fn with_modules(config: ExecutionConfig, modules: Vec<std::sync::Arc<dyn TxModule>>) -> Self {
         Self { config, modules }
+    }
+
+    /// Block-end lifecycle: let every registered module act once on the completed block, in registration order.
+    fn run_block_end(&self, state: &mut StateStore, block_height: u64) {
+        for m in &self.modules {
+            m.on_block_end(&self.config, state, block_height);
+        }
     }
 
     /// Offer a module-owned transaction to the registered modules.
@@ -5258,7 +5275,7 @@ impl Executor {
         // DIS-003E: block-end sweep — activate unchallenged pending recoveries.
         // Runs AFTER all txs (so CancelRecovery txs in this block have fired)
         // and BEFORE commit (so activation is included in the state root).
-        sweep_pending_recoveries(state, height);
+        self.run_block_end(state, height);
 
         // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
         // Operates only on fees_collected (this block) — not the collector's
@@ -5430,7 +5447,7 @@ impl Executor {
         // DIS-003E: block-end sweep — activate unchallenged pending recoveries.
         // Runs AFTER all txs (so CancelRecovery txs in this block have fired)
         // and BEFORE commit (so activation is included in the state root).
-        sweep_pending_recoveries(state, height);
+        self.run_block_end(state, height);
 
         // Distribute this block's fees: 70% validator pool / 20% treasury / 10% burn.
         distribute_block_fees_from(&self.config.fee_collector, fees_collected,
@@ -9769,6 +9786,66 @@ a4:pk=Some(3)|kv=1|pending=true|cancelled=true|policy=false\n");
             assert_ne!(r6.state_root, r7.state_root, "activation is inside block 7's reported root");
             assert_eq!(r7.state_root, st.current_root().unwrap());
         }
+    }
+
+    /// A module that records every `on_block_end` call: how many, at which heights, and the state root it saw.
+    struct RecordingModule {
+        calls: std::sync::Mutex<Vec<(u64, String)>>,
+    }
+    impl TxModule for RecordingModule {
+        fn name(&self) -> &'static str { "recording" }
+        fn try_execute(&self, _c: &ExecutionConfig, _t: &Transaction, _s: &mut StateStore, _h: u64) -> Option<Result<(), String>> { None }
+        fn on_block_end(&self, _c: &ExecutionConfig, state: &mut StateStore, h: u64) {
+            self.calls.lock().unwrap().push((h, state.current_root().unwrap_or("").to_string()));
+        }
+    }
+
+    /// The block-end hook runs exactly once per completed block, in both execution paths, AFTER the block's transactions and
+    /// BEFORE fee distribution (so the root it sees differs from both the pre-block root and the block's final root).
+    #[test]
+    fn s2_on_block_end_runs_once_per_block_after_txs_and_before_fee_distribution() {
+        use chain_forge_agents::AgentStore;
+        for with_identity in [false, true] {
+            let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+            let rec = std::sync::Arc::new(RecordingModule { calls: std::sync::Mutex::new(vec![]) });
+            let exec = Executor::with_modules(ExecutionConfig::from_genesis(&genesis), vec![rec.clone() as std::sync::Arc<dyn TxModule>]);
+            let mut st = StateStore::new(HashWidth::Bits256);
+            st.apply_genesis(&genesis).unwrap();
+            let mut finals = vec![];
+            let mut pre = vec![];
+            for (i, h) in [10u64, 11, 12].into_iter().enumerate() {
+                pre.push(st.current_root().unwrap().to_string());
+                let txs = vec![Transaction::transfer(&format!("t{i}"), "qcb1alice", "qcb1bob", "uqcb", 1_000, i as u64)];
+                let r = if with_identity {
+                    exec.execute_block_with_identity(h, txs, &mut st, &mut IdentityStore::new(0), &mut AgentStore::new(), 1_000 + h, None)
+                } else {
+                    exec.execute_block(h, txs, &mut st, 1_000 + h)
+                };
+                assert_eq!(r.tx_results.iter().filter(|t| t.success).count(), 1);
+                assert!(r.fees_collected > 0);
+                finals.push(r.state_root);
+            }
+            let calls = rec.calls.lock().unwrap().clone();
+            assert_eq!(calls.iter().map(|c| c.0).collect::<Vec<_>>(), vec![10, 11, 12], "with_identity={with_identity}: exactly one call per block, in order");
+            for i in 0..3 {
+                assert_ne!(calls[i].1, pre[i], "hook runs after the block's transactions");
+                assert_ne!(calls[i].1, finals[i], "hook runs before fee distribution");
+            }
+        }
+    }
+
+    /// A core-only executor (no module) never sweeps: a pending recovery stays pending.
+    #[test]
+    fn s2_without_the_dis_module_nothing_sweeps() {
+        let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+        let exec = Executor::with_modules(ExecutionConfig::from_genesis(&genesis), vec![]);
+        let mut st = StateStore::new(HashWidth::Bits256);
+        st.apply_genesis(&genesis).unwrap();
+        let mut a = st.get_account("qcb1alice").unwrap().clone();
+        a.pending_recovery = Some(sw_pending(10, 2, 7, false));
+        st.upsert_account(a);
+        exec.execute_block(50, vec![], &mut st, 1);
+        assert!(st.get_account("qcb1alice").unwrap().pending_recovery.is_some());
     }
 
 }
