@@ -665,7 +665,9 @@ With Dave down on purpose, only Alice and Carol remained (2 of 4, below quorum),
 ---
 
 
-## H0-3b  Reconciliation against the acceptance criteria (2026-11-04) — NOT closed
+## H0-3b  Reconciliation against the acceptance criteria (2026-11-04) — CLOSED (owner, 2026-11-04; supersedes the table statuses below)
+
+**Update after PR #70 (merge `ed451d3`, test head `5d84dba`):** the section 6 component sweep closes the one partial cell. Windows at `5d84dba`: sweep passed, unit suite 398 passed / 0 failed / 2 ignored. All five section 11 criteria and all ten section 6 rows are satisfied; criterion 1 is no longer "owner to confirm". H0-3b acceptance is **not** storage v2 production readiness: v2 stays default-off, no migration, no default flip. P02A-W1 stays unexplained. The Windows trees also held unrelated modified Android Gradle files. The table below is the pre-#70 record.
 
 Criteria are `docs/persist-001-p02-design.md` section 11. No new gates are added here. Status uses only evidence recorded in this repository.
 
