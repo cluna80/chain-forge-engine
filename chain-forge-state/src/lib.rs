@@ -1489,4 +1489,18 @@ mod tests {
         assert_eq!(a.policy_generation, 0);
     }
 
+    /// Balances above u64::MAX must survive the account wire layout (why S1 does not use `#[serde(flatten)]`).
+    #[test]
+    fn s1_u128_balances_above_u64_round_trip() {
+        let big: u128 = u128::from(u64::MAX) * 1000 + 17;
+        let mut a = AccountState::new("ex1big".into(), "user".into());
+        a.balances.insert("uex".into(), big);
+        a.key_version = 9;
+        let json = serde_json::to_string(&a).unwrap();
+        let back: AccountState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.balances["uex"], big);
+        assert_eq!(back.key_version, 9);
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
 }
