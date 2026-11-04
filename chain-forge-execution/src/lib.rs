@@ -9623,4 +9623,152 @@ mod tests {
         }
     }
 
+    // ── S2 step 2 baseline: the DIS-003E block-end sweep (recorded on c501a7b BEFORE the on_block_end refactor) ──────────
+    fn sw_pending(new_pk_seed: u8, key_version: u32, activation_height: u64, cancelled: bool) -> chain_forge_state::PendingRecovery {
+        chain_forge_state::PendingRecovery {
+            new_public_key: (0..64u8).map(|i| i.wrapping_add(new_pk_seed)).collect(),
+            new_key_scheme: "ml-dsa-65".to_string(),
+            key_version,
+            submitted_at_height: activation_height.saturating_sub(5),
+            activation_height,
+            policy_id: 1,
+            cancelled,
+        }
+    }
+
+    /// Accounts a1..a4 inserted in `order`. a1 is due at 100, a2 was due at 90, a3 is due at 200, a4 is due at 100 but cancelled.
+    fn sw_state(order: &[&str]) -> StateStore {
+        let mut st = StateStore::new(HashWidth::Bits256);
+        for name in order {
+            let addr = format!("qcb1{name}");
+            let mut a = chain_forge_state::AccountState::new(addr.clone(), "user".into());
+            a.credit("uqcb", 1_000);
+            a.public_key = Some(vec![1, 2, 3]);
+            a.key_version = 1;
+            a.pending_recovery = match *name {
+                "a1" => Some(sw_pending(10, 2, 100, false)),
+                "a2" => Some(sw_pending(20, 3, 90, false)),
+                "a3" => Some(sw_pending(30, 4, 200, false)),
+                "a4" => Some(sw_pending(40, 5, 100, true)),
+                _ => None,
+            };
+            st.upsert_account(a);
+        }
+        st
+    }
+
+    fn sw_summary(st: &StateStore) -> String {
+        let mut out = String::new();
+        for n in ["a1", "a2", "a3", "a4"] {
+            let a = st.get_account(&format!("qcb1{n}")).unwrap();
+            out.push_str(&format!("{n}:pk={:?}|kv={}|pending={}|cancelled={}|policy={}\n",
+                a.public_key.as_ref().map(|k| k.len()), a.key_version, a.pending_recovery.is_some(),
+                a.pending_recovery.as_ref().map(|p| p.cancelled).unwrap_or(false), a.recovery_policy.is_some()));
+        }
+        out
+    }
+
+    const SW_ROOT_BEFORE: &str = "3ed70eb8d35a49fcb2744a0ffe4abc1f6747025102d51a1f52353f7b5aa69fa6";
+    const SW_ROOT_AFTER_100: &str = "180d1d4ed0c1415cb9a96f6c65a4cadbf56938c575eca6f8784e048bc84d703e";
+    const SW_ROOT_AFTER_200: &str = "617b154052602f63b71589d348c6da154d182ac43a8ae8e97e7a34bed09f5d12";
+
+    #[test]
+    fn s2_sweep_does_not_activate_before_the_configured_height() {
+        let mut st = sw_state(&["a1", "a2", "a3", "a4"]);
+        let before = st.current_root().unwrap().to_string();
+        sweep_pending_recoveries(&mut st, 89);
+        assert_eq!(st.current_root().unwrap(), before, "nothing is due at 89");
+        assert!(st.get_account("qcb1a2").unwrap().pending_recovery.is_some());
+        assert_eq!(st.get_account("qcb1a2").unwrap().public_key.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(before, SW_ROOT_BEFORE);
+    }
+
+    #[test]
+    fn s2_sweep_activates_at_the_exact_height_and_after() {
+        let mut st = sw_state(&["a1", "a2", "a3", "a4"]);
+        sweep_pending_recoveries(&mut st, 90);          // exactly a2's activation height
+        let a2 = st.get_account("qcb1a2").unwrap();
+        assert!(a2.pending_recovery.is_none());
+        assert_eq!(a2.key_version, 3);
+        assert_eq!(a2.public_key.as_ref().unwrap().len(), 64);
+        assert!(st.get_account("qcb1a1").unwrap().pending_recovery.is_some(), "a1 is not due until 100");
+        sweep_pending_recoveries(&mut st, 100);         // a1 exactly due now; a2 already done
+        assert!(st.get_account("qcb1a1").unwrap().pending_recovery.is_none());
+        assert_eq!(st.get_account("qcb1a1").unwrap().key_version, 2);
+        assert_eq!(st.current_root().unwrap(), SW_ROOT_AFTER_100);
+        assert_eq!(sw_summary(&st), "a1:pk=Some(64)|kv=2|pending=false|cancelled=false|policy=false\n\
+a2:pk=Some(64)|kv=3|pending=false|cancelled=false|policy=false\n\
+a3:pk=Some(3)|kv=1|pending=true|cancelled=false|policy=false\n\
+a4:pk=Some(3)|kv=1|pending=true|cancelled=true|policy=false\n");
+    }
+
+    #[test]
+    fn s2_sweep_leaves_a_cancelled_recovery_inactive_forever() {
+        let mut st = sw_state(&["a1", "a2", "a3", "a4"]);
+        for h in [100, 101, 1_000, 1_000_000] { sweep_pending_recoveries(&mut st, h); }
+        let a4 = st.get_account("qcb1a4").unwrap();
+        assert!(a4.pending_recovery.as_ref().unwrap().cancelled, "cancelled flag is never cleared");
+        assert_eq!(a4.public_key.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(a4.key_version, 1);
+    }
+
+    #[test]
+    fn s2_sweep_handles_several_pending_recoveries_and_is_idempotent() {
+        let mut st = sw_state(&["a1", "a2", "a3", "a4"]);
+        sweep_pending_recoveries(&mut st, 200);         // a1, a2 and a3 are all due; a4 cancelled
+        let once = st.current_root().unwrap().to_string();
+        let summary = sw_summary(&st);
+        assert_eq!(once, SW_ROOT_AFTER_200);
+        for h in [200, 200, 201] { sweep_pending_recoveries(&mut st, h); }
+        assert_eq!(st.current_root().unwrap(), once, "running the sweep again changes nothing");
+        assert_eq!(sw_summary(&st), summary);
+        assert_eq!(summary, "a1:pk=Some(64)|kv=2|pending=false|cancelled=false|policy=false\n\
+a2:pk=Some(64)|kv=3|pending=false|cancelled=false|policy=false\n\
+a3:pk=Some(64)|kv=4|pending=false|cancelled=false|policy=false\n\
+a4:pk=Some(3)|kv=1|pending=true|cancelled=true|policy=false\n");
+    }
+
+    #[test]
+    fn s2_sweep_result_does_not_depend_on_account_insertion_order() {
+        let orders: [&[&str]; 4] = [&["a1", "a2", "a3", "a4"], &["a4", "a3", "a2", "a1"], &["a3", "a1", "a4", "a2"], &["a2", "a4", "a1", "a3"]];
+        for (i, order) in orders.iter().enumerate() {
+            let mut st = sw_state(order);
+            assert_eq!(st.current_root().unwrap(), SW_ROOT_BEFORE, "order {i}: root before the sweep");
+            sweep_pending_recoveries(&mut st, 100);
+            assert_eq!(st.current_root().unwrap(), SW_ROOT_AFTER_100, "order {i}: root after the sweep");
+        }
+    }
+
+    /// Through the real block path (both entry points): the sweep runs once per block, after the transactions, before commit.
+    #[test]
+    fn s2_sweep_runs_inside_both_block_execution_paths() {
+        use chain_forge_agents::AgentStore;
+        for with_identity in [false, true] {
+            let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+            let exec = Executor::new(ExecutionConfig::from_genesis(&genesis));
+            let mut st = StateStore::new(HashWidth::Bits256);
+            st.apply_genesis(&genesis).unwrap();
+            let mut a = st.get_account("qcb1alice").unwrap().clone();
+            a.public_key = Some(vec![1, 2, 3]);
+            a.pending_recovery = Some(sw_pending(10, 2, 7, false));
+            st.upsert_account(a);
+            let run = |st: &mut StateStore, h: u64| {
+                if with_identity {
+                    exec.execute_block_with_identity(h, vec![], st, &mut IdentityStore::new(0), &mut AgentStore::new(), 1_000 + h, None)
+                } else {
+                    exec.execute_block(h, vec![], st, 1_000 + h)
+                }
+            };
+            let r6 = run(&mut st, 6);
+            assert!(st.get_account("qcb1alice").unwrap().pending_recovery.is_some(), "with_identity={with_identity}: not due at 6");
+            let r7 = run(&mut st, 7);
+            let alice = st.get_account("qcb1alice").unwrap();
+            assert!(alice.pending_recovery.is_none(), "with_identity={with_identity}: activated at 7");
+            assert_eq!(alice.key_version, 2);
+            assert_eq!(alice.public_key.as_ref().unwrap().len(), 64);
+            assert_ne!(r6.state_root, r7.state_root, "activation is inside block 7's reported root");
+            assert_eq!(r7.state_root, st.current_root().unwrap());
+        }
+    }
+
 }
