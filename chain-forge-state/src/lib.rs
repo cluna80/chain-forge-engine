@@ -56,11 +56,14 @@ pub type StateResult<T> = Result<T, StateError>;
 /// The on-chain state for a single account.
 /// Balances are stored as u128 to avoid overflow on large supplies.
 /// The denom is stored per-account so multi-token chains work naturally.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// S1 (CF-QAT-REPO-002): the Qattice-owned account data (resource-escrow binding and the DIS key-version / recovery
+/// fields) lives in [`AccountExtFields`] (`self.ext`, reachable through `Deref`, so `acct.key_version` still works).
+/// The serialized JSON (field order included) and the Merkle leaf bytes are byte-identical to the pre-S1 layout; see
+/// the `s1_*` parity tests. A later step moves `AccountExtFields` out of this crate.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(from = "AccountStateWire")]
 pub struct AccountState {
-    /// Persistent job binding and original funding source for resource escrow.
-    #[serde(default)]
-    pub escrow: Option<EscrowBinding>,
     pub address: String,
     /// Balances keyed by token denom (e.g. "uqcb", "uqrc").
     pub balances: BTreeMap<String, u128>,
@@ -78,29 +81,127 @@ pub struct AccountState {
     /// by the executor on the account's first successful signed transaction
     /// (only possible when the address is derived from that key). Once set,
     /// every transaction from this account must be signed by this key.
-    #[serde(default)]
     pub public_key: Option<Vec<u8>>,
+    /// Chain-specific account data (see [`AccountExtFields`]).
+    pub ext: AccountExtFields,
+}
+
+/// Qattice-owned account data. Grouped so it can move out of the generic state crate without touching the generic
+/// fields. All fields default, so older state files that lack them still load.
+#[derive(Debug, Clone, Default)]
+pub struct AccountExtFields {
+    /// Persistent job binding and original funding source for resource escrow.
+    pub escrow: Option<EscrowBinding>,
     /// DIS-002A: monotonically increasing key version. 0 = initial bind;
     /// incremented by 1 on each successful RotateAccountKey execution.
     /// Used to prevent replay of stale rotation transactions.
-    #[serde(default)]
     pub key_version: u32,
     /// DIS-002B Path 2: optional lost-device recovery policy enrolled by the
     /// account holder while they still control the signing key.
-    #[serde(default)]
     pub recovery_policy: Option<RecoveryPolicy>,
     /// DIS-003A: monotonically increasing generation counter. Incremented on
     /// every EnrollRecoveryPolicy; never reset, not even after revocation.
     /// Ensures old guardian signatures cannot be replayed under a re-enrolled
     /// policy that happens to share the same guardian set.
-    #[serde(default)]
     pub policy_generation: u64,
     /// DIS-003E: pending two-phase recovery commit. Set when a valid
     /// `RecoverAccountKey` tx is accepted. Cleared (and key replaced) by the
     /// block-end sweep at `activation_height` if not cancelled, or cleared with
     /// `cancelled = true` by a `CancelRecovery` tx from the current account key.
-    #[serde(default)]
     pub pending_recovery: Option<PendingRecovery>,
+}
+
+impl AccountExtFields {
+    /// Extra Merkle-leaf parts, appended after the generic parts in this exact order. Appended only when present, so
+    /// accounts without these fields keep exactly the leaf bytes (and state roots) they had.
+    fn leaf_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(binding) = &self.escrow {
+            // JSON string escaping prevents ambiguous job/source encodings.
+            parts.push(format!("escrow={}", serde_json::to_string(binding).unwrap()));
+        }
+        if let Some(rp) = &self.recovery_policy {
+            // Include policy_id so replacement policies produce distinct state roots.
+            parts.push(format!(
+                "recovery=t{}/{}/{}/pid{}", rp.threshold, rp.guardians.len(),
+                rp.enrolled_at_key_version, rp.policy_id
+            ));
+        }
+        if self.policy_generation > 0 {
+            parts.push(format!("pgen={}", self.policy_generation));
+        }
+        parts
+    }
+}
+
+impl std::ops::Deref for AccountState {
+    type Target = AccountExtFields;
+    fn deref(&self) -> &AccountExtFields { &self.ext }
+}
+impl std::ops::DerefMut for AccountState {
+    fn deref_mut(&mut self) -> &mut AccountExtFields { &mut self.ext }
+}
+
+/// Wire layout of an account: the pre-S1 flat field set and order, kept byte-for-byte. (Not `#[serde(flatten)]`:
+/// flatten buffers values and cannot carry u128 balances above u64.)
+#[derive(Deserialize)]
+struct AccountStateWire {
+    #[serde(default)]
+    escrow: Option<EscrowBinding>,
+    address: String,
+    balances: BTreeMap<String, u128>,
+    nonce: u64,
+    role: String,
+    charm: Option<IntrinsicCharm>,
+    #[serde(default)]
+    public_key: Option<Vec<u8>>,
+    #[serde(default)]
+    key_version: u32,
+    #[serde(default)]
+    recovery_policy: Option<RecoveryPolicy>,
+    #[serde(default)]
+    policy_generation: u64,
+    #[serde(default)]
+    pending_recovery: Option<PendingRecovery>,
+}
+
+#[derive(Serialize)]
+struct AccountStateWireRef<'a> {
+    escrow: &'a Option<EscrowBinding>,
+    address: &'a String,
+    balances: &'a BTreeMap<String, u128>,
+    nonce: u64,
+    role: &'a String,
+    charm: &'a Option<IntrinsicCharm>,
+    public_key: &'a Option<Vec<u8>>,
+    key_version: u32,
+    recovery_policy: &'a Option<RecoveryPolicy>,
+    policy_generation: u64,
+    pending_recovery: &'a Option<PendingRecovery>,
+}
+
+impl From<AccountStateWire> for AccountState {
+    fn from(w: AccountStateWire) -> Self {
+        Self {
+            address: w.address, balances: w.balances, nonce: w.nonce, role: w.role, charm: w.charm,
+            public_key: w.public_key,
+            ext: AccountExtFields {
+                escrow: w.escrow, key_version: w.key_version, recovery_policy: w.recovery_policy,
+                policy_generation: w.policy_generation, pending_recovery: w.pending_recovery,
+            },
+        }
+    }
+}
+
+impl Serialize for AccountState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        AccountStateWireRef {
+            escrow: &self.ext.escrow, address: &self.address, balances: &self.balances, nonce: self.nonce,
+            role: &self.role, charm: &self.charm, public_key: &self.public_key, key_version: self.ext.key_version,
+            recovery_policy: &self.ext.recovery_policy, policy_generation: self.ext.policy_generation,
+            pending_recovery: &self.ext.pending_recovery,
+        }.serialize(serializer)
+    }
 }
 
 /// DIS-003E: a pending two-phase recovery, set when a valid `RecoverAccountKey`
@@ -172,11 +273,7 @@ impl AccountState {
             role,
             charm: None,
             public_key: None,
-            key_version: 0,
-            escrow: None,
-            recovery_policy: None,
-            policy_generation: 0,
-            pending_recovery: None,
+            ext: AccountExtFields::default(),
         }
     }
 
@@ -191,11 +288,7 @@ impl AccountState {
             role,
             charm: Some(IntrinsicCharm::provisional(current_epoch)),
             public_key: None,
-            key_version: 0,
-            escrow: None,
-            recovery_policy: None,
-            policy_generation: 0,
-            pending_recovery: None,
+            ext: AccountExtFields::default(),
         }
     }
 
@@ -291,20 +384,7 @@ impl AccountState {
             let hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
             parts.push(format!("pk={hex}"));
         }
-        if let Some(binding) = &self.escrow {
-            // JSON string escaping prevents ambiguous job/source encodings.
-            parts.push(format!("escrow={}", serde_json::to_string(binding).unwrap()));
-        }
-        if let Some(rp) = &self.recovery_policy {
-            // Include policy_id so replacement policies produce distinct state roots.
-            parts.push(format!(
-                "recovery=t{}/{}/{}/pid{}", rp.threshold, rp.guardians.len(),
-                rp.enrolled_at_key_version, rp.policy_id
-            ));
-        }
-        if self.policy_generation > 0 {
-            parts.push(format!("pgen={}", self.policy_generation));
-        }
+        parts.extend(self.ext.leaf_parts());
         parts.join("|").into_bytes()
     }
 }
@@ -1364,7 +1444,7 @@ mod tests {
         let restored: AccountState = serde_json::from_value(v)
             .expect("pre-DIS-003 account JSON must deserialize");
         assert_eq!(restored.policy_generation, 0);
-        assert_eq!(restored.recovery_policy.unwrap().policy_id, 0);
+        assert_eq!(restored.recovery_policy.as_ref().unwrap().policy_id, 0);
     }
     // ── S1 parity corpus (recorded from chain-forge-engine @ 61e02c6 before any change) ─────────────────────────────
     // For accounts with each Qattice-owned field set, the Merkle leaf bytes, the state root and the exact serialized JSON
