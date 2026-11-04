@@ -9443,4 +9443,98 @@ mod tests {
             }
         }
     }
+    // ── S2 parity corpus ─────────────────────────────────────────────────────────────────────────────────────────────
+    // Executes every TxBody variant (module-complete genesis, signatures not required) and records, for each: success,
+    // error text, gas used, fee charged, events and the state root afterwards. Two passes: each variant on a fresh state, and
+    // all variants in sequence on ONE state (so later variants see the effects of earlier ones). The recording was taken from
+    // `main` at 6a1588c BEFORE the transaction-module refactor (S2); the refactor must reproduce it exactly.
+    // Regenerate only on purpose: `CF_UPDATE_S2_GOLDEN=1 cargo test -p chain-forge-execution s2_`.
+    fn s2_bodies() -> Vec<TxBody> {
+        use chain_forge_agents::{AgentCapability, SpendingLimits};
+        let s = |x: &str| x.to_string();
+        let b = |n: usize, seed: u8| -> Vec<u8> { (0..n).map(|i| seed.wrapping_add(i as u8)).collect() };
+        let ga = |p: u8| GuardianAuth { guardian_public_key: b(8, p), signature: b(8, p + 1), expires_at_height: Some(77) };
+        vec![
+            TxBody::Transfer{to:s("qcb1bob"),denom:s("uqcb"),amount:1000}, TxBody::Burn{denom:s("uqcb"),amount:7},
+            TxBody::Stake{validator:s("qcb1val"),amount:9}, TxBody::BondValidator{amount:100,owner_identity_id:Some(s("id1"))},
+            TxBody::UnbondValidator,
+            TxBody::RegisterValidatorKey{consensus_pubkey:b(8,1),proof_of_possession:b(8,2),scheme:s("ml-dsa-65"),pop_version:1},
+            TxBody::Custom{module:s("m"),payload:b(4,3)}, TxBody::RegisterIdentity, TxBody::Attest{claimant_id:s("qcb1bob")},
+            TxBody::SponsorAgent{agent_address:s("a")}, TxBody::RevokeAgent{agent_address:s("a")},
+            TxBody::RevokeAttestation{attested_id:s("x")}, TxBody::ConfirmSybil{sybil_id:s("x")}, TxBody::ReverseSybil{sybil_id:s("x")},
+            TxBody::ReportSuspectedSybil{suspected_id:s("x")}, TxBody::CharmConfinementUpdate{epoch:5},
+            TxBody::IntrinsicCharmRecord{event:CharmEvent::DecayTick},
+            TxBody::RegisterAgent{agent_id:s("ag"),agent_address:s("aa"),capabilities:vec![AgentCapability::MerchantSettlement],spending_limits:SpendingLimits::unlimited(),description:s("d"),parent_agent_id:None},
+            TxBody::AuthorizeAgent{agent_id:s("ag")}, TxBody::SuspendAgent{agent_id:s("ag"),reason:s("r")}, TxBody::RevokeAgentFull{agent_id:s("ag")},
+            TxBody::RecordAgentSpend{agent_id:s("ag"),amount_uqrc:3},
+            TxBody::SpawnChildAgent{child_agent_id:s("c"),child_agent_address:s("ca"),parent_agent_id:s("p"),capabilities:vec![AgentCapability::MerchantSettlement],spending_limits:SpendingLimits::unlimited(),description:s("d")},
+            TxBody::ActivatePqConsensus{activation_epoch:9},
+            TxBody::EmergencyDeprecateAlgorithm{deprecated_scheme:s("a"),replacement_scheme:s("b"),grace_epochs:2,rationale:s("r"),advisory_ref:Some(s("adv")),scope:DeprecationScope::TxSignatures},
+            TxBody::ClaimResearchReward{claim_id:s("c1"),objective_id:s("o"),task_id:s("t"),result_id:s("r"),contribution_hash:s("h"),recipient:s("qcb1bob"),amount_uqcb:50,policy_version:s("v1"),reward_kind:s("k")},
+            TxBody::RotateAccountKey{new_public_key:b(8,4),new_key_scheme:s("ml-dsa-65"),key_version:1,pop_signature:b(8,5)},
+            TxBody::VerifyIdentityWithProof{proof_bytes:b(8,6),public_inputs_bytes:b(8,7)},
+            TxBody::EnrollRecoveryPolicy{guardians:vec![b(8,8),b(8,9)],threshold:2},
+            TxBody::RecoverAccountKey{new_public_key:b(8,10),new_key_scheme:s("ml-dsa-65"),key_version:2,pop_signature:b(8,11),guardian_signatures:vec![ga(12),ga(14)],policy_id:3},
+            TxBody::RevokeRecoveryPolicy, TxBody::CancelRecovery,
+            TxBody::UpdateGuardianPolicy{new_guardians:vec![b(8,16)],new_threshold:1},
+            TxBody::ProposeChange{kind_json:s("{\"k\":1}")}, TxBody::VoteOnProposal{proposal_id:4,choice:s("yes")}, TxBody::ActivateChange{proposal_id:4},
+        ]
+    }
+
+    fn s2_record(label: &str, tx: &Transaction, r: &TransactionResult, state: &StateStore) -> String {
+        format!("{label}\t{}\tok={}\terr={}\tgas={}\tfee={}\tevents={}\troot={}\n",
+            tx.body.variant_name(), r.success, r.error.clone().unwrap_or_default().replace('\n', " "), r.gas_used, r.fee_charged,
+            r.events.join("|"), state.current_root().unwrap_or(""))
+    }
+
+    fn s2_corpus() -> String {
+        use chain_forge_agents::AgentStore;
+        let bodies = s2_bodies();
+        assert_eq!(bodies.len(), 36);
+        let mk = |i: usize, body: TxBody, nonce: u64| Transaction {
+            id: format!("s2-{i}"), sender: "qcb1alice".to_string(), nonce, body, gas_limit: 5_000_000,
+            sig_scheme: None, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![],
+        };
+        let mut out = String::new();
+        // pass 1: every variant on a fresh state
+        for (i, body) in bodies.iter().cloned().enumerate() {
+            let (exec, mut state) = setup();
+            let mut identity = IdentityStore::new(0);
+            let mut agents = AgentStore::new();
+            let tx = mk(i, body, 0);
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 10);
+            out.push_str(&s2_record("fresh", &tx, &r, &state));
+        }
+        // pass 2: all variants in order on one state
+        let (exec, mut state) = setup();
+        let mut identity = IdentityStore::new(0);
+        let mut agents = AgentStore::new();
+        for (i, body) in bodies.into_iter().enumerate() {
+            let nonce = state.get_account("qcb1alice").map(|a| a.nonce).unwrap_or(0);
+            let tx = mk(100 + i, body, nonce);
+            let r = exec.execute_tx_with_identity(&tx, &mut state, &mut identity, &mut agents, 10 + i as u64);
+            out.push_str(&s2_record("seq", &tx, &r, &state));
+        }
+        out
+    }
+
+    #[test]
+    fn s2_execution_corpus_matches_the_recorded_baseline() {
+        let got = s2_corpus();
+        assert_eq!(got, s2_corpus(), "the corpus itself must be deterministic");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/s2_exec_corpus.golden");
+        if std::env::var("CF_UPDATE_S2_GOLDEN").is_ok() {
+            std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).unwrap();
+            std::fs::write(path, &got).unwrap();
+            return;
+        }
+        let want = std::fs::read_to_string(path).expect("golden file missing; record it with CF_UPDATE_S2_GOLDEN=1 on the pre-refactor code");
+        if got != want {
+            for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
+                assert_eq!(g, w, "corpus line {i} changed");
+            }
+            assert_eq!(got.lines().count(), want.lines().count(), "corpus length changed");
+        }
+    }
+
 }

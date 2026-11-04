@@ -1,0 +1,72 @@
+fresh	Transfer	ok=true	err=	gas=64	fee=64	events=transfer: 1000 uqcb -> qcb1bob	root=2dbaf37cd6dd5dbd6035423065fc5c9fff7e4356edbde46aeab8193d0720286d
+fresh	Burn	ok=true	err=	gas=67	fee=67	events=burn: 7 uqcb (BME)	root=9b567792ec44f5d1e9c75f7bb6e5fae66db84c663269e2e6f61fb204e357c694
+fresh	Stake	ok=true	err=	gas=90	fee=90	events=stake: 9 -> qcb1val	root=51ee56c5b0d00e2322e3bbb50c284e4cfad96b0b6c8f8109a16d1117ea537c72
+fresh	BondValidator	ok=false	err=bond_validator: sender qcb1alice cannot bind to identity id1: tx.sender must equal owner_identity_id	gas=83	fee=83	events=	root=1e8e9dd56b0c97fc5280618762e2c0397a5a8b76728a7e1d098db89d7b53a9a8
+fresh	UnbondValidator	ok=false	err=qcb1alice has no bonded stake and no unbonding entry to sweep	gas=75	fee=75	events=	root=4ff4255c6cc92912b6b47845cbdf65fe084ffbdbe15a3e839c8f983d6923b377
+fresh	RegisterValidatorKey	ok=false	err=transaction from qcb1alice has no signature and no pq_signature; set require_signatures = false in genesis to allow unsigned txs	gas=0	fee=0	events=	root=e361f1157416cf0e2a31986f563c92453ccbedf08f27f6b7fdb75169a422c404
+fresh	Custom	ok=true	err=	gas=122	fee=122	events=custom: module=m bytes=4	root=4a46bcd2b3e085e1519df4c3b9c3853d18cc805010360d7275c70b1e37abfba5
+fresh	RegisterIdentity	ok=true	err=	gas=55	fee=55	events=register_identity: qcb1alice registered as Provisional	root=1d4a18baedc3a467e549d6ec1ffcbec91fe989a67d2a2b8c173bc69390d75cd5
+fresh	Attest	ok=false	err=identity qcb1alice not found	gas=52	fee=52	events=	root=292481795f42d2f24938bac5d31bc503c3dea981afcbca6230584afd55b726a2
+fresh	SponsorAgent	ok=false	err=identity qcb1alice not found	gas=66	fee=66	events=	root=047c85ced87971f2bc41069c536bf293b6fdb12282e211a7947b15755b1b4871
+fresh	RevokeAgent	ok=false	err=identity qcb1alice not found	gas=46	fee=46	events=	root=5ad62241679998f3e68ad4cde25d38d322fc793a3457ec0182acf7b5ba8f3236
+fresh	RevokeAttestation	ok=false	err=no active attestation from qcb1alice for x	gas=46	fee=46	events=	root=5ad62241679998f3e68ad4cde25d38d322fc793a3457ec0182acf7b5ba8f3236
+fresh	ConfirmSybil	ok=false	err=coordinator not configured; call set_coordinator before confirm_sybil / reverse_sybil	gas=106	fee=106	events=	root=d62ef90027630fbb00bb6d13cb8455028d0da7e2c40b04e5facb3acd5bde743b
+fresh	ReverseSybil	ok=false	err=coordinator not configured; call set_coordinator before confirm_sybil / reverse_sybil	gas=106	fee=106	events=	root=d62ef90027630fbb00bb6d13cb8455028d0da7e2c40b04e5facb3acd5bde743b
+fresh	ReportSuspectedSybil	ok=false	err=attester qcb1alice has not attested identity x and cannot report it as a suspected sybil	gas=46	fee=46	events=	root=5ad62241679998f3e68ad4cde25d38d322fc793a3457ec0182acf7b5ba8f3236
+fresh	CharmConfinementUpdate	ok=false	err=CharmConfinementUpdate: sender qcb1alice is not Verified tier	gas=73	fee=73	events=	root=2d51dc95cd991e10dd8817f04def655fd4286b1874e6ea723dab3bc3ace7ac50
+fresh	IntrinsicCharmRecord	ok=false	err=IntrinsicCharmRecord: sender qcb1alice not registered in identity store	gas=63	fee=63	events=	root=40aa1ecd6cab09530922cc0271cf2d1aab29c7ac2f6991fdfff84477f76ee0a3
+fresh	RegisterAgent	ok=false	err=RegisterAgent: sponsor qcb1alice is not Verified (Charm Confinement requires Verified or Established tier)	gas=166	fee=166	events=	root=f87d2586be8de9ae4108914da52606b14a2a5982ceb3300f078bc49299f8c4b3
+fresh	AuthorizeAgent	ok=false	err=AuthorizeAgent: agent ag not found	gas=67	fee=67	events=	root=2f49d22137be7e941106b250ad84743a9b3d6c3141d8c3c194652ccfec306863
+fresh	SuspendAgent	ok=false	err=SuspendAgent: agent ag not found	gas=58	fee=58	events=	root=257b84da47e22ddd879bf69273691d69593a16a2b4b85c50e465f6d1bd31cf35
+fresh	RevokeAgentFull	ok=false	err=RevokeAgentFull: agent ag not found	gas=87	fee=87	events=	root=34acc25fc25537da51e9f00f0be8b47074005f56a7f2f75293470279a10a7c16
+fresh	RecordAgentSpend	ok=false	err=RecordAgentSpend: agent ag not found	gas=63	fee=63	events=	root=40aa1ecd6cab09530922cc0271cf2d1aab29c7ac2f6991fdfff84477f76ee0a3
+fresh	SpawnChildAgent	ok=false	err=SpawnChildAgent: parent agent 'p' does not exist or is not Active	gas=166	fee=166	events=	root=f87d2586be8de9ae4108914da52606b14a2a5982ceb3300f078bc49299f8c4b3
+fresh	ActivatePqConsensus	ok=true	err=	gas=65	fee=65	events=activate_pq_consensus: activation_epoch=9 set_by=qcb1alice at_epoch=0	root=861d9c9737291536fb5251f087a050256a1540e606ce665c3a1601f84f1c9c10
+fresh	EmergencyDeprecateAlgorithm	ok=false	err=EmergencyDeprecateAlgorithm: no crypto_governors configured in genesis — all deprecation txs denied	gas=255	fee=255	events=	root=a98ae4b75641b0baac4cdb1a48bc89a75b03c73e1636de0d3bcb3ce9174a256c
+fresh	ClaimResearchReward	ok=false	err=ClaimResearchReward: no settlement_operators configured in genesis — all claims denied (sender: qcb1alice, claim_id=c1, objective_id=o)	gas=169	fee=169	events=	root=6d553c25b8edd057ac0a0bc87d80d2de508580f6b55a8f0327c4b4dad6bb8581
+fresh	RotateAccountKey	ok=false	err=RotateAccountKey: qcb1alice has no bound key; submit a regular transaction first	gas=110	fee=110	events=	root=82598b8cc12cd41a017181a376f5e12d2eec2f0fd05bb317a096c925e91ee72e
+fresh	VerifyIdentityWithProof	ok=false	err=VerifyIdentityWithProof: no pop_verifier configured on this node	gas=113	fee=113	events=	root=e4512a28e19cb2612f811c17d902a2e58223c37c7dd88fdeac06b1390d665175
+fresh	EnrollRecoveryPolicy	ok=false	err=EnrollRecoveryPolicy: guardian[0] key must be 1952 bytes, got 8	gas=99	fee=99	events=	root=788d67b6739485426c90e4d2ff28a46afa1f33dce3918ca775f0029f64063154
+fresh	RecoverAccountKey	ok=false	err=RecoverAccountKey: qcb1alice has no enrolled recovery policy	gas=0	fee=0	events=	root=e361f1157416cf0e2a31986f563c92453ccbedf08f27f6b7fdb75169a422c404
+fresh	RevokeRecoveryPolicy	ok=false	err=RevokeRecoveryPolicy: qcb1alice has no enrolled recovery policy to revoke	gas=45	fee=45	events=	root=25d2d817d8c8c07eb72af490ee8cac4c1e78d35adef008a3e78dcf212496825a
+fresh	CancelRecovery	ok=false	err=CancelRecovery: qcb1alice has no pending recovery to cancel	gas=45	fee=45	events=	root=25d2d817d8c8c07eb72af490ee8cac4c1e78d35adef008a3e78dcf212496825a
+fresh	UpdateGuardianPolicy	ok=false	err=UpdateGuardianPolicy: qcb1alice has no enrolled recovery policy to update	gas=91	fee=91	events=	root=5aad068cf9f398c3ffd2ad8dce083ae59a4515f483e8942b0561e695bf5e1af2
+fresh	ProposeChange	ok=false	err=ProposeChange: sender qcb1alice must be Verified or Established tier	gas=112	fee=112	events=	root=78488bc87ca443bae6e7c720e973595a333f19b7de5c311149ab2d4186c97c7a
+fresh	VoteOnProposal	ok=false	err=VoteOnProposal: sender qcb1alice must be Verified or Established tier	gas=76	fee=76	events=	root=d372f9637505e20dbe8ba11937111072b397c1c03f56c4be2cfaa8f2b14f3692
+fresh	ActivateChange	ok=false	err=proposal 4 not found	gas=85	fee=85	events=	root=ad3d223282e08e1504793faf5e4ffeddbfcfdf903217c576e78e0e9a8d29d4b6
+seq	Transfer	ok=true	err=	gas=64	fee=64	events=transfer: 1000 uqcb -> qcb1bob	root=2dbaf37cd6dd5dbd6035423065fc5c9fff7e4356edbde46aeab8193d0720286d
+seq	Burn	ok=true	err=	gas=67	fee=67	events=burn: 7 uqcb (BME)	root=5380565506161db014d529a9e05f5db551bf3379b2e6056d7697fffaa120c007
+seq	Stake	ok=true	err=	gas=90	fee=90	events=stake: 9 -> qcb1val	root=3ae593f9fd3aa2baf12c676aead94d09fb706846c81f7cabc366df34b19cd481
+seq	BondValidator	ok=false	err=bond_validator: sender qcb1alice cannot bind to identity id1: tx.sender must equal owner_identity_id	gas=83	fee=83	events=	root=7e09209bd3360fd30c1387080490f5e2572c4165660376a701005e14d0ffffc0
+seq	UnbondValidator	ok=false	err=qcb1alice has no bonded stake and no unbonding entry to sweep	gas=75	fee=75	events=	root=2304316c92da8f39f5e2531375d8d98fcf5e574dd073fc07d9619e15c08a4ed8
+seq	RegisterValidatorKey	ok=false	err=transaction from qcb1alice has no signature and no pq_signature; set require_signatures = false in genesis to allow unsigned txs	gas=0	fee=0	events=	root=2304316c92da8f39f5e2531375d8d98fcf5e574dd073fc07d9619e15c08a4ed8
+seq	Custom	ok=true	err=	gas=122	fee=122	events=custom: module=m bytes=4	root=17031d065aaa14056ed70fe976cdd6fd0c6d70d7ef49ca4e7ae5376bb39d4cdb
+seq	RegisterIdentity	ok=true	err=	gas=55	fee=55	events=register_identity: qcb1alice registered as Provisional	root=32290d9a6691a1569aa25274b5dae32e5592b6ab2cb2690b877d4383e7012274
+seq	Attest	ok=false	err=attester qcb1alice is not Verified -- only Verified or Established identities can vouch for a new claimant	gas=52	fee=52	events=	root=32d4c074edf80406b1bcedc6345bbb03ccda26bd557ab7492c4fb41077376947
+seq	SponsorAgent	ok=false	err=identity qcb1alice is not verified (tier: Provisional)	gas=66	fee=66	events=	root=79e1b87b67ed7e92cad1c136a62ba17b454d3470bb02f70e6ea544992ef0a3e9
+seq	RevokeAgent	ok=false	err=qcb1alice has not sponsored agent a	gas=46	fee=46	events=	root=ab605fb085066419545bbdc5d6b1c2875c30cea801330b41cfe6235dca61e6dc
+seq	RevokeAttestation	ok=false	err=no active attestation from qcb1alice for x	gas=46	fee=46	events=	root=ca47f6f09af19badf642b491f6fb48233265d880e55c1beba060459a83d25943
+seq	ConfirmSybil	ok=false	err=coordinator not configured; call set_coordinator before confirm_sybil / reverse_sybil	gas=106	fee=106	events=	root=e84cf7216032ec1c57aacfdd2c1ce17b0e81ba43aa899b9a53c5d7915c34e5a2
+seq	ReverseSybil	ok=false	err=coordinator not configured; call set_coordinator before confirm_sybil / reverse_sybil	gas=106	fee=106	events=	root=75d3824a04d9192cd2af0e66b1a1c3d84651f757bbe7fc9d092145a751e60d1a
+seq	ReportSuspectedSybil	ok=false	err=attester qcb1alice has not attested identity x and cannot report it as a suspected sybil	gas=46	fee=46	events=	root=60a400a287fb0ac766080be45b6f0ca4bcd727690ed6491836dcb135d4bc3600
+seq	CharmConfinementUpdate	ok=false	err=CharmConfinementUpdate: sender qcb1alice is not Verified tier	gas=73	fee=73	events=	root=104caefc8ac31318b8fff33e47fcd9e0a079b6064dcd25fc555a0a6e5135ee9e
+seq	IntrinsicCharmRecord	ok=true	err=	gas=63	fee=63	events=intrinsic_charm_record: sender=qcb1alice event=DecayTick	root=4b7889acc8073105522ec72a2c6725426899dfaef3db53e7e1899deeba530dd4
+seq	RegisterAgent	ok=false	err=RegisterAgent: sponsor qcb1alice is not Verified (Charm Confinement requires Verified or Established tier)	gas=166	fee=166	events=	root=799722cbbf7ec64d0944f031071794bc4783489cb7fe2315093ff3160e95edde
+seq	AuthorizeAgent	ok=false	err=AuthorizeAgent: agent ag not found	gas=67	fee=67	events=	root=094f00dcd54a194c903e1fd50132058eb5d6b8fef56ac1d0389c82659af8ed48
+seq	SuspendAgent	ok=false	err=SuspendAgent: agent ag not found	gas=58	fee=58	events=	root=3580d3ad617dce3531db7eb58b44e47609db8ea257bad67d78891b9592ea8423
+seq	RevokeAgentFull	ok=false	err=RevokeAgentFull: agent ag not found	gas=87	fee=87	events=	root=5486d09c524b7f15286dfb14241590b3d3d80d106fcda12370982de00c1b31f7
+seq	RecordAgentSpend	ok=false	err=RecordAgentSpend: agent ag not found	gas=63	fee=63	events=	root=3e0069a8c36d938df08a50f1ae716d10fc513134204e70b3da64e37e9b5f3cc4
+seq	SpawnChildAgent	ok=false	err=SpawnChildAgent: parent agent 'p' does not exist or is not Active	gas=166	fee=166	events=	root=fb133fc01b35716e9b6f0b8f75e0a76a359078153ba5212c7d231900e366de9f
+seq	ActivatePqConsensus	ok=true	err=	gas=65	fee=65	events=activate_pq_consensus: activation_epoch=9 set_by=qcb1alice at_epoch=0	root=0b93e0a2ba763ec62615a0b46b760cb3bb6b3da2d7a1140959d445ea3032c745
+seq	EmergencyDeprecateAlgorithm	ok=false	err=EmergencyDeprecateAlgorithm: no crypto_governors configured in genesis — all deprecation txs denied	gas=255	fee=255	events=	root=023a4a9fa353e1ffbe90333518adf913227e6db6fcf04790471b663e7a3a38e5
+seq	ClaimResearchReward	ok=false	err=ClaimResearchReward: no settlement_operators configured in genesis — all claims denied (sender: qcb1alice, claim_id=c1, objective_id=o)	gas=169	fee=169	events=	root=d0148e3f75bb2167380ffe73c67f77aa6b2880cb01096c95160c78426e657e48
+seq	RotateAccountKey	ok=false	err=RotateAccountKey: qcb1alice has no bound key; submit a regular transaction first	gas=110	fee=110	events=	root=0226e3fb6824150f010ccc7535291b419bbbd79f8e3d11177b54d40b8cbe6126
+seq	VerifyIdentityWithProof	ok=false	err=VerifyIdentityWithProof: no pop_verifier configured on this node	gas=113	fee=113	events=	root=f38a6c024f02131cb752441edf2119b673c6a140ff5ca0a913c5b4d3972f52aa
+seq	EnrollRecoveryPolicy	ok=false	err=EnrollRecoveryPolicy: guardian[0] key must be 1952 bytes, got 8	gas=99	fee=99	events=	root=4c4cff8527bfc190954cb84c0dca62f8593de9efe9703b6ff2bf085a3ec21455
+seq	RecoverAccountKey	ok=false	err=RecoverAccountKey: qcb1alice has no enrolled recovery policy	gas=0	fee=0	events=	root=4c4cff8527bfc190954cb84c0dca62f8593de9efe9703b6ff2bf085a3ec21455
+seq	RevokeRecoveryPolicy	ok=false	err=RevokeRecoveryPolicy: qcb1alice has no enrolled recovery policy to revoke	gas=45	fee=45	events=	root=2c5868000c9a2e4e6575005add42e15ebbe3b937475de9226e0efc7966edb4eb
+seq	CancelRecovery	ok=false	err=CancelRecovery: qcb1alice has no pending recovery to cancel	gas=45	fee=45	events=	root=bf1df40eb295c28f34eb13e4d51487e984e68f17527d4a23bbcc40538d9fa4c9
+seq	UpdateGuardianPolicy	ok=false	err=UpdateGuardianPolicy: qcb1alice has no enrolled recovery policy to update	gas=91	fee=91	events=	root=a90caecf6ec6e7427ab8a6f6566985ba751795176c1d3ec60354afcc10d0404f
+seq	ProposeChange	ok=false	err=ProposeChange: sender qcb1alice must be Verified or Established tier	gas=112	fee=112	events=	root=2f98330d7b2f0882ae62ef63502020ba61201a274b42d98366ccc533e6ac23e5
+seq	VoteOnProposal	ok=false	err=VoteOnProposal: sender qcb1alice must be Verified or Established tier	gas=76	fee=76	events=	root=cf1378b5e55fb5586e9b4935dfef1b7d0d73f16869244a6bcda298c21e8e6293
+seq	ActivateChange	ok=false	err=proposal 4 not found	gas=85	fee=85	events=	root=8601a81214eb0fb80dbf7b4f71d15169ec09ba94b997aca3938f00e11eafbd08
