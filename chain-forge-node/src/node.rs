@@ -657,6 +657,10 @@ pub struct Node {
     storage_v2: bool,
     v2_logs: std::sync::Mutex<Option<crate::storage_v2::V2Logs>>,
     dir_lock: Option<crate::dirlock::DataDirLock>,
+    /// PERSIST-HALT-1: set (one way) when a required persistence operation fails. A node in this state signs nothing,
+    /// commits nothing and stops its event loop; only a process restart (which re-runs the full recovery and signing-guard
+    /// checks) can resume participation. Never cleared in-process.
+    persistence_failed: Option<String>,
     /// Proposals/votes for the next height, replayed through the full
     /// handlers (payload and signature checks included) after the commit.
     next_height_msgs: Vec<NextHeightMsg>,
@@ -1634,6 +1638,7 @@ impl Node {
             storage_v2: false,
             v2_logs: std::sync::Mutex::new(None),
             dir_lock: None,
+            persistence_failed: None,
             next_height_msgs: Vec::new(),
             last_sync_request: None,
             pocd_config,
@@ -1900,9 +1905,29 @@ impl Node {
         self.peer_capacity_table.clone()
     }
 
+    /// Enter the terminal persistence-failed state (idempotent, one way). The failure is local: it is never turned into a
+    /// protocol-level penalty; the safe response is to stop participating.
+    fn latch_persistence_failure(&mut self, err: &str) {
+        if self.persistence_failed.is_none() {
+            error!(error = %err,
+                "FATAL: a required persistence operation failed. This node has STOPPED signing and committing and will not \
+                 resume in this process. Restart it only after checking the data directory; startup re-verifies the \
+                 committed state and the signing guard before any signature is possible.");
+            if let Ok(mut st) = self.status.lock() { st.is_running = false; }
+        }
+        self.persistence_failed = Some(err.to_string());
+    }
+
+    /// `true` once a persistence operation has failed in this process (terminal).
+    fn persistence_halted(&self) -> bool { self.persistence_failed.is_some() }
+
+    /// The persistence failure that stopped this node, if any.
+    pub fn persistence_failure(&self) -> Option<&str> { self.persistence_failed.as_deref() }
+
     /// Sign a Vote with this node's key, domain-separated by chain_id.
     /// No-op (leaves signature empty) if no signing key is loaded.
     fn sign_vote(&self, vote: &mut Vote) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1: no signature after a persistence failure
         let Some(ref kp) = self.signing_key else { return };
         let chain_id = self.genesis.chain_id.as_str();
         let bytes = vote_signing_bytes(
@@ -1917,6 +1942,7 @@ impl Node {
 
     /// Sign a BlockProposal with this node's key.
     fn sign_proposal(&self, proposal: &mut BlockProposal) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1: no signature after a persistence failure
         let Some(ref kp) = self.signing_key else { return };
         let chain_id = self.genesis.chain_id.as_str();
         let bytes = proposal_signing_bytes(
@@ -2857,6 +2883,10 @@ impl Node {
         }
         let mut running = true;
         while running {
+            if self.persistence_halted() {
+                error!("node event loop stopping: a persistence operation failed (PERSIST-HALT-1)");
+                break;
+            }
             tokio::select! {
                 _ = consensus_interval.tick(), if self.consensus.drives_own_votes() => {
                     self.consensus_tick().await;
@@ -2887,6 +2917,7 @@ impl Node {
                 }
 
                 _ = interval.tick() => {
+                    if self.persistence_halted() { continue; }    // PERSIST-HALT-1: no heartbeat-driven round change or nil vote
                     let height = self.consensus.current_height();
                     let peer_count = {
                         let s = self.status.lock().unwrap();
@@ -2969,6 +3000,7 @@ impl Node {
                                     if let Err(e) = self.persist_state() {
                                         tracing::error!(error = %e,
                                             "FATAL: snapshot write failed — halting event loop");
+                                        self.latch_persistence_failure(&e);
                                         running = false;
                                     }
                                 }
@@ -3099,6 +3131,10 @@ impl Node {
                         s.local_peer_id = Some(peer_id.0.clone());
                     }
                 }
+            }
+
+            NetworkEvent::Message(_) if self.persistence_halted() => {
+                // PERSIST-HALT-1: a node whose persistence failed accepts no consensus input.
             }
 
             NetworkEvent::Message(msg) => {
@@ -3835,6 +3871,7 @@ impl Node {
     /// everyone else forward immediately instead of a slow, uncoordinated
     /// drift that can easily never converge.
     async fn catch_up_round_if_behind(&mut self, height: u64, their_round: u32) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1: no local round advancement either
         let my_round = self.consensus.current_round();
         if height != self.consensus.current_height() || their_round <= my_round {
             return;
@@ -3889,6 +3926,7 @@ impl Node {
         &mut self,
         proposal: &BlockProposal,
     ) -> Result<Option<chain_forge_consensus::CommitCertificate>, String> {
+        if self.persistence_halted() { return Ok(None); } // PERSIST-HALT-1
         let Some(my_id) = self.validator_id.clone() else {
             return Ok(None);
         };
@@ -4245,6 +4283,10 @@ impl Node {
         cert: chain_forge_consensus::CommitCertificate,
         proposal: &BlockProposal,
     ) -> Result<(), String> {
+        // PERSIST-HALT-1: after a persistence failure this process commits nothing further.
+        if let Some(e) = &self.persistence_failed {
+            return Err(format!("refusing to commit: persistence failed earlier in this process ({e})"));
+        }
         // A commit means the round we were tracking is over -- clear the
         // propose-once guard so the next height starts clean.
         self.last_proposed = None;
@@ -5329,6 +5371,7 @@ impl Node {
             tracing::error!(error = %e,
                 "FATAL: snapshot write failed after commit — halting consensus to prevent \
                  double-signing on restart. Operator must fix the data directory.");
+            self.latch_persistence_failure(&e);       // PERSIST-HALT-1: the latch every signing path checks
             return Err(e);
         }
 
@@ -5636,6 +5679,7 @@ impl Node {
     async fn drive_consensus(&mut self) {
         let mut budget = 10_000usize;
         while let Some(action) = self.consensus.next_action() {
+            if self.persistence_halted() { break; }       // PERSIST-HALT-1: drop every queued action, e.g. the next height's votes
             budget -= 1;
             if budget == 0 {
                 warn!("consensus action budget exhausted; continuing on the next tick");
@@ -5679,6 +5723,7 @@ impl Node {
     /// Sign (through the double-sign guard), persist, broadcast, and feed
     /// back one of this validator's own votes.
     async fn cast_engine_vote(&mut self, mut vote: Vote) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1
         if self.signing_key.is_none() {
             debug!("no signing key loaded: not casting");
             return;
@@ -5701,8 +5746,14 @@ impl Node {
                 self.sign_guard.record(&vote, self.consensus.lock_state());
                 if let Err(e) = self.persist_sign_guard() {
                     error!(error = %e, "cannot persist signing state: vote withheld");
+                    // The guard is the consensus safety boundary: if it cannot be made durable this node cannot know that its
+                    // signing history is recorded, so it stops signing for the rest of the process (local, not a protocol penalty).
+                    self.latch_persistence_failure(&format!("signing guard write failed (vote at height {}): {e}", vote.height));
                     return;
                 }
+                // fault-injection builds only: die right after the vote's guard is durable, before it is sent
+                #[cfg(feature = "fault-injection")]
+                crate::persistence::fault::hit_at("vote_guard_written", vote.height);
             }
         }
         #[cfg(feature = "fault-injection")]
@@ -5821,6 +5872,7 @@ impl Node {
     /// Engine-driven consensus tick: fire due timers, replay buffered
     /// next-height messages, propose when asked, and re-gossip.
     async fn consensus_tick(&mut self) {
+        if self.persistence_halted() { return; }          // PERSIST-HALT-1
         #[cfg(feature = "fault-injection")]
         for m in self.fault.take_due() {
             let _ = Box::pin(self.handle_event(NetworkEvent::Message(m))).await;
@@ -5886,6 +5938,7 @@ impl Node {
     /// durable, or the node is abstaining. A node with a signing key signs a proposal only after the guard
     /// recording it is on disk (the same rule as votes); a node without a key (tests) is unchanged.
     async fn sign_and_register_own_proposal(&mut self, mut proposal: BlockProposal) -> Option<BlockProposal> {
+        if self.persistence_halted() { return None; }     // PERSIST-HALT-1
         if self.signing_key.is_some() {
             if let Some(g) = self.signing_abstain_until {
                 if proposal.height <= g {
@@ -5901,8 +5954,12 @@ impl Node {
                     self.sign_guard.record_proposal(&proposal);
                     if let Err(e) = self.persist_sign_guard() {
                         error!(error = %e, "cannot persist signing state: proposal withheld");
+                        self.latch_persistence_failure(&format!("signing guard write failed (proposal at height {}): {e}", proposal.height));
                         return None;
                     }
+                    // fault-injection builds only: die right after the proposal's guard is durable, before it is sent
+                    #[cfg(feature = "fault-injection")]
+                    crate::persistence::fault::hit_at("proposal_guard_written", proposal.height);
                 }
             }
         } else {
@@ -7799,20 +7856,16 @@ mod tests {
             (after_failure, after_next)
         }
 
-        /// KNOWN FAILURE (KNOWN_ISSUES PERSIST-HALT-1, fix scoped for PR B): every `commit_block` caller on the multi-node path only
-        /// logs the error, so the validator keeps signing at h+1 after block h failed to persist. Run with `--ignored`.
+        /// PERSIST-HALT-1 regression: after block h fails to persist, the validator signs nothing at h+1 (it used to).
         #[tokio::test]
-        #[ignore = "known failure PERSIST-HALT-1: consensus does not halt after a persistence error; fix is in PR B"]
         async fn a_persistence_failure_stops_the_validator_signing_at_the_next_height_v1() {
             let (a, b) = persistence_failure_then_next_height(false).await;
             assert!(a.map_or(false, |l| l.0 == 1), "carol signed at height 1 before the failure: {a:?}");
             assert!(b.map_or(true, |l| l.0 <= 1), "carol must not sign at height 2 after a persistence failure at height 1; guard shows {b:?}");
         }
 
-        /// KNOWN FAILURE (KNOWN_ISSUES PERSIST-HALT-1, fix scoped for PR B): every `commit_block` caller on the multi-node path only
-        /// logs the error, so the validator keeps signing at h+1 after block h failed to persist. Run with `--ignored`.
+        /// PERSIST-HALT-1 regression: after block h fails to persist, the validator signs nothing at h+1 (it used to).
         #[tokio::test]
-        #[ignore = "known failure PERSIST-HALT-1: consensus does not halt after a persistence error; fix is in PR B"]
         async fn a_persistence_failure_stops_the_validator_signing_at_the_next_height_v2() {
             let (a, b) = persistence_failure_then_next_height(true).await;
             assert!(a.map_or(false, |l| l.0 == 1), "carol signed at height 1 before the failure: {a:?}");
@@ -7988,6 +8041,201 @@ mod tests {
         async fn model_based_commit_crash_restart_v1() { for seed in 1..=6 { model_run(false, seed, 14).await; } }
         #[tokio::test]
         async fn model_based_commit_crash_restart_v2() { for seed in 1..=6 { model_run(true, seed, 14).await; } }
+
+        // ══ PERSIST-HALT-1: the persistence-failure latch (PR B) ═════════════════════════════════════════════════
+        async fn carol_voting_node(dir: &std::path::Path, v2: bool) -> Node {
+            let mut n = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+            n.signing_key = Some(ClassicalScheme.generate_keypair("qcb1carol").unwrap());
+            if v2 { n.set_storage_v2(true).unwrap(); }
+            n.set_data_dir(dir.to_path_buf()).unwrap();
+            n
+        }
+        const VOTERS3: [&str; 3] = ["qcb1alice", "qcb1bob", "qcb1dave"];
+        fn next_block(n: &mut Node, h: u64) -> BlockProposal { let tx = n.block_payload(h).encode(); proposal(h, tx) }
+
+        /// After a persistence failure EVERY signing and committing entry point refuses, on both formats; the latch is one-way.
+        #[tokio::test]
+        async fn after_a_persistence_failure_no_signing_or_commit_path_works() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("latch-all-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                let p0 = next_block(&mut n, 0); deliver(&mut n, &p0, &VOTERS3).await;
+                assert!(n.persistence_failure().is_none(), "no failure yet");
+                let p1 = next_block(&mut n, 1);
+                crate::persistence::fault::arm("manifest_written"); deliver(&mut n, &p1, &VOTERS3).await; crate::persistence::fault::disarm();
+                assert!(n.persistence_failure().is_some(), "v2={v2}: the failure latched the node");
+                let (guard, height) = (n.sign_guard.last, n.status.lock().unwrap().height);
+                assert!(!n.status.lock().unwrap().is_running, "status reports the node as not running");
+                // a. the engine's vote path
+                let vote = Vote { vote_type: VoteType::Prevote, height: 2, round: 0, validator: ValidatorId("qcb1carol".into()), block_hash: Some(BlockHash("x".into())),
+                                  signature: vec![], scheme: "classical".into() };
+                n.cast_engine_vote(vote.clone()).await;
+                assert_eq!(n.sign_guard.last, guard, "v2={v2}: no vote was recorded or signed");
+                // b. proposals, c. the raw signing primitives (a safety net under every path)
+                let prop = BlockProposal { height: 2, round: 0, proposer: ValidatorId("qcb1carol".into()), block_hash: BlockHash("h2".into()), parent_hash: BlockHash("p".into()),
+                                           timestamp_ms: 0, tx_data: vec![], signature: vec![], pol_round: None };
+                assert!(n.sign_and_register_own_proposal(prop.clone()).await.is_none(), "v2={v2}: no proposal");
+                let mut v = vote.clone(); n.sign_vote(&mut v); assert!(v.signature.is_empty(), "v2={v2}: sign_vote leaves no signature");
+                let mut q = prop.clone(); n.sign_proposal(&mut q); assert!(q.signature.is_empty(), "v2={v2}: sign_proposal leaves no signature");
+                // d. consensus input from the network is ignored, nothing advances
+                let p2 = next_block(&mut n, 2); deliver(&mut n, &p2, &VOTERS3).await;
+                assert_eq!(n.sign_guard.last, guard, "v2={v2}: nothing signed at height 2");
+                assert_eq!(n.status.lock().unwrap().height, height, "v2={v2}: height did not advance");
+                // e. commits are refused, f. ticks and the action queue do nothing
+                let cert = chain_forge_consensus::CommitCertificate { height: 2, round: 0, block_hash: p2.block_hash.clone(), precommits: vec![] };
+                let r = n.commit_block(cert, &p2).await;
+                assert!(r.as_ref().err().map_or(false, |e| e.contains("refusing to commit")), "v2={v2}: commit refused, got {r:?}");
+                n.consensus_tick().await; n.drive_consensus().await; n.catch_up_round_if_behind(2, 5).await;
+                assert_eq!(n.sign_guard.last, guard, "v2={v2}: ticks and the action queue signed nothing");
+                assert_eq!(n.status.lock().unwrap().height, height);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// The event loop itself stops (and `main` exits non-zero) once the latch is set.
+        #[tokio::test]
+        async fn the_event_loop_stops_after_a_persistence_failure() {
+            let mut n = Node::new(GENESIS, None).await.unwrap();
+            n.persistence_failed = Some("injected".into());
+            tokio::time::timeout(std::time::Duration::from_secs(5), n.run()).await.expect("run() must return promptly after a persistence failure");
+            assert_eq!(n.persistence_failure(), Some("injected"));
+        }
+
+        /// A restart is the only way back, and it re-verifies: the committed state is block 0, the guard (block 1 votes) is ahead
+        /// of it, so the restarted validator abstains until the state catches up, refuses a conflicting vote, and recommits.
+        #[tokio::test]
+        async fn restart_after_a_persistence_failure_reverifies_and_abstains_until_caught_up() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("latch-restart-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                let p0 = next_block(&mut n, 0); deliver(&mut n, &p0, &VOTERS3).await;
+                let p1 = next_block(&mut n, 1);
+                crate::persistence::fault::arm("manifest_written"); deliver(&mut n, &p1, &VOTERS3).await; crate::persistence::fault::disarm();
+                let guard = n.sign_guard.last; assert!(guard.map_or(false, |l| l.0 == 1), "carol signed block 1 before the failure: {guard:?}");
+                drop(n);                                                                           // the process stops
+                let mut r = carol_voting_node(&dir, v2).await;
+                assert!(r.persistence_failure().is_none(), "a fresh process starts clean...");
+                assert_eq!(restart_height(r.load_persisted_state()), 0, "v2={v2}: ...but only from the verified committed state (block 0)");
+                assert_eq!(r.signing_abstaining_until(), Some(1), "v2={v2}: the guard (block 1) is ahead of the state: abstain");
+                let conflicting = signed_vote(CHAIN, VoteType::Precommit, 1, 0, "qcb1carol", BlockHash("a-different-block".into()));
+                assert!(r.sign_guard.check(&conflicting).is_err(), "v2={v2}: a conflicting vote at height 1 is refused");
+                deliver(&mut r, &p1, &VOTERS3).await;                                              // block 1 is committed again
+                assert_eq!(r.status.lock().unwrap().height, 1);
+                assert_eq!(r.signing_abstaining_until(), None, "v2={v2}: abstention ends once the state reaches the guard height");
+                assert!(r.persistence_failure().is_none());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// A failed v2 log append is a persistence failure like any other: it latches the node (the poisoned handle alone is not enough).
+        #[tokio::test]
+        async fn a_v2_log_append_failure_latches_the_node() {
+            let dir = v2_tmp("latch-append"); let mut n = carol_voting_node(&dir, true).await;
+            let p0 = next_block(&mut n, 0); deliver(&mut n, &p0, &VOTERS3).await;
+            let p1 = next_block(&mut n, 1);
+            crate::blocklog::FAIL_APPEND_AFTER.with(|c| c.set(Some(11))); deliver(&mut n, &p1, &VOTERS3).await;
+            assert!(n.persistence_failure().map_or(false, |e| e.contains("injected I/O error during append")), "latched with the append error: {:?}", n.persistence_failure());
+            let guard = n.sign_guard.last;
+            let p2 = next_block(&mut n, 2); deliver(&mut n, &p2, &VOTERS3).await;
+            assert_eq!(n.sign_guard.last, guard, "nothing signed after the append failure");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The latch is for PERSISTENCE failures only: a block refused for another reason (state divergence) does not latch.
+        #[tokio::test]
+        async fn a_non_persistence_commit_refusal_does_not_latch() {
+            let dir = v2_tmp("latch-not"); let mut n = carol_voting_node(&dir, false).await;
+            let bad = proposal(0, payload(None, Some("not-the-real-root")));
+            deliver(&mut n, &bad, &VOTERS3).await;
+            assert!(n.persistence_failure().is_none(), "a rejected block is not a persistence failure");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ══ Signing-guard write failure latches the node (owner decision 2026-11-04) ═════════════════════════════
+        /// Make the next signing-guard write fail with a REAL I/O error: replace the `persist/` directory by a file.
+        fn break_guard_storage(dir: &std::path::Path) {
+            let p = dir.join("persist"); std::fs::rename(&p, dir.join("persist.aside")).unwrap(); std::fs::write(&p, b"not a directory").unwrap();
+        }
+        fn fix_guard_storage(dir: &std::path::Path) {
+            let p = dir.join("persist"); std::fs::remove_file(&p).unwrap(); std::fs::rename(dir.join("persist.aside"), &p).unwrap();
+        }
+
+        /// A failed guard write for a VOTE latches the node: nothing is sent, and no later vote, proposal, commit or tick works;
+        /// recovery needs a new process, which refuses an unusable data directory and otherwise re-verifies the guard.
+        #[tokio::test]
+        async fn a_failed_signing_guard_write_for_a_vote_latches_the_node_and_stops_all_signing() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("gw-vote-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                let p0 = next_block(&mut n, 0); deliver(&mut n, &p0, &VOTERS3).await;
+                assert!(n.persistence_failure().is_none(), "v2={v2}: healthy guard writes never latch");
+                assert_eq!(n.sign_guard.last, Some((0, 0, 2)), "v2={v2}: carol signed block 0");
+                break_guard_storage(&dir);
+                let p1 = next_block(&mut n, 1); deliver(&mut n, &p1, &VOTERS3).await;           // carol's first vote at height 1 cannot be recorded
+                let why = n.persistence_failure().map(str::to_string);
+                assert!(why.as_deref().map_or(false, |e| e.contains("signing guard write failed (vote at height 1)")), "v2={v2}: latched with the guard error, got {why:?}");
+                assert!(carol_votes(&n).iter().all(|v| v.height < 1), "v2={v2}: no vote of carol's at height 1 was accepted for sending");
+                assert!(!n.status.lock().unwrap().is_running);
+                let guard = n.sign_guard.last;
+                // every later signing / committing path refuses
+                let vote = Vote { vote_type: VoteType::Precommit, height: 1, round: 0, validator: ValidatorId("qcb1carol".into()), block_hash: Some(p1.block_hash.clone()), signature: vec![], scheme: "classical".into() };
+                n.cast_engine_vote(vote.clone()).await; assert_eq!(n.sign_guard.last, guard, "v2={v2}: no further vote recorded");
+                let prop = BlockProposal { height: 2, round: 0, proposer: ValidatorId("qcb1carol".into()), block_hash: BlockHash("h2".into()), parent_hash: BlockHash("p".into()), timestamp_ms: 0, tx_data: vec![], signature: vec![], pol_round: None };
+                assert!(n.sign_and_register_own_proposal(prop).await.is_none(), "v2={v2}: no proposal");
+                let mut sv = vote.clone(); n.sign_vote(&mut sv); assert!(sv.signature.is_empty(), "v2={v2}: no raw signature");
+                let cert = chain_forge_consensus::CommitCertificate { height: 1, round: 0, block_hash: p1.block_hash.clone(), precommits: vec![] };
+                assert!(n.commit_block(cert, &p1).await.is_err(), "v2={v2}: commits refused");
+                n.consensus_tick().await; n.drive_consensus().await;
+                assert_eq!(n.sign_guard.last, guard);
+                drop(n);                                                                         // the process stops
+                // a new process cannot run on the unusable directory...
+                let mut r = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap(); if v2 { r.set_storage_v2(true).unwrap(); }
+                assert!(r.set_data_dir(dir.clone()).is_err(), "v2={v2}: an unusable data directory is an error, never a silent memory-only start");
+                drop(r);
+                // ...and on the repaired one it re-verifies: the guard on disk holds block 0 only (the failed write never reached disk), the vote at height 1 was never sent
+                fix_guard_storage(&dir);
+                let mut r2 = carol_voting_node(&dir, v2).await;
+                let h = restart_height(r2.load_persisted_state());
+                assert!(h <= 1, "v2={v2}: restored a verified committed height, got {h}");
+                assert_eq!(r2.sign_guard.last.map(|l| l.0), Some(0), "v2={v2}: the guard on disk is the last one that was made durable");
+                assert!(r2.persistence_failure().is_none());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// The same for a PROPOSAL whose guard write fails.
+        #[tokio::test]
+        async fn a_failed_signing_guard_write_for_a_proposal_latches_the_node() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("gw-prop-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                let p0 = next_block(&mut n, 0); deliver(&mut n, &p0, &VOTERS3).await;
+                break_guard_storage(&dir);
+                let prop = BlockProposal { height: 1, round: 0, proposer: ValidatorId("qcb1carol".into()), block_hash: BlockHash("h1".into()), parent_hash: BlockHash("p".into()), timestamp_ms: 0, tx_data: vec![], signature: vec![], pol_round: None };
+                assert!(n.sign_and_register_own_proposal(prop.clone()).await.is_none(), "v2={v2}: the proposal is withheld");
+                assert!(n.persistence_failure().map_or(false, |e| e.contains("signing guard write failed (proposal at height 1)")), "v2={v2}: latched: {:?}", n.persistence_failure());
+                // and now nothing else signs either (a vote at height 1)
+                let vote = Vote { vote_type: VoteType::Prevote, height: 1, round: 0, validator: ValidatorId("qcb1carol".into()), block_hash: Some(BlockHash("h1".into())), signature: vec![], scheme: "classical".into() };
+                let before = n.sign_guard.last; n.cast_engine_vote(vote).await;
+                assert_eq!(n.sign_guard.last, before, "v2={v2}: no vote after a failed proposal guard write");
+                assert!(n.sign_and_register_own_proposal(prop).await.is_none());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// Successful signing and restart behaviour is unchanged: guard writes that succeed never latch, and the guard survives a restart.
+        #[tokio::test]
+        async fn successful_guard_writes_never_latch_and_survive_a_restart() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("gw-ok-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                for h in 0..3 { let p = next_block(&mut n, h); deliver(&mut n, &p, &VOTERS3).await; }
+                assert!(n.persistence_failure().is_none(), "v2={v2}");
+                assert_eq!(n.sign_guard.last, Some((2, 0, 2)));
+                assert!(n.status.lock().unwrap().height == 2);
+                drop(n);
+                let mut r = carol_voting_node(&dir, v2).await;
+                assert_eq!(restart_height(r.load_persisted_state()), 2);
+                assert_eq!(r.sign_guard.last, Some((2, 0, 2)), "v2={v2}: the guard was restored");
+                assert!(r.persistence_failure().is_none() && r.signing_abstaining_until().is_none());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
 
         /// Regression (v1 nodes, default storage): the proposal guard added in PR 2 must load guard files written
         /// before it, leave them untouched until the node signs, then survive a restart and refuse conflicting proposals.

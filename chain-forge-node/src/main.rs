@@ -258,7 +258,13 @@ async fn main() {
                 tracing::error!(error = %e, "FATAL: cannot use the data directory in storage v2 (is another node running on it?)");
                 std::process::exit(1);
             }
-            Err(e) => tracing::warn!(error = %e, "could not set data dir — running memory-only"),
+            // A data directory that was asked for but cannot be used must stop the node, whichever storage format it is. Running
+            // memory-only instead would let a restarted validator sign with no signing guard and no committed state.
+            Err(e) => {
+                tracing::error!(dir = %dir.display(), error = %e,
+                    "FATAL: --data-dir was given but cannot be used; refusing to run memory-only (a validator without its signing guard could double-sign)");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -298,4 +304,10 @@ async fn main() {
 
     // Run the main event loop (blocks until node exits).
     node.run().await;
+
+    // PERSIST-HALT-1: a node stopped by a persistence failure must not look like a clean exit.
+    if let Some(e) = node.persistence_failure() {
+        tracing::error!(error = %e, "node stopped because a persistence operation failed; verify the data directory before restarting");
+        std::process::exit(2);
+    }
 }

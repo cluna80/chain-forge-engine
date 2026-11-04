@@ -310,3 +310,98 @@ fn sigkill_rounds(v2: bool) {
     no_equivocation(&refs);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// H0-3b PR B: the signing-guard windows. Dave's process is aborted right after the guard recording a VOTE (resp. a PROPOSAL)
+/// is durable, before the message is sent. After the restart: the guard on disk still holds what was authorised, the node
+/// resumes from the verified committed state (abstaining while the guard is ahead of it), the chain converges, and no node
+/// reports an equivocation.
+#[test]
+fn v2_a_node_aborted_after_its_signing_guard_write_restarts_without_conflicting_signatures() { guard_window_crashes(true) }
+#[test]
+fn v1_a_node_aborted_after_its_signing_guard_write_restarts_without_conflicting_signatures() { guard_window_crashes(false) }
+
+fn guard_window_crashes(v2: bool) {
+    V2.with(|c| c.set(v2));
+    for point in ["vote_guard_written", "proposal_guard_written"] {
+        println!("\n── V2L-3: Dave aborts at {point} (v2={v2}) ──");
+        let base = std::env::temp_dir().join(format!("cf-{}l3-{}-{point}", if v2 { "v2" } else { "v1" }, std::process::id()));
+        let (mut nodes, _p2p) = start_cluster(&base, &[("CF_FAULT_V2_CRASH_POINT", point), ("CF_FAULT_V2_CRASH_HEIGHT", "6")]);
+        let feeder = Feeder::start(nodes[0].api);
+        let d = Instant::now() + Duration::from_secs(180);
+        let status = loop {
+            if let Some(s) = nodes[3].child.as_mut().unwrap().try_wait().unwrap() { break s; }
+            if Instant::now() > d { for n in &nodes { dump(n); } panic!("Dave did not abort at {point} (was the node built with --features fault-injection?)"); }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        nodes[3].child = None;
+        assert!(!status.success(), "{point}: Dave must have been aborted, got {status:?}");
+        let crash_log = read_log(&nodes[3].log);
+        let at_h: u64 = crash_log.lines().filter(|l| l.contains(&format!("crashing the process at {point} at height")))
+            .filter_map(|l| l.rsplit("height ").next()).filter_map(|h| h.trim().parse().ok()).next()
+            .unwrap_or_else(|| panic!("{point}: the crash height is not in Dave's log"));
+        println!("   {point}: aborted while signing at height {at_h}");
+        // the guard that was made durable BEFORE the message left the node
+        let guard: serde_json::Value = serde_json::from_slice(&std::fs::read(nodes[3].data.join("persist").join("consensus_signing.json")).expect("guard file exists")).unwrap();
+        if point == "vote_guard_written" {
+            assert!(guard["last"][0].as_u64().map_or(false, |h| h == at_h), "{point}: the guard records the vote at height {at_h}: {}", guard["last"]);
+        } else {
+            assert_eq!(guard["proposal"]["height"].as_u64(), Some(at_h), "{point}: the guard records the proposal at height {at_h}");
+        }
+        let surv: Vec<u16> = nodes[..3].iter().map(|n| n.api).collect();
+        assert!(wait_heights(&surv, at_h + 3, Duration::from_secs(120)), "{point}: survivors did not advance without Dave");
+        let mut dave = spawn("dave", &nodes[3].data.clone(), &nodes[3].log.with_file_name("dave2.log"), nodes[3].p2p, &nodes[3].peers.clone(), &[]);
+        assert!(wait_port(dave.api, Duration::from_secs(30)), "{point}: restarted Dave's API never opened");
+        std::thread::sleep(Duration::from_secs(1));
+        let log = read_log(&dave.log);
+        assert!(log.contains(fmt_line()) && log.contains("resumed from persisted state") && !log.contains("starting from genesis"), "{point}: Dave did not resume\n{log}");
+        let got = resumed_height(&dave.log).expect("resumed height in the log");
+        println!("   {point}: Dave resumed at height {got}");
+        assert!(got == at_h || got + 1 == at_h, "{point}: resumed at {got}, signing was at {at_h}");
+        if point == "vote_guard_written" {
+            // a vote at at_h was authorised; the committed state is behind it => the node must abstain, not re-decide
+            assert_eq!(got + 1, at_h, "{point}: the block was not committed");
+            assert!(log.contains("abstaining from signing"), "{point}: the restarted node must abstain while its guard is ahead of its state");
+        }
+        let target = height(nodes[0].api).unwrap();
+        assert!(wait_heights(&[dave.api], target, Duration::from_secs(120)), "{point}: Dave did not catch up to {target}");
+        let all = [&nodes[0], &nodes[1], &nodes[2], &dave];
+        assert!(wait_heights(&all.iter().map(|n| n.api).collect::<Vec<_>>(), target, Duration::from_secs(60)));
+        assert_roots_agree(&all, point);
+        let sent = feeder.finish();
+        assert!(sent >= 5, "{point}: only {sent} transactions were accepted");
+        no_equivocation(&all);
+        dave.kill9();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// A node asked to use a data directory that cannot be used must STOP (it used to warn and run memory-only on the default
+/// storage, where a restarted validator would then sign with no signing guard and no committed state).
+#[test]
+fn v1_a_node_with_an_unusable_data_dir_refuses_to_start() { unusable_data_dir(false) }
+#[test]
+fn v2_a_node_with_an_unusable_data_dir_refuses_to_start() { unusable_data_dir(true) }
+
+fn unusable_data_dir(v2: bool) {
+    let base = std::env::temp_dir().join(format!("cf-baddir-{}-{}", if v2 { "v2" } else { "v1" }, std::process::id()));
+    let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let blocker = base.join("a-file"); std::fs::write(&blocker, b"x").unwrap();
+    let data = blocker.join("data");                       // a directory "inside" a file: cannot be created
+    let log = base.join("node.log");
+    let f = std::fs::File::create(&log).unwrap();
+    let mut cmd = Command::new(node_bin());
+    cmd.args(["--genesis", genesis().to_str().unwrap(), "--validator", "qcb1alice", "--key-file", key("alice").to_str().unwrap(),
+              "--data-dir", data.to_str().unwrap(), "--api-port", &free_port().to_string(), "--p2p-port", &free_port().to_string()]);
+    if v2 { cmd.arg("--storage-v2-experimental"); }
+    let mut child = cmd.stdout(f.try_clone().unwrap()).stderr(f).stdin(Stdio::null()).spawn().unwrap();
+    let d = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() { break s; }
+        if Instant::now() > d { let _ = child.kill(); panic!("the node kept running with an unusable data directory:\n{}", read_log(&log)); }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let text = read_log(&log);
+    assert!(!status.success(), "must exit non-zero, got {status:?}");
+    assert!(text.contains("FATAL") && !text.contains("running memory-only"), "the log must say FATAL and must not fall back to memory-only:\n{text}");
+    let _ = std::fs::remove_dir_all(&base);
+}

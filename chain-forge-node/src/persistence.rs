@@ -291,6 +291,18 @@ pub(crate) mod fault {
         #[cfg(feature = "fault-injection")]
         HEIGHT.store(_h, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Crash point keyed on a message height (signing-guard windows): aborts the process when `CF_FAULT_V2_CRASH_POINT`
+    /// names `point` and `height >= CF_FAULT_V2_CRASH_HEIGHT`. Fault-injection builds only; a no-op otherwise.
+    pub(crate) fn hit_at(_point: &'static str, _height: u64) {
+        #[cfg(feature = "fault-injection")]
+        if std::env::var("CF_FAULT_V2_CRASH_POINT").ok().as_deref() == Some(_point) {
+            let at: u64 = std::env::var("CF_FAULT_V2_CRASH_HEIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+            if _height >= at {
+                eprintln!("cf_fault: crashing the process at {_point} at height {_height}");
+                std::process::abort();
+            }
+        }
+    }
     pub(crate) fn hit(point: &'static str) -> std::io::Result<()> {
         #[cfg(feature = "fault-injection")]
         if std::env::var("CF_FAULT_V2_CRASH_POINT").ok().as_deref() == Some(point) {
