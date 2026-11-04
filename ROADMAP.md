@@ -472,6 +472,26 @@ Machine 1 (Alice) → creates Agent-A → funds 100 test QCB
 
 **Still open (Qattice):** ACCT-LEAF-1 (investigation next, read-only; no change to leaf encoding or state-root behavior without a separate design and compatibility review); H0-11B/C/D and BIZ-PRE-5; P2P automatic reconnection (not implemented); the 24-suite live sweep and the Phase 0 closeout write-up (`PHASE-0-CLOSEOUT.md` covers P0-1 only); the QRC cleanup in this repository (QRC is retired; `chain-forge-qrc`, `chain-forge-resource`, `qrc_sim/`, the `qrc` / `market` modules and dormant QRC paths in `execution` and `node`; QRC in signed or persisted data such as `RecordAgentSpend.amount_uqrc` is a separate design decision; `chain-forge-tokenomics` has no importer and is assessed in that cleanup); the remaining DIS hooks still in the core path (`RecoverAccountKey` admission, gas and size tables, signature policy, module gating) and the `TxBody` enum; machine and deployment follow-ups for the rename (remotes on other machines, webhooks, Vercel). No item is newly marked complete beyond what the cited PRs and runs show.
 
+### ACCT-LEAF-1 — Complete authenticated account state (Phase 0.5 / mainnet security gate)
+
+**Priority: HIGH — OPEN; design-only, not implemented.** Identified 2026-11-04 during S0 root-baseline work; read-only investigation recorded in `KNOWN_ISSUES.md`. Design proposal: [PR #82](https://github.com/cluna80/Qattice/pull/82), `docs/ACCT-LEAF-1-state-leaf-v2-design.md` (draft, not merged or approved as a final wire format). This is a Qattice-only protocol milestone, independent of the paused Chain Forge extraction.
+
+**Problem:** The v1 account Merkle leaf does not authenticate `key_version`, complete guardian public keys, `pending_recovery` (including cancellation and activation height), `role`, or all `IntrinsicCharm` fields. A scratch-only probe found unchanged roots when several such fields were changed; no exploit or consensus divergence was demonstrated. The v1 delimiter-based balance encoding is also not injective for arbitrary denom strings. These gaps limit root-based restore integrity and future account proofs.
+
+**Preferred design (subject to owner review):** Option A, a canonical versioned v2 account leaf with complete field coverage, fixed byte-level encoding, domain-separated substructure hashes, and deterministic cross-platform roots. Prefer a fresh v2 genesis for mainnet and regenerated v2 devnets; retain historical v1 verification. No production encoder, state-root, genesis, persistence, signing-domain or baseline changes are authorized by this roadmap entry.
+
+| Gate | Deliverable / acceptance criterion | Status |
+|---|---|---|
+| AL-1 — Investigation | Account-field commitment matrix, root mutation probe, recovery transition audit, limitations documented | **DONE** (read-only; `KNOWN_ISSUES.md`) |
+| AL-2 — Design review | Resolve O1–O7 in PR #82; specify canonical bytes, hashed preimages, versioning, proof model, persistence and rollback; owner approves final format | **IN REVIEW** (draft PR #82) |
+| AL-3 — PR-A: reference vectors | Independent Python reference encoder, golden byte vectors, malformed-input cases; docs/tests only; owner-reviewed | **PLANNED — NOT STARTED** |
+| AL-4 — v1 compatibility | Extract/guard legacy encoder without changing behavior; existing 28 genesis hashes, S0 leaf/root corpus and historical roots remain byte-identical | **PLANNED — NOT AUTHORIZED** |
+| AL-5 — v2 encoder | Complete `AccountState` and nested-struct coverage; injective encoding; field-mutation, insertion-order, canonical-vector and Linux/Windows parity tests | **PLANNED — NOT AUTHORIZED** |
+| AL-6 — Activation and persistence | Explicit genesis/version rules; fresh-v2 chain, manifest/restart fail-closed checks, tamper detection, recovery lifecycle and four-node agreement; migration for existing chains separately gated | **PLANNED — NOT AUTHORIZED** |
+| AL-7 — Mainnet readiness | Independently reviewed v2 test evidence, performance bounds, intentionally new v2 corpora, documented rollback limits and owner sign-off before mainnet genesis | **PLANNED — NOT AUTHORIZED** |
+
+**Related but separate:** `STATE-COMMIT-2` is a proposed read-only audit of identity/attestation, agent, validator, liveness and slashing state outside the account tree. It must determine which fields are authoritative, derivable or node-local before claiming whole-chain state-root completeness. Track and review separately; ACCT-LEAF-1 alone does not close it.
+
 ### Protocol Blockers
 
 The following open items in Phase 0.5 block specific Phase 1 milestones. Phase 1 work that does **not** touch these subsystems may continue in parallel.
