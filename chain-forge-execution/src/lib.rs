@@ -3263,11 +3263,108 @@ fn execute_update_guardian_policy(
 /// optional IdentityStore and QrcEngine references.
 pub struct Executor {
     config: ExecutionConfig,
+    /// S2: pluggable transaction families, tried in order for the variants the core does not execute itself.
+    modules: Vec<std::sync::Arc<dyn TxModule>>,
+}
+
+/// S2 (CF-QAT-REPO-002): a pluggable family of transaction types. The executor offers a transaction to each registered
+/// module in order; the first module that owns the body executes it and returns `Some(result)`. Fee, nonce, gas and rollback
+/// handling stay in the executor, so a module only applies the body. `DisModule` is the first one (the DIS key rotation and
+/// recovery transactions); a later step moves it out of this crate.
+pub trait TxModule: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Execute `tx` if this module owns its body, otherwise return `None`.
+    fn try_execute(
+        &self,
+        config:       &ExecutionConfig,
+        tx:           &Transaction,
+        state:        &mut StateStore,
+        block_height: u64,
+    ) -> Option<Result<(), String>>;
+}
+
+/// DIS account-key rotation and recovery transactions (DIS-002A/002B/003A/003E).
+pub struct DisModule;
+
+impl TxModule for DisModule {
+    fn name(&self) -> &'static str { "dis" }
+
+    fn try_execute(
+        &self,
+        config:       &ExecutionConfig,
+        tx:           &Transaction,
+        state:        &mut StateStore,
+        block_height: u64,
+    ) -> Option<Result<(), String>> {
+        Some(match &tx.body {
+            TxBody::RotateAccountKey { new_public_key, new_key_scheme, key_version, pop_signature } => {
+                execute_rotate_account_key(
+                    config, tx, state,
+                    new_public_key, new_key_scheme, key_version, pop_signature,
+                )
+            }
+            // DIS-002B: recovery policy enrollment and recovery.
+            // DIS-003E C-18: if a pending (non-cancelled) recovery exists,
+            // enrolling a new policy cancels it first.
+            TxBody::EnrollRecoveryPolicy { guardians, threshold } => {
+                // C-18: cancel any pending recovery before enrolling a new policy.
+                if let Ok(acct) = state.get_account_mut(&tx.sender) {
+                    if let Some(ref p) = acct.pending_recovery.clone() {
+                        if !p.cancelled {
+                            acct.pending_recovery = Some(chain_forge_state::PendingRecovery {
+                                cancelled: true,
+                                ..p.clone()
+                            });
+                            state.refresh_leaf(&tx.sender);
+                            tracing::info!(
+                                sender = %tx.sender,
+                                "DIS-003E C-18: pending recovery cancelled by new EnrollRecoveryPolicy"
+                            );
+                        }
+                    }
+                }
+                execute_enroll_recovery_policy(tx, state, guardians, *threshold)
+            }
+            TxBody::RecoverAccountKey {
+                new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+                policy_id,
+            } => {
+                execute_recover_account_key(
+                    config, tx, state,
+                    new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
+                    *policy_id, block_height,
+                )
+            }
+            TxBody::RevokeRecoveryPolicy => execute_revoke_recovery_policy(tx, state),
+            TxBody::UpdateGuardianPolicy { new_guardians, new_threshold } => {
+                execute_update_guardian_policy(tx, state, new_guardians, *new_threshold)
+            }
+            // DIS-003E: cancel a pending recovery (must be signed by current key).
+            TxBody::CancelRecovery => execute_cancel_recovery(tx, state),
+            _ => return None,
+        })
+    }
 }
 
 impl Executor {
     pub fn new(config: ExecutionConfig) -> Self {
-        Self { config }
+        // Qattice's behavior is unchanged: the DIS module is registered by default for now.
+        Self { config, modules: vec![std::sync::Arc::new(DisModule)] }
+    }
+
+    /// An executor with an explicit module list (empty = a core-only executor that refuses module-owned transactions).
+    pub fn with_modules(config: ExecutionConfig, modules: Vec<std::sync::Arc<dyn TxModule>>) -> Self {
+        Self { config, modules }
+    }
+
+    /// Offer a module-owned transaction to the registered modules.
+    fn run_module(&self, tx: &Transaction, state: &mut StateStore, block_height: u64) -> Result<(), String> {
+        for m in &self.modules {
+            if let Some(r) = m.try_execute(&self.config, tx, state, block_height) {
+                return r;
+            }
+        }
+        Err(format!("no registered module executes {}", tx.body.variant_name()))
     }
 
     /// The chain's native fee/stake denom (e.g. `"uqcb"`). Exposed so
@@ -3967,55 +4064,13 @@ impl Executor {
             }
 
             // DIS-002A: key rotation does not touch identity store.
-            TxBody::RotateAccountKey { new_public_key, new_key_scheme, key_version, pop_signature } => {
-                execute_rotate_account_key(
-                    &self.config, tx, state,
-                    new_public_key, new_key_scheme, key_version, pop_signature,
-                )
-            }
-
-            // DIS-002B: recovery policy enrollment and recovery.
-            // DIS-003E C-18: if a pending (non-cancelled) recovery exists,
-            // enrolling a new policy cancels it first.
-            TxBody::EnrollRecoveryPolicy { guardians, threshold } => {
-                // C-18: cancel any pending recovery before enrolling a new policy.
-                if let Ok(acct) = state.get_account_mut(&tx.sender) {
-                    if let Some(ref p) = acct.pending_recovery.clone() {
-                        if !p.cancelled {
-                            acct.pending_recovery = Some(chain_forge_state::PendingRecovery {
-                                cancelled: true,
-                                ..p.clone()
-                            });
-                            state.refresh_leaf(&tx.sender);
-                            tracing::info!(
-                                sender = %tx.sender,
-                                "DIS-003E C-18: pending recovery cancelled by new EnrollRecoveryPolicy"
-                            );
-                        }
-                    }
-                }
-                execute_enroll_recovery_policy(tx, state, guardians, *threshold)
-            }
-            TxBody::RecoverAccountKey {
-                new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
-                policy_id,
-            } => {
-                execute_recover_account_key(
-                    &self.config, tx, state,
-                    new_public_key, new_key_scheme, key_version, pop_signature, guardian_signatures,
-                    *policy_id, block_height,
-                )
-            }
-            TxBody::RevokeRecoveryPolicy => {
-                execute_revoke_recovery_policy(tx, state)
-            }
-            TxBody::UpdateGuardianPolicy { new_guardians, new_threshold } => {
-                execute_update_guardian_policy(tx, state, new_guardians, *new_threshold)
-            }
-            // DIS-003E: cancel a pending recovery (must be signed by current key).
-            TxBody::CancelRecovery => {
-                execute_cancel_recovery(tx, state)
-            }
+            // S2: DIS key rotation / recovery transactions are executed by the registered `DisModule`.
+            TxBody::RotateAccountKey { .. }
+            | TxBody::EnrollRecoveryPolicy { .. }
+            | TxBody::RecoverAccountKey { .. }
+            | TxBody::RevokeRecoveryPolicy
+            | TxBody::UpdateGuardianPolicy { .. }
+            | TxBody::CancelRecovery => self.run_module(tx, state, block_height),
 
             TxBody::SponsorAgent { agent_address } => {
                 // Charm Confinement: sponsor must be Verified tier
@@ -9534,6 +9589,37 @@ mod tests {
                 assert_eq!(g, w, "corpus line {i} changed");
             }
             assert_eq!(got.lines().count(), want.lines().count(), "corpus length changed");
+        }
+    }
+
+    /// S2: the six DIS transaction types are executed through the registered module. An executor with no modules refuses
+    /// them (nothing in the core executes DIS logic any more); the default executor still runs them exactly as before.
+    #[test]
+    fn s2_dis_transactions_run_only_through_a_registered_module() {
+        use chain_forge_agents::AgentStore;
+        let dis_bodies: Vec<TxBody> = s2_bodies().into_iter().filter(|b| matches!(b,
+            TxBody::RotateAccountKey{..} | TxBody::EnrollRecoveryPolicy{..} | TxBody::RecoverAccountKey{..}
+            | TxBody::RevokeRecoveryPolicy | TxBody::UpdateGuardianPolicy{..} | TxBody::CancelRecovery)).collect();
+        assert_eq!(dis_bodies.len(), 6);
+        for (i, body) in dis_bodies.into_iter().enumerate() {
+            let tx = Transaction { id: format!("m-{i}"), sender: "qcb1alice".into(), nonce: 0, body, gas_limit: 5_000_000,
+                sig_scheme: None, signature: vec![], public_key: vec![], pq_signatures: vec![], pq_public_key: vec![] };
+            let (default_exec, mut st1) = setup();
+            let r1 = default_exec.execute_tx_with_identity(&tx, &mut st1, &mut IdentityStore::new(0), &mut AgentStore::new(), 10);
+            assert!(!r1.error.clone().unwrap_or_default().contains("no registered module"), "{}: default executor must run the DIS module", tx.body.variant_name());
+            let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+            let bare = Executor::with_modules(ExecutionConfig::from_genesis(&genesis), vec![]);
+            let mut st2 = StateStore::new(HashWidth::Bits256);
+            st2.apply_genesis(&genesis).unwrap();
+            let r2 = bare.execute_tx_with_identity(&tx, &mut st2, &mut IdentityStore::new(0), &mut AgentStore::new(), 10);
+            assert!(!r2.success);
+            if matches!(tx.body, TxBody::RecoverAccountKey{..}) {
+                // Still rejected at ADMISSION by DIS authorization code that lives in the core path (verify_recover_account_key,
+                // signature policy, gas and size tables). Later S2 steps move those hooks behind the module too.
+                assert_eq!(r2.fee_charged, 0, "RecoverAccountKey is rejected at admission");
+            } else {
+                assert!(r2.error.clone().unwrap_or_default().contains("no registered module executes"), "{}: got {:?}", tx.body.variant_name(), r2.error);
+            }
         }
     }
 
