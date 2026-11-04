@@ -1,20 +1,22 @@
 //! DIS-002B — Identity Continuity: Authorized Device Migration (Path 1)
 //!
-//! Proves that a Verified pilot identity survives a `RotateAccountKey` rotation
-//! with all identity attributes unchanged, and that negative cases are correctly
+//! Proves that a registered, attested pilot identity survives a `RotateAccountKey` rotation
+//! with its tier and attestation record unchanged, and that negative cases are correctly
 //! rejected.
 //!
 //! ## Test sequence
 //!
 //! 1. Spin up a 4-node devnet using `genesis-dis002b.json`.
-//! 2. **Bootstrap Verified identity** for `qcb1pilot`:
+//! 2. **Bootstrap an attested identity** for `qcb1pilot`:
 //!    a. Submit `RegisterIdentity` from `qcb1pilot` (signed with Key_A).
-//!    b. Submit `Attest` from `qcb1bob` (a Verified genesis validator).
-//!    c. Poll `/api/identity/qcb1pilot` until `registered: true` on ALL 4 nodes.
+//!    b. Submit `Attest` from `qcb1bob` (a Verified genesis validator). The devnet's attestation quorum is 3, so one
+//!       attestation leaves the pilot `Provisional`; the test checks the tier does not CHANGE, not that it is `Verified`.
+//!    c. Poll `/api/identity/qcb1pilot` until `registered: true` on ALL 4 nodes, then until the attestation is visible on ALL
+//!       4 nodes (`attestation_count >= 1` and `attested_by` contains `qcb1bob`), so the snapshot below is a stable baseline.
 //! 3. **Snapshot** identity record: tier, attestation_count, attested_by.
 //! 4. **B-01**: Submit `RotateAccountKey` Key_A → Key_B with valid PoP.
 //! 5. **B-02**: Verify identity ID and account address unchanged after rotation.
-//! 6. **B-03**: Verify Verified tier and attestation records unchanged.
+//! 6. **B-03**: Verify the tier and attestation records are unchanged by the rotation.
 //! 7. **B-04**: Verify balance (decreased by gas), nonce, preserved.
 //! 8. **B-05**: Submit a Transfer with Key_B — must succeed.
 //! 9. **B-06**: Submit a Transfer with Key_A — must be rejected.
@@ -326,6 +328,37 @@ fn poll_until_registered(ports: &[u16], address: &str, timeout: Duration) -> boo
     }
 }
 
+/// Poll until EVERY port reports, for `address`, `attestation_count >= 1` and `attested_by` containing `attester`.
+///
+/// `poll_until_registered` is not enough as a baseline: the Attest tx is submitted to (and awaited on) one node, and
+/// `registered` is already true everywhere from the earlier RegisterIdentity block, so the registration poll returns
+/// immediately while another node may not yet have committed the attestation block (it commits tens of milliseconds
+/// after the first). Reading the "before" snapshot in that window made B-03 fail intermittently (count 0, then 1).
+/// Bounded by `timeout`; on timeout the error lists what each node last reported.
+fn poll_until_attested(ports: &[u16], address: &str, attester: &str, timeout: Duration) -> Result<Duration, String> {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    loop {
+        let seen: Vec<(u16, Option<u64>, Vec<String>)> = ports.iter().map(|&p| {
+            let v = identity_of(p, address);
+            let count = v.as_ref().and_then(|v| v["attestation_count"].as_u64());
+            let by = v.as_ref().and_then(|v| v["attested_by"].as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            (p, count, by)
+        }).collect();
+        let ready = seen.iter().all(|(_, c, by)| c.map_or(false, |c| c >= 1) && by.iter().any(|b| b == attester));
+        if ready { return Ok(start.elapsed()); }
+        if Instant::now() >= deadline {
+            let detail: Vec<String> = seen.iter()
+                .map(|(p, c, by)| format!("port {p}: attestation_count={c:?} attested_by={by:?}")).collect();
+            return Err(format!(
+                "attestation by {attester} for {address} not visible on all nodes within {timeout:?}: {}", detail.join("; ")));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 // ── Transaction builders ──────────────────────────────────────────────────────
 
 fn build_register_identity(seed: &str, sender: &str, nonce: u64) -> Transaction {
@@ -578,12 +611,22 @@ fn dis_002b_migration() {
     );
     eprintln!("[phase3] Identity converged on all 4 nodes.");
 
+    // Baseline: the attestation must be visible on every node BEFORE the snapshot is taken (see poll_until_attested).
+    match poll_until_attested(&all_ports, PILOT_ADDR, "qcb1bob", Duration::from_secs(60)) {
+        Ok(waited) => eprintln!("[phase3] Attestation by qcb1bob visible on all 4 nodes (waited {waited:?})."),
+        Err(e) => panic!("[phase3] baseline not established: {e}"),
+    }
+
     // ── Snapshot identity record before rotation ──────────────────────────────
     let identity_before = identity_of(api_port, PILOT_ADDR)
         .expect("identity not found on alice before rotation");
     let tier_before = identity_before["tier"].as_str().unwrap_or("null").to_string();
     let attcount_before = identity_before["attestation_count"].as_u64().unwrap_or(0);
     let attested_by_before = identity_before["attested_by"].clone();
+
+    assert!(attcount_before >= 1, "baseline not established: attestation_count={attcount_before} before rotation");
+    assert!(attested_by_before.as_array().map_or(false, |a| a.iter().any(|x| x.as_str() == Some("qcb1bob"))),
+        "baseline not established: attested_by={attested_by_before} lacks qcb1bob");
 
     eprintln!("\n[snapshot] identity before rotation:");
     eprintln!("  tier              = {tier_before}");
@@ -592,7 +635,7 @@ fn dis_002b_migration() {
 
     // ── B-01: RotateAccountKey Key_A → Key_B ─────────────────────────────────
     // nonce=1 (RegisterIdentity was nonce=0).
-    eprintln!("\n[B-01] RotateAccountKey Key_A → Key_B (Verified pilot identity migration)");
+    eprintln!("\n[B-01] RotateAccountKey Key_A → Key_B (pilot identity migration)");
     let rotation_tx = build_rotation_tx(SEED_A, SEED_B, PILOT_ADDR, 1, 1, "pilot-a-to-b");
     let rotation_json = serde_json::to_string(&rotation_tx).expect("serialise");
     let resp_rot = submit_tx(api_port, &rotation_json);
@@ -618,8 +661,8 @@ fn dis_002b_migration() {
     // If the record had changed address, /api/identity/qcb1pilot would return registered: false.
     eprintln!("[B-02] PASS: identity record still found at address {PILOT_ADDR}.");
 
-    // ── B-03: Verified tier and attestation records unchanged ─────────────────
-    eprintln!("\n[B-03] Verify Verified tier and attestation records unchanged");
+    // ── B-03: tier and attestation records unchanged by the rotation ──────────
+    eprintln!("\n[B-03] Verify tier and attestation records unchanged");
     let tier_after = identity_after["tier"].as_str().unwrap_or("null").to_string();
     let attcount_after = identity_after["attestation_count"].as_u64().unwrap_or(0);
     let attested_by_after = &identity_after["attested_by"];
@@ -761,7 +804,7 @@ fn dis_002b_migration() {
     // ── Summary ───────────────────────────────────────────────────────────────
     eprintln!();
     eprintln!("DIS-002B Path 1 PASS — all B-01..B-08 criteria verified:");
-    eprintln!("  B-01: Verified pilot identity migrated Key_A → Key_B");
+    eprintln!("  B-01: pilot identity migrated Key_A → Key_B");
     eprintln!("  B-02: Identity ID and account address unchanged");
     eprintln!("  B-03: tier={tier_before}, attestation_count={attcount_after} — both unchanged");
     eprintln!("  B-04: nonce={nonce_after}, balance decreased by gas fees");
@@ -770,7 +813,7 @@ fn dis_002b_migration() {
     eprintln!("  B-07: Replayed migration tx rejected");
     eprintln!("  B-08: Unauthorized rotation attempt rejected");
     eprintln!("  [+] All 4 nodes agree on state root {first_root}");
-    eprintln!("  [+] All 4 nodes show Verified tier after migration");
+    eprintln!("  [+] All 4 nodes show tier={tier_before} after migration");
     eprintln!();
     eprintln!("Per CLAUDE.md: mark milestone ✅ only after confirmed passing on");
     eprintln!("developer machine (Windows/MINGW64): git pull && cargo build -p chain-forge-node");
