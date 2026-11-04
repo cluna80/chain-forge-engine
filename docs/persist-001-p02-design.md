@@ -4,7 +4,7 @@
 **Closes (when implemented and Windows-confirmed):** H0-3b. **Also addresses:** KNOWN_ISSUES §9 (cost) and §11 (torn files; fixed by #48).
 **Not in scope:** §13 (history-dependent roots after deletions), the API bind-failure change, consensus policy (H0-11B).
 
-## Implementation status (2026-11-02, main `3ebcfcd`)
+## Implementation status (2026-11-02, main `3ebcfcd`; rows marked [2026-11-03] updated at `main` `6aa603f`)
 
 | Memo item | Status |
 | --- | --- |
@@ -13,16 +13,16 @@
 | Strict migration of pre-H0-3 directories | **Done** (L1–L5); a missing or damaged legacy file is `Fatal` |
 | D1 persist before the next height; a failed write halts consensus | **Done** (PR #41 path, unchanged) |
 | D2 two generations, never destroy the last valid one | **Done** |
-| D3 `--reset-data` | **NOT implemented.** No message refers to it; they say "start with a clean data directory" |
+| D3 `--reset-data` | **NOT implemented; DEFERRED (owner, 2026-11-03):** no automatic or shortcut recovery. Messages say "start with a clean data directory". |
 | D4 embedded database | Deferred |
 | D5 `format_version` (no downgrade) | **Done**; a manifest without it is refused |
 | D6 guard with no chain state is fatal | **Done, with one refinement:** only if the guard last signed above height 0 (a validator may vote on the first block before its first commit) |
 | Guard ahead of the state | **Done:** the node abstains from signing and resumes when `commit_block` applies a block at the guard height; it no longer exits |
 | Manifest `chain_id`, `genesis_hash` (`compute_genesis_hash`, the H0-8 definition), `state_root`; the restored state must reproduce the root | **Done** |
 | Directory fsync (`snapshots/`, the signing guard's directory), real Windows flush | **Done**; the Windows flush is shown to *succeed* only, power-loss durability is untested |
-| Unguarded proposal signing | **Open follow-on** (section 14) |
-| Retry for transient sharing violations | **Not added, by decision;** needs its own Windows-validated decision (section 15) |
-| **P-02b: journal + checkpoints (cost)** | **NOT started.** Every block still rewrites and fsyncs all eight files; the cost is unchanged (section 16) |
+| Unguarded proposal signing | **[2026-11-03] Implemented (#65):** the signed proposal is recorded in the signing guard and the guard is durable before the proposal is sent; applies to v1 too; old guard files load unchanged. **Owner: accepted conditionally (2026-11-03), subject to regression validation**; closure of H0-3b still needs the Windows re-runs listed in the ROADMAP. |
+| Retry for transient sharing violations | **Decided (owner, 2026-11-03): fail closed on persistence errors; automatic retries are deferred.** (See KNOWN_ISSUES PERSIST-HALT-1: the "fail closed" part is not yet true on the multi-node path.) |
+| **P-02b: journal + checkpoints (cost)** | **[2026-11-03] Implemented as storage format 2, DEFAULT OFF and test-only (#64, #65):** two append-only hash-chained logs plus a small generation. The default storage (v1) is unchanged and still rewrites every file each block. Measurements, the integration design and the acceptance plan: PR #62 (open) and the ROADMAP PERSIST-001 / H0-3b row. |
 
 Evidence: PR #48; KNOWN_ISSUES P02A-W1 (Windows validation, with one unexplained C-01 failure); the ROADMAP rows for H0-3 and PERSIST-001 / H0-3b. H0-3 stays ◐ until a power-loss durability test is run.
 

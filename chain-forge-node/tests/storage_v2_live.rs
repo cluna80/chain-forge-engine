@@ -1,6 +1,7 @@
 //! PERSIST-001 P-02b PR 2 — storage format 2: live four-node crash and restart acceptance (EXPERIMENTAL).
 //!
-//! Four real node processes, every one started with `--storage-v2-experimental` (default OFF).
+//! Four real node processes. The `v2_*` tests start every node with `--storage-v2-experimental` (default OFF); the `v1_*`
+//! tests run the SAME scenarios on the default (production) storage with no flag, for the three boundaries v1 has.
 //!
 //! V2L-1  a node ABORTS at each v2 commit boundary (after the block-log append, after the validator-history append,
 //!        after the generation files, after the manifest, after CURRENT): the process dies with no cleanup; on
@@ -123,6 +124,10 @@ impl Node {
     fn kill9(&mut self) { if let Some(mut c) = self.child.take() { let _ = c.kill(); let _ = c.wait(); } }
 }
 
+thread_local! { static V2: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+fn is_v2() -> bool { V2.with(|v| v.get()) }
+fn fmt_line() -> &'static str { if is_v2() { "storage format: v2" } else { "storage format: v1 (default)" } }
+
 fn spawn(name: &'static str, data: &PathBuf, log: &PathBuf, p2p: u16, peers: &[u16], envs: &[(&str, &str)]) -> Node {
     std::fs::create_dir_all(data).unwrap();
     let api = free_port();
@@ -130,7 +135,8 @@ fn spawn(name: &'static str, data: &PathBuf, log: &PathBuf, p2p: u16, peers: &[u
     let mut cmd = Command::new(node_bin());
     cmd.args(["--genesis", genesis().to_str().unwrap(), "--validator", &format!("qcb1{name}"),
               "--key-file", key(name).to_str().unwrap(), "--data-dir", data.to_str().unwrap(),
-              "--api-port", &api.to_string(), "--p2p-port", &p2p.to_string(), "--storage-v2-experimental"]);
+              "--api-port", &api.to_string(), "--p2p-port", &p2p.to_string()]);
+    if is_v2() { cmd.arg("--storage-v2-experimental"); }
     for q in peers { cmd.args(["--bootstrap", &format!("/ip4/127.0.0.1/tcp/{q}")]); }
     for (k, v) in envs { cmd.env(k, v); }
     let child = cmd.stdout(f.try_clone().unwrap()).stderr(f).stdin(Stdio::null()).spawn().unwrap_or_else(|e| panic!("spawn {name}: {e}"));
@@ -184,10 +190,19 @@ const CRASH_AT: u64 = 6;
 
 /// V2L-1
 #[test]
-fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
-    for point in ["block_log_appended", "hvs_log_appended", "gen_files_written", "manifest_written", "current_written"] {
+fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() { boundary_crashes(true) }
+
+/// The same scenario on the DEFAULT storage (v1), for the boundaries its commit has (generation files, manifest, `CURRENT`).
+#[test]
+fn v1_a_node_aborted_at_each_commit_boundary_recovers_and_converges() { boundary_crashes(false) }
+
+fn boundary_crashes(v2: bool) {
+    V2.with(|c| c.set(v2));
+    let points: &[&str] = if v2 { &["block_log_appended", "hvs_log_appended", "gen_files_written", "manifest_written", "current_written"] }
+                          else { &["gen_files_written", "manifest_written", "current_written"] };
+    for &point in points {
         println!("\n── V2L-1: Dave aborts at {point} while committing height {CRASH_AT} ──");
-        let base = std::env::temp_dir().join(format!("cf-v2l1-{}-{point}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("cf-{}l1-{}-{point}", if v2 { "v2" } else { "v1" }, std::process::id()));
         let (mut nodes, p2p) = start_cluster(&base, &[("CF_FAULT_V2_CRASH_POINT", point), ("CF_FAULT_V2_CRASH_HEIGHT", &CRASH_AT.to_string())]);
         let feeder = Feeder::start(nodes[0].api);
         // Dave dies by himself
@@ -201,7 +216,7 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
         assert!(!status.success(), "{point}: Dave must have been aborted, got {status:?}");
         assert!(read_log(&nodes[3].log).contains(&format!("crashing the process at {point}")), "{point}: Dave's log does not show the injected crash");
         // the format was selected and logged
-        for n in &nodes { assert!(read_log(&n.log).contains("storage format: v2"), "{}: log does not name the storage format", n.name); }
+        for n in &nodes { assert!(read_log(&n.log).contains(fmt_line()), "{}: log does not name the storage format", n.name); }
         // survivors keep finalizing (3 of 4)
         let surv: Vec<u16> = nodes[..3].iter().map(|n| n.api).collect();
         assert!(wait_heights(&surv, CRASH_AT + 4, Duration::from_secs(90)), "{point}: survivors did not advance without Dave");
@@ -211,7 +226,7 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
         assert!(wait_port(dave.api, Duration::from_secs(30)), "{point}: restarted Dave's API never opened (lock or recovery failure)");
         std::thread::sleep(Duration::from_secs(1));
         let log = read_log(&dave.log);
-        assert!(log.contains("storage format: v2"), "{point}: restarted Dave did not log the storage format");
+        assert!(log.contains(fmt_line()), "{point}: restarted Dave did not log the storage format");
         assert!(log.contains("resumed from persisted state") && !log.contains("starting from genesis"), "{point}: Dave did not resume from persisted state\n{log}");
         let want = if point == "current_written" { CRASH_AT } else { CRASH_AT - 1 };
         let got = resumed_height(&dave.log).expect("resumed height in log");
@@ -239,8 +254,15 @@ fn v2_a_node_aborted_at_each_commit_boundary_recovers_and_converges() {
 
 /// V2L-2
 #[test]
-fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() {
-    let base = std::env::temp_dir().join(format!("cf-v2l2-{}", std::process::id()));
+fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() { sigkill_rounds(true) }
+
+/// The same SIGKILL scenario on the DEFAULT storage (v1; there is no directory lock to test).
+#[test]
+fn v1_sigkill_restart_at_multiple_heights() { sigkill_rounds(false) }
+
+fn sigkill_rounds(v2: bool) {
+    V2.with(|c| c.set(v2));
+    let base = std::env::temp_dir().join(format!("cf-{}l2-{}", if v2 { "v2" } else { "v1" }, std::process::id()));
     let (mut nodes, _p2p) = start_cluster(&base, &[]);
     let feeder = Feeder::start(nodes[0].api);
     let mut last_root = String::new();
@@ -259,18 +281,20 @@ fn v2_sigkill_restart_at_multiple_heights_and_the_directory_lock() {
         assert!(wait_port(back.api, Duration::from_secs(30)), "round {round}: restarted {name} API never opened");
         std::thread::sleep(Duration::from_secs(1));
         let text = read_log(&back.log);
-        assert!(text.contains("storage format: v2") && text.contains("resumed from persisted state") && !text.contains("starting from genesis"),
+        assert!(text.contains(fmt_line()) && text.contains("resumed from persisted state") && !text.contains("starting from genesis"),
                 "round {round}: {name} did not resume on v2\n{text}");
         println!("   {name} resumed at height {:?} (killed at ~{at_kill})", resumed_height(&back.log));
         let target_h = height(nodes[0].api).unwrap();
         assert!(wait_heights(&[back.api], target_h, Duration::from_secs(120)), "round {round}: {name} did not catch up");
         // the OS lock: a SECOND process on this running node's directory is refused
-        let mut second = spawn(name, &data, &log.with_file_name(format!("{name}-r{round}-dup.log")), free_port(), &peers, &[]);
-        let d = Instant::now() + Duration::from_secs(30);
-        let code = loop { if let Some(s) = second.child.as_mut().unwrap().try_wait().unwrap() { break s; } assert!(Instant::now() < d, "round {round}: a second process on a locked directory kept running"); std::thread::sleep(Duration::from_millis(200)); };
-        second.child = None;
-        assert!(!code.success(), "round {round}: duplicate process must exit non-zero");
-        assert!(read_log(&second.log).contains("cannot use the data directory in storage v2"), "round {round}: duplicate refused for the wrong reason");
+        if v2 {
+            let mut second = spawn(name, &data, &log.with_file_name(format!("{name}-r{round}-dup.log")), free_port(), &peers, &[]);
+            let d = Instant::now() + Duration::from_secs(30);
+            let code = loop { if let Some(s) = second.child.as_mut().unwrap().try_wait().unwrap() { break s; } assert!(Instant::now() < d, "round {round}: a second process on a locked directory kept running"); std::thread::sleep(Duration::from_millis(200)); };
+            second.child = None;
+            assert!(!code.success(), "round {round}: duplicate process must exit non-zero");
+            assert!(read_log(&second.log).contains("cannot use the data directory in storage v2"), "round {round}: duplicate refused for the wrong reason");
+        }
         nodes[victim] = back;
         let refs: Vec<&Node> = nodes.iter().collect();
         assert!(wait_heights(&all_ports(&nodes), target_h, Duration::from_secs(60)));

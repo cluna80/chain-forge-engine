@@ -7775,6 +7775,220 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// D1 / "a failed write halts consensus": when persisting block h fails, a validator must NOT sign anything at
+        /// h+1 (a vote or proposal for h+1 would be authorised while block h is not durable). Runs on both formats.
+        async fn persistence_failure_then_next_height(v2: bool) -> (Option<(u64, u32, u8)>, Option<(u64, u32, u8)>) {
+            let dir = std::env::temp_dir().join(format!("cf-pf-halt-{}-{}", v2, std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut n = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap();
+            n.signing_key = Some(ClassicalScheme.generate_keypair("qcb1carol").unwrap());
+            if v2 { n.set_storage_v2(true).unwrap(); }
+            n.set_data_dir(dir.clone()).unwrap();
+            let voters = ["qcb1alice", "qcb1bob", "qcb1dave"];
+            let mut drive = |n: &mut Node, h: u64| { let tx = n.block_payload(h).encode(); proposal(h, tx) };
+            let p0 = drive(&mut n, 0); deliver(&mut n, &p0, &voters).await;
+            assert!(dir.join("CURRENT").exists(), "block 0 persisted normally");
+            let p1 = drive(&mut n, 1);
+            crate::persistence::fault::arm("manifest_written");           // persisting block 1 fails with an I/O-style error
+            deliver(&mut n, &p1, &voters).await;
+            crate::persistence::fault::disarm();
+            let after_failure = n.sign_guard.last;                        // what carol had signed up to the failed block
+            let p2 = drive(&mut n, 2); deliver(&mut n, &p2, &voters).await; // the network moves on to height 2
+            let after_next = n.sign_guard.last;
+            let _ = std::fs::remove_dir_all(&dir);
+            (after_failure, after_next)
+        }
+
+        /// KNOWN FAILURE (KNOWN_ISSUES PERSIST-HALT-1, fix scoped for PR B): every `commit_block` caller on the multi-node path only
+        /// logs the error, so the validator keeps signing at h+1 after block h failed to persist. Run with `--ignored`.
+        #[tokio::test]
+        #[ignore = "known failure PERSIST-HALT-1: consensus does not halt after a persistence error; fix is in PR B"]
+        async fn a_persistence_failure_stops_the_validator_signing_at_the_next_height_v1() {
+            let (a, b) = persistence_failure_then_next_height(false).await;
+            assert!(a.map_or(false, |l| l.0 == 1), "carol signed at height 1 before the failure: {a:?}");
+            assert!(b.map_or(true, |l| l.0 <= 1), "carol must not sign at height 2 after a persistence failure at height 1; guard shows {b:?}");
+        }
+
+        /// KNOWN FAILURE (KNOWN_ISSUES PERSIST-HALT-1, fix scoped for PR B): every `commit_block` caller on the multi-node path only
+        /// logs the error, so the validator keeps signing at h+1 after block h failed to persist. Run with `--ignored`.
+        #[tokio::test]
+        #[ignore = "known failure PERSIST-HALT-1: consensus does not halt after a persistence error; fix is in PR B"]
+        async fn a_persistence_failure_stops_the_validator_signing_at_the_next_height_v2() {
+            let (a, b) = persistence_failure_then_next_height(true).await;
+            assert!(a.map_or(false, |l| l.0 == 1), "carol signed at height 1 before the failure: {a:?}");
+            assert!(b.map_or(true, |l| l.0 <= 1), "carol must not sign at height 2 after a persistence failure at height 1; guard shows {b:?}");
+        }
+
+        // ══ H0-3b evidence (PR A): v2 loader refusals, I/O failure injection, model-based commit/crash/restart ══════════
+        fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for e in std::fs::read_dir(src).unwrap() {
+                let e = e.unwrap(); let to = dst.join(e.file_name());
+                if e.path().is_dir() { copy_dir(&e.path(), &to) } else { std::fs::copy(e.path(), to).unwrap(); }
+            }
+        }
+        fn current_gen_dir(dir: &std::path::Path) -> std::path::PathBuf {
+            dir.join("snapshots").join(std::fs::read_to_string(dir.join("CURRENT")).unwrap().trim())
+        }
+
+        /// The v2 loader refuses every kind of damaged, foreign or ambiguous generation, and never falls back to an older
+        /// generation or to genesis. (The small files and the manifest go through the loader shared with v1; the layout
+        /// classification and the descriptor are v2-specific.)
+        #[tokio::test]
+        async fn v2_loader_refuses_damaged_foreign_or_inconsistent_generations() {
+            let base = v2_tmp("loader-base"); let mut n = v2_node(&base).await; let mut nonce = 0;
+            for h in 0..6 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            let ident = n.snapshot_identity(); drop(n);
+            let case = |tag: &str| { let d = v2_tmp(&format!("loader-{tag}")); copy_dir(&base, &d); d };
+            let refused = |d: std::path::PathBuf, what: &'static str| async move {
+                let r = v2_node(&d).await.load_persisted_state();
+                assert!(is_fatal(&r), "{what}: must be Fatal, got {}", match &r { PersistStartup::Fresh => "Fresh".into(), PersistStartup::Restored { height, .. } => format!("Restored at {height}"), _ => "?".into() });
+                let _ = std::fs::remove_dir_all(&d);
+            };
+            // sanity: the untouched copy restores
+            { let d = case("ok"); assert_eq!(restart_height(v2_node(&d).await.load_persisted_state()), 5); let _ = std::fs::remove_dir_all(&d); }
+            // 1. a small file changed (hash mismatch)
+            // (a) one byte appended: the SIZE check catches it. (b) one letter changed in place, same size and still valid JSON:
+            // only the SHA-256 check can catch it, and the restored state would otherwise load.
+            { let d = case("tamper"); let f = current_gen_dir(&d).join("identity.json"); let mut b = std::fs::read(&f).unwrap(); b.push(b' '); std::fs::write(&f, b).unwrap(); refused(d, "a small file with an appended byte").await; }
+            { let d = case("tamper-same-size"); let g = current_gen_dir(&d);
+              let name = crate::storage_v2::SMALL_FILES.iter().find(|n| { let t = std::fs::read_to_string(g.join(n)).unwrap(); t.contains("qcb1alice") }).expect("a small file names qcb1alice");
+              let f = g.join(name); let t = std::fs::read_to_string(&f).unwrap(); let at = t.find("qcb1alice").unwrap() + 8;      // the final 'e'
+              let mut b = t.into_bytes(); let before = b.len(); b[at] = b'f'; assert_eq!(b.len(), before);
+              std::fs::write(&f, b).unwrap(); refused(d, "a same-size, still-valid edit of a small file (SHA-256 check)").await; }
+            // 2. a small file missing
+            { let d = case("missing"); std::fs::remove_file(current_gen_dir(&d).join("agents.json")).unwrap(); refused(d, "a missing small file").await; }
+            // 3. manifest damaged, 4. manifest missing
+            { let d = case("mgarbage"); std::fs::write(current_gen_dir(&d).join("manifest.json"), b"{ not json").unwrap(); refused(d, "a damaged manifest").await; }
+            { let d = case("mgone"); std::fs::remove_file(current_gen_dir(&d).join("manifest.json")).unwrap(); refused(d, "a missing manifest").await; }
+            // 5. CURRENT names a generation that does not exist
+            { let d = case("curmissing"); std::fs::write(d.join("CURRENT"), "gen-999999").unwrap(); refused(d, "CURRENT pointing at a missing generation").await; }
+            // 6. unknown future format_version, and a manifest without one
+            for (tag, v) in [("fv3", Some(3u64)), ("fvnone", None)] {
+                let d = case(tag); let mp = current_gen_dir(&d).join("manifest.json");
+                let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+                match v { Some(x) => { m["format_version"] = serde_json::json!(x); } None => { m.as_object_mut().unwrap().remove("format_version"); } }
+                std::fs::write(&mp, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+                refused(d, "an unknown or missing format_version").await;
+            }
+            // 7. valid hashes but a state root that the restored state does not reproduce; 8. state.json height != manifest height
+            for (tag, root, height) in [("badroot", "ab".repeat(32), 5u64), ("badheight", ident_root(&base), 4)] {
+                let d = case(tag); let g = current_gen_dir(&d);
+                let mut files: Vec<(&str, Vec<u8>)> = crate::storage_v2::SMALL_FILES.iter().map(|f| (*f, std::fs::read(g.join(f)).unwrap())).collect();
+                files.push((crate::storage_v2::DESCRIPTOR_FILE, std::fs::read(g.join(crate::storage_v2::DESCRIPTOR_FILE)).unwrap()));
+                crate::persistence::write_snapshot_format(&d, height, &files, &ident, &root, crate::persistence::FORMAT_VERSION_V2).unwrap();
+                refused(d, "a generation whose root or height disagrees with its contents").await;
+            }
+            // 9. a data directory written under another genesis
+            { let d = case("foreign"); let mut f = Node::new(GENESIS, None).await.unwrap(); f.set_storage_v2(true).unwrap(); f.set_data_dir(d.clone()).unwrap();
+              assert!(is_fatal(&f.load_persisted_state()), "another genesis must be refused"); drop(f); let _ = std::fs::remove_dir_all(&d); }
+            // 10. the NEWEST generation is damaged while the previous one is valid: refuse, never fall back
+            { let d = case("nofallback"); let f = current_gen_dir(&d).join("state.json"); let mut b = std::fs::read(&f).unwrap(); b[10] ^= 1; std::fs::write(&f, b).unwrap();
+              assert!(std::fs::read_dir(d.join("snapshots")).unwrap().count() >= 2, "an older generation exists");
+              refused(d, "a damaged newest generation (no silent fallback)").await; }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        /// The state root recorded in the current generation's manifest (used to build a generation that is wrong in one field only).
+        fn ident_root(dir: &std::path::Path) -> String {
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(current_gen_dir(dir).join("manifest.json")).unwrap()).unwrap();
+            m["state_root"].as_str().unwrap().to_string()
+        }
+
+        /// An I/O error at ANY commit boundary is returned by `persist_state` (never swallowed), and a later persist after the
+        /// failure succeeds and leaves a restartable directory. Both formats (v1 has three of the points).
+        #[tokio::test]
+        async fn persist_state_returns_every_injected_io_failure_on_both_formats() {
+            for v2 in [false, true] {
+                let points: &[&'static str] = if v2 { &["block_log_appended", "hvs_log_appended", "gen_files_written", "manifest_written", "current_written"] }
+                                              else { &["gen_files_written", "manifest_written", "current_written"] };
+                let dir = v2_tmp(&format!("iofail-{v2}")); let mut n = liveness_node(1_000_000).await;
+                if v2 { n.set_storage_v2(true).unwrap(); }
+                n.set_data_dir(dir.clone()).unwrap(); let mut nonce = 0;
+                for h in 0..4 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+                for &p in points {
+                    crate::persistence::fault::arm(p);
+                    let r = n.persist_state();
+                    crate::persistence::fault::disarm();
+                    assert!(r.as_ref().err().map_or(false, |e| e.contains(&format!("injected crash after {p}"))), "v2={v2} {p}: expected the injected error, got {r:?}");
+                    assert!(n.persist_state().is_ok(), "v2={v2} {p}: the next persist succeeds");
+                }
+                drop(n);
+                let mut r = liveness_node(1_000_000).await; if v2 { r.set_storage_v2(true).unwrap(); } r.set_data_dir(dir.clone()).unwrap();
+                assert_eq!(restart_height(r.load_persisted_state()), 3, "v2={v2}: restartable after every failure");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// A real I/O error in the middle of a log append (23 torn bytes on disk): `persist_state` fails, and a restart finds
+        /// the last committed block.
+        #[tokio::test]
+        async fn v2_log_append_io_error_fails_persist_and_restart_recovers() {
+            let dir = v2_tmp("append-io"); let mut n = v2_node(&dir).await; let mut nonce = 0;
+            for h in 0..5 { commit_with_txs(&mut n, h, 1, &mut nonce).await; }
+            let p = next_proposal(&mut n, 5, 1, &mut nonce);
+            crate::blocklog::FAIL_APPEND_AFTER.with(|c| c.set(Some(23)));
+            deliver_lenient(&mut n, &p).await;                        // commit_block's persist fails with the injected error
+            drop(n);                                                  // no retry (by decision): the node stops
+            let mut r = v2_node(&dir).await;
+            assert_eq!(restart_height(r.load_persisted_state()), 4, "the append never completed, so block 5 was not committed");
+            deliver(&mut r, &p, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"]).await;
+            drop(r);
+            assert_eq!(restart_height(v2_node(&dir).await.load_persisted_state()), 5);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Model-based test (design memo section 9, item 4): random sequences of commit, crash-at-a-boundary and restart,
+        /// checked against a reference model ("the last committed block") AND a reference node that never crashes (state
+        /// roots must agree at every height). Runs on both formats; deterministic seeds.
+        async fn model_run(v2: bool, seed: u64, steps: usize) {
+            let dir = v2_tmp(&format!("model-{v2}-{seed}"));
+            let open = |dir: std::path::PathBuf| async move { let mut n = liveness_node(1_000_000).await; if v2 { n.set_storage_v2(true).unwrap(); } n.set_data_dir(dir).unwrap(); n };
+            let voters = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+            let points: Vec<&'static str> = if v2 { vec!["block_log_appended", "hvs_log_appended", "gen_files_written", "manifest_written", "current_written"] }
+                                            else { vec!["gen_files_written", "manifest_written", "current_written"] };
+            let mut node = open(dir.clone()).await; let mut reference = liveness_node(1_000_000).await;
+            let (mut nonce, mut next_h, mut committed): (u64, u64, Option<u64>) = (0, 0, None);
+            let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+            let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+            for step in 0..steps {
+                match rnd() % 4 {
+                    0 | 1 => {
+                        let p = next_proposal(&mut node, next_h, 2, &mut nonce);
+                        deliver(&mut node, &p, &voters).await; deliver(&mut reference, &p, &voters).await;
+                        committed = Some(next_h); next_h += 1;
+                    }
+                    2 => {
+                        let point = points[(rnd() as usize) % points.len()];
+                        let p = next_proposal(&mut node, next_h, 2, &mut nonce);
+                        crate::persistence::fault::arm(point); deliver_lenient(&mut node, &p).await; crate::persistence::fault::disarm();
+                        drop(node);
+                        node = open(dir.clone()).await;
+                        let r = node.load_persisted_state();
+                        let landed = point == "current_written";
+                        match (landed, committed) {
+                            (true, _) => assert_eq!(restart_height(r), next_h, "seed {seed} step {step}: crash after {point} must keep the new block"),
+                            (false, Some(c)) => assert_eq!(restart_height(r), c, "seed {seed} step {step}: crash at {point} must roll back to {c}"),
+                            (false, None) => assert!(matches!(r, PersistStartup::Fresh), "seed {seed} step {step}: nothing was committed, so a restart is fresh"),
+                        }
+                        if !landed { deliver(&mut node, &p, &voters).await; }          // the same block is committed again
+                        deliver(&mut reference, &p, &voters).await;
+                        committed = Some(next_h); next_h += 1;
+                    }
+                    _ => {
+                        drop(node); node = open(dir.clone()).await;
+                        let r = node.load_persisted_state();
+                        match committed { Some(c) => assert_eq!(restart_height(r), c, "seed {seed} step {step}: clean restart"), None => assert!(matches!(r, PersistStartup::Fresh)) }
+                    }
+                }
+                if committed.is_some() { assert_eq!(node.live_state_root(), reference.live_state_root(), "seed {seed} step {step}: state root diverged from the never-crashing reference"); }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        #[tokio::test]
+        async fn model_based_commit_crash_restart_v1() { for seed in 1..=6 { model_run(false, seed, 14).await; } }
+        #[tokio::test]
+        async fn model_based_commit_crash_restart_v2() { for seed in 1..=6 { model_run(true, seed, 14).await; } }
+
         /// Regression (v1 nodes, default storage): the proposal guard added in PR 2 must load guard files written
         /// before it, leave them untouched until the node signs, then survive a restart and refuse conflicting proposals.
         #[tokio::test]

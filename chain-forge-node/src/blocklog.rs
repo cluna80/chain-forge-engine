@@ -144,6 +144,11 @@ fn segments(dir: &Path) -> std::io::Result<Vec<(u64, PathBuf)>> {
 /// First segment's first height in `dir`, if any segment exists (used to classify a log-only directory).
 pub fn first_segment_height(dir: &Path) -> std::io::Result<Option<u64>> { Ok(segments(dir)?.first().map(|s| s.0)) }
 
+/// Test-only I/O failure injection: the NEXT `append` writes only this many bytes of its record, syncs, and returns an
+/// I/O error (what a full disk or a failing device leaves behind).
+#[cfg(test)]
+thread_local! { pub(crate) static FAIL_APPEND_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+
 pub struct BlockLog {
     dir: PathBuf,
     kind: u8,
@@ -232,6 +237,11 @@ impl BlockLog {
             fsync_dir(&self.dir)?;
         }
         let (f, n) = self.cur.as_mut().unwrap();
+        #[cfg(test)]
+        if let Some(k) = FAIL_APPEND_AFTER.with(|c| c.take()) {
+            f.write_all(&bytes[..k.min(bytes.len())])?; f.sync_data()?;
+            return Err(LogError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected I/O error during append")));
+        }
         f.write_all(&bytes)?;
         f.sync_data()?;
         *n += 1;
@@ -504,6 +514,42 @@ mod tests {
         std::fs::write(d.join(seg_name(0)), &bytes).unwrap();
         assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_err());
         assert!(rec(&d, Some(Tail { height: 2, hash: hh }), 100).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An I/O error in the middle of an append is an error, leaves the in-memory tail unchanged, and the torn bytes are
+    /// removed by recovery against the committed tail.
+    #[test]
+    fn a_failed_append_is_an_error_and_recovery_removes_the_torn_bytes() {
+        let d = tmp("failappend"); let tails = fill(&d, 4, 100);
+        let seg = first_seg(&d); let before = std::fs::read(&seg).unwrap();
+        FAIL_APPEND_AFTER.with(|c| c.set(Some(23)));
+        let mut l = BlockLog::recover(&d, K, anchor(), 0, 100, Some(tails[3].clone())).unwrap();
+        assert!(matches!(l.append(4, &payload(4)), Err(LogError::Io(_))));
+        assert_eq!(l.tail(), Some(&tails[3]), "the in-memory tail did not advance");
+        assert_eq!(std::fs::read(&seg).unwrap().len(), before.len() + 23, "23 torn bytes are on disk");
+        drop(l);
+        let l2 = rec(&d, Some(tails[3].clone()), 100).unwrap();
+        assert_eq!(l2.tail(), Some(&tails[3]));
+        assert_eq!(std::fs::read(&seg).unwrap(), before, "recovery cut the file back to the committed tail");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// KNOWN FAILURE (KNOWN_ISSUES PERSIST-APPEND-1, fix scoped for PR B): after a failed append, a LATER append on the same
+    /// handle writes after the torn bytes and buries them, so the log no longer verifies. Today this is safe only because
+    /// a persistence error halts the node (which it does not yet: PERSIST-HALT-1). Desired: the next append is refused or
+    /// the file is cut back, so the log always verifies.
+    #[test]
+    #[ignore = "known failure PERSIST-APPEND-1: a failed append can be buried by a later append; fix is in PR B"]
+    fn a_failed_append_followed_by_another_append_must_not_leave_an_unverifiable_log() {
+        let d = tmp("buried"); let tails = fill(&d, 3, 100);
+        let mut l = BlockLog::recover(&d, K, anchor(), 0, 100, Some(tails[2].clone())).unwrap();
+        FAIL_APPEND_AFTER.with(|c| c.set(Some(23)));
+        assert!(l.append(3, &payload(3)).is_err());
+        let second = l.append(3, &payload(3));
+        if second.is_ok() {
+            assert!(BlockLog::replay(&d, K, anchor(), 0, |_, _| {}).is_ok(), "the log must still verify after a later successful append");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
