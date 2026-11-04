@@ -169,15 +169,15 @@ All `*_live` tests below follow the CLAUDE.md rule: ✅ only after Windows confi
 
 Method: tests inserted into a throwaway worktree of `origin/main@baf7345` (no production edit, no golden baseline touched), run in the Linux sandbox with `-j 2`.
 Source: `docs/state-commit-2/scratch-tests/*.rs.txt`. Captured output: `docs/state-commit-2/results/`.
-**Sandbox only. Per CLAUDE.md nothing below is ✅ until Windows confirms** (command in `docs/state-commit-2/README.md`).
+**Windows reproduction (owner, BossKing MINGW64, 3 node runs + 1 executor run) matched the sandbox output line for line; see `docs/state-commit-2/results/windows-bossking.txt`.** These tests *characterize defects*; reproducing them confirms the defects exist, not that anything is fixed. No fix is ✅ (command in `docs/state-commit-2/README.md`).
 
 | ID | Claim | Source reading said | Experiment | Status |
 |---|---|---|---|---|
-| E1 | Account tier mirror stale after epoch lapse | stale (§4) | Genesis validator Alice: identity tier `Provisional` after `advance_epoch_to` + `propose_block` (registry sweep ran); account charm tier still `Verified`; leaf bytes and state root **unchanged**. 3 identical runs | **Confirmed in sandbox** |
-| E2 | `validators.json` edited (4 `bonded_uqcb` fields +123,456,789) with manifest SHA-256/size recomputed is accepted | accepted (SC2-3) | `is_restored() == true`; Alice bond 1,000,000 → 124,456,789; state root identical. 3 identical runs | **Confirmed in sandbox** |
-| E3 | `identity.json` edited (4 `tier` fields → `Established`) with manifest recomputed is accepted | accepted | `is_restored() == true`; Alice tier `Verified` → `Established`; root identical. 3 runs | **Confirmed in sandbox** |
-| E4 | Agent `by_address` index is trusted from disk | index trusted (row 10) | `by_address` **is serialized**. A corrupted entry restores without error; `get_by_address("qcb1agent1")` → `Err("agent nonexistent not found")` while `get("a1")` succeeds. 3 runs | **Confirmed in sandbox** (index not rebuilt) |
-| E5 | No address/denom length limit | none found by grep | `execute_tx`: 300-byte address transfer **succeeded** (new account leaf 317 bytes); 100-byte denom **succeeded**; 70,000-byte address **succeeded**. 1 run | **Confirmed at executor level.** The HTTP layer caps the body by `max_tx_bytes` (`api.rs ~183`, 65,536 in shipped templates). Other ingress (gossip, direct block proposal) was not tested |
+| E1 | Account tier mirror stale after epoch lapse | stale (§4) | Genesis validator Alice: identity tier `Provisional` after `advance_epoch_to` + `propose_block` (registry sweep ran); account charm tier still `Verified`; leaf bytes and state root **unchanged**. 3 identical runs | **Confirmed in sandbox and on Windows** |
+| E2 | `validators.json` edited (4 `bonded_uqcb` fields +123,456,789) with manifest SHA-256/size recomputed is accepted | accepted (SC2-3) | `is_restored() == true`; Alice bond 1,000,000 → 124,456,789; state root identical. 3 identical runs | **Confirmed in sandbox and on Windows** |
+| E3 | `identity.json` edited (4 `tier` fields → `Established`) with manifest recomputed is accepted | accepted | `is_restored() == true`; Alice tier `Verified` → `Established`; root identical. 3 runs | **Confirmed in sandbox and on Windows** |
+| E4 | Agent `by_address` index is trusted from disk | index trusted (row 10) | `by_address` **is serialized**. A corrupted entry restores without error; `get_by_address("qcb1agent1")` → `Err("agent nonexistent not found")` while `get("a1")` succeeds. 3 runs | **Confirmed in sandbox and on Windows** (index not rebuilt) |
+| E5 | No address/denom length limit | none found by grep | `execute_tx`: 300-byte address transfer **succeeded** (new account leaf 317 bytes); 100-byte denom **succeeded**; 70,000-byte address **succeeded**. 1 run | **Confirmed at executor level, sandbox and Windows.** The HTTP layer caps the body by `max_tx_bytes` (`api.rs ~183`, 65,536 in shipped templates). Other ingress (gossip, direct block proposal) was not tested |
 
 Not demonstrated: any cross-node exploit; that E2/E3 survive the signing guard or p2p sync; anything on Windows.
 E2/E3 need write access to the data directory. They show the manifest hash is an integrity check, not an authenticity check.

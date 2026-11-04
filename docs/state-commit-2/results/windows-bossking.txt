@@ -1,0 +1,7 @@
+Windows (BossKing, MINGW64) run of docs/state-commit-2/run_scratch.sh, reported by owner 2026-11-04.
+Output identical to the sandbox lines in node-run1..3.txt and exec-run1.txt:
+executor: addr300_success=true new_acct_leaf_len=Some(317) denom100_success=true bob_leaf_len=Some(131) addr70000_success=true err3=None  (1 passed)
+node x3 (4 passed each): agent-index restored=true get_by_address=Err("agent nonexistent not found") get_by_id_ok=true;
+ identity-tamper restored=true Verified->Established root_equal=true;
+ validator-tamper restored=true 1000000->124456789 root_equal=true;
+ stale-tier identity=Provisional account_charm=Some("Verified") leaf_unchanged=true root_unchanged=true
