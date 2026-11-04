@@ -431,6 +431,13 @@ pub struct GenesisIdentity {
 /// before a Provisional identity becomes Verified. Whitepaper Section 4 /
 /// Identity Pilot Design Section 3.1: "provisional target: 3 attestations."
 /// Also the minimum any non-devnet genesis may configure.
+/// O8 (STATE-COMMIT-2) size bounds. Applied at genesis validation and mempool
+/// admission only; NOT enforced by the executor and NOT part of any encoding.
+/// Executor-level enforcement needs a commitment-profile decision (see docs/STATE-COMMIT-2-audit.md §14).
+pub const MAX_ADDRESS_BYTES: usize = 256;
+pub const MAX_DENOM_BYTES: usize = 64;
+pub const MAX_GENESIS_ROLE_BYTES: usize = 64;
+
 pub const DEFAULT_ATTESTATION_QUORUM: usize = 3;
 
 /// Upper bound on a configured quorum. A larger value is almost certainly a
@@ -852,6 +859,20 @@ impl GenesisConfig {
         }
         if self.genesis_accounts.is_empty() {
             errors.push("genesis_accounts is empty - chain cannot start".into());
+        }
+        for acct in &self.genesis_accounts {
+            if acct.address.is_empty() || acct.address.len() > MAX_ADDRESS_BYTES {
+                errors.push(format!(
+                    "genesis account {:?}: address length {} is outside 1..={} bytes",
+                    acct.label, acct.address.len(), MAX_ADDRESS_BYTES
+                ));
+            }
+            if acct.role.len() > MAX_GENESIS_ROLE_BYTES {
+                errors.push(format!(
+                    "genesis account {:?}: role length {} exceeds {} bytes",
+                    acct.label, acct.role.len(), MAX_GENESIS_ROLE_BYTES
+                ));
+            }
         }
 
         // Warn (not error) if PQC is enabled but max_tx_bytes may be too small.
@@ -1835,6 +1856,24 @@ mod tests {
         let cfg = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
         let errors = cfg.validate();
         assert!(errors.is_empty(), "clean genesis should have no errors: {errors:?}");
+    }
+
+    #[test]
+    fn o8_genesis_rejects_overlength_address_and_role_but_accepts_the_limits() {
+        let base = GenesisConfig::from_json(minimal_genesis_json()).unwrap();
+        let mut ok = base.clone();
+        ok.genesis_accounts[0].address = "a".repeat(MAX_ADDRESS_BYTES);
+        ok.genesis_accounts[0].role = "r".repeat(MAX_GENESIS_ROLE_BYTES);
+        assert!(!ok.validate().iter().any(|e| e.contains("length")), "limits are inclusive: {:?}", ok.validate());
+        let mut long_addr = base.clone();
+        long_addr.genesis_accounts[0].address = "a".repeat(MAX_ADDRESS_BYTES + 1);
+        assert!(long_addr.validate().iter().any(|e| e.contains("address length")));
+        let mut empty_addr = base.clone();
+        empty_addr.genesis_accounts[0].address = String::new();
+        assert!(empty_addr.validate().iter().any(|e| e.contains("address length")));
+        let mut long_role = base.clone();
+        long_role.genesis_accounts[0].role = "r".repeat(MAX_GENESIS_ROLE_BYTES + 1);
+        assert!(long_role.validate().iter().any(|e| e.contains("role length")));
     }
 
     #[test]
