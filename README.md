@@ -1,6 +1,6 @@
 # Qattice — Built by Chain Forge Engine
 
-**Qattice** is a sovereign Layer-1 blockchain built from scratch in Rust. Its distinguishing
+**Qattice** is a sovereign Layer-1 blockchain built from the Chain Forge Engine in Rust. Its distinguishing
 feature is personhood-weighted Byzantine Fault Tolerant consensus: voting power derives from
 verified human identity rather than capital or computation. The native token is **QCB**
 (QuarkCharmBit), fixed at 210,000,000 at genesis with no inflation. A Grand Challenge system
