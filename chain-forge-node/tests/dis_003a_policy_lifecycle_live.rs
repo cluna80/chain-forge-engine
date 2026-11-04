@@ -36,6 +36,9 @@ use std::{
 };
 
 use chain_forge_crypto::{MlDsaScheme, SchemeId, SignatureScheme, mldsa_tx_prehash};
+#[path = "common/live_genesis.rs"]
+mod live_genesis;
+
 use chain_forge_execution::{
     Transaction, TxBody, GuardianAuth,
     account_key_rotation_signing_bytes,
@@ -97,7 +100,10 @@ fn node_bin() -> PathBuf {
 }
 
 fn genesis_path() -> PathBuf {
-    manifest_dir().join("tests").join("devnet").join("genesis-dis003a.json")
+    // Patched once per process: the ML-DSA keys this test signs with are random per process (see common/live_genesis.rs).
+    static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    P.get_or_init(|| live_genesis::with_ml_dsa_keys(
+        &manifest_dir().join("tests").join("devnet").join("genesis-dis003a.json"), "dis003a", &[(PILOT_ADDR, SEED_A)])).clone()
 }
 
 fn key_file(label: &str) -> PathBuf {
