@@ -5746,6 +5746,9 @@ impl Node {
                 self.sign_guard.record(&vote, self.consensus.lock_state());
                 if let Err(e) = self.persist_sign_guard() {
                     error!(error = %e, "cannot persist signing state: vote withheld");
+                    // The guard is the consensus safety boundary: if it cannot be made durable this node cannot know that its
+                    // signing history is recorded, so it stops signing for the rest of the process (local, not a protocol penalty).
+                    self.latch_persistence_failure(&format!("signing guard write failed (vote at height {}): {e}", vote.height));
                     return;
                 }
                 // fault-injection builds only: die right after the vote's guard is durable, before it is sent
@@ -5951,6 +5954,7 @@ impl Node {
                     self.sign_guard.record_proposal(&proposal);
                     if let Err(e) = self.persist_sign_guard() {
                         error!(error = %e, "cannot persist signing state: proposal withheld");
+                        self.latch_persistence_failure(&format!("signing guard write failed (proposal at height {}): {e}", proposal.height));
                         return None;
                     }
                     // fault-injection builds only: die right after the proposal's guard is durable, before it is sent
@@ -8143,6 +8147,94 @@ mod tests {
             deliver(&mut n, &bad, &VOTERS3).await;
             assert!(n.persistence_failure().is_none(), "a rejected block is not a persistence failure");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ══ Signing-guard write failure latches the node (owner decision 2026-11-04) ═════════════════════════════
+        /// Make the next signing-guard write fail with a REAL I/O error: replace the `persist/` directory by a file.
+        fn break_guard_storage(dir: &std::path::Path) {
+            let p = dir.join("persist"); std::fs::rename(&p, dir.join("persist.aside")).unwrap(); std::fs::write(&p, b"not a directory").unwrap();
+        }
+        fn fix_guard_storage(dir: &std::path::Path) {
+            let p = dir.join("persist"); std::fs::remove_file(&p).unwrap(); std::fs::rename(dir.join("persist.aside"), &p).unwrap();
+        }
+
+        /// A failed guard write for a VOTE latches the node: nothing is sent, and no later vote, proposal, commit or tick works;
+        /// recovery needs a new process, which refuses an unusable data directory and otherwise re-verifies the guard.
+        #[tokio::test]
+        async fn a_failed_signing_guard_write_for_a_vote_latches_the_node_and_stops_all_signing() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("gw-vote-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                let p0 = next_block(&mut n, 0); deliver(&mut n, &p0, &VOTERS3).await;
+                assert!(n.persistence_failure().is_none(), "v2={v2}: healthy guard writes never latch");
+                assert_eq!(n.sign_guard.last, Some((0, 0, 2)), "v2={v2}: carol signed block 0");
+                break_guard_storage(&dir);
+                let p1 = next_block(&mut n, 1); deliver(&mut n, &p1, &VOTERS3).await;           // carol's first vote at height 1 cannot be recorded
+                let why = n.persistence_failure().map(str::to_string);
+                assert!(why.as_deref().map_or(false, |e| e.contains("signing guard write failed (vote at height 1)")), "v2={v2}: latched with the guard error, got {why:?}");
+                assert!(carol_votes(&n).iter().all(|v| v.height < 1), "v2={v2}: no vote of carol's at height 1 was accepted for sending");
+                assert!(!n.status.lock().unwrap().is_running);
+                let guard = n.sign_guard.last;
+                // every later signing / committing path refuses
+                let vote = Vote { vote_type: VoteType::Precommit, height: 1, round: 0, validator: ValidatorId("qcb1carol".into()), block_hash: Some(p1.block_hash.clone()), signature: vec![], scheme: "classical".into() };
+                n.cast_engine_vote(vote.clone()).await; assert_eq!(n.sign_guard.last, guard, "v2={v2}: no further vote recorded");
+                let prop = BlockProposal { height: 2, round: 0, proposer: ValidatorId("qcb1carol".into()), block_hash: BlockHash("h2".into()), parent_hash: BlockHash("p".into()), timestamp_ms: 0, tx_data: vec![], signature: vec![], pol_round: None };
+                assert!(n.sign_and_register_own_proposal(prop).await.is_none(), "v2={v2}: no proposal");
+                let mut sv = vote.clone(); n.sign_vote(&mut sv); assert!(sv.signature.is_empty(), "v2={v2}: no raw signature");
+                let cert = chain_forge_consensus::CommitCertificate { height: 1, round: 0, block_hash: p1.block_hash.clone(), precommits: vec![] };
+                assert!(n.commit_block(cert, &p1).await.is_err(), "v2={v2}: commits refused");
+                n.consensus_tick().await; n.drive_consensus().await;
+                assert_eq!(n.sign_guard.last, guard);
+                drop(n);                                                                         // the process stops
+                // a new process cannot run on the unusable directory...
+                let mut r = Node::new(GENESIS, Some("qcb1carol".into())).await.unwrap(); if v2 { r.set_storage_v2(true).unwrap(); }
+                assert!(r.set_data_dir(dir.clone()).is_err(), "v2={v2}: an unusable data directory is an error, never a silent memory-only start");
+                drop(r);
+                // ...and on the repaired one it re-verifies: the guard on disk holds block 0 only (the failed write never reached disk), the vote at height 1 was never sent
+                fix_guard_storage(&dir);
+                let mut r2 = carol_voting_node(&dir, v2).await;
+                let h = restart_height(r2.load_persisted_state());
+                assert!(h <= 1, "v2={v2}: restored a verified committed height, got {h}");
+                assert_eq!(r2.sign_guard.last.map(|l| l.0), Some(0), "v2={v2}: the guard on disk is the last one that was made durable");
+                assert!(r2.persistence_failure().is_none());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// The same for a PROPOSAL whose guard write fails.
+        #[tokio::test]
+        async fn a_failed_signing_guard_write_for_a_proposal_latches_the_node() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("gw-prop-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                let p0 = next_block(&mut n, 0); deliver(&mut n, &p0, &VOTERS3).await;
+                break_guard_storage(&dir);
+                let prop = BlockProposal { height: 1, round: 0, proposer: ValidatorId("qcb1carol".into()), block_hash: BlockHash("h1".into()), parent_hash: BlockHash("p".into()), timestamp_ms: 0, tx_data: vec![], signature: vec![], pol_round: None };
+                assert!(n.sign_and_register_own_proposal(prop.clone()).await.is_none(), "v2={v2}: the proposal is withheld");
+                assert!(n.persistence_failure().map_or(false, |e| e.contains("signing guard write failed (proposal at height 1)")), "v2={v2}: latched: {:?}", n.persistence_failure());
+                // and now nothing else signs either (a vote at height 1)
+                let vote = Vote { vote_type: VoteType::Prevote, height: 1, round: 0, validator: ValidatorId("qcb1carol".into()), block_hash: Some(BlockHash("h1".into())), signature: vec![], scheme: "classical".into() };
+                let before = n.sign_guard.last; n.cast_engine_vote(vote).await;
+                assert_eq!(n.sign_guard.last, before, "v2={v2}: no vote after a failed proposal guard write");
+                assert!(n.sign_and_register_own_proposal(prop).await.is_none());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// Successful signing and restart behaviour is unchanged: guard writes that succeed never latch, and the guard survives a restart.
+        #[tokio::test]
+        async fn successful_guard_writes_never_latch_and_survive_a_restart() {
+            for v2 in [false, true] {
+                let dir = v2_tmp(&format!("gw-ok-{v2}")); let mut n = carol_voting_node(&dir, v2).await;
+                for h in 0..3 { let p = next_block(&mut n, h); deliver(&mut n, &p, &VOTERS3).await; }
+                assert!(n.persistence_failure().is_none(), "v2={v2}");
+                assert_eq!(n.sign_guard.last, Some((2, 0, 2)));
+                assert!(n.status.lock().unwrap().height == 2);
+                drop(n);
+                let mut r = carol_voting_node(&dir, v2).await;
+                assert_eq!(restart_height(r.load_persisted_state()), 2);
+                assert_eq!(r.sign_guard.last, Some((2, 0, 2)), "v2={v2}: the guard was restored");
+                assert!(r.persistence_failure().is_none() && r.signing_abstaining_until().is_none());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
 
         /// Regression (v1 nodes, default storage): the proposal guard added in PR 2 must load guard files written

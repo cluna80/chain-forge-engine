@@ -374,3 +374,34 @@ fn guard_window_crashes(v2: bool) {
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+/// A node asked to use a data directory that cannot be used must STOP (it used to warn and run memory-only on the default
+/// storage, where a restarted validator would then sign with no signing guard and no committed state).
+#[test]
+fn v1_a_node_with_an_unusable_data_dir_refuses_to_start() { unusable_data_dir(false) }
+#[test]
+fn v2_a_node_with_an_unusable_data_dir_refuses_to_start() { unusable_data_dir(true) }
+
+fn unusable_data_dir(v2: bool) {
+    let base = std::env::temp_dir().join(format!("cf-baddir-{}-{}", if v2 { "v2" } else { "v1" }, std::process::id()));
+    let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let blocker = base.join("a-file"); std::fs::write(&blocker, b"x").unwrap();
+    let data = blocker.join("data");                       // a directory "inside" a file: cannot be created
+    let log = base.join("node.log");
+    let f = std::fs::File::create(&log).unwrap();
+    let mut cmd = Command::new(node_bin());
+    cmd.args(["--genesis", genesis().to_str().unwrap(), "--validator", "qcb1alice", "--key-file", key("alice").to_str().unwrap(),
+              "--data-dir", data.to_str().unwrap(), "--api-port", &free_port().to_string(), "--p2p-port", &free_port().to_string()]);
+    if v2 { cmd.arg("--storage-v2-experimental"); }
+    let mut child = cmd.stdout(f.try_clone().unwrap()).stderr(f).stdin(Stdio::null()).spawn().unwrap();
+    let d = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() { break s; }
+        if Instant::now() > d { let _ = child.kill(); panic!("the node kept running with an unusable data directory:\n{}", read_log(&log)); }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let text = read_log(&log);
+    assert!(!status.success(), "must exit non-zero, got {status:?}");
+    assert!(text.contains("FATAL") && !text.contains("running memory-only"), "the log must say FATAL and must not fall back to memory-only:\n{text}");
+    let _ = std::fs::remove_dir_all(&base);
+}
