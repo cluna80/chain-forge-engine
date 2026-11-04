@@ -1366,4 +1366,47 @@ mod tests {
         assert_eq!(restored.policy_generation, 0);
         assert_eq!(restored.recovery_policy.unwrap().policy_id, 0);
     }
+    // ── S1 parity corpus (recorded from chain-forge-engine @ 61e02c6 before any change) ─────────────────────────────
+    // For accounts with each Qattice-owned field set, the Merkle leaf bytes, the state root and the exact serialized JSON
+    // (field order included) must never change: they are consensus state / persisted state.
+    #[test]
+    fn s1_account_leaf_root_and_json_match_the_recorded_baseline() {
+        let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (r#"plain"#, r#"{}"#, r#"ex1a|3|none|uex=1000"#, r#"ecb20f8869facd5dca72115f6d12dc67d9f11e21e04e7e7721988468f7717e6d"#, r#"{"escrow":null,"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":null,"key_version":0,"recovery_policy":null,"policy_generation":0,"pending_recovery":null}"#),
+        (r#"pk"#, r#"{"public_key": [1, 2, 3, 4]}"#, r#"ex1a|3|none|uex=1000|pk=01020304"#, r#"224804cdf050b6f2ab75182ce2c206e9fe5b382c6a377a75d44b27ae4c65f2c0"#, r#"{"escrow":null,"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":[1,2,3,4],"key_version":0,"recovery_policy":null,"policy_generation":0,"pending_recovery":null}"#),
+        (r#"escrow"#, r#"{"escrow": {"job_id": "j1", "agent_wallet": "w", "funding_source": "f"}}"#, r#"ex1a|3|none|uex=1000|escrow={"job_id":"j1","agent_wallet":"w","funding_source":"f"}"#, r#"19048679b20477f9c43ec90edd89486434bf7156de03892f456640250f5e8fa9"#, r#"{"escrow":{"job_id":"j1","agent_wallet":"w","funding_source":"f"},"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":null,"key_version":0,"recovery_policy":null,"policy_generation":0,"pending_recovery":null}"#),
+        (r#"key_version"#, r#"{"key_version": 5}"#, r#"ex1a|3|none|uex=1000"#, r#"ecb20f8869facd5dca72115f6d12dc67d9f11e21e04e7e7721988468f7717e6d"#, r#"{"escrow":null,"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":null,"key_version":5,"recovery_policy":null,"policy_generation":0,"pending_recovery":null}"#),
+        (r#"recovery"#, r#"{"recovery_policy": {"guardians": [[1], [2]], "threshold": 2, "enrolled_at_key_version": 1, "policy_id": 7}}"#, r#"ex1a|3|none|uex=1000|recovery=t2/2/1/pid7"#, r#"4bb5c0e332d8b11cc5bddbb539855942a8b4042626b0f816467df42992e1c3e5"#, r#"{"escrow":null,"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":null,"key_version":0,"recovery_policy":{"guardians":[[1],[2]],"threshold":2,"enrolled_at_key_version":1,"policy_id":7},"policy_generation":0,"pending_recovery":null}"#),
+        (r#"pgen"#, r#"{"policy_generation": 4}"#, r#"ex1a|3|none|uex=1000|pgen=4"#, r#"a6eff5f94701376776916ece1583b36220fb08df2f3d5d241e300fa3ce406fe5"#, r#"{"escrow":null,"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":null,"key_version":0,"recovery_policy":null,"policy_generation":4,"pending_recovery":null}"#),
+        (r#"pending"#, r#"{"pending_recovery": {"new_public_key": [1], "new_key_scheme": "ml-dsa-65", "key_version": 2, "submitted_at_height": 10, "activation_height": 20, "policy_id": 1, "cancelled": false}}"#, r#"ex1a|3|none|uex=1000"#, r#"ecb20f8869facd5dca72115f6d12dc67d9f11e21e04e7e7721988468f7717e6d"#, r#"{"escrow":null,"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":null,"key_version":0,"recovery_policy":null,"policy_generation":0,"pending_recovery":{"new_public_key":[1],"new_key_scheme":"ml-dsa-65","key_version":2,"submitted_at_height":10,"activation_height":20,"policy_id":1,"cancelled":false}}"#),
+        (r#"all"#, r#"{"public_key": [1, 2, 3, 4], "escrow": {"job_id": "j1", "agent_wallet": "w", "funding_source": "f"}, "key_version": 5, "recovery_policy": {"guardians": [[1], [2]], "threshold": 2, "enrolled_at_key_version": 1, "policy_id": 7}, "policy_generation": 4, "pending_recovery": {"new_public_key": [1], "new_key_scheme": "ml-dsa-65", "key_version": 2, "submitted_at_height": 10, "activation_height": 20, "policy_id": 1, "cancelled": false}}"#, r#"ex1a|3|none|uex=1000|pk=01020304|escrow={"job_id":"j1","agent_wallet":"w","funding_source":"f"}|recovery=t2/2/1/pid7|pgen=4"#, r#"ded65b4333961ebc5e2eb812153de1daeb32f1f17c56dc5fd9b6438a329d8125"#, r#"{"escrow":{"job_id":"j1","agent_wallet":"w","funding_source":"f"},"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null,"public_key":[1,2,3,4],"key_version":5,"recovery_policy":{"guardians":[[1],[2]],"threshold":2,"enrolled_at_key_version":1,"policy_id":7},"policy_generation":4,"pending_recovery":{"new_public_key":[1],"new_key_scheme":"ml-dsa-65","key_version":2,"submitted_at_height":10,"activation_height":20,"policy_id":1,"cancelled":false}}"#)
+        ];
+        assert_eq!(cases.len(), 8);
+        for (name, extra, leaf, root, json) in cases {
+            let mut v = serde_json::json!({"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null});
+            let extra: serde_json::Value = serde_json::from_str(extra).unwrap();
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let a: AccountState = serde_json::from_value(v).unwrap();
+            assert_eq!(String::from_utf8(a.to_leaf_bytes()).unwrap(), *leaf, "{name}: leaf bytes changed");
+            let mut st = StateStore::new(HashWidth::Bits256);
+            st.upsert_account(a.clone());
+            assert_eq!(st.current_root().unwrap(), *root, "{name}: state root changed");
+            assert_eq!(serde_json::to_string(&a).unwrap(), *json, "{name}: serialized JSON changed (order or content)");
+            // The pinned JSON loads back to an account with the identical leaf and re-serializes identically.
+            let back: AccountState = serde_json::from_str(json).unwrap();
+            assert_eq!(back.to_leaf_bytes(), a.to_leaf_bytes(), "{name}: round-trip leaf");
+            assert_eq!(serde_json::to_string(&back).unwrap(), *json, "{name}: round-trip JSON");
+        }
+    }
+
+    /// Old state files (written before this seam) omit the Qattice-owned fields entirely; they must still load.
+    #[test]
+    fn s1_old_account_json_without_qattice_fields_still_loads() {
+        let old = r#"{"address":"ex1a","balances":{"uex":1000},"nonce":3,"role":"user","charm":null}"#;
+        let a: AccountState = serde_json::from_str(old).unwrap();
+        assert_eq!(a.key_version, 0);
+        assert!(a.recovery_policy.is_none() && a.pending_recovery.is_none() && a.escrow.is_none());
+        assert_eq!(a.policy_generation, 0);
+    }
+
 }
