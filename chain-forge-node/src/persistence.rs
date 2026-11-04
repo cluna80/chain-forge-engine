@@ -1112,6 +1112,44 @@ mod tests {
         ));
     }
 
+    /// H0-3b section 6 sweep: EVERY component listed in the committed manifest, independently truncated to half, emptied
+    /// and deleted, starting from a fresh valid snapshot each time. The load must refuse (never `Ok(None)` = "new", never
+    /// `Ok(Some)`), and the error must name the damaged component, so an unrelated failure cannot produce a false pass.
+    #[test]
+    fn every_manifest_component_truncated_emptied_or_deleted_is_refused_naming_that_file() {
+        let probe = make_temp_dir();
+        write_snapshot(probe.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
+        let mf: SnapshotManifest = serde_json::from_slice(
+            &std::fs::read(probe.path().join("snapshots").join("gen-000001").join("manifest.json")).unwrap()).unwrap();
+        let names: Vec<String> = mf.files.iter().map(|f| f.name.clone()).collect();
+        assert!(names.len() >= 6, "the manifest must list the full component set, got {names:?}");
+        for f in SNAPSHOT_FILES { assert!(names.iter().any(|n| n == f), "{f} must be manifest-listed"); }
+        let mut checked = 0;
+        for name in &names {
+            for how in ["truncate-half", "empty", "delete"] {
+                let dir = make_temp_dir();
+                write_snapshot(dir.path(), 5, &dummy_contents(5), &test_identity(), &test_root()).unwrap();
+                assert!(matches!(load_snapshot(dir.path(), &test_identity()), Ok(Some(_))), "{name}: the undamaged snapshot loads");
+                let path = dir.path().join("snapshots").join("gen-000001").join(name);
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(bytes.len() > 1, "{name} must be long enough to truncate");
+                match how {
+                    "truncate-half" => std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap(),
+                    "empty"         => std::fs::write(&path, b"").unwrap(),
+                    _               => std::fs::remove_file(&path).unwrap(),
+                }
+                match (how, load_snapshot(dir.path(), &test_identity())) {
+                    ("delete", Err(PersistError::MissingFile { file, .. })) => assert_eq!(&file, name, "{name}/{how}"),
+                    ("truncate-half" | "empty", Err(PersistError::HashMismatch { file, .. })) => assert_eq!(&file, name, "{name}/{how}"),
+                    (_, other) => panic!("{name}/{how}: expected a file-specific refusal naming {name}, got {:?}",
+                        other.map(|o| o.map(|c| c.height))),
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, names.len() * 3);
+    }
+
     #[test]
     fn load_hash_mismatch_is_error() {
         let dir = make_temp_dir();
