@@ -211,6 +211,9 @@ async fn main() {
         attestation_coordinator: node.attestation_coordinator(),
         governance_authorities: node.governance_authorities(),
         account_signature_policy: node.account_signature_policy(),
+        // TEST-ONLY switch: never enabled outside tests (no CLI flag, no genesis field).
+        #[cfg(feature = "signing-v2")]
+        mldsa_signing_v2: false,
     };
     // Set the data directory for state persistence.
     if args.storage_v2 && args.data_dir.is_none() {

@@ -544,6 +544,9 @@ pub struct Node {
     consensus: Box<dyn ConsensusEngine>,
     state:     StateStore,
     executor:  Executor,
+    /// TEST-ONLY (feature `signing-v2`): ingress and execution apply the signing-v2 rules. No activation path.
+    #[cfg(feature = "signing-v2")]
+    mldsa_signing_v2: bool,
     /// The P2P network backend. Mock in tests and default builds; real
     /// libp2p when the node crate's own "real-network" feature is enabled.
     /// Boxed as a trait object so both implementations are interchangeable
@@ -1604,6 +1607,8 @@ impl Node {
             consensus: engine,
             state,
             executor,
+            #[cfg(feature = "signing-v2")]
+            mldsa_signing_v2: false,
             network,
             status,
             explorer,
@@ -1716,6 +1721,16 @@ impl Node {
             .map(|a| a.address.clone())
             .collect()
     }
+
+    /// TEST-ONLY (feature `signing-v2`): switch signing-v2 on for this node's execution and ingress.
+    #[cfg(feature = "signing-v2")]
+    pub fn set_mldsa_signing_v2_for_test(&mut self, on: bool) {
+        self.mldsa_signing_v2 = on;
+        self.executor.set_mldsa_signing_v2_for_test(on);
+    }
+
+    #[cfg(feature = "signing-v2")]
+    pub fn mldsa_signing_v2(&self) -> bool { self.mldsa_signing_v2 }
 
     pub fn nonce_cache(&self) -> SharedNonceCache {
         self.nonce_cache.clone()
@@ -10265,21 +10280,21 @@ mod tests {
         use chain_forge_crypto::{mldsa_tx_prehash, KeyPair, MlDsaScheme, SchemeId, SignatureScheme as _};
         use chain_forge_execution::signing_v2::{self, TX_CONTEXT};
 
-        const CHAIN: &str = "qcb-testnet-1";
+        pub(super) const CHAIN: &str = "qcb-testnet-1";
         const VALS: [&str; 4] = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
-        const RECV: &str = "qcb1recv";
+        pub(super) const RECV: &str = "qcb1recv";
 
-        fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+        pub(super) fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 
-        fn user_key() -> KeyPair { B::keygen_from_seed(&[7u8; 32]) }
+        pub(super) fn user_key() -> KeyPair { B::keygen_from_seed(&[7u8; 32]) }
 
-        fn user_addr(kp: &KeyPair) -> String {
+        pub(super) fn user_addr(kp: &KeyPair) -> String {
             Address::from_public_key_schemed(&kp.public_key, "qcb", HashWidth::Bits256, AddressScheme::PostQuantum).to_string()
         }
 
         /// Test genesis: signatures required; a funded ML-DSA user (address derived from its key, no key bound at
         /// genesis, so the first transaction carries it) and an empty receiver.
-        fn genesis(sender: &str) -> String {
+        pub(super) fn genesis(sender: &str) -> String {
             let g = GENESIS.replace(r#""require_signatures": false"#, r#""require_signatures": true"#)
                 .replace(r#""crypto_governors": ["qcb1alice"],"#, r#""crypto_governors": ["qcb1alice"],"#);
             let extra = format!(
@@ -10291,13 +10306,13 @@ mod tests {
             out
         }
 
-        fn transfer(sender: &str, id: &str, nonce: u64, amount: u128) -> Transaction {
+        pub(super) fn transfer(sender: &str, id: &str, nonce: u64, amount: u128) -> Transaction {
             let mut t = Transaction::transfer(id, sender, RECV, "uqcb", amount, nonce);
             t.gas_limit = 500_000;
             t
         }
 
-        fn sign_v2(kp: &KeyPair, tx: &mut Transaction, carry_key: bool) {
+        pub(super) fn sign_v2(kp: &KeyPair, tx: &mut Transaction, carry_key: bool) {
             tx.sig_scheme = Some(SchemeId::MlDsa);
             tx.signature.clear();
             tx.public_key.clear();
@@ -10465,6 +10480,123 @@ mod tests {
             commit_everywhere(&mut nodes, 0, &[t], None).await;
             assert_agree(&nodes, "switch off");
             for n in &nodes { assert_eq!(recv(n), 0, "legacy path must not accept a v2 signature"); }
+        }
+    }
+
+    // ── Signing v2, ingress alignment (TEST-ONLY, feature `signing-v2`) ───────
+    //
+    // With the switch on, POST /api/tx and Node::submit_tx (API drain and gossip) must refuse what execution would
+    // refuse structurally (envelope rules E1-E5 of docs/mldsa-tx-signing-v2/SPEC.md), so such transactions never occupy
+    // the mempool or a block. Written before the fix. No genesis field, no activation path.
+    #[cfg(feature = "signing-v2")]
+    mod signing_v2_ingress {
+        use super::*;
+        use super::signing_v2_four_node as f;
+
+        async fn v2_node(sender: &str, on: bool) -> Node {
+            let mut n = Node::new(&f::genesis(sender), None).await.unwrap();
+            n.set_mldsa_signing_v2_for_test(on);
+            n
+        }
+
+        fn good(kp: &KeyPair, sender: &str, id: &str, nonce: u64) -> Transaction {
+            let mut t = f::transfer(sender, id, nonce, 10);
+            f::sign_v2(kp, &mut t, true);
+            t
+        }
+
+        /// (label, expected code, tx) for every envelope violation reachable without any account state.
+        fn bad_envelopes(kp: &KeyPair, s: &str) -> Vec<(&'static str, &'static str, Transaction)> {
+            let mut v = vec![];
+            let mut t = good(kp, s, "e1a", 0); t.sig_scheme = None;
+            v.push(("no scheme", "E1_SCHEME_MISSING", t));
+            let mut t = good(kp, s, "e1b", 0); t.sig_scheme = Some(SchemeId::Classical);
+            v.push(("ed25519 scheme", "E1_SCHEME_NOT_MLDSA", t));
+            let mut t = good(kp, s, "e2", 0); t.signature = vec![1u8; 64];
+            v.push(("classical signature present", "E2_CLASSICAL_MATERIAL_PRESENT", t));
+            let mut t = good(kp, s, "e3", 0); let d = t.pq_signatures[0].clone(); t.pq_signatures.push(d);
+            v.push(("two signatures", "E3_NOT_EXACTLY_ONE_SIGNATURE", t));
+            let mut t = good(kp, s, "e4a", 0); t.pq_signatures[0] = t.pq_signatures[0].replacen("mldsa65:", "mldsa44:", 1);
+            v.push(("bad tag", "E4_BAD_SIGNATURE_TAG", t));
+            // 2,420-byte signature = 4,840 hex chars: passes the legacy "smallest PQ signature" length check.
+            let mut t = good(kp, s, "e4b", 0); t.pq_signatures[0] = format!("mldsa65:{}", "ab".repeat(2420));
+            v.push(("2,420-byte signature", "E4_SIGNATURE_WRONG_LENGTH", t));
+            let mut t = good(kp, s, "e5", 0); t.pq_public_key.clear();
+            v.push(("first use without key", "E5_FIRST_USE_KEY_MISSING_OR_WRONG_LENGTH", t));
+            v
+        }
+
+        #[tokio::test]
+        async fn api_accepts_a_well_formed_v2_transaction() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let node = v2_node(&s, true).await;
+            let port = rpc_start(&node).await;
+            let t = good(&kp, &s, "ok", 0);
+            let (code, v) = rpc(port, "POST", "/api/tx", &serde_json::to_string(&t).unwrap()).await;
+            assert_eq!(code, 200, "a well-formed v2 transaction must be queued: {v}");
+            assert_eq!(node.tx_queue().lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn api_rejects_each_envelope_violation_with_its_code_and_queues_nothing() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let node = v2_node(&s, true).await;
+            let port = rpc_start(&node).await;
+            for (label, code_str, t) in bad_envelopes(&kp, &s) {
+                let (code, v) = rpc(port, "POST", "/api/tx", &serde_json::to_string(&t).unwrap()).await;
+                assert_eq!(code, 400, "{label}: must be rejected at ingress: {v}");
+                assert_eq!(v["state"], "rejected", "{label}: {v}");
+                assert!(v["message"].as_str().unwrap_or("").contains(code_str), "{label}: expected {code_str} in {v}");
+            }
+            assert_eq!(node.tx_queue().lock().unwrap().len(), 0, "no rejected transaction may be queued");
+        }
+
+        /// Control: with the switch off, a transaction carrying two signatures passes legacy ingress (the gap the
+        /// switch closes; wrong-length signatures are already refused by `check_tx`, so they are not the gap).
+        #[tokio::test]
+        async fn control_switch_off_legacy_ingress_admits_two_signatures() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let node = v2_node(&s, false).await;
+            let port = rpc_start(&node).await;
+            let t = bad_envelopes(&kp, &s).into_iter().find(|b| b.1 == "E3_NOT_EXACTLY_ONE_SIGNATURE").unwrap().2;
+            assert_eq!(t.pq_signatures.len(), 2);
+            let (code, v) = rpc(port, "POST", "/api/tx", &serde_json::to_string(&t).unwrap()).await;
+            assert_eq!(code, 200, "legacy ingress admits it today: {v}");
+        }
+
+        #[tokio::test]
+        async fn submit_tx_refuses_each_envelope_violation_and_admits_a_good_one() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut node = v2_node(&s, true).await;
+            for (label, _, t) in bad_envelopes(&kp, &s) {
+                assert!(!node.submit_tx(t), "{label}: submit_tx (API drain and gossip) must refuse it");
+            }
+            assert!(node.mempool.is_empty());
+            assert!(node.submit_tx(good(&kp, &s, "ok", 0)), "a well-formed v2 transaction is admitted");
+        }
+
+        /// E5 with a key already bound to the sender: a transaction carrying a different key is refused.
+        #[tokio::test]
+        async fn submit_tx_refuses_a_key_that_differs_from_the_bound_key() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let other = chain_forge_crypto::fips204_backend::MlDsa65Fips204::keygen_from_seed(&[9u8; 32]);
+            let mut node = v2_node(&s, true).await;
+            node.state.get_account_mut(&s).unwrap().public_key = Some(kp.public_key.clone());
+            let mut t = f::transfer(&s, "e5b", 0, 10);
+            f::sign_v2(&other, &mut t, true);
+            assert!(!node.submit_tx(t), "E5_KEY_DIFFERS_FROM_BOUND_KEY");
+            let mut ok = f::transfer(&s, "ok-bound", 0, 10);
+            f::sign_v2(&kp, &mut ok, false); // bound key: the transaction need not carry it
+            assert!(node.submit_tx(ok), "a transaction that omits the key is fine once it is bound");
+        }
+
+        /// Control: switch off, `submit_tx` keeps today's behaviour for the same malformed envelopes.
+        #[tokio::test]
+        async fn control_switch_off_submit_tx_is_unchanged() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut node = v2_node(&s, false).await;
+            let t = bad_envelopes(&kp, &s).into_iter().find(|b| b.1 == "E3_NOT_EXACTLY_ONE_SIGNATURE").unwrap().2;
+            assert!(node.submit_tx(t), "without the switch nothing changes");
         }
     }
 
@@ -15044,6 +15176,7 @@ mod tests {
             max_tx_bytes: node.max_tx_bytes(), tx_queue_capacity: node.mempool_capacity(),
             block_gas_limit: node.block_gas_limit(), attestation_coordinator: node.attestation_coordinator(),
             governance_authorities: node.governance_authorities(), account_signature_policy: node.account_signature_policy(),
+            #[cfg(feature = "signing-v2")] mldsa_signing_v2: node.mldsa_signing_v2(),
         };
         tokio::spawn(crate::api::serve(
             port, node.status(), node.explorer(), node.qrc_metrics(), node.peers(), node.tx_queue(), precheck,

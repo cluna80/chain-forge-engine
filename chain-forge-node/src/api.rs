@@ -107,6 +107,9 @@ pub struct TxPrecheck {
     /// Genesis `cryptography.signature_scheme`: which schemes user accounts
     /// may sign with. Checked by the same function execution uses.
     pub account_signature_policy: chain_forge_core::AccountSignaturePolicy,
+    /// TEST-ONLY (feature `signing-v2`): apply the signing-v2 envelope rules E1-E5 at ingress.
+    #[cfg(feature = "signing-v2")]
+    pub mldsa_signing_v2: bool,
 }
 
 /// Maximum nonce gap the mempool accepts for an account's next tx.
