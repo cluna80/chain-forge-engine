@@ -41,12 +41,12 @@ Migration does not change any genesis, address, public key or signature rule.
 ```bash
 cd /c/Dev/chain-forge-engine && git fetch origin feat/key-storage-hardening
 git worktree add ../ks-wt origin/feat/key-storage-hardening          # skip if ks-wt already exists
-cd /c/Dev/ks-wt && git log --oneline -1                              # paste this line together with the output
+cd /c/Dev/ks-wt && git log --oneline -1                              # paste this line together with the output (it must be the head named in PR #109)
 export CARGO_INCREMENTAL=0
 cargo test -j 2 -p chain-forge-keygen --features signing-v2 -- --nocapture --test-threads=1
 ```
-Expected on Windows (the `cfg(unix)` permission tests are not compiled there): `keygen_v2` 9, `keystore` 20, `keystore_cli` 9,
-`keystore_windows` 7, all `0 failed`. Then look at the real ACLs yourself:
+Expected on Windows (the `cfg(unix)` permission tests are not compiled there): `icacls_decode` 4, `keygen_v2` 9, `keystore` 20,
+`keystore_cli` 9, `keystore_windows` 7, all `0 failed`. Then look at the real ACLs yourself:
 ```bash
 export QCB_KEY_PASSPHRASE='a long passphrase of 12+ bytes'
 mkdir -p /c/Dev/ks-demo && cd /c/Dev/ks-demo

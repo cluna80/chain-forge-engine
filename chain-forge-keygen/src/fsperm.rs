@@ -77,11 +77,21 @@ pub fn sddl_owner_only(sddl: &str, sid: &str, is_dir: bool) -> Result<(), String
 
 // ── parsing what `icacls <path> /save <file>` writes (pure, so it is tested on every platform) ──────────────────────
 
-/// Decode the file written by `icacls /save`. SCAFFOLD for the red test: the BOM-only logic that failed on Windows.
+/// Decode the file written by `icacls /save`. On Windows it is **UTF-16LE with no byte-order mark** (observed on the owner's
+/// machine); a BOM, UTF-16BE and UTF-8 are accepted too so a different Windows version cannot break verification.
 pub fn decode_icacls_save(raw: &[u8]) -> String {
-    if raw.starts_with(&[0xFF, 0xFE]) {
-        let u: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&u)
+    let le = |b: &[u8]| String::from_utf16_lossy(&b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<u16>>());
+    let be = |b: &[u8]| String::from_utf16_lossy(&b.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<u16>>());
+    if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(&raw[3..]).to_string()
+    } else if raw.starts_with(&[0xFF, 0xFE]) {
+        le(&raw[2..])
+    } else if raw.starts_with(&[0xFE, 0xFF]) {
+        be(&raw[2..])
+    } else if raw.len() >= 2 && raw[0] == 0 && raw[1] != 0 {
+        be(raw) // UTF-16BE without a BOM: ASCII text has a NUL in the first byte of every unit
+    } else if raw.len() >= 2 && raw[1] == 0 {
+        le(raw) // UTF-16LE without a BOM: ASCII text has a NUL in the second byte of every unit
     } else {
         String::from_utf8_lossy(raw).to_string()
     }
@@ -146,6 +156,12 @@ pub mod unix {
 /// The current user's SID, from `whoami /user` (locale independent: the SID is the last CSV field).
 #[cfg(windows)]
 pub fn current_user_sid() -> Result<String, String> {
+    static SID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    SID.get_or_init(current_user_sid_uncached).clone()
+}
+
+#[cfg(windows)]
+fn current_user_sid_uncached() -> Result<String, String> {
     let o = std::process::Command::new("whoami").args(["/user", "/fo", "csv", "/nh"]).output().map_err(|e| format!("whoami failed: {e}"))?;
     if !o.status.success() { return Err("whoami /user failed".into()); }
     let text = String::from_utf8_lossy(&o.stdout);
