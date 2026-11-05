@@ -1,0 +1,64 @@
+    Finished `release` profile [optimized] target(s) in 13.53s
+KAT  fips204 0.5.0                                      keygen 25/25 | siggen external-prehash:15/15 external-pure:15/15 internal:15/15 | sigver external-prehash:15/15 external-pure:15/15 internal:15/15
+KAT  ml-dsa 0.1.2 (RustCrypto)                          keygen 25/25 | siggen external-prehash:0/15 (N/A 15) external-pure:15/15 internal:15/15 | sigver external-prehash:0/15 (N/A 15) external-pure:15/15 internal:15/15
+KAT  libcrux-ml-dsa 0.0.11                              keygen 25/25 | siggen external-prehash:2/15 (N/A 13) external-pure:15/15 internal:15/15 | sigver external-prehash:1/15 (N/A 14) external-pure:15/15 internal:15/15
+KAT  pqcrypto-mldsa 0.1.2 (PQClean)                     keygen 0/25 (N/A 25) | siggen external-prehash:0/15 (N/A 15) external-pure:0/15 (N/A 15) internal:0/15 (N/A 15) | sigver external-prehash:0/15 (N/A 15) external-pure:15/15 internal:0/15 (N/A 15)
+KAT  pqcrypto-dilithium 0.5.0 (CURRENT chain library)   keygen 0/25 (N/A 25) | siggen external-prehash:0/15 (N/A 15) external-pure:0/15 internal:0/15 (N/A 15) | sigver external-prehash:0/15 (N/A 15) external-pure:12/15 internal:0/15 (N/A 15)
+NEG  fips204    entries with ACCEPTED/PANIC/SIGNED: ['secret_key_all_zero', 'secret_key_inconsistent_tr']
+NEG  mldsa      entries with ACCEPTED/PANIC/SIGNED: ['secret_key_all_zero', 'secret_key_inconsistent_tr', 'secret_key_invalid_eta_encoding']
+NEG  libcrux    entries with ACCEPTED/PANIC/SIGNED: ['secret_key_all_zero', 'secret_key_inconsistent_tr', 'secret_key_invalid_eta_encoding']
+NEG  pqmldsa    entries with ACCEPTED/PANIC/SIGNED: ['secret_key_all_zero', 'secret_key_inconsistent_tr', 'secret_key_invalid_eta_encoding', 'sign_with_256_byte_context']
+NEG  old        entries with ACCEPTED/PANIC/SIGNED: ['secret_key_all_zero', 'secret_key_inconsistent_tr', 'secret_key_invalid_eta_encoding']
+--- Rust cross-verification matrix (valid accepted / mutated rejected)
+fips204  verifies fips204 : 144/144 mutated 288/288
+fips204  verifies mldsa   : 144/144 mutated 288/288
+fips204  verifies libcrux : 144/144 mutated 288/288
+fips204  verifies pqmldsa : 144/144 mutated 288/288
+fips204  verifies old     : 0/144 mutated 288/288
+mldsa    verifies fips204 : 144/144 mutated 288/288
+mldsa    verifies mldsa   : 144/144 mutated 288/288
+mldsa    verifies libcrux : 144/144 mutated 288/288
+mldsa    verifies pqmldsa : 144/144 mutated 288/288
+mldsa    verifies old     : 0/144 mutated 288/288
+libcrux  verifies fips204 : 144/144 mutated 288/288
+libcrux  verifies mldsa   : 144/144 mutated 288/288
+libcrux  verifies libcrux : 144/144 mutated 288/288
+libcrux  verifies pqmldsa : 144/144 mutated 288/288
+libcrux  verifies old     : 0/144 mutated 288/288
+pqmldsa  verifies fips204 : 144/144 mutated 288/288
+pqmldsa  verifies mldsa   : 144/144 mutated 288/288
+pqmldsa  verifies libcrux : 144/144 mutated 288/288
+pqmldsa  verifies pqmldsa : 144/144 mutated 288/288
+pqmldsa  verifies old     : 0/144 mutated 288/288
+old      verifies fips204 : 0/144 mutated 288/288
+old      verifies mldsa   : 0/144 mutated 288/288
+old      verifies libcrux : 0/144 mutated 288/288
+old      verifies pqmldsa : 0/144 mutated 288/288
+old      verifies old     : 144/144 mutated 288/288
+--- independent pure-Python implementation
+{"implementation": "dilithium-py 1.5.1 (pure Python)", "keygen_from_seed": "25/25", "pk_from_sk_matches_nist_pk": "25/25", "siggen_deterministic": {"external-pure": "15/15", "external-prehash": "15/15", "internal": "15/15"}, "sigver": {"external-pure": "15/15", "external-prehash": "15/15", "internal": "15/15"}}
+{"verifier": "dilithium-py 1.5.1", "signer": "fips204 0.5.0", "valid_accepted": "144/144", "mutated_rejected": "144/144"}
+{"verifier": "dilithium-py 1.5.1", "signer": "ml-dsa 0.1.2 (RustCrypto)", "valid_accepted": "144/144", "mutated_rejected": "144/144"}
+{"verifier": "dilithium-py 1.5.1", "signer": "libcrux-ml-dsa 0.0.11", "valid_accepted": "144/144", "mutated_rejected": "144/144"}
+{"verifier": "dilithium-py 1.5.1", "signer": "pqcrypto-mldsa 0.1.2 (PQClean)", "valid_accepted": "144/144", "mutated_rejected": "144/144"}
+{"verifier": "dilithium-py 1.5.1", "signer": "pqcrypto-dilithium 0.5.0 (CURRENT chain library)", "valid_accepted": "0/144", "mutated_rejected": "144/144"}
+{"backend": "fips204 0.5.0", "keys": 6, "pk_equals_independent_pk_from_sk": "6/6", "seeded_keys_equal_independent_key_derive": "6/6"}
+{"backend": "ml-dsa 0.1.2 (RustCrypto)", "keys": 6, "pk_equals_independent_pk_from_sk": "6/6", "seeded_keys_equal_independent_key_derive": "6/6"}
+{"backend": "libcrux-ml-dsa 0.0.11", "keys": 6, "pk_equals_independent_pk_from_sk": "6/6", "seeded_keys_equal_independent_key_derive": "6/6"}
+{"backend": "pqcrypto-mldsa 0.1.2 (PQClean)", "keys": 6, "pk_equals_independent_pk_from_sk": "6/6", "seeded_keys_equal_independent_key_derive": "n/a (no seeded keygen)"}
+{"backend": "pqcrypto-dilithium 0.5.0 (CURRENT chain library)", "keys": 6, "pk_equals_independent_pk_from_sk": "6/6", "seeded_keys_equal_independent_key_derive": "n/a (no seeded keygen)"}
+--- bench (microseconds per operation, single thread)
+{"backend":"fips204 0.5.0","keygen_us":305.91416000000004,"sign_us":784.7149033333333,"verify_us":336.2521455}
+
+{"backend":"ml-dsa 0.1.2 (RustCrypto)","keygen_us":484.322645,"sign_us":1533.629565,"verify_us":319.1110995}
+
+{"backend":"libcrux-ml-dsa 0.0.11","keygen_us":88.61066000000001,"sign_us":248.19929333333334,"verify_us":95.72178849999999}
+
+{"backend":"pqcrypto-mldsa 0.1.2 (PQClean)","keygen_us":null,"sign_us":132.15402333333333,"verify_us":48.2061895}
+
+{"backend":"pqcrypto-dilithium 0.5.0 (CURRENT chain library)","keygen_us":null,"sign_us":187.49255166666669,"verify_us":51.350846}
+
+
+real	0m48.219s
+user	0m59.476s
+sys	0m1.991s

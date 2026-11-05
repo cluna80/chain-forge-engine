@@ -1,0 +1,60 @@
+--- a/pqclean/crypto_sign/dilithium3/clean/poly.c
++++ b/pqclean/crypto_sign/dilithium3/clean/poly.c
+@@ -475,14 +475,14 @@
+ * Arguments:   - poly *c: pointer to output polynomial
+ *              - const uint8_t mu[]: byte array containing seed of length SEEDBYTES
+ **************************************************/
+-void PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(poly *c, const uint8_t seed[SEEDBYTES]) {
++void PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(poly *c, const uint8_t seed[CTILDEBYTES]) {
+     unsigned int i, b, pos;
+     uint64_t signs;
+     uint8_t buf[SHAKE256_RATE];
+     shake256incctx state;
+ 
+     shake256_inc_init(&state);
+-    shake256_inc_absorb(&state, seed, SEEDBYTES);
++    shake256_inc_absorb(&state, seed, CTILDEBYTES);
+     shake256_inc_finalize(&state);
+     shake256_inc_squeeze(buf, sizeof buf, &state);
+ 
+--- a/pqclean/crypto_sign/dilithium3/clean/poly.h
++++ b/pqclean/crypto_sign/dilithium3/clean/poly.h
+@@ -33,7 +33,7 @@
+ void PQCLEAN_DILITHIUM3_CLEAN_poly_uniform_gamma1(poly *a,
+         const uint8_t seed[CRHBYTES],
+         uint16_t nonce);
+-void PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(poly *c, const uint8_t seed[SEEDBYTES]);
++void PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(poly *c, const uint8_t seed[CTILDEBYTES]);
+ 
+ void PQCLEAN_DILITHIUM3_CLEAN_polyeta_pack(uint8_t *r, const poly *a);
+ void PQCLEAN_DILITHIUM3_CLEAN_polyeta_unpack(poly *r, const uint8_t *a);
+--- a/pqclean/crypto_sign/dilithium3/avx2/poly.c
++++ b/pqclean/crypto_sign/dilithium3/avx2/poly.c
+@@ -639,14 +639,14 @@
+ * Arguments:   - poly *c: pointer to output polynomial
+ *              - const uint8_t mu[]: byte array containing seed of length SEEDBYTES
+ **************************************************/
+-void PQCLEAN_DILITHIUM3_AVX2_poly_challenge(poly *restrict c, const uint8_t seed[SEEDBYTES]) {
++void PQCLEAN_DILITHIUM3_AVX2_poly_challenge(poly *restrict c, const uint8_t seed[CTILDEBYTES]) {
+     unsigned int i, b, pos;
+     uint64_t signs;
+     ALIGNED_UINT8(SHAKE256_RATE) buf;
+     shake256incctx state;
+ 
+     shake256_inc_init(&state);
+-    shake256_inc_absorb(&state, seed, SEEDBYTES);
++    shake256_inc_absorb(&state, seed, CTILDEBYTES);
+     shake256_inc_finalize(&state);
+     shake256_inc_squeeze(buf.coeffs, SHAKE256_RATE, &state);
+ 
+--- a/pqclean/crypto_sign/dilithium3/avx2/poly.h
++++ b/pqclean/crypto_sign/dilithium3/avx2/poly.h
+@@ -31,7 +31,7 @@
+ void PQCLEAN_DILITHIUM3_AVX2_poly_uniform_eta(poly *a, const uint8_t seed[CRHBYTES], uint16_t nonce);
+ void PQCLEAN_DILITHIUM3_AVX2_poly_uniform_gamma1_preinit(poly *a, stream256_state *state);
+ void PQCLEAN_DILITHIUM3_AVX2_poly_uniform_gamma1(poly *a, const uint8_t seed[CRHBYTES], uint16_t nonce);
+-void PQCLEAN_DILITHIUM3_AVX2_poly_challenge(poly *c, const uint8_t seed[SEEDBYTES]);
++void PQCLEAN_DILITHIUM3_AVX2_poly_challenge(poly *c, const uint8_t seed[CTILDEBYTES]);
+ 
+ void PQCLEAN_DILITHIUM3_AVX2_poly_uniform_4x(poly *a0,
+         poly *a1,

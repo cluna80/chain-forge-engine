@@ -64,6 +64,8 @@ required-features = ["real-crypto"]
 tokio     = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 rayon     = { version = "1" }
+# K1 conformance tests only (SHA-3 / SHAKE for the HashML-DSA pre-hash vectors); not a runtime dependency.
+sha3      = { workspace = true }
 
 [[bench]]
 name              = "mldsa_validator"
