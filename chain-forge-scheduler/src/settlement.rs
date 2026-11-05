@@ -135,6 +135,9 @@ pub enum SettlementError {
     #[error("claim already exists (idempotent): claim_id={0}")]
     ClaimAlreadyExists(String),
 
+    #[error("unknown signing_profile {0:?}: expected \"qattice-v2\" or no profile (legacy)")]
+    UnknownSigningProfile(String),
+
     #[error("operator key decode error: {0}")]
     KeyDecode(String),
 
@@ -165,6 +168,32 @@ pub async fn settle_objective(
         "replication" => RewardKind::Replication,
         other         => return Err(SettlementError::UnknownRewardKind(other.to_owned())),
     };
+
+    // ── 1b. Signing profile and (for v2) the operator key, BEFORE anything is stored ──────────────────────────────────
+    //
+    // An unknown profile, a malformed key or a key pair whose halves do not match must fail here, not after a pending
+    // claim has been written to the database.
+    let use_v2 = match req.signing_profile.as_deref() {
+        None => false,
+        Some("qattice-v2") => {
+            #[cfg(feature = "signing-v2")]
+            { true }
+            #[cfg(not(feature = "signing-v2"))]
+            { return Err(SettlementError::UnknownSigningProfile(
+                "qattice-v2 (this scheduler build does not include the signing-v2 feature)".to_owned())); }
+        }
+        Some(other) => return Err(SettlementError::UnknownSigningProfile(other.to_owned())),
+    };
+    #[cfg(feature = "signing-v2")]
+    let v2_keypair: Option<KeyPair> = if use_v2 {
+        let sk = hex::decode(&req.operator_secret_key_hex).map_err(|e| SettlementError::KeyDecode(format!("secret key: {e}")))?;
+        let pk = hex::decode(&req.operator_public_key_hex).map_err(|e| SettlementError::KeyDecode(format!("public key: {e}")))?;
+        chain_forge_crypto::fips204_backend::MlDsa65Fips204::validate_keypair(&pk, &sk)
+            .map_err(|e| SettlementError::SigningFailed(format!("invalid operator key pair: {e}")))?;
+        Some(KeyPair { scheme: SchemeId::MlDsa, public_key: pk, private_key: sk })
+    } else { None };
+    #[cfg(not(feature = "signing-v2"))]
+    let _ = use_v2;
 
     // ── 2. Look up the canonical accepted result for this task ────────────────
     //
@@ -261,6 +290,22 @@ pub async fn settle_objective(
 
     // ── 6. Sign with ML-DSA-65 ────────────────────────────────────────────────
     //
+    // Signing v2 (`signing_profile = "qattice-v2"`): the full canonical preimage, FIPS 204, hedged (chain-forge-wallet).
+    // The deterministic tx id above is unchanged. The legacy path below is untouched.
+    #[cfg(feature = "signing-v2")]
+    if let Some(kp) = &v2_keypair {
+        use chain_forge_wallet::signing_v2::{sign_transaction_v2, V2TxParams};
+        tx = sign_transaction_v2(kp, &req.chain_id, "qcb", V2TxParams {
+            id: tx.id.clone(), nonce: tx.nonce, gas_limit: tx.gas_limit, body: tx.body.clone(),
+            sender: Some(tx.sender.clone()), carry_key: true,
+        }).map_err(|e| SettlementError::SigningFailed(e.to_string()))?;
+    }
+    #[cfg(feature = "signing-v2")]
+    let legacy = v2_keypair.is_none();
+    #[cfg(not(feature = "signing-v2"))]
+    let legacy = true;
+    if legacy {
+    //
     // The executor verifies: SHA-256("chain-forge/pq-tx/v1\n" || chain_id || "\n" || body_json)
     // signed with the operator's ML-DSA-65 key.
     let sk_bytes = hex::decode(&req.operator_secret_key_hex)
@@ -286,6 +331,7 @@ pub async fn settle_objective(
     tx.pq_signatures = vec![format!("mldsa65:{}", hex::encode(&sig.bytes))];
     tx.sig_scheme    = Some(SchemeId::MlDsa);  // CS-001-H2: explicit scheme tag
     tx.pq_public_key = pk_bytes;
+    }
 
     // ── 7. POST to node ───────────────────────────────────────────────────────
     let node_url = req.node_url.trim_end_matches('/');

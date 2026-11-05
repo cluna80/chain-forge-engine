@@ -534,6 +534,14 @@ async fn settle_handler(
             (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
         }
 
+        Err(e @ SettlementError::UnknownSigningProfile(_)) => {
+            let body = serde_json::json!({
+                "error": "unknown_signing_profile",
+                "message": e.to_string(),
+            });
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+
         Err(SettlementError::KeyDecode(msg)) => {
             let body = serde_json::json!({
                 "error": "key_decode_error",
