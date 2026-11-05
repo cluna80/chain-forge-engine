@@ -6958,6 +6958,171 @@ mod tests {
         a.nonce == 0 && a.balance_of("uqcb") == 5_000_000
     }
 
+    // ── H0-4 / H0-6 characterization (written before any fix) ───────────────────
+    /// H0-4. Characterization of CURRENT behavior: an ML-DSA transaction signature covers only
+    /// (chain_id, body) -- `mldsa_tx_prehash(chain_id, body_json)` -- not the nonce, id, sender or
+    /// gas limit. An observer of a signed transfer can therefore resubmit the same signature and
+    /// body under the sender's next nonce and a new id, and it executes again.
+    #[test]
+    fn h0_4_characterization_mldsa_signed_tx_replays_under_a_new_nonce() {
+        let (exec, mut state) = setup_signed("h04-chain", "qcb1sender");
+        let (tx0, pk) = make_pq_tx_with_chain("h04-chain", "qcb1sender", 0, "h04-seed");
+        state.get_account_mut("qcb1sender").unwrap().public_key = Some(pk);
+        let r0 = exec.execute_tx(&tx0, &mut state, 0);
+        assert!(r0.success, "the signed transfer executes: {:?}", r0.error);
+        let after_first = state.get_account("qcb1recv").unwrap().balance_of("uqcb");
+
+        // The attacker changes ONLY unsigned fields: id and nonce.
+        let mut replay = tx0.clone();
+        replay.id = "attacker-replay".into();
+        replay.nonce = 1;
+        let r1 = exec.execute_tx(&replay, &mut state, 1);
+        let after_replay = state.get_account("qcb1recv").unwrap().balance_of("uqcb");
+        println!("H04-RESULT mldsa-replay: first_ok={} replay_ok={} recv_after_first={after_first} recv_after_replay={after_replay} err={:?}",
+            r0.success, r1.success, r1.error);
+
+        // Changing the gas limit (also unsigned) is accepted too.
+        let mut gas = tx0.clone();
+        gas.id = "attacker-gas".into();
+        gas.nonce = 2;
+        gas.gas_limit = tx0.gas_limit + 1;
+        let r2 = exec.execute_tx(&gas, &mut state, 2);
+        println!("H04-RESULT mldsa-gas-limit-unsigned: ok={} err={:?}", r2.success, r2.error);
+        assert!(r1.success && r2.success, "characterization: both replays currently execute");
+    }
+
+    /// H0-4. Desired behavior: the replay above must be rejected. Fails today.
+    #[test]
+    #[ignore = "H0-4: ML-DSA tx signature does not cover nonce/id/gas_limit; fix changes signing bytes and needs owner approval + activation design"]
+    fn h0_4_mldsa_signature_must_bind_the_nonce() {
+        let (exec, mut state) = setup_signed("h04-chain", "qcb1sender");
+        let (tx0, pk) = make_pq_tx_with_chain("h04-chain", "qcb1sender", 0, "h04-seed");
+        state.get_account_mut("qcb1sender").unwrap().public_key = Some(pk);
+        assert!(exec.execute_tx(&tx0, &mut state, 0).success);
+        let mut replay = tx0.clone();
+        replay.id = "attacker-replay".into();
+        replay.nonce = 1;
+        let r1 = exec.execute_tx(&replay, &mut state, 1);
+        assert!(!r1.success, "a signature made for nonce 0 must not authorize nonce 1");
+        assert_eq!(state.get_account("qcb1recv").unwrap().balance_of("uqcb"), 100, "receiver credited once");
+    }
+
+    /// H0-4 control: an Ed25519 signature covers (id, sender, nonce, body, gas_limit), so the same
+    /// trick fails. Passes today.
+    #[test]
+    fn h0_4_control_ed25519_signed_tx_does_not_replay_under_a_new_nonce() {
+        let (exec, mut state, alice) = signed_setup();
+        let mut tx = Transaction::transfer("e0", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+        assert!(exec.execute_tx(&tx, &mut state, 0).success);
+        let mut replay = tx.clone();
+        replay.id = "e1".into();
+        replay.nonce = 1;
+        let r = exec.execute_tx(&replay, &mut state, 1);
+        assert!(!r.success && r.error.as_deref().unwrap_or("").contains("invalid signature"), "{:?}", r.error);
+    }
+
+    /// H0-4. Same tx replayed at the SAME nonce in a later block: rejected, and a rejected nonce
+    /// mismatch changes nothing (balances, nonce, state root) and charges no fee.
+    #[test]
+    fn h0_4_same_nonce_replay_across_blocks_is_rejected_with_no_state_change() {
+        let (exec, mut state, alice) = signed_setup();
+        let mut tx = Transaction::transfer("e0", "qcb1alice", "qcb1bob", "uqcb", 100, 0);
+        tx.sign(&alice, "qcb-testnet-1").unwrap();
+        assert!(exec.execute_tx(&tx, &mut state, 1).success);
+        let root = state.current_root().unwrap_or("").to_string();
+        let alice_acct = state.get_account("qcb1alice").unwrap().clone();
+        let bob_bal = state.get_account("qcb1bob").unwrap().balance_of("uqcb");
+        for height in [2u64, 3, 1000] {
+            let r = exec.execute_tx(&tx, &mut state, height);
+            assert!(!r.success && r.error.as_deref().unwrap_or("").contains("nonce mismatch"), "{:?}", r.error);
+            assert_eq!(r.fee_charged, 0, "a nonce mismatch is refused before any fee is taken");
+        }
+        assert_eq!(state.current_root().unwrap_or(""), root, "state root unchanged by rejected replays");
+        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, alice_acct.nonce);
+        assert_eq!(state.get_account("qcb1alice").unwrap().balance_of("uqcb"), alice_acct.balance_of("uqcb"));
+        assert_eq!(state.get_account("qcb1bob").unwrap().balance_of("uqcb"), bob_bal);
+    }
+
+    /// H0-4 boundary conditions: far-future and maximum nonces are rejected without mutation.
+    #[test]
+    fn h0_4_nonce_boundaries_are_rejected_without_mutation() {
+        let (exec, mut state) = setup();
+        let root = state.current_root().unwrap_or("").to_string();
+        for n in [1u64, 2, 100, 101, u64::MAX - 1, u64::MAX] {
+            let tx = Transaction::transfer(&format!("b{n}"), "qcb1alice", "qcb1bob", "uqcb", 1, n);
+            let r = exec.execute_tx(&tx, &mut state, 0);
+            assert!(!r.success && r.error.as_deref().unwrap_or("").contains("nonce mismatch"), "nonce {n}: {:?}", r.error);
+        }
+        assert_eq!(state.current_root().unwrap_or(""), root);
+        assert_eq!(state.get_account("qcb1alice").unwrap().nonce, 0);
+    }
+
+    /// H0-4. `AccountState::increment_nonce` is `self.nonce += 1`. At u64::MAX that panics in a
+    /// debug build and wraps to 0 in a release build (the workspace sets no overflow-checks), which
+    /// would re-open nonce 0. Practically unreachable (2^64 transactions, or a tampered state file);
+    /// recorded as a hardening item.
+    #[test]
+    fn h0_4_characterization_nonce_overflow_at_u64_max() {
+        let mut a = chain_forge_state::AccountState::new("qcb1x".into(), "user".into());
+        a.nonce = u64::MAX;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { a.increment_nonce(); a.nonce }));
+        println!("H04-RESULT nonce-overflow: {:?}", r.as_ref().map_err(|_| "panicked (debug overflow check)"));
+    }
+
+    /// H0-6. Two transactions in ONE block try to bind different keys to the same unbound account.
+    /// The first successful signed tx binds its key; the second, signed by another key, is refused
+    /// ("does not match the key bound"). Winner is the first in block order, identical on every run.
+    #[test]
+    fn h0_6_conflicting_key_bindings_in_one_block_have_exactly_one_deterministic_winner() {
+        fn run(order_a_first: bool) -> (String, Vec<bool>, Option<Vec<u8>>, String) {
+            let genesis = GenesisConfig::from_json(genesis_json()).unwrap();
+            let mut config = ExecutionConfig::from_genesis(&genesis);
+            config.require_signatures = true;
+            let mut state = StateStore::new(HashWidth::Bits256);
+            state.apply_genesis(&genesis).unwrap();
+            let exec = Executor::new(config);
+            let k1 = key("h06-key-one");
+            let addr = Address::from_public_key(&k1.public_key, "qcb", HashWidth::Bits256);
+            let k2 = key("h06-key-two");
+            let mut acct = chain_forge_state::AccountState::new(addr.as_str().into(), "user".into());
+            acct.credit("uqcb", 1_000_000);
+            state.upsert_account(acct);
+            // tx_a: signed by the key the address derives from. tx_b: signed by another key, same account.
+            let mut tx_a = Transaction::transfer("a", addr.as_str(), "qcb1bob", "uqcb", 10, 0);
+            tx_a.sign(&k1, "qcb-testnet-1").unwrap();
+            let mut tx_b = Transaction::transfer("b", addr.as_str(), "qcb1bob", "uqcb", 10, 0);
+            tx_b.sign(&k2, "qcb-testnet-1").unwrap();
+            let order = if order_a_first { vec![&tx_a, &tx_b] } else { vec![&tx_b, &tx_a] };
+            let results: Vec<bool> = order.iter().map(|t| exec.execute_tx(t, &mut state, 1).success).collect();
+            let bound = state.get_account(addr.as_str()).unwrap().public_key.clone();
+            (addr.as_str().to_string(), results, bound, state.current_root().unwrap_or("").to_string())
+        }
+        let (addr, r1, bound1, root1) = run(true);
+        let (_, r1b, bound1b, root1b) = run(true);
+        assert_eq!(r1, vec![true, false], "derived-key tx binds, the foreign-key tx is refused ({addr})");
+        assert_eq!((r1.clone(), bound1.clone(), root1.clone()), (r1b, bound1b, root1b), "same input, same outcome and root");
+        // Reversed order: the foreign key is refused first (the account has no bound key and the
+        // address is not derived from it), then the derived key binds. Still exactly one binding.
+        let (_, r2, bound2, _) = run(false);
+        assert_eq!(r2, vec![false, true]);
+        assert_eq!(bound1, bound2, "the same key ends up bound regardless of order: ownership follows the address derivation");
+        println!("H06-RESULT conflicting-binding: order[a,b]={r1:?} order[b,a]={r2:?} bound_is_derived_key={}", bound1.is_some());
+    }
+
+    /// H0-6 (ML-DSA). A named, unbound account cannot be claimed by whoever signs first: first use
+    /// requires the sender to be the address derived from the ML-DSA key.
+    #[test]
+    fn h0_6_mldsa_first_use_cannot_claim_a_named_unbound_account() {
+        let (exec, mut state) = setup_signed("h06-chain", "qcb1sender");
+        let (tx, _pk) = make_pq_tx_with_chain("h06-chain", "qcb1sender", 0, "h06-attacker");
+        let r = exec.execute_tx(&tx, &mut state, 0);
+        assert!(!r.success, "an attacker's ML-DSA key must not bind to a named genesis account");
+        assert!(r.error.as_deref().unwrap_or("").contains("not derived from the signing key"), "{:?}", r.error);
+        assert!(state.get_account("qcb1sender").unwrap().public_key.is_none());
+        assert_eq!(state.get_account("qcb1sender").unwrap().nonce, 0);
+    }
+
     #[test]
     fn pqc_native_rejects_ed25519_signed_txs_tagged_or_not() {
         const CHAIN: &str = "qcb-policy";
