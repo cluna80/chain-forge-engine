@@ -57,6 +57,8 @@ getrandom             = { version = "0.2" }
 # Unit tests (cfg(test)) are carved out inside node.rs so they still
 # use the fast in-memory mock regardless of this feature flag.
 real-network = []
+# TEST-ONLY: forwards to chain-forge-execution/signing-v2 (node-level v2 tests). Not enabled by default; no activation path.
+signing-v2 = ["chain-forge-execution/signing-v2"]
 # Enable ZK-VRC personhood proof verification in the execution layer (QPC-GAP-002).
 # Adds chain-forge-personhood (Groth16/ark-*) as a build dependency.
 # Without this feature, VerifyIdentityWithProof txs are accepted as a tx type
