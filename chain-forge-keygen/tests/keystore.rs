@@ -14,8 +14,8 @@ fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("qcb-ks-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    #[cfg(unix)]
-    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap(); }
+    // Owner-only on every platform (chmod 700 on Unix; a protected single-ACE DACL on Windows), verified by read-back.
+    chain_forge_keygen::fsperm::prepare_dir(&d, true).expect("harden the test directory");
     d
 }
 
@@ -83,7 +83,8 @@ fn the_file_holds_no_plaintext_secret_and_only_the_seed_is_encrypted() {
     let text = std::fs::read_to_string(&f).unwrap();
     let l = load(&f, PASS, &OsPlatform).unwrap();
     let sk_hex: String = l.keypair.private_key.iter().map(|b| format!("{b:02x}")).collect();
-    assert!(!text.contains(&sk_hex[..64]) && !text.contains(PASS));
+    // The secret key starts with rho, which is also the start of the (public) public key; K (bytes 32..64) is secret.
+    assert!(!text.contains(&sk_hex[64..128]) && !text.contains(&sk_hex[128..256]) && !text.contains(PASS));
     let v = read_json(&f);
     for forbidden in ["private_key", "seed", "secret_key"] { assert!(v.get(forbidden).is_none(), "{forbidden} must not be a field"); }
     assert_eq!(v["ciphertext"].as_str().unwrap().len(), 2 * (32 + 16), "seed (32) + GCM tag (16) only, not the 4,032-byte expanded key");
@@ -175,8 +176,7 @@ fn structural_damage_is_refused() {
     for (label, bytes) in [("empty", b"".to_vec()), ("not json", b"{ nope".to_vec()), ("array", b"[]".to_vec()), ("oversize", vec![b' '; 70_000])] {
         let f = d.join(format!("raw-{label}.json"));
         std::fs::write(&f, bytes).unwrap();
-        #[cfg(unix)]
-        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap(); }
+        chain_forge_keygen::fsperm::restrict_file(&f).expect("restrict the raw test file");
         assert!(load(&f, PASS, &OsPlatform).is_err(), "{label}");
     }
     let _ = std::fs::remove_dir_all(&d);
@@ -434,4 +434,63 @@ fn the_sddl_verifier_rejects_everything_else() {
     ];
     for (label, s) in bad { assert!(sddl_owner_only(&s, SID, false).is_err(), "{label}: {s:?} must be rejected"); }
     assert!(sddl_owner_only(&format!("D:P(A;;FA;;;{SID})"), SID, true).is_err(), "a directory ACE must be inheritable (OICI)");
+}
+
+// ── an independent encoder that follows docs/key-storage/SPEC.md (cross-checks the format and the post-decryption checks) ─
+
+fn spec_encode(label: &str, address: &str, pk: &[u8], kind: &str, payload: &[u8], pass: &str) -> Value {
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, KeyInit};
+    let (m, t, pl) = (19_456u32, 2u32, 1u32);
+    let salt = [7u8; 32]; let nonce = [9u8; 12];
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mut aad = b"qattice-key/v1\0".to_vec();
+    let mut put = |b: &[u8]| { aad.extend_from_slice(&(b.len() as u32).to_be_bytes()); aad.extend_from_slice(b); };
+    for f in [&b"qattice-key"[..], b"1", b"ml-dsa-65", label.as_bytes(), address.as_bytes(), pk, kind.as_bytes(), b"argon2id", b"19",
+              m.to_string().as_bytes(), t.to_string().as_bytes(), pl.to_string().as_bytes(), &salt, b"aes-256-gcm", &nonce] { put(f); }
+    let mut key = [0u8; 32];
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon2::Params::new(m, t, pl, Some(32)).unwrap())
+        .hash_password_into(pass.as_bytes(), &salt, &mut key).unwrap();
+    let ct = Aes256Gcm::new_from_slice(&key).unwrap().encrypt(aes_gcm::Nonce::from_slice(&nonce), Payload { msg: payload, aad: &aad }).unwrap();
+    json!({ "format": "qattice-key", "version": 1, "scheme": "ml-dsa-65", "label": label, "address": address, "public_key": hex(pk),
+            "payload_kind": kind, "kdf": { "algorithm": "argon2id", "version": 19, "m_cost_kib": m, "t_cost": t, "p_cost": pl, "salt": hex(&salt) },
+            "cipher": { "algorithm": "aes-256-gcm", "nonce": hex(&nonce) }, "ciphertext": hex(&ct) })
+}
+
+fn put_file(dir: &Path, name: &str, v: &Value) -> PathBuf {
+    let f = dir.join(name);
+    std::fs::write(&f, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+    chain_forge_keygen::fsperm::restrict_file(&f).expect("restrict the test file");
+    f
+}
+
+fn addr(pk: &[u8]) -> String {
+    chain_forge_core::Address::from_public_key_schemed(pk, "qcb", chain_forge_core::HashWidth::Bits256, chain_forge_core::AddressScheme::PostQuantum).as_str().to_string()
+}
+
+#[test]
+fn a_file_made_by_an_independent_encoder_following_the_spec_loads() {
+    let d = tmpdir("indep");
+    let (seed, kp) = B::generate().unwrap();
+    let f = put_file(&d, "i.json", &spec_encode("indep", &addr(&kp.public_key), &kp.public_key, "seed", &seed, PASS));
+    let l = load(&f, PASS, &OsPlatform).expect("the spec is implementable independently");
+    assert_eq!(l.public_key, kp.public_key);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_validly_encrypted_but_inconsistent_payload_is_refused_after_decryption() {
+    let d = tmpdir("inconsistent");
+    let (seed_a, kp_a) = B::generate().unwrap();
+    let (_seed_b, kp_b) = B::generate().unwrap();
+    // 1. valid AEAD, but the seed regenerates a different public key than the header states
+    let f = put_file(&d, "a.json", &spec_encode("x", &addr(&kp_b.public_key), &kp_b.public_key, "seed", &seed_a, PASS));
+    assert!(matches!(load(&f, PASS, &OsPlatform), Err(Error::Key(_))), "seed/public key mismatch");
+    // 2. valid AEAD, expanded key of another pair
+    let f = put_file(&d, "b.json", &spec_encode("x", &addr(&kp_a.public_key), &kp_a.public_key, "expanded-secret-key", &kp_b.private_key, PASS));
+    assert!(matches!(load(&f, PASS, &OsPlatform), Err(Error::Key(_))), "expanded key/public key mismatch");
+    // 3. valid AEAD, but the address is not the one derived from the public key
+    let f = put_file(&d, "c.json", &spec_encode("x", &addr(&kp_b.public_key), &kp_a.public_key, "seed", &seed_a, PASS));
+    assert!(matches!(load(&f, PASS, &OsPlatform), Err(Error::Key(_))), "address mismatch");
+    let _ = std::fs::remove_dir_all(&d);
 }

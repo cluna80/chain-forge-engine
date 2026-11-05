@@ -901,6 +901,7 @@ dependencies = [
  "chain-forge-crypto",
  "getrandom 0.2.17",
  "hex",
+ "libc",
  "serde_json",
  "zeroize",
 ]

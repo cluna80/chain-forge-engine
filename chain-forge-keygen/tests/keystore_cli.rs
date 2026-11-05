@@ -14,8 +14,7 @@ fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("qcb-ksc-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    #[cfg(unix)]
-    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap(); }
+    chain_forge_keygen::fsperm::prepare_dir(&d, true).expect("harden the test directory");
     d
 }
 
@@ -150,7 +149,7 @@ fn key_migrate_encrypts_without_touching_or_printing_the_old_file() {
     assert!(o.status.success(), "{}", text(&o));
     assert_eq!(std::fs::read(&src).unwrap(), before, "the plaintext source is untouched");
     let t = text(&o);
-    assert!(!t.contains(&hex(&seed)[..32]) && !t.contains(&hex(&kp.private_key)[..64]) && !t.contains(PASS));
+    assert!(!t.contains(&hex(&seed)[..32]) && !t.contains(&hex(&kp.private_key)[64..128]) && !t.contains(PASS));
     assert!(t.to_lowercase().contains("not deleted") || t.to_lowercase().contains("still exists"), "the operator is told the old file remains: {t}");
     let c = run(&["key-check", out.to_str().unwrap(), "--passphrase-file", pf.to_str().unwrap()]);
     assert!(c.status.success(), "{}", text(&c));

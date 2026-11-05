@@ -22,6 +22,9 @@ aes-gcm          = { version = "0.10", optional = true }
 zeroize          = { version = "1", optional = true }
 getrandom        = { version = "0.2", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lib]
 name = "chain_forge_keygen"
 path = "src/lib.rs"
