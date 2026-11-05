@@ -102,7 +102,8 @@ fn hedged_signing_is_randomised_and_every_signature_verifies() {
 #[test]
 fn generated_keys_come_from_the_returned_seed() {
     let (seed, kp) = B::generate().unwrap();
-    assert_eq!(B::keygen_from_seed(&seed), kp);
+    let again = B::keygen_from_seed(&seed);
+    assert_eq!((again.public_key, again.private_key), (kp.public_key, kp.private_key));
     let (seed2, _) = B::generate().unwrap();
     assert_ne!(seed, seed2);
 }
@@ -164,6 +165,22 @@ fn validate_keypair_catches_inconsistent_and_mismatched_keys() {
     let mut bad_rho = kp.private_key.clone();
     bad_rho[0] ^= 1;
     assert_eq!(B::validate_keypair(&kp.public_key, &bad_rho), Err(Error::KeyPairInconsistent), "wrong rho");
+    // a subtle corruption: rho and tr are intact but a secret vector no longer matches the public key
+    let mut found = false;
+    for pos in 128..400 {
+        let mut b = kp.private_key.clone();
+        b[pos] ^= 1;
+        match B::validate_keypair(&kp.public_key, &b) {
+            Err(Error::MalformedSecretKey) => continue,
+            r => { assert_eq!(r, Err(Error::KeyPairInconsistent), "flip at {pos}"); found = true; break; }
+        }
+    }
+    assert!(found, "no single-bit corruption of s1 produced a well-formed but inconsistent key");
+    // it must never panic on garbage
+    for fill in [0x00u8, 0x55, 0xAA, 0xFF] {
+        let r = std::panic::catch_unwind(|| B::validate_keypair(&vec![fill; PUBLIC_KEY_BYTES], &vec![fill; SECRET_KEY_BYTES])).expect("validate_keypair must not panic");
+        assert!(r.is_err(), "fill {fill:#x}");
+    }
     assert_eq!(B::validate_keypair(&kp.public_key[..10], &kp.private_key), Err(Error::BadPublicKeyLength));
     assert_eq!(B::validate_keypair(&kp.public_key, &kp.private_key[..10]), Err(Error::BadSecretKeyLength));
 }

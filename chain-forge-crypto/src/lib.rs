@@ -1074,6 +1074,10 @@ pub fn mldsa_tx_prehash(chain_id: &str, body_json: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+// -- FIPS 204 ML-DSA-65 backend (off by default; independent of the legacy `MlDsaScheme` above) -----------------
+#[cfg(feature = "fips204-backend")]
+pub mod fips204_backend;
+
 // -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
