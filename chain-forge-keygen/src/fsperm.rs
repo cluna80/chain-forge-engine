@@ -75,6 +75,26 @@ pub fn sddl_owner_only(sddl: &str, sid: &str, is_dir: bool) -> Result<(), String
     Ok(())
 }
 
+// ── parsing what `icacls <path> /save <file>` writes (pure, so it is tested on every platform) ──────────────────────
+
+/// Decode the file written by `icacls /save`. SCAFFOLD for the red test: the BOM-only logic that failed on Windows.
+pub fn decode_icacls_save(raw: &[u8]) -> String {
+    if raw.starts_with(&[0xFF, 0xFE]) {
+        let u: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&u)
+    } else {
+        String::from_utf8_lossy(raw).to_string()
+    }
+}
+
+/// The SDDL line of an `icacls /save` file: the object's name comes first, then its SDDL. A path such as `D:\keys\k.json` also
+/// contains "D:", but SDDL never contains a path separator, so select on that.
+pub fn sddl_line(text: &str) -> Option<String> {
+    text.lines().map(str::trim)
+        .find(|l| l.contains("D:") && !l.contains('\\') && !l.contains('/'))
+        .map(str::to_string)
+}
+
 // ── Unix ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -146,19 +166,8 @@ pub fn read_sddl(path: &Path) -> Result<String, String> {
     let raw = std::fs::read(&tmp).map_err(|e| format!("cannot read the saved ACL: {e}"));
     let _ = std::fs::remove_file(&tmp);
     let raw = raw?;
-    // icacls writes UTF-16LE (with a BOM); fall back to UTF-8.
-    let text = if raw.starts_with(&[0xFF, 0xFE]) {
-        let u: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&u)
-    } else {
-        String::from_utf8_lossy(&raw).to_string()
-    };
-    // The saved file is the object's name followed by its SDDL. A path such as `D:\keys\k.json` also contains "D:", but SDDL
-    // never contains a path separator, so select on that.
-    text.lines().map(str::trim)
-        .find(|l| l.contains("D:") && !l.contains('\\') && !l.contains('/'))
-        .map(str::to_string)
-        .ok_or_else(|| format!("no SDDL line in icacls output {text:?}"))
+    let text = decode_icacls_save(&raw);
+    sddl_line(&text).ok_or_else(|| format!("no SDDL line in icacls output {text:?}"))
 }
 
 #[cfg(windows)]
