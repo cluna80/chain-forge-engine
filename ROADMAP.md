@@ -1,5 +1,18 @@
 # Qattice — Public Testnet Alpha: ML-DSA-65 + PQ-HotStuff Launch Plan
-> **Owner decision: 2026-11-05 | Status: LOCKED DIRECTION, IMPLEMENTATION IN PROGRESS | Repository: [cluna80/Qattice](https://github.com/cluna80/Qattice)**
+
+## K1 backend evaluation update — 2026-11-05 (new evidence; decision gate pending)
+
+**Source:** [K1 draft PR #95](https://github.com/cluna80/Qattice/pull/95), `docs/k1-backend-evaluation/README.md` and `tools/k1-backend-eval/`. This is an **append-only update**; no earlier requirements or evidence have been removed.
+
+- **Evidence from Linux (not Windows):** four evaluated, version-pinned backends plus independent Python interoperability oracle. Candidate `fips204` **0.5.0** passed all measured NIST ACVP ML-DSA-65 vector classes: key generation **25/25**, signing **45/45**, verification **45/45**, plus reported cross-implementation signing and negative tests. The previously used `pqcrypto-dilithium` variant remains **nonconformant**; existing historical signatures cannot be verified by a conformant verifier. Reported valid legacy key pairs were reusable in sampling, **not** proof that all persisted keys can be migrated without checks.
+- **Preferred candidate, NOT launch approval:** `fips204` 0.5.0 for an **isolated, feature-gated backend implementation PR** after review. No independent audit identified. Windows/MINGW64 parity, production-feature and default OS-RNG/hedged-signing tests, dependency and platform review, exact-length validation, migration/integrity tests and a cryptographic review are **OPEN**. `libcrux-ml-dsa` and independent Python may serve as testing oracles, not alternative transaction/validator algorithms.
+- **Proposed signing-v2 design, pending owner acceptance:** standard **FIPS 204 external pure ML-DSA** with separate explicit, versioned contexts for transactions, validator votes, DIS and other signed domains; sign the **entire canonical, length-delimited transaction preimage** including chain ID, transaction ID, sender, nonce, gas limit, body and bound PQ public key. This **would supersede** the earlier approved SHA-256-prehash-as-message plan. Do **not** freeze PR #94 vectors or silently alter signing rules until this decision is explicitly approved and independently tested. HashML-DSA and pure ML-DSA on a 32-byte digest are different operations; do not conflate them.
+- **Key custody migration safety:** validate all stored key pairs and matching public-key/address bindings before switching signers. **Do not** automatically transform existing expanded secret keys into 32-byte seed backups; legacy seed expansion differs and such backups may not reproduce existing keys. Default signing should use a reviewed cryptographically secure RNG (hedged mode), fail closed on entropy errors, with deterministic mode for fixed-vector tests only, subject to implementation review.
+- **No public-testnet gate is closed by this result.** QAT-01 remains in progress pending the above checks and explicit backend acceptance. QAT-02/03 and PQ-HotStuff production integration remain blocked on reviewed, conforming cryptography. PRs #94, #95 and the roadmap PR #96 remain draft/unmerged; do not modify the separate Chain Forge project.
+
+---
+
+ **Owner decision: 2026-11-05 | Status: LOCKED DIRECTION, IMPLEMENTATION IN PROGRESS | Repository: [cluna80/Qattice](https://github.com/cluna80/Qattice)**
 >
 > **Append-only roadmap notice:** This new section is placed above the original engineering roadmap. All pre-existing roadmap text below is retained verbatim as historical engineering context. Where older plans conflict, the November 5 owner decisions in this section take precedence for Qattice's first public testnet. Do not interpret historical completed tests as proof that the new public-testnet gates have passed.
 >
