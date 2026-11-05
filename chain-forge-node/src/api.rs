@@ -107,6 +107,9 @@ pub struct TxPrecheck {
     /// Genesis `cryptography.signature_scheme`: which schemes user accounts
     /// may sign with. Checked by the same function execution uses.
     pub account_signature_policy: chain_forge_core::AccountSignaturePolicy,
+    /// TEST-ONLY (feature `signing-v2`): apply the signing-v2 envelope rules E1-E5 at ingress.
+    #[cfg(feature = "signing-v2")]
+    pub mldsa_signing_v2: bool,
 }
 
 /// Maximum nonce gap the mempool accepts for an account's next tx.
@@ -286,6 +289,26 @@ pub async fn serve(
                             // visit_none fallback (→ empty Vec) cannot silently accept it.
                             http_400_json(r#"{"status":"rejected","state":"rejected","message":"malformed signature: null is not a valid signature value"}"#)
                         } else { match serde_json::from_str::<Transaction>(body) {
+                            // TEST-ONLY signing v2 (feature `signing-v2`): the structural envelope rules E1-E5, ahead of the
+                            // legacy arms so the stable v2 code is what the client sees. The API has no account state, so the
+                            // bound key is unknown: a transaction that carries no key is treated as relying on a bound key
+                            // (E5 is then settled by `Node::submit_tx`, which knows it); one that carries a key must carry
+                            // a well-formed 1,952-byte key.
+                            #[cfg(feature = "signing-v2")]
+                            Ok(tx) if precheck.mldsa_signing_v2
+                                && chain_forge_execution::signing_v2::check_envelope(
+                                    &tx, if tx.pq_public_key.is_empty() { Some(&[][..]) } else { None }).is_err() => {
+                                let code = chain_forge_execution::signing_v2::check_envelope(
+                                    &tx, if tx.pq_public_key.is_empty() { Some(&[][..]) } else { None }).unwrap_err();
+                                tracing::info!(tx_id = %tx.id, code, "transaction rejected at ingress (signing v2 envelope)");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "state": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": format!("{code}: invalid signing-v2 envelope")
+                                });
+                                http_400_json(&resp.to_string())
+                            }
                             Ok(tx) if chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy).is_err() => {
                                 let reason = chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy)
                                     .unwrap_err();

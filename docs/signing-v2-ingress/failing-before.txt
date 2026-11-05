@@ -1,0 +1,15 @@
+test node::tests::signing_v2_ingress::api_accepts_a_well_formed_v2_transaction ... ok
+test node::tests::signing_v2_ingress::control_switch_off_submit_tx_is_unchanged ... ok
+test node::tests::signing_v2_ingress::control_switch_off_legacy_ingress_admits_two_signatures ... ok
+test node::tests::signing_v2_ingress::submit_tx_refuses_a_key_that_differs_from_the_bound_key ... FAILED
+test node::tests::signing_v2_ingress::api_rejects_each_envelope_violation_with_its_code_and_queues_nothing ... FAILED
+test node::tests::signing_v2_ingress::submit_tx_refuses_each_envelope_violation_and_admits_a_good_one ... FAILED
+
+thread 'node::tests::signing_v2_ingress::submit_tx_refuses_a_key_that_differs_from_the_bound_key' (2121) panicked at chain-forge-node/src/node.rs:10587:13:
+E5_KEY_DIFFERS_FROM_BOUND_KEY
+thread 'node::tests::signing_v2_ingress::api_rejects_each_envelope_violation_with_its_code_and_queues_nothing' (2118) panicked at chain-forge-node/src/node.rs:10549:17:
+no scheme: expected E1_SCHEME_MISSING in {"message":"unsigned or malformed: public_key must be 32 bytes, got 0","state":"rejected","status":"rejected","tx_id":"e1a"}
+thread 'node::tests::signing_v2_ingress::submit_tx_refuses_each_envelope_violation_and_admits_a_good_one' (2122) panicked at chain-forge-node/src/node.rs:10572:17:
+no scheme: submit_tx (API drain and gossip) must refuse it
+test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 416 filtered out; finished in 0.32s
+
