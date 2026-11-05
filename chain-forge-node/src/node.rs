@@ -10763,6 +10763,21 @@ mod tests {
         assert!(e.contains("qattice-v2") && e.contains("signing-v2"), "{e}");
     }
 
+    /// The public-alpha release bundle must contain signing v2 (and so the conformant FIPS 204 backend): a `public-alpha` build
+    /// can never silently run legacy signatures.
+    #[cfg(feature = "public-alpha")]
+    #[test]
+    fn a_public_alpha_build_includes_signing_v2() {
+        assert!(cfg!(feature = "signing-v2"), "the public-alpha feature must imply signing-v2");
+    }
+
+    #[cfg(feature = "public-alpha")]
+    #[tokio::test]
+    async fn a_public_alpha_build_starts_a_qattice_v2_genesis() {
+        let n = Node::new(&with_profile(GENESIS, r#""qattice-v2""#), None).await.expect("a public-alpha build must start a v2 genesis");
+        assert_eq!(n.genesis.commitment_profile(), Ok(chain_forge_core::CommitmentProfile::QatticeV2));
+    }
+
     #[tokio::test]
     async fn an_absent_profile_keeps_the_legacy_rules() {
         let n = Node::new(GENESIS, None).await.unwrap();

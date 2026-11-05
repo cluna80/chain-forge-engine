@@ -901,6 +901,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chain-forge-launch"
+version = "0.1.0"
+dependencies = [
+ "chain-forge-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chain-forge-miner"
 version = "0.1.0"
 dependencies = [
