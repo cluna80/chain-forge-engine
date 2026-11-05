@@ -1,0 +1,16 @@
+running 14 tests
+test acvp_keygen_keys_roundtrip_through_the_library ... ok
+test acvp_siggen_deterministic_signatures_match_byte_for_byte ... ignored, K1: pqcrypto-dilithium 0.5.0 is not FIPS 204 conformant (challenge sampled from 32 of 48 c-tilde bytes); passes with the one-line change in docs/k1-mldsa-conformance/challenge-full-ctilde.patch
+test acvp_sigver_accept_and_reject_agree_with_nist ... ignored, K1: pqcrypto-dilithium 0.5.0 is not FIPS 204 conformant (challenge sampled from 32 of 48 c-tilde bytes); passes with the one-line change in docs/k1-mldsa-conformance/challenge-full-ctilde.patch
+test all_zero_public_key_does_not_verify ... ok
+test characterization_library_does_not_match_nist_today ... K1-RESULT characterization: siggen byte-matches 0/45; internal c-tilde prefix matches 11/15; sigver NIST-valid verified 0/9; NIST-invalid rejected 36/36
+test characterization_wrapper_accepts_an_overlong_public_key_today ... K1-RESULT overlong-pk (1953 bytes) verify -> Ok("ACCEPTED")
+test invalid_signatures_and_messages_are_rejected ... ok
+test library_generated_keys_are_structurally_consistent ... ok
+test library_parameter_sizes_are_the_fips204_ml_dsa_65_sizes ... ok
+test library_signing_is_deterministic ... ok
+test malformed_keys_are_rejected_at_parse_time ... ok
+test wrapper_must_reject_a_public_key_with_trailing_bytes ... ignored, K1 finding: MlDsaScheme::verify silently truncates an over-long public key; fix is a wrapper change (separate PR)
+test wrapper_rejects_tampered_signature_message_scheme_and_short_key ... ok
+test wrapper_signs_and_verifies_exactly_like_the_raw_library ... ok
+test result: ok. 11 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.18s

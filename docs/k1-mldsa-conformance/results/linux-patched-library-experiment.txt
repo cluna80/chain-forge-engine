@@ -1,0 +1,16 @@
+running 14 tests
+test acvp_keygen_keys_roundtrip_through_the_library ... ok
+test acvp_siggen_deterministic_signatures_match_byte_for_byte ... K1-RESULT siggen (total, matched) per interface: {"external-prehash": (15, 15), "external-pure": (15, 15), "internal": (15, 15)}
+test acvp_sigver_accept_and_reject_agree_with_nist ... K1-RESULT sigver: 45/45 agree with NIST (36 expected rejections); per interface {"external-prehash": (15, 15), "external-pure": (15, 15), "internal": (15, 15)}
+test all_zero_public_key_does_not_verify ... ok
+test characterization_library_does_not_match_nist_today ... K1-RESULT characterization: siggen byte-matches 45/45; internal c-tilde prefix matches 15/15; sigver NIST-valid verified 9/9; NIST-invalid rejected 36/36
+test characterization_wrapper_accepts_an_overlong_public_key_today ... K1-RESULT overlong-pk (1953 bytes) verify -> Ok("ACCEPTED")
+test invalid_signatures_and_messages_are_rejected ... ok
+test library_generated_keys_are_structurally_consistent ... ok
+test library_parameter_sizes_are_the_fips204_ml_dsa_65_sizes ... ok
+test library_signing_is_deterministic ... ok
+test malformed_keys_are_rejected_at_parse_time ... ok
+test wrapper_must_reject_a_public_key_with_trailing_bytes ... 
+test wrapper_rejects_tampered_signature_message_scheme_and_short_key ... ok
+test wrapper_signs_and_verifies_exactly_like_the_raw_library ... ok
+test result: FAILED. 12 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
