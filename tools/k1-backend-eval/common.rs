@@ -315,6 +315,24 @@ pub fn sign_keys<B: Backend>(file: &Value) -> Value {
     json!({"signer": B::name(), "cases": out})
 }
 
+/// Verify a signing-v2 vector file (docs/mldsa-tx-signing-v2/vectors/v2.json): each case is
+/// ML-DSA.Verify(pk, M = preimage, ctx, signature) and must equal `expect_valid`.
+pub fn verify_v2<B: Backend>(file: &Value) -> Value {
+    let (mut total, mut agree) = (0u32, 0u32);
+    let mut bad = vec![];
+    for c in file["cases"].as_array().unwrap() {
+        let (pk, m, sig) = (hx(c, "verify_public_key_hex"), hx(c, "preimage_hex"), hx(c, "signature_hex"));
+        let ctx = c["context"].as_str().unwrap().as_bytes().to_vec();
+        let want = c["expect_valid"].as_bool().unwrap();
+        total += 1;
+        match B::verify_pure(&pk, &m, &ctx, &sig) {
+            Some(got) if got == want => agree += 1,
+            other => bad.push(json!({"case": c["name"], "expected": want, "got": other})),
+        }
+    }
+    json!({"verifier": B::name(), "cases": total, "agree": agree, "disagreements": bad})
+}
+
 pub fn main_for<B: Backend>() {
     let args: Vec<String> = std::env::args().collect();
     let fixture = || -> Value { serde_json::from_str(&std::fs::read_to_string(&args[2]).unwrap()).unwrap() };
@@ -326,6 +344,7 @@ pub fn main_for<B: Backend>() {
         Some("bench") => bench::<B>(),
         Some("keys") => gen_keys::<B>(),
         Some("sign-keys") => sign_keys::<B>(&fixture()),
+        Some("verify-v2") => verify_v2::<B>(&fixture()),
         Some("stack") => { stack_probe::<B>(args[2].parse().unwrap()); return; }
         _ => { eprintln!("usage: <kat|verify-interop> <json> | neg | gen-interop | bench"); std::process::exit(2) }
     };
