@@ -1,0 +1,1345 @@
+{
+ "format": "qattice-state-leaf-vectors",
+ "leaf_version": 2,
+ "magic_hex": "0051414c45414600",
+ "domains": {
+  "recovery_policy": "qattice/state/recovery-policy/v1",
+  "pending_recovery": "qattice/state/pending-recovery/v1",
+  "charm": "qattice/state/charm/v1",
+  "escrow": "qattice/state/escrow/v1"
+ },
+ "bounds": {
+  "address": 256,
+  "role": 64,
+  "denom": 64,
+  "balance_entries": 256,
+  "public_key": 4096,
+  "guardians": 64,
+  "scheme": 64,
+  "escrow_field": 256,
+  "leaf": 32768
+ },
+ "byte_string_notation": "{'hex': str} or {'seq': {'seed': s, 'len': n}} meaning byte i = (s + i) mod 256",
+ "positive": [
+  {
+   "name": "minimal",
+   "description": "no optional field, no balance",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000035010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+    "leaf_len": 66,
+    "leaf_sha3_256": "04c5e41e351d436f8cfdaddec0db06a04f0d27e84aeec0f21b04798033086145",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "a3574603b4ae2f47f92d93465b0cf7001f8493d2f575d98476503971d4374390",
+    "jmt_leaf_node_hash": "a2ab561b4dcde15004a15b9e5e7d2144a83804954b2222fe3683919e73beff84"
+   }
+  },
+  {
+   "name": "balances_sorted_input_unsorted",
+   "description": "three denoms given out of order; the leaf lists them ascending by byte order",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {
+     "uqcb": 1000,
+     "aaa": 5,
+     "uex": 0
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c45414600020000007b010000000971636231616c69636502000000000000000003000000047573657204000500000003000000036161610000000000000000000000000000000500000003756578000000000000000000000000000000000000000475716362000000000000000000000000000003e80700000000080000000000000000",
+    "leaf_len": 136,
+    "leaf_sha3_256": "f5277f5064d7d111636b711c9d817c7afb6454e1d083ad0baa3c19f89c2e8d25",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "d55fab364808e716f528046fd337d951bb59bb6957b9342b9c4a4a4b171d1ba8",
+    "jmt_leaf_node_hash": "e2e69f0ccf429a4fda06489251421f97efdecc97d825d32f7892f07f03fe3fb1"
+   }
+  },
+  {
+   "name": "zero_balance_entry_is_kept",
+   "description": "a denom with amount 0 is still an entry",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {
+     "uqcb": 0
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c45414600020000004d010000000971636231616c696365020000000000000000030000000475736572040005000000010000000475716362000000000000000000000000000000000700000000080000000000000000",
+    "leaf_len": 90,
+    "leaf_sha3_256": "3cf753bb7d6922ca16bfa136afc5b82e5415f721b5b8e7104f9d01d20ded9620",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "914e2539ec4c964ab8f3785156d68744008f42c98ab5618c99565c6dd7dd88dc",
+    "jmt_leaf_node_hash": "8fa0f5f0dc92efe83d7575152c07df168bacabfaa881b41c3d7918002b87ad09"
+   }
+  },
+  {
+   "name": "with_public_key_mldsa65_size",
+   "description": "1952-byte public key",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": {
+     "seq": {
+      "seed": 1,
+      "len": 1952
+     }
+    },
+    "key_version": 2,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c4541460002000007da010000000971636231616c6963650200000000000000000300000004757365720400050000000006000007a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa00700000002080000000000000000",
+    "leaf_len": 2023,
+    "leaf_sha3_256": "1278bf39c801dfa96653ad66dcf5b78c354c0e33e7856e8e658b2af8236535a9",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "ed19581cfe128c66e0ef3fbd7a2b771afef8af97161a14b6ba09070e8b7c3690",
+    "jmt_leaf_node_hash": "69ee951fc7d9277ee1a9763d572bf200caf250e0ba5715b1ee1a76320c70234c"
+   }
+  },
+  {
+   "name": "empty_public_key_is_present",
+   "description": "Some(empty) is distinct from None",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": {
+     "hex": ""
+    },
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c45414600020000003a010000000971636231616c6963650200000000000000000300000004757365720400050000000006000000000700000000080000000000000000",
+    "leaf_len": 71,
+    "leaf_sha3_256": "0d7e3122b0a440bbbd1b9f763d8014ccc9b9d61fb823613d855e220a574a5dc5",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "40e2111ff21bc597407d20f22a30f9857c8fa4be5d942941257412d26f6dd1f4",
+    "jmt_leaf_node_hash": "5d9fbde01c92d11ca89e80a6362c029cf151250816658126d555a73440a8311b"
+   }
+  },
+  {
+   "name": "with_recovery_policy",
+   "description": "3 guardians of 1952 bytes, threshold 2",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 2,
+    "recovery_policy": {
+     "guardians": [
+      {
+       "seq": {
+        "seed": 10,
+        "len": 1952
+       }
+      },
+      {
+       "seq": {
+        "seed": 17,
+        "len": 1952
+       }
+      },
+      {
+       "seq": {
+        "seed": 24,
+        "len": 1952
+       }
+      }
+     ],
+     "threshold": 2,
+     "enrolled_at_key_version": 4,
+     "policy_id": 7
+    },
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c69636502000000000000000003000000047573657204000500000000070000000008000000000000000209d5e330050dd8af7fede7eadd49da0ea86e66d91feb934efd6dab652330ace4da",
+    "leaf_len": 99,
+    "leaf_sha3_256": "945de711cee9c97dccde86dcc9dfd6dd574520f39ffe87d3a67f96bbc1c8ca43",
+    "substructure_hashes": {
+     "recovery_policy": "d5e330050dd8af7fede7eadd49da0ea86e66d91feb934efd6dab652330ace4da"
+    },
+    "substructure_bodies": {
+     "recovery_policy": {
+      "body_len": 5888,
+      "body_sha3_256": "30d9594033f570900e346d68efa440022e92afb75dd10e66f8c0d28606bafdbd"
+     }
+    },
+    "jmt_value_hash": "f98f289648b55b6ffe2c9ab8a29c75061b34e9854cab1f7e67ef86b2e89d66cd",
+    "jmt_leaf_node_hash": "2ab7b4b131871066aa655fe2b68dd3ea01e3af39a0556747712296834afda35a"
+   }
+  },
+  {
+   "name": "recovery_policy_guardian_order_matters",
+   "description": "same guardians in another order give another hash",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 2,
+    "recovery_policy": {
+     "guardians": [
+      {
+       "seq": {
+        "seed": 24,
+        "len": 1952
+       }
+      },
+      {
+       "seq": {
+        "seed": 17,
+        "len": 1952
+       }
+      },
+      {
+       "seq": {
+        "seed": 10,
+        "len": 1952
+       }
+      }
+     ],
+     "threshold": 2,
+     "enrolled_at_key_version": 4,
+     "policy_id": 7
+    },
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c69636502000000000000000003000000047573657204000500000000070000000008000000000000000209a37d87072fc8b9847a7000a5646463846be8bbdd458c904355c60ea4a6c12aff",
+    "leaf_len": 99,
+    "leaf_sha3_256": "6fbe75094c0a93cfe0e59abf0c2a51fd1c3c1d1698a84ff51adf006ec2a21096",
+    "substructure_hashes": {
+     "recovery_policy": "a37d87072fc8b9847a7000a5646463846be8bbdd458c904355c60ea4a6c12aff"
+    },
+    "substructure_bodies": {
+     "recovery_policy": {
+      "body_len": 5888,
+      "body_sha3_256": "635e346fec046e95cf9e358b2144cc917103ec522cabb7de938de62fc113e7a0"
+     }
+    },
+    "jmt_value_hash": "ea6bac2c9119651ef1c8db197db6e8da5a4d2553f7c15b289cebabf76d41b6ff",
+    "jmt_leaf_node_hash": "66b1e499117f6ae7d0c769ccf13cb8be1788cc7088361f0f395a157b078dd866"
+   }
+  },
+  {
+   "name": "with_pending_recovery",
+   "description": "pending record, not cancelled",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": {
+     "new_public_key": {
+      "seq": {
+       "seed": 40,
+       "len": 1952
+      }
+     },
+     "new_key_scheme": "ml-dsa-65",
+     "key_version": 5,
+     "submitted_at_height": 10,
+     "activation_height": 50,
+     "policy_id": 7,
+     "cancelled": false
+    },
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c6963650200000000000000000300000004757365720400050000000007000000000800000000000000000a5b2d64400caafdc487c2a7b5c918297cc693e9f2de3120a0c006fc2c1db6efea",
+    "leaf_len": 99,
+    "leaf_sha3_256": "d75801ff172f260c8c8d9e38976474b8057d52166bbbbfe5ac01db8058a634fd",
+    "substructure_hashes": {
+     "pending_recovery": "5b2d64400caafdc487c2a7b5c918297cc693e9f2de3120a0c006fc2c1db6efea"
+    },
+    "substructure_bodies": {
+     "pending_recovery": {
+      "body_len": 1998,
+      "body_sha3_256": "49c98ea795faac849499d1f6b5fd28bca475ea5f253e77eb281e3dae34e12c0f"
+     }
+    },
+    "jmt_value_hash": "5cc29146906b1a7ea63e7e4c158b0c0f666cd4727ee9b40f9136e0c82e9f165b",
+    "jmt_leaf_node_hash": "c661259227ef5b513f8c93fa82f7cfbc9619532fe710c91bbf6fe09a1b5b1e7f"
+   }
+  },
+  {
+   "name": "with_pending_recovery_cancelled",
+   "description": "same record with cancelled = true",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": {
+     "new_public_key": {
+      "seq": {
+       "seed": 40,
+       "len": 1952
+      }
+     },
+     "new_key_scheme": "ml-dsa-65",
+     "key_version": 5,
+     "submitted_at_height": 10,
+     "activation_height": 50,
+     "policy_id": 7,
+     "cancelled": true
+    },
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c6963650200000000000000000300000004757365720400050000000007000000000800000000000000000ae0352ecae91a99fd732e65692867ddf4e4ff5566894491aeb29e1b015e92fc13",
+    "leaf_len": 99,
+    "leaf_sha3_256": "36165d21665948ead887a012bf00595b9598460ca89852c9e94cae11eaefa7d1",
+    "substructure_hashes": {
+     "pending_recovery": "e0352ecae91a99fd732e65692867ddf4e4ff5566894491aeb29e1b015e92fc13"
+    },
+    "substructure_bodies": {
+     "pending_recovery": {
+      "body_len": 1998,
+      "body_sha3_256": "66302fab0386299aac564bbc0eb7b2d6c044a282b1409d55b036311b75ae095f"
+     }
+    },
+    "jmt_value_hash": "8026c878f3c9e42b480912ef09b825824e9ed99b6cd29df34ed2b393577dcd71",
+    "jmt_leaf_node_hash": "7887b4bef648e4a9944dda323a6a569975bea0a6a53b38046e462c5b2d18fa20"
+   }
+  },
+  {
+   "name": "with_charm_verified",
+   "description": "charm with every field set",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": {
+     "tier": "Verified",
+     "decay_exemption": {
+      "days": 30,
+      "last_earned_epoch": 12
+     },
+     "verified_since_epoch": 3,
+     "last_attested_epoch": 44,
+     "consecutive_active_epochs": 9,
+     "verified_via_wot": true
+    },
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c6963650200000000000000000300000004757365720402050000000007000000000800000000000000000b6e4324dc3512dfd64cc2136582ce8d81f337fbf5593656bc0249b4859b7614db",
+    "leaf_len": 99,
+    "leaf_sha3_256": "a78a46b2b83e40bee1137cb18b2f2764a8f9e26064680599830f9ac515e42b83",
+    "substructure_hashes": {
+     "charm": "6e4324dc3512dfd64cc2136582ce8d81f337fbf5593656bc0249b4859b7614db"
+    },
+    "substructure_bodies": {
+     "charm": {
+      "body_hex": "020000001e000000000000000c010000000000000003000000000000002c0000000901"
+     }
+    },
+    "jmt_value_hash": "c7f07e76333baf8f2afbfe66a6fcbaa0db0105841d28e8e5506e25aed31ff96d",
+    "jmt_leaf_node_hash": "86db79587ccf6772d3cba0484cebba2c349ad587fa3815c0d6f930559185a89b"
+   }
+  },
+  {
+   "name": "with_charm_provisional_no_since",
+   "description": "verified_since_epoch absent",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": {
+     "tier": "Provisional",
+     "decay_exemption": {
+      "days": 30,
+      "last_earned_epoch": 12
+     },
+     "verified_since_epoch": null,
+     "last_attested_epoch": 44,
+     "consecutive_active_epochs": 9,
+     "verified_via_wot": false
+    },
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c6963650200000000000000000300000004757365720401050000000007000000000800000000000000000b6296d565af82dcd8b495cb755c9bf318b4f63230afed90bef26f91b0b977e0c0",
+    "leaf_len": 99,
+    "leaf_sha3_256": "42efc6c3f1557b520065d3df9617787394ca067ad52a5a9557673dcc9d24137b",
+    "substructure_hashes": {
+     "charm": "6296d565af82dcd8b495cb755c9bf318b4f63230afed90bef26f91b0b977e0c0"
+    },
+    "substructure_bodies": {
+     "charm": {
+      "body_hex": "010000001e000000000000000c00000000000000002c0000000900"
+     }
+    },
+    "jmt_value_hash": "ac1301194d12f8d6046d5833c4a75388149c43c464300d93171dfa3da2ddf295",
+    "jmt_leaf_node_hash": "59a1bb0e4e1db89876dacaea3de130fe1572d6e3a371e14e9f2b35339d6f8d99"
+   }
+  },
+  {
+   "name": "with_charm_established",
+   "description": "tier Established",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": {
+     "tier": "Established",
+     "decay_exemption": {
+      "days": 0,
+      "last_earned_epoch": 0
+     },
+     "verified_since_epoch": 1,
+     "last_attested_epoch": 0,
+     "consecutive_active_epochs": 0,
+     "verified_via_wot": true
+    },
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c6963650200000000000000000300000004757365720403050000000007000000000800000000000000000b3f24d1239dce018a1d1fa3c405d447d2d2bb9bf6403707d31a52c0bcdeb1ac79",
+    "leaf_len": 99,
+    "leaf_sha3_256": "b34be6b63842b2d015b2b51ba107601194f28523bc4fc9c9ab15dc5b4a9c250a",
+    "substructure_hashes": {
+     "charm": "3f24d1239dce018a1d1fa3c405d447d2d2bb9bf6403707d31a52c0bcdeb1ac79"
+    },
+    "substructure_bodies": {
+     "charm": {
+      "body_hex": "0300000000000000000000000001000000000000000100000000000000000000000001"
+     }
+    },
+    "jmt_value_hash": "168534a611abeb83153ada036efac9707719a9f7b19a3cf42b808a9099b9647c",
+    "jmt_leaf_node_hash": "89877c44a1c784a829b856b681ea894374d0999840f4ebeb336a1c21c211b81b"
+   }
+  },
+  {
+   "name": "with_escrow",
+   "description": "dormant escrow binding",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {},
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": {
+     "job_id": "job-1",
+     "agent_wallet": "qcb1wallet",
+     "funding_source": "qcb1fund"
+    }
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000056010000000971636231616c6963650200000000000000000300000004757365720400050000000007000000000800000000000000000c608c179fdc65261db02a64bbff39a57f723fa205a6c882a92df115c211ba7185",
+    "leaf_len": 99,
+    "leaf_sha3_256": "82d87028b1d3a4384ebf5fd44d7aa24c880f0b8c48d1ee5538867f0da0cd17ba",
+    "substructure_hashes": {
+     "escrow": "608c179fdc65261db02a64bbff39a57f723fa205a6c882a92df115c211ba7185"
+    },
+    "substructure_bodies": {
+     "escrow": {
+      "body_hex": "000000056a6f622d310000000a7163623177616c6c6574000000087163623166756e64"
+     }
+    },
+    "jmt_value_hash": "1b9d4bff673da1029afb970d657a56fedb57a0957429df7f7edde7640a109873",
+    "jmt_leaf_node_hash": "304f4e63b6b7754147680d89b920a7b47ffd2748f1c69aa8f17b8c88325ba0a0"
+   }
+  },
+  {
+   "name": "all_fields",
+   "description": "every optional field present",
+   "account": {
+    "address": "qcb1all",
+    "nonce": 77,
+    "role": "validator",
+    "balances": {
+     "uqcb": 1000000000000000000000000000000,
+     "uex": 1
+    },
+    "public_key": {
+     "seq": {
+      "seed": 3,
+      "len": 1952
+     }
+    },
+    "key_version": 9,
+    "policy_generation": 4,
+    "recovery_policy": {
+     "guardians": [
+      {
+       "seq": {
+        "seed": 10,
+        "len": 1952
+       }
+      },
+      {
+       "seq": {
+        "seed": 17,
+        "len": 1952
+       }
+      },
+      {
+       "seq": {
+        "seed": 24,
+        "len": 1952
+       }
+      }
+     ],
+     "threshold": 2,
+     "enrolled_at_key_version": 4,
+     "policy_id": 7
+    },
+    "pending_recovery": {
+     "new_public_key": {
+      "seq": {
+       "seed": 40,
+       "len": 1952
+      }
+     },
+     "new_key_scheme": "ml-dsa-65",
+     "key_version": 5,
+     "submitted_at_height": 10,
+     "activation_height": 50,
+     "policy_id": 7,
+     "cancelled": false
+    },
+    "charm": {
+     "tier": "Verified",
+     "decay_exemption": {
+      "days": 30,
+      "last_earned_epoch": 12
+     },
+     "verified_since_epoch": 3,
+     "last_attested_epoch": 44,
+     "consecutive_active_epochs": 9,
+     "verified_via_wot": true
+    },
+    "escrow": {
+     "job_id": "job-1",
+     "agent_wallet": "qcb1wallet",
+     "funding_source": "qcb1fund"
+    }
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000890010000000771636231616c6c02000000000000004d030000000976616c696461746f7204020500000002000000037565780000000000000000000000000000000100000004757163620000000c9f2c9cd04674edea4000000006000007a0030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2070000000908000000000000000409d5e330050dd8af7fede7eadd49da0ea86e66d91feb934efd6dab652330ace4da0a5b2d64400caafdc487c2a7b5c918297cc693e9f2de3120a0c006fc2c1db6efea0b6e4324dc3512dfd64cc2136582ce8d81f337fbf5593656bc0249b4859b7614db0c608c179fdc65261db02a64bbff39a57f723fa205a6c882a92df115c211ba7185",
+    "leaf_len": 2205,
+    "leaf_sha3_256": "63aaefa822f9105d798b90bf5558b0a61c41c4676b3d1da759809693b613d17f",
+    "substructure_hashes": {
+     "recovery_policy": "d5e330050dd8af7fede7eadd49da0ea86e66d91feb934efd6dab652330ace4da",
+     "pending_recovery": "5b2d64400caafdc487c2a7b5c918297cc693e9f2de3120a0c006fc2c1db6efea",
+     "charm": "6e4324dc3512dfd64cc2136582ce8d81f337fbf5593656bc0249b4859b7614db",
+     "escrow": "608c179fdc65261db02a64bbff39a57f723fa205a6c882a92df115c211ba7185"
+    },
+    "substructure_bodies": {
+     "recovery_policy": {
+      "body_len": 5888,
+      "body_sha3_256": "30d9594033f570900e346d68efa440022e92afb75dd10e66f8c0d28606bafdbd"
+     },
+     "pending_recovery": {
+      "body_len": 1998,
+      "body_sha3_256": "49c98ea795faac849499d1f6b5fd28bca475ea5f253e77eb281e3dae34e12c0f"
+     },
+     "charm": {
+      "body_hex": "020000001e000000000000000c010000000000000003000000000000002c0000000901"
+     },
+     "escrow": {
+      "body_hex": "000000056a6f622d310000000a7163623177616c6c6574000000087163623166756e64"
+     }
+    },
+    "jmt_value_hash": "b849576fbbd8cbc6e3743b3dbd140a8500df349c72eff96d140dbc5b42947979",
+    "jmt_leaf_node_hash": "dbb08339f5a3af21a342220e761fc8ebfe6eeeb99d63e1bb8c50ad9a8b9715cb"
+   }
+  },
+  {
+   "name": "non_ascii_strings",
+   "description": "UTF-8 is hashed as bytes, never normalised",
+   "account": {
+    "address": "qcb1ünï",
+    "nonce": 0,
+    "role": "用户",
+    "balances": {
+     "µqcb": 3
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200000050010000000971636231c3bc6ec3af0200000000000000000300000006e794a8e688b70400050000000100000005c2b5716362000000000000000000000000000000030700000000080000000000000000",
+    "leaf_len": 93,
+    "leaf_sha3_256": "7e16cbf2734e33bc6fea41cf05d727eaf29dd9da74e611d3f5756a707917b86a",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "7013e585252b89831decd2781499c4d7f02f79ea10dac31f2ccd69356acafac5",
+    "jmt_leaf_node_hash": "3a72fd53eeed8f65cba0e672d17a8360f41f6dfd5e381ad522ac8725aaea2246"
+   }
+  },
+  {
+   "name": "denom_with_separators",
+   "description": "denoms containing '|' and '=' (ambiguous in v1) are unambiguous in v2",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {
+     "a=1|b": 2
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c45414600020000004e010000000971636231616c6963650200000000000000000300000004757365720400050000000100000005613d317c62000000000000000000000000000000020700000000080000000000000000",
+    "leaf_len": 91,
+    "leaf_sha3_256": "88541a89f4cd8f02dc36deefaafd8c777fb1aa6d8dcba4e1dd84f496ca47711c",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "faf586d09baf12d8382da5026e329bf48582345c8c8f48ad552090b6080f3612",
+    "jmt_leaf_node_hash": "c52060ac876081703a51744b31d80bec2ebf270127256aaf381fe12bc0f09559"
+   }
+  },
+  {
+   "name": "two_denoms_a_and_b",
+   "description": "the honest map {'a':1,'b':2}; its v1 text equals the one for the forged single denom 'a=1|b' (see denom_with_separators), its v2 leaf does not",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {
+     "a": 1,
+     "b": 2
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c45414600020000005f010000000971636231616c696365020000000000000000030000000475736572040005000000020000000161000000000000000000000000000000010000000162000000000000000000000000000000020700000000080000000000000000",
+    "leaf_len": 108,
+    "leaf_sha3_256": "e57cdaa3ffdee8839d58f7baafa21e7027fc250eefb14ca6b5e8dfa4b7c3e8c3",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "f858bd0e7e19df4c390fa5b16dd8a30b8624ae7b87f5cc83a899360f42e1fdce",
+    "jmt_leaf_node_hash": "c0086f4823f0cdac4741f09c02750a1f3442e670f1fce56292f6f241241b073f"
+   }
+  },
+  {
+   "name": "numeric_extremes",
+   "description": "u64 / u128 / u32 maxima",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 18446744073709551615,
+    "role": "user",
+    "balances": {
+     "uqcb": 340282366920938463463374607431768211455
+    },
+    "public_key": null,
+    "key_version": 4294967295,
+    "policy_generation": 18446744073709551615,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c45414600020000004d010000000971636231616c69636502ffffffffffffffff030000000475736572040005000000010000000475716362ffffffffffffffffffffffffffffffff07ffffffff08ffffffffffffffff",
+    "leaf_len": 90,
+    "leaf_sha3_256": "11e19116146bd3dcdeaa33ea92e97a7deb5f0ba69b3f9977f34cac5a581f83c0",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "5c39266aad8c0dc115fe529f831b1bd051862cd45e855024385b7a2d12a24664",
+    "jmt_leaf_node_hash": "b9b0c595412aa363e083ce63f317f1e2e2e891c541b4440ce195616a453a60a5"
+   }
+  },
+  {
+   "name": "max_balance_entries",
+   "description": "256 entries, the bound",
+   "account": {
+    "address": "qcb1alice",
+    "nonce": 0,
+    "role": "user",
+    "balances": {
+     "d000": 0,
+     "d001": 1,
+     "d002": 2,
+     "d003": 3,
+     "d004": 4,
+     "d005": 5,
+     "d006": 6,
+     "d007": 7,
+     "d008": 8,
+     "d009": 9,
+     "d010": 10,
+     "d011": 11,
+     "d012": 12,
+     "d013": 13,
+     "d014": 14,
+     "d015": 15,
+     "d016": 16,
+     "d017": 17,
+     "d018": 18,
+     "d019": 19,
+     "d020": 20,
+     "d021": 21,
+     "d022": 22,
+     "d023": 23,
+     "d024": 24,
+     "d025": 25,
+     "d026": 26,
+     "d027": 27,
+     "d028": 28,
+     "d029": 29,
+     "d030": 30,
+     "d031": 31,
+     "d032": 32,
+     "d033": 33,
+     "d034": 34,
+     "d035": 35,
+     "d036": 36,
+     "d037": 37,
+     "d038": 38,
+     "d039": 39,
+     "d040": 40,
+     "d041": 41,
+     "d042": 42,
+     "d043": 43,
+     "d044": 44,
+     "d045": 45,
+     "d046": 46,
+     "d047": 47,
+     "d048": 48,
+     "d049": 49,
+     "d050": 50,
+     "d051": 51,
+     "d052": 52,
+     "d053": 53,
+     "d054": 54,
+     "d055": 55,
+     "d056": 56,
+     "d057": 57,
+     "d058": 58,
+     "d059": 59,
+     "d060": 60,
+     "d061": 61,
+     "d062": 62,
+     "d063": 63,
+     "d064": 64,
+     "d065": 65,
+     "d066": 66,
+     "d067": 67,
+     "d068": 68,
+     "d069": 69,
+     "d070": 70,
+     "d071": 71,
+     "d072": 72,
+     "d073": 73,
+     "d074": 74,
+     "d075": 75,
+     "d076": 76,
+     "d077": 77,
+     "d078": 78,
+     "d079": 79,
+     "d080": 80,
+     "d081": 81,
+     "d082": 82,
+     "d083": 83,
+     "d084": 84,
+     "d085": 85,
+     "d086": 86,
+     "d087": 87,
+     "d088": 88,
+     "d089": 89,
+     "d090": 90,
+     "d091": 91,
+     "d092": 92,
+     "d093": 93,
+     "d094": 94,
+     "d095": 95,
+     "d096": 96,
+     "d097": 97,
+     "d098": 98,
+     "d099": 99,
+     "d100": 100,
+     "d101": 101,
+     "d102": 102,
+     "d103": 103,
+     "d104": 104,
+     "d105": 105,
+     "d106": 106,
+     "d107": 107,
+     "d108": 108,
+     "d109": 109,
+     "d110": 110,
+     "d111": 111,
+     "d112": 112,
+     "d113": 113,
+     "d114": 114,
+     "d115": 115,
+     "d116": 116,
+     "d117": 117,
+     "d118": 118,
+     "d119": 119,
+     "d120": 120,
+     "d121": 121,
+     "d122": 122,
+     "d123": 123,
+     "d124": 124,
+     "d125": 125,
+     "d126": 126,
+     "d127": 127,
+     "d128": 128,
+     "d129": 129,
+     "d130": 130,
+     "d131": 131,
+     "d132": 132,
+     "d133": 133,
+     "d134": 134,
+     "d135": 135,
+     "d136": 136,
+     "d137": 137,
+     "d138": 138,
+     "d139": 139,
+     "d140": 140,
+     "d141": 141,
+     "d142": 142,
+     "d143": 143,
+     "d144": 144,
+     "d145": 145,
+     "d146": 146,
+     "d147": 147,
+     "d148": 148,
+     "d149": 149,
+     "d150": 150,
+     "d151": 151,
+     "d152": 152,
+     "d153": 153,
+     "d154": 154,
+     "d155": 155,
+     "d156": 156,
+     "d157": 157,
+     "d158": 158,
+     "d159": 159,
+     "d160": 160,
+     "d161": 161,
+     "d162": 162,
+     "d163": 163,
+     "d164": 164,
+     "d165": 165,
+     "d166": 166,
+     "d167": 167,
+     "d168": 168,
+     "d169": 169,
+     "d170": 170,
+     "d171": 171,
+     "d172": 172,
+     "d173": 173,
+     "d174": 174,
+     "d175": 175,
+     "d176": 176,
+     "d177": 177,
+     "d178": 178,
+     "d179": 179,
+     "d180": 180,
+     "d181": 181,
+     "d182": 182,
+     "d183": 183,
+     "d184": 184,
+     "d185": 185,
+     "d186": 186,
+     "d187": 187,
+     "d188": 188,
+     "d189": 189,
+     "d190": 190,
+     "d191": 191,
+     "d192": 192,
+     "d193": 193,
+     "d194": 194,
+     "d195": 195,
+     "d196": 196,
+     "d197": 197,
+     "d198": 198,
+     "d199": 199,
+     "d200": 200,
+     "d201": 201,
+     "d202": 202,
+     "d203": 203,
+     "d204": 204,
+     "d205": 205,
+     "d206": 206,
+     "d207": 207,
+     "d208": 208,
+     "d209": 209,
+     "d210": 210,
+     "d211": 211,
+     "d212": 212,
+     "d213": 213,
+     "d214": 214,
+     "d215": 215,
+     "d216": 216,
+     "d217": 217,
+     "d218": 218,
+     "d219": 219,
+     "d220": 220,
+     "d221": 221,
+     "d222": 222,
+     "d223": 223,
+     "d224": 224,
+     "d225": 225,
+     "d226": 226,
+     "d227": 227,
+     "d228": 228,
+     "d229": 229,
+     "d230": 230,
+     "d231": 231,
+     "d232": 232,
+     "d233": 233,
+     "d234": 234,
+     "d235": 235,
+     "d236": 236,
+     "d237": 237,
+     "d238": 238,
+     "d239": 239,
+     "d240": 240,
+     "d241": 241,
+     "d242": 242,
+     "d243": 243,
+     "d244": 244,
+     "d245": 245,
+     "d246": 246,
+     "d247": 247,
+     "d248": 248,
+     "d249": 249,
+     "d250": 250,
+     "d251": 251,
+     "d252": 252,
+     "d253": 253,
+     "d254": 254,
+     "d255": 255
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_hex": "0051414c454146000200001835010000000971636231616c6963650200000000000000000300000004757365720400050000010000000004643030300000000000000000000000000000000000000004643030310000000000000000000000000000000100000004643030320000000000000000000000000000000200000004643030330000000000000000000000000000000300000004643030340000000000000000000000000000000400000004643030350000000000000000000000000000000500000004643030360000000000000000000000000000000600000004643030370000000000000000000000000000000700000004643030380000000000000000000000000000000800000004643030390000000000000000000000000000000900000004643031300000000000000000000000000000000a00000004643031310000000000000000000000000000000b00000004643031320000000000000000000000000000000c00000004643031330000000000000000000000000000000d00000004643031340000000000000000000000000000000e00000004643031350000000000000000000000000000000f00000004643031360000000000000000000000000000001000000004643031370000000000000000000000000000001100000004643031380000000000000000000000000000001200000004643031390000000000000000000000000000001300000004643032300000000000000000000000000000001400000004643032310000000000000000000000000000001500000004643032320000000000000000000000000000001600000004643032330000000000000000000000000000001700000004643032340000000000000000000000000000001800000004643032350000000000000000000000000000001900000004643032360000000000000000000000000000001a00000004643032370000000000000000000000000000001b00000004643032380000000000000000000000000000001c00000004643032390000000000000000000000000000001d00000004643033300000000000000000000000000000001e00000004643033310000000000000000000000000000001f00000004643033320000000000000000000000000000002000000004643033330000000000000000000000000000002100000004643033340000000000000000000000000000002200000004643033350000000000000000000000000000002300000004643033360000000000000000000000000000002400000004643033370000000000000000000000000000002500000004643033380000000000000000000000000000002600000004643033390000000000000000000000000000002700000004643034300000000000000000000000000000002800000004643034310000000000000000000000000000002900000004643034320000000000000000000000000000002a00000004643034330000000000000000000000000000002b00000004643034340000000000000000000000000000002c00000004643034350000000000000000000000000000002d00000004643034360000000000000000000000000000002e00000004643034370000000000000000000000000000002f00000004643034380000000000000000000000000000003000000004643034390000000000000000000000000000003100000004643035300000000000000000000000000000003200000004643035310000000000000000000000000000003300000004643035320000000000000000000000000000003400000004643035330000000000000000000000000000003500000004643035340000000000000000000000000000003600000004643035350000000000000000000000000000003700000004643035360000000000000000000000000000003800000004643035370000000000000000000000000000003900000004643035380000000000000000000000000000003a00000004643035390000000000000000000000000000003b00000004643036300000000000000000000000000000003c00000004643036310000000000000000000000000000003d00000004643036320000000000000000000000000000003e00000004643036330000000000000000000000000000003f00000004643036340000000000000000000000000000004000000004643036350000000000000000000000000000004100000004643036360000000000000000000000000000004200000004643036370000000000000000000000000000004300000004643036380000000000000000000000000000004400000004643036390000000000000000000000000000004500000004643037300000000000000000000000000000004600000004643037310000000000000000000000000000004700000004643037320000000000000000000000000000004800000004643037330000000000000000000000000000004900000004643037340000000000000000000000000000004a00000004643037350000000000000000000000000000004b00000004643037360000000000000000000000000000004c00000004643037370000000000000000000000000000004d00000004643037380000000000000000000000000000004e00000004643037390000000000000000000000000000004f00000004643038300000000000000000000000000000005000000004643038310000000000000000000000000000005100000004643038320000000000000000000000000000005200000004643038330000000000000000000000000000005300000004643038340000000000000000000000000000005400000004643038350000000000000000000000000000005500000004643038360000000000000000000000000000005600000004643038370000000000000000000000000000005700000004643038380000000000000000000000000000005800000004643038390000000000000000000000000000005900000004643039300000000000000000000000000000005a00000004643039310000000000000000000000000000005b00000004643039320000000000000000000000000000005c00000004643039330000000000000000000000000000005d00000004643039340000000000000000000000000000005e00000004643039350000000000000000000000000000005f00000004643039360000000000000000000000000000006000000004643039370000000000000000000000000000006100000004643039380000000000000000000000000000006200000004643039390000000000000000000000000000006300000004643130300000000000000000000000000000006400000004643130310000000000000000000000000000006500000004643130320000000000000000000000000000006600000004643130330000000000000000000000000000006700000004643130340000000000000000000000000000006800000004643130350000000000000000000000000000006900000004643130360000000000000000000000000000006a00000004643130370000000000000000000000000000006b00000004643130380000000000000000000000000000006c00000004643130390000000000000000000000000000006d00000004643131300000000000000000000000000000006e00000004643131310000000000000000000000000000006f00000004643131320000000000000000000000000000007000000004643131330000000000000000000000000000007100000004643131340000000000000000000000000000007200000004643131350000000000000000000000000000007300000004643131360000000000000000000000000000007400000004643131370000000000000000000000000000007500000004643131380000000000000000000000000000007600000004643131390000000000000000000000000000007700000004643132300000000000000000000000000000007800000004643132310000000000000000000000000000007900000004643132320000000000000000000000000000007a00000004643132330000000000000000000000000000007b00000004643132340000000000000000000000000000007c00000004643132350000000000000000000000000000007d00000004643132360000000000000000000000000000007e00000004643132370000000000000000000000000000007f00000004643132380000000000000000000000000000008000000004643132390000000000000000000000000000008100000004643133300000000000000000000000000000008200000004643133310000000000000000000000000000008300000004643133320000000000000000000000000000008400000004643133330000000000000000000000000000008500000004643133340000000000000000000000000000008600000004643133350000000000000000000000000000008700000004643133360000000000000000000000000000008800000004643133370000000000000000000000000000008900000004643133380000000000000000000000000000008a00000004643133390000000000000000000000000000008b00000004643134300000000000000000000000000000008c00000004643134310000000000000000000000000000008d00000004643134320000000000000000000000000000008e00000004643134330000000000000000000000000000008f00000004643134340000000000000000000000000000009000000004643134350000000000000000000000000000009100000004643134360000000000000000000000000000009200000004643134370000000000000000000000000000009300000004643134380000000000000000000000000000009400000004643134390000000000000000000000000000009500000004643135300000000000000000000000000000009600000004643135310000000000000000000000000000009700000004643135320000000000000000000000000000009800000004643135330000000000000000000000000000009900000004643135340000000000000000000000000000009a00000004643135350000000000000000000000000000009b00000004643135360000000000000000000000000000009c00000004643135370000000000000000000000000000009d00000004643135380000000000000000000000000000009e00000004643135390000000000000000000000000000009f0000000464313630000000000000000000000000000000a00000000464313631000000000000000000000000000000a10000000464313632000000000000000000000000000000a20000000464313633000000000000000000000000000000a30000000464313634000000000000000000000000000000a40000000464313635000000000000000000000000000000a50000000464313636000000000000000000000000000000a60000000464313637000000000000000000000000000000a70000000464313638000000000000000000000000000000a80000000464313639000000000000000000000000000000a90000000464313730000000000000000000000000000000aa0000000464313731000000000000000000000000000000ab0000000464313732000000000000000000000000000000ac0000000464313733000000000000000000000000000000ad0000000464313734000000000000000000000000000000ae0000000464313735000000000000000000000000000000af0000000464313736000000000000000000000000000000b00000000464313737000000000000000000000000000000b10000000464313738000000000000000000000000000000b20000000464313739000000000000000000000000000000b30000000464313830000000000000000000000000000000b40000000464313831000000000000000000000000000000b50000000464313832000000000000000000000000000000b60000000464313833000000000000000000000000000000b70000000464313834000000000000000000000000000000b80000000464313835000000000000000000000000000000b90000000464313836000000000000000000000000000000ba0000000464313837000000000000000000000000000000bb0000000464313838000000000000000000000000000000bc0000000464313839000000000000000000000000000000bd0000000464313930000000000000000000000000000000be0000000464313931000000000000000000000000000000bf0000000464313932000000000000000000000000000000c00000000464313933000000000000000000000000000000c10000000464313934000000000000000000000000000000c20000000464313935000000000000000000000000000000c30000000464313936000000000000000000000000000000c40000000464313937000000000000000000000000000000c50000000464313938000000000000000000000000000000c60000000464313939000000000000000000000000000000c70000000464323030000000000000000000000000000000c80000000464323031000000000000000000000000000000c90000000464323032000000000000000000000000000000ca0000000464323033000000000000000000000000000000cb0000000464323034000000000000000000000000000000cc0000000464323035000000000000000000000000000000cd0000000464323036000000000000000000000000000000ce0000000464323037000000000000000000000000000000cf0000000464323038000000000000000000000000000000d00000000464323039000000000000000000000000000000d10000000464323130000000000000000000000000000000d20000000464323131000000000000000000000000000000d30000000464323132000000000000000000000000000000d40000000464323133000000000000000000000000000000d50000000464323134000000000000000000000000000000d60000000464323135000000000000000000000000000000d70000000464323136000000000000000000000000000000d80000000464323137000000000000000000000000000000d90000000464323138000000000000000000000000000000da0000000464323139000000000000000000000000000000db0000000464323230000000000000000000000000000000dc0000000464323231000000000000000000000000000000dd0000000464323232000000000000000000000000000000de0000000464323233000000000000000000000000000000df0000000464323234000000000000000000000000000000e00000000464323235000000000000000000000000000000e10000000464323236000000000000000000000000000000e20000000464323237000000000000000000000000000000e30000000464323238000000000000000000000000000000e40000000464323239000000000000000000000000000000e50000000464323330000000000000000000000000000000e60000000464323331000000000000000000000000000000e70000000464323332000000000000000000000000000000e80000000464323333000000000000000000000000000000e90000000464323334000000000000000000000000000000ea0000000464323335000000000000000000000000000000eb0000000464323336000000000000000000000000000000ec0000000464323337000000000000000000000000000000ed0000000464323338000000000000000000000000000000ee0000000464323339000000000000000000000000000000ef0000000464323430000000000000000000000000000000f00000000464323431000000000000000000000000000000f10000000464323432000000000000000000000000000000f20000000464323433000000000000000000000000000000f30000000464323434000000000000000000000000000000f40000000464323435000000000000000000000000000000f50000000464323436000000000000000000000000000000f60000000464323437000000000000000000000000000000f70000000464323438000000000000000000000000000000f80000000464323439000000000000000000000000000000f90000000464323530000000000000000000000000000000fa0000000464323531000000000000000000000000000000fb0000000464323532000000000000000000000000000000fc0000000464323533000000000000000000000000000000fd0000000464323534000000000000000000000000000000fe0000000464323535000000000000000000000000000000ff0700000000080000000000000000",
+    "leaf_len": 6210,
+    "leaf_sha3_256": "2944ae6929b9c9d9d25083779bcd03be4d1885c5b1c55348bbd4062f7e1746ee",
+    "substructure_hashes": {},
+    "substructure_bodies": {},
+    "jmt_value_hash": "09e51d8e61066e936c1c43b2594bf06b2650bea1ef97aec2c0b22c76acc7c849",
+    "jmt_leaf_node_hash": "42c4eb26af14087b7d78e0d5726a01dbc9451e0d93eeaa1ca60d2e1d4ca69ae2"
+   }
+  }
+ ],
+ "negative": [
+  {
+   "name": "bad_magic",
+   "kind": "leaf",
+   "hex": "0151414c454146000200000035010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "bad_magic"
+  },
+  {
+   "name": "bad_version_1",
+   "kind": "leaf",
+   "hex": "0051414c454146000100000035010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "bad_version"
+  },
+  {
+   "name": "bad_version_3",
+   "kind": "leaf",
+   "hex": "0051414c454146000300000035010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "bad_version"
+  },
+  {
+   "name": "empty_input",
+   "kind": "leaf",
+   "hex": "",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "magic_only",
+   "kind": "leaf",
+   "hex": "0051414c45414600",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "body_length_one_too_large",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000036010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "body_length_one_too_small",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000034010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "body_length_zero",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000000010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "trailing_byte_after_a_complete_leaf",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000035010000000971636231616c69636502000000000000000003000000047573657204000500000000070000000008000000000000000000",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "trailing_garbage_tag_ff",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000035010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000ff",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "tag_out_of_order",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000035020000000000000000010000000971636231616c696365030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "tag_out_of_order"
+  },
+  {
+   "name": "duplicate_tag",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000043010000000971636231616c696365010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "duplicate_tag"
+  },
+  {
+   "name": "missing_address",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000027020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "missing_required_tag"
+  },
+  {
+   "name": "missing_nonce",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000002c010000000971636231616c696365030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "missing_required_tag"
+  },
+  {
+   "name": "unknown_tag_0d",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000036010000000971636231616c6963650200000000000000000300000004757365720400050000000007000000000800000000000000000d",
+   "expected_error": "unknown_tag"
+  },
+  {
+   "name": "unknown_tag_00",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000003600010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "unknown_tag"
+  },
+  {
+   "name": "unknown_tag_ff",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000036010000000971636231616c696365020000000000000000030000000475736572040005000000000700000000080000000000000000ff",
+   "expected_error": "unknown_tag"
+  },
+  {
+   "name": "tier_out_of_range",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000035010000000971636231616c696365020000000000000000030000000475736572040405000000000700000000080000000000000000",
+   "expected_error": "tier_out_of_range"
+  },
+  {
+   "name": "tier_nonzero_without_charm_hash",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000035010000000971636231616c696365020000000000000000030000000475736572040205000000000700000000080000000000000000",
+   "expected_error": "tier_charm_mismatch"
+  },
+  {
+   "name": "charm_hash_with_tier_zero",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000056010000000971636231616c6963650200000000000000000300000004757365720400050000000007000000000800000000000000000b6e4324dc3512dfd64cc2136582ce8d81f337fbf5593656bc0249b4859b7614db",
+   "expected_error": "tier_charm_mismatch"
+  },
+  {
+   "name": "address_over_bound",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000012d01000001016161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "length_over_bound"
+  },
+  {
+   "name": "address_empty",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000002c0100000000020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "empty_not_allowed"
+  },
+  {
+   "name": "address_invalid_utf8",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000002e0100000002c328020000000000000000030000000475736572040005000000000700000000080000000000000000",
+   "expected_error": "invalid_utf8"
+  },
+  {
+   "name": "address_length_runs_past_end",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000000801000000ff616263",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "role_over_bound",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000072010000000971636231616c69636502000000000000000003000000417272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272040005000000000700000000080000000000000000",
+   "expected_error": "length_over_bound"
+  },
+  {
+   "name": "balances_descending",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000063010000000971636231616c69636502000000000000000003000000047573657204000500000002000000036262620000000000000000000000000000000200000003616161000000000000000000000000000000010700000000080000000000000000",
+   "expected_error": "balances_not_strictly_ascending"
+  },
+  {
+   "name": "balances_duplicate_denom",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000063010000000971636231616c69636502000000000000000003000000047573657204000500000002000000036161610000000000000000000000000000000100000003616161000000000000000000000000000000010700000000080000000000000000",
+   "expected_error": "balances_not_strictly_ascending"
+  },
+  {
+   "name": "balances_count_over_bound",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000063010000000971636231616c69636502000000000000000003000000047573657204000500000101000000036161610000000000000000000000000000000100000003626262000000000000000000000000000000020700000000080000000000000000",
+   "expected_error": "balance_count_over_bound"
+  },
+  {
+   "name": "balances_count_larger_than_entries",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000063010000000971636231616c69636502000000000000000003000000047573657204000500000003000000036161610000000000000000000000000000000100000003626262000000000000000000000000000000020700000000080000000000000000",
+   "expected_error": "length_over_bound"
+  },
+  {
+   "name": "balances_empty_denom",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000049010000000971636231616c6963650200000000000000000300000004757365720400050000000100000000000000000000000000000000000000010700000000080000000000000000",
+   "expected_error": "empty_not_allowed"
+  },
+  {
+   "name": "balances_invalid_utf8_denom",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000004b010000000971636231616c6963650200000000000000000300000004757365720400050000000100000002c328000000000000000000000000000000010700000000080000000000000000",
+   "expected_error": "invalid_utf8"
+  },
+  {
+   "name": "charm_hash_truncated_31_bytes",
+   "kind": "leaf",
+   "hex": "0051414c454146000200000055010000000971636231616c6963650200000000000000000300000004757365720402050000000007000000000800000000000000000b6e4324dc3512dfd64cc2136582ce8d81f337fbf5593656bc0249b4859b7614",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "public_key_over_bound",
+   "kind": "leaf",
+   "hex": "0051414c45414600020000003b010000000971636231616c696365020000000000000000030000000475736572040005000000000600001001090700000000080000000000000000",
+   "expected_error": "length_over_bound"
+  },
+  {
+   "name": "leaf_over_total_bound",
+   "kind": "leaf",
+   "hex": "0051414c454146000200008035010000000971636231616c6963650200000000000000000300000004757365720400050000000007000000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+   "expected_error": "leaf_over_bound"
+  },
+  {
+   "name": "recovery_policy_zero_guardians",
+   "kind": "recovery_policy",
+   "hex": "0000000200000004000000000000000700000000",
+   "expected_error": "guardian_count"
+  },
+  {
+   "name": "recovery_policy_too_many_guardians",
+   "kind": "recovery_policy",
+   "hex": "0000000200000004000000000000000700000041000007a00a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9000007a01112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0",
+   "expected_error": "guardian_count"
+  },
+  {
+   "name": "recovery_policy_trailing_byte",
+   "kind": "recovery_policy",
+   "hex": "0000000200000004000000000000000700000002000007a00a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9000007a01112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb000",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "recovery_policy_truncated",
+   "kind": "recovery_policy",
+   "hex": "0000000200000004000000000000000700000002000007a00a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9000007a01112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "recovery_policy_guardian_over_bound",
+   "kind": "recovery_policy",
+   "hex": "0000000200000004000000000000000700000002000010010a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9000007a01112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0",
+   "expected_error": "length_over_bound"
+  },
+  {
+   "name": "pending_cancelled_byte_2",
+   "kind": "pending_recovery",
+   "hex": "000007a028292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7000000096d6c2d6473612d363500000005000000000000000a0000000000000032000000000000000702",
+   "expected_error": "bool_not_01"
+  },
+  {
+   "name": "pending_trailing_byte",
+   "kind": "pending_recovery",
+   "hex": "000007a028292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7000000096d6c2d6473612d363500000005000000000000000a000000000000003200000000000000070000",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "pending_scheme_invalid_utf8",
+   "kind": "pending_recovery",
+   "hex": "000007a028292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c700000002c32800000005000000000000000a0000000000000032000000000000000700",
+   "expected_error": "invalid_utf8"
+  },
+  {
+   "name": "pending_truncated",
+   "kind": "pending_recovery",
+   "hex": "000007a028292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7000000096d6c2d6473612d363500000005000000000000000a00000000000000320000000000000007",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "charm_tier_zero",
+   "kind": "charm",
+   "hex": "000000001e000000000000000c010000000000000003000000000000002c0000000901",
+   "expected_error": "tier_out_of_range"
+  },
+  {
+   "name": "charm_tier_4",
+   "kind": "charm",
+   "hex": "040000001e000000000000000c010000000000000003000000000000002c0000000901",
+   "expected_error": "tier_out_of_range"
+  },
+  {
+   "name": "charm_since_flag_2",
+   "kind": "charm",
+   "hex": "020000001e000000000000000c020000000000000003000000000000002c0000000901",
+   "expected_error": "bool_not_01"
+  },
+  {
+   "name": "charm_wot_byte_2",
+   "kind": "charm",
+   "hex": "020000001e000000000000000c010000000000000003000000000000002c0000000902",
+   "expected_error": "bool_not_01"
+  },
+  {
+   "name": "charm_trailing_byte",
+   "kind": "charm",
+   "hex": "020000001e000000000000000c010000000000000003000000000000002c000000090100",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "charm_truncated",
+   "kind": "charm",
+   "hex": "020000001e000000000000000c010000000000000003000000000000002c00000009",
+   "expected_error": "truncated"
+  },
+  {
+   "name": "escrow_trailing_byte",
+   "kind": "escrow",
+   "hex": "000000056a6f622d310000000a7163623177616c6c6574000000087163623166756e6400",
+   "expected_error": "trailing_bytes"
+  },
+  {
+   "name": "escrow_truncated",
+   "kind": "escrow",
+   "hex": "000000056a6f622d310000000a7163623177616c6c6574000000087163623166756e",
+   "expected_error": "truncated"
+  }
+ ]
+}

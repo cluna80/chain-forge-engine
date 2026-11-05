@@ -1,0 +1,349 @@
+{
+ "format": "qattice-state-leaf-vectors",
+ "leaf_version": 1,
+ "note": "Frozen legacy text leaf. The first eight cases mirror the S1 parity corpus in chain-forge-state.",
+ "cases": [
+  {
+   "name": "plain",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d31303030",
+    "jmt_value_hash": "7a734b696f5d2f89a5c87f87c18ab629944bd101b1521da63e25d78814e85369",
+    "jmt_leaf_node_hash": "ecb20f8869facd5dca72115f6d12dc67d9f11e21e04e7e7721988468f7717e6d"
+   }
+  },
+  {
+   "name": "pk",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": {
+     "hex": "01020304"
+    },
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000|pk=01020304",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d313030307c706b3d3031303230333034",
+    "jmt_value_hash": "e5c0492d3b90821ea6c47ea350fb3c960fe08eafd7fcee1efd7003e6dbf97e69",
+    "jmt_leaf_node_hash": "224804cdf050b6f2ab75182ce2c206e9fe5b382c6a377a75d44b27ae4c65f2c0"
+   }
+  },
+  {
+   "name": "escrow",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": {
+     "job_id": "j1",
+     "agent_wallet": "w",
+     "funding_source": "f"
+    }
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000|escrow={\"job_id\":\"j1\",\"agent_wallet\":\"w\",\"funding_source\":\"f\"}",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d313030307c657363726f773d7b226a6f625f6964223a226a31222c226167656e745f77616c6c6574223a2277222c2266756e64696e675f736f75726365223a2266227d",
+    "jmt_value_hash": "b3d78711efc50e8c491620bfe15f62ed6be85318e821d20a48b17012cf5c8d7d",
+    "jmt_leaf_node_hash": "19048679b20477f9c43ec90edd89486434bf7156de03892f456640250f5e8fa9"
+   }
+  },
+  {
+   "name": "key_version_not_in_v1_leaf",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": null,
+    "key_version": 5,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d31303030",
+    "jmt_value_hash": "7a734b696f5d2f89a5c87f87c18ab629944bd101b1521da63e25d78814e85369",
+    "jmt_leaf_node_hash": "ecb20f8869facd5dca72115f6d12dc67d9f11e21e04e7e7721988468f7717e6d"
+   }
+  },
+  {
+   "name": "recovery",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": {
+     "guardians": [
+      {
+       "hex": "01"
+      },
+      {
+       "hex": "02"
+      }
+     ],
+     "threshold": 2,
+     "enrolled_at_key_version": 1,
+     "policy_id": 7
+    },
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000|recovery=t2/2/1/pid7",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d313030307c7265636f766572793d74322f322f312f70696437",
+    "jmt_value_hash": "6ea67123c842c4473ba46e3aaf97c3027ce85a56a1de6c98be83b4bd08b083d8",
+    "jmt_leaf_node_hash": "4bb5c0e332d8b11cc5bddbb539855942a8b4042626b0f816467df42992e1c3e5"
+   }
+  },
+  {
+   "name": "pgen",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 4,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000|pgen=4",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d313030307c7067656e3d34",
+    "jmt_value_hash": "fa479690148172f5a8f16c0b6c8a2e21a9da0cfb7f3a744657f4287a12d19929",
+    "jmt_leaf_node_hash": "a6eff5f94701376776916ece1583b36220fb08df2f3d5d241e300fa3ce406fe5"
+   }
+  },
+  {
+   "name": "pending_not_in_v1_leaf",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": {
+     "new_public_key": {
+      "hex": "01"
+     },
+     "new_key_scheme": "ml-dsa-65",
+     "key_version": 2,
+     "submitted_at_height": 10,
+     "activation_height": 20,
+     "policy_id": 1,
+     "cancelled": false
+    },
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d31303030",
+    "jmt_value_hash": "7a734b696f5d2f89a5c87f87c18ab629944bd101b1521da63e25d78814e85369",
+    "jmt_leaf_node_hash": "ecb20f8869facd5dca72115f6d12dc67d9f11e21e04e7e7721988468f7717e6d"
+   }
+  },
+  {
+   "name": "all",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 3,
+    "role": "user",
+    "balances": {
+     "uex": 1000
+    },
+    "public_key": {
+     "hex": "01020304"
+    },
+    "key_version": 5,
+    "policy_generation": 4,
+    "recovery_policy": {
+     "guardians": [
+      {
+       "hex": "01"
+      },
+      {
+       "hex": "02"
+      }
+     ],
+     "threshold": 2,
+     "enrolled_at_key_version": 1,
+     "policy_id": 7
+    },
+    "pending_recovery": {
+     "new_public_key": {
+      "hex": "01"
+     },
+     "new_key_scheme": "ml-dsa-65",
+     "key_version": 2,
+     "submitted_at_height": 10,
+     "activation_height": 20,
+     "policy_id": 1,
+     "cancelled": false
+    },
+    "charm": null,
+    "escrow": {
+     "job_id": "j1",
+     "agent_wallet": "w",
+     "funding_source": "f"
+    }
+   },
+   "expected": {
+    "leaf_text": "ex1a|3|none|uex=1000|pk=01020304|escrow={\"job_id\":\"j1\",\"agent_wallet\":\"w\",\"funding_source\":\"f\"}|recovery=t2/2/1/pid7|pgen=4",
+    "leaf_hex": "657831617c337c6e6f6e657c7565783d313030307c706b3d30313032303330347c657363726f773d7b226a6f625f6964223a226a31222c226167656e745f77616c6c6574223a2277222c2266756e64696e675f736f75726365223a2266227d7c7265636f766572793d74322f322f312f706964377c7067656e3d34",
+    "jmt_value_hash": "34f0bbb83c8cef7f96f37d5dadc77f0ad4f871ad0fdd7b9e7701a3c757b07cb9",
+    "jmt_leaf_node_hash": "ded65b4333961ebc5e2eb812153de1daeb32f1f17c56dc5fd9b6438a329d8125"
+   }
+  },
+  {
+   "name": "v1_ambiguity_two_denoms",
+   "note": "same v1 bytes as the next case",
+   "account": {
+    "address": "x",
+    "nonce": 0,
+    "role": "user",
+    "balances": {
+     "a": 1,
+     "b": 2
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "x|0|none|a=1|b=2",
+    "leaf_hex": "787c307c6e6f6e657c613d317c623d32",
+    "jmt_value_hash": "1749eab7f99a71ac04557bb6d22cddb26001d8107e908d82ccead29a331d5441",
+    "jmt_leaf_node_hash": "c9d17912a531ea396edb5e3d5dc6ef1560e4d2e95d60a90befb4f60a5a931c43"
+   }
+  },
+  {
+   "name": "v1_ambiguity_one_denom_with_separators",
+   "note": "same v1 bytes as the previous case: v1 is not injective in principle",
+   "account": {
+    "address": "x",
+    "nonce": 0,
+    "role": "user",
+    "balances": {
+     "a=1|b": 2
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": null,
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "x|0|none|a=1|b=2",
+    "leaf_hex": "787c307c6e6f6e657c613d317c623d32",
+    "jmt_value_hash": "1749eab7f99a71ac04557bb6d22cddb26001d8107e908d82ccead29a331d5441",
+    "jmt_leaf_node_hash": "c9d17912a531ea396edb5e3d5dc6ef1560e4d2e95d60a90befb4f60a5a931c43"
+   }
+  },
+  {
+   "name": "v1_charm_tier_text",
+   "note": null,
+   "account": {
+    "address": "ex1a",
+    "nonce": 1,
+    "role": "user",
+    "balances": {
+     "uex": 1
+    },
+    "public_key": null,
+    "key_version": 0,
+    "policy_generation": 0,
+    "recovery_policy": null,
+    "pending_recovery": null,
+    "charm": {
+     "tier": "Established",
+     "decay_exemption": {
+      "days": 30,
+      "last_earned_epoch": 12
+     },
+     "verified_since_epoch": 3,
+     "last_attested_epoch": 44,
+     "consecutive_active_epochs": 9,
+     "verified_via_wot": true
+    },
+    "escrow": null
+   },
+   "expected": {
+    "leaf_text": "ex1a|1|Established|uex=1",
+    "leaf_hex": "657831617c317c45737461626c69736865647c7565783d31",
+    "jmt_value_hash": "83ea9b47a90512bb19c296b58f368d1bd214ec92257b07a400ecb33a04ea259a",
+    "jmt_leaf_node_hash": "5e2de96f9742687a0b8f392dd762c8497ed103dfcfd7b88d915079a269191f82"
+   }
+  }
+ ]
+}
