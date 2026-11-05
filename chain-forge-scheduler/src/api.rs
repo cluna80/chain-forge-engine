@@ -476,40 +476,70 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
 
 // ── Settlement handler (Change Set L) ─────────────────────────────────────────
 
-/// `POST /scheduler/objectives/:objective_id/settle` — REMOVED. SCAFFOLD: the old behaviour is not kept; the body is never read.
+/// `POST /scheduler/objectives/:objective_id/settle` — REMOVED. It accepted the operator's private key in the request body. The body is
+/// never read. Use `…/settle/prepare`, sign with `qcb-claim-signer`, then `…/settle/submit`.
 async fn settle_removed_handler() -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, "scaffold").into_response()
+    let body = serde_json::json!({
+        "error": "settle_endpoint_removed",
+        "message": "This endpoint accepted a private key and has been removed. Never send a private key to the scheduler: \
+                    use POST /settle/prepare, sign the result with qcb-claim-signer, then POST /settle/submit.",
+    });
+    (StatusCode::GONE, Json(body)).into_response()
 }
 
-/// `POST /scheduler/objectives/:objective_id/settle/prepare`. SCAFFOLD: no secret-material scan yet.
+fn settlement_error_response(e: SettlementError) -> Response {
+    let (status, code) = match &e {
+        SettlementError::PrivateKeyMaterial(_) => (StatusCode::BAD_REQUEST, "private_key_material_rejected"),
+        SettlementError::UnsupportedProfile(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unsupported_signing_profile"),
+        SettlementError::SigningUnavailable => (StatusCode::NOT_IMPLEMENTED, "signing_unavailable"),
+        SettlementError::UnknownRewardKind(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unknown_reward_kind"),
+        SettlementError::PolicyRejected(_) => (StatusCode::UNPROCESSABLE_ENTITY, "policy_rejected"),
+        SettlementError::KeyDecode(_) => (StatusCode::UNPROCESSABLE_ENTITY, "public_key_invalid"),
+        SettlementError::TxMismatch(_) => (StatusCode::UNPROCESSABLE_ENTITY, "transaction_does_not_match_claim"),
+        SettlementError::BadSignature(_) => (StatusCode::UNPROCESSABLE_ENTITY, "signature_rejected"),
+        SettlementError::NoAcceptedResult(..) => (StatusCode::NOT_FOUND, "no_accepted_result"),
+        SettlementError::ClaimNotFound(_) => (StatusCode::NOT_FOUND, "claim_not_found"),
+        SettlementError::ClaimAlreadyExists(_) => (StatusCode::CONFLICT, "claim_already_exists"),
+        SettlementError::NodeSubmission(_) => (StatusCode::BAD_GATEWAY, "node_submission_failed"),
+        SettlementError::Db(_) => {
+            tracing::error!(error = %e, "settlement database error");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "internal_error" }))).into_response();
+        }
+    };
+    (status, Json(serde_json::json!({ "error": code, "message": e.to_string() }))).into_response()
+}
+
+fn invalid_request() -> Response {
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": "invalid_request", "message": "the body is not a valid request for this endpoint" }))).into_response()
+}
+
+/// `POST /scheduler/objectives/:objective_id/settle/prepare`: public data in, unsigned transaction and signing request out. A body that
+/// contains private-key material is refused before it is parsed or anything is stored.
 async fn settle_prepare_handler(
     State(state):       State<Arc<AppState>>,
     Path(objective_id): Path<String>,
     body:               axum::body::Bytes,
 ) -> Response {
-    let req: PrepareRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error":"invalid_request"}))).into_response(),
-    };
+    if let Err(e) = reject_private_key_material(&body) { return settlement_error_response(e); }
+    let Ok(req) = serde_json::from_slice::<PrepareRequest>(&body) else { return invalid_request() };
     match prepare_settlement(state.scheduler.db(), &objective_id, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => settlement_error_response(e),
     }
 }
 
-/// `POST /scheduler/objectives/:objective_id/settle/submit`. SCAFFOLD: no secret-material scan yet.
+/// `POST /scheduler/objectives/:objective_id/settle/submit`: the SIGNED claim transaction in; the scheduler checks it is exactly the stored
+/// claim, verifies it, and forwards it to the node. Returns `201` on success, `409` when the claim is no longer pending.
 async fn settle_submit_handler(
     State(state):       State<Arc<AppState>>,
     Path(objective_id): Path<String>,
     body:               axum::body::Bytes,
 ) -> Response {
-    let req: SubmitRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error":"invalid_request"}))).into_response(),
-    };
+    if let Err(e) = reject_private_key_material(&body) { return settlement_error_response(e); }
+    let Ok(req) = serde_json::from_slice::<SubmitRequest>(&body) else { return invalid_request() };
     match submit_settlement(state.scheduler.db(), &objective_id, req).await {
         Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => settlement_error_response(e),
     }
 }
 

@@ -143,7 +143,7 @@ impl Env {
     }
     async fn claims(&self) -> usize { self.db.list_reward_claims_for_objective(&self.obj).await.unwrap().len() }
     fn node_posts(&self) -> usize { self.node_log.lock().unwrap().len() }
-    fn submit_body(&self, claim_id: &str, signed_tx: &Value) -> String { json!({ "claim_id": claim_id, "signed_tx": signed_tx, "node_url": self.node }).to_string() }
+    fn submit_body(&self, claim_id: &str, signed_tx: &Value) -> String { json!({ "claim_id": claim_id, "chain_id": CHAIN, "signed_tx": signed_tx, "node_url": self.node }).to_string() }
 }
 
 /// What an external signer does: recompute the v2 preimage from the unsigned transaction, sign it, return the signed transaction.
@@ -323,13 +323,13 @@ async fn submit_refuses_every_transaction_that_is_not_exactly_the_prepared_claim
     // a valid-looking signature that does not verify
     let mut t = good.clone(); t["pq_signatures"][0] = json!(flip(good["pq_signatures"][0].as_str().unwrap())); cases.push(("flipped signature nibble", t, 422));
     // the body is not the claim, even though a valid signature covers it
-    let mut t = unsigned.clone(); t["body"]["amount_uqcb"] = json!(t["body"]["amount_uqcb"].as_u64().unwrap() + 1); cases.push(("amount raised, re-signed", resign(&t, &kp, CHAIN), 422));
-    let mut t = unsigned.clone(); t["body"]["recipient"] = json!("qcb1thief"); cases.push(("recipient changed, re-signed", resign(&t, &kp, CHAIN), 422));
-    let mut t = unsigned.clone(); t["body"]["claim_id"] = json!("0".repeat(64)); cases.push(("claim id changed, re-signed", resign(&t, &kp, CHAIN), 422));
+    let mut t = unsigned.clone(); let a = t["body"]["ClaimResearchReward"]["amount_uqcb"].as_u64().unwrap(); t["body"]["ClaimResearchReward"]["amount_uqcb"] = json!(a + 1); cases.push(("amount raised, re-signed", resign(&t, &kp, CHAIN), 422));
+    let mut t = unsigned.clone(); t["body"]["ClaimResearchReward"]["recipient"] = json!("qcb1thief"); cases.push(("recipient changed, re-signed", resign(&t, &kp, CHAIN), 422));
+    let mut t = unsigned.clone(); t["body"]["ClaimResearchReward"]["claim_id"] = json!("0".repeat(64)); cases.push(("claim id changed, re-signed", resign(&t, &kp, CHAIN), 422));
     let mut t = unsigned.clone(); t["id"] = json!("custom-id"); cases.push(("transaction id changed, re-signed", resign(&t, &kp, CHAIN), 422));
     let mut t = unsigned.clone(); t["gas_limit"] = json!(10_000_000u64); cases.push(("gas limit changed, re-signed", resign(&t, &kp, CHAIN), 422));
     // a body swapped for a different transaction type entirely
-    let mut t = unsigned.clone(); t["body"] = json!({ "type": "Transfer", "to": "qcb1thief", "amount": 5, "denom": "uqcb" }); cases.push(("a transfer instead of a claim, re-signed", resign(&t, &kp, CHAIN), 422));
+    let mut t = unsigned.clone(); t["body"] = json!({ "Transfer": { "to": "qcb1thief", "amount": 5, "denom": "uqcb" } }); cases.push(("a transfer instead of a claim, re-signed", resign(&t, &kp, CHAIN), 422));
     // signed for another chain, signed by another key, signed by the legacy scheme
     cases.push(("signed for a different chain", external_sign(&p, &kp, "some-other-chain"), 422));
     cases.push(("signed by a different key but carrying the operator key", external_sign(&p, &other, CHAIN), 422));

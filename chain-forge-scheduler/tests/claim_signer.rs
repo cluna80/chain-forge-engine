@@ -26,8 +26,8 @@ fn setup(d: &Path) -> (String, chain_forge_wallet::WalletKeyFile, Value) {
     let wf = d.join("w.wallet.json").to_string_lossy().to_string();
     let kf = chain_forge_wallet::generate_wallet(&wf, "t", PASS).unwrap();
     let pk = unhex(&kf.public_key);
-    let body = json!({ "type": "ClaimResearchReward", "claim_id": "c".repeat(64), "objective_id": "obj", "task_id": "task", "result_id": "r".repeat(8),
-        "contribution_hash": "h".repeat(8), "recipient": "qcb1miner", "amount_uqcb": 5_000_000u64, "policy_version": "QcbResearchRewardPolicy-v1", "reward_kind": "primary" });
+    let body = json!({ "ClaimResearchReward": { "claim_id": "c".repeat(64), "objective_id": "obj", "task_id": "task", "result_id": "r".repeat(8),
+        "contribution_hash": "h".repeat(8), "recipient": "qcb1miner", "amount_uqcb": 5_000_000u64, "policy_version": "QcbResearchRewardPolicy-v1", "reward_kind": "primary" } });
     let tx: Transaction = serde_json::from_value(json!({
         "id": "tx-1", "sender": kf.address, "nonce": 0, "body": body, "gas_limit": 500_000, "sig_scheme": "MlDsa", "signature": "", "public_key": "",
         "pq_signatures": [], "pq_public_key": hex(&pk) })).unwrap();
@@ -89,7 +89,7 @@ fn the_signer_refuses_to_sign_anything_but_the_claim_it_was_told_to_expect() {
     cases.push(("wrong expected chain id", prepared.clone(), vec!["--expect-chain-id", "other-chain"]));
     let mut p = prepared.clone(); p["signing_request"]["chain_id"] = json!("other-chain"); cases.push(("request names another chain", p, vec![]));
     let mut p = prepared.clone(); p["unsigned_tx"]["sender"] = json!("qcb1someoneelse"); cases.push(("sender is not this wallet", p, vec![]));
-    let mut p = prepared.clone(); p["unsigned_tx"]["body"] = json!({ "type": "Transfer", "to": "qcb1thief", "amount": 1, "denom": "uqcb" }); cases.push(("a transfer instead of a claim", p, vec![]));
+    let mut p = prepared.clone(); p["unsigned_tx"]["body"] = json!({ "Transfer": { "to": "qcb1thief", "amount": 1, "denom": "uqcb" } }); cases.push(("a transfer instead of a claim", p, vec![]));
     let mut p = prepared.clone(); p["signing_request"]["preimage_hex"] = json!("00".repeat(40)); cases.push(("the scheduler's preimage is not the transaction's", p, vec![]));
     let mut p = prepared.clone(); p["signing_request"]["profile"] = json!("legacy"); cases.push(("legacy profile", p, vec![]));
     let mut p = prepared.clone(); p["unsigned_tx"]["pq_signatures"] = json!(["mldsa65:ab"]); cases.push(("already carries a signature", p, vec![]));
