@@ -1218,6 +1218,8 @@ dependencies = [
  "argon2",
  "chain-forge-core",
  "chain-forge-crypto",
+ "chain-forge-execution",
+ "chain-forge-state",
  "rand 0.8.8",
  "serde",
  "serde_json",

@@ -1,0 +1,9 @@
+test a_legacy_generated_wallet_key_signs_under_the_conforming_backend ... FAILED
+test an_explicit_sender_is_used_for_genesis_bound_accounts ... FAILED
+test a_wallet_signed_transfer_executes_and_binds_the_key ... FAILED
+test a_wallet_signature_does_not_survive_any_change_to_what_it_signs ... FAILED
+test signatures_are_hedged_two_signatures_over_one_transaction_differ_and_both_verify ... FAILED
+test once_bound_the_key_can_be_omitted ... FAILED
+test the_signed_transaction_survives_a_json_round_trip ... FAILED
+test signing_refuses_a_key_pair_whose_halves_do_not_match ... ok
+test result: FAILED. 1 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
