@@ -42,7 +42,42 @@ def case(name, note, **over):
     }
 
 
-def main():
+def envelope_vectors():
+    good_sig = "mldsa65:" + "ab" * enc.MLDSA65_SIG_BYTES
+    pk = "cd" * enc.MLDSA65_PK_BYTES
+    base = {"sig_scheme": "MlDsa", "signature_hex": "", "public_key_hex": "",
+            "pq_signatures": [good_sig], "pq_public_key_hex": pk}
+    rows = [
+        ("accept_first_use", "valid envelope, unbound sender, key carried", {}, None),
+        ("accept_bound_key_omitted", "valid envelope, key already bound, tx omits the key", {"pq_public_key_hex": ""}, pk),
+        ("accept_bound_key_repeated", "valid envelope, key already bound, tx repeats the same key", {}, pk),
+        ("reject_scheme_missing", "sig_scheme absent (legacy implicit detection)", {"sig_scheme": None}, None),
+        ("reject_ed25519", "Ed25519-tagged transaction", {"sig_scheme": "Classical"}, None),
+        ("reject_hybrid", "hybrid-tagged transaction", {"sig_scheme": "HybridEd25519MlDsa"}, None),
+        ("reject_slhdsa", "SLH-DSA tag (no live verifier, not allowed)", {"sig_scheme": "SlhDsa"}, None),
+        ("reject_fndsa", "FN-DSA tag", {"sig_scheme": "FnDsa"}, None),
+        ("reject_ed25519_signature_present", "ML-DSA tag but an Ed25519 signature rides along", {"signature_hex": "00" * 64}, None),
+        ("reject_ed25519_key_present", "ML-DSA tag but an Ed25519 public key rides along", {"public_key_hex": "11" * 32}, None),
+        ("reject_no_signature", "no pq_signatures", {"pq_signatures": []}, None),
+        ("reject_two_signatures", "two pq_signatures entries", {"pq_signatures": [good_sig, good_sig]}, None),
+        ("reject_wrong_tag", "entry tagged slhdsa:", {"pq_signatures": ["slhdsa:" + "ab" * enc.MLDSA65_SIG_BYTES]}, None),
+        ("reject_not_hex", "non-hex signature body", {"pq_signatures": ["mldsa65:" + "zz" * enc.MLDSA65_SIG_BYTES]}, None),
+        ("reject_short_signature", "signature one byte short", {"pq_signatures": ["mldsa65:" + "ab" * (enc.MLDSA65_SIG_BYTES - 1)]}, None),
+        ("reject_long_signature", "signature one byte long", {"pq_signatures": ["mldsa65:" + "ab" * (enc.MLDSA65_SIG_BYTES + 1)]}, None),
+        ("reject_first_use_without_key", "unbound sender and no key", {"pq_public_key_hex": ""}, None),
+        ("reject_first_use_short_key", "unbound sender, key one byte short", {"pq_public_key_hex": "cd" * (enc.MLDSA65_PK_BYTES - 1)}, None),
+        ("reject_key_differs_from_bound", "bound key present, tx carries a different key", {"pq_public_key_hex": "ee" * enc.MLDSA65_PK_BYTES}, pk),
+    ]
+    out = []
+    for name, note, over, bound in rows:
+        tx = dict(base)
+        tx.update(over)
+        res, code = enc.check_envelope(tx, bound)
+        out.append({"name": name, "note": note, "tx": tx, "bound_key_hex": bound, "expect": res, "code": code})
+    return out
+
+
+def main(out_path=None):
     cases = [
         case("baseline", "reference transfer, nonce 0"),
         case("nonce_1", "only the nonce differs: v1 digest is IDENTICAL (the H0-4 replay), v2 differs", nonce=1),
@@ -61,6 +96,7 @@ def main():
         case("adjacent_fields_a", "id='ab', sender='c' (prefix-freeness pair, part 1)", tx_id="ab", sender="c"),
         case("adjacent_fields_b", "id='a', sender='bc' (prefix-freeness pair, part 2): must differ from part 1", tx_id="a", sender="bc"),
     ]
+    envelope_cases = envelope_vectors()
     digests = [c["v2_digest_hex"] for c in cases]
     assert len(set(digests)) == len(digests), "every case must have a distinct v2 digest"
     out = {
@@ -68,13 +104,16 @@ def main():
         "domain_v1": enc.DOMAIN_V1.decode(), "domain_v2": enc.DOMAIN_V2.decode(),
         "hash": "SHA-256",
         "note": "Keys are deterministic stand-ins, not real ML-DSA keys. v2 is a PROPOSAL; nothing in the Rust code uses it.",
+        "algorithm_id_hex": enc.ALG_MLDSA65.hex(),
         "cases": cases,
+        "envelope_cases": envelope_cases,
     }
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w", encoding="utf-8", newline="\n") as f:
+    out_path = out_path or OUT
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
-    print(f"wrote {OUT}: {len(cases)} cases")
+    print(f"wrote {out_path}: {len(cases)} cases")
 
 
 if __name__ == "__main__":

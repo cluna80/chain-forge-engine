@@ -35,9 +35,13 @@ class Vectors(unittest.TestCase):
             self.assertEqual(enc.v1_digest(p["chain_id"], p["body_json"]).hex(), c["v1_digest_hex"], c["name"])
 
     def test_generation_is_deterministic(self):
+        """Regenerates into a temp file (never the committed one) and compares byte for byte."""
+        import tempfile
         before = open(os.path.join(HERE, "vectors", "v2.json"), encoding="utf-8").read()
-        gv.main()
-        after = open(os.path.join(HERE, "vectors", "v2.json"), encoding="utf-8").read()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "v2.json")
+            gv.main(path)
+            after = open(path, encoding="utf-8").read()
         self.assertEqual(before, after)
 
     def test_all_digests_distinct(self):
@@ -70,13 +74,14 @@ class Structure(unittest.TestCase):
     def test_domain_and_field_order(self):
         m = enc.v2_message(**BASE)
         self.assertTrue(m.startswith(b"chain-forge/pq-tx/v2\n"))
-        rest = m[len(enc.DOMAIN_V2):]
+        self.assertEqual(m[len(enc.DOMAIN_V2):len(enc.DOMAIN_V2) + 1], enc.ALG_MLDSA65)
+        rest = m[len(enc.DOMAIN_V2) + 1:]
         n = struct.unpack(">I", rest[:4])[0]
         self.assertEqual(rest[4:4 + n], BASE["chain_id"].encode())
 
     def test_total_length(self):
         m = enc.v2_message(**BASE)
-        expect = (len(enc.DOMAIN_V2) + 4 + len(BASE["chain_id"]) + 4 + len(BASE["tx_id"]) + 4 + len(BASE["sender"])
+        expect = (len(enc.DOMAIN_V2) + 1 + 4 + len(BASE["chain_id"]) + 4 + len(BASE["tx_id"]) + 4 + len(BASE["sender"])
                   + 8 + 8 + 4 + len(BASE["body_json"].encode()) + 4 + len(BASE["pq_public_key"]))
         self.assertEqual(len(m), expect)
 
@@ -96,6 +101,53 @@ class Structure(unittest.TestCase):
         self.assertNotEqual(enc.DOMAIN_V1, enc.DOMAIN_V2)
         self.assertNotEqual(d2(), enc.v1_digest(BASE["chain_id"], BASE["body_json"]))
         self.assertFalse(enc.v2_message(**BASE).startswith(b"chain-forge/tx/v1\n"))   # Ed25519 domain
+
+
+class Algorithm(unittest.TestCase):
+    def test_single_fixed_algorithm_identifier(self):
+        self.assertEqual(enc.ALG_MLDSA65, b"\x01")
+        self.assertEqual(VECTORS["algorithm_id_hex"], "01")
+
+    def test_algorithm_identifier_is_in_the_preimage(self):
+        import hashlib as h
+        m = enc.v2_message(**BASE)
+        other = m.replace(enc.DOMAIN_V2 + b"\x01", enc.DOMAIN_V2 + b"\x02", 1)
+        self.assertNotEqual(h.sha256(m).digest(), h.sha256(other).digest())
+
+    def test_v1_signature_digest_never_equals_a_v2_digest(self):
+        """A signature made over the v1 digest must not verify under v2 (digests differ for every vector)."""
+        for c in VECTORS["cases"]:
+            self.assertNotEqual(c["v1_digest_hex"], c["v2_digest_hex"], c["name"])
+
+    def test_cross_chain_digests_differ(self):
+        self.assertNotEqual(d2(chain_id="qcb-testnet-1"), d2(chain_id="qcb-alpha-1"))
+
+
+class Envelope(unittest.TestCase):
+    def test_envelope_vectors(self):
+        for c in VECTORS["envelope_cases"]:
+            res, code = enc.check_envelope(c["tx"], c["bound_key_hex"])
+            self.assertEqual((res, code), (c["expect"], c["code"]), c["name"])
+
+    def test_exactly_three_accepts_and_every_reject_has_a_code(self):
+        ok = [c for c in VECTORS["envelope_cases"] if c["expect"] == "ok"]
+        bad = [c for c in VECTORS["envelope_cases"] if c["expect"] == "reject"]
+        self.assertEqual(len(ok), 3)
+        self.assertTrue(all(c["code"] for c in bad))
+
+    def test_only_mldsa_scheme_tag_is_accepted(self):
+        pk = "cd" * enc.MLDSA65_PK_BYTES
+        base = {"signature_hex": "", "public_key_hex": "", "pq_signatures": ["mldsa65:" + "ab" * enc.MLDSA65_SIG_BYTES],
+                "pq_public_key_hex": pk}
+        for scheme in (None, "Classical", "HybridEd25519MlDsa", "SlhDsa", "FnDsa", "ml-dsa-65", "mldsa", ""):
+            tx = dict(base, sig_scheme=scheme)
+            self.assertEqual(enc.check_envelope(tx)[0], "reject", scheme)
+        self.assertEqual(enc.check_envelope(dict(base, sig_scheme="MlDsa"))[0], "ok")
+
+    def test_effective_key_prefers_bound_key(self):
+        pk = "cd" * enc.MLDSA65_PK_BYTES
+        self.assertEqual(enc.effective_public_key({"pq_public_key_hex": ""}, pk), bytes.fromhex(pk))
+        self.assertEqual(enc.effective_public_key({"pq_public_key_hex": pk}, None), bytes.fromhex(pk))
 
 
 class Rejections(unittest.TestCase):
