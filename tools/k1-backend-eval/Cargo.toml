@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["ev-mldsa", "ev-libcrux", "ev-fips204", "ev-pqmldsa", "ev-old"]
+[profile.release]
+opt-level = 3
+debug = false
