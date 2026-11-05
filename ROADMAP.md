@@ -1,3 +1,60 @@
+# Qattice — Public Testnet Alpha: ML-DSA-65 + PQ-HotStuff Launch Plan
+> **Owner decision: 2026-11-05 | Status: LOCKED DIRECTION, IMPLEMENTATION IN PROGRESS | Repository: [cluna80/Qattice](https://github.com/cluna80/Qattice)**
+>
+> **Append-only roadmap notice:** This new section is placed above the original engineering roadmap. All pre-existing roadmap text below is retained verbatim as historical engineering context. Where older plans conflict, the November 5 owner decisions in this section take precedence for Qattice's first public testnet. Do not interpret historical completed tests as proof that the new public-testnet gates have passed.
+>
+> **Launch objective:** Qattice's **first public network** is **Public Testnet Alpha running PQ-HotStuff from genesis**, with FIPS 204-conformant **ML-DSA-65-only** transaction and validator authentication, personhood-weighted consensus, authenticated state and a security-reviewed operational deployment. **No public Tendermint alpha.** No launch date is committed.
+
+## 2026-11-05 locked architecture and repository boundaries
+
+- **Qattice is the implementation repository.** Build the PQ-HotStuff engine directly in the existing Qattice Rust workspace (including any internally named `chain-forge-*` crates). **Do not modify the separate Chain Forge project.** Repository separation has occurred at the GitHub repository level; older repository-separation plans are historical or require separate authorization for any further code migration.
+- **PQ-HotStuff is mandatory for the first public testnet** and the intended mainnet consensus. Tendermint remains a **private development and regression baseline** until PQ-HotStuff is validated; it is not an approved public-testnet engine.
+- **FIPS 204 ML-DSA-65 only for fresh-chain transaction and consensus authorization.** No Ed25519, hybrid signatures, algorithm fallback, downgrade or implicit scheme acceptance on the new chain. Historical signature handling, if required for existing private/legacy chains, must be isolated and must not activate on the fresh public genesis.
+- **Cryptographic conformance is a hard prerequisite.** Draft [PR #95](https://github.com/cluna80/Qattice/pull/95) reports that the current `pqcrypto-dilithium` 0.5.0 `dilithium3` implementation does not interoperate with final FIPS 204: 0/45 matching NIST signature-generation vectors and rejection of all 9 valid verification vectors; 36 invalid cases rejected. A scratch challenge-sampling patch matching vectors is **diagnostic only**, not an approved production fix. Evaluate independent conforming libraries and cross-implementation interoperability; record source provenance, licenses, security posture, exact versions and Linux/Windows evidence before selecting a replacement. `dis-core` and all other users of this backend require inventory and migration tests.
+- **Signing v2:** use the approved SHA-256 transaction prehash binding chain ID, transaction ID, sender, nonce, gas limit, canonical body and PQ public key. Enforce exactly one correctly encoded ML-DSA-65 signature, exact public-key/signature lengths, account key binding and fail-closed scheme checks. The final **FIPS 204 external signing interface and context/domain framing** must be specified and independently verified before freezing vectors in draft [PR #94](https://github.com/cluna80/Qattice/pull/94). Do not mistake a raw internal signing interface for the standardized external interface. Close **H0-4** transaction signature replay (see [PR #93](https://github.com/cluna80/Qattice/pull/93)) with negative and live tests.
+- **Fresh-chain activation:** top-level `commitment_profile = "qattice-v2"` selects new canonical account/authority commitments and strict ML-DSA-only transaction and validator policy; absent profile retains historical behavior; unsupported profiles fail closed. Fresh public genesis must also explicitly select `bft_variant: "pq-hotstuff"`, `personhood_weighted: true`, unique chain/network IDs and new operator-generated cryptographic keys. Do not silently migrate historical state roots, signatures, keys, genesis or data directories.
+- **Personhood:** one verified human has bounded consensus voting influence regardless of additional QCB bonded; validator eligibility, identity lifecycle, revocation and epoch transitions must be tested. Reliability-conditioned rewards must be based on verifiable committed participation evidence, not stake-based voting multipliers.
+- **PQ-HotStuff protocol decisions D1–D5 remain:** two-chain HotStuff/Jolteon-style commit, versioned QC (signature-list v1 initially), round-robin leader, revocation effective in the first block after commitment, and committed-evidence slashing before PQ-HotStuff Phase 0. The existing legacy `HotStuffEngine` is not the implementation base. ML-DSA signature-list QCs have bandwidth limits; validate the practical validator ceiling and performance before promising 1,000 validators / sub-3-second finality.
+- **Transport is an unresolved security dependency:** libp2p peer identity, Noise, gossip signing and TLS may still rely on classical cryptography. Do not claim *end-to-end post-quantum security* without a threat model, engineering disposition and validation. Public exposure requires explicit owner acceptance of any documented residual risk; this roadmap does not grant it.
+- **No production Rust changes, merges, public deployment or genesis activation are authorized by this documentation decision alone.** Keep independent implementation and audit PRs separate.
+
+## Dependency-ordered public-testnet release gates
+
+| Gate | Workstream and acceptance evidence | Status as of 2026-11-05 |
+|---|---|---|
+| **QAT-01 / K1** | Compare candidate FIPS 204 ML-DSA-65 libraries against authoritative NIST vectors, keyGen/sign/verify and malformed-input cases; independent interoperability; evaluate context framing, provenance, Linux/Windows. Select backend only after review. | **BLOCKED: current backend nonconformant**; draft PR #95, Linux characterization; Windows and candidate evaluation pending |
+| **QAT-02 / H0-4** | Implement ML-DSA-only signing v2 and update node, wallet, DIS/recovery and transaction submission paths; exact-length checks, replay resistance, cross-implementation vectors and live Linux/Windows tests. | **Design only** in draft PR #94; H0-4 reproduced in draft PR #93 |
+| **QAT-03 / GENESIS-V2** | Implement fail-closed `qattice-v2` profile and ML-DSA-only enforcement, versioned account/authority commitments, no v1/v2 cross-acceptance, fresh genesis with PQ-HotStuff. | **Pending** |
+| **QAT-04 / STATE + H0** | Close STATE-COMMIT-2 (authoritative identity/validator/agent/slashing state), ACCT-LEAF-1, restore integrity, remaining Phase 0.5 safety, recovery, P2P, RPC and consensus blockers; preserve earlier verified milestones. | **Partially complete; open blockers** (see draft PR #85 and roadmap evidence) |
+| **QAT-05 / EVIDENCE** | Design engine-independent commit certificates/participation evidence; implement **committed** equivocation evidence and deterministic slashing, verified across nodes, initially using private Tendermint baseline. | **Pending; prerequisite for HotStuff Phase 0** |
+| **QAT-06 / PQHS-P0** | Implement PQ-HotStuff safety, two-chain commit, versioned QC/TC, leader pacemaker, signature rules and thousands of seeded adversarial simulations; mutation-check safety invariants. | **Pending** |
+| **QAT-07 / PQHS-P1** | Durable write-before-broadcast safety state, restart anti-equivocation, personhood power caps, epoch validator sets, next-block revocation, key rotation, ML-DSA-only validator admission. | **Pending** |
+| **QAT-08 / PQHS-P2** | Separate **private** four-node PQ-HotStuff devnet, fresh private genesis, distinct chain/network IDs, OS-RNG validator keys, live partitions, crash/restart, committed slashing, state-root agreement and Linux/Windows tests. | **Pending** |
+| **QAT-09 / PQHS-P3** | Adversarial and independent review, bandwidth/finality benchmarks at 4/7/16/31 validators where feasible, operator runbooks, monitoring, no unresolved safety-critical findings. | **Pending** |
+| **QAT-10 / PQ NETWORK** | Decide and validate peer-authentication, transport confidentiality and gossip security posture; document unresolved classical dependencies, threat model and owner approval for any limited-alpha exceptions. | **Open; not accepted** |
+| **QAT-11 / PUBLIC ALPHA** | Reconcile existing G0–G7 readiness gates: new PQ-HotStuff genesis, security closure, bounded public RPC/faucet/explorer, independent operators/testers, soak and incident/recovery drills, reproducible Windows/Linux evidence, explicit launch authorization. | **NOT AUTHORIZED** |
+
+**Critical path:** QAT-01 → QAT-02 → QAT-03 (cryptographic activation), alongside QAT-04 security remediation; QAT-05 → QAT-06 → QAT-07 → QAT-08 → QAT-09 (consensus); QAT-10 security disposition and all relevant G0–G7 gates → QAT-11 public launch. Architecture documents, test-harness preparation and threat modeling can proceed in parallel, but **do not deploy or sign production-like PQ-HotStuff consensus messages using the nonconforming backend**.
+
+## Public-testnet and mainnet sequencing
+
+1. **Private Tendermint regression environment:** retained solely to validate current safety, committed-evidence slashing and migration-related tests.
+2. **Private PQ-HotStuff devnet:** independent fresh genesis; Phase 2 acceptance on Linux and Windows.
+3. **Public Testnet Alpha:** first public Qattice network, fresh `qattice-v2` PQ-HotStuff genesis, independent validator onboarding and public-operational gates.
+4. **Mainnet preparation (PQ-HotStuff Phase 4):** later, after public-testnet findings, independent review, final QC/validator ceiling decisions and separate owner approval; **never reuse testnet state or keys**.
+
+## Tracking and evidence
+
+- [PQ-HOTSTUFF-001 protocol specification](docs/pq-hotstuff-001-spec.md): existing locked D1–D5, phase-specific safety and performance requirements. Historical Chain Forge references within older sections do not authorize changes to the separate Chain Forge repository.
+- [Crypto dependency audit](docs/CRYPTO-DEPENDENCY-AUDIT.md) and draft [PR #94](https://github.com/cluna80/Qattice/pull/94): ML-DSA-only v2 design; vectors remain provisional pending conformance and framing decisions.
+- Draft [PR #95](https://github.com/cluna80/Qattice/pull/95): K1 nonconformance characterization, NIST fixtures and scratch diagnostic patch; no production backend replacement.
+- Draft [PR #93](https://github.com/cluna80/Qattice/pull/93): H0-4 transaction replay reproduction.
+- Draft [PR #85](https://github.com/cluna80/Qattice/pull/85): STATE-COMMIT-2 authority commitment findings; ACCT-LEAF-1 requires versioned commitment design.
+- Existing Public Testnet Alpha G0–G7 documents and the original roadmap below remain part of the evidence record; **older readiness labels must be re-evaluated against the mandatory PQ-HotStuff and FIPS 204 gates**.
+- Evidence rule: tests-first where practical, adversarial and mutation checks, clean-clone reproducibility, Linux and Windows confirmation, recorded commit/test logs, explicit owner review. Never mark a gate complete based solely on a draft PR, a passing self-interoperability test, or a specification.
+
+---
+
 # Chain Forge / Qattice — Engineering Roadmap
 
 > **Repository name:** this repository was renamed from `chain-forge-engine` to `Qattice` on 2026-11-04 (`https://github.com/cluna80/Qattice`; GitHub redirects the old URL). Entries below that say `chain-forge-engine` record the name at the time the evidence was produced and are left as written. Qattice and Chain Forge are now separate projects; the `chain-forge-*` crate names are legacy internal identifiers.
