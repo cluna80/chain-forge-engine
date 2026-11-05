@@ -1,6 +1,6 @@
 # ML-DSA-65-only transaction authorization and signing message, v2 (PROPOSED — DRAFT, design + vectors only)
 
-Status: **proposal, revised 2026-11-05 for the owner's ML-DSA-only decision.** Nothing in the Rust code, wallets or genesis uses it. Evidence for why it is needed: `docs/H0-4-H0-6-findings.md` (PR #93): under the current ML-DSA digest an observer can replay a signed transaction under a new nonce, because the signature does not cover the nonce.
+Status: **proposal, revised 2026-11-05 for the owner's ML-DSA-only decision and updated for the owner's cryptographic architecture decisions of the same day (§6). Reference vectors are NOT frozen** (see §6, K1). Nothing in the Rust code, wallets or genesis uses it. Evidence for why it is needed: `docs/H0-4-H0-6-findings.md` (PR #93): under the current ML-DSA digest an observer can replay a signed transaction under a new nonce, because the signature does not cover the nonce.
 
 ## 0. Policy this specification implements (owner decision)
 
@@ -55,7 +55,12 @@ After E1–E5 the existing first-use rule still applies unchanged: an unbound se
 
 ## 3. Activation
 
-By **chain profile, not per transaction**. A chain whose genesis selects the v2 profile (the fresh alpha genesis) accepts **only** this scheme; every other chain keeps today's behaviour. No new field on `Transaction`, and Ed25519 `signing_bytes` is untouched (legacy chains only). The v2 profile implies, and genesis validation must enforce: `signature_scheme = "pqc-native"` with `pqc_algorithm = "ml-dsa"` (account policy `MlDsaOnly`), `validator_scheme = "ml-dsa-65"`, and no `classical`/`hybrid` selection. The profile selector is a genesis-format change and needs its own owner decision (Q3 in the STATE-COMMIT-2 decision record, #85). **A v2 chain must reject v1 signatures and the reverse**; digest-level tests are here, chain-level tests belong to the Rust PR.
+By **chain profile, not per transaction**, selected by a **top-level genesis field `commitment_profile = "qattice-v2"`** (owner decision 2026-11-05):
+- **Absent field = legacy behavior and legacy hashes** (the field must not enter the genesis hash when absent).
+- **The fresh alpha genesis requires `qattice-v2`.**
+- **Any other value fails closed** (a node refuses to start on a genesis whose `commitment_profile` it does not support, including a legacy node meeting `qattice-v2`).
+- `qattice-v2` accepts **only** this scheme for ML-DSA transactions and enforces ML-DSA-65-only transaction **and** validator authentication: genesis validation must enforce `signature_scheme = "pqc-native"` with `pqc_algorithm = "ml-dsa"` (account policy `MlDsaOnly`), `validator_scheme = "ml-dsa-65"`, 1,952-byte keys only, and no `classical`/`hybrid` selection. **No hybrid, no Ed25519, no v1-signature fallback.**
+- No new field on `Transaction`; Ed25519 `signing_bytes` is untouched (legacy chains only). Adding the genesis field is itself a genesis-format change and is implemented in its own reviewed PR. **A v2 chain must reject v1 signatures and the reverse**; digest-level tests are here, chain-level tests belong to the Rust PR.
 
 Legacy chains stay exposed to the v1 replay (H0-4); any publicly running legacy chain needs a disclosure.
 
@@ -72,12 +77,17 @@ Legacy chains stay exposed to the v1 replay (H0-4); any publicly running legacy 
 
 ML-DSA-65 sizes in this repo: public key 1,952 bytes, signature 3,309 bytes (measured here: pk 1,952, sk 4,032, sig 3,309). A first-use transaction carries the key; later transactions may omit it (E5), keeping steady-state transactions smaller. With the shipped `max_tx_bytes = 65,536` a first-use transaction fits comfortably.
 
-## 6. Open decisions for the owner
+## 6. Decisions (owner, 2026-11-05)
 
-- **Q-H1 Hash:** SHA-256 (matches v1) or SHA3-256 (matches the state tree). Recommendation: SHA-256, since only second-preimage resistance matters here.
-- **Q-A1 Activation field:** name and location of the profile selector (with Q3).
-- **Q-A2 Disclosure** for any publicly running legacy v1 chain.
-- **Q-K1 Conformance:** the chain uses `pqcrypto-dilithium` 0.5.0 (`dilithium3`) as "ML-DSA-65"; sizes match FIPS 204 ML-DSA-65, but the repo has no NIST known-answer test. Recommendation: add ACVP/KAT vectors before launch (see the dependency audit).
+- **Q-H1 Hash: APPROVED, SHA-256** for the v2 prehash.
+- **Q-A1 Activation field: DECIDED**, `commitment_profile = "qattice-v2"` (§3).
+- **Q-A2 Disclosure: YES.** Any publicly accessible legacy v1 network must carry a disclosure of H0-4 (ML-DSA replay under a new nonce). The disclosure text is a separate deliverable.
+- **Transport: OPEN.** Classical P2P identity (Ed25519), Noise, gossip signing and RPC TLS remain **open cryptographic dependencies and must not be described as post-quantum.** A separate design and threat-model review is required before any restricted-alpha exception is considered (see `docs/CRYPTO-DEPENDENCY-AUDIT.md`, rows N1-N4).
+- **Q-K1 Conformance: REQUIRED before launch.** FIPS 204 ML-DSA-65 interoperability evidence: authoritative known-answer vectors, key-generation verification, signature generation and verification, independent-implementation interoperability, invalid-signature and malformed-key rejection, Linux and Windows parity. If the library is not FIPS 204 compatible, a standards-conformant replacement is proposed rather than renaming the algorithm.
+
+**K1 result so far (PR #95, Linux sandbox): the current library is NOT FIPS 204 compatible** (0/45 NIST signatures reproduced; all NIST-valid signatures rejected; cause isolated to the challenge derivation). Consequences for this specification:
+1. **The reference vectors in this PR are not frozen.** The digest framing here is independent of the library bug, but the final signing message may change to use the FIPS 204 context string (`M' = 0x00 ‖ |ctx| ‖ ctx ‖ M`) as the domain separator, and the vectors must then be regenerated. They are frozen only after the K1 backend decision.
+2. Anything signed by the current library is not interoperable with conforming implementations; v2 must be built on the replacement backend.
 
 Removed from the previous draft: hybrid-transaction rules (hybrid is rejected), `sig_scheme` signing question (fixed identifier, §1).
 
