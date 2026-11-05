@@ -1568,7 +1568,7 @@ impl Node {
         let initial_nonce_cache = {
             let mut m = std::collections::HashMap::new();
             for acct in state.all_accounts() {
-                let seed = if acct.nonce == 0 { u64::MAX } else { acct.nonce };
+                let seed = Self::nonce_cache_seed(acct.nonce);
                 m.insert(acct.address.clone(), seed);
             }
             m
@@ -2539,6 +2539,9 @@ impl Node {
             let snap: chain_forge_state::StateSnapshot =
                 serde_json::from_slice(required!("state.json"))?;
             self.state.restore_snapshot(snap);
+            // RPC-TX-1: the API nonce cache was seeded from the genesis state at start-up;
+            // rebuild it from the restored state so replays of committed nonces are rejected.
+            self.refresh_nonce_cache();
 
             // Gap 4: the restored state must reproduce the root the manifest
             // recorded. The file hashes prove the bytes are what was written; only
@@ -2826,6 +2829,25 @@ impl Node {
         } else {
             warn!("mempool full -- transaction dropped");
             false
+        }
+    }
+
+    /// The nonce-cache value for an account whose NEXT expected nonce is `next_expected`
+    /// (`AccountState::nonce`, which the executor requires a transaction to equal exactly).
+    /// The cache stores the LAST CONSUMED nonce, so that is `next_expected - 1`; an account
+    /// that has consumed none holds the `NO_PRIOR_TX` sentinel (`u64::MAX`).
+    fn nonce_cache_seed(next_expected: u64) -> u64 {
+        if next_expected == 0 { u64::MAX } else { next_expected - 1 }
+    }
+
+    /// RPC-TX-1: rebuild the API's per-sender nonce cache from authoritative state.
+    /// Called after every block executes (both execution paths) and after a restore.
+    /// The cache only drives the API's early replay/gap check; execution still requires
+    /// `tx.nonce == account.nonce` on every node.
+    fn refresh_nonce_cache(&self) {
+        let mut cache = self.nonce_cache.lock().unwrap();
+        for acct in self.state.all_accounts() {
+            cache.insert(acct.address.clone(), Self::nonce_cache_seed(acct.nonce));
         }
     }
 
@@ -4326,12 +4348,6 @@ impl Node {
         let participation = payload.last_commit.clone();
         let txs: Vec<Transaction> = payload.txs;
         self.remove_committed_from_mempool(&txs);
-        // Keep a lightweight (tx_id, sender, nonce) index before txs is consumed by
-        // execute_block_with_identity so the post-execution nonce-cache update
-        // can correlate successful TransactionResults back to their senders and nonces.
-        let txs_for_cache: Vec<(String, String, u64)> = txs.iter()
-            .map(|t| (t.id.clone(), t.sender.clone(), t.nonce))
-            .collect();
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4557,35 +4573,11 @@ impl Node {
             )
         };
 
-        // F1: update per-sender nonce cache AFTER execution, from the tx.nonce of each
-        // INCLUDED transaction. The API check rejects tx.nonce <= cache, so cache
-        // must store the last consumed tx.nonce (not state.nonce, which is
-        // post-increment and would block the immediately following valid submission).
-        // H0-5: an included-but-failed tx (fee_charged > 0) consumes its nonce on
-        // chain just like a successful one, so it advances the cache too; a
-        // rejected tx (fee_charged == 0) consumed nothing and leaves it alone.
-        {
-            let mut cache = self.nonce_cache.lock().unwrap();
-            for r in exec_result.tx_results.iter().filter(|r| r.fee_charged > 0) {
-                // TransactionResult has no sender field; look up (sender, nonce) from
-                // the index captured before txs was consumed by execute_block_with_identity.
-                if let Some((_, sender, tx_nonce)) = txs_for_cache.iter().find(|(id, _, _)| id == &r.tx_id) {
-                    let entry = cache.entry(sender.clone()).or_insert(0);
-                    if tx_nonce >= entry {
-                        *entry = *tx_nonce;
-                    }
-                }
-            }
-            // F5 bootstrap: seed any account that now exists in state but has never
-            // committed a tx (e.g. Transfer recipients). Without this, newly funded
-            // addresses are blocked from submitting their first tx (RegisterIdentity,
-            // BondValidator, etc.) because the F5 check only allows known senders.
-            // u64::MAX is the NO_PRIOR_TX sentinel: the nonce check allows any nonce
-            // in 0..MAX_NONCE_GAP as the first tx.
-            for acct in self.state.all_accounts() {
-                cache.entry(acct.address.clone()).or_insert(u64::MAX);
-            }
-        }
+        // F1 / RPC-TX-1: refresh the API's per-sender nonce cache from the state just
+        // produced. The state is the authority (an included-but-failed tx consumes its
+        // nonce like a successful one, a rejected one consumes nothing), and unlike the
+        // previous incremental update this cannot be stuck on the NO_PRIOR_TX sentinel.
+        self.refresh_nonce_cache();
 
         // Diagnostic: log each failed tx so tests can see the root cause.
         for r in exec_result.tx_results.iter().filter(|r| !r.success) {
@@ -6328,6 +6320,9 @@ impl Node {
                 &mut self.agents, now_ms, None,
             )
         };
+
+        // RPC-TX-1: this execution path also advances account nonces.
+        self.refresh_nonce_cache();
 
         // Diagnostic: log each failed tx so tests can see the root cause.
         for r in exec_result.tx_results.iter().filter(|r| !r.success) {

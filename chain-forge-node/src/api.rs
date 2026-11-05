@@ -269,12 +269,14 @@ pub async fn serve(
                         if body.len() > raw_limit {
                             let resp = serde_json::json!({
                                 "status": "rejected",
+                                    "state": "rejected",
                                 "message": format!("request body too large: {} bytes, limit {}", body.len(), raw_limit)
                             });
                             http_400_json(&resp.to_string())
                         } else if json_depth > MAX_JSON_DEPTH {
                             let resp = serde_json::json!({
                                 "status": "rejected",
+                                    "state": "rejected",
                                 "message": format!("request body nesting depth {json_depth} exceeds limit {MAX_JSON_DEPTH}")
                             });
                             http_400_json(&resp.to_string())
@@ -282,7 +284,7 @@ pub async fn serve(
                             // F5: explicit JSON null for signature is a malformed tx, not a
                             // missing-field. Reject before deserialization so the visitor's
                             // visit_none fallback (→ empty Vec) cannot silently accept it.
-                            http_400_json(r#"{"status":"rejected","message":"malformed signature: null is not a valid signature value"}"#)
+                            http_400_json(r#"{"status":"rejected","state":"rejected","message":"malformed signature: null is not a valid signature value"}"#)
                         } else { match serde_json::from_str::<Transaction>(body) {
                             Ok(tx) if chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy).is_err() => {
                                 let reason = chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy)
@@ -290,6 +292,7 @@ pub async fn serve(
                                 tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at ingress (account signature policy)");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
@@ -301,6 +304,7 @@ pub async fn serve(
                                 tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at mempool ingress (check_tx)");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
@@ -311,6 +315,7 @@ pub async fn serve(
                                     .unwrap_err();
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
@@ -322,6 +327,7 @@ pub async fn serve(
                                 tracing::info!(tx_id = %tx.id, "committed-tx replay rejected at ingress");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": "transaction already committed — replay not permitted"
                                 });
@@ -338,6 +344,7 @@ pub async fn serve(
                                     "tx rejected: sender has no committed history on this chain");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": format!("sender {} is not a registered account on this chain", tx.sender)
                                 });
@@ -364,6 +371,7 @@ pub async fn serve(
                                 tracing::info!(nonce, last_committed = last, "nonce replay / out-of-sequence rejected at ingress");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx_id,
                                     "message": format!("nonce {nonce} out of range (last committed: {last}, max gap: 100)")
                                 });
@@ -384,6 +392,7 @@ pub async fn serve(
                             }) => {
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": "malformed PQ signature: entry is not valid hex or is too short for any supported PQ algorithm"
                                 });
@@ -414,6 +423,7 @@ pub async fn serve(
                                     "tx rejected: Transfer amount exceeds sender balance");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": format!("insufficient balance: {amount} {denom} requested but sender has {sender_balance}")
                                 });
@@ -428,6 +438,7 @@ pub async fn serve(
                                     "tx rejected: Ed25519 signature has wrong byte length");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": format!(
                                         "malformed Ed25519 signature: expected 64 bytes, got {}",
@@ -448,6 +459,7 @@ pub async fn serve(
                                 tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at submission");
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
@@ -484,6 +496,7 @@ pub async fn serve(
                                 };
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
@@ -530,6 +543,7 @@ pub async fn serve(
                                 );
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
@@ -564,24 +578,76 @@ pub async fn serve(
                                 );
                                 let resp = serde_json::json!({
                                     "status": "rejected",
+                                    "state": "rejected",
                                     "tx_id": tx.id,
                                     "message": reason
                                 });
                                 http_400_json(&resp.to_string())
                             }
+                            // RPC-TX-1 / O8: refuse over-bound sender, address and denom fields
+                            // before queueing, with the same rule Node::submit_tx applies.
+                            Ok(tx) if chain_forge_execution::check_admission_bounds(&tx).is_err() => {
+                                let reason = chain_forge_execution::check_admission_bounds(&tx).unwrap_err();
+                                tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at ingress (O8 bounds)");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "state": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
+                            // RPC-TX-1: bounded queue, idempotent duplicates, honest wording.
+                            // "queued_for_validation" means RECEIVED: the node validates and admits the
+                            // transaction at its next heartbeat, and consensus has not seen it.
                             Ok(tx) => {
                                 let tx_id = tx.id.clone();
-                                tx_queue.lock().unwrap().push(tx);
-                                tracing::info!(tx_id, "transaction queued via POST /api/tx");
-                                let resp = serde_json::json!({
-                                    "status": "queued",
-                                    "tx_id": tx_id
-                                });
-                                http_200_json(&resp.to_string())
+                                let cap = if precheck.tx_queue_capacity == 0 { DEFAULT_TX_QUEUE_CAPACITY } else { precheck.tx_queue_capacity };
+                                let mut q = tx_queue.lock().unwrap();
+                                if let Some(existing) = q.iter().find(|t| t.id == tx.id) {
+                                    if serde_json::to_vec(existing).ok() == serde_json::to_vec(&tx).ok() {
+                                        let resp = serde_json::json!({
+                                            "status": "queued",
+                                            "state": "queued_for_validation",
+                                            "tx_id": tx_id,
+                                            "duplicate": true
+                                        });
+                                        http_200_json(&resp.to_string())
+                                    } else {
+                                        let resp = serde_json::json!({
+                                            "status": "rejected",
+                                            "state": "rejected",
+                                            "tx_id": tx_id,
+                                            "message": "a different transaction with this id is already queued"
+                                        });
+                                        http_400_json(&resp.to_string())
+                                    }
+                                } else if q.len() >= cap {
+                                    drop(q);
+                                    tracing::warn!(tx_id, cap, "tx queue full: submission refused");
+                                    let resp = serde_json::json!({
+                                        "status": "queue_full",
+                                        "state": "queue_full",
+                                        "tx_id": tx_id,
+                                        "message": "the node's transaction queue is full; retry later"
+                                    });
+                                    http_503_json(&resp.to_string())
+                                } else {
+                                    q.push(tx);
+                                    drop(q);
+                                    tracing::info!(tx_id, "transaction queued via POST /api/tx");
+                                    let resp = serde_json::json!({
+                                        "status": "queued",
+                                        "state": "queued_for_validation",
+                                        "tx_id": tx_id
+                                    });
+                                    http_200_json(&resp.to_string())
+                                }
                             }
                             Err(e) => {
                                 let resp = serde_json::json!({
                                     "status": "error",
+                                    "state": "rejected",
                                     "message": format!("invalid transaction JSON: {e}")
                                 });
                                 http_400_json(&resp.to_string())
@@ -1640,6 +1706,8 @@ pub async fn serve(
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Body limit when genesis sets no `max_tx_bytes` (0 = unlimited).
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
+/// Queue capacity used when genesis `limits.mempool_size` is 0, so the queue is always finite.
+const DEFAULT_TX_QUEUE_CAPACITY: usize = 5_000;
 /// Most bytes read and discarded after a 413, so a huge upload can't hold
 /// the task open.
 const MAX_DRAIN_BYTES: usize = 8 * 1_048_576;
@@ -1763,6 +1831,13 @@ fn http_400_json(body: &str) -> String {
 fn http_413_json(body: &str) -> String {
     format!(
         "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    )
+}
+
+fn http_503_json(body: &str) -> String {
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nRetry-After: 5\r\nContent-Length: {}\r\n\r\n{}",
         body.len(), body
     )
 }
