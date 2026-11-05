@@ -1,0 +1,19 @@
+
+    // ── STATE-COMMIT-2 scratch reproduction (NOT for merge) ─────────────────────
+    #[test]
+    fn sc2_scratch_overlength_address_and_denom() {
+        let (exec, mut state) = setup();
+        let long_addr = format!("qcb1{}", "a".repeat(296));          // 300 bytes
+        let long_denom = format!("u{}", "d".repeat(99));             // 100 bytes
+        state.get_account_mut("qcb1alice").unwrap().credit(&long_denom, 1_000);
+        state.refresh_leaf("qcb1alice");
+        let r1 = exec.execute_tx(&Transaction::transfer("t1", "qcb1alice", &long_addr, "uqcb", 1_000, 0), &mut state, 0);
+        let leaf1 = state.get_account(&long_addr).map(|a| a.to_leaf_bytes().len()).ok();
+        let r2 = exec.execute_tx(&Transaction::transfer("t2", "qcb1alice", "qcb1bob", &long_denom, 10, 1), &mut state, 0);
+        let leaf2 = state.get_account("qcb1bob").map(|a| a.to_leaf_bytes().len()).ok();
+        // 70000-byte address: exceeds max_tx_bytes (65536) — is that enforced in execute_tx?
+        let huge = format!("qcb1{}", "b".repeat(70_000));
+        let r3 = exec.execute_tx(&Transaction::transfer("t3", "qcb1alice", &huge, "uqcb", 1, 2), &mut state, 0);
+        println!("SC2-RESULT overlength: addr300_success={} new_acct_leaf_len={leaf1:?} denom100_success={} bob_leaf_len={leaf2:?} addr70000_success={} err3={:?}",
+            r1.success, r2.success, r3.success, r3.error);
+    }

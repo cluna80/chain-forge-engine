@@ -1,0 +1,5 @@
+test node::p02a_gaps::sc2_scratch_agent_index_reconstruction ... SC2-RESULT agent-index: index_serialized=true fields_changed=1 restored=true get_by_address=Err("agent nonexistent not found") get_by_id_ok=true
+test node::p02a_gaps::sc2_scratch_identity_state_tamper_on_restore ... SC2-RESULT identity-tamper: fields_changed=4 restored=true orig_tier=Ok(Verified) restored_tier=Ok(Established) root_equal=true
+test node::p02a_gaps::sc2_scratch_validator_state_tamper_on_restore ... SC2-RESULT validator-tamper: fields_changed=4 restored=true orig_bond=Some(1000000) restored_bond=Some(124456789) root_equal=true
+test node::tests::sc2_scratch_stale_account_tier_after_epoch_lapse ... SC2-RESULT stale-tier: identity_tier=Provisional account_charm_before=Some("Verified") account_charm_after=Some("Verified") leaf_unchanged=true root_unchanged=true
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 400 filtered out; finished in 0.50s

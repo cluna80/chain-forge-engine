@@ -1,0 +1,23 @@
+    // ── STATE-COMMIT-2 scratch reproduction (NOT for merge) ─────────────────────
+    #[tokio::test]
+    async fn sc2_scratch_stale_account_tier_after_epoch_lapse() {
+        use chain_forge_identity::LIVENESS_EPOCH_WINDOW;
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let tier_of = |n: &Node| n.state.get_account("qcb1alice").unwrap().charm.as_ref().map(|c| format!("{:?}", c.tier));
+        let acct_before = tier_of(&node);
+        let leaf_before = node.state.get_account("qcb1alice").unwrap().to_leaf_bytes();
+        let root_before = node.state.current_root().unwrap_or("").to_string();
+        let target = LIVENESS_EPOCH_WINDOW + 2;
+        node.identity.lapse_only("qcb1alice", target);
+        for a in ["qcb1bob", "qcb1carol", "qcb1dave"] { node.identity.stay_lively(a, target); }
+        assert!(node.identity.advance_epoch_to(target));
+        node.propose_block(chain_forge_consensus::BlockHash("h0".into())).await.unwrap();
+        let id_tier = format!("{:?}", node.identity.get("qcb1alice").unwrap().charm.tier);
+        let acct_after = tier_of(&node);
+        let leaf_after = node.state.get_account("qcb1alice").unwrap().to_leaf_bytes();
+        let root_after = node.state.current_root().unwrap_or("").to_string();
+        println!("SC2-RESULT stale-tier: identity_tier={id_tier} account_charm_before={acct_before:?} account_charm_after={acct_after:?} \
+                  leaf_unchanged={} root_unchanged={}", leaf_before == leaf_after, root_before == root_after);
+        assert_eq!(id_tier, "Provisional", "precondition: identity lapsed");
+        assert_ne!(acct_after.clone().unwrap_or_default(), format!("Some(\"{id_tier}\")"), "mirror is stale iff this fails to equal identity");
+    }
