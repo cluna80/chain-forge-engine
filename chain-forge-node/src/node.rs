@@ -959,6 +959,16 @@ impl Node {
         // boot into a validator set that can never vote.
         genesis.validate_validator_keys().map_err(NodeError::Genesis)?;
         genesis.account_signature_policy().map_err(NodeError::Genesis)?;
+        // `commitment_profile` (owner decision 2026-11-05): an unknown value stops the node, and so does a `qattice-v2`
+        // genesis on a binary that does not have signing v2 compiled in (it would silently run the legacy rules).
+        let profile = genesis.commitment_profile().map_err(NodeError::Genesis)?;
+        #[cfg(not(feature = "signing-v2"))]
+        if profile == chain_forge_core::CommitmentProfile::QatticeV2 {
+            return Err(NodeError::Genesis(
+                "commitment_profile \"qattice-v2\" requires a binary built with the `signing-v2` feature; \
+                 this binary would run the legacy signing rules".into(),
+            ));
+        }
         genesis.recovery_timelock_blocks().map_err(NodeError::Genesis)?;
 
         // Hard error, in every environment: an accepted-but-nonsensical
@@ -1608,7 +1618,7 @@ impl Node {
             state,
             executor,
             #[cfg(feature = "signing-v2")]
-            mldsa_signing_v2: false,
+            mldsa_signing_v2: profile == chain_forge_core::CommitmentProfile::QatticeV2,
             network,
             status,
             explorer,
@@ -10356,7 +10366,7 @@ mod tests {
             p
         }
 
-        fn evidence(h: u64, hash: &BlockHash) -> CommitCertificate {
+        pub(super) fn evidence(h: u64, hash: &BlockHash) -> CommitCertificate {
             CommitCertificate {
                 height: h, round: 0, block_hash: hash.clone(),
                 precommits: VALS.iter().map(|v| signed_vote(CHAIN, VoteType::Precommit, h, 0, v, hash.clone())).collect(),
@@ -10728,7 +10738,9 @@ mod tests {
     // The profile in genesis, not a test switch, decides whether signing v2 runs: at execution (every node) and at ingress
     // (API + mempool). Unknown values and a binary without signing v2 compiled in fail closed at startup.
 
-    fn with_profile(json: &str, value: &str) -> String {
+    /// Add `commitment_profile` and, as a real v2 genesis must, make the chain ML-DSA-only.
+    pub(super) fn with_profile(json: &str, value: &str) -> String {
+        let json = json.replace(r#""signature_scheme": "hybrid""#, r#""signature_scheme": "pqc-native""#);
         let out = json.replacen(r#""address_prefix": "qcb","#, &format!(r#""address_prefix": "qcb", "commitment_profile": {value},"#), 1);
         assert!(out.contains("commitment_profile"));
         out
@@ -10784,11 +10796,10 @@ mod tests {
             let mut v1 = f::transfer(&s, "v1", 0, 1_000); f::sign_v1(&kp, &mut v1);
             assert!(!nodes[1].submit_tx(v1.clone()), "a v1 signature must not enter the mempool of a v2 chain");
             // Execution on all four nodes: v1 changes nothing; v2 credits once; roots agree.
-            f::commit_everywhere(&mut nodes, 0, &[v1], None).await;
+            let c0 = f::commit_everywhere(&mut nodes, 0, &[v1], None).await;
             f::assert_agree(&nodes, "after v1");
             for n in &nodes { assert_eq!(f::recv(n), 0); }
-            let c = f::commit_everywhere(&mut nodes, 1, &[good], None).await;
-            let _ = c;
+            f::commit_everywhere(&mut nodes, 1, &[good], Some(&f::evidence(0, &c0))).await;
             f::assert_agree(&nodes, "after v2");
             for n in &nodes { assert_eq!(f::recv(n), 1_000); }
         }
@@ -16870,19 +16881,30 @@ mod p02a_gaps {
     #[cfg(feature = "signing-v2")]
     #[tokio::test]
     async fn the_commitment_profile_cannot_change_across_a_restart() {
-        let v2 = GENESIS.replacen(r#""address_prefix": "qcb","#, r#""address_prefix": "qcb", "commitment_profile": "qattice-v2","#, 1);
-        assert_ne!(v2, GENESIS);
-        // v2 directory: the same genesis restores; the legacy genesis (field removed) is refused.
-        let dir = tmp("profile-v2");
-        { let mut n = Node::new(&v2, Some("qcb1alice".into())).await.unwrap(); n.set_data_dir(dir.clone()).unwrap();
-          let g = chain_forge_consensus::BlockHash("0000000000000000".into());
-          let c0 = n.propose_block(g).await.unwrap(); n.propose_block(c0.block_hash).await.unwrap(); n.persist_state().unwrap(); }
+        // Two genesis files that differ ONLY in the profile field (same chain, same scheme).
+        let v2 = super::tests::with_profile(GENESIS, r#""qattice-v2""#);
+        let twin = v2.replacen(r#" "commitment_profile": "qattice-v2","#, "", 1);
+        assert_ne!(v2, twin);
+        assert!(!twin.contains("commitment_profile") && twin.contains(r#""signature_scheme": "pqc-native""#));
+        async fn write_dir(tag: &str, genesis: &str) -> std::path::PathBuf {
+            let dir = tmp(tag);
+            let mut n = Node::new(genesis, Some("qcb1alice".into())).await.unwrap();
+            n.set_data_dir(dir.clone()).unwrap();
+            let g = chain_forge_consensus::BlockHash("0000000000000000".into());
+            let c0 = n.propose_block(g).await.unwrap();
+            n.propose_block(c0.block_hash).await.unwrap();
+            n.persist_state().unwrap();
+            dir
+        }
+        // v2 directory: the same genesis restores; the same genesis without the field is refused.
+        let dir = write_dir("profile-v2", &v2).await;
         assert!(matches!(restart_with(&dir, &v2).await, PersistStartup::Restored { .. }));
-        let e = fatal_text(&restart_with(&dir, GENESIS).await);
+        let e = fatal_text(&restart_with(&dir, &twin).await);
         assert!(e.contains("genesis_hash"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
-        // Legacy directory: the v2 genesis is refused.
-        let dir = committed_dir("profile-legacy").await;
+        // Legacy-twin directory: the v2 genesis is refused.
+        let dir = write_dir("profile-twin", &twin).await;
+        assert!(matches!(restart_with(&dir, &twin).await, PersistStartup::Restored { .. }));
         let e = fatal_text(&restart_with(&dir, &v2).await);
         assert!(e.contains("genesis_hash"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
