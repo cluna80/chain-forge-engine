@@ -2827,6 +2827,16 @@ impl Node {
             debug!(tx_id = %tx.id, error = %e, "transaction refused by the account signature policy");
             return false;
         }
+        // TEST-ONLY signing v2: the envelope rules E1-E5 against the sender's bound key (if any), so a transaction
+        // execution would refuse on structure never occupies the mempool (API drain and gossip both come through here).
+        #[cfg(feature = "signing-v2")]
+        if self.mldsa_signing_v2 {
+            let bound: Option<Vec<u8>> = self.state.get_account(&tx.sender).ok().and_then(|a| a.public_key.clone()).filter(|k| !k.is_empty());
+            if let Err(code) = chain_forge_execution::signing_v2::check_envelope(&tx, bound.as_deref()) {
+                debug!(tx_id = %tx.id, code, "transaction refused by the signing-v2 envelope rules");
+                return false;
+            }
+        }
         if let Err(e) = chain_forge_execution::check_admission_bounds(&tx) {
             debug!(tx_id = %tx.id, error = %e, "transaction refused by the O8 admission bounds");
             return false;
@@ -10543,12 +10553,38 @@ mod tests {
             let node = v2_node(&s, true).await;
             let port = rpc_start(&node).await;
             for (label, code_str, t) in bad_envelopes(&kp, &s) {
+                // The API has no account state: a key-less transaction may rely on a bound key, so E5 "first use
+                // without key" is settled by `submit_tx` (next test), not here.
+                if code_str.starts_with("E5_FIRST_USE") { continue; }
                 let (code, v) = rpc(port, "POST", "/api/tx", &serde_json::to_string(&t).unwrap()).await;
                 assert_eq!(code, 400, "{label}: must be rejected at ingress: {v}");
                 assert_eq!(v["state"], "rejected", "{label}: {v}");
                 assert!(v["message"].as_str().unwrap_or("").contains(code_str), "{label}: expected {code_str} in {v}");
             }
             assert_eq!(node.tx_queue().lock().unwrap().len(), 0, "no rejected transaction may be queued");
+        }
+
+        /// The API cannot tell a first use from a bound sender, so it queues a key-less transaction; the drain into the
+        /// mempool (`submit_tx`, which knows the bound key) refuses it when the sender has no bound key.
+        #[tokio::test]
+        async fn a_keyless_first_use_passes_the_api_but_is_refused_at_the_mempool() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut node = v2_node(&s, true).await;
+            let port = rpc_start(&node).await;
+            let t = bad_envelopes(&kp, &s).into_iter().find(|b| b.1.starts_with("E5_FIRST_USE")).unwrap().2;
+            let (code, v) = rpc(port, "POST", "/api/tx", &serde_json::to_string(&t).unwrap()).await;
+            assert_eq!(code, 200, "{v}");
+            assert_eq!(node.tx_queue().lock().unwrap().len(), 1);
+            node.drain_api_tx_queue().await;
+            assert_eq!(node.tx_queue().lock().unwrap().len(), 0, "the queue was drained");
+            assert!(node.mempool.is_empty(), "submit_tx must refuse the key-less first use");
+
+            // Positive counterpart through the same path: a well-formed transaction reaches the mempool.
+            let ok = good(&kp, &s, "ok-drain", 0);
+            let (code, v) = rpc(port, "POST", "/api/tx", &serde_json::to_string(&ok).unwrap()).await;
+            assert_eq!(code, 200, "{v}");
+            node.drain_api_tx_queue().await;
+            assert_eq!(node.mempool.len(), 1, "a well-formed v2 transaction reaches the mempool");
         }
 
         /// Control: with the switch off, a transaction carrying two signatures passes legacy ingress (the gap the
