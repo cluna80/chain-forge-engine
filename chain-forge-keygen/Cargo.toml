@@ -17,6 +17,15 @@ serde_json = { workspace = true }
 hex        = { workspace = true }
 chain-forge-core = { path = "../chain-forge-core", optional = true }
 
+argon2           = { version = "0.5", optional = true }
+aes-gcm          = { version = "0.10", optional = true }
+zeroize          = { version = "1", optional = true }
+getrandom        = { version = "0.2", optional = true }
+
+[lib]
+name = "chain_forge_keygen"
+path = "src/lib.rs"
+
 [features]
 # TEST-ONLY signing v2 key generation and checking (conforming FIPS 204 keygen). Off by default; legacy commands untouched.
-signing-v2 = ["dep:chain-forge-core", "chain-forge-crypto/fips204-backend"]
+signing-v2 = ["dep:chain-forge-core", "chain-forge-crypto/fips204-backend", "dep:argon2", "dep:aes-gcm", "dep:zeroize", "dep:getrandom"]

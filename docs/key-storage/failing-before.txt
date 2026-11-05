@@ -1,0 +1,35 @@
+== keystore (library)
+test a_missing_grandparent_directory_is_an_error_not_a_silent_mkdir_p ... ok
+test a_file_asking_for_a_weak_or_enormous_kdf_is_refused_before_any_key_derivation ... FAILED
+test a_new_key_round_trips_and_signs_under_the_conforming_backend ... FAILED
+test a_new_storage_directory_is_created_restricted ... FAILED
+test a_wrong_passphrase_fails_without_returning_anything ... FAILED
+test an_existing_file_is_never_overwritten ... FAILED
+test every_authenticated_header_field_is_bound_to_the_ciphertext ... FAILED
+test every_file_gets_a_fresh_salt_and_nonce ... FAILED
+test an_existing_loose_directory_is_refused_unless_hardening_is_requested ... FAILED
+test kdf_cost_outside_the_bounds_is_refused_on_create ... FAILED
+test failures_of_randomness_permissions_or_directory_leave_no_file ... ok
+test loading_verifies_the_real_permissions_and_refuses_a_loosened_file_or_directory ... FAILED
+test structural_damage_is_refused ... FAILED
+test the_file_holds_no_plaintext_secret_and_only_the_seed_is_encrypted ... FAILED
+test the_sddl_verifier_accepts_exactly_one_protected_ace_for_the_current_user ... FAILED
+test the_sddl_verifier_rejects_everything_else ... ok
+test weak_passphrases_are_refused_and_leave_no_file ... FAILED
+test migrating_a_legacy_library_key_without_a_seed_stores_the_expanded_key_encrypted ... FAILED
+test migrating_a_plaintext_key_keeps_the_key_encrypts_the_seed_and_leaves_the_source_untouched ... FAILED
+test migration_refuses_damaged_sources_existing_outputs_and_missing_files_and_creates_nothing ... FAILED
+test result: FAILED. 3 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+== keystore_cli
+test a_wrong_or_weak_passphrase_fails_and_creates_nothing ... ok
+test kdf_flags_below_the_floor_or_above_the_ceiling_are_refused ... ok
+test a_passphrase_is_never_accepted_on_the_command_line ... FAILED
+test key_new_never_overwrites ... FAILED
+test key_new_then_key_check_round_trips_and_prints_only_public_information ... FAILED
+test key_migrate_encrypts_without_touching_or_printing_the_old_file ... FAILED
+test the_cli_creates_owner_only_files_and_directories ... FAILED
+test the_default_cost_is_the_production_cost ... FAILED
+test usage_errors_exit_two ... FAILED
+test the_passphrase_can_come_from_the_environment_or_stdin ... FAILED
+test result: FAILED. 2 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+(keystore_windows.rs is cfg(windows) and is not compiled on Linux)
