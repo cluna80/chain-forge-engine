@@ -4,6 +4,10 @@ Companion to `docs/k1-mldsa-conformance/README.md` (the finding that the current
 
 Authorization: the owner approved fetching the four Rust candidates and a reputable pure-Python implementation for isolated evaluation only. Nothing else was installed; no installation script was run (Rust crates were fetched by `cargo`, whose only code execution is the candidates' own build scripts during the test build; the Python package was installed from a hash-checked pure-Python wheel that I inspected first).
 
+## 0. Owner decision recorded (2026-11-05)
+
+Approved and locked: algorithm FIPS 204 ML-DSA-65; preferred implementation **`fips204` 0.5.0, subject to remaining validation** (Windows K1 parity, the migration PRs); interface **standard FIPS 204 pure ML-DSA**; the signed message is the **complete canonical, versioned preimage** (not a separate SHA-256 digest, which supersedes the earlier prehash approval); **explicit Qattice contexts** per protocol; no Ed25519, hybrid or downgrade. The signing-v2 specification and its vectors (PR #94) were regenerated for this design; the harness here gained a `verify-v2` command, and **all four candidates plus the independent Python implementation agree on all 29 vector cases** (15 valid accepted, 14 invalid rejected) while the current chain library rejects all 15 valid ones.
+
 ## 1. Recommendation
 
 **Adopt `fips204` 0.5.0 (integritychain) as the Qattice ML-DSA-65 backend**, used through the FIPS 204 external pure interface with a Qattice context string, and keep a second implementation (`libcrux-ml-dsa`, plus the pure-Python reference) only as a **differential-test oracle** in CI, never in production.
@@ -122,10 +126,10 @@ Platforms: all four built and ran on Linux x86-64 here. Windows, macOS, aarch64,
 
 ## 10. Proposed isolated migration PR sequence (nothing authorized; each reviewed separately, tests first)
 
-1. **Decision record** (this PR + #95): backend, version pin, interface = FIPS 204 external pure with context. Then freeze the #94 vectors.
+1. **Decision record** (this PR + #95): backend, version pin, interface = FIPS 204 external pure with context. Recorded; the #94 vectors are regenerated for it.
 2. **Backend seam:** add `fips204` behind a feature in `chain-forge-crypto` as a new `SignatureScheme` implementation; keep the old code as a clearly-named legacy backend. Parameterise the K1 conformance tests over both backends; the NIST tests pass for the new one. No caller switched yet.
 3. **Wrapper hardening:** exact-length keys, no truncation, error on malformed secret keys and on contexts over 255 bytes, tests for each (turns the ignored wrapper test green).
-4. **Signing domain v2:** FIPS 204 context string `qattice/tx/v2`-style domain, SHA-256 digest as message (as approved), envelope rules E1-E5, behind `commitment_profile = "qattice-v2"`; the H0-4 acceptance test turns green.
+4. **Signing domain v2:** the full canonical preimage as the message and the FIPS 204 context `qattice/tx/v2` (no separate digest; owner 2026-11-05), envelope rules E1-E5, behind `commitment_profile = "qattice-v2"`; the H0-4 acceptance test turns green.
 5. **Validator and consensus signing** on the new backend under the profile (PQ-HotStuff / Tendermint votes with their own contexts); remove the classical branches under the profile.
 6. **Signers:** wallet, scheduler, node `tx`/keygen, wallet app, Android JNI; store the 32-byte seed form; key files from the current library remain valid (§4.2).
 7. **`dis-core`** backend swap and delegation-proof compatibility decision.
