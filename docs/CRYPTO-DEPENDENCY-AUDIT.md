@@ -16,7 +16,7 @@ Columns: **Crit.** = security-critical for the alpha. **On alpha path** = reacha
 
 | ID | Component / location | Algorithm | Purpose | Crit. | On alpha path | Action | Disposition |
 |---|---|---|---|---|---|---|---|
-| T1 | ML-DSA tx digest (`mldsa_tx_prehash`, `verify_mldsa_authorization`) | ML-DSA-65 over v1 digest (chain id + body only) | transaction authorization | **Critical** | yes | v2 digest binding id, sender, nonce, gas, body, key (SPEC §1) | **Replace** (H0-4, reproduced on Windows) |
+| T1 | ML-DSA tx digest (`mldsa_tx_prehash`, `verify_mldsa_authorization`) | ML-DSA-65 over v1 digest (chain id + body only) | transaction authorization | **Critical** | yes | signing v2: FIPS 204 pure ML-DSA-65 over the **full canonical preimage** (chain id, id, sender, nonce, gas, body, key; version-tagged) with context `qattice/tx/v2`; no separate digest (owner 2026-11-05, SPEC §1-2) | **Replace** (H0-4, reproduced on Windows) |
 | T2 | Ed25519 tx path (`verify_signature`, `Transaction::sign`/`signing_bytes`, `ClassicalScheme`) | Ed25519 | legacy tx authorization | High | **refused** when account policy is `MlDsaOnly`, accepted otherwise | v2 profile must force `MlDsaOnly`; keep code for legacy profile and tests | Gate + Legacy-only |
 | T3 | `tx_signature_scheme` maps `HybridEd25519MlDsa` to `"ml-dsa-65"` | hybrid tag | account policy | High | **yes: Hybrid-tagged txs pass the `pqc-native` policy** and then verify through the ML-DSA path only (Ed25519 half ignored) | reject any non-`MlDsa` tag on v2 (rule E1) | **Replace** |
 | T4 | Implicit detection: `sig_scheme = None` plus an `mldsa65:` entry is accepted | legacy envelope | back-compat | Medium | yes | reject missing tag (E1) | **Replace** |
@@ -26,10 +26,10 @@ Columns: **Crit.** = security-critical for the alpha. **On alpha path** = reacha
 | T8 | First-use binding (`bind_key_if_unbound`) | both | key ownership | High | yes | unchanged; H0-6 tests found no defect | Test (done, sandbox+Windows for #93) |
 | T9 | Genesis account `public_key` (core doc says Ed25519; validation accepts hex; ML-DSA keys are 1,952 B) | either | pre-bound account keys | Medium | yes | v2 genesis validation: only 1,952-byte ML-DSA keys | **Replace** (validation rule) |
 | T10 | Node `tx` CLI and `keygen` default to `"ed25519"`, accept `"hybrid"` (`node/src/tx.rs ~111`, `keygen.rs ~59`, `node.rs ~2049`) | Ed25519 / hybrid | operator tooling | Medium | yes (operators) | default to ML-DSA-65; refuse ed25519/hybrid key files on a v2 chain | **Replace** |
-| T11 | `chain-forge-wallet` (`sign_transaction`, `generate`) | ML-DSA-65 | wallet signing | High | yes | already ML-DSA; update to v2 digest (two call sites) | **Replace** (digest only) |
+| T11 | `chain-forge-wallet` (`sign_transaction`, `generate`) | ML-DSA-65 | wallet signing | High | yes | already ML-DSA; update to the v2 preimage and context (two call sites) | **Replace** (digest only) |
 | T12 | Wallet app (`Qattice wallet/`): `keypair-store.ts` scheme `"mldsa65"`; docs still describe the v1 prehash | ML-DSA-65 | end-user wallet | High | yes | update to v2; the app's `gate-identity.server.ts` verifies Ed25519 JWKs (an external identity provider, see X3) | **Replace** + Exclude (X3) |
-| T13 | Scheduler `settlement.rs`, `verifier_registry.rs` | ML-DSA-65 | settlement txs, verifier PoP | Medium | only if scheduler/settlement is enabled | update to v2 digest | **Replace** if enabled |
-| T14 | Android wallet path (PR #63) and `dis-wallet-android` JNI | ML-DSA-65 (JNI) | mobile signing | High | yes | update to v2 digest | **Replace** |
+| T13 | Scheduler `settlement.rs`, `verifier_registry.rs` | ML-DSA-65 | settlement txs, verifier PoP | Medium | only if scheduler/settlement is enabled | update to the v2 preimage and context | **Replace** if enabled |
+| T14 | Android wallet path (PR #63) and `dis-wallet-android` JNI | ML-DSA-65 (JNI) | mobile signing | High | yes | update to the v2 preimage and context | **Replace** |
 
 ### 1b. Consensus and validators
 
@@ -89,7 +89,7 @@ Columns: **Crit.** = security-critical for the alpha. **On alpha path** = reacha
 
 1. **Spec review** (PR #94) and owner decisions: Q-H1 hash, Q-A1 profile selector (with Q3), Q-A2 legacy disclosure, whether to accept the N1–N4 transport limitation for the alpha.
 2. **K1 conformance** (PR #95): done for sigGen/sigVer, **result: the current library fails**; next a backend decision and an independent-implementation check, then re-run on Linux and Windows. Everything below is built on the replacement backend.
-3. **Rust v2 digest + envelope rules** behind the v2 profile, with `h0_4_mldsa_signature_must_bind_the_nonce` as the acceptance test, golden-vector parity with the Python encoder, and tests for every rejection code (E1–E5) and for v1-under-v2 and v2-under-v1.
+3. **Rust v2 preimage, contexts + envelope rules** behind the v2 profile, with `h0_4_mldsa_signature_must_bind_the_nonce` as the acceptance test, golden-vector parity with the Python encoder, and tests for every rejection code (E1–E5) and for v1-under-v2 and v2-under-v1.
 4. **Profile gates:** genesis validation forcing `MlDsaOnly` + `validator_scheme = "ml-dsa-65"` + 1,952-byte keys only (T2, T9, V3, V8); classical vote branch and migration state unreachable (V2, T7); simulation keys unreachable (V5); `pocd`/governance/vca-pq off in the alpha genesis (K5, I5, I2).
 5. **Signers:** wallet, scheduler, node `tx` CLI and keygen defaults, wallet app, Android path move to v2 and ML-DSA defaults (T10–T14).
 6. **Negative tests across the stack:** recovery/rotation (T6, I3), slashing evidence (V9), PoP verifier (I1), seeded-keygen refusal (K2).
