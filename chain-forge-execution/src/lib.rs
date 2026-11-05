@@ -3409,6 +3409,10 @@ impl TxModule for DisModule {
 }
 
 impl Executor {
+    /// TEST-ONLY (feature `signing-v2`): turn the signing-v2 authorization path on or off for this executor.
+    #[cfg(feature = "signing-v2")]
+    pub fn set_mldsa_signing_v2_for_test(&mut self, on: bool) { self.config.mldsa_signing_v2 = on; }
+
     pub fn new(config: ExecutionConfig) -> Self {
         // Qattice's behavior is unchanged: the DIS module is registered by default for now.
         Self { config, modules: vec![std::sync::Arc::new(DisModule)] }

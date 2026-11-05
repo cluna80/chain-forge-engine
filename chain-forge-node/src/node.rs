@@ -10250,6 +10250,224 @@ mod tests {
         })
     }
 
+    // ── Signing v2, node level (TEST-ONLY, feature `signing-v2`) ──────────────
+    //
+    // Four in-process nodes execute the same committed blocks with the test-only
+    // v2 switch on. Evidence wanted: identical state roots on all four nodes for
+    // v2-signed transactions, including the H0-4 replay (same signature, new
+    // id and nonce). No activation path, no genesis field, no ingress change.
+    #[cfg(feature = "signing-v2")]
+    mod signing_v2_four_node {
+        use super::*;
+        use chain_forge_consensus::{compute_block_hash, CommitCertificate};
+        use chain_forge_core::{Address, AddressScheme, HashWidth};
+        use chain_forge_crypto::fips204_backend::MlDsa65Fips204 as B;
+        use chain_forge_crypto::{mldsa_tx_prehash, KeyPair, MlDsaScheme, SchemeId, SignatureScheme as _};
+        use chain_forge_execution::signing_v2::{self, TX_CONTEXT};
+
+        const CHAIN: &str = "qcb-testnet-1";
+        const VALS: [&str; 4] = ["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"];
+        const RECV: &str = "qcb1recv";
+
+        fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+
+        fn user_key() -> KeyPair { B::keygen_from_seed(&[7u8; 32]) }
+
+        fn user_addr(kp: &KeyPair) -> String {
+            Address::from_public_key_schemed(&kp.public_key, "qcb", HashWidth::Bits256, AddressScheme::PostQuantum).to_string()
+        }
+
+        /// Test genesis: signatures required; a funded ML-DSA user (address derived from its key, no key bound at
+        /// genesis, so the first transaction carries it) and an empty receiver.
+        fn genesis(sender: &str) -> String {
+            let g = GENESIS.replace(r#""require_signatures": false"#, r#""require_signatures": true"#)
+                .replace(r#""crypto_governors": ["qcb1alice"],"#, r#""crypto_governors": ["qcb1alice"],"#);
+            let extra = format!(
+                r#"{{ "label": "U", "address": "{sender}", "balance": "1000000", "role": "user" }},
+                   {{ "label": "R", "address": "{RECV}", "balance": "0", "role": "user" }},
+                   "#);
+            let out = g.replacen(r#""genesis_accounts": ["#, &format!(r#""genesis_accounts": [{extra}"#), 1);
+            assert!(out.contains(sender) && out.contains(r#""require_signatures": true"#));
+            out
+        }
+
+        fn transfer(sender: &str, id: &str, nonce: u64, amount: u128) -> Transaction {
+            let mut t = Transaction::transfer(id, sender, RECV, "uqcb", amount, nonce);
+            t.gas_limit = 500_000;
+            t
+        }
+
+        fn sign_v2(kp: &KeyPair, tx: &mut Transaction, carry_key: bool) {
+            tx.sig_scheme = Some(SchemeId::MlDsa);
+            tx.signature.clear();
+            tx.public_key.clear();
+            tx.pq_public_key = if carry_key { kp.public_key.clone() } else { vec![] };
+            let pre = signing_v2::tx_preimage(CHAIN, tx, &kp.public_key).unwrap();
+            let sig = B::sign_with_randomness(&kp.private_key, &pre, TX_CONTEXT, &[0u8; 32]).unwrap();
+            tx.pq_signatures = vec![format!("mldsa65:{}", hex(&sig))];
+        }
+
+        /// Legacy (v1) ML-DSA signature: covers only chain id + body (the H0-4 defect), not the nonce.
+        fn sign_v1(kp: &KeyPair, tx: &mut Transaction) {
+            tx.sig_scheme = Some(SchemeId::MlDsa);
+            tx.pq_public_key = kp.public_key.clone();
+            let body = serde_json::to_vec(&tx.body).unwrap();
+            let pre = mldsa_tx_prehash(CHAIN, &body);
+            let sig = MlDsaScheme.sign(&pre, kp).unwrap();
+            tx.pq_signatures = vec![format!("mldsa65:{}", hex(&sig.bytes))];
+        }
+
+        fn sign_proposal(mut p: BlockProposal) -> BlockProposal {
+            let kp = ClassicalScheme.generate_keypair(&p.proposer.0).unwrap();
+            let bytes = chain_forge_consensus::proposal_signing_bytes(
+                CHAIN, p.height, p.round, &p.block_hash, &p.parent_hash, p.pol_round);
+            p.signature = ClassicalScheme.sign(&bytes, &kp).unwrap().bytes;
+            p
+        }
+
+        fn evidence(h: u64, hash: &BlockHash) -> CommitCertificate {
+            CommitCertificate {
+                height: h, round: 0, block_hash: hash.clone(),
+                precommits: VALS.iter().map(|v| signed_vote(CHAIN, VoteType::Precommit, h, 0, v, hash.clone())).collect(),
+            }
+        }
+
+        async fn four_nodes(sender: &str, v2: bool) -> Vec<Node> {
+            let g = genesis(sender);
+            let mut v = vec![];
+            for _ in 0..4 {
+                let mut n = Node::new(&g, None).await.unwrap();
+                n.executor.set_mldsa_signing_v2_for_test(v2);
+                v.push(n);
+            }
+            v
+        }
+
+        /// Every node receives the same proposal and votes; returns the block hash.
+        async fn commit_everywhere(nodes: &mut [Node], h: u64, txs: &[Transaction], prev: Option<&CommitCertificate>) -> BlockHash {
+            let root = nodes[0].state.current_root().map(str::to_string);
+            let tx_data = serde_json::to_vec(&serde_json::json!({
+                "version": 1, "txs": txs, "last_commit": prev, "prev_state_root": root,
+            })).unwrap();
+            let parent = BlockHash(format!("genesis_h{h}"));
+            let p = sign_proposal(BlockProposal {
+                height: h, round: 0, proposer: ValidatorId(VALS[(h % 4) as usize].into()),
+                block_hash: compute_block_hash(CHAIN, h, &parent, &tx_data),
+                parent_hash: parent, timestamp_ms: 0, tx_data, signature: vec![], pol_round: None,
+            });
+            for n in nodes.iter_mut() {
+                n.handle_event(gossip(GossipTopic::BlockProposal, serde_json::to_vec(&p).unwrap())).await.unwrap();
+                for t in [VoteType::Prevote, VoteType::Precommit] {
+                    for v in &VALS[..3] {
+                        let vote = signed_vote(CHAIN, t.clone(), h, 0, v, p.block_hash.clone());
+                        n.handle_event(gossip(GossipTopic::ConsensusVote, serde_json::to_vec(&vote).unwrap())).await.unwrap();
+                    }
+                }
+                assert_eq!(n.status.lock().unwrap().height, h, "every node must commit h{h}");
+            }
+            p.block_hash
+        }
+
+        fn roots(nodes: &[Node]) -> Vec<String> {
+            nodes.iter().map(|n| n.state.current_root().unwrap_or("").to_string()).collect()
+        }
+        fn assert_agree(nodes: &[Node], what: &str) {
+            let r = roots(nodes);
+            assert!(!r[0].is_empty(), "{what}: state root must exist");
+            assert!(r.iter().all(|x| *x == r[0]), "{what}: state roots diverged: {r:?}");
+        }
+        fn recv(n: &Node) -> u128 { n.state.get_account(RECV).map(|a| a.balance_of("uqcb")).unwrap_or(0) }
+        fn nonce_of(n: &Node, a: &str) -> u64 { n.state.get_account(a).unwrap().nonce }
+
+        /// Four nodes, one v2-signed transfer: identical roots, receiver credited once.
+        #[tokio::test]
+        async fn four_nodes_agree_on_a_v2_signed_transfer() {
+            let kp = user_key(); let s = user_addr(&kp);
+            let mut nodes = four_nodes(&s, true).await;
+            let mut t = transfer(&s, "v2-t0", 0, 1_000);
+            sign_v2(&kp, &mut t, true);
+            commit_everywhere(&mut nodes, 0, &[t], None).await;
+            assert_agree(&nodes, "after v2 transfer");
+            for n in &nodes {
+                assert_eq!(recv(n), 1_000, "receiver credited exactly once");
+                assert_eq!(nonce_of(n, &s), 1);
+                assert_eq!(n.state.get_account(&s).unwrap().public_key.as_deref(), Some(&kp.public_key[..]), "first use binds the key");
+            }
+        }
+
+        /// H0-4 at node level: replaying the same signature under a new id and nonce is rejected on all four nodes,
+        /// roots stay identical, the receiver is credited once; a fresh v2 signature for nonce 1 then succeeds.
+        #[tokio::test]
+        async fn four_nodes_agree_when_a_v2_signature_is_replayed_under_a_new_nonce() {
+            let kp = user_key(); let s = user_addr(&kp);
+            let mut nodes = four_nodes(&s, true).await;
+            let mut t0 = transfer(&s, "v2-t0", 0, 1_000);
+            sign_v2(&kp, &mut t0, true);
+            let c0 = commit_everywhere(&mut nodes, 0, &[t0.clone()], None).await;
+            assert_agree(&nodes, "after original");
+            let before = roots(&nodes)[0].clone();
+
+            let mut replay = t0.clone();
+            replay.id = "v2-replay".into();
+            replay.nonce = 1;
+            assert_eq!(replay.pq_signatures, t0.pq_signatures, "the replay reuses the exact signature");
+            let c1 = commit_everywhere(&mut nodes, 1, &[replay], Some(&evidence(0, &c0))).await;
+            assert_agree(&nodes, "after replay block");
+            for n in &nodes {
+                assert_eq!(recv(n), 1_000, "replay must not credit the receiver again");
+                assert_eq!(nonce_of(n, &s), 1, "a rejected replay consumes no nonce");
+            }
+            let _ = before;
+
+            let mut t1 = transfer(&s, "v2-t1", 1, 500);
+            sign_v2(&kp, &mut t1, false);
+            commit_everywhere(&mut nodes, 2, &[t1], Some(&evidence(1, &c1))).await;
+            assert_agree(&nodes, "after legitimate nonce 1");
+            for n in &nodes { assert_eq!(recv(n), 1_500); assert_eq!(nonce_of(n, &s), 2); }
+        }
+
+        /// Nonce-only replay: same id, same signature, only the nonce changed. Isolates the nonce coverage
+        /// (the id is signed too, so changing both would be caught by either field).
+        #[tokio::test]
+        async fn four_nodes_agree_when_only_the_nonce_of_a_signed_tx_is_changed() {
+            let kp = user_key(); let s = user_addr(&kp);
+            let mut nodes = four_nodes(&s, true).await;
+            let mut t0 = transfer(&s, "v2-t0", 0, 1_000);
+            sign_v2(&kp, &mut t0, true);
+            let c0 = commit_everywhere(&mut nodes, 0, &[t0.clone()], None).await;
+            let mut replay = t0.clone();
+            replay.nonce = 1;
+            commit_everywhere(&mut nodes, 1, &[replay], Some(&evidence(0, &c0))).await;
+            assert_agree(&nodes, "after nonce-only replay");
+            for n in &nodes { assert_eq!(recv(n), 1_000); assert_eq!(nonce_of(n, &s), 1); }
+        }
+
+        /// A legacy v1 signature (chain id + body only) is rejected by all four nodes under the switch.
+        #[tokio::test]
+        async fn four_nodes_reject_a_v1_signed_transfer_under_the_switch() {
+            let kp = user_key(); let s = user_addr(&kp);
+            let mut nodes = four_nodes(&s, true).await;
+            let mut t = transfer(&s, "v1-t0", 0, 1_000);
+            sign_v1(&kp, &mut t);
+            commit_everywhere(&mut nodes, 0, &[t], None).await;
+            assert_agree(&nodes, "after v1 tx");
+            for n in &nodes { assert_eq!(recv(n), 0); assert_eq!(nonce_of(n, &s), 0); }
+        }
+
+        /// Control: with the switch OFF the same v2 transaction is not accepted (the legacy verifier does not
+        /// know the v2 preimage), so the new tests above really depend on the switch.
+        #[tokio::test]
+        async fn control_switch_off_does_not_accept_a_v2_signature() {
+            let kp = user_key(); let s = user_addr(&kp);
+            let mut nodes = four_nodes(&s, false).await;
+            let mut t = transfer(&s, "v2-t0", 0, 1_000);
+            sign_v2(&kp, &mut t, true);
+            commit_everywhere(&mut nodes, 0, &[t], None).await;
+            assert_agree(&nodes, "switch off");
+            for n in &nodes { assert_eq!(recv(n), 0, "legacy path must not accept a v2 signature"); }
+        }
+    }
+
     #[test]
     fn is_proposer_for_matches_expected_rotation() {
         let vs = ValidatorSet {
