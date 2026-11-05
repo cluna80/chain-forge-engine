@@ -30,7 +30,7 @@ Four different things are tracked separately and must not be conflated:
 | #106 | `qcb-keygen` `mldsa-v2` / `check-v2` | #102 | `c55a37e` | yes | yes, 9 passed, commit shown `c55a37e` |
 | #108 | Public Alpha launch manifest gate and release bundle | #104 | `ac5fe3e` | yes | yes, launch crate 15 passed at `ac5fe3e`; node `public-alpha` run reported at the same head |
 | #109 | encrypted ML-DSA-65 key storage with verified Windows ACLs (closes #107) | #106 | `826fab4` | yes | yes: tests rerun at `826fab4` after an icacls UTF-16LE fix, plus a manual ACL check with a disposable key |
-| #110 | scheduler settlement without private keys (prepare / external sign / submit; old `/settle` = 410) | #105 | see PR | yes | **NO. Linux sandbox only; Windows pending** |
+| #110 | scheduler settlement without private keys (prepare / external sign / submit; old `/settle` = 410) | #105 | `2808a90` | yes | yes: lib 66, `claim_flow_e2e` 1, `claim_signer` 6 (`--features signing-v2`) and lib 53, `default_build` 2 (default) passed at `2808a90`, commit shown; first attempts hit a corrupt local build cache, fixed by `cargo clean` |
 
 Integration dependencies: #103, #105 and #106 build on #102; #109 builds on #106; #110 builds on #105; #108 builds on #104. #102 and #104 are independent of each other and both branch from `main`. A merge-readiness report for the chain is separate from this document.
 
@@ -38,7 +38,7 @@ Integration dependencies: #103, #105 and #106 build on #102; #109 builds on #106
 | Gate | Evidence now | Not yet satisfied |
 |---|---|---|
 | QAT-01 / K1 | `fips204` 0.5.0 passed measured NIST ACVP vectors on Linux; backend merged feature-gated (#97) | final security acceptance; independent cryptographic review; Windows K1 and RNG/hedged-signing review are not recorded as complete here |
-| QAT-02 / signing v2 | execution path (#98), ingress (#100, #101) merged; wallet, CLI, keygen, key storage and a key-free scheduler flow are implemented in draft PRs with Windows confirmation for #102–#106, #108, #109 | #110 Windows run; personhood, dis-core and web/Android signers **not started**; independent vectors and review; no merge of #102–#110 |
+| QAT-02 / signing v2 | execution path (#98), ingress (#100, #101) merged; wallet, CLI, keygen, key storage and a key-free scheduler flow are implemented in draft PRs with Windows confirmation for #102–#106, #108, #109 | personhood, dis-core and web/Android signers **not started**; independent vectors and review; no merge of #102–#110 |
 | QAT-03 / genesis v2 | `commitment_profile` (#104) and the launch gate (#108) tested on Windows | a real alpha genesis (chain id, environment, ML-DSA validator set, balances) does **not exist**; owner inputs outstanding |
 | QAT-04 / hardening | partial; see the original table | open: P2P bootstrap (below), state and recovery items |
 | QAT-05 … QAT-09 | unchanged: pending | PQ-HotStuff is not implemented; Tendermint remains the private devnet baseline |
@@ -47,7 +47,7 @@ Integration dependencies: #103, #105 and #106 build on #102; #109 builds on #106
 
 ### Findings recorded since the November 5 plan
 - **P2P bootstrap start-order race (QAT-04, open, not fixed).** Nodes dial `--bootstrap` once at startup with no retry. Measured in the Linux sandbox (not on Windows) on a four-node devnet: simultaneous start failed in 4 of 6 trials, staggered start succeeded in 6 of 6; the original stall was observed on the owner's Windows machine. This was first mis-attributed to MSYS path rewriting; that was wrong. MSYS argument rewriting is a separate, real Windows hazard, but it was not the cause. Needed: bounded retry with backoff and a deterministic repeated four-node startup test, as its own PR.
-- **Scheduler private-key transmission** is addressed in draft #110 (not merged, not Windows-confirmed). Remaining limits are listed in that PR: no TLS or authentication on the scheduler API, caller-supplied `node_url`, key held in memory by the signer process, heuristic key-material detection, and a breaking change for legacy chains and external callers of the old route.
+- **Scheduler private-key transmission** is addressed in draft #110 (not merged; Windows-confirmed at `2808a90`). Remaining limits are listed in that PR: no TLS or authentication on the scheduler API, caller-supplied `node_url`, key held in memory by the signer process, heuristic key-material detection, and a breaking change for legacy chains and external callers of the old route.
 - **Key storage:** #109 provides encrypted storage and verified ACLs for `qcb-keygen` keys. The legacy wallet container is a different format and is not migrated. No production validator keys have been generated.
 - **Consensus on the devnet** is Tendermint with ML-DSA-65 keys (`tests/devnet/genesis-4node-mldsa.json`); HotStuff/FBA remain devnet-only. This is not PQ-HotStuff and not the public-alpha network.
 
