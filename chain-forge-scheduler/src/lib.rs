@@ -67,7 +67,7 @@ pub use beacon::{BeaconService, BeaconSlot};
 pub use error::SchedulerError;
 pub use miner::{MinerInfo, MinerRegistry};
 pub use scheduler::ResearchScheduler;
-pub use settlement::{SettleRequest, SettlementError};
+pub use settlement::{PrepareRequest, SettlementError, SubmitRequest};
 pub use verification::{VerificationEngine, VerificationError, VerifyRequest, VerifyResponse};
 pub use verifier_registry::{
     VerifierRegistry, VerifierRecord, RegistryError,
@@ -78,4 +78,4 @@ pub use verifier_registry::{
 mod tests;
 
 #[cfg(all(test, feature = "signing-v2"))]
-mod settle_v2_tests;
+mod settle_signing_tests;
