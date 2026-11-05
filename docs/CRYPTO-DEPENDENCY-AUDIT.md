@@ -79,7 +79,7 @@ Columns: **Crit.** = security-critical for the alpha. **On alpha path** = reacha
 
 ## 2. What the audit shows
 
-1. **Transactions are closest to done, but not done:** the `pqc-native` policy exists and refuses Ed25519, yet it **accepts the Hybrid tag** (T3), implicit untagged ML-DSA (T4) and extra smuggled material (T5), and the ML-DSA digest has the replay defect (T1). These are fixed by the v2 specification's rules E1–E5 and the v2 digest.
+1. **Transactions are closest to done, but not done:** the `pqc-native` policy exists and refuses Ed25519, yet it **accepts the Hybrid tag** (T3), implicit untagged ML-DSA (T4) and extra smuggled material (T5), and the ML-DSA digest has the replay defect (T1). These are fixed by the v2 specification's rules E1–E5 and the v2 preimage and context.
 2. **Consensus is policy-ready but needs a profile gate:** an ML-DSA-only validator mode exists (`validator_scheme = "ml-dsa-65"`), but classical branches remain in the vote-verification path and genesis validation (V2, V3). V5 (derivable devnet simulation keys) must be shown unreachable on a real chain.
 3. **The network is not post-quantum and cannot be made so by the transaction work:** peer identity, the Noise handshake, gossip signing and RPC TLS are classical (N1–N4). On the alpha, transactions and consensus messages are ML-DSA-signed end to end, so forging them does not depend on the transport; but peer impersonation and transport confidentiality are classical. That is a **disclosed limitation**, not a closed gate.
 4. **Conformance is unproven:** K1 is the single point the whole signature story rests on.
