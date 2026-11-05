@@ -118,3 +118,45 @@ fn a_wrong_passphrase_or_a_missing_input_fails_without_output() {
     assert_eq!(o.status.code(), Some(2), "the expected chain id is mandatory: the signer never signs for a guessed chain");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Recompute the scheduler's preimage for a (tampered) transaction, so the preimage comparison cannot be what refuses it.
+fn with_fresh_preimage(mut p: Value, pk: &[u8]) -> Value {
+    let tx: Transaction = serde_json::from_value(p["unsigned_tx"].clone()).unwrap();
+    p["signing_request"]["preimage_hex"] = json!(hex(&signing_v2::tx_preimage(CHAIN, &tx, pk).unwrap()));
+    p
+}
+
+#[test]
+fn every_signer_check_refuses_on_its_own_even_when_the_preimage_is_consistent() {
+    let d = tmpdir("alone"); let (wf, kf, prepared) = setup(&d);
+    let pk = unhex(&kf.public_key);
+    let mut cases: Vec<(&str, Value)> = vec![];
+    let mut p = prepared.clone(); p["unsigned_tx"]["sender"] = json!("qcb1someoneelse"); cases.push(("tx sender is another address", with_fresh_preimage(p, &pk)));
+    let mut p = prepared.clone(); p["signing_request"]["signer"] = json!("qcb1someoneelse"); cases.push(("request names another signer", p));
+    let mut p = prepared.clone(); p["unsigned_tx"]["gas_limit"] = json!(400_000u64); cases.push(("gas below the claim limit", with_fresh_preimage(p, &pk)));
+    let mut p = prepared.clone(); p["signing_request"]["context"] = json!("qattice/tx/v1"); cases.push(("another signing context", p));
+    let mut p = prepared.clone(); p["unsigned_tx"]["body"]["ClaimResearchReward"]["amount_uqcb"] = json!(0u64); p["amount_uqcb"] = json!(0u64);
+    cases.push(("zero amount", with_fresh_preimage(p, &pk)));
+    let mut p = prepared.clone(); p["signing_request"]["pq_public_key_hex"] = json!(hex(&B::keygen_from_seed(&[3u8; 32]).public_key));
+    cases.push(("request names another public key", p));
+    for (label, p) in cases {
+        let o = sign(&d, &wf, &p, &[]);
+        assert!(!o.status.success(), "{label}: must refuse (stdout: {})", String::from_utf8_lossy(&o.stdout));
+        assert!(o.stdout.is_empty(), "{label}: nothing on stdout");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_passphrase_flag_is_rejected_by_name_with_a_usage_error() {
+    let d = tmpdir("flag"); let (wf, _kf, prepared) = setup(&d);
+    let pf = d.join("prepared.json");
+    std::fs::write(&pf, serde_json::to_vec(&prepared).unwrap()).unwrap();
+    for flag in ["--passphrase", "--password", "-p"] {
+        let o = run(&["--wallet", &wf, "--prepared", pf.to_str().unwrap(), "--expect-chain-id", CHAIN, flag, PASS], None);
+        assert_eq!(o.status.code(), Some(2), "{flag}");
+        assert!(text(&o).contains("never accepted on the command line"), "{flag}: {}", text(&o));
+        assert!(!text(&o).contains(PASS) && o.stdout.is_empty());
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

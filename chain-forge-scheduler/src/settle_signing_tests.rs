@@ -260,6 +260,34 @@ async fn requests_carrying_private_key_material_are_rejected_on_every_settlement
 }
 
 #[tokio::test]
+async fn every_forbidden_field_name_is_rejected_by_name_even_with_a_short_innocent_looking_value() {
+    let e = env().await; let kp = key();
+    for part in ["secret", "private", "seed", "mnemonic", "passphrase", "password", "privkey"] {
+        for url in [e.prepare_url(), e.submit_url()] {
+            let mut b = prepare_body(&e.task, &kp, 0);
+            b[format!("x_{part}_y")] = json!("0");
+            let (code, text) = post(&url, &b.to_string()).await;
+            assert_eq!(code, 400, "name part {part} to {url}: got {code} {text}");
+            assert_eq!(jv(&text)["error"], "private_key_material_rejected", "{part}: {text}");
+        }
+    }
+    assert_eq!(e.claims().await, 0);
+}
+
+#[tokio::test]
+async fn a_pending_claim_is_never_handed_out_for_a_different_recipient() {
+    let e = env().await; let kp = key();
+    let a = e.prepare(&kp, 0).await;
+    let mut b = prepare_body(&e.task, &kp, 0); b["recipient"] = json!("qcb1someoneelse");
+    let (code, text) = post(&e.prepare_url(), &b.to_string()).await;
+    if code == 200 {
+        assert_ne!(jv(&text)["claim_id"], a["claim_id"], "a different recipient must never receive the first recipient's claim: {text}");
+    } else {
+        assert!(matches!(code, 409 | 422), "{code} {text}");
+    }
+}
+
+#[tokio::test]
 async fn the_old_settle_endpoint_that_took_a_private_key_is_gone() {
     let e = env().await; let kp = key();
     let mut legacy = prepare_body(&e.task, &kp, 0);
