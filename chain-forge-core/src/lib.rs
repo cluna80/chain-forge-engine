@@ -285,6 +285,11 @@ pub struct GenesisConfig {
     pub modules:         Vec<String>,
     pub custom_modules:  Vec<String>,
     pub genesis_accounts: Vec<GenesisAccount>,
+    /// Commitment/signing profile (owner decision 2026-11-05). Absent = legacy, and the genesis hash is unchanged (the field
+    /// is not serialised when absent). `"qattice-v2"` = signing v2 (docs/mldsa-tx-signing-v2/SPEC.md). Any other value is
+    /// refused at startup. Resolve with [`GenesisConfig::commitment_profile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment_profile: Option<String>,
     /// Pilot-phase sybil coordinator: the address authorized to call
     /// ConfirmSybil and ReverseSybil on-chain. None means coordinator
     /// authority is not set — attestation guard Phases C/D will reject
@@ -757,7 +762,21 @@ pub struct GenesisAccount {
     pub public_key: Option<String>,
 }
 
+/// The commitment/signing profile a chain runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentProfile {
+    /// Pre-v2 behaviour, byte for byte.
+    Legacy,
+    /// Signing v2: full canonical preimage, FIPS 204 ML-DSA-65, strict envelope.
+    QatticeV2,
+}
+
 impl GenesisConfig {
+    /// SCAFFOLD (tests first): always Legacy.
+    pub fn commitment_profile(&self) -> Result<CommitmentProfile, String> {
+        Ok(CommitmentProfile::Legacy)
+    }
+
     /// Parse from a JSON string (as produced by the Chain Forge wizard).
     pub fn from_json(json: &str) -> CoreResult<Self> {
         serde_json::from_str(json)
