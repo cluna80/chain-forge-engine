@@ -206,6 +206,7 @@ async fn main() {
         modules:                node.enabled_modules(),
         settlement_operators:   node.settlement_operators(),
         max_tx_bytes:           node.max_tx_bytes(),
+        tx_queue_capacity:      node.mempool_capacity(),
         block_gas_limit:        node.block_gas_limit(),
         attestation_coordinator: node.attestation_coordinator(),
         governance_authorities: node.governance_authorities(),

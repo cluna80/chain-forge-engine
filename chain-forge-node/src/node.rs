@@ -1568,7 +1568,7 @@ impl Node {
         let initial_nonce_cache = {
             let mut m = std::collections::HashMap::new();
             for acct in state.all_accounts() {
-                let seed = if acct.nonce == 0 { u64::MAX } else { acct.nonce };
+                let seed = Self::nonce_cache_seed(acct.nonce);
                 m.insert(acct.address.clone(), seed);
             }
             m
@@ -1690,6 +1690,12 @@ impl Node {
 
     pub fn max_tx_bytes(&self) -> usize {
         self.genesis.limits.max_tx_bytes as usize
+    }
+
+    /// Genesis `limits.mempool_size`: the node's mempool capacity, also used as the
+    /// capacity of the API's pre-admission queue.
+    pub fn mempool_capacity(&self) -> usize {
+        self.genesis.limits.mempool_size as usize
     }
 
     pub fn block_gas_limit(&self) -> u64 {
@@ -2533,6 +2539,9 @@ impl Node {
             let snap: chain_forge_state::StateSnapshot =
                 serde_json::from_slice(required!("state.json"))?;
             self.state.restore_snapshot(snap);
+            // RPC-TX-1: the API nonce cache was seeded from the genesis state at start-up;
+            // rebuild it from the restored state so replays of committed nonces are rejected.
+            self.refresh_nonce_cache();
 
             // Gap 4: the restored state must reproduce the root the manifest
             // recorded. The file hashes prove the bytes are what was written; only
@@ -2823,6 +2832,48 @@ impl Node {
         }
     }
 
+    /// The nonce-cache value for an account whose NEXT expected nonce is `next_expected`
+    /// (`AccountState::nonce`, which the executor requires a transaction to equal exactly).
+    /// The cache stores the LAST CONSUMED nonce, so that is `next_expected - 1`; an account
+    /// that has consumed none holds the `NO_PRIOR_TX` sentinel (`u64::MAX`).
+    fn nonce_cache_seed(next_expected: u64) -> u64 {
+        if next_expected == 0 { u64::MAX } else { next_expected - 1 }
+    }
+
+    /// RPC-TX-1: rebuild the API's per-sender nonce cache from authoritative state.
+    /// Called after every block executes (both execution paths) and after a restore.
+    /// The cache only drives the API's early replay/gap check; execution still requires
+    /// `tx.nonce == account.nonce` on every node.
+    fn refresh_nonce_cache(&self) {
+        let mut cache = self.nonce_cache.lock().unwrap();
+        for acct in self.state.all_accounts() {
+            cache.insert(acct.address.clone(), Self::nonce_cache_seed(acct.nonce));
+        }
+    }
+
+    /// Move every transaction the HTTP API queued since the last tick through
+    /// `submit_tx` (the node's admission), and gossip the ones it admits.
+    /// Extracted unchanged from the heartbeat arm of `run` so it can be tested.
+    pub(crate) async fn drain_api_tx_queue(&mut self) {
+        let mut queue = self.tx_queue.lock().unwrap();
+        let submitted: Vec<Transaction> = queue.drain(..).collect();
+        drop(queue);
+        for tx in submitted {
+            // Gossip it so ANY proposer can include it, not
+            // just this node on its own proposer turns. Only
+            // API-submitted txs are published; txs received
+            // over gossip are not re-published (gossipsub
+            // already propagates them through the mesh).
+            let payload = serde_json::to_vec(&tx).unwrap_or_default();
+            if self.submit_tx(tx) {
+                let _ = self.network.publish(OutboundMessage {
+                    topic:   GossipTopic::Transaction,
+                    payload,
+                }).await;
+            }
+        }
+    }
+
     /// Drop transactions that a committed block contained. Called from
     /// commit_block, which every multi-node commit path goes through
     /// (own proposal, peer's proposal, and state-sync replay).
@@ -2935,25 +2986,7 @@ impl Node {
                     // so this queue (SharedTxQueue) is the only bridge --
                     // same reasoning as status/explorer/peers being shared
                     // the other direction (node -> API).
-                    {
-                        let mut queue = self.tx_queue.lock().unwrap();
-                        let submitted: Vec<Transaction> = queue.drain(..).collect();
-                        drop(queue);
-                        for tx in submitted {
-                            // Gossip it so ANY proposer can include it, not
-                            // just this node on its own proposer turns. Only
-                            // API-submitted txs are published; txs received
-                            // over gossip are not re-published (gossipsub
-                            // already propagates them through the mesh).
-                            let payload = serde_json::to_vec(&tx).unwrap_or_default();
-                            if self.submit_tx(tx) {
-                                let _ = self.network.publish(OutboundMessage {
-                                    topic:   GossipTopic::Transaction,
-                                    payload,
-                                }).await;
-                            }
-                        }
-                    }
+                    self.drain_api_tx_queue().await;
 
                     // A genesis with bootstrap_nodes configured signals real
                     // peers are expected -- even before the first one has
@@ -4315,12 +4348,6 @@ impl Node {
         let participation = payload.last_commit.clone();
         let txs: Vec<Transaction> = payload.txs;
         self.remove_committed_from_mempool(&txs);
-        // Keep a lightweight (tx_id, sender, nonce) index before txs is consumed by
-        // execute_block_with_identity so the post-execution nonce-cache update
-        // can correlate successful TransactionResults back to their senders and nonces.
-        let txs_for_cache: Vec<(String, String, u64)> = txs.iter()
-            .map(|t| (t.id.clone(), t.sender.clone(), t.nonce))
-            .collect();
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4546,35 +4573,11 @@ impl Node {
             )
         };
 
-        // F1: update per-sender nonce cache AFTER execution, from the tx.nonce of each
-        // INCLUDED transaction. The API check rejects tx.nonce <= cache, so cache
-        // must store the last consumed tx.nonce (not state.nonce, which is
-        // post-increment and would block the immediately following valid submission).
-        // H0-5: an included-but-failed tx (fee_charged > 0) consumes its nonce on
-        // chain just like a successful one, so it advances the cache too; a
-        // rejected tx (fee_charged == 0) consumed nothing and leaves it alone.
-        {
-            let mut cache = self.nonce_cache.lock().unwrap();
-            for r in exec_result.tx_results.iter().filter(|r| r.fee_charged > 0) {
-                // TransactionResult has no sender field; look up (sender, nonce) from
-                // the index captured before txs was consumed by execute_block_with_identity.
-                if let Some((_, sender, tx_nonce)) = txs_for_cache.iter().find(|(id, _, _)| id == &r.tx_id) {
-                    let entry = cache.entry(sender.clone()).or_insert(0);
-                    if tx_nonce >= entry {
-                        *entry = *tx_nonce;
-                    }
-                }
-            }
-            // F5 bootstrap: seed any account that now exists in state but has never
-            // committed a tx (e.g. Transfer recipients). Without this, newly funded
-            // addresses are blocked from submitting their first tx (RegisterIdentity,
-            // BondValidator, etc.) because the F5 check only allows known senders.
-            // u64::MAX is the NO_PRIOR_TX sentinel: the nonce check allows any nonce
-            // in 0..MAX_NONCE_GAP as the first tx.
-            for acct in self.state.all_accounts() {
-                cache.entry(acct.address.clone()).or_insert(u64::MAX);
-            }
-        }
+        // F1 / RPC-TX-1: refresh the API's per-sender nonce cache from the state just
+        // produced. The state is the authority (an included-but-failed tx consumes its
+        // nonce like a successful one, a rejected one consumes nothing), and unlike the
+        // previous incremental update this cannot be stuck on the NO_PRIOR_TX sentinel.
+        self.refresh_nonce_cache();
 
         // Diagnostic: log each failed tx so tests can see the root cause.
         for r in exec_result.tx_results.iter().filter(|r| !r.success) {
@@ -6317,6 +6320,9 @@ impl Node {
                 &mut self.agents, now_ms, None,
             )
         };
+
+        // RPC-TX-1: this execution path also advances account nonces.
+        self.refresh_nonce_cache();
 
         // Diagnostic: log each failed tx so tests can see the root cause.
         for r in exec_result.tx_results.iter().filter(|r| !r.success) {
@@ -14807,6 +14813,150 @@ mod tests {
         assert!(node.submit_tx(Transaction::transfer("o8-ok", "qcb1alice", "qcb1bob", "uqcb", 1, 0)), "a normal transfer is still admitted");
     }
 
+    // ── RPC-TX-1: public transaction ingress hardening ───────────────────────────
+    // Tests written before the fix; see the PR for the failing-before output.
+
+    /// Start the HTTP API on a free loopback port against this node's shared handles.
+    async fn rpc_start(node: &Node) -> u16 {
+        use std::sync::{Arc, Mutex};
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let precheck = crate::api::TxPrecheck {
+            chain_id: node.chain_id().to_string(), require_signatures: node.require_signatures(),
+            modules: node.enabled_modules(), settlement_operators: node.settlement_operators(),
+            max_tx_bytes: node.max_tx_bytes(), tx_queue_capacity: node.mempool_capacity(),
+            block_gas_limit: node.block_gas_limit(), attestation_coordinator: node.attestation_coordinator(),
+            governance_authorities: node.governance_authorities(), account_signature_policy: node.account_signature_policy(),
+        };
+        tokio::spawn(crate::api::serve(
+            port, node.status(), node.explorer(), node.qrc_metrics(), node.peers(), node.tx_queue(), precheck,
+            node.pocd_registry(), Arc::new(Mutex::new(crate::auth::ChallengeStore::new())), "rpc-test".into(),
+            node.peer_capacity_table(), node.nonce_cache(), Arc::new(Mutex::new(crate::api::DelegationUsageStore::new(None))),
+        ));
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() { return port; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("API did not start");
+    }
+
+    async fn rpc(port: u16, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        let code: u16 = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+        (code, serde_json::from_str(body).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn rpc_tx(id: &str, nonce: u64) -> String {
+        serde_json::to_string(&Transaction::transfer(id, "qcb1alice", "qcb1bob", "uqcb", 1, nonce)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rpc_tx1_queue_is_bounded_and_full_returns_503_queue_full() {
+        let node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let cap = node.mempool_capacity();
+        assert!(cap > 0 && cap <= 1000, "test genesis must have a small finite capacity, got {cap}");
+        let port = rpc_start(&node).await;
+        for i in 0..cap {
+            let (code, v) = rpc(port, "POST", "/api/tx", &rpc_tx(&format!("q{i}"), (i % 100) as u64)).await;
+            assert_eq!(code, 200, "tx {i} must be accepted below capacity: {v}");
+        }
+        let (code, v) = rpc(port, "POST", "/api/tx", &rpc_tx("one-too-many", 5)).await;
+        assert_eq!(code, 503, "a full queue must answer 503: {v}");
+        assert_eq!(v["status"], "queue_full", "{v}");
+        assert_eq!(v["state"], "queue_full", "{v}");
+        assert_eq!(node.tx_queue().lock().unwrap().len(), cap, "the queue never exceeds its capacity");
+    }
+
+    #[tokio::test]
+    async fn rpc_tx1_duplicate_ids_do_not_consume_capacity_and_conflicting_reuse_is_rejected() {
+        let node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let port = rpc_start(&node).await;
+        let (c1, v1) = rpc(port, "POST", "/api/tx", &rpc_tx("dup", 0)).await;
+        assert_eq!(c1, 200, "{v1}");
+        let (c2, v2) = rpc(port, "POST", "/api/tx", &rpc_tx("dup", 0)).await;
+        assert_eq!(c2, 200, "an identical resubmission is idempotent: {v2}");
+        assert_eq!(v2["duplicate"], true, "{v2}");
+        assert_eq!(node.tx_queue().lock().unwrap().len(), 1, "an identical resubmission must not take a second slot");
+        let (c3, v3) = rpc(port, "POST", "/api/tx", &rpc_tx_amount("dup", 0, 2)).await;
+        assert_eq!(c3, 400, "same id with different content is a conflict: {v3}");
+        assert_eq!(v3["state"], "rejected", "{v3}");
+        assert_eq!(node.tx_queue().lock().unwrap().len(), 1);
+    }
+
+    fn rpc_tx_amount(id: &str, nonce: u64, amount: u128) -> String {
+        serde_json::to_string(&Transaction::transfer(id, "qcb1alice", "qcb1bob", "uqcb", amount, nonce)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rpc_tx1_responses_say_exactly_what_was_validated() {
+        let node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let port = rpc_start(&node).await;
+        let (code, v) = rpc(port, "POST", "/api/tx", &rpc_tx("ok1", 0)).await;
+        assert_eq!(code, 200);
+        assert_eq!(v["status"], "queued", "legacy status kept for existing clients: {v}");
+        assert_eq!(v["state"], "queued_for_validation", "{v}");
+        // malformed JSON
+        let (code, v) = rpc(port, "POST", "/api/tx", "{not json").await;
+        assert_eq!(code, 400);
+        assert_eq!(v["state"], "rejected", "{v}");
+        // over-bound address is rejected at ingress and never queued (O8 at the API)
+        let long = format!("qcb1{}", "a".repeat(300));
+        let body = serde_json::to_string(&Transaction::transfer("long1", "qcb1alice", &long, "uqcb", 1, 1)).unwrap();
+        let (code, v) = rpc(port, "POST", "/api/tx", &body).await;
+        assert_eq!(code, 400, "{v}");
+        assert_eq!(v["status"], "rejected", "{v}");
+        assert_eq!(v["state"], "rejected", "{v}");
+        assert_eq!(node.tx_queue().lock().unwrap().len(), 1, "only the valid tx was queued");
+    }
+
+    #[tokio::test]
+    async fn rpc_tx1_concurrent_submission_and_drain_loses_and_duplicates_nothing() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let port = rpc_start(&node).await;
+        let mut tasks = Vec::new();
+        for i in 0..40u64 {
+            tasks.push(tokio::spawn(async move { rpc(port, "POST", "/api/tx", &rpc_tx(&format!("c{i}"), i)).await }));
+        }
+        for _ in 0..10 { node.drain_api_tx_queue().await; tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+        let mut accepted = std::collections::BTreeSet::new();
+        for (i, t) in tasks.into_iter().enumerate() {
+            let (code, v) = t.await.unwrap();
+            assert_eq!(code, 200, "tx c{i}: {v}");
+            accepted.insert(format!("c{i}"));
+        }
+        node.drain_api_tx_queue().await;
+        let mut in_pool: Vec<String> = node.mempool.iter().map(|t| t.id.clone()).collect();
+        in_pool.sort();
+        let mut want: Vec<String> = accepted.into_iter().collect();
+        want.sort();
+        assert_eq!(in_pool, want, "every accepted transaction is in the mempool exactly once");
+        assert_eq!(node.tx_queue().lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_tx1_more_than_101_sequential_transactions_from_one_account_stay_possible() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let cache = node.nonce_cache();
+        let mut parent = chain_forge_consensus::BlockHash("0000000000000000".into());
+        for n in 0..=105u64 {
+            let last = *cache.lock().unwrap().get("qcb1alice").expect("genesis account is in the cache");
+            assert!(!crate::api::f1_nonce_rejected(last, n), "the API must still accept nonce {n} (cache last = {last})");
+            assert!(node.submit_tx(Transaction::transfer(&format!("seq{n}"), "qcb1alice", "qcb1bob", "uqcb", 1, n)));
+            let cert = node.propose_block(parent).await.unwrap();
+            parent = cert.block_hash;
+        }
+        let last = *cache.lock().unwrap().get("qcb1alice").unwrap();
+        assert_eq!(last, 105, "the cache holds the last consumed nonce");
+        assert!(crate::api::f1_nonce_rejected(last, 105), "replaying the last nonce is rejected at ingress");
+        assert!(!crate::api::f1_nonce_rejected(last, 106));
+    }
+
     #[tokio::test]
     async fn sweep_does_not_restore_validator_with_downgraded_identity() {
         // Invariant C (two-layer enforcement):
@@ -16390,5 +16540,30 @@ mod p02a_gaps {
         let ok = n.agents.get_by_address("qcb1agent1").is_ok();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!r.is_restored() || ok, "restore must either refuse or rebuild the index so get_by_address works");
+    }
+
+    // ── RPC-TX-1: nonce cache must be rebuilt from restored state ────────────────
+    #[tokio::test]
+    async fn rpc_tx1_nonce_cache_is_rebuilt_from_state_after_restart() {
+        let dir = tmp("rpc-tx1-restart");
+        {
+            let mut n = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            n.set_data_dir(dir.to_path_buf()).unwrap();
+            let mut parent = chain_forge_consensus::BlockHash("0000000000000000".into());
+            for k in 0..3u64 {
+                assert!(n.submit_tx(Transaction::transfer(&format!("r{k}"), "qcb1alice", "qcb1bob", "uqcb", 1, k)));
+                parent = n.propose_block(parent).await.unwrap().block_hash;
+            }
+            n.persist_state().unwrap();
+        }
+        let (n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "{r:?}");
+        let alice_nonce = n.state.get_account("qcb1alice").unwrap().nonce;
+        let cached = *n.nonce_cache().lock().unwrap().get("qcb1alice").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(alice_nonce, 3, "precondition: three committed transactions");
+        assert_eq!(cached, 2, "the cache holds the last consumed nonce (state nonce - 1), not the genesis sentinel");
+        assert!(crate::api::f1_nonce_rejected(cached, 2), "replay of an already-committed nonce is rejected at ingress after restart");
+        assert!(!crate::api::f1_nonce_rejected(cached, 3), "the next valid nonce is accepted");
     }
 }
