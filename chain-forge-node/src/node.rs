@@ -10333,7 +10333,7 @@ mod tests {
         }
 
         /// Legacy (v1) ML-DSA signature: covers only chain id + body (the H0-4 defect), not the nonce.
-        fn sign_v1(kp: &KeyPair, tx: &mut Transaction) {
+        pub(super) fn sign_v1(kp: &KeyPair, tx: &mut Transaction) {
             tx.sig_scheme = Some(SchemeId::MlDsa);
             tx.pq_public_key = kp.public_key.clone();
             let body = serde_json::to_vec(&tx.body).unwrap();
@@ -10624,6 +10624,87 @@ mod tests {
             let mut ok = f::transfer(&s, "ok-bound", 0, 10);
             f::sign_v2(&kp, &mut ok, false); // bound key: the transaction need not carry it
             assert!(node.submit_tx(ok), "a transaction that omits the key is fine once it is bound");
+        }
+
+        // -- Signature verification at ingress (well-formed envelope, wrong signature) ---------------------------------
+
+        /// Well-formed envelopes whose signature does not verify: (label, tx).
+        fn forged(kp: &KeyPair, s: &str) -> Vec<(&'static str, Transaction)> {
+            let mut v = vec![];
+            let mut t = good(kp, s, "f1", 0);
+            let mut sig = t.pq_signatures[0].clone().into_bytes();
+            let i = "mldsa65:".len() + 100;
+            sig[i] = if sig[i] == b'0' { b'1' } else { b'0' };
+            t.pq_signatures[0] = String::from_utf8(sig).unwrap();
+            v.push(("one flipped signature nibble", t));
+            let mut t = good(kp, s, "f2", 0);
+            if let chain_forge_execution::TxBody::Transfer { amount, .. } = &mut t.body { *amount += 1; }
+            v.push(("body altered after signing", t));
+            let mut t = good(kp, s, "f3", 0); t.nonce = 1;
+            v.push(("nonce altered after signing (H0-4)", t));
+            let mut t = good(kp, s, "f4", 0); t.gas_limit += 1;
+            v.push(("gas limit altered after signing", t));
+            let mut t = f::transfer(s, "f5", 0, 10);
+            let v1_kp = kp.clone();
+            f::sign_v1(&v1_kp, &mut t);
+            v.push(("legacy v1 signature", t));
+            v
+        }
+
+        #[tokio::test]
+        async fn api_rejects_a_forged_signature_and_queues_nothing() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let node = v2_node(&s, true).await;
+            let port = rpc_start(&node).await;
+            for (label, t) in forged(&kp, &s) {
+                let (code, v) = rpc(port, "POST", "/api/tx", &serde_json::to_string(&t).unwrap()).await;
+                assert_eq!(code, 400, "{label}: a signature that does not verify must be refused at ingress: {v}");
+                assert!(v["message"].as_str().unwrap_or("").contains("verification failed"), "{label}: {v}");
+            }
+            assert_eq!(node.tx_queue().lock().unwrap().len(), 0);
+        }
+
+        #[tokio::test]
+        async fn submit_tx_refuses_a_forged_signature() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut node = v2_node(&s, true).await;
+            for (label, t) in forged(&kp, &s) {
+                assert!(!node.submit_tx(t), "{label}: submit_tx (API drain and gossip) must refuse it");
+            }
+            assert!(node.mempool.is_empty());
+        }
+
+        /// First use by a key that does not own the sender address: the signature verifies under the carried key, but the
+        /// sender is not derived from it. The API cannot know the sender is unbound, so `submit_tx` settles this.
+        #[tokio::test]
+        async fn submit_tx_refuses_a_first_use_key_that_does_not_own_the_sender() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let other = chain_forge_crypto::fips204_backend::MlDsa65Fips204::keygen_from_seed(&[9u8; 32]);
+            let mut node = v2_node(&s, true).await;
+            let mut t = f::transfer(&s, "thief", 0, 10);
+            f::sign_v2(&other, &mut t, true);
+            assert!(!node.submit_tx(t), "an address can only be claimed by the holder of its key");
+        }
+
+        /// Bound sender, signature by another key, key not carried: must not verify against the bound key.
+        #[tokio::test]
+        async fn submit_tx_refuses_a_signature_by_a_key_other_than_the_bound_key() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let other = chain_forge_crypto::fips204_backend::MlDsa65Fips204::keygen_from_seed(&[9u8; 32]);
+            let mut node = v2_node(&s, true).await;
+            node.state.get_account_mut(&s).unwrap().public_key = Some(kp.public_key.clone());
+            let mut t = f::transfer(&s, "wrongsig", 0, 10);
+            f::sign_v2(&other, &mut t, false); // preimage names `other`'s key; verification uses the bound key
+            assert!(!node.submit_tx(t));
+        }
+
+        /// Control: switch off, a forged signature passes today's `submit_tx` (it checks structure and policy only).
+        #[tokio::test]
+        async fn control_switch_off_submit_tx_does_not_verify_the_signature() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut node = v2_node(&s, false).await;
+            let t = forged(&kp, &s).into_iter().find(|x| x.0 == "body altered after signing").unwrap().1;
+            assert!(node.submit_tx(t), "without the switch nothing changes");
         }
 
         /// Control: switch off, `submit_tx` keeps today's behaviour for the same malformed envelopes.
