@@ -28,5 +28,11 @@ serde_json        = { workspace = true }
 thiserror         = { workspace = true }
 tracing           = { workspace = true }
 
+[features]
+# TEST-ONLY signing v2 (FIPS 204 pure ML-DSA-65 over the full canonical preimage, docs/mldsa-tx-signing-v2/SPEC.md).
+# Off by default. Even when compiled in, it only runs when `ExecutionConfig::mldsa_signing_v2` is set, which no genesis
+# path does. The `commitment_profile` genesis field that will activate it is a separate, later change.
+signing-v2 = ["chain-forge-crypto/fips204-backend"]
+
 [dev-dependencies]
 tokio = { workspace = true }
