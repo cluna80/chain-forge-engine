@@ -2836,6 +2836,12 @@ impl Node {
                 debug!(tx_id = %tx.id, code, "transaction refused by the signing-v2 envelope rules");
                 return false;
             }
+            // The same authorization execution applies (bound key or derived address, then the signature), so a forged
+            // transaction never occupies the mempool or a block.
+            if let Err(e) = self.executor.authorize_v2(&tx, &self.state) {
+                debug!(tx_id = %tx.id, error = %e, "transaction refused by signing-v2 authorization");
+                return false;
+            }
         }
         if let Err(e) = chain_forge_execution::check_admission_bounds(&tx) {
             debug!(tx_id = %tx.id, error = %e, "transaction refused by the O8 admission bounds");

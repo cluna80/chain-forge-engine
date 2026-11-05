@@ -100,6 +100,21 @@ pub fn verify_with_key(chain_id: &str, tx: &Transaction, preimage_key: &[u8], ve
     }
 }
 
+/// Stateless signature check for ingress that has no account state (the HTTP API): verify the signature against the key the
+/// transaction carries. A well-formed envelope is assumed (`check_envelope`). It does not apply the bound-key or
+/// derived-address rules; those need the sender's account and are applied by [`authorize`] at the mempool and at execution.
+/// Returns Ok for a transaction that carries no key (it relies on a bound key the caller cannot see).
+pub fn verify_carried_key(chain_id: &str, tx: &Transaction) -> Result<(), String> {
+    if tx.pq_public_key.is_empty() {
+        return Ok(());
+    }
+    let preimage = tx_preimage(chain_id, tx, &tx.pq_public_key)?;
+    let sig_hex = tx.pq_signatures.first().and_then(|s| s.strip_prefix(SIG_TAG)).ok_or_else(|| "E4_BAD_SIGNATURE_TAG".to_string())?;
+    let sig = unhex(sig_hex).ok_or_else(|| "E4_SIGNATURE_NOT_HEX".to_string())?;
+    MlDsa65Fips204::verify(&tx.pq_public_key, &preimage, &sig, TX_CONTEXT)
+        .map_err(|e| format!("ML-DSA signature verification failed (signing v2): {e}"))
+}
+
 /// Authorization of one transaction under signing v2. Rejections happen before any nonce check or fee debit, exactly like
 /// the legacy authorization step, so a failed authorization changes no state.
 pub(crate) fn authorize(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
