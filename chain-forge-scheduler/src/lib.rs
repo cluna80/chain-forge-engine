@@ -76,3 +76,6 @@ pub use verifier_registry::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "signing-v2"))]
+mod settle_v2_tests;

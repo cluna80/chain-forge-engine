@@ -92,6 +92,12 @@ pub struct SettleRequest {
     /// chain before calling.  Used for per-objective budget enforcement.
     pub disbursed_uqcb: u64,
 
+    /// Signing profile for the claim transaction. Absent = legacy (unchanged). `"qattice-v2"` = signing v2 (requires the
+    /// `signing-v2` build feature); any other value is refused before anything is stored or signed. Must match the node's
+    /// genesis `commitment_profile`.
+    #[serde(default)]
+    pub signing_profile: Option<String>,
+
     /// QcbResearchRewardPolicy overrides.  When omitted, devnet defaults apply.
     #[serde(default)]
     pub policy: Option<PolicyOverride>,
