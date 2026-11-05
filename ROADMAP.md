@@ -1,5 +1,13 @@
 # Qattice — Public Testnet Alpha: ML-DSA-65 + PQ-HotStuff Launch Plan
 
+## Owner approval — signing v2 full canonical preimage (2026-11-05)
+
+**APPROVED AND LOCKED:** For the fresh `qattice-v2` chain, use **FIPS 204 pure ML-DSA-65 external signing** with explicit, versioned, purpose-specific Qattice context strings. Sign the **complete canonical, unambiguous, length-delimited transaction preimage** (including chain ID, transaction ID, sender, nonce, gas limit, body and PQ public key), **not a separately SHA-256-hashed digest**. This explicitly **supersedes** the earlier approved SHA-256 transaction-prehash-as-message decision wherever it appears in the new public-testnet plan or draft PR #94. Existing legacy chains and their signatures are unchanged.
+
+**Implementation acceptance:** specify exact canonical serialization, context bytes and length limits; produce fresh golden vectors and independent FIPS 204 cross-implementation verification; test replay, mutation, wrong context, wrong chain, malformed lengths, account-key binding and deterministic serialization across Rust, wallet and other signers. Never mix pure ML-DSA with HashML-DSA or the raw internal signing interface. Keep transaction, validator consensus and DIS contexts distinct. `fips204` 0.5.0 is the **preferred candidate**, not yet approved as a production-ready backend; K1 Windows parity, secure RNG/hedged signing, integration tests and security review remain open. No production code, merge or public deployment is authorized by this roadmap update.
+
+---
+
 ## K1 backend evaluation update — 2026-11-05 (new evidence; decision gate pending)
 
 **Source:** [K1 draft PR #95](https://github.com/cluna80/Qattice/pull/95), `docs/k1-backend-evaluation/README.md` and `tools/k1-backend-eval/`. This is an **append-only update**; no earlier requirements or evidence have been removed.
