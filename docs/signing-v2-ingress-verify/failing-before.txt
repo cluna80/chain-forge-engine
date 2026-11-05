@@ -1,0 +1,23 @@
+test node::tests::signing_v2_ingress::api_accepts_a_well_formed_v2_transaction ... ok
+test node::tests::signing_v2_ingress::api_rejects_each_envelope_violation_with_its_code_and_queues_nothing ... ok
+test node::tests::signing_v2_ingress::a_keyless_first_use_passes_the_api_but_is_refused_at_the_mempool ... ok
+test node::tests::signing_v2_ingress::control_switch_off_legacy_ingress_admits_two_signatures ... ok
+test node::tests::signing_v2_ingress::api_rejects_a_forged_signature_and_queues_nothing ... FAILED
+test node::tests::signing_v2_ingress::control_switch_off_submit_tx_does_not_verify_the_signature ... ok
+test node::tests::signing_v2_ingress::submit_tx_refuses_a_first_use_key_that_does_not_own_the_sender ... FAILED
+test node::tests::signing_v2_ingress::submit_tx_refuses_a_signature_by_a_key_other_than_the_bound_key ... FAILED
+test node::tests::signing_v2_ingress::submit_tx_refuses_a_forged_signature ... FAILED
+test node::tests::signing_v2_ingress::submit_tx_refuses_a_key_that_differs_from_the_bound_key ... ok
+test node::tests::signing_v2_ingress::control_switch_off_submit_tx_is_unchanged ... ok
+test node::tests::signing_v2_ingress::submit_tx_refuses_each_envelope_violation_and_admits_a_good_one ... ok
+
+thread 'node::tests::signing_v2_ingress::api_rejects_a_forged_signature_and_queues_nothing' (360) panicked at chain-forge-node/src/node.rs:10661:17:
+assertion `left == right` failed: one flipped signature nibble: a signature that does not verify must be refused at ingress: {"state":"queued_for_validation","status":"queued","tx_id":"f1"}
+thread 'node::tests::signing_v2_ingress::submit_tx_refuses_a_first_use_key_that_does_not_own_the_sender' (365) panicked at chain-forge-node/src/node.rs:10686:13:
+an address can only be claimed by the holder of its key
+thread 'node::tests::signing_v2_ingress::submit_tx_refuses_a_signature_by_a_key_other_than_the_bound_key' (368) panicked at chain-forge-node/src/node.rs:10698:13:
+assertion failed: !node.submit_tx(t)
+thread 'node::tests::signing_v2_ingress::submit_tx_refuses_a_forged_signature' (366) panicked at chain-forge-node/src/node.rs:10672:17:
+one flipped signature nibble: submit_tx (API drain and gossip) must refuse it
+test result: FAILED. 8 passed; 4 failed; 0 ignored; 0 measured; 416 filtered out; finished in 0.61s
+

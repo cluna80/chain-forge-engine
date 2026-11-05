@@ -3409,6 +3409,13 @@ impl TxModule for DisModule {
 }
 
 impl Executor {
+    /// TEST-ONLY (feature `signing-v2`): the exact signing-v2 authorization execution applies (envelope, bound key or
+    /// derived address, signature), for mempool admission. Changes no state.
+    #[cfg(feature = "signing-v2")]
+    pub fn authorize_v2(&self, tx: &Transaction, state: &StateStore) -> Result<(), String> {
+        signing_v2::authorize(&self.config, tx, state)
+    }
+
     /// TEST-ONLY (feature `signing-v2`): turn the signing-v2 authorization path on or off for this executor.
     #[cfg(feature = "signing-v2")]
     pub fn set_mldsa_signing_v2_for_test(&mut self, on: bool) { self.config.mldsa_signing_v2 = on; }

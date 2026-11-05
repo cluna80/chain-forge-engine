@@ -309,6 +309,22 @@ pub async fn serve(
                                 });
                                 http_400_json(&resp.to_string())
                             }
+                            // TEST-ONLY signing v2: a carried key lets the API verify the signature statelessly. Bound-key and
+                            // derived-address rules need account state and are applied by `Node::submit_tx`.
+                            #[cfg(feature = "signing-v2")]
+                            Ok(tx) if precheck.mldsa_signing_v2
+                                && chain_forge_execution::signing_v2::verify_carried_key(&precheck.chain_id, &tx).is_err() => {
+                                let reason = chain_forge_execution::signing_v2::verify_carried_key(&precheck.chain_id, &tx)
+                                    .unwrap_err();
+                                tracing::info!(tx_id = %tx.id, %reason, "transaction rejected at ingress (signing v2 signature)");
+                                let resp = serde_json::json!({
+                                    "status": "rejected",
+                                    "state": "rejected",
+                                    "tx_id": tx.id,
+                                    "message": reason
+                                });
+                                http_400_json(&resp.to_string())
+                            }
                             Ok(tx) if chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy).is_err() => {
                                 let reason = chain_forge_execution::check_account_signature_policy(&tx, precheck.account_signature_policy)
                                     .unwrap_err();
