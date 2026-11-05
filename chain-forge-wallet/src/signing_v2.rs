@@ -1,7 +1,13 @@
 //! TEST-ONLY signing-v2 transaction signer (feature `signing-v2`). See docs/mldsa-tx-signing-v2/SPEC.md.
-//! SCAFFOLD: not implemented yet (tests are written first).
+//!
+//! The transaction is built from the node's own `Transaction` type so that the body JSON signed here is byte-for-byte the
+//! body JSON the verifier recomputes. Signing is hedged (fresh OS randomness per signature, FIPS 204 default); deterministic
+//! signing exists only for test vectors and is not reachable from this module.
 
-use crate::{KeyPair, WalletError, WalletResult};
+use crate::{KeyPair, SchemeId, WalletError, WalletResult};
+use chain_forge_core::{Address, AddressScheme, HashWidth};
+use chain_forge_crypto::fips204_backend::MlDsa65Fips204 as B;
+use chain_forge_execution::signing_v2;
 use chain_forge_execution::{Transaction, TxBody};
 
 /// Inputs for one transaction. `sender: None` means "the address derived from the key".
@@ -16,6 +22,33 @@ pub struct V2TxParams {
 }
 
 /// Sign one transaction under signing v2 (hedged: fresh OS randomness per signature).
-pub fn sign_transaction_v2(_kp: &KeyPair, _chain_id: &str, _address_prefix: &str, _p: V2TxParams) -> WalletResult<Transaction> {
-    Err(WalletError::SigningV2("not implemented".into()))
+///
+/// The key pair is validated first (a mismatched or malformed secret key is an error, never a panic). With `sender: None` the
+/// sender is the address derived from the key (`address_prefix`, post-quantum scheme), which is what a first-use transaction
+/// must name; an explicit sender is for accounts whose key is bound in genesis.
+pub fn sign_transaction_v2(kp: &KeyPair, chain_id: &str, address_prefix: &str, p: V2TxParams) -> WalletResult<Transaction> {
+    B::validate_keypair(&kp.public_key, &kp.private_key).map_err(|e| WalletError::SigningV2(format!("invalid key pair: {e}")))?;
+    let sender = match p.sender {
+        Some(s) => s,
+        None => Address::from_public_key_schemed(&kp.public_key, address_prefix, HashWidth::Bits256, AddressScheme::PostQuantum)
+            .as_str()
+            .to_string(),
+    };
+    let mut tx = Transaction {
+        id: p.id,
+        sender,
+        nonce: p.nonce,
+        body: p.body,
+        gas_limit: p.gas_limit,
+        sig_scheme: Some(SchemeId::MlDsa),
+        signature: vec![],
+        public_key: vec![],
+        pq_signatures: vec![],
+        pq_public_key: if p.carry_key { kp.public_key.clone() } else { vec![] },
+    };
+    let preimage = signing_v2::tx_preimage(chain_id, &tx, &kp.public_key).map_err(WalletError::SigningV2)?;
+    let sig = B::sign(&kp.private_key, &preimage, signing_v2::TX_CONTEXT).map_err(|e| WalletError::SigningV2(format!("signing failed: {e}")))?;
+    let hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+    tx.pq_signatures = vec![format!("mldsa65:{hex}")];
+    Ok(tx)
 }
