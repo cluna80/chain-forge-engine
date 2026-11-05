@@ -1,0 +1,30 @@
+    Updating crates.io index
+     Locking 1 package to latest compatible version
+      Adding fips204 v0.5.0
+   Compiling zeroize v1.9.1
+   Compiling getrandom v0.2.17
+   Compiling sha3 v0.10.9
+   Compiling tracing v0.1.44
+   Compiling rand_core v0.6.4
+   Compiling chain-forge-core v0.1.0 (/home/user/chain-forge-engine/chain-forge-core)
+   Compiling fips204 v0.5.0
+   Compiling ciborium v0.2.2
+   Compiling criterion v0.5.1
+   Compiling chain-forge-crypto v0.1.0 (/home/user/chain-forge-engine/chain-forge-crypto)
+warning: unused import: `DetachedSignature`
+   --> chain-forge-crypto/src/lib.rs:424:53
+    |
+424 |         use pqcrypto_traits::sign::{SecretKey as _, DetachedSignature};
+    |                                                     ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `chain-forge-crypto` (lib) generated 1 warning
+error[E0432]: unresolved import `chain_forge_crypto::fips204_backend`
+ --> chain-forge-crypto/tests/fips204_backend.rs:9:25
+  |
+9 | use chain_forge_crypto::fips204_backend::{Error, MlDsa65Fips204 as B, MAX_CONTEXT_BYTES, PUBLIC_KEY_BYTES, SECRET_KEY_BYTES, SIGNATUR...
+  |                         ^^^^^^^^^^^^^^^ could not find `fips204_backend` in `chain_forge_crypto`
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `chain-forge-crypto` (test "fips204_backend") due to 1 previous error

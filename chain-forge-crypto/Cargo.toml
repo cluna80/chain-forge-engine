@@ -39,6 +39,10 @@ sha2             = { version = "0.10" }
 # ML-DSA / CRYSTALS-Dilithium (NIST FIPS 204) — Phase 1 real PQC signing
 pqcrypto-dilithium = { version = "0.5", optional = true }
 pqcrypto-traits    = { version = "0.3", optional = true }
+# FIPS 204 ML-DSA-65 backend (feature "fips204-backend"); pinned exactly. Not used by default and not wired into any caller.
+fips204            = { version = "=0.5.0", optional = true, default-features = false, features = ["default-rng", "ml-dsa-65"] }
+getrandom          = { version = "0.2", optional = true }
+sha3               = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -49,6 +53,9 @@ real-crypto = ["dep:ed25519-dalek", "dep:rand"]
 real-pqc    = ["dep:pqcrypto-dilithium", "dep:pqcrypto-traits"]
 # Both real crypto backends.
 real-all    = ["real-crypto", "real-pqc"]
+# FIPS 204 ML-DSA-65 via the `fips204` crate (pure FIPS 204 interface with context strings, strict key/signature
+# lengths, hedged signing from the OS RNG). Off by default; the legacy `MlDsaScheme` is unchanged.
+fips204-backend = ["dep:fips204", "dep:getrandom", "dep:sha3"]
 
 [[bin]]
 name = "chain-forge-keygen"
