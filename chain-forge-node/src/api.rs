@@ -90,6 +90,9 @@ pub struct TxPrecheck {
     /// Maximum accepted tx payload size in bytes (0 = unlimited).
     /// Sourced from genesis `limits.max_tx_bytes`.
     pub max_tx_bytes: usize,
+    /// RPC-TX-1: most API-submitted transactions that may wait for the node's
+    /// next heartbeat drain. Sourced from genesis `limits.mempool_size`.
+    pub tx_queue_capacity: usize,
     /// Maximum gas a single tx may request. Sourced from genesis
     /// `limits.block_gas_limit`. A tx asking for more than one full block's
     /// worth of gas can never be included and is rejected at ingress.
