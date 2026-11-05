@@ -45,6 +45,8 @@ use chain_forge_governance::{GovernanceModule, GovernanceConfig, ProposalKind, V
 /// Validator Onboarding — Permissionless Entry via Stake Bond. See
 /// ROADMAP.md, "Validator Onboarding" section.
 pub mod validator_bond;
+#[cfg(feature = "signing-v2")]
+pub mod signing_v2;
 
 /// Deserialize a `Vec<u8>` from either a JSON byte-array `[0,1,2,…]` or a
 /// lowercase hex string `"0102…"`.  Blockchain clients (Python, JS, Go) almost
@@ -1842,6 +1844,10 @@ pub struct ExecutionConfig {
     /// Genesis `cryptography.signature_scheme`: which schemes user accounts
     /// may sign with. See `check_account_signature_policy`.
     pub account_signature_policy: chain_forge_core::AccountSignaturePolicy,
+    /// TEST-ONLY (cargo feature `signing-v2`): verify ML-DSA transactions with signing v2 (FIPS 204 pure ML-DSA-65 over the
+    /// full canonical preimage, `signing_v2.rs`) instead of the legacy digest. No genesis path sets this; it defaults to false.
+    #[cfg(feature = "signing-v2")]
+    pub mldsa_signing_v2: bool,
 
     /// DIS-003E: how many blocks a pending recovery must age before the
     /// block-end sweep may activate it.
@@ -1885,6 +1891,8 @@ impl ExecutionConfig {
             attestation_cap_per_window: genesis.attestation_cap_per_window()
                 .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW),
             mldsa_consensus_only: genesis.mldsa_consensus_only(),
+            #[cfg(feature = "signing-v2")]
+            mldsa_signing_v2: false,
             // Fail closed: an invalid scheme is treated as ML-DSA-only.
             // (The node refuses to start on one anyway.)
             account_signature_policy: genesis.account_signature_policy()
@@ -2033,6 +2041,13 @@ fn verify_authorization_for(config: &ExecutionConfig, tx: &Transaction, state: &
 /// so `verify_authorization_for` can force it for specific tx types
 /// regardless of chain config.
 fn verify_authorization_signed(config: &ExecutionConfig, tx: &Transaction, state: &StateStore) -> Result<(), String> {
+    // TEST-ONLY signing v2 (feature `signing-v2` + `mldsa_signing_v2`): strict envelope rules and the full-preimage
+    // signature replace everything below. Checked before the legacy policy so that, e.g., an Ed25519 tag is reported by
+    // the v2 rule (E1) rather than by the legacy policy message.
+    #[cfg(feature = "signing-v2")]
+    if config.mldsa_signing_v2 {
+        return signing_v2::authorize(config, tx, state);
+    }
     check_account_signature_policy(tx, config.account_signature_policy)?;
 
     // -- Scheme dispatch (CS-001-H2: versioned signature envelope) -------------
@@ -5823,6 +5838,8 @@ mod tests {
             attestation_quorum: chain_forge_core::DEFAULT_ATTESTATION_QUORUM,
             attestation_cap_per_window: chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW,
             mldsa_consensus_only: false,
+            #[cfg(feature = "signing-v2")]
+            mldsa_signing_v2: false,
             account_signature_policy: chain_forge_core::AccountSignaturePolicy::Ed25519Allowed,
             recovery_timelock_blocks: 0,
         };

@@ -380,3 +380,43 @@ fn vector_signatures_verify_through_the_executor_verification_function() {
         assert_eq!(ok, c["expect_valid"].as_bool().unwrap(), "case {}", c["name"]);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// End to end with the independent reference signatures (made by a pure-Python FIPS 204 implementation, PR #94)
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn the_context_constant_is_the_spec_value() {
+    assert_eq!(TX_CONTEXT, b"qattice/tx/v2");
+    assert_eq!(vectors()["cases"][0]["context"].as_str().unwrap().as_bytes(), TX_CONTEXT);
+}
+
+fn tx_from_vector_case(c: &Value) -> Transaction {
+    let mut tx = Transaction::transfer("x", "x", "x", "x", 0, 0);
+    tx.id = c["id"].as_str().unwrap().into();
+    tx.sender = c["sender"].as_str().unwrap().into();
+    tx.nonce = c["nonce"].as_u64().unwrap();
+    tx.gas_limit = c["gas_limit"].as_u64().unwrap();
+    tx.body = serde_json::from_str(c["body_json"].as_str().unwrap()).unwrap();
+    tx.sig_scheme = Some(SchemeId::MlDsa);
+    tx.pq_signatures = vec![format!("mldsa65:{}", c["signature_hex"].as_str().unwrap())];
+    tx
+}
+
+#[test]
+fn the_executor_accepts_the_python_made_reference_signature_and_rejects_the_python_made_replay() {
+    let v = vectors();
+    let find = |name: &str| v["cases"].as_array().unwrap().iter().find(|c| c["name"] == name).unwrap().clone();
+    let base = find("baseline");
+    let (exec, mut state) = setup(CHAIN, true);          // chain id "qattice-alpha-1", sender "qcb1sender"
+    state.get_account_mut("qcb1sender").unwrap().public_key = Some(unhex(v["keys"]["A"]["pk_hex"].as_str().unwrap()));
+    let r0 = exec.execute_tx(&tx_from_vector_case(&base), &mut state, 1);
+    assert!(r0.success, "the reference signature must be accepted: {:?}", r0.error);
+    assert_eq!(recv_balance(&state), 100);
+    // the H0-4 attack from the vector file: the baseline signature, nonce changed to 1
+    let replay = find("replay_nonce_changed");
+    assert!(!replay["expect_valid"].as_bool().unwrap());
+    let r1 = exec.execute_tx(&tx_from_vector_case(&replay), &mut state, 2);
+    assert!(!r1.success && r1.error.as_deref().unwrap_or("").contains("verification failed"), "{:?}", r1.error);
+    assert_eq!(recv_balance(&state), 100, "credited once");
+}
