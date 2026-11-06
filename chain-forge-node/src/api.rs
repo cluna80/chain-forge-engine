@@ -638,7 +638,9 @@ pub async fn serve(
                             }
                             // RPC-TX-1: bounded queue, idempotent duplicates, honest wording.
                             // "queued_for_validation" means RECEIVED: the node validates and admits the
-                            // transaction at its next heartbeat, and consensus has not seen it.
+                            // transaction at its next heartbeat, and consensus has not seen it. The node's admission has the
+                            // account state this API lacks (bound keys, derived addresses, mempool room); if it refuses the
+                            // transaction, GET /api/tx/{id} answers state "rejected" with a code.
                             Ok(tx) => {
                                 let tx_id = tx.id.clone();
                                 let cap = if precheck.tx_queue_capacity == 0 { DEFAULT_TX_QUEUE_CAPACITY } else { precheck.tx_queue_capacity };
@@ -748,7 +750,14 @@ pub async fn serve(
                         let ex = explorer.lock().unwrap();
                         match ex.txs.get(id) {
                             Some(t) => http_200_json(&serde_json::to_string(t).unwrap_or_default()),
-                            None    => http_404(),
+                            // Not committed. If the node refused it at admission (after this API answered `queued_for_validation`),
+                            // say so, with a stable code. Anything else (still queued, pending, or unknown) is 404 as before.
+                            None => match ex.refused_txs.get(id) {
+                                Some(r) => http_200_json(&serde_json::json!({
+                                    "tx_id": r.tx_id, "status": "rejected", "state": "rejected", "code": r.code, "message": r.message,
+                                }).to_string()),
+                                None => http_404(),
+                            },
                         }
                     } else if first_line.starts_with("GET /api/identity/") {
                         // GET /api/identity/{address} — identity record for an address.
