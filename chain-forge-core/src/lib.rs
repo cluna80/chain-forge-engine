@@ -285,6 +285,11 @@ pub struct GenesisConfig {
     pub modules:         Vec<String>,
     pub custom_modules:  Vec<String>,
     pub genesis_accounts: Vec<GenesisAccount>,
+    /// Commitment/signing profile (owner decision 2026-11-05). Absent = legacy, and the genesis hash is unchanged (the field
+    /// is not serialised when absent). `"qattice-v2"` = signing v2 (docs/mldsa-tx-signing-v2/SPEC.md). Any other value is
+    /// refused at startup. Resolve with [`GenesisConfig::commitment_profile`].
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_commitment_profile")]
+    pub commitment_profile: Option<String>,
     /// Pilot-phase sybil coordinator: the address authorized to call
     /// ConfirmSybil and ReverseSybil on-chain. None means coordinator
     /// authority is not set — attestation guard Phases C/D will reject
@@ -757,7 +762,42 @@ pub struct GenesisAccount {
     pub public_key: Option<String>,
 }
 
+/// `commitment_profile` is either absent or a string. An explicit `null` (or any non-string) is refused rather than read as
+/// "absent", which would silently mean legacy on a chain that meant to select a profile.
+fn de_commitment_profile<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(d).map(Some)
+}
+
+/// The commitment/signing profile a chain runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentProfile {
+    /// Pre-v2 behaviour, byte for byte.
+    Legacy,
+    /// Signing v2: full canonical preimage, FIPS 204 ML-DSA-65, strict envelope.
+    QatticeV2,
+}
+
 impl GenesisConfig {
+    /// Resolve `commitment_profile`. Hard validation: the node refuses to start on `Err`, so an unknown value never runs
+    /// under a guessed profile. `"qattice-v2"` requires an ML-DSA-only chain (no Ed25519 or hybrid accounts).
+    pub fn commitment_profile(&self) -> Result<CommitmentProfile, String> {
+        match self.commitment_profile.as_deref() {
+            None => Ok(CommitmentProfile::Legacy),
+            Some("qattice-v2") => match self.account_signature_policy() {
+                Ok(AccountSignaturePolicy::MlDsaOnly) => Ok(CommitmentProfile::QatticeV2),
+                Ok(_) => Err(format!(
+                    "commitment_profile \"qattice-v2\" requires cryptography.signature_scheme \"pqc-native\" with pqc_algorithm \"ml-dsa\" \
+                     (got \"{}\"): the v2 profile has no Ed25519 or hybrid accounts",
+                    self.cryptography.signature_scheme
+                )),
+                Err(e) => Err(format!("commitment_profile \"qattice-v2\": {e}")),
+            },
+            Some(other) => Err(format!(
+                "unknown commitment_profile {other:?}; the only supported value is \"qattice-v2\" (omit the field for a legacy chain)"
+            )),
+        }
+    }
+
     /// Parse from a JSON string (as produced by the Chain Forge wizard).
     pub fn from_json(json: &str) -> CoreResult<Self> {
         serde_json::from_str(json)

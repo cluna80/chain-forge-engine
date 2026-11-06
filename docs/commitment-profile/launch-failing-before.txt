@@ -1,0 +1,29 @@
+== launch
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test a_genesis_that_matches_its_manifest_is_accepted ... FAILED
+test a_genesis_that_changes_the_commitment_profile_is_rejected ... FAILED
+test a_genesis_that_omits_the_commitment_profile_is_rejected ... FAILED
+test a_genesis_that_is_not_ml_dsa_only_is_rejected ... FAILED
+test a_manifest_cannot_weaken_the_requirements ... FAILED
+test any_change_to_the_pinned_genesis_is_rejected ... FAILED
+test an_unparseable_genesis_is_rejected ... FAILED
+test chain_id_and_environment_mode_must_match_the_manifest ... FAILED
+test every_violation_is_reported_not_just_the_first ... FAILED
+test the_release_recipe_verifies_first_and_builds_with_the_public_alpha_feature ... FAILED
+test no_historical_genesis_passes_the_public_alpha_gate ... FAILED
+test malformed_manifests_are_rejected ... FAILED
+test the_tool_fails_closed_on_missing_files_and_bad_usage ... FAILED
+test the_tool_exits_zero_on_a_good_pair_and_one_with_codes_on_a_bad_one ... FAILED
+test historical_genesis_files_keep_their_hashes_and_stay_legacy ... ok
+test result: FAILED. 1 passed; 14 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+== node --features public-alpha
+test node::tests::a_public_alpha_build_includes_signing_v2 ... FAILED
+test node::tests::a_public_alpha_build_starts_a_qattice_v2_genesis ... FAILED
+
+thread 'node::tests::a_public_alpha_build_includes_signing_v2' (1250) panicked at chain-forge-node/src/node.rs:10771:9:
+the public-alpha feature must imply signing-v2
+thread 'node::tests::a_public_alpha_build_starts_a_qattice_v2_genesis' (1251) panicked at chain-forge-node/src/node.rs:10777:82:
+a public-alpha build must start a v2 genesis: Genesis("commitment_profile \"qattice-v2\" requires a binary built with the `signing-v2` feature; this binary would run the legacy signing rules")
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 414 filtered out; finished in 0.16s
+
