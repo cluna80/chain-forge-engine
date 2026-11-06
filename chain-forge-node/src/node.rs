@@ -409,8 +409,19 @@ pub struct TxRefusal {
     pub detail: String,
 }
 
+/// Every refusal code `Node::try_submit_tx` can produce. This list is part of the API contract of `GET /api/tx/{id}`
+/// (docs/tx-admission-outcome/API.md): codes are never renamed or reused, only added. `duplicate_pending` and `already_committed` are
+/// never reported to callers (see `TxRefusal::is_reportable`).
+pub const REFUSAL_CODES: [&str; 7] = [
+    "account_signature_policy", "signing_v2_envelope", "signing_v2_authorization", "admission_bounds",
+    "duplicate_pending", "already_committed", "mempool_full",
+];
+
 impl TxRefusal {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self { Self { code, detail: detail.into() } }
+    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        debug_assert!(REFUSAL_CODES.contains(&code), "undocumented refusal code {code}");
+        Self { code, detail: detail.into() }
+    }
     /// A transaction that is already pending or already committed is not a refusal the caller needs to hear about:
     /// its outcome is (or will be) the original one.
     pub fn is_reportable(&self) -> bool { !matches!(self.code, "duplicate_pending" | "already_committed") }
@@ -10662,6 +10673,20 @@ mod tests {
             assert!(log_len <= MAX_REFUSED_TXS);
         }
 
+        /// Contract: a transaction that breaks the v2 envelope is refused with code `signing_v2_envelope` and the E-code as its detail.
+        #[tokio::test]
+        async fn contract_envelope_violations_are_refused_with_the_envelope_code_and_the_e_code_as_detail() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut node = v2_node(&s, true).await;
+            node.set_mldsa_signing_v2_for_test(true);
+            for (label, e_code, tx) in bad_envelopes(&kp, &s) {
+                let r = node.try_submit_tx(tx).unwrap_err();
+                assert_eq!(r.code, "signing_v2_envelope", "{label}");
+                assert_eq!(r.detail, e_code, "{label}: the detail carries the stable E-code");
+                assert!(REFUSAL_CODES.contains(&r.code));
+            }
+        }
+
         /// (label, expected code, tx) for every envelope violation reachable without any account state.
         fn bad_envelopes(kp: &KeyPair, s: &str) -> Vec<(&'static str, &'static str, Transaction)> {
             let mut v = vec![];
@@ -15617,6 +15642,122 @@ mod tests {
         assert_eq!(log.len(), 3);
         // The bound is a small fixed constant, not whatever a test computes from it.
         assert!(MAX_REFUSED_TXS <= 4_096 && MAX_REFUSED_TXS >= 64);
+    }
+
+    // ── API contract of the admission outcome (owner-approved 2026-11-06). These pin the wire shape and the code set. ─────────
+
+    /// Raw HTTP exchange: (status, lower-cased header block, body text).
+    async fn rpc_raw(port: u16, method: &str, path: &str, body: &str) -> (u16, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        let code: u16 = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        (code, head.to_ascii_lowercase(), body.to_string())
+    }
+
+    fn keys_of(v: &serde_json::Value) -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().expect("a JSON object").keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    #[tokio::test]
+    async fn contract_the_post_answer_is_unchanged_queued_for_validation() {
+        let node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let port = rpc_start(&node).await;
+        let (code, head, body) = rpc_raw(port, "POST", "/api/tx", &rpc_tx("c-post", 3)).await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: application/json"), "{head}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(keys_of(&v), vec!["state", "status", "tx_id"], "no field is added to the POST answer: {v}");
+        assert_eq!((v["status"].as_str(), v["state"].as_str(), v["tx_id"].as_str()), (Some("queued"), Some("queued_for_validation"), Some("c-post")));
+    }
+
+    #[tokio::test]
+    async fn contract_a_rejected_outcome_has_exactly_these_fields_and_is_stable_across_reads() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        fill_mempool(&mut node);
+        let port = rpc_start(&node).await;
+        assert_eq!(rpc(port, "POST", "/api/tx", &rpc_tx("c-rej", 4)).await.0, 200);
+        node.drain_api_tx_queue().await;
+        let (code, head, body) = rpc_raw(port, "GET", "/api/tx/c-rej", "").await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: application/json"), "{head}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(keys_of(&v), vec!["code", "message", "state", "status", "tx_id"], "the rejected shape is exactly this: {v}");
+        assert_eq!((v["status"].as_str(), v["state"].as_str(), v["tx_id"].as_str(), v["code"].as_str()),
+                   (Some("rejected"), Some("rejected"), Some("c-rej"), Some("mempool_full")));
+        assert!(REFUSAL_CODES.contains(&v["code"].as_str().unwrap()), "an undocumented code reached the wire");
+        // Reading does not consume the outcome.
+        let (_, _, again) = rpc_raw(port, "GET", "/api/tx/c-rej", "").await;
+        assert_eq!(again, body, "a second read returns the same answer");
+    }
+
+    #[tokio::test]
+    async fn contract_unknown_and_committed_answers_are_the_legacy_ones_and_a_commit_outranks_a_refusal() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let port = rpc_start(&node).await;
+        let (code, _, body) = rpc_raw(port, "GET", "/api/tx/never-seen", "").await;
+        assert_eq!((code, body.as_str()), (404, r#"{"error":"not found"}"#), "unknown ids keep the legacy 404 body");
+        // A committed transaction keeps its legacy shape, even if a refusal for the same id was recorded earlier.
+        {
+            let ex = node.explorer();
+            let mut ex = ex.lock().unwrap();
+            ex.refused_txs.record("c-done", "mempool_full", "earlier refusal");
+            ex.txs.insert("c-done".into(), TxSummary { id: "c-done".into(), height: 9, sender: "qcb1alice".into(), kind: "Transfer".into(),
+                success: true, gas_used: 21_000, events: vec![], error: None });
+        }
+        let (code, _, body) = rpc_raw(port, "GET", "/api/tx/c-done", "").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(keys_of(&v), vec!["error", "events", "gas_used", "height", "id", "kind", "sender", "success"], "the committed shape is unchanged: {v}");
+        assert_eq!(v["success"], true);
+        assert!(v.get("code").is_none() && v.get("state").is_none(), "a refusal must never mask a committed result: {v}");
+        node.drain_api_tx_queue().await;
+    }
+
+    #[tokio::test]
+    async fn contract_every_refusal_code_try_submit_tx_can_produce_is_documented_and_exact() {
+        // account_signature_policy
+        let mut pq = Node::new(&genesis_with_signature_scheme("pqc-native"), None).await.unwrap();
+        let r = pq.try_submit_tx(Transaction::transfer("p1", "qcb1alice", "qcb1bob", "uqcb", 1, 0)).unwrap_err();
+        assert_eq!(r.code, "account_signature_policy");
+        assert!(r.is_reportable());
+        // admission_bounds
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let long = format!("qcb1{}", "a".repeat(300));
+        let r = node.try_submit_tx(Transaction::transfer("b1", "qcb1alice", &long, "uqcb", 1, 0)).unwrap_err();
+        assert_eq!(r.code, "admission_bounds");
+        assert!(r.is_reportable());
+        // duplicate_pending (never reported)
+        assert!(node.try_submit_tx(Transaction::transfer("d1", "qcb1alice", "qcb1bob", "uqcb", 1, 0)).is_ok());
+        let r = node.try_submit_tx(Transaction::transfer("d1", "qcb1alice", "qcb1bob", "uqcb", 1, 0)).unwrap_err();
+        assert_eq!(r.code, "duplicate_pending");
+        assert!(!r.is_reportable());
+        // already_committed (never reported)
+        node.explorer().lock().unwrap().txs.insert("k1".into(), TxSummary { id: "k1".into(), height: 1, sender: "qcb1alice".into(),
+            kind: "Transfer".into(), success: true, gas_used: 1, events: vec![], error: None });
+        let r = node.try_submit_tx(Transaction::transfer("k1", "qcb1alice", "qcb1bob", "uqcb", 1, 0)).unwrap_err();
+        assert_eq!(r.code, "already_committed");
+        assert!(!r.is_reportable());
+        // mempool_full (a fresh node: this one already holds a pending transaction)
+        let mut full = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        fill_mempool(&mut full);
+        let r = full.try_submit_tx(Transaction::transfer("m1", "qcb1alice", "qcb1bob", "uqcb", 1, 0)).unwrap_err();
+        assert_eq!(r.code, "mempool_full");
+        assert!(r.is_reportable());
+        for c in ["account_signature_policy", "admission_bounds", "duplicate_pending", "already_committed", "mempool_full"] {
+            assert!(REFUSAL_CODES.contains(&c), "{c} must be in the documented list");
+        }
+        // submit_tx keeps its boolean contract: true exactly when try_submit_tx is Ok.
+        let mut n2 = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        assert!(n2.submit_tx(Transaction::transfer("s1", "qcb1alice", "qcb1bob", "uqcb", 1, 0)));
+        assert!(!n2.submit_tx(Transaction::transfer("s1", "qcb1alice", "qcb1bob", "uqcb", 1, 0)));
     }
 
     #[tokio::test]
