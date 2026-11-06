@@ -1,0 +1,15 @@
+Failing-before (Linux sandbox, unmodified main 3fa3754): cargo test -p chain-forge-node --test adversarial_gossip --no-run
+error[E0063]: missing field `genesis_hash` in initializer of `NetworkConfig`
+   --> chain-forge-node/tests/adversarial_gossip.rs:350:18
+    |
+350 |     let config = NetworkConfig {
+    |                  ^^^^^^^^^^^^^ missing `genesis_hash`
+
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `chain-forge-node` (test "adversarial_gossip") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+warning: variable does not need to be mutable
+    --> chain-forge-node/src/node.rs:1162:13
+     |
+1162 |         let mut exec_config = ExecutionConfig::from_genesis(&genesis);
+     |             ----^^^^^^^^^^^

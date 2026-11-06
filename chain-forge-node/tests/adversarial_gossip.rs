@@ -344,6 +344,19 @@ fn wait_all_apis_up(ports: &DevnetPorts) -> bool {
 
 // ── Attacker: real libp2p peer that publishes malicious gossip ─────────────────
 
+/// The genesis hash the devnet nodes advertise (H0-8): `compute_genesis_hash` of the genesis file they were started from.
+fn devnet_genesis_hash() -> String {
+    let text = std::fs::read_to_string(genesis_path()).expect("read devnet genesis");
+    let genesis = chain_forge_core::GenesisConfig::from_json(&text).expect("parse devnet genesis");
+    chain_forge_core::compute_genesis_hash(&genesis)
+}
+
+/// The attacker must really be connected to the devnet; otherwise "the chain kept advancing" would prove nothing.
+fn assert_attacker_connected(svc: &Libp2pService) {
+    assert!(svc.peer_count() >= 1,
+        "the attacker is not connected to any devnet node: a rejection observed below would be vacuous");
+}
+
 /// Start a `Libp2pService` on an OS-assigned port and dial `target_p2p_port`.
 /// Returns `(service, actual_addr_string)`.
 async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
@@ -356,6 +369,10 @@ async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
         peer_discovery:  PeerDiscovery::Mdns,
         max_peers:       8,
         max_message_bytes: 1024 * 1024,
+        // H0-8: advertise the devnet's real genesis hash. The attacker is a member of this chain that passes the genesis-hash
+        // handshake, so what is under test below is the consensus layer's rejection, not a refused connection. (Leaving this
+        // `None` would still be accepted today, but a stricter handshake would then silently make these tests vacuous.)
+        genesis_hash:    Some(devnet_genesis_hash()),
     };
     let (svc, addr) = Libp2pService::start(&config).await
         .expect("attacker libp2p start");
@@ -368,6 +385,7 @@ async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
 async fn attacker_publish_vote(svc: &Libp2pService, vote: &Vote) {
     let payload = serde_json::to_vec(vote).expect("vote serialise");
     tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_attacker_connected(svc);
     svc.publish(OutboundMessage {
         topic:   GossipTopic::ConsensusVote,
         payload,
@@ -476,6 +494,7 @@ async fn adversarial_equivocation_over_gossip() {
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
     eprintln!("   [attacker] waiting 2s for gossipsub mesh...");
     tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_attacker_connected(&attacker);
 
     let balance_before = balance_of(ports.alice_api, "qcb1alice");
     eprintln!("   alice balance before: {balance_before:?} uqcb");
