@@ -10,7 +10,9 @@
 //! | POST   | `/scheduler/tasks/{task_id}/result`         | Submit task result                       |
 //! | POST   | `/scheduler/tasks/{task_id}/verify`         | Submit independent verification (CS M)   |
 //! | GET    | `/scheduler/objectives/{id}/results`        | List results for an objective            |
-//! | POST   | `/scheduler/objectives/{id}/settle`         | Settle a canonical result (Change Set L) |
+//! | POST   | `/scheduler/objectives/{id}/settle/prepare` | Prepare a claim: unsigned tx + signing request |
+//! | POST   | `/scheduler/objectives/{id}/settle/submit`  | Submit the SIGNED claim tx (no private key ever) |
+//! | POST   | `/scheduler/objectives/{id}/settle`         | REMOVED (410): it accepted a private key |
 //! | GET    | `/scheduler/status`                         | Queue depth + active lease count         |
 //!
 //! ## State sharing
@@ -36,7 +38,7 @@ use crate::{
     error::SchedulerError,
     miner::MinerRegistry,
     scheduler::ResearchScheduler,
-    settlement::{settle_objective, SettleRequest, SettlementError},
+    settlement::{prepare_settlement, reject_private_key_material, submit_settlement, PrepareRequest, SettlementError, SubmitRequest},
     verification::{VerificationEngine, VerificationError, VerifyRequest},
     verifier_registry::{
         RegisterVerifierRequest, RegistryError, VerifierRegistry,
@@ -73,7 +75,9 @@ pub fn router(state: AppState) -> Router {
         .route("/scheduler/tasks/:task_id/verify",                  post(verify_result))
         .route("/scheduler/objectives/:objective_id/results",       get(list_objective_results))
         // Change Set L: settlement operator endpoint
-        .route("/scheduler/objectives/:objective_id/settle",        post(settle_handler))
+        .route("/scheduler/objectives/:objective_id/settle",        post(settle_removed_handler))
+        .route("/scheduler/objectives/:objective_id/settle/prepare", post(settle_prepare_handler))
+        .route("/scheduler/objectives/:objective_id/settle/submit",  post(settle_submit_handler))
         // Change Set P (P1): verifier identity registration
         .route("/scheduler/verifiers/register",                     post(register_verifier))
         .route("/scheduler/verifiers",                              get(list_verifiers))
@@ -472,88 +476,70 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
 
 // ── Settlement handler (Change Set L) ─────────────────────────────────────────
 
-/// `POST /scheduler/objectives/:objective_id/settle`
-///
-/// Settlement operators call this endpoint to pay a miner whose canonical
-/// research result has been accepted.  The handler:
-///
-/// 1. Looks up the canonical accepted result for the given task.
-/// 2. Computes the reward via `QcbResearchRewardPolicy`.
-/// 3. Inserts a `pending` claim record (idempotent — duplicate claim_id returns
-///    the existing record).
-/// 4. Builds and ML-DSA-65 signs a `ClaimResearchReward` transaction.
-/// 5. POSTs the tx to the QCB node.
-/// 6. Marks the claim `submitted`.
-///
-/// Returns `201 Created` on success, `409 Conflict` when the claim already
-/// exists and has been submitted, and `422 Unprocessable` for policy or key
-/// errors.
-async fn settle_handler(
-    State(state):          State<Arc<AppState>>,
-    Path(objective_id):    Path<String>,
-    Json(req):             Json<SettleRequest>,
+/// `POST /scheduler/objectives/:objective_id/settle` — REMOVED. It accepted the operator's private key in the request body. The body is
+/// never read. Use `…/settle/prepare`, sign with `qcb-claim-signer`, then `…/settle/submit`.
+async fn settle_removed_handler() -> Response {
+    let body = serde_json::json!({
+        "error": "settle_endpoint_removed",
+        "message": "This endpoint accepted a private key and has been removed. Never send a private key to the scheduler: \
+                    use POST /settle/prepare, sign the result with qcb-claim-signer, then POST /settle/submit.",
+    });
+    (StatusCode::GONE, Json(body)).into_response()
+}
+
+fn settlement_error_response(e: SettlementError) -> Response {
+    let (status, code) = match &e {
+        SettlementError::PrivateKeyMaterial(_) => (StatusCode::BAD_REQUEST, "private_key_material_rejected"),
+        SettlementError::UnsupportedProfile(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unsupported_signing_profile"),
+        SettlementError::SigningUnavailable => (StatusCode::NOT_IMPLEMENTED, "signing_unavailable"),
+        SettlementError::UnknownRewardKind(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unknown_reward_kind"),
+        SettlementError::PolicyRejected(_) => (StatusCode::UNPROCESSABLE_ENTITY, "policy_rejected"),
+        SettlementError::KeyDecode(_) => (StatusCode::UNPROCESSABLE_ENTITY, "public_key_invalid"),
+        SettlementError::TxMismatch(_) => (StatusCode::UNPROCESSABLE_ENTITY, "transaction_does_not_match_claim"),
+        SettlementError::BadSignature(_) => (StatusCode::UNPROCESSABLE_ENTITY, "signature_rejected"),
+        SettlementError::NoAcceptedResult(..) => (StatusCode::NOT_FOUND, "no_accepted_result"),
+        SettlementError::ClaimNotFound(_) => (StatusCode::NOT_FOUND, "claim_not_found"),
+        SettlementError::ClaimAlreadyExists(_) => (StatusCode::CONFLICT, "claim_already_exists"),
+        SettlementError::NodeSubmission(_) => (StatusCode::BAD_GATEWAY, "node_submission_failed"),
+        SettlementError::Db(_) => {
+            tracing::error!(error = %e, "settlement database error");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "internal_error" }))).into_response();
+        }
+    };
+    (status, Json(serde_json::json!({ "error": code, "message": e.to_string() }))).into_response()
+}
+
+fn invalid_request() -> Response {
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": "invalid_request", "message": "the body is not a valid request for this endpoint" }))).into_response()
+}
+
+/// `POST /scheduler/objectives/:objective_id/settle/prepare`: public data in, unsigned transaction and signing request out. A body that
+/// contains private-key material is refused before it is parsed or anything is stored.
+async fn settle_prepare_handler(
+    State(state):       State<Arc<AppState>>,
+    Path(objective_id): Path<String>,
+    body:               axum::body::Bytes,
 ) -> Response {
-    match settle_objective(state.scheduler.db(), &objective_id, req).await {
+    if let Err(e) = reject_private_key_material(&body) { return settlement_error_response(e); }
+    let Ok(req) = serde_json::from_slice::<PrepareRequest>(&body) else { return invalid_request() };
+    match prepare_settlement(state.scheduler.db(), &objective_id, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => settlement_error_response(e),
+    }
+}
+
+/// `POST /scheduler/objectives/:objective_id/settle/submit`: the SIGNED claim transaction in; the scheduler checks it is exactly the stored
+/// claim, verifies it, and forwards it to the node. Returns `201` on success, `409` when the claim is no longer pending.
+async fn settle_submit_handler(
+    State(state):       State<Arc<AppState>>,
+    Path(objective_id): Path<String>,
+    body:               axum::body::Bytes,
+) -> Response {
+    if let Err(e) = reject_private_key_material(&body) { return settlement_error_response(e); }
+    let Ok(req) = serde_json::from_slice::<SubmitRequest>(&body) else { return invalid_request() };
+    match submit_settlement(state.scheduler.db(), &objective_id, req).await {
         Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
-
-        Err(SettlementError::ClaimAlreadyExists(id)) => {
-            // Idempotent: a prior run already submitted this claim.
-            let body = serde_json::json!({
-                "error": "claim_already_exists",
-                "claim_id": id,
-                "message": "This claim was already submitted in a prior request.",
-            });
-            (StatusCode::CONFLICT, Json(body)).into_response()
-        }
-
-        Err(SettlementError::NoAcceptedResult(obj, task)) => {
-            let body = serde_json::json!({
-                "error": "no_accepted_result",
-                "objective_id": obj,
-                "task_id": task,
-                "message": "No canonical accepted result found for this task. \
-                            Ensure the result has been verified and accepted before settling.",
-            });
-            (StatusCode::NOT_FOUND, Json(body)).into_response()
-        }
-
-        Err(SettlementError::PolicyRejected(e)) => {
-            let body = serde_json::json!({
-                "error": "policy_rejected",
-                "message": e.to_string(),
-            });
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
-        }
-
-        Err(SettlementError::UnknownRewardKind(kind)) => {
-            let body = serde_json::json!({
-                "error": "unknown_reward_kind",
-                "reward_kind": kind,
-                "message": "Expected 'primary' or 'replication'.",
-            });
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
-        }
-
-        Err(e @ SettlementError::UnknownSigningProfile(_)) => {
-            let body = serde_json::json!({
-                "error": "unknown_signing_profile",
-                "message": e.to_string(),
-            });
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
-        }
-
-        Err(SettlementError::KeyDecode(msg)) => {
-            let body = serde_json::json!({
-                "error": "key_decode_error",
-                "message": msg,
-            });
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
-        }
-
-        Err(e) => {
-            tracing::error!(error = %e, "settlement failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => settlement_error_response(e),
     }
 }
 
