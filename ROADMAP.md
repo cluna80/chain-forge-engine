@@ -243,6 +243,20 @@ This decision is final. Do not re-litigate it during Phase 0 or Phase 1 work.
 - **QCB / uQCB** — the one and only token on Qattice. 1 QCB = 1,000,000 uQCB (micro-QCB). All balances, PoCD rewards, staking, and governance use uQCB. There is no second token.
 - **PoCD research rewards** — paid from `treasury:pocd-research` in uQCB.
 
+### Cryptographic Architecture Policy (owner direction 2026-11-06; DRAFT, not in force until merged)
+
+**Principle.** Build on FIPS 204 ML-DSA now. Design a versioned, replaceable signature interface so future standardized algorithms can be introduced through explicit protocol upgrades without weakening validator identity, consensus safety, or transaction authorization.
+
+1. **FIPS 204 ML-DSA-65 is the primary signature standard** for the intended consensus, transaction, and identity architecture. Each subsystem (consensus, transactions, identity/DIS) is implemented and independently validated separately; selecting the standard does not make a subsystem conformant. Pre-standard Dilithium code (validator consensus signatures, DIS, legacy transactions) is a known gap, migrated under `docs/fips204-migration/PLAN.md` once its open decisions are made.
+2. **No automatic algorithm negotiation or downgrade.** A versioned protocol profile (genesis `commitment_profile` or a governed activation) determines which algorithms are permitted. Exactly one algorithm is allowed per domain per profile/epoch today. No hybrid, fallback or cross-acceptance.
+3. **Algorithm identifiers are mandatory.** They appear in key registrations and signature envelopes from the first version of any new format and are cryptographically bound into the signed message. A signature whose identifier is not the one the profile allows for that domain is rejected.
+4. **Exactly one authorized signature per operation.** Canonical encoding, exact key/signature lengths, and a distinct domain-separation context per signing domain (as in signing v2, rules E1–E5).
+5. **FN-DSA (FIPS 206) is research-only.** It is not a dependency. Activation requires standardization, security review, benchmarking, and explicit protocol approval (milestone QAT-FNDSA-001). Any new algorithm enters only through a new profile, never by negotiation.
+
+**Consensus engine vs. signing backend.** Migrating validator signatures to FIPS 204 does not replace Tendermint with PQ-HotStuff (a separate milestone, `docs/pq-hotstuff-001-spec.md`). It does change consensus-critical verification, so it requires compatibility testing, independent review and explicit activation approval. It starts as test-only integration, never enabled in default builds.
+
+**Order of work.** (1) QAT-FNDSA-001 roadmap milestone: merged (#120). (2) Complete the signing-v2 integration sequence. (3) Merge this policy. (4) FIPS 204 migration, subject to the six decisions in `docs/fips204-migration/PLAN.md` and independent security review.
+
 ### Phase 0 Exit Criteria
 
 > A milestone is ✅ only when implementation **and** a passing acceptance test both exist. Code alone is not sufficient.
