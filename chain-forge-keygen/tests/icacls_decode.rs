@@ -1,10 +1,10 @@
-//! Parsing of `icacls <path> /save <file>` output. The first sample is the **real output captured on the owner's Windows
-//! machine (BossKing, 2026-11-05)**: UTF-16LE with no byte-order mark.
+//! Parsing of `icacls <path> /save <file>` output. The first sample has the **shape of the real output captured on a Windows machine
+//! (2026-11-05)**: UTF-16LE with no byte-order mark. The account SID below is a SYNTHETIC placeholder, not any real account's SID.
 #![cfg(feature = "signing-v2")]
 
 use chain_forge_keygen::fsperm::{decode_icacls_save, sddl_line, sddl_owner_only};
 
-const SID: &str = "S-1-5-21-2026880741-1893771558-4269005647-1001";
+const SID: &str = "S-1-5-21-1000000001-1000000002-1000000003-1001";
 
 fn utf16le(s: &str, bom: bool) -> Vec<u8> {
     let mut v = if bom { vec![0xFF, 0xFE] } else { vec![] };

@@ -37,25 +37,53 @@ Migration does not change any genesis, address, public key or signature rule.
 * Windows: protected DACL with exactly one allow ACE for the current user's SID on the file and the directory, **read back with
   `icacls /save` and verified**; load repeats the check. Administrators/SYSTEM can always override.
 
-## Windows validation (BossKing, Git Bash)
+## Windows validation (Git Bash)
+Run one block at a time and paste the `git log` line together with the output. Use `-j 1` and close other applications: on a machine with
+a small page file a parallel build can fail with `os error 1455` ("The paging file is too small"), which looks like a compiler error but is
+memory exhaustion.
 ```bash
 cd /c/Dev/chain-forge-engine && git fetch origin feat/key-storage-hardening
-git worktree add ../ks-wt origin/feat/key-storage-hardening          # skip if ks-wt already exists
-cd /c/Dev/ks-wt && git log --oneline -1                              # paste this line together with the output (it must be the head named in PR #109)
-export CARGO_INCREMENTAL=0
-cargo test -j 2 -p chain-forge-keygen --features signing-v2 -- --nocapture --test-threads=1
+git worktree add /c/Dev/ks-wt origin/feat/key-storage-hardening      # skip if /c/Dev/ks-wt already exists
+cd /c/Dev/ks-wt && git log --oneline -1                              # must be the head named in PR #109
 ```
-Expected on Windows (the `cfg(unix)` permission tests are not compiled there): `icacls_decode` 4, `keygen_v2` 9, `keystore` 20,
-`keystore_cli` 9, `keystore_windows` 7, all `0 failed`. Then look at the real ACLs yourself:
 ```bash
-export QCB_KEY_PASSPHRASE='a long passphrase of 12+ bytes'
-mkdir -p /c/Dev/ks-demo && cd /c/Dev/ks-demo
-/c/Dev/cf-target2/debug/qcb-keygen.exe key-new demo --out /c/Dev/ks-demo/keys/demo.qkey.json --kdf-memory-kib 19456 --kdf-iterations 2 --kdf-parallelism 1
-icacls /c/Dev/ks-demo/keys/demo.qkey.json      # expect exactly ONE entry: your account, (F)
-icacls /c/Dev/ks-demo/keys                     # expect exactly ONE entry: your account, (OI)(CI)(F); no "(I)" inherited entries
-cd /c/Dev/chain-forge-engine && rm -rf /c/Dev/ks-demo && git worktree remove --force ../ks-wt
+export CARGO_INCREMENTAL=0
+cargo test -j 1 -p chain-forge-keygen --features signing-v2 -- --nocapture --test-threads=1
 ```
-(If the binary is not at that path, `cargo build -p chain-forge-keygen --features signing-v2` puts it under `$CARGO_TARGET_DIR/debug`.)
+Expected on Windows (the `cfg(unix)` permission tests are not compiled there; counts are per test binary, in this order of the output):
+`icacls_decode` 4, `keygen_v2` 9, `keystore` 20, `keystore_cli` 9, `keystore_windows` 7, `system_tools` 5, all `0 failed`.
+
+### Look at the real ACLs yourself
+```bash
+# Read the passphrase without echo and without leaving it in the shell history; never type it on the command line.
+read -rs -p "passphrase (12+ bytes): " QCB_KEY_PASSPHRASE; echo; export QCB_KEY_PASSPHRASE
+mkdir -p /c/Dev/ks-demo && cd /c/Dev/ks-demo
+cargo build -j 1 -p chain-forge-keygen --features signing-v2 --manifest-path /c/Dev/ks-wt/Cargo.toml
+/c/Dev/ks-wt/target/debug/qcb-keygen.exe key-new demo --out /c/Dev/ks-demo/keys/demo.qkey.json --kdf-memory-kib 19456 --kdf-iterations 2 --kdf-parallelism 1
+unset QCB_KEY_PASSPHRASE
+```
+Then inspect the ACLs with the **Windows** `icacls`, not a same-named program on `PATH`:
+```bash
+/c/Windows/System32/icacls.exe 'C:\Dev\ks-demo\keys\demo.qkey.json'   # expect exactly ONE entry: your account, (F)
+/c/Windows/System32/icacls.exe 'C:\Dev\ks-demo\keys'                   # expect exactly ONE entry: your account, (OI)(CI)(F); no "(I)" entries
+```
+PowerShell equivalent: `& "$env:SystemRoot\System32\icacls.exe" C:\Dev\ks-demo\keys\demo.qkey.json`.
+
+### Git Bash pitfalls (these have caused wrong results on this project)
+* **Argument rewriting.** Git Bash (MSYS) rewrites an argument that starts with `/` into a Windows path before a native `.exe` sees it, so
+  `whoami /user` or `icacls x /save f` can receive a mangled argument. Prefer single-quoted Windows paths as above, or prefix the command
+  with `MSYS_NO_PATHCONV=1`.
+* **`whoami` is not Windows' `whoami`.** In Git Bash it is GNU `whoami` and does not understand `/user`. Use
+  `MSYS_NO_PATHCONV=1 /c/Windows/System32/whoami.exe /user`. The key store itself never relies on `PATH`: it runs
+  `%SystemRoot%\System32\whoami.exe` and `icacls.exe` by absolute path and refuses to run if they are missing.
+* **Cleanup.** When you are done, from a directory outside the worktree and one command at a time (no `--force`):
+```bash
+cd /c/Dev && rm -r /c/Dev/ks-demo
+```
+```bash
+cd /c/Dev/chain-forge-engine && git worktree remove /c/Dev/ks-wt
+```
+(If the worktree has uncommitted changes git will refuse; look at them before deciding anything further.)
 
 ## Open items (not solved by this work)
 Same-user malware and memory disclosure; Administrators/SYSTEM override; the stdin prompt does not hide input; passphrase strength

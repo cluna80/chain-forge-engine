@@ -151,6 +151,26 @@ pub mod unix {
     }
 }
 
+/// Absolute path of a Windows system tool: `<SystemRoot>\System32\<name>`, never a `PATH` search. `system_root` and `windir` are the values of the
+/// `SystemRoot` and `windir` environment variables; a value that is not an absolute drive path without `..` is ignored. Falls back to
+/// `C:\Windows`. `name` must be a bare file name. (Pure, so it is tested on every platform.)
+pub fn system32_tool(name: &str, system_root: Option<&std::ffi::OsStr>, windir: Option<&std::ffi::OsStr>) -> Result<std::path::PathBuf, String> {
+    if name.is_empty() || name == "." || name == ".." || name.trim() != name || name.contains(['/', '\\', ':']) {
+        return Err(format!("{name:?} is not a bare file name"));
+    }
+    // An environment value is used only if it is an absolute drive path ("X:\..."), with no "." / ".." component and no further ':'.
+    fn usable(v: Option<&std::ffi::OsStr>) -> Option<String> {
+        let s = v?.to_str()?;
+        let b = s.as_bytes();
+        let drive_abs = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+        if !drive_abs { return None; } // checked first: the slice below is only taken once the first three bytes are known ASCII
+        let clean = !s.split(['\\', '/']).any(|c| c == ".." || c == ".") && !s[2..].contains(':');
+        if clean { Some(s.trim_end_matches(['\\', '/']).to_string()) } else { None }
+    }
+    let root = usable(system_root).or_else(|| usable(windir)).unwrap_or_else(|| "C:\\Windows".to_string());
+    Ok(std::path::PathBuf::from(root).join("System32").join(name))
+}
+
 // ── Windows ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /// The current user's SID, from `whoami /user` (locale independent: the SID is the last CSV field).
@@ -160,9 +180,16 @@ pub fn current_user_sid() -> Result<String, String> {
     SID.get_or_init(current_user_sid_uncached).clone()
 }
 
+/// The system tool `name` by absolute path (`%SystemRoot%\\System32\\name`); fail closed if it is not there. Never searches `PATH`.
+#[cfg(windows)]
+fn tool(name: &str) -> Result<std::path::PathBuf, String> {
+    let p = system32_tool(name, std::env::var_os("SystemRoot").as_deref(), std::env::var_os("windir").as_deref())?;
+    if p.is_file() { Ok(p) } else { Err(format!("{} was not found; refusing to look for {name} on PATH", p.display())) }
+}
+
 #[cfg(windows)]
 fn current_user_sid_uncached() -> Result<String, String> {
-    let o = std::process::Command::new("whoami").args(["/user", "/fo", "csv", "/nh"]).output().map_err(|e| format!("whoami failed: {e}"))?;
+    let o = std::process::Command::new(tool("whoami.exe")?).args(["/user", "/fo", "csv", "/nh"]).output().map_err(|e| format!("whoami failed: {e}"))?;
     if !o.status.success() { return Err("whoami /user failed".into()); }
     let text = String::from_utf8_lossy(&o.stdout);
     let last = text.trim().rsplit(',').next().unwrap_or("").trim().trim_matches('"').to_string();
@@ -174,7 +201,7 @@ fn current_user_sid_uncached() -> Result<String, String> {
 pub fn read_sddl(path: &Path) -> Result<String, String> {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("qcb-acl-{}-{}.txt", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
-    let o = std::process::Command::new("icacls").arg(path).arg("/save").arg(&tmp).output().map_err(|e| format!("icacls failed to start: {e}"))?;
+    let o = std::process::Command::new(tool("icacls.exe")?).arg(path).arg("/save").arg(&tmp).output().map_err(|e| format!("icacls failed to start: {e}"))?;
     if !o.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("icacls /save failed: {}", String::from_utf8_lossy(&o.stdout)));
@@ -188,7 +215,7 @@ pub fn read_sddl(path: &Path) -> Result<String, String> {
 
 #[cfg(windows)]
 fn icacls(args: &[&std::ffi::OsStr]) -> Result<(), String> {
-    let o = std::process::Command::new("icacls").args(args).output().map_err(|e| format!("icacls failed to start: {e}"))?;
+    let o = std::process::Command::new(tool("icacls.exe")?).args(args).output().map_err(|e| format!("icacls failed to start: {e}"))?;
     if o.status.success() { Ok(()) } else { Err(format!("icacls failed: {}", String::from_utf8_lossy(&o.stdout).trim())) }
 }
 
