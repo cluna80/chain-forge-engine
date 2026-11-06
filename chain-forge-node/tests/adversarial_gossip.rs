@@ -344,6 +344,24 @@ fn wait_all_apis_up(ports: &DevnetPorts) -> bool {
 
 // ── Attacker: real libp2p peer that publishes malicious gossip ─────────────────
 
+/// The genesis hash the devnet nodes advertise (H0-8): `compute_genesis_hash` of the genesis file they were started from.
+fn devnet_genesis_hash() -> String {
+    let text = std::fs::read_to_string(genesis_path()).expect("read devnet genesis");
+    let genesis = chain_forge_core::GenesisConfig::from_json(&text).expect("parse devnet genesis");
+    chain_forge_core::compute_genesis_hash(&genesis)
+}
+
+/// The attacker must really be connected to the devnet; otherwise "the chain kept advancing" would prove nothing. Waits (bounded) for the
+/// connection instead of sampling once, so a slow dial or discovery cannot fail a test that is about something else.
+async fn assert_attacker_connected(svc: &Libp2pService) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while svc.peer_count() < 1 {
+        assert!(std::time::Instant::now() < deadline,
+            "the attacker is not connected to any devnet node after 15 s: a rejection observed below would be vacuous");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Start a `Libp2pService` on an OS-assigned port and dial `target_p2p_port`.
 /// Returns `(service, actual_addr_string)`.
 async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
@@ -356,6 +374,10 @@ async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
         peer_discovery:  PeerDiscovery::Mdns,
         max_peers:       8,
         max_message_bytes: 1024 * 1024,
+        // H0-8: advertise the devnet's real genesis hash. The attacker is a member of this chain that passes the genesis-hash
+        // handshake, so what is under test below is the consensus layer's rejection, not a refused connection. (Leaving this
+        // `None` would still be accepted today, but a stricter handshake would then silently make these tests vacuous.)
+        genesis_hash:    Some(devnet_genesis_hash()),
     };
     let (svc, addr) = Libp2pService::start(&config).await
         .expect("attacker libp2p start");
@@ -368,6 +390,7 @@ async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
 async fn attacker_publish_vote(svc: &Libp2pService, vote: &Vote) {
     let payload = serde_json::to_vec(vote).expect("vote serialise");
     tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_attacker_connected(svc).await;
     svc.publish(OutboundMessage {
         topic:   GossipTopic::ConsensusVote,
         payload,
@@ -397,13 +420,12 @@ async fn adversarial_unknown_validator() {
     let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
-    assert!(wait_all_apis_up(&ports), "nodes did not start");
+    if !wait_all_apis_up(&ports) { fail_with_evidence(&ports, &log_dir, "nodes did not start"); }
 
     println!("   [phase1] Waiting for height >= 2...");
-    assert!(
-        poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)),
-        "chain did not reach height 2 before attack"
-    );
+    if !poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)) {
+        fail_with_evidence(&ports, &log_dir, "chain did not reach height 2 before attack");
+    }
 
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
 
@@ -464,18 +486,18 @@ async fn adversarial_equivocation_over_gossip() {
     let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
-    assert!(wait_all_apis_up(&ports), "nodes did not start");
+    if !wait_all_apis_up(&ports) { fail_with_evidence(&ports, &log_dir, "nodes did not start"); }
 
     println!("   [phase1] Waiting for height >= 2...");
-    assert!(
-        poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)),
-        "chain did not reach height 2 before attack"
-    );
+    if !poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)) {
+        fail_with_evidence(&ports, &log_dir, "chain did not reach height 2 before attack");
+    }
 
     // Start attacker and wait for gossipsub mesh.
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
     eprintln!("   [attacker] waiting 2s for gossipsub mesh...");
     tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_attacker_connected(&attacker).await;
 
     let balance_before = balance_of(ports.alice_api, "qcb1alice");
     eprintln!("   alice balance before: {balance_before:?} uqcb");
@@ -695,13 +717,12 @@ async fn adversarial_garbage_signature() {
     let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
-    assert!(wait_all_apis_up(&ports), "nodes did not start in time");
+    if !wait_all_apis_up(&ports) { fail_with_evidence(&ports, &log_dir, "nodes did not start in time"); }
 
     println!("   [phase1] Waiting for height >= 2 (verifying chain starts with real signing)...");
-    assert!(
-        poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)),
-        "chain did not reach height 2 before attack"
-    );
+    if !poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)) {
+        fail_with_evidence(&ports, &log_dir, "chain did not reach height 2 before attack");
+    }
 
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
 
@@ -807,6 +828,17 @@ fn tempdir(prefix: &str) -> PathBuf {
 }
 
 /// Dump the tail of node log files to stdout for post-mortem inspection.
+/// Fail a test and keep the evidence: the last lines of every node's log and the current heights/peer counts. Used on the EARLY failure
+/// paths (nodes did not start, chain did not reach height 2) that used to panic with no log at all.
+fn fail_with_evidence(ports: &DevnetPorts, log_dir: &std::path::Path, what: &str) -> ! {
+    let heights: Vec<u64> = ports.all_api_ports().iter().map(|&p| height_of(p)).collect();
+    let peers: Vec<Option<u64>> = ports.all_api_ports().iter()
+        .map(|&p| api_get(p, "/api/status").and_then(|v| v["peer_count"].as_u64())).collect();
+    println!("\n── FAILURE EVIDENCE: {what} ──\n   heights (alice, bob, carol, dave) = {heights:?}\n   peer_count = {peers:?}");
+    dump_logs(log_dir, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"], 25);
+    panic!("{what} (heights {heights:?}, peer_count {peers:?}; node logs printed above)");
+}
+
 fn dump_logs(log_dir: &std::path::Path, names: &[&str], tail_lines: usize) {
     for name in names {
         let log = log_dir.join(format!("{name}.log"));
