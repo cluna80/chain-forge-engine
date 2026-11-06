@@ -1,0 +1,40 @@
+== core
+thread 'an_explicit_null_is_refused_not_treated_as_legacy' (1207) panicked at chain-forge-core/tests/commitment_profile.rs:65:5:
+explicit null must not mean legacy, got Ok(Ok(Legacy))
+thread 'qattice_v2_resolves_survives_a_round_trip_and_is_bound_into_the_genesis_hash' (1209) panicked at chain-forge-core/tests/commitment_profile.rs:41:5:
+assertion `left == right` failed
+thread 'qattice_v2_requires_an_ml_dsa_only_chain' (1208) panicked at chain-forge-core/tests/commitment_profile.rs:75:9:
+qattice-v2 on a hybrid chain must be refused, got Ok(Ok(Legacy))
+thread 'unknown_or_malformed_values_fail_closed' (1210) panicked at chain-forge-core/tests/commitment_profile.rs:52:9:
+"qattice-v3" must be refused, got Ok(Ok(Legacy))
+test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+== node, feature signing-v2
+test node::tests::an_absent_profile_keeps_the_legacy_rules ... ok
+test node::tests::an_unknown_or_malformed_profile_stops_the_node_at_startup ... FAILED
+test node::tests::profile_active::legacy_authorization_cannot_bypass_the_profile_even_with_require_signatures_false ... FAILED
+test node::tests::profile_active::the_api_enforces_the_profile_from_genesis ... FAILED
+test node::tests::profile_active::the_genesis_profile_activates_ingress_and_execution_without_the_test_switch ... FAILED
+test node::p02a_gaps::the_commitment_profile_cannot_change_across_a_restart ... ok
+
+thread 'node::tests::an_unknown_or_malformed_profile_stops_the_node_at_startup' (1223) panicked at chain-forge-node/src/node.rs:10741:13:
+commitment_profile "qattice-v3" must be refused at startup
+thread 'node::tests::profile_active::legacy_authorization_cannot_bypass_the_profile_even_with_require_signatures_false' (1224) panicked at chain-forge-node/src/node.rs:10821:17:
+u0 must not enter the mempool
+thread 'node::tests::profile_active::the_api_enforces_the_profile_from_genesis' (1225) panicked at chain-forge-node/src/node.rs:10804:13:
+assertion `left == right` failed: {"state":"queued_for_validation","status":"queued","tx_id":"two"}
+thread 'node::tests::profile_active::the_genesis_profile_activates_ingress_and_execution_without_the_test_switch' (1226) panicked at chain-forge-node/src/node.rs:10780:13:
+the profile must switch ingress on
+test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 428 filtered out; finished in 0.28s
+
+== node, default features
+test node::tests::an_absent_profile_keeps_the_legacy_rules ... ok
+test node::tests::a_binary_without_signing_v2_refuses_a_qattice_v2_genesis ... FAILED
+test node::tests::an_unknown_or_malformed_profile_stops_the_node_at_startup ... FAILED
+
+thread 'node::tests::a_binary_without_signing_v2_refuses_a_qattice_v2_genesis' (1268) panicked at chain-forge-node/src/node.rs:10750:25:
+must be refused
+thread 'node::tests::an_unknown_or_malformed_profile_stops_the_node_at_startup' (1270) panicked at chain-forge-node/src/node.rs:10741:13:
+commitment_profile "qattice-v3" must be refused at startup
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 411 filtered out; finished in 0.16s
+

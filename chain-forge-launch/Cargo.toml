@@ -1,0 +1,21 @@
+[package]
+name        = "chain-forge-launch"
+description = "Qattice launch-manifest verification: gates a public-alpha genesis before deployment"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[lib]
+name = "chain_forge_launch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qcb-launch"
+path = "src/main.rs"
+
+[dependencies]
+chain-forge-core = { path = "../chain-forge-core" }
+serde            = { workspace = true }
+serde_json       = { workspace = true }

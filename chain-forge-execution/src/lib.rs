@@ -1891,8 +1891,10 @@ impl ExecutionConfig {
             attestation_cap_per_window: genesis.attestation_cap_per_window()
                 .unwrap_or(chain_forge_core::DEFAULT_ATTESTATION_CAP_PER_WINDOW),
             mldsa_consensus_only: genesis.mldsa_consensus_only(),
+            // The genesis profile decides. Fail closed: an unresolvable profile selects the strict rules (the node
+            // refuses to start on one anyway).
             #[cfg(feature = "signing-v2")]
-            mldsa_signing_v2: false,
+            mldsa_signing_v2: !matches!(genesis.commitment_profile(), Ok(chain_forge_core::CommitmentProfile::Legacy)),
             // Fail closed: an invalid scheme is treated as ML-DSA-only.
             // (The node refuses to start on one anyway.)
             account_signature_policy: genesis.account_signature_policy()
