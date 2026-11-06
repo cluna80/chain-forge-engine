@@ -473,6 +473,8 @@ impl RefusedTxLog {
         if self.by_id.remove(&key).is_some() { self.order.retain(|k| *k != key); }
     }
     pub fn get(&self, tx_id: &str) -> Option<&RefusedTx> { self.by_id.get(&clip(tx_id, MAX_REFUSED_ID_LEN)) }
+    /// Number of remembered refusals (used by the tests that pin the bound).
+    #[cfg(test)]
     pub fn len(&self) -> usize { self.by_id.len() }
 }
 
