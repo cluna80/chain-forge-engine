@@ -1,0 +1,44 @@
+Failing-before (Linux sandbox, base main 3fa3754 + scaffold: try_submit_tx refactor and an inert RefusedTxLog; recording and GET wiring absent)
+cargo test -p chain-forge-node --features signing-v2 --bin chain-forge-node -- <the 7 new tests>
+
+test node::tests::resubmitting_a_pending_transaction_is_not_reported_as_rejected ... ok
+test node::tests::a_transaction_refused_after_it_was_queued_gets_a_deterministic_outcome_from_get_api_tx ... FAILED
+test node::tests::a_refusal_is_forgotten_when_the_same_id_is_later_admitted ... FAILED
+test node::tests::the_refusal_log_updates_in_place_clips_long_fields_and_is_consistent_for_long_ids ... FAILED
+test node::tests::the_refusal_log_is_bounded_and_evicts_the_oldest_and_the_mempool_is_untouched ... FAILED
+test node::tests::signing_v2_ingress::a_bound_key_transaction_with_a_bad_signature_is_refused_with_a_code_and_never_enters_the_mempool ... FAILED
+test node::tests::signing_v2_ingress::a_flood_of_bad_bound_key_signatures_cannot_grow_the_mempool_or_the_log_without_bound ... FAILED
+thread 'node::tests::a_transaction_refused_after_it_was_queued_gets_a_deterministic_outcome_from_get_api_tx' (19711) panicked at chain-forge-node/src/node.rs:15516:9:
+assertion `left == right` failed: {"error":"not found"}
+  left: 404
+ right: 200
+thread 'node::tests::a_refusal_is_forgotten_when_the_same_id_is_later_admitted' (19710) panicked at chain-forge-node/src/node.rs:15534:9:
+assertion `left == right` failed
+  left: Null
+ right: "rejected"
+thread 'node::tests::the_refusal_log_updates_in_place_clips_long_fields_and_is_consistent_for_long_ids' (19716) panicked at chain-forge-node/src/node.rs:15582:9:
+assertion `left == right` failed: the same id takes one slot
+  left: 0
+ right: 1
+thread 'node::tests::the_refusal_log_is_bounded_and_evicts_the_oldest_and_the_mempool_is_untouched' (19715) panicked at chain-forge-node/src/node.rs:15571:9:
+assertion `left == right` failed: the log never exceeds its bound
+  left: 0
+ right: 1024
+thread 'node::tests::signing_v2_ingress::a_bound_key_transaction_with_a_bad_signature_is_refused_with_a_code_and_never_enters_the_mempool' (19713) panicked at chain-forge-node/src/node.rs:10603:13:
+assertion `left == right` failed: {"error":"not found"}
+  left: 404
+ right: 200
+thread 'node::tests::signing_v2_ingress::a_flood_of_bad_bound_key_signatures_cannot_grow_the_mempool_or_the_log_without_bound' (19714) panicked at chain-forge-node/src/node.rs:10639:13:
+assertion `left == right` failed: every refusal is reportable, within the bound (1024)
+  left: 0
+ right: 120
+test result: FAILED. 1 passed; 6 failed; 0 ignored; 0 measured; 428 filtered out; finished in 4.09s
+
+Note: the one test that PASSES here (resubmitting_a_pending_transaction_is_not_reported_as_rejected) is a guard against a wrong fix
+(recording a duplicate as a refusal); it is covered by a mutation check instead of a red run.
+
+Disclosure: my FIRST red run of the two signing-v2 tests failed for the WRONG reason. My test setup used four_nodes(.., true), which switches
+only the executor's v2 flag; the node's own ingress flag stayed off, so the node skipped its v2 checks and the forged transaction entered the
+mempool. That was a test-setup error, not a node bug. I added set_mldsa_signing_v2_for_test(true) for each node (as a v2 genesis profile does)
+and re-ran: the forged transactions then stay out of the mempool (already true before this change) and the tests fail only on the missing
+outcome (GET /api/tx/{id} = 404; refusal log empty: 0 of 120).
