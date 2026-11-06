@@ -895,6 +895,7 @@ dependencies = [
 name = "chain-forge-keygen"
 version = "0.1.0"
 dependencies = [
+ "chain-forge-core",
  "chain-forge-crypto",
  "hex",
  "serde_json",
