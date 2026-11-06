@@ -165,6 +165,15 @@ Hardening the foundation before adding features. Each item is a draft PR, unmerg
 ### Consensus safety (#18): why it was needed
 A 5-node run with only honest nodes finalized two conflicting blocks at height 1. Validators precommitted without a prevote polka and locked only at commit. The blocks were empty, so state roots matched and only block hashes revealed the fork. Fixed by the full Tendermint state machine (Buchman, Kwon & Milosevic, Algorithm 1). Covered by unit lock-rule tests, a scripted fork counterexample, a seeded model-based simulation (staggered starts, crashes, equivocators within f, fork detection beyond f), and live block-hash agreement tests. Partition recovery passed in the Linux sandbox; it can't run on Windows (no iptables).
 
+### PQ-HotStuff-2 — future consensus transition designation (owner direction, 2026-11-06)
+
+**Status: Planned / naming decision only.** When Qattice transitions from its existing Tendermint-style consensus engine to the next HotStuff-based consensus implementation, designate that target **PQ-HotStuff-2**. This is the forward-looking name for the planned upgrade; it does **not** mean PQ-HotStuff-2 is implemented, reviewed, tested, activated, or a second live consensus engine today.
+
+- Keep the existing `PQ-HotStuff` references and `docs/pq-hotstuff-001-spec.md` as historical/specification identifiers until a separately reviewed design migration explicitly supersedes them. Do not silently rename files, protocol IDs, configuration, or code.
+- Carry forward Qattice's personhood-weighted consensus invariant and **FIPS 204 ML-DSA-65 as the primary signature target**. FN-DSA remains research-only under QAT-FNDSA-001; no automatic algorithm fallback or negotiation.
+- Before implementation or activation, define the **PQ-HotStuff-2** protocol specification, version/upgrade boundaries, quorum-certificate format, safety/liveness proofs or analysis, validator and key migration, rollback/failure handling, and benchmark acceptance criteria (target: 1,000 validators and finality under 3 seconds; not yet demonstrated).
+- Treat the transition as a consensus-critical change requiring independent review, repeatable adversarial testing, and explicit owner/governance activation approval. Do not bundle it into the ongoing signing-v2 integration sequence or FIPS 204 signing-backend migration.
+
 ### PQ-HotStuff (locked direction, owner 2026-10-28)
 PQ-HotStuff (personhood-weighted, ML-DSA-only, two-chain HotStuff) is the target consensus for Qattice mainnet and a selectable Chain Forge engine. Protocol spec: `docs/pq-hotstuff-001-spec.md`. Decisions locked 2026-10-28: D1 two-chain commit; D2 versioned QC (v1 signature list now, mainnet ceiling after M0); D3 round-robin leaders; D4 revocation effective the block after it commits; D5 gate 4 first. The hardened Tendermint devnet (ML-DSA keys, #24) stays the default until PQ-HotStuff passes its Phase 2 gate on Windows. Order: release gate 4 (committed-evidence slashing) first, then PQ-HotStuff Phase 0. The legacy `HotStuffEngine` is not a base and stays devnet-only.
 
