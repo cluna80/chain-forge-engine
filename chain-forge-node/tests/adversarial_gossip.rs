@@ -41,7 +41,8 @@
 //! ## Run
 //! ```
 //! # All verified tests:
-//! cargo test -p chain-forge-node --test adversarial_gossip -- --nocapture --test-threads=1
+//! cargo test -p chain-forge-node --test adversarial_gossip -- --nocapture
+//! # (the tests serialise themselves with a lock, so the default thread count is safe)
 //! # Include the Phase-0 stub:
 //! cargo test -p chain-forge-node --test adversarial_gossip -- --nocapture --test-threads=1 --ignored
 //! ```
@@ -68,17 +69,40 @@ use chain_forge_p2p::{
 
 const CHAIN_ID: &str = "qcb-devnet-4node";
 
+/// One devnet at a time. Each test starts a whole four-node devnet from the SAME genesis and the nodes discover peers by mDNS, so devnets
+/// that run at the same time find and mix with each other's nodes (observed: `peer_count` 6 instead of 3, then stalled chains). `cargo test`
+/// runs the tests of one binary in parallel by default, so every test takes this lock first and `--test-threads=1` is no longer required.
+static ONE_DEVNET_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ── Port helpers ──────────────────────────────────────────────────────────────
 
-/// Ask the OS for a free TCP port, then release the listener.
-/// There is a small TOCTOU window between release and the process binding it,
-/// but this is acceptable for tests where the alternative is fixed-port conflicts.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("free_port: bind failed")
-        .local_addr()
-        .expect("free_port: local_addr failed")
-        .port()
+/// Reserve `n` DISTINCT ports that are OUTSIDE every OS's dynamic (ephemeral) port range, and free at this moment.
+///
+/// The old helper asked the OS for a port with `bind(0)` and released it, eight times. Windows hands out ephemeral ports sequentially, so
+/// the eight released ports were consecutive numbers in exactly the pool that the OS gives to OUTGOING connections. A node that had already
+/// started and was dialling its peers could take one of them as its source port before the node that owned it bound it: bob's HTTP API then
+/// failed with `os error 10048` (address in use) while its consensus ran normally, and the test waited 30 s for an API that never came.
+/// Ports below 32768 are outside Linux's (32768-60999) and Windows' (49152-65535) dynamic ranges, so no outgoing connection can take one.
+/// All listeners are held until every port is chosen, so the ports are distinct by construction.
+fn reserve_ports(n: usize) -> Vec<u16> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const LOW: u32 = 20_000;
+    const HIGH: u32 = 32_000;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let seed = (std::process::id() as u64).wrapping_mul(2_654_435_761)
+        .wrapping_add(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0))
+        .wrapping_add(CALLS.fetch_add(1, Ordering::SeqCst) as u64 * 97);
+    let mut port = LOW + (seed % (HIGH - LOW) as u64) as u32;
+    let (mut held, mut chosen, mut tries) = (Vec::new(), Vec::new(), 0u32);
+    while chosen.len() < n {
+        tries += 1;
+        assert!(tries < 4_000, "could not find {n} free ports in {LOW}..{HIGH}");
+        if port >= HIGH { port = LOW; }
+        if let Ok(l) = TcpListener::bind(("0.0.0.0", port as u16)) { held.push(l); chosen.push(port as u16); }
+        port += 1;
+    }
+    drop(held);
+    chosen
 }
 
 /// All ports for one devnet + attacker instance, each allocated dynamically.
@@ -95,15 +119,10 @@ struct DevnetPorts {
 
 impl DevnetPorts {
     fn new() -> Self {
+        let p = reserve_ports(8);
         Self {
-            alice_api:  free_port(),
-            bob_api:    free_port(),
-            carol_api:  free_port(),
-            dave_api:   free_port(),
-            alice_p2p:  free_port(),
-            bob_p2p:    free_port(),
-            carol_p2p:  free_port(),
-            dave_p2p:   free_port(),
+            alice_api: p[0], bob_api: p[1], carol_api: p[2], dave_api: p[3],
+            alice_p2p: p[4], bob_p2p: p[5], carol_p2p: p[6], dave_p2p: p[7],
         }
     }
 
@@ -291,6 +310,23 @@ fn poll_until_height(ports: &[u16], target: u64, timeout: Duration) -> bool {
     }
 }
 
+// ── Port reservation guard ─────────────────────────────────────────────────────
+
+/// Takes the devnet lock so it cannot reserve a port a running devnet test has chosen but a node has not bound yet.
+#[test]
+fn reserved_ports_are_distinct_free_and_outside_every_ephemeral_range() {
+    let _one_devnet = ONE_DEVNET_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..300 {
+        let p = reserve_ports(8);
+        let distinct: std::collections::BTreeSet<_> = p.iter().collect();
+        assert_eq!(distinct.len(), 8, "ports must be distinct: {p:?}");
+        for &x in &p {
+            assert!((20_000..32_000).contains(&x), "port {x} is outside 20000..32000 (Linux dynamic ports start at 32768, Windows at 49152)");
+            TcpListener::bind(("0.0.0.0", x)).unwrap_or_else(|e| panic!("port {x} was not free after being reserved: {e}"));
+        }
+    }
+}
+
 // ── Skip guard ────────────────────────────────────────────────────────────────
 
 fn skip_if_no_binary() -> bool {
@@ -344,6 +380,24 @@ fn wait_all_apis_up(ports: &DevnetPorts) -> bool {
 
 // ── Attacker: real libp2p peer that publishes malicious gossip ─────────────────
 
+/// The genesis hash the devnet nodes advertise (H0-8): `compute_genesis_hash` of the genesis file they were started from.
+fn devnet_genesis_hash() -> String {
+    let text = std::fs::read_to_string(genesis_path()).expect("read devnet genesis");
+    let genesis = chain_forge_core::GenesisConfig::from_json(&text).expect("parse devnet genesis");
+    chain_forge_core::compute_genesis_hash(&genesis)
+}
+
+/// The attacker must really be connected to the devnet; otherwise "the chain kept advancing" would prove nothing. Waits (bounded) for the
+/// connection instead of sampling once, so a slow dial or discovery cannot fail a test that is about something else.
+async fn assert_attacker_connected(svc: &Libp2pService) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while svc.peer_count() < 1 {
+        assert!(std::time::Instant::now() < deadline,
+            "the attacker is not connected to any devnet node after 15 s: a rejection observed below would be vacuous");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Start a `Libp2pService` on an OS-assigned port and dial `target_p2p_port`.
 /// Returns `(service, actual_addr_string)`.
 async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
@@ -356,6 +410,10 @@ async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
         peer_discovery:  PeerDiscovery::Mdns,
         max_peers:       8,
         max_message_bytes: 1024 * 1024,
+        // H0-8: advertise the devnet's real genesis hash. The attacker is a member of this chain that passes the genesis-hash
+        // handshake, so what is under test below is the consensus layer's rejection, not a refused connection. (Leaving this
+        // `None` would still be accepted today, but a stricter handshake would then silently make these tests vacuous.)
+        genesis_hash:    Some(devnet_genesis_hash()),
     };
     let (svc, addr) = Libp2pService::start(&config).await
         .expect("attacker libp2p start");
@@ -368,6 +426,7 @@ async fn start_attacker(target_p2p_port: u16) -> (Libp2pService, String) {
 async fn attacker_publish_vote(svc: &Libp2pService, vote: &Vote) {
     let payload = serde_json::to_vec(vote).expect("vote serialise");
     tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_attacker_connected(svc).await;
     svc.publish(OutboundMessage {
         topic:   GossipTopic::ConsensusVote,
         payload,
@@ -382,6 +441,7 @@ async fn attacker_publish_vote(svc: &Libp2pService, vote: &Vote) {
 #[tokio::test]
 async fn adversarial_unknown_validator() {
     if skip_if_no_binary() { return; }
+    let _one_devnet = ONE_DEVNET_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
 
     let ports = DevnetPorts::new();
     println!("\n── Adversarial test: unknown-validator vote over gossip ─────────────");
@@ -397,13 +457,12 @@ async fn adversarial_unknown_validator() {
     let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
-    assert!(wait_all_apis_up(&ports), "nodes did not start");
+    if !wait_all_apis_up(&ports) { fail_with_evidence(&ports, &log_dir, "nodes did not start"); }
 
     println!("   [phase1] Waiting for height >= 2...");
-    assert!(
-        poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)),
-        "chain did not reach height 2 before attack"
-    );
+    if !poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)) {
+        fail_with_evidence(&ports, &log_dir, "chain did not reach height 2 before attack");
+    }
 
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
 
@@ -453,6 +512,7 @@ async fn adversarial_unknown_validator() {
 #[tokio::test]
 async fn adversarial_equivocation_over_gossip() {
     if skip_if_no_binary() { return; }
+    let _one_devnet = ONE_DEVNET_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
 
     let ports = DevnetPorts::new();
     println!("\n── Adversarial test: equivocation (double-vote) over gossip ─────────");
@@ -464,18 +524,18 @@ async fn adversarial_equivocation_over_gossip() {
     let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
-    assert!(wait_all_apis_up(&ports), "nodes did not start");
+    if !wait_all_apis_up(&ports) { fail_with_evidence(&ports, &log_dir, "nodes did not start"); }
 
     println!("   [phase1] Waiting for height >= 2...");
-    assert!(
-        poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)),
-        "chain did not reach height 2 before attack"
-    );
+    if !poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)) {
+        fail_with_evidence(&ports, &log_dir, "chain did not reach height 2 before attack");
+    }
 
     // Start attacker and wait for gossipsub mesh.
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
     eprintln!("   [attacker] waiting 2s for gossipsub mesh...");
     tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_attacker_connected(&attacker).await;
 
     let balance_before = balance_of(ports.alice_api, "qcb1alice");
     eprintln!("   alice balance before: {balance_before:?} uqcb");
@@ -672,6 +732,7 @@ async fn adversarial_equivocation_over_gossip() {
 #[tokio::test]
 async fn adversarial_garbage_signature() {
     if skip_if_no_binary() { return; }
+    let _one_devnet = ONE_DEVNET_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
 
     // Key files must exist — generated by `gen-devnet-keys`.
     let keys_dir = devnet_keys_dir();
@@ -695,13 +756,12 @@ async fn adversarial_garbage_signature() {
     let _nodes  = spawn_devnet(&ports, &log_dir, true);
 
     println!("   Waiting for API ports...");
-    assert!(wait_all_apis_up(&ports), "nodes did not start in time");
+    if !wait_all_apis_up(&ports) { fail_with_evidence(&ports, &log_dir, "nodes did not start in time"); }
 
     println!("   [phase1] Waiting for height >= 2 (verifying chain starts with real signing)...");
-    assert!(
-        poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)),
-        "chain did not reach height 2 before attack"
-    );
+    if !poll_until_height(&ports.all_api_ports(), 2, Duration::from_secs(30)) {
+        fail_with_evidence(&ports, &log_dir, "chain did not reach height 2 before attack");
+    }
 
     let (attacker, _addr) = start_attacker(ports.alice_p2p).await;
 
@@ -807,6 +867,19 @@ fn tempdir(prefix: &str) -> PathBuf {
 }
 
 /// Dump the tail of node log files to stdout for post-mortem inspection.
+/// Fail a test and keep the evidence: the last lines of every node's log and the current heights/peer counts. Used on the EARLY failure
+/// paths (nodes did not start, chain did not reach height 2) that used to panic with no log at all.
+fn fail_with_evidence(ports: &DevnetPorts, log_dir: &std::path::Path, what: &str) -> ! {
+    let heights: Vec<u64> = ports.all_api_ports().iter().map(|&p| height_of(p)).collect();
+    let peers: Vec<Option<u64>> = ports.all_api_ports().iter()
+        .map(|&p| api_get(p, "/api/status").and_then(|v| v["peer_count"].as_u64())).collect();
+    let answered: Vec<bool> = ports.all_api_ports().iter().map(|&p| api_get(p, "/api/status").is_some()).collect();
+    println!("\n── FAILURE EVIDENCE: {what} ──\n   heights (alice, bob, carol, dave) = {heights:?}\n   peer_count = {peers:?}\n   api ports = {:?}, answered = {answered:?}\n   p2p ports = {:?}\n   (a node whose API never answers while its log shows blocks usually failed to bind its API port: look for `failed to bind HTTP API port`)",
+        ports.all_api_ports(), [ports.alice_p2p, ports.bob_p2p, ports.carol_p2p, ports.dave_p2p]);
+    dump_logs(log_dir, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"], 25);
+    panic!("{what} (heights {heights:?}, peer_count {peers:?}; node logs printed above)");
+}
+
 fn dump_logs(log_dir: &std::path::Path, names: &[&str], tail_lines: usize) {
     for name in names {
         let log = log_dir.join(format!("{name}.log"));
