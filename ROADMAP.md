@@ -1,5 +1,59 @@
 # Qattice — Public Testnet Alpha: ML-DSA-65 + PQ-HotStuff Launch Plan
 
+## Status refresh — 2026-11-05 (verified against GitHub; append-only)
+
+> **Documentation only.** This section was added on top of the roadmap in draft PR #96 and removes nothing. Earlier text, including the status column of the gate table below it, is kept as historical evidence of what was true when it was written; where it differs from this section, **this section is the current status**. It marks **no gate complete**. No production code, merge or deployment is authorized by it. The locked PQ-HotStuff direction (D1–D5, `docs/pq-hotstuff-001-spec.md`) is unchanged.
+
+### How to read the status columns
+Four different things are tracked separately and must not be conflated:
+- **Implemented**: code exists on a branch (draft PR).
+- **Windows-confirmed**: the owner ran the stated command on the Windows machine (BossKing, MINGW64) at the stated commit and pasted the result into the PR. Per `CLAUDE.md`, a sandbox/CI run never counts.
+- **Merged**: in `main`. Nothing here is merged without explicit owner approval.
+- **Public-alpha ready**: a gate's own acceptance evidence is complete. **None is.**
+
+### Merged to `main` so far (test-only or feature-gated, inactive by default)
+| PR | What | Note |
+|---|---|---|
+| #95 | K1 FIPS 204 ML-DSA-65 conformance characterization | the legacy `pqcrypto-dilithium` backend is not conformant |
+| #97 | isolated `fips204` 0.5.0 backend behind a feature gate | inactive unless the feature is enabled |
+| #98 | test-only signing v2 in the execution path (H0-4 fix) | feature + config switch |
+| #99 | four-node state-root agreement on signing-v2 transactions | test-only |
+| #100, #101 | signing-v2 ingress alignment and signature verification at ingress | test-only |
+
+### Open draft PRs #102–#110 (none merged; stacking shown by base branch)
+| PR | Scope | Base | Head | Implemented | Windows-confirmed (owner-reported in the PR) |
+|---|---|---|---|---|---|
+| #102 | wallet signing-v2 signer | `main` | `80c687a` | yes | yes, 8 passed at `80c687a` |
+| #103 | `qcb-wallet` transfer-v2 CLI | #102 | `58d10a4` | yes | yes, 7 passed at `58d10a4` |
+| #104 | genesis `commitment_profile` (`qattice-v2`; absent = legacy) | `main` | `1e63496` | yes | yes, node `--features signing-v2` 23 passed at `1e63496` |
+| #105 | scheduler settlement signing v2 (took a secret key) | #102 | `9c56b3d` | yes | yes at `9c56b3d` (6 passed); **its key-in-request design is superseded by #110** |
+| #106 | `qcb-keygen` `mldsa-v2` / `check-v2` | #102 | `c55a37e` | yes | yes, 9 passed, commit shown `c55a37e` |
+| #108 | Public Alpha launch manifest gate and release bundle | #104 | `ac5fe3e` | yes | yes, launch crate 15 passed at `ac5fe3e`; node `public-alpha` run reported at the same head |
+| #109 | encrypted ML-DSA-65 key storage with verified Windows ACLs (closes #107) | #106 | `826fab4` | yes | yes: tests rerun at `826fab4` after an icacls UTF-16LE fix, plus a manual ACL check with a disposable key |
+| #110 | scheduler settlement without private keys (prepare / external sign / submit; old `/settle` = 410) | #105 | `2808a90` | yes | yes: lib 66, `claim_flow_e2e` 1, `claim_signer` 6 (`--features signing-v2`) and lib 53, `default_build` 2 (default) passed at `2808a90`, commit shown; first attempts hit a corrupt local build cache, fixed by `cargo clean` |
+
+Integration dependencies: #103, #105 and #106 build on #102; #109 builds on #106; #110 builds on #105; #108 builds on #104. #102 and #104 are independent of each other and both branch from `main`. A merge-readiness report for the chain is separate from this document.
+
+### Gate status, refreshed (does not overwrite the table below)
+| Gate | Evidence now | Not yet satisfied |
+|---|---|---|
+| QAT-01 / K1 | `fips204` 0.5.0 passed measured NIST ACVP vectors on Linux; backend merged feature-gated (#97) | final security acceptance; independent cryptographic review; Windows K1 and RNG/hedged-signing review are not recorded as complete here |
+| QAT-02 / signing v2 | execution path (#98), ingress (#100, #101) merged; wallet, CLI, keygen, key storage and a key-free scheduler flow are implemented in draft PRs with Windows confirmation for #102–#106, #108, #109 | personhood, dis-core and web/Android signers **not started**; independent vectors and review; no merge of #102–#110 |
+| QAT-03 / genesis v2 | `commitment_profile` (#104) and the launch gate (#108) tested on Windows | a real alpha genesis (chain id, environment, ML-DSA validator set, balances) does **not exist**; owner inputs outstanding |
+| QAT-04 / hardening | partial; see the original table | open: P2P bootstrap (below), state and recovery items |
+| QAT-05 … QAT-09 | unchanged: pending | PQ-HotStuff is not implemented; Tendermint remains the private devnet baseline |
+| QAT-10 / transport | unchanged: open | libp2p / Noise / gossip / TLS remain classical; nothing here is "post-quantum" end to end |
+| QAT-11 / public alpha | **not authorized** | requires every gate above, an explicit launch manifest and owner authorization |
+
+### Findings recorded since the November 5 plan
+- **P2P bootstrap start-order race (QAT-04, open, not fixed).** Nodes dial `--bootstrap` once at startup with no retry. Measured in the Linux sandbox (not on Windows) on a four-node devnet: simultaneous start failed in 4 of 6 trials, staggered start succeeded in 6 of 6; the original stall was observed on the owner's Windows machine. This was first mis-attributed to MSYS path rewriting; that was wrong. MSYS argument rewriting is a separate, real Windows hazard, but it was not the cause. Needed: bounded retry with backoff and a deterministic repeated four-node startup test, as its own PR.
+- **Scheduler private-key transmission** is addressed in draft #110 (not merged; Windows-confirmed at `2808a90`). Remaining limits are listed in that PR: no TLS or authentication on the scheduler API, caller-supplied `node_url`, key held in memory by the signer process, heuristic key-material detection, and a breaking change for legacy chains and external callers of the old route.
+- **Key storage:** #109 provides encrypted storage and verified ACLs for `qcb-keygen` keys. The legacy wallet container is a different format and is not migrated. No production validator keys have been generated.
+- **Consensus on the devnet** is Tendermint with ML-DSA-65 keys (`tests/devnet/genesis-4node-mldsa.json`); HotStuff/FBA remain devnet-only. This is not PQ-HotStuff and not the public-alpha network.
+
+### Still open, not authorized by this section
+PQ-HotStuff Phases 0–2 · public-alpha genesis and validator allocations · bootstrap retry · remaining signers · independent cryptographic and security review · transport disposition · any merge of #102–#110 · public deployment.
+
 ## Owner approval — signing v2 full canonical preimage (2026-11-05)
 
 **APPROVED AND LOCKED:** For the fresh `qattice-v2` chain, use **FIPS 204 pure ML-DSA-65 external signing** with explicit, versioned, purpose-specific Qattice context strings. Sign the **complete canonical, unambiguous, length-delimited transaction preimage** (including chain ID, transaction ID, sender, nonce, gas limit, body and PQ public key), **not a separately SHA-256-hashed digest**. This explicitly **supersedes** the earlier approved SHA-256 transaction-prehash-as-message decision wherever it appears in the new public-testnet plan or draft PR #94. Existing legacy chains and their signatures are unchanged.
