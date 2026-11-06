@@ -67,6 +67,46 @@ the operator's address in genesis `settlement_operators`; `treasury:pocd-researc
 | 501 | `signing_unavailable` | the scheduler was built without `signing-v2` |
 | 502 | `node_submission_failed` | the node did not accept the transaction |
 
+## Known dependencies, and what is not known
+Owner decision (2026-11-06): the HTTP 410 is the intended secure behaviour for Qattice v2. **Do not assume external operators are unaffected.**
+
+**Known (searched every tracked file of the repository at PR #110 head `2808a90`):**
+| Where | Dependency | Action |
+|---|---|---|
+| `tests/devnet/results/pocd-e2e-2026-10-11.md` | a historical record of two manual calls to the old route | none; it is evidence of what happened on 2026-10-11 and is left as written |
+| `ROADMAP.md` (COS-PoCD-000/002 rows) | planned work says it will "reuse research reward settlement" | that work must use prepare / sign / submit; it must not be built on the old route |
+| `docs/key-storage/*` | prose that mentions the old route as a blocking issue | closed by PR #110 once merged |
+| workspace crates, `scripts/`, miner, verifier, wallet | **none**: no code calls the route | none |
+
+**Not known (cannot be searched from the repository):** operator scripts, cron jobs, dashboards, CI jobs, runbooks and shell history on
+machines outside this repository; other repositories; anything that talks to a deployed scheduler. The only evidence available is each
+operator's own, so the checks below must be run by whoever operates a scheduler.
+
+## Operator self-check (read-only; run before the upgrade)
+Find anything that still sends the old request or a private key:
+```bash
+# Git Bash: tracked scripts and notes under your own folders (adjust the roots; -I skips binaries, -l lists files only)
+grep -rIl --exclude-dir=target --exclude-dir=.git -E "operator_secret_key_hex|/settle([^/a-z_]|$)" /c/Dev /c/Users/"$USERNAME"/Documents 2>/dev/null
+```
+```powershell
+# PowerShell equivalent
+Get-ChildItem C:\Dev -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\(target|\.git)\\' } |
+  Select-String -Pattern 'operator_secret_key_hex','/settle(?![/a-z_])' -List | Select-Object -ExpandProperty Path
+```
+Also check any reverse proxy or scheduler access log you keep for `POST …/settle` (without `/prepare` or `/submit`). Any hit means a client
+still needs the new flow. A client that gets `410` must treat it as permanent and must not retry.
+
+## Required steps before the scheduler with this change is deployed
+1. Inventory callers (self-check above) and list who owns each.
+2. Tell every owner the old route returns 410 from the new scheduler build, and share this guide.
+3. Treat every operator key that was ever sent to the old route as exposed; create a new wallet and register the new address in genesis
+   `settlement_operators` (or, on a running chain, through the chain's own governance path; this guide does not change it).
+4. Build the scheduler and `qcb-claim-signer` with `--features signing-v2`; rehearse prepare / sign / submit on a devnet first.
+5. Only then deploy. **Rollback** is the previous scheduler build, which keeps the key-in-body route; use it only as a stop-gap and rotate
+   the key again afterwards.
+6. Record the date each caller was migrated. A caller that cannot migrate (for example a legacy, non-`qattice-v2` chain) has no
+   scheduler-assisted path; that is a known loss of function, not a bug.
+
 ## Remaining limitations (unchanged by this document)
 No TLS or authentication on the scheduler API; `node_url` is caller-supplied (SSRF risk); the key-material check is heuristic (the
 structural guarantee is that no field or code path accepts a key); the signer holds the key in memory while signing; the wallet file
