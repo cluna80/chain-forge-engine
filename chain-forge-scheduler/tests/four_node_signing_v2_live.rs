@@ -5,9 +5,9 @@
 //! | V-01 | a transfer signed locally by `qcb-wallet transfer-v2` (first use) commits; all 4 nodes include it in the same block and agree on the state root |
 //! | V-02 | a second transfer from the now-bound key (no key carried) commits |
 //! | V-03 | an exact replay of an executed signed tx changes nothing on any node |
-//! | V-04 | the same signature moved to a new nonce / id (H0-4 replay) is refused |
-//! | V-05 | a body edited after signing is refused |
-//! | V-06 | a v2 signature made for ANOTHER chain id is refused |
+//! | V-04 | the same signature moved to a new nonce / id (H0-4 replay) is refused: `GET /api/tx/{id}` reports `rejected` with code `signing_v2_authorization` |
+//! | V-05 | a body edited after signing is refused: same code |
+//! | V-06 | a v2 signature made for ANOTHER chain id is refused: same code |
 //! | V-07 | a LEGACY-digest ML-DSA signature is refused on the v2 chain (no cross-acceptance) |
 //! | V-08 | prepare -> `qcb-claim-signer` -> submit settles a `ClaimResearchReward` on the real nodes: block inclusion, treasury debited, recipient credited, roots agree |
 //! | V-09 | the settled claim cannot be replayed (directly at a node, or through the scheduler) and a wrong `--expect-chain-id` makes the signer refuse |
@@ -103,6 +103,18 @@ fn wait_tx_result(port: u16, id: &str, secs: u64) -> Option<Value> {
         if let Some(v) = api_get(port, &format!("/api/tx/{id}")) {
             let nf = v["error"].as_str().map_or(false, |e| e.contains("not found"));
             if !nf && (v.get("success").is_some() || v.get("error").is_some()) { return Some(v); }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    None
+}
+
+/// Poll `GET /api/tx/{id}` until the node reports the transaction as refused at admission (PR #116 contract), or give up.
+fn wait_refusal(port: u16, id: &str, secs: u64) -> Option<Value> {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if let Some(v) = api_get(port, &format!("/api/tx/{id}")) {
+            if v["state"] == "rejected" { return Some(v); }
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -228,7 +240,7 @@ fn legacy_transfer(kp: &chain_forge_crypto::KeyPair, sender: &str, to: &str, id:
 fn account(label: &str, address: &str, balance: &str, role: &str) -> Value { json!({ "label": label, "address": address, "balance": balance, "role": role }) }
 
 /// Submit; it must be refused or, if admitted, must fail at execution, and `who`'s (nonce, balance) must not move on any node.
-fn expect_not_applied(net: &Net, tx: &Value, who: &str, what: &str) {
+fn expect_not_applied(net: &Net, tx: &Value, who: &str, what: &str, expect_code: Option<&str>) {
     let snap = || net.api.iter().map(|&p| (nonce(p, who), balance(p, who))).collect::<Vec<_>>();
     let before = snap();
     let id = tx["id"].as_str().unwrap().to_string();
@@ -237,16 +249,27 @@ fn expect_not_applied(net: &Net, tx: &Value, who: &str, what: &str) {
         println!("    {what}: refused at the API (400): {}", resp["message"].as_str().unwrap_or(&resp.to_string()).chars().take(110).collect::<String>());
     } else {
         assert_eq!(resp["status"], "queued", "{what}: unexpected answer {code} {resp}");
-        // Admitted. Two outcomes are acceptable: a recorded execution FAILURE, or no result at all (the transaction was dropped when a
-        // block was built). A recorded SUCCESS is never acceptable. (Observed: when the signing key is already bound the API cannot
-        // verify the signature without account state, so such a tx is queued and then silently dropped.)
-        match wait_tx_result(net.alice(), &id, 30) {
-            Some(r) => {
-                assert!(!r["success"].as_bool().unwrap_or(false), "{what}: {id} was EXECUTED SUCCESSFULLY: {r}");
-                println!("    {what}: admitted, then failed at execution");
-                net.assert_converged(r["height"].as_u64().unwrap_or(0), what);
+        // Admitted by the API (stateless). The node's admission then decides, with account state. PR #116 contract: a refusal is reported by
+        // GET /api/tx/{id} as state "rejected" with a stable code. Without an expected code, a recorded execution failure or no result at
+        // all are also acceptable; a recorded SUCCESS never is.
+        let refusal = wait_refusal(net.alice(), &id, 20);
+        match (expect_code, refusal) {
+            (Some(want), Some(r)) => {
+                assert_eq!(r["code"], want, "{what}: wrong refusal code: {r}");
+                assert_eq!((r["status"].as_str(), r["tx_id"].as_str()), (Some("rejected"), Some(id.as_str())), "{what}: {r}");
+                assert!(r["message"].as_str().map_or(false, |m| !m.is_empty()) && r.get("success").is_none(), "{what}: {r}");
+                println!("    {what}: admitted at the API, then refused by the node: GET /api/tx/{id} -> rejected, code {want}");
             }
-            None => println!("    {what}: admitted at the API, never executed (no result recorded)"),
+            (Some(want), None) => { net.dump_logs(); panic!("{what}: expected GET /api/tx/{id} to report a rejection with code {want}, but none was reported"); }
+            (None, Some(r)) => println!("    {what}: admitted at the API, then refused by the node with code {}", r["code"]),
+            (None, None) => match wait_tx_result(net.alice(), &id, 30) {
+                Some(r) => {
+                    assert!(!r["success"].as_bool().unwrap_or(false), "{what}: {id} was EXECUTED SUCCESSFULLY: {r}");
+                    println!("    {what}: admitted, then failed at execution");
+                    net.assert_converged(r["height"].as_u64().unwrap_or(0), what);
+                }
+                None => println!("    {what}: admitted at the API, never executed (no result recorded)"),
+            },
         }
         for &p in &net.api {
             let v = api_get(p, &format!("/api/tx/{id}")).unwrap_or(Value::Null);
@@ -357,18 +380,25 @@ async fn four_real_nodes_on_a_fresh_qattice_v2_genesis_settle_signed_transfers_a
     expect_committed(&net, &t1, "V-02");
     assert_eq!(net.on_all(|p| balance(p, &sink.address), "V-02 balance"), 3_000);
 
+    // API contract (PR #116): committed results keep their legacy shape; an unknown id is still a 404 with the legacy body.
+    let done = api_get(net.alice(), "/api/tx/v2-t0").expect("a committed tx is readable");
+    assert_eq!(done["success"], true, "{done}");
+    assert!(done.get("code").is_none() && done.get("state").is_none(), "a committed result must not look like a refusal: {done}");
+    let (code, body) = http_raw("GET", net.alice(), "/api/tx/never-submitted", None).map(|(c, b)| (c, b)).unwrap();
+    assert_eq!((code, body.as_str()), (404, r#"{"error":"not found"}"#), "an unknown id keeps the legacy 404");
+
     // V-03..V-07: refusals; nothing about the sender may change anywhere.
     println!("  V-03..V-07 refusals");
-    expect_not_applied(&net, &t1, &user.address, "V-03 exact replay of an executed tx");
+    expect_not_applied(&net, &t1, &user.address, "V-03 exact replay of an executed tx", None);
     let mut moved = t1.clone(); moved["nonce"] = json!(2); moved["id"] = json!("v2-replayed-nonce");
-    expect_not_applied(&net, &moved, &user.address, "V-04 same signature, new nonce and id");
+    expect_not_applied(&net, &moved, &user.address, "V-04 same signature, new nonce and id", Some("signing_v2_authorization"));
     let mut edited = sign_transfer(&user, &sink.address, 10, 2, CHAIN_V2, "v2-edited", false);
     edited["body"]["Transfer"]["amount"] = json!(9_999_999u64);
-    expect_not_applied(&net, &edited, &user.address, "V-05 body edited after signing");
+    expect_not_applied(&net, &edited, &user.address, "V-05 body edited after signing", Some("signing_v2_authorization"));
     let other = sign_transfer(&user, &sink.address, 10, 2, "some-other-chain", "v2-other-chain", false);
-    expect_not_applied(&net, &other, &user.address, "V-06 signature made for another chain id");
+    expect_not_applied(&net, &other, &user.address, "V-06 signature made for another chain id", Some("signing_v2_authorization"));
     let legacy = legacy_transfer(&lkp, &laddr, &sink.address, "legacy-on-v2", 0, CHAIN_V2);
-    expect_not_applied(&net, &legacy, &laddr, "V-07 legacy-digest signature on a v2 chain");
+    expect_not_applied(&net, &legacy, &laddr, "V-07 legacy-digest signature on a v2 chain", None);
     // After all that, a correct transfer at the same nonce still works: the refusals consumed nothing.
     let t2 = sign_transfer(&user, &sink.address, 500, 2, CHAIN_V2, "v2-t2", false);
     expect_committed(&net, &t2, "V-03..07 control");
@@ -413,7 +443,7 @@ async fn four_real_nodes_on_a_fresh_qattice_v2_genesis_settle_signed_transfers_a
     println!("    V-08: claim {claim_tx_id} settled in block {h}: {amount} uqcb treasury -> recipient; roots agree");
 
     // V-09: replay of the settled claim, at a node and through the scheduler.
-    expect_not_applied(&net, &signed["signed_tx"], &op.address, "V-09 replay of the settled claim at a node");
+    expect_not_applied(&net, &signed["signed_tx"], &op.address, "V-09 replay of the settled claim at a node", None);
     assert_eq!(net.on_all(|p| balance(p, TREASURY), "V-09 treasury"), treasury0 - amount as u128, "no second payout");
     let (code, resp) = post_json(&format!("{api}/scheduler/objectives/{obj}/settle/submit"),
         &json!({ "claim_id": signed["claim_id"], "chain_id": CHAIN_V2, "signed_tx": signed["signed_tx"], "node_url": node_url })).await;
@@ -449,7 +479,7 @@ async fn a_legacy_chain_with_the_same_binary_accepts_legacy_signatures_and_refus
     expect_committed(&net, &ok, "L-01 legacy-signed transfer on a legacy chain");
     assert_eq!(net.on_all(|p| nonce(p, &laddr), "L-01 nonce"), 1);
     let v2 = sign_transfer(&v2user, "qcb1bob", 1_000, 0, CHAIN_LEGACY, "v2-on-legacy", true);
-    expect_not_applied(&net, &v2, &v2user.address, "L-02 v2-signed transaction on a legacy chain");
+    expect_not_applied(&net, &v2, &v2user.address, "L-02 v2-signed transaction on a legacy chain", None);
     net.assert_converged(0, "final");
     println!("  ✓ legacy chain: legacy accepted, v2 refused; roots agree");
     drop(net);
