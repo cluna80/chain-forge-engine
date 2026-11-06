@@ -7,9 +7,16 @@ authors.workspace     = true
 license.workspace     = true
 repository.workspace  = true
 
+[[bin]]
+name = "qcb-claim-signer"
+path = "src/bin/qcb-claim-signer.rs"
+required-features = ["signing-v2"]
+
 [dependencies]
 chain-forge-research-db = { path = "../chain-forge-research-db" }
 chain-forge-execution    = { path = "../chain-forge-execution" }
+# TEST-ONLY signing v2 for settlement transactions (docs/mldsa-tx-signing-v2/SPEC.md). Off by default.
+chain-forge-wallet = { path = "../chain-forge-wallet", optional = true }
 chain-forge-crypto       = { path = "../chain-forge-crypto", features = ["real-pqc"] }
 sha2                     = { workspace = true }
 hex                      = { workspace = true }
@@ -37,5 +44,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 name = "qcb-scheduler"
 path = "src/main.rs"
 
+[features]
+signing-v2 = ["dep:chain-forge-wallet", "chain-forge-wallet/signing-v2", "chain-forge-execution/signing-v2", "chain-forge-crypto/fips204-backend"]
+
 [dev-dependencies]
 tokio = { workspace = true }
+chain-forge-core     = { path = "../chain-forge-core" }
+chain-forge-state    = { path = "../chain-forge-state" }
+chain-forge-identity = { path = "../chain-forge-identity" }
+chain-forge-agents   = { path = "../chain-forge-agents" }
+chain-forge-wallet   = { path = "../chain-forge-wallet" }

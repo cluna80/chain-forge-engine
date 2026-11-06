@@ -1,0 +1,7 @@
+test settle_v2_tests::a_v2_settlement_signature_does_not_survive_changes_to_what_it_signs ... ok
+test settle_v2_tests::an_unknown_profile_is_refused_before_anything_is_stored_or_sent ... FAILED
+test settle_v2_tests::a_bad_key_under_v2_is_refused_before_a_claim_is_stored ... FAILED
+test settle_v2_tests::a_v2_settlement_submits_a_transaction_that_verifies_under_signing_v2 ... FAILED
+test settle_v2_tests::control_without_a_profile_the_legacy_signature_is_unchanged ... ok
+test settle_v2_tests::v2_signatures_are_hedged_and_the_transaction_id_is_unchanged ... ok
+test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 53 filtered out; finished in 0.62s

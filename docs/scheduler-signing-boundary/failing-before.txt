@@ -1,0 +1,19 @@
+== lib (settle_signing)
+test settle_signing_tests::legitimate_long_hex_is_not_mistaken_for_a_secret ... FAILED
+test settle_signing_tests::a_correctly_signed_transaction_is_verified_forwarded_unchanged_and_the_claim_marked_submitted ... FAILED
+test settle_signing_tests::a_claim_signed_for_another_chain_or_by_another_key_is_refused_by_the_executor_too ... FAILED
+test settle_signing_tests::prepare_is_idempotent_until_the_claim_is_submitted ... FAILED
+test settle_signing_tests::prepare_refuses_anything_but_the_v2_profile_and_bad_public_keys_and_stores_nothing ... FAILED
+test settle_signing_tests::submit_refuses_every_transaction_that_is_not_exactly_the_prepared_claim_signed_by_the_operator ... FAILED
+test settle_signing_tests::prepare_returns_an_unsigned_transaction_and_a_signing_request_and_stores_a_pending_claim ... FAILED
+test settle_signing_tests::the_scheduler_source_has_no_field_or_variable_for_a_secret_key ... ok
+test settle_signing_tests::requests_carrying_private_key_material_are_rejected_on_every_settlement_endpoint_and_leave_no_trace ... FAILED
+test settle_signing_tests::the_old_settle_endpoint_that_took_a_private_key_is_gone ... FAILED
+test settle_signing_tests::the_real_executor_accepts_the_signed_claim_the_scheduler_forwarded_pays_once_and_refuses_a_replay ... FAILED
+test result: FAILED. 1 passed; 10 failed; 0 ignored; 0 measured; 53 filtered out; finished in 0.55s
+== claim_signer
+test the_signer_refuses_to_sign_anything_but_the_claim_it_was_told_to_expect ... FAILED
+test the_signer_signs_a_genuine_prepared_claim_and_the_result_verifies_under_signing_v2 ... FAILED
+test the_signer_never_prints_the_secret_key_or_the_passphrase_and_never_takes_it_on_the_command_line ... FAILED
+test a_wrong_passphrase_or_a_missing_input_fails_without_output ... FAILED
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.96s
