@@ -48,11 +48,20 @@ the operator's address in genesis `settlement_operators`; `treasury:pocd-researc
    ```
    qcb-claim-signer --wallet operator.wallet.json --prepared prepared.json --expect-chain-id <node chain_id> [--max-amount-uqcb N] > signed.json
    ```
-3. **Submit** the signed transaction. `node_url` must be `http://` or `https://`.
+3. **Submit** the signed transaction. Build the request body from `signed.json` first (a hand-edited JSON body is error-prone), then post it.
+   `node_url` must be `http://` or `https://`.
+   ```bash
+   # Git Bash / Linux (needs jq)
+   jq --arg chain "<node chain_id>" --arg node "http://127.0.0.1:8080" '{claim_id, chain_id: $chain, signed_tx, node_url: $node}' signed.json > submit.json
+   curl -s -X POST $SCHEDULER/scheduler/objectives/$OBJ/settle/submit -H 'content-type: application/json' --data-binary @submit.json
    ```
-   curl -s -X POST $SCHEDULER/scheduler/objectives/$OBJ/settle/submit -H 'content-type: application/json' -d '{
-     "claim_id":"…","chain_id":"<node chain_id>","signed_tx":{…from signed.json…},"node_url":"http://127.0.0.1:8080"}'
+   ```powershell
+   # PowerShell
+   $s = Get-Content signed.json -Raw | ConvertFrom-Json
+   @{ claim_id = $s.claim_id; chain_id = '<node chain_id>'; signed_tx = $s.signed_tx; node_url = 'http://127.0.0.1:8080' } | ConvertTo-Json -Depth 20 | Set-Content submit.json
+   Invoke-RestMethod -Method Post -Uri "$env:SCHEDULER/scheduler/objectives/$env:OBJ/settle/submit" -ContentType 'application/json' -InFile submit.json
    ```
+   The request has exactly four fields: `claim_id`, `chain_id`, `signed_tx`, `node_url`. Any other field is refused.
 
 `prepare` is idempotent until the claim is submitted. A submitted claim cannot be prepared or submitted again (409).
 
