@@ -14,12 +14,12 @@ workspace with no borrowed consensus or state-machine code from any other chain.
 
 ## Current status — Devnet (November 2026)
 
-**Working on a live 4-node devnet:**
+**Supported four-node devnet and separately tested integration configurations:**
 
 | Area | Status |
 |---|---|
 | BFT consensus (Tendermint-style, pluggable) | ✅ Running — 4-node, block-producing; supported devnet validators use ML-DSA-65-format keys on the legacy consensus cryptography backend |
-| ML-DSA-65 user transactions | ✅ Legacy devnet transactions tested; separate FIPS 204-conformant signing-v2 path tested on a fresh private integration fixture, not enabled on the supported devnet |
+| ML-DSA-65 user transactions | ✅ Legacy devnet transactions tested; separate FIPS 204-based signing-v2 implementation tested on a fresh private integration fixture, not enabled on the supported devnet |
 | Replay / nonce protection | ✅ All rejection cases pass |
 | Timestamp monotonicity | ✅ Enforced and regression-tested |
 | Post-quantum identity (DIS protocol) | ✅ 4 pilot devices at Verified tier |
@@ -30,7 +30,9 @@ workspace with no borrowed consensus or state-machine code from any other chain.
 
 **Not yet working / out of scope for Phase 0:**
 
-- **Validator keys versus cryptographic backend:** The supported four-node devnet (`tests/devnet/genesis-4node-mldsa.json`) declares `validator_scheme: ml-dsa-65` and `signature_scheme: pqc-native`; its validator public keys use the ML-DSA-65 format (1,952 bytes). **Consensus votes and block signatures still use the legacy ML-DSA backend, not the FIPS 204-conformant signing-v2 backend.** Migration and verification of validator/consensus signing remain open (QAT-01/02 / legacy ML-DSA roadmap work). Ed25519 validator keys remain in classical-compatibility test fixtures, not the supported ML-DSA devnet.\n- **FIPS 204 scope:** `chain-forge-execution/src/signing_v2.rs` uses the `fips204_backend` for **user transaction** authorization only, under the `signing-v2` feature and an explicit chain commitment profile. It does not upgrade validator votes or block signatures. Four-node signing-v2 integration tests do not establish FIPS 204 conformity of consensus signing.\n- PQ-HotStuff consensus is not implemented or deployed; the supported devnet uses the Tendermint-style engine.
+- **Validator keys versus cryptographic backend:** The supported four-node devnet (`tests/devnet/genesis-4node-mldsa.json`) declares `validator_scheme: ml-dsa-65` and `signature_scheme: pqc-native`; its validator public keys use the ML-DSA-65 format (1,952 bytes). **Consensus votes and block signatures still use the legacy ML-DSA backend, not the FIPS 204-based signing-v2 transaction backend.** Migration and verification of validator/consensus signing remain open (QAT-01/02 / legacy ML-DSA roadmap work). Ed25519 validator keys remain in classical-compatibility test fixtures, not the supported ML-DSA devnet.
+- **FIPS 204 scope:** `chain-forge-execution/src/signing_v2.rs` uses the `fips204_backend` for **user transaction** authorization only, under the `signing-v2` feature and an explicit chain commitment profile. It does not upgrade validator votes or block signatures. Four-node signing-v2 integration tests do not establish FIPS 204 conformity of consensus signing.
+- PQ-HotStuff consensus is not implemented or deployed; the supported devnet uses the Tendermint-style engine.
 - No public testnet — devnet is single-operator
 - No resource marketplace (removed; may return as an optional module post-Phase 0)
 - No independent cryptographic audit of DIS transcript format (return gate documented)
