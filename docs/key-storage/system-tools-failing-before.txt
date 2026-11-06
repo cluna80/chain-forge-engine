@@ -1,0 +1,12 @@
+Failing-before for the #109 follow-up (absolute System32 tool paths). Linux sandbox, scaffold resolver that refuses everything; the launches still use bare names.
+test only_a_bare_file_name_is_accepted ... ok
+test a_relative_or_dotted_root_is_never_used ... FAILED
+test the_tool_path_is_under_system_root_system32 ... FAILED
+test no_system_tool_is_launched_by_a_bare_name ... FAILED
+test windir_is_used_when_system_root_is_missing_and_c_windows_when_both_are ... FAILED
+thread 'a_relative_or_dotted_root_is_never_used' (359) panicked at chain-forge-keygen/tests/system_tools.rs:30:60:
+thread 'the_tool_path_is_under_system_root_system32' (362) panicked at chain-forge-keygen/tests/system_tools.rs:14:62:
+thread 'no_system_tool_is_launched_by_a_bare_name' (360) panicked at chain-forge-keygen/tests/system_tools.rs:50:13:
+fsperm.rs launches a tool by bare name: Command::new("icacls")
+thread 'windir_is_used_when_system_root_is_missing_and_c_windows_when_both_are' (363) panicked at chain-forge-keygen/tests/system_tools.rs:21:60:
+test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
