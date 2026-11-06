@@ -12,14 +12,14 @@ workspace with no borrowed consensus or state-machine code from any other chain.
 
 ---
 
-## Current status — Devnet (October 2026)
+## Current status — Devnet (November 2026)
 
-**Working on a live 4-node devnet:**
+**Supported four-node devnet and separately tested integration configurations:**
 
 | Area | Status |
 |---|---|
-| BFT consensus (Tendermint-style, pluggable) | ✅ Running — 4-node, block-producing |
-| ML-DSA-65 (NIST FIPS 204) user transactions | ✅ Sign, submit, finalize |
+| BFT consensus (Tendermint-style, pluggable) | ✅ Running — 4-node, block-producing; supported devnet validators use ML-DSA-65-format keys on the legacy consensus cryptography backend |
+| ML-DSA-65 user transactions | ✅ Legacy devnet transactions tested; separate FIPS 204-based signing-v2 implementation tested on a fresh private integration fixture, not enabled on the supported devnet |
 | Replay / nonce protection | ✅ All rejection cases pass |
 | Timestamp monotonicity | ✅ Enforced and regression-tested |
 | Post-quantum identity (DIS protocol) | ✅ 4 pilot devices at Verified tier |
@@ -30,7 +30,9 @@ workspace with no borrowed consensus or state-machine code from any other chain.
 
 **Not yet working / out of scope for Phase 0:**
 
-- Consensus validators still use Ed25519 keys (ML-DSA validator keys are Phase 1 / mainnet)
+- **Validator keys versus cryptographic backend:** The supported four-node devnet (`tests/devnet/genesis-4node-mldsa.json`) declares `validator_scheme: ml-dsa-65` and `signature_scheme: pqc-native`; its validator public keys use the ML-DSA-65 format (1,952 bytes). **Consensus votes and block signatures still use the legacy ML-DSA backend, not the FIPS 204-based signing-v2 transaction backend.** Migration and verification of validator/consensus signing remain open (QAT-01/02 / legacy ML-DSA roadmap work). Ed25519 validator keys remain in classical-compatibility test fixtures, not the supported ML-DSA devnet.
+- **FIPS 204 scope:** `chain-forge-execution/src/signing_v2.rs` uses the `fips204_backend` for **user transaction** authorization only, under the `signing-v2` feature and an explicit chain commitment profile. It does not upgrade validator votes or block signatures. Four-node signing-v2 integration tests do not establish FIPS 204 conformity of consensus signing.
+- PQ-HotStuff consensus is not implemented or deployed; the supported devnet uses the Tendermint-style engine.
 - No public testnet — devnet is single-operator
 - No resource marketplace (removed; may return as an optional module post-Phase 0)
 - No independent cryptographic audit of DIS transcript format (return gate documented)
@@ -138,7 +140,7 @@ is the team to take it to a public testnet, an audit, and eventually mainnet.
 | Role | What's needed |
 |---|---|
 | **Cryptographer / protocol security** | Independent review of the DIS transcript format and ML-DSA integration; formal security model for the personhood-weighted consensus design; help specifying the ZK-VRC proof system for humanity verification |
-| **Distributed systems / consensus** | Phase 1 work: migrate consensus validator keys from Ed25519 to ML-DSA, formal liveness/safety analysis, honest validator threshold proofs for the personhood-weighted variant |
+| **Distributed systems / consensus** | Migrate the existing ML-DSA-65 validator consensus signing path from the legacy backend to a reviewed FIPS 204-conformant backend; implement and validate PQ-HotStuff, formal liveness/safety analysis and personhood-weighted threshold proofs |
 | **Mobile / Android** | Take `dis-wallet-android` from reference implementation to production: HSM key storage, secure enclave integration, UX for the DIS identity flow |
 | **Rust / blockchain infra** | Network hardening, persistent storage (current devnet is in-memory after restart), peering and discovery for a public testnet, the FeeSponsor execution wiring |
 | **Scientific computing / Grand Challenge** | Domain expertise to evaluate and design Grand Challenge tasks; verifier independence and quorum design; integration with real computational workloads |
