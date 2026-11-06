@@ -40,6 +40,8 @@ fn usage() -> ! {
     eprintln!("  qcb-wallet sign-tx    --wallet <file> --body <json> [--chain-id <id>]");
     eprintln!("  qcb-wallet sign-challenge --challenge <json> --path <file> [--passphrase <pass>]");
     eprintln!("  qcb-wallet submit     --wallet <file> --body <json> --node <host:port> [--chain-id <id>] [--dry-run]");
+    #[cfg(feature = "signing-v2")]
+    eprintln!("  qcb-wallet transfer-v2 --wallet <file> --to <addr> --amount <n> --nonce <n> --chain-id <id> [--denom <d>] [--id <id>] [--gas-limit <n>] [--address-prefix <p>] [--first-use] [--node <host:port>]   (TEST-ONLY signing v2)");
     eprintln!();
     eprintln!("Set QCB_WALLET_PASSPHRASE env var to skip the passphrase prompt.");
     std::process::exit(2);
@@ -68,6 +70,8 @@ fn main() {
         "sign-tx"        => cmd_sign_tx(&args[2..]),
         "sign-challenge" => cmd_sign_challenge(&args[2..]),
         "submit"         => cmd_submit(&args[2..]),
+        #[cfg(feature = "signing-v2")]
+        "transfer-v2"    => cmd_transfer_v2(&args[2..]),
         "--help" | "-h"  => usage(),
         other => {
             eprintln!("unknown subcommand: {other}");
@@ -317,4 +321,82 @@ fn wallet_flag(args: &[String]) -> String {
     }
     eprintln!("--wallet <file> is required");
     usage();
+}
+
+/// TEST-ONLY signing v2: sign one transfer and print exactly one transaction JSON document on stdout (or submit it with
+/// `--node`). `--nonce` and `--chain-id` are required: nothing is signed for a guessed chain or nonce. `--first-use` puts the
+/// public key in the transaction (needed until the account's key is bound on chain).
+#[cfg(feature = "signing-v2")]
+fn cmd_transfer_v2(args: &[String]) {
+    use chain_forge_wallet::signing_v2::{sign_transaction_v2, submit_v2, V2TxParams};
+    let (mut wallet, mut to, mut amount, mut nonce, mut chain) = (None, None, None, None, None);
+    let mut denom = "uqcb".to_string();
+    let mut id: Option<String> = None;
+    let mut gas_limit: u64 = 500_000;
+    let mut prefix = "qcb".to_string();
+    let mut first_use = false;
+    let mut node: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].clone();
+        let mut val = || -> String {
+            i += 1;
+            match args.get(i) {
+                Some(v) => v.clone(),
+                None => { eprintln!("missing value for {flag}"); std::process::exit(2) }
+            }
+        };
+        match flag.as_str() {
+            "--wallet"         => wallet = Some(val()),
+            "--to"             => to = Some(val()),
+            "--amount"         => amount = Some(val()),
+            "--nonce"          => nonce = Some(val()),
+            "--chain-id"       => chain = Some(val()),
+            "--denom"          => denom = val(),
+            "--id"             => id = Some(val()),
+            "--gas-limit"      => gas_limit = val().parse().unwrap_or_else(|_| { eprintln!("--gas-limit must be a number"); std::process::exit(2) }),
+            "--address-prefix" => prefix = val(),
+            "--node"           => node = Some(val()),
+            "--first-use"      => first_use = true,
+            other => { eprintln!("unknown flag: {other}"); usage(); }
+        }
+        i += 1;
+    }
+    let need = |v: Option<String>, name: &str| v.unwrap_or_else(|| { eprintln!("{name} is required"); std::process::exit(2) });
+    let wallet = need(wallet, "--wallet");
+    let to = need(to, "--to");
+    let chain = need(chain, "--chain-id");
+    let amount: u128 = need(amount, "--amount").parse().unwrap_or_else(|_| { eprintln!("--amount must be a whole number"); std::process::exit(2) });
+    let nonce: u64 = need(nonce, "--nonce").parse().unwrap_or_else(|_| { eprintln!("--nonce must be a whole number"); std::process::exit(2) });
+    let id = id.unwrap_or_else(|| {
+        use rand::RngCore;
+        let mut r = [0u8; 6];
+        rand::rngs::OsRng.fill_bytes(&mut r);
+        format!("wallet-v2-{nonce}-{}", r.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    });
+
+    let pass = passphrase();
+    let (_kf, kp) = load_wallet(&wallet, &pass).unwrap_or_else(|e| {
+        eprintln!("error loading wallet: {e}");
+        std::process::exit(1);
+    });
+    let params = V2TxParams {
+        id, nonce, gas_limit, sender: None, carry_key: first_use,
+        body: chain_forge_execution::TxBody::Transfer { to, amount, denom },
+    };
+    let tx = sign_transaction_v2(&kp, &chain, &prefix, params).unwrap_or_else(|e| {
+        eprintln!("signing failed: {e}");
+        std::process::exit(1);
+    });
+    match node {
+        None => println!("{}", serde_json::to_string(&tx).expect("serialise")),
+        Some(n) => {
+            let (host, port) = n.split_once(':').unwrap_or_else(|| { eprintln!("--node must be host:port"); std::process::exit(2) });
+            let port: u16 = port.parse().unwrap_or_else(|_| { eprintln!("port must be a number"); std::process::exit(2) });
+            match submit_v2(host, port, &tx) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                Err(e) => { eprintln!("submit failed: {e}"); std::process::exit(1); }
+            }
+        }
+    }
 }
