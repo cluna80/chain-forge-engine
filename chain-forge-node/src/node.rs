@@ -444,11 +444,22 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 impl RefusedTxLog {
+    /// Remember that `tx_id` was refused. The same id takes one slot (it is updated in place); when the log is full the oldest entry is
+    /// evicted. Id and detail are clipped, so one entry has a fixed maximum size and the whole log a fixed maximum memory.
     pub fn record(&mut self, tx_id: &str, code: &str, detail: &str) {
-        let _ = (tx_id, code, detail); // scaffold: not recording yet
+        let key = clip(tx_id, MAX_REFUSED_ID_LEN);
+        let entry = RefusedTx { tx_id: key.clone(), code: code.to_string(), message: clip(detail, MAX_REFUSED_DETAIL_LEN) };
+        if self.by_id.insert(key.clone(), entry).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > MAX_REFUSED_TXS {
+                if let Some(oldest) = self.order.pop_front() { self.by_id.remove(&oldest); }
+            }
+        }
     }
+    /// Forget a refusal (the same id was admitted later).
     pub fn remove(&mut self, tx_id: &str) {
-        let _ = tx_id; // scaffold
+        let key = clip(tx_id, MAX_REFUSED_ID_LEN);
+        if self.by_id.remove(&key).is_some() { self.order.retain(|k| *k != key); }
     }
     pub fn get(&self, tx_id: &str) -> Option<&RefusedTx> { self.by_id.get(&clip(tx_id, MAX_REFUSED_ID_LEN)) }
     pub fn len(&self) -> usize { self.by_id.len() }
@@ -2956,11 +2967,22 @@ impl Node {
             // over gossip are not re-published (gossipsub
             // already propagates them through the mesh).
             let payload = serde_json::to_vec(&tx).unwrap_or_default();
-            if self.submit_tx(tx) {
-                let _ = self.network.publish(OutboundMessage {
-                    topic:   GossipTopic::Transaction,
-                    payload,
-                }).await;
+            let id = tx.id.clone();
+            match self.try_submit_tx(tx) {
+                Ok(()) => {
+                    // Admitted: an earlier refusal of this id (a corrected resubmission) no longer applies.
+                    self.explorer.lock().unwrap().refused_txs.remove(&id);
+                    let _ = self.network.publish(OutboundMessage {
+                        topic:   GossipTopic::Transaction,
+                        payload,
+                    }).await;
+                }
+                Err(r) if r.is_reportable() => {
+                    // The API answered `queued_for_validation`; this is the outcome that answer promised. Callers read it from
+                    // GET /api/tx/{id}. (Bounded: see `RefusedTxLog`.)
+                    self.explorer.lock().unwrap().refused_txs.record(&id, r.code, &r.detail);
+                }
+                Err(_) => {} // already pending or already committed: the original outcome stands
             }
         }
     }
@@ -15588,6 +15610,13 @@ mod tests {
         log.remove(&long_id);
         assert!(log.get(&long_id).is_none());
         assert_eq!(log.len(), 1);
+        // Recording the same id over and over must not push other entries out early (it is one slot, not many).
+        log.record("keep", "mempool_full", "k");
+        for _ in 0..(2 * MAX_REFUSED_TXS) { log.record("dup", "mempool_full", "d"); }
+        assert!(log.get("keep").is_some(), "re-recording one id must not evict older entries");
+        assert_eq!(log.len(), 3);
+        // The bound is a small fixed constant, not whatever a test computes from it.
+        assert!(MAX_REFUSED_TXS <= 4_096 && MAX_REFUSED_TXS >= 64);
     }
 
     #[tokio::test]
