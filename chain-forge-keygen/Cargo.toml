@@ -15,3 +15,8 @@ path = "src/main.rs"
 chain-forge-crypto = { path = "../chain-forge-crypto", features = ["real-pqc", "real-crypto"] }
 serde_json = { workspace = true }
 hex        = { workspace = true }
+chain-forge-core = { path = "../chain-forge-core", optional = true }
+
+[features]
+# TEST-ONLY signing v2 key generation and checking (conforming FIPS 204 keygen). Off by default; legacy commands untouched.
+signing-v2 = ["dep:chain-forge-core", "chain-forge-crypto/fips204-backend"]

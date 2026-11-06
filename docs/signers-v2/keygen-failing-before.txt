@@ -1,0 +1,11 @@
+test an_output_file_is_required_so_secrets_never_go_to_a_terminal ... ok
+test an_existing_file_is_never_overwritten ... FAILED
+test check_v2_accepts_its_own_files_and_prints_only_public_information ... FAILED
+test check_v2_rejects_every_kind_of_damage ... FAILED
+test check_v2_accepts_a_legacy_generated_key_file ... FAILED
+test mldsa_v2_writes_a_consistent_key_file ... FAILED
+test stdout_and_stderr_carry_no_secret_material ... FAILED
+test control_the_legacy_mldsa_command_is_unchanged ... ok
+test the_key_file_is_readable_by_its_owner_only ... FAILED
+test two_runs_give_different_keys ... FAILED
+test result: FAILED. 2 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
