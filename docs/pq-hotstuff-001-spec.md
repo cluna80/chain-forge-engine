@@ -1,6 +1,6 @@
 # PQ-HOTSTUFF-001 — PQ-HotStuff-2 Consensus: Protocol Specification
 
-Status: **Decisions D1–D5 locked (owner, 2026-10-28). Designation and cryptographic interface adopted (owner, 2026-11-06; §13 table N, §3.1). Revision for review: not yet approved.** Implements the locked direction of 2026-10-28 ("Qattice PQ-HotStuff Consensus Specification"). No code yet. No activation on any network.
+Status: **Decisions D1–D5 locked (owner, 2026-10-28). Designation and cryptographic interface adopted (owner, 2026-11-06; §3.1, §15). Revision for review: not yet approved.** Implements the locked direction of 2026-10-28 ("Qattice PQ-HotStuff Consensus Specification"). No code yet. No activation on any network.
 Date: 2026-10-28 (revised 2026-11-06)
 Designation: **PQ-HotStuff-2** is the official name of this protocol (the first planned HotStuff-based Qattice consensus; not a successor to a shipped "PQ-HotStuff-1"). This file name, the document ID `PQ-HOTSTUFF-001`, the config value `pq-hotstuff` and the module path stay unchanged until a separately reviewed change renames them. In this document "PQ-HotStuff" means PQ-HotStuff-2.
 Scope: Qattice mainnet consensus; a selectable Chain Forge `ConsensusEngine`.
@@ -169,7 +169,9 @@ Evidence types:
 
 Each item of evidence is self-verifying: both signatures check under the offender's key for that epoch (under §3.1, with the right context and `alg_id`).
 
-**Evidence compares canonical signed messages, not signature bytes.** Because signing is hedged (§3.1), two signatures over the *same* canonical vote message differ in bytes and are **not** evidence (a restarted node that re-signs, or a relay that re-sends, never causes slashing). A double vote is two votes by the same voter for the same `(epoch, round)` whose canonical vote messages differ (different `block_id`). Evidence is deduplicated by the hash of the canonical message pair, never by signature bytes. Required tests: re-signing the same vote produces different bytes and no evidence; two different messages produce evidence; the same evidence cannot be included twice. (A vote followed by a timeout in the same round is **not** evidence; §5 allows it. Lock-violation evidence, such as a timeout whose high QC is below a QC the signer already voted on, is a Phase 3 candidate.)
+**Evidence compares canonical signed messages, not signature bytes.** Because signing is hedged (§3.1), two signatures over the *same* canonical vote message differ in bytes and are **not** evidence (a restarted node that re-signs, or a relay that re-sends, never causes slashing). A double vote is two votes by the same voter for the same `(epoch, round)` whose canonical vote messages differ (different `block_id`). Evidence is deduplicated by the hash of the canonical message pair, never by signature bytes. Required tests: re-signing the same vote produces different bytes and no evidence; two different messages produce evidence; the same evidence cannot be included twice.
+
+(A vote followed by a timeout in the same round is **not** evidence; §5 allows it. Lock-violation evidence, such as a timeout whose high QC is below a QC the signer already voted on, is a Phase 3 candidate.)
 
 **Handling must be committed evidence (release gate 4).** Evidence is included in a block's payload. It is validated during proposal checks and applied during execution, identically on every node. A node never slashes from its own local observation. The #24 live run showed what happens otherwise: each node slashes when it happens to see the double vote, node states diverge, and the chain halts. Gate 4 builds this for Tendermint first. PQ-HotStuff reuses it unchanged.
 
