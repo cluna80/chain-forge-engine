@@ -31,14 +31,17 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     /// The delay after `done` redials have been made (`done = 0`: the delay before the first redial).
     pub fn delay_after(&self, done: u32) -> Duration {
-        let _ = done;
-        Duration::ZERO // scaffold: real backoff not implemented yet
+        let factor = 1u32.checked_shl(done).unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max_delay)
     }
 }
 
 /// Strip a trailing `/p2p/<peer id>` so `"/ip4/1.2.3.4/tcp/9"` and `"/ip4/1.2.3.4/tcp/9/p2p/12D3…"` name the same dial target.
 pub fn normalize(addr: &str) -> String {
-    addr.to_string() // scaffold: real normalisation not implemented yet
+    match addr.find("/p2p/") {
+        Some(i) => addr[..i].to_string(),
+        None => addr.to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -71,13 +74,23 @@ impl BootstrapRetry {
 
     /// Addresses to dial again at `now`. Each returned address counts as one redial and is rescheduled (or finished, at the bound).
     pub fn due(&mut self, now: Duration) -> Vec<String> {
-        let _ = now;
-        Vec::new() // scaffold: never redials
+        let mut out = vec![];
+        for e in self.entries.iter_mut().filter(|e| !e.finished && e.next_at <= now) {
+            out.push(e.addr.clone());
+            e.done_attempts += 1;
+            if e.done_attempts >= self.policy.max_attempts {
+                e.finished = true; // the bound
+            } else {
+                e.next_at = now + self.policy.delay_after(e.done_attempts);
+            }
+        }
+        out
     }
 
     /// An outbound connection to `addr` succeeded: stop redialling it.
     pub fn mark_connected(&mut self, addr: &str) {
-        let _ = addr; // scaffold
+        let key = normalize(addr);
+        for e in self.entries.iter_mut().filter(|e| e.key == key) { e.finished = true; }
     }
 
     /// Addresses that may still be redialled.
