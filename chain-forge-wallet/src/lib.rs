@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
+#[cfg(feature = "signing-v2")]
+pub mod signing_v2;
+
 pub use chain_forge_crypto::{KeyPair, MlDsaScheme, SchemeId, SignatureScheme};
 use chain_forge_crypto::mldsa_tx_prehash;  // CS-001-M2: canonical PQ pre-hash helper
 
@@ -44,6 +47,9 @@ pub enum WalletError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("signing v2: {0}")]
+    SigningV2(String),
 
     #[error("hex decode error: {0}")]
     Hex(String),
