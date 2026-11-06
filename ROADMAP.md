@@ -1710,3 +1710,33 @@ security-validation prerequisites, not completed findings.
 **First product wedge:** Verified deterministic scientific/cryptographic computation. General-purpose GPU/AI workloads are a later expansion and must not inherit unsupported PoCD verification claims.
 
 **Non-goals for initial milestone:** Replacing BFT with PoCD; requiring every paid job to produce scientific discoveries; creating a new token; modifying the fixed QCB supply; claiming general-purpose zero-knowledge proof of computation; production launch before security review and customer validation.
+
+---
+
+## QAT-FNDSA-001 — Dual post-quantum consensus signatures (research proposal, 2026-11-06)
+
+**Status:** 🔲 Proposed / research only. **No consensus implementation, activation, genesis change, or validator-key migration is authorized by this entry.** This work is independent of the ongoing integration/validation PR stack and must not interrupt it.
+
+**Goal:** Evaluate cryptographic agility for Qattice's personhood-weighted BFT by retaining **ML-DSA-65 (FIPS 204)** as the default baseline and researching **FN-DSA-1024 (proposed FIPS 206)** as a second, experimental consensus-signature option. FIPS 206 finalization, independent review, and measured performance are production gates, not assumed accomplishments. The supported devnet currently uses ML-DSA-65-format validator keys with a **legacy consensus signing backend**; the FIPS 204-based signing-v2 path for *user transactions* does not upgrade consensus votes or block signatures.
+
+**Non-negotiable invariants:**
+- One verified human retains one bounded consensus voting share; algorithm selection does not affect voting power, rewards, personhood status, or validator-seat eligibility.
+- Initial design is **one registered consensus scheme/key per validator per epoch**, not dual-signing every vote. Registration, rotation, and epoch transitions must preserve identity continuity and prevent duplicate voting.
+- Signed consensus preimages must be canonically encoded and domain-separated by chain ID, protocol version, scheme ID, validator identity, epoch, height, round, vote type, and block commitment; unknown/mismatched schemes and invalid encodings fail closed.
+- All honest nodes must agree on the activated scheme registry and epoch-pinned validator keys. No silent fallback to legacy, unregistered, or weaker verification.
+- A consensus-specific verification interface is required; user-transaction signing-v2 cannot be treated as a consensus signing backend without separate review.
+- Preserve the existing Tendermint-style engine until an independently reviewed consensus change is approved. FN-DSA experimentation is **not** PQ-HotStuff deployment.
+
+**Sizing hypothesis (not performance evidence):** ML-DSA-65 signatures are 3,309 bytes; FN-DSA-1024 signatures are at most approximately 1,280 bytes. For 1,000 individual signatures, the respective payloads are ~3.309 MB and up to ~1.280 MB (up to ~61% smaller), excluding all other consensus/network overhead. ML-DSA-65 is NIST security category 3; FN-DSA-1024 targets category 5. Finality improvement must be measured, not inferred from bytes alone.
+
+| Milestone | Status | Deliverable / acceptance criteria |
+|---|---|---|
+| **QAT-FNDSA-001A — Implementation and threat-model review** | 🔲 Research | Survey FN-DSA-1024 candidates; assess standards status, constant-time signing, floating-point/sampling and randomness risks, portability, licensing, maintenance, key protection, test vectors, and independent review evidence. Document adversary model and no-go conditions. |
+| **QAT-FNDSA-001B — Isolated comparative benchmark** | 🔲 Research | Reproducible ML-DSA-65 vs FN-DSA-1024 signing/verification throughput and latency (median/p95/p99), CPU, memory, key/signature sizes, and platform differences on identical hardware; no changes to production consensus. |
+| **QAT-FNDSA-001C — Test-only signature router design** | 🔲 Proposed | Specify canonical message and scheme-ID encoding, bounded key/signature formats, epoch-pinned registration, deterministic verification, rotation/recovery, versioning, and explicit activation. Reject cross-scheme replay, invalid encodings, wrong keys/domains/epochs, and algorithm fallback. |
+| **QAT-FNDSA-001D — Experimental mixed-scheme devnet** | 🔲 Future / gated | Only after review of A–C: test 100% ML-DSA, 100% FN-DSA, and mixed-validator epochs with restarts, faults, partitions, equivocation attempts, and key rotation. No conflicting finalized blocks under the stated fault model; publish reproducible evidence. |
+| **QAT-FNDSA-001E — Scale and activation decision** | 🔲 Future / gated | Benchmark **1,000 validators and <3 s finality** under specified hardware, topology, load, quorum, and adversary assumptions. Report p50/p95/p99 finality, network bytes, verification CPU, and failure recovery. Require applicable finalized standard, independent cryptographic/security review, protocol compatibility and rollback plan, and explicit owner/governance approval before any production activation. |
+
+**Dependencies / sequencing:** Complete the existing FIPS 204 consensus-backend migration and review independently; do not bundle FN-DSA changes into that work or into the active integration PR stack. Research and isolated benchmarks may proceed in parallel. No mainnet or public-testnet enablement is implied by passing an isolated benchmark.
+
+**Non-goals:** Replacing ML-DSA-65 immediately; reducing the personhood security model; adding signature-based voting multipliers; enabling two active consensus keys for one human in an epoch; claiming finalized FIPS 206 conformity before standardization and review; treating bandwidth savings as proof of sub-three-second finality.
