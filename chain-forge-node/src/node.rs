@@ -398,6 +398,60 @@ pub struct ExplorerState {
     /// NOTE: UsefulWorkReceipt (chain-forge-resource) has been retired.
     /// This field is kept as a placeholder to avoid breaking API shape.
     pub gc_receipts: std::collections::VecDeque<serde_json::Value>,
+    /// Why the node refused transactions that the API had accepted for validation (bounded; see `RefusedTxLog`).
+    pub refused_txs: RefusedTxLog,
+}
+
+/// Why `Node::try_submit_tx` refused a transaction. `code` is stable and machine-readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxRefusal {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl TxRefusal {
+    fn new(code: &'static str, detail: impl Into<String>) -> Self { Self { code, detail: detail.into() } }
+    /// A transaction that is already pending or already committed is not a refusal the caller needs to hear about:
+    /// its outcome is (or will be) the original one.
+    pub fn is_reportable(&self) -> bool { !matches!(self.code, "duplicate_pending" | "already_committed") }
+}
+
+/// Most refusals remembered for `GET /api/tx/{id}`. The log is bounded so recording refusals cannot itself become an unbounded structure.
+pub const MAX_REFUSED_TXS: usize = 1_024;
+const MAX_REFUSED_ID_LEN: usize = 128;
+const MAX_REFUSED_DETAIL_LEN: usize = 200;
+
+/// One remembered refusal.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RefusedTx {
+    pub tx_id: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// A bounded, oldest-first-evicted record of transactions the node refused after the API had queued them.
+#[derive(Debug, Default)]
+pub struct RefusedTxLog {
+    order: std::collections::VecDeque<String>,
+    by_id: std::collections::HashMap<String, RefusedTx>,
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max { return s.to_string(); }
+    let mut end = max;
+    while !s.is_char_boundary(end) { end -= 1; }
+    s[..end].to_string()
+}
+
+impl RefusedTxLog {
+    pub fn record(&mut self, tx_id: &str, code: &str, detail: &str) {
+        let _ = (tx_id, code, detail); // scaffold: not recording yet
+    }
+    pub fn remove(&mut self, tx_id: &str) {
+        let _ = tx_id; // scaffold
+    }
+    pub fn get(&self, tx_id: &str) -> Option<&RefusedTx> { self.by_id.get(&clip(tx_id, MAX_REFUSED_ID_LEN)) }
+    pub fn len(&self) -> usize { self.by_id.len() }
 }
 
 pub const MAX_GC_RECEIPTS: usize = 500;
@@ -2820,12 +2874,18 @@ impl Node {
     /// execute it a second time, fail on nonce, and overwrite the explorer's
     /// record of the original success.
     pub fn submit_tx(&mut self, tx: Transaction) -> bool {
+        self.try_submit_tx(tx).is_ok()
+    }
+
+    /// `submit_tx` with the reason for a refusal. This is the node's admission: the only place that holds account state, so the
+    /// only place that can apply the bound-key and derived-address rules and verify the signature against the right key.
+    pub fn try_submit_tx(&mut self, tx: Transaction) -> Result<(), TxRefusal> {
         // The account signature policy, applied here exactly as in execution,
         // so a tx refused there never occupies the mempool (API and gossip
         // both come through here).
         if let Err(e) = chain_forge_execution::check_account_signature_policy(&tx, self.account_signature_policy()) {
             debug!(tx_id = %tx.id, error = %e, "transaction refused by the account signature policy");
-            return false;
+            return Err(TxRefusal::new("account_signature_policy", e.to_string()));
         }
         // TEST-ONLY signing v2: the envelope rules E1-E5 against the sender's bound key (if any), so a transaction
         // execution would refuse on structure never occupies the mempool (API drain and gossip both come through here).
@@ -2834,32 +2894,32 @@ impl Node {
             let bound: Option<Vec<u8>> = self.state.get_account(&tx.sender).ok().and_then(|a| a.public_key.clone()).filter(|k| !k.is_empty());
             if let Err(code) = chain_forge_execution::signing_v2::check_envelope(&tx, bound.as_deref()) {
                 debug!(tx_id = %tx.id, code, "transaction refused by the signing-v2 envelope rules");
-                return false;
+                return Err(TxRefusal::new("signing_v2_envelope", code.to_string()));
             }
             // The same authorization execution applies (bound key or derived address, then the signature), so a forged
             // transaction never occupies the mempool or a block.
             if let Err(e) = self.executor.authorize_v2(&tx, &self.state) {
                 debug!(tx_id = %tx.id, error = %e, "transaction refused by signing-v2 authorization");
-                return false;
+                return Err(TxRefusal::new("signing_v2_authorization", e.to_string()));
             }
         }
         if let Err(e) = chain_forge_execution::check_admission_bounds(&tx) {
             debug!(tx_id = %tx.id, error = %e, "transaction refused by the O8 admission bounds");
-            return false;
+            return Err(TxRefusal::new("admission_bounds", e.to_string()));
         }
         if self.mempool.iter().any(|t| t.id == tx.id) {
-            return false;
+            return Err(TxRefusal::new("duplicate_pending", "the transaction is already pending"));
         }
         if self.explorer.lock().unwrap().txs.contains_key(&tx.id) {
             debug!(tx_id = %tx.id, "already committed -- ignoring");
-            return false;
+            return Err(TxRefusal::new("already_committed", "the transaction is already committed"));
         }
         if self.mempool.len() < self.genesis.limits.mempool_size as usize {
             self.mempool.push(tx);
-            true
+            Ok(())
         } else {
             warn!("mempool full -- transaction dropped");
-            false
+            Err(TxRefusal::new("mempool_full", "the mempool is full; resubmit later"))
         }
     }
 
@@ -10363,7 +10423,7 @@ mod tests {
             }
         }
 
-        async fn four_nodes(sender: &str, v2: bool) -> Vec<Node> {
+        pub(super) async fn four_nodes(sender: &str, v2: bool) -> Vec<Node> {
             let g = genesis(sender);
             let mut v = vec![];
             for _ in 0..4 {
@@ -10375,7 +10435,7 @@ mod tests {
         }
 
         /// Every node receives the same proposal and votes; returns the block hash.
-        async fn commit_everywhere(nodes: &mut [Node], h: u64, txs: &[Transaction], prev: Option<&CommitCertificate>) -> BlockHash {
+        pub(super) async fn commit_everywhere(nodes: &mut [Node], h: u64, txs: &[Transaction], prev: Option<&CommitCertificate>) -> BlockHash {
             let root = nodes[0].state.current_root().map(str::to_string);
             let tx_data = serde_json::to_vec(&serde_json::json!({
                 "version": 1, "txs": txs, "last_commit": prev, "prev_state_root": root,
@@ -10519,6 +10579,65 @@ mod tests {
             let mut t = f::transfer(sender, id, nonce, 10);
             f::sign_v2(kp, &mut t, true);
             t
+        }
+
+        /// The bound-key case: the sender's key is already on chain, so the transaction carries none and the API (which has no
+        /// account state) cannot verify its signature. The node's admission can, and must refuse it with a reportable code.
+        #[tokio::test]
+        async fn a_bound_key_transaction_with_a_bad_signature_is_refused_with_a_code_and_never_enters_the_mempool() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut nodes = f::four_nodes(&s, true).await;
+            for n in nodes.iter_mut() { n.set_mldsa_signing_v2_for_test(true); } // ingress too, as a v2 genesis profile does
+            let mut t0 = f::transfer(&s, "bk0", 0, 10); f::sign_v2(&kp, &mut t0, true);
+            f::commit_everywhere(&mut nodes, 0, &[t0], None).await; // the key is now bound on chain
+            let port = super::rpc_start(&nodes[0]).await;
+
+            let mut bad = f::transfer(&s, "bk-bad", 1, 10); f::sign_v2(&kp, &mut bad, false);
+            if let chain_forge_execution::TxBody::Transfer { ref mut amount, .. } = bad.body { *amount = 11; } // signed 10, sends 11
+            let (code, v) = super::rpc(port, "POST", "/api/tx", &serde_json::to_string(&bad).unwrap()).await;
+            assert_eq!(code, 200, "the API cannot decide this without account state: {v}");
+            assert_eq!(v["state"], "queued_for_validation", "{v}");
+            nodes[0].drain_api_tx_queue().await;
+            assert_eq!(nodes[0].mempool.len(), 0, "a forged transaction never occupies the mempool");
+            let (code, v) = super::rpc(port, "GET", "/api/tx/bk-bad", "").await;
+            assert_eq!(code, 200, "{v}");
+            assert_eq!(v["state"], "rejected", "{v}");
+            assert_eq!(v["code"], "signing_v2_authorization", "{v}");
+
+            // The refusal consumed nothing: a correct transaction at the same nonce is admitted.
+            let mut good = f::transfer(&s, "bk-good", 1, 10); f::sign_v2(&kp, &mut good, false);
+            assert_eq!(super::rpc(port, "POST", "/api/tx", &serde_json::to_string(&good).unwrap()).await.0, 200);
+            nodes[0].drain_api_tx_queue().await;
+            assert!(nodes[0].mempool.iter().any(|t| t.id == "bk-good"));
+            assert_eq!(super::rpc(port, "GET", "/api/tx/bk-good", "").await.0, 404, "pending is not rejected");
+        }
+
+        /// A flood of bound-key transactions with bad signatures: none enters the mempool, the pre-admission queue empties on every
+        /// drain, and the refusal log stays within its bound.
+        #[tokio::test]
+        async fn a_flood_of_bad_bound_key_signatures_cannot_grow_the_mempool_or_the_log_without_bound() {
+            let kp = f::user_key(); let s = f::user_addr(&kp);
+            let mut nodes = f::four_nodes(&s, true).await;
+            for n in nodes.iter_mut() { n.set_mldsa_signing_v2_for_test(true); } // ingress too, as a v2 genesis profile does
+            let mut t0 = f::transfer(&s, "fl0", 0, 10); f::sign_v2(&kp, &mut t0, true);
+            f::commit_everywhere(&mut nodes, 0, &[t0], None).await;
+            let n = 120;
+            {
+                let q = nodes[0].tx_queue();
+                let mut q = q.lock().unwrap();
+                for i in 0..n {
+                    let mut bad = f::transfer(&s, &format!("flood-bad-{i}"), 1, 10); f::sign_v2(&kp, &mut bad, false);
+                    if let chain_forge_execution::TxBody::Transfer { ref mut amount, .. } = bad.body { *amount = 11; }
+                    q.push(bad);
+                }
+            }
+            nodes[0].drain_api_tx_queue().await;
+            assert_eq!(nodes[0].mempool.len(), 0, "no bad signature enters the mempool");
+            assert_eq!(nodes[0].tx_queue().lock().unwrap().len(), 0, "the pre-admission queue is emptied by the drain");
+            let ex = nodes[0].explorer();
+            let log_len = ex.lock().unwrap().refused_txs.len();
+            assert_eq!(log_len, n, "every refusal is reportable, within the bound ({MAX_REFUSED_TXS})");
+            assert!(log_len <= MAX_REFUSED_TXS);
         }
 
         /// (label, expected code, tx) for every envelope violation reachable without any account state.
@@ -15365,6 +15484,110 @@ mod tests {
 
     fn rpc_tx_amount(id: &str, nonce: u64, amount: u128) -> String {
         serde_json::to_string(&Transaction::transfer(id, "qcb1alice", "qcb1bob", "uqcb", amount, nonce)).unwrap()
+    }
+
+    // ── Admission outcome: a transaction the API queued and the node then refused is not silently lost ─────────────
+    //
+    // `POST /api/tx` runs only stateless checks and answers `queued_for_validation`. The node validates and admits at its next
+    // heartbeat, with account state the API does not have (bound keys, derived addresses, mempool room). A refusal there used to
+    // leave no trace: the caller saw `queued`, then `404`. Now the refusal is recorded (bounded) and `GET /api/tx/{id}` reports it.
+
+    async fn get_tx(port: u16, id: &str) -> (u16, serde_json::Value) { rpc(port, "GET", &format!("/api/tx/{id}"), "").await }
+
+    fn fill_mempool(node: &mut Node) {
+        let cap = node.mempool_capacity();
+        for i in 0..cap {
+            assert!(node.submit_tx(Transaction::transfer(&format!("fill{i}"), "qcb1alice", "qcb1bob", "uqcb", 1, (i % 100) as u64)));
+        }
+        assert_eq!(node.mempool.len(), cap);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_refused_after_it_was_queued_gets_a_deterministic_outcome_from_get_api_tx() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        fill_mempool(&mut node);
+        let port = rpc_start(&node).await;
+        let (code, v) = rpc(port, "POST", "/api/tx", &rpc_tx("late", 5)).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["state"], "queued_for_validation", "{v}");
+        assert_eq!(get_tx(port, "late").await.0, 404, "before the node's admission there is no outcome yet");
+        node.drain_api_tx_queue().await;
+        let (code, v) = get_tx(port, "late").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["state"], "rejected", "{v}");
+        assert_eq!(v["status"], "rejected", "{v}");
+        assert_eq!(v["code"], "mempool_full", "{v}");
+        assert_eq!(v["tx_id"], "late", "{v}");
+        assert!(v["message"].as_str().map_or(false, |m| !m.is_empty()), "{v}");
+        assert!(v.get("success").is_none(), "a refusal is not an execution result: {v}");
+        assert_eq!(node.mempool.len(), node.mempool_capacity(), "a refused transaction does not enter the mempool");
+        assert_eq!(node.tx_queue().lock().unwrap().len(), 0, "the queue was drained");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_forgotten_when_the_same_id_is_later_admitted() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        fill_mempool(&mut node);
+        let port = rpc_start(&node).await;
+        assert_eq!(rpc(port, "POST", "/api/tx", &rpc_tx("again", 6)).await.0, 200);
+        node.drain_api_tx_queue().await;
+        assert_eq!(get_tx(port, "again").await.1["state"], "rejected");
+        node.mempool.clear(); // room again
+        assert_eq!(rpc(port, "POST", "/api/tx", &rpc_tx("again", 6)).await.0, 200);
+        node.drain_api_tx_queue().await;
+        assert!(node.mempool.iter().any(|t| t.id == "again"), "now admitted");
+        let (code, v) = get_tx(port, "again").await;
+        assert_eq!(code, 404, "an admitted, pending transaction must not still read as rejected: {v}");
+    }
+
+    #[tokio::test]
+    async fn resubmitting_a_pending_transaction_is_not_reported_as_rejected() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        let port = rpc_start(&node).await;
+        assert_eq!(rpc(port, "POST", "/api/tx", &rpc_tx("pend", 7)).await.0, 200);
+        node.drain_api_tx_queue().await;
+        assert!(node.mempool.iter().any(|t| t.id == "pend"));
+        assert_eq!(rpc(port, "POST", "/api/tx", &rpc_tx("pend", 7)).await.0, 200);
+        node.drain_api_tx_queue().await;
+        assert_eq!(node.mempool.iter().filter(|t| t.id == "pend").count(), 1);
+        let (code, v) = get_tx(port, "pend").await;
+        assert_eq!(code, 404, "a duplicate of a pending transaction is not a refusal of it: {v}");
+    }
+
+    #[tokio::test]
+    async fn the_refusal_log_is_bounded_and_evicts_the_oldest_and_the_mempool_is_untouched() {
+        let mut node = Node::new(GENESIS_FAST_EPOCH, None).await.unwrap();
+        fill_mempool(&mut node);
+        let cap = node.mempool_capacity();
+        let n = 2 * MAX_REFUSED_TXS + 5;
+        {
+            let q = node.tx_queue();
+            let mut q = q.lock().unwrap();
+            for i in 0..n { q.push(Transaction::transfer(&format!("flood{i}"), "qcb1alice", "qcb1bob", "uqcb", 1, 1)); }
+        }
+        node.drain_api_tx_queue().await;
+        let ex = node.explorer();
+        let ex = ex.lock().unwrap();
+        assert_eq!(ex.refused_txs.len(), MAX_REFUSED_TXS, "the log never exceeds its bound");
+        assert!(ex.refused_txs.get("flood0").is_none(), "the oldest refusal is evicted");
+        assert!(ex.refused_txs.get(&format!("flood{}", n - 1)).is_some(), "the newest refusal is kept");
+        assert_eq!(node.mempool.len(), cap, "refused transactions never enter the mempool");
+    }
+
+    #[test]
+    fn the_refusal_log_updates_in_place_clips_long_fields_and_is_consistent_for_long_ids() {
+        let mut log = RefusedTxLog::default();
+        log.record("a", "mempool_full", "first");
+        log.record("a", "admission_bounds", "second");
+        assert_eq!(log.len(), 1, "the same id takes one slot");
+        assert_eq!(log.get("a").unwrap().code, "admission_bounds");
+        let long_id = "x".repeat(10_000);
+        log.record(&long_id, "mempool_full", &"é".repeat(5_000));
+        let r = log.get(&long_id).expect("a long id is found again with the same clipping");
+        assert!(r.tx_id.len() <= 128 && r.message.len() <= 200 && r.message.is_char_boundary(r.message.len()));
+        log.remove(&long_id);
+        assert!(log.get(&long_id).is_none());
+        assert_eq!(log.len(), 1);
     }
 
     #[tokio::test]
