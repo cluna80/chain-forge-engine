@@ -76,15 +76,33 @@ static ONE_DEVNET_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Port helpers ──────────────────────────────────────────────────────────────
 
-/// Ask the OS for a free TCP port, then release the listener.
-/// There is a small TOCTOU window between release and the process binding it,
-/// but this is acceptable for tests where the alternative is fixed-port conflicts.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("free_port: bind failed")
-        .local_addr()
-        .expect("free_port: local_addr failed")
-        .port()
+/// Reserve `n` DISTINCT ports that are OUTSIDE every OS's dynamic (ephemeral) port range, and free at this moment.
+///
+/// The old helper asked the OS for a port with `bind(0)` and released it, eight times. Windows hands out ephemeral ports sequentially, so
+/// the eight released ports were consecutive numbers in exactly the pool that the OS gives to OUTGOING connections. A node that had already
+/// started and was dialling its peers could take one of them as its source port before the node that owned it bound it: bob's HTTP API then
+/// failed with `os error 10048` (address in use) while its consensus ran normally, and the test waited 30 s for an API that never came.
+/// Ports below 32768 are outside Linux's (32768-60999) and Windows' (49152-65535) dynamic ranges, so no outgoing connection can take one.
+/// All listeners are held until every port is chosen, so the ports are distinct by construction.
+fn reserve_ports(n: usize) -> Vec<u16> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const LOW: u32 = 20_000;
+    const HIGH: u32 = 32_000;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let seed = (std::process::id() as u64).wrapping_mul(2_654_435_761)
+        .wrapping_add(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0))
+        .wrapping_add(CALLS.fetch_add(1, Ordering::SeqCst) as u64 * 97);
+    let mut port = LOW + (seed % (HIGH - LOW) as u64) as u32;
+    let (mut held, mut chosen, mut tries) = (Vec::new(), Vec::new(), 0u32);
+    while chosen.len() < n {
+        tries += 1;
+        assert!(tries < 4_000, "could not find {n} free ports in {LOW}..{HIGH}");
+        if port >= HIGH { port = LOW; }
+        if let Ok(l) = TcpListener::bind(("0.0.0.0", port as u16)) { held.push(l); chosen.push(port as u16); }
+        port += 1;
+    }
+    drop(held);
+    chosen
 }
 
 /// All ports for one devnet + attacker instance, each allocated dynamically.
@@ -101,15 +119,10 @@ struct DevnetPorts {
 
 impl DevnetPorts {
     fn new() -> Self {
+        let p = reserve_ports(8);
         Self {
-            alice_api:  free_port(),
-            bob_api:    free_port(),
-            carol_api:  free_port(),
-            dave_api:   free_port(),
-            alice_p2p:  free_port(),
-            bob_p2p:    free_port(),
-            carol_p2p:  free_port(),
-            dave_p2p:   free_port(),
+            alice_api: p[0], bob_api: p[1], carol_api: p[2], dave_api: p[3],
+            alice_p2p: p[4], bob_p2p: p[5], carol_p2p: p[6], dave_p2p: p[7],
         }
     }
 
@@ -294,6 +307,23 @@ fn poll_until_height(ports: &[u16], target: u64, timeout: Duration) -> bool {
         if all { println!(); return true; }
         if Instant::now() >= deadline { println!(); return false; }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+// ── Port reservation guard ─────────────────────────────────────────────────────
+
+/// Takes the devnet lock so it cannot reserve a port a running devnet test has chosen but a node has not bound yet.
+#[test]
+fn reserved_ports_are_distinct_free_and_outside_every_ephemeral_range() {
+    let _one_devnet = ONE_DEVNET_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..300 {
+        let p = reserve_ports(8);
+        let distinct: std::collections::BTreeSet<_> = p.iter().collect();
+        assert_eq!(distinct.len(), 8, "ports must be distinct: {p:?}");
+        for &x in &p {
+            assert!((20_000..32_000).contains(&x), "port {x} is outside 20000..32000 (Linux dynamic ports start at 32768, Windows at 49152)");
+            TcpListener::bind(("0.0.0.0", x)).unwrap_or_else(|e| panic!("port {x} was not free after being reserved: {e}"));
+        }
     }
 }
 
@@ -843,7 +873,9 @@ fn fail_with_evidence(ports: &DevnetPorts, log_dir: &std::path::Path, what: &str
     let heights: Vec<u64> = ports.all_api_ports().iter().map(|&p| height_of(p)).collect();
     let peers: Vec<Option<u64>> = ports.all_api_ports().iter()
         .map(|&p| api_get(p, "/api/status").and_then(|v| v["peer_count"].as_u64())).collect();
-    println!("\n── FAILURE EVIDENCE: {what} ──\n   heights (alice, bob, carol, dave) = {heights:?}\n   peer_count = {peers:?}");
+    let answered: Vec<bool> = ports.all_api_ports().iter().map(|&p| api_get(p, "/api/status").is_some()).collect();
+    println!("\n── FAILURE EVIDENCE: {what} ──\n   heights (alice, bob, carol, dave) = {heights:?}\n   peer_count = {peers:?}\n   api ports = {:?}, answered = {answered:?}\n   p2p ports = {:?}\n   (a node whose API never answers while its log shows blocks usually failed to bind its API port: look for `failed to bind HTTP API port`)",
+        ports.all_api_ports(), [ports.alice_p2p, ports.bob_p2p, ports.carol_p2p, ports.dave_p2p]);
     dump_logs(log_dir, &["qcb1alice", "qcb1bob", "qcb1carol", "qcb1dave"], 25);
     panic!("{what} (heights {heights:?}, peer_count {peers:?}; node logs printed above)");
 }
