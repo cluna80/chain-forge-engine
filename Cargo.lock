@@ -895,6 +895,7 @@ dependencies = [
 name = "chain-forge-keygen"
 version = "0.1.0"
 dependencies = [
+ "chain-forge-core",
  "chain-forge-crypto",
  "hex",
  "serde_json",
@@ -1030,9 +1031,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chain-forge-agents",
+ "chain-forge-core",
  "chain-forge-crypto",
  "chain-forge-execution",
+ "chain-forge-identity",
  "chain-forge-research-db",
+ "chain-forge-state",
+ "chain-forge-wallet",
  "chrono",
  "clap",
  "hex",
@@ -1218,6 +1224,8 @@ dependencies = [
  "argon2",
  "chain-forge-core",
  "chain-forge-crypto",
+ "chain-forge-execution",
+ "chain-forge-state",
  "rand 0.8.8",
  "serde",
  "serde_json",
