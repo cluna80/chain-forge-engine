@@ -587,6 +587,8 @@ pub fn check_message_size(payload: &[u8], limit: usize) -> P2pResult<()> {
 ///
 /// Phase 1 status: full implementation. Nodes can peer, gossip block
 /// proposals, consensus votes, and transactions across machines.
+pub mod bootstrap;
+
 #[cfg(feature = "real-network")]
 pub mod real {
     use super::*;
@@ -787,7 +789,13 @@ pub mod real {
                     .map_err(|e| P2pError::Internal(format!("subscribe {topic_str}: {e}")))?;
             }
 
-            // Dial bootstrap nodes (testnet/mainnet)
+            // Dial bootstrap nodes (testnet/mainnet). The first dial happens now; if the bootstrap peer is not listening yet it is
+            // dialled again with backoff (bounded, see `bootstrap::BootstrapRetry`) until an outbound connection succeeds.
+            let mut bootstrap_retry = crate::bootstrap::BootstrapRetry::new(
+                config.bootstrap_nodes.iter().filter(|a| a.parse::<Multiaddr>().is_ok()).cloned(),
+                crate::bootstrap::RetryPolicy::default(),
+                Duration::ZERO,
+            );
             for addr_str in &config.bootstrap_nodes {
                 if let Ok(addr) = addr_str.parse::<Multiaddr>() {
                     let _ = swarm.dial(addr);
@@ -811,9 +819,20 @@ pub mod real {
                 // redundant-connection dedupe-close (see ConnectionClosed below)
                 // doesn't get misread as the peer fully disconnecting.
                 let mut peer_conn_count: HashMap<String, usize> = HashMap::new();
+                let started = std::time::Instant::now();
+                let mut redial_tick = tokio::time::interval(Duration::from_millis(500));
 
                 loop {
                     tokio::select! {
+                        // Bootstrap peers that were not reachable at startup are dialled again, with backoff, within a bound.
+                        _ = redial_tick.tick() => {
+                            for a in bootstrap_retry.due(started.elapsed()) {
+                                if let Ok(addr) = a.parse::<Multiaddr>() {
+                                    tracing::debug!(%a, "redialling bootstrap peer");
+                                    let _ = swarm.dial(addr);
+                                }
+                            }
+                        }
                         // Outbound message from node -> publish to gossip
                         Some(msg) = outbound_rx.recv() => {
                             let topic = gossipsub::IdentTopic::new(
@@ -929,6 +948,10 @@ pub mod real {
                                 }
 
                                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                                    // An outbound connection to a bootstrap address succeeded: stop redialling it.
+                                    if endpoint.is_dialer() {
+                                        bootstrap_retry.mark_connected(&endpoint.get_remote_address().to_string());
+                                    }
                                     tracing::info!(peer = %peer_id, "connection established");
                                     // Register as an explicit gossipsub peer immediately so
                                     // flood_publish delivers votes before the mesh heartbeat

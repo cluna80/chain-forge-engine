@@ -1,0 +1,30 @@
+Failing-before evidence for the P2P bootstrap retry (Linux sandbox, base = main 3fa3754, scaffold = no-op BootstrapRetry).
+No fix is present in any run below.
+
+(1) pure scheduler unit tests: 7 of 9 fail (the 2 that pass assert "nothing yet due" and "no addresses", which a no-op satisfies)
+    test bootstrap::tests::an_address_is_returned_once_per_due_time_not_on_every_poll ... FAILED
+    test bootstrap::tests::no_addresses_means_nothing_to_do ... ok
+    test bootstrap::tests::nothing_is_due_before_the_first_delay ... ok
+    test bootstrap::tests::a_connection_reported_with_a_peer_id_suffix_still_matches ... FAILED
+    test bootstrap::tests::a_connected_address_is_never_redialled ... FAILED
+    test bootstrap::tests::addresses_are_independent_and_duplicates_are_collapsed ... FAILED
+    test bootstrap::tests::redials_happen_at_the_backoff_times_and_stop_at_the_bound ... FAILED
+    test bootstrap::tests::the_delays_double_and_are_capped ... FAILED
+    test bootstrap::tests::the_schedule_is_relative_to_the_start_time ... FAILED
+
+(2) real libp2p, mDNS off, node B bootstraps to A, A starts 3 s later with no bootstrap list: the node never connects
+    test an_unreachable_bootstrap_address_does_not_stop_the_node_from_running ... ok
+    trial 1: None
+    thread 'a_node_started_before_its_bootstrap_peer_connects_when_the_peer_appears_repeatedly' (15649) panicked at chain-forge-p2p/tests/bootstrap_retry.rs:43:9:
+    trial 1: the node never connected to its bootstrap peer (no redial)
+    test a_node_started_before_its_bootstrap_peer_connects_when_the_peer_appears_repeatedly ... FAILED
+    test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.31s
+    error: test failed, to rerun pass `-p chain-forge-p2p --test bootstrap_retry`
+
+(3) four real nodes, seed topology (bob/carol/dave --bootstrap alice; alice none), alice started last:
+    trial 1: the nodes did not connect and produce blocks within 90s (peers [0, 0, 0, 0] heights [0, 0, 0, 0])
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 93.25s
+
+Disclosure: my FIRST version of test (3) used an all-to-all bootstrap list and PASSED on the unfixed code (connected in 7.5 s):
+the last node to start dials the others, so the network formed by itself. That test could not detect the bug. I changed it to the
+seed-node topology above (the one that reproduces the stall) AFTER that first run; only this changed test is the red evidence.
