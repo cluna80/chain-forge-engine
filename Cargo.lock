@@ -895,9 +895,15 @@ dependencies = [
 name = "chain-forge-keygen"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
+ "argon2",
+ "chain-forge-core",
  "chain-forge-crypto",
+ "getrandom 0.2.17",
  "hex",
+ "libc",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -1218,6 +1224,8 @@ dependencies = [
  "argon2",
  "chain-forge-core",
  "chain-forge-crypto",
+ "chain-forge-execution",
+ "chain-forge-state",
  "rand 0.8.8",
  "serde",
  "serde_json",

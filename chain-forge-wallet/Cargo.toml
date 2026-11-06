@@ -37,11 +37,20 @@ rand     = "0.8"
 sha2     = "0.10"
 # HTTP client for devnet tx submission (no async — keep deps lean)
 ureq     = { version = "2", features = ["json"] }
+# TEST-ONLY signing v2 (feature `signing-v2`): builds the node's own Transaction type so the signed bytes are exactly what the
+# verifier recomputes.
+chain-forge-execution = { path = "../chain-forge-execution", optional = true }
+
+[dev-dependencies]
+chain-forge-state = { path = "../chain-forge-state" }
 
 [features]
 default = []
 # Enable integration test against live devnet (Alice:8080)
 devnet-test = []
+# TEST-ONLY: sign transactions with the signing-v2 preimage and the FIPS 204 backend (docs/mldsa-tx-signing-v2/SPEC.md). Off by
+# default; the legacy signer is untouched.
+signing-v2 = ["dep:chain-forge-execution", "chain-forge-execution/signing-v2", "chain-forge-crypto/fips204-backend"]
 
 [[bin]]
 name = "qcb-wallet"
