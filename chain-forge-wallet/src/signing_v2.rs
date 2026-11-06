@@ -21,6 +21,17 @@ pub struct V2TxParams {
     pub carry_key: bool,
 }
 
+/// Submit a signed v2 transaction to a node's `POST /api/tx` and return the node's JSON answer.
+pub fn submit_v2(host: &str, port: u16, tx: &Transaction) -> WalletResult<serde_json::Value> {
+    let url = format!("http://{host}:{port}/api/tx");
+    match ureq::post(&url).set("Content-Type", "application/json").send_json(tx) {
+        Ok(resp) => resp.into_json().map_err(|e| WalletError::Network(format!("response parse: {e}"))),
+        // The node answers a refusal with a 400 and a JSON body; hand that body back instead of hiding it.
+        Err(ureq::Error::Status(_, resp)) => resp.into_json().map_err(|e| WalletError::Network(format!("response parse: {e}"))),
+        Err(e) => Err(WalletError::Network(format!("{e}"))),
+    }
+}
+
 /// Sign one transaction under signing v2 (hedged: fresh OS randomness per signature).
 ///
 /// The key pair is validated first (a mismatched or malformed secret key is an error, never a panic). With `sender: None` the
