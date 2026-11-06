@@ -587,6 +587,8 @@ pub fn check_message_size(payload: &[u8], limit: usize) -> P2pResult<()> {
 ///
 /// Phase 1 status: full implementation. Nodes can peer, gossip block
 /// proposals, consensus votes, and transactions across machines.
+pub mod bootstrap;
+
 #[cfg(feature = "real-network")]
 pub mod real {
     use super::*;
