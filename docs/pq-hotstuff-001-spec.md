@@ -1,7 +1,8 @@
-# PQ-HOTSTUFF-001 — PQ-HotStuff Consensus: Protocol Specification
+# PQ-HOTSTUFF-001 — PQ-HotStuff-2 Consensus: Protocol Specification
 
-Status: **Decisions D1–D5 locked (owner, 2026-10-28).** Implements the locked direction of 2026-10-28 ("Qattice PQ-HotStuff Consensus Specification"). No code yet.
-Date: 2026-10-28
+Status: **Decisions D1–D5 locked (owner, 2026-10-28). Designation and cryptographic interface adopted (owner, 2026-11-06; §13 table N, §3.1). Revision for review: not yet approved.** Implements the locked direction of 2026-10-28 ("Qattice PQ-HotStuff Consensus Specification"). No code yet. No activation on any network.
+Date: 2026-10-28 (revised 2026-11-06)
+Designation: **PQ-HotStuff-2** is the official name of this protocol (the first planned HotStuff-based Qattice consensus; not a successor to a shipped "PQ-HotStuff-1"). This file name, the document ID `PQ-HOTSTUFF-001`, the config value `pq-hotstuff` and the module path stay unchanged until a separately reviewed change renames them. In this document "PQ-HotStuff" means PQ-HotStuff-2.
 Scope: Qattice mainnet consensus; a selectable Chain Forge `ConsensusEngine`.
 
 This document turns the locked direction into a buildable protocol: message formats, safety rules, commit rule, pacemaker, persistence, reconfiguration, and the acceptance gates each phase must pass. Items marked **[decision]** need an owner choice; each has a recommendation.
@@ -13,9 +14,9 @@ This document turns the locked direction into a buildable protocol: message form
 | Component | Status | Role here |
 |---|---|---|
 | Tendermint engine (`tendermint/engine.rs`) | Hardened (#18, gates 1–3), Windows-confirmed | **Stable devnet baseline** until PQ-HotStuff passes every gate in §12. Its patterns (engine-driven actions, persisted sign guard, model-based simulation) are reused. |
-| ML-DSA-65 consensus keys (#24) | Windows-confirmed on Tendermint | Reused as-is: `sign_consensus` / `verify_consensus`, ML-DSA-only genesis (`validator_scheme: "ml-dsa-65"`), key files, PoP registration. |
+| ML-DSA-65 consensus keys (#24) | Windows-confirmed on Tendermint, **on the pre-standard `dilithium3` backend** (K1: 0 of 45 NIST signing vectors matched) | **Not reused for signing.** PQ-HotStuff-2 signs and verifies only through the FIPS 204 signer interface (§3.1, `docs/fips204-migration/PLAN.md` in PR #119). The existing Tendermint devnet is not migrated or modified. Registration/PoP *structure* (PQ-VAL-001/2/3) is reused, with the new PoP context. |
 | Legacy `HotStuffEngine` (`lib.rs`) | Devnet-only (gate 2). No engine-driven voting, no persisted lock, `verify_commit` checks no signatures | **Not a base.** PQ-HotStuff is a new module. The legacy engine stays devnet-only and is retired once PQ-HotStuff lands. |
-| Equivocation slashing | Broken (gate 4): signed evidence never verifies; fixing only that diverges node state | **Prerequisite.** Committed-evidence slashing is engine-independent and must land first (§9). |
+| Equivocation slashing | Committed-evidence slashing landed (gate 4, #26, Windows-confirmed) | Reused; evidence is compared on canonical signed messages, not signature bytes (§9). |
 | Succinct committee proof (M0, `docs/succinct-proof-prototype-scope.md` on `docs/validator-sampling-spec`) | Scoped, in progress in another session | Decides the mainnet validator-set ceiling (§10). |
 
 No consensus code is borrowed. The safety rules below follow the published two-chain HotStuff variant (DiemBFT v4 / Jolteon: Gelashvili et al., "Jolteon and Ditto", FC 2022; Diem team, "DiemBFT v4", 2021). They are implemented from the papers, and the arguments are re-checked in review (§12, Phase 3).
@@ -27,7 +28,7 @@ No consensus code is borrowed. The safety rules below follow the published two-c
 - **Validators:** an epoch-fixed set V_e. Each v has voting power p(v) ≥ 0, a registered ML-DSA-65 key, and verified personhood. Power comes from the personhood layer (bounded per human; §8). Total T = Σp.
 - **Faults:** Byzantine power f < T/3. **Quorum:** q = ⌊2T/3⌋ + 1 (gate 3 floor: never lower).
 - **Network:** partial synchrony. After an unknown GST, messages between honest validators arrive within Δ.
-- **Signatures:** ML-DSA-65 only. A message signed by any other scheme is invalid; there is no fallback. The engine refuses to start unless every key in V_e is 1952 bytes.
+- **Signatures:** FIPS 204 ML-DSA-65 only, selected by the versioned protocol profile and carrying an explicit algorithm identifier (§3.1). A message signed by any other algorithm, or whose identifier does not match the profile, is invalid; there is no fallback, negotiation or retry with another algorithm. The engine refuses to start unless every key in V_e is 1952 bytes and was registered with the profile's algorithm identifier.
 - **Safety:** no two honest validators commit different blocks at the same height, under any network schedule.
 - **Liveness:** after GST, with an honest leader, a new block commits within a bounded number of rounds.
 
@@ -55,18 +56,35 @@ Timeout   { epoch, round, high_qc: QuorumCert, voter, signature }    // signs (e
 TimeoutCert{ epoch, round, high_qc_rounds: [u64], signers: Bitmap, signatures: [Sig], high_qc: QuorumCert }
 ```
 
-Signing bytes are domain-separated and bind the chain and epoch:
+Every signature is carried in an envelope `Sig { alg_id, bytes }` (§3.1), and the QC/TC `signatures` lists hold such envelopes. Signing bytes are domain-separated, bind the chain and epoch, and **bind `alg_id`**:
 
-| Message | Bytes |
+| Message | Canonical bytes (the message passed to the signer, with the FIPS 204 context of §3.1) |
 |---|---|
-| Block | `"CFH1\|block\|" ‖ block_id` |
-| Vote | `"CFH1\|vote\|" ‖ chain_id ‖ epoch ‖ round ‖ block_id ‖ parent_id ‖ parent_round` |
-| Timeout | `"CFH1\|timeout\|" ‖ chain_id ‖ epoch ‖ round ‖ high_qc_round` |
+| Block | `"CFH1\|block\|" ‖ alg_id ‖ block_id` |
+| Vote | `"CFH1\|vote\|" ‖ alg_id ‖ chain_id ‖ epoch ‖ round ‖ block_id ‖ parent_id ‖ parent_round` |
+| Timeout | `"CFH1\|timeout\|" ‖ alg_id ‖ chain_id ‖ epoch ‖ round ‖ high_qc_round` |
 
-Tag `CFH1` cannot collide with the Tendermint tags (`CFV|`, `CFP2`), so a signature from one engine is never valid in the other.
+Tag `CFH1` cannot collide with the Tendermint tags (`CFV|`, `CFP2`), so a signature from one engine is never valid in the other. The tag is unchanged by this revision (the FIPS 204 context already separates it from every pre-standard signature); see §15 item 3.
 
-**QC validity:** every signer is in V_epoch, each counted once. Each signature verifies with `verify_consensus` against the signer's key. Signer power sums to at least q.
+**QC validity:** every signer is in V_epoch, each counted once. Each signature envelope has the profile's `alg_id` and verifies under §3.1 against the signer's key. Signer power sums to at least q.
 **TC validity:** the same, over timeout bytes for the same `(epoch, round)`. `high_qc` is valid, and `high_qc.round == max(high_qc_rounds)`.
+
+### 3.1 Cryptographic profile (owner decisions 3, 4, 5, 2026-11-06)
+
+1. **Backend derived from the versioned protocol profile.** The chain's profile (named in genesis) determines which signature algorithm is permitted for each signing domain. There is no separate backend switch and no fallback. For the PQ-HotStuff-2 devnet the profile permits exactly one algorithm.
+2. **Explicit algorithm identifiers, rejected on mismatch.** `alg_id` appears in every validator key registration (including PoP) and in every signature envelope, and is bound into the signed bytes (table above). A registration, vote, proposal, timeout, QC entry or TC entry whose `alg_id` is not the one the profile permits for that domain is invalid. Verification never retries with another algorithm. Proposed value for the permitted identifier: `alg_id = 1` for "ML-DSA-65, FIPS 204" (§15 item 2).
+3. **One signer implementation.** The engine consumes the FIPS 204 signer interface planned in PR #119 (`MlDsa65Fips204Scheme`, pure ML-DSA-65 over `fips204`, explicit context, hedged). It adds no cryptographic implementation of its own and never calls the pre-standard `MlDsaScheme` / `dilithium3` code.
+4. **Hedged signing.** Each signature uses fresh randomness (as signing v2). Two signatures over the same vote therefore differ; §5 and §9 are written so that this never matters.
+5. **Contexts (domain separation):**
+
+| Domain | FIPS 204 context | Status |
+|---|---|---|
+| Vote | `qattice/vote/v2` | approved |
+| Block proposal | `qattice/proposal/v2` | approved |
+| Validator proof of possession | `qattice/validator-pop/v2` | approved |
+| Timeout | `qattice/timeout/v2` | **proposed; needs approval** (§15 item 1) |
+
+A signature produced for one domain must fail verification in every other domain (a required negative test). Contexts are at most 255 bytes.
 
 ---
 
@@ -149,7 +167,9 @@ Evidence types:
 - **double vote:** two votes, same `(epoch, round)`, different `block_id`.
 - **double proposal:** two blocks from the leader of the same round.
 
-Each item of evidence is self-verifying: both signatures check under the offender's key for that epoch. (A vote followed by a timeout in the same round is **not** evidence; §5 allows it. Lock-violation evidence, such as a timeout whose high QC is below a QC the signer already voted on, is a Phase 3 candidate.)
+Each item of evidence is self-verifying: both signatures check under the offender's key for that epoch (under §3.1, with the right context and `alg_id`).
+
+**Evidence compares canonical signed messages, not signature bytes.** Because signing is hedged (§3.1), two signatures over the *same* canonical vote message differ in bytes and are **not** evidence (a restarted node that re-signs, or a relay that re-sends, never causes slashing). A double vote is two votes by the same voter for the same `(epoch, round)` whose canonical vote messages differ (different `block_id`). Evidence is deduplicated by the hash of the canonical message pair, never by signature bytes. Required tests: re-signing the same vote produces different bytes and no evidence; two different messages produce evidence; the same evidence cannot be included twice. (A vote followed by a timeout in the same round is **not** evidence; §5 allows it. Lock-violation evidence, such as a timeout whose high QC is below a QC the signer already voted on, is a Phase 3 candidate.)
 
 **Handling must be committed evidence (release gate 4).** Evidence is included in a block's payload. It is validated during proposal checks and applied during execution, identically on every node. A node never slashes from its own local observation. The #24 live run showed what happens otherwise: each node slashes when it happens to see the double vote, node states diverge, and the chain halts. Gate 4 builds this for Tendermint first. PQ-HotStuff reuses it unchanged.
 
@@ -179,9 +199,9 @@ Recommendation: specify the QC as a versioned type now (`QuorumCert::V1 | V2`), 
 
 ## 11. Chain Forge integration
 
-- **Selection:** `consensus.bft_variant: "pq-hotstuff"`. Startup refuses it unless `cryptography.validator_scheme == "ml-dsa-65"` (no classical path). Until the §12 Phase 2 gate passes, it is devnet-only, enforced by the same check as gate 2.
+- **Selection:** `consensus.bft_variant: "pq-hotstuff"`. The engine is **feature-gated**: it is compiled only with an explicit Cargo feature that is not in any default feature set (name proposed: `pq-hotstuff`), and a default build refuses the value. Startup also refuses it unless the genesis profile selects the FIPS 204 backend (§3.1); the label `validator_scheme: "ml-dsa-65"` is not sufficient because on existing chains it means the pre-standard backend. No classical path. Until the §12 Phase 2 gate passes, it is devnet-only, enforced by the same check as gate 2.
 - **Engine:** a new module `chain-forge-consensus/src/pq_hotstuff/`. It implements `ConsensusEngine` with `drives_own_votes() = true`, and drives the node through the existing `ConsensusAction` / `next_action` / `on_step_timeout` / `gossip_messages` hooks. It gains new actions: `SendVoteTo(leader)` and `BroadcastTimeout`.
-- **Reused unchanged:** key registration, PoP, activation and rotation (PQ-VAL-001/2/3); `sign_consensus` / `verify_consensus`; payload validation; block-hash agreement; state-root binding.
+- **Reused unchanged:** the *structure* of key registration, PoP, activation and rotation (PQ-VAL-001/2/3, with the §3.1 identifiers and contexts); payload validation; block-hash agreement; state-root binding; committed-evidence slashing. Signing and verification go through the FIPS 204 signer interface, not `sign_consensus` / `verify_consensus` on the pre-standard backend.
 - **Other chains:** the engine takes the power function as input. Personhood weighting is mandatory in **Qattice's** genesis profile, where startup refuses `pq-hotstuff` without `personhood_weighted: true`. Another Chain Forge chain can supply stake or equal weights.
 
 ---
@@ -190,8 +210,9 @@ Recommendation: specify the QC as a versioned type now (`QuorumCert::V1 | V2`), 
 
 Each gate follows the project rule: failing tests first, then mutation checks, then sandbox, then **Windows confirmation** before ✅.
 
-**Phase 0 — prerequisites and core engine**
-- **Gate 4** (committed-evidence slashing, on Tendermint) lands first.
+**Phase 0 — prerequisites and core engine** (authorized by the owner 2026-11-06 as tests-first draft PRs after this revision is approved)
+- **Gate 4** (committed-evidence slashing, on Tendermint) has landed (#26).
+- Scope: consensus message types and canonical signing bytes (§3, §3.1); the two-chain commit rule and safety invariants (§5, §6); pacemaker and timeout handling; feature-gated engine selection (§11); deterministic simulation and adversarial safety testing; mutation tests showing that removing each essential safety check makes a test fail. Phase 0 uses in-memory test keys only (no key files).
 - Types, signing bytes, the §5 safety rules, the §6 commit rule and the pacemaker. Single-process unit tests:
   - Each safety rule individually.
   - The scripted counterexamples: voting without rule 3 forks across a view change; committing on a non-consecutive QC forks.
@@ -220,7 +241,9 @@ Each gate follows the project rule: failing tests first, then mutation checks, t
 **Phase 4 — mainnet genesis**
 - A fresh genesis: PQ-HotStuff, ML-DSA from block 0, the D2 ceiling and QC format, no devnet state.
 
-The Tendermint devnet stays the default until Phase 2 passes on Windows.
+The Tendermint devnet stays the default until Phase 2 passes on Windows. Phase 2 uses a **fresh genesis and a separate four-node development network** with newly generated keys; the existing Tendermint devnet is not migrated or modified. Retiring Tendermint for any network is a separate owner decision after the Phase 2 gate and independent review.
+
+**Restrictions on all PQ-HotStuff-2 work (owner, 2026-11-06):** no default consensus change; no network activation; no mainnet change; no automatic signature downgrade or fallback; no change to the existing Tendermint implementation; no production validator key-file change; no merge without separate owner approval. Each implementation PR must carry tests, reviewable changes and documented Windows results before merge approval.
 
 ---
 
@@ -239,3 +262,23 @@ The Tendermint devnet stays the default until Phase 2 passes on Windows.
 These keep the locked direction. They make two claims precise:
 - **"Linear communication":** linear in messages, not bytes. Under ML-DSA the bytes grow roughly as n² until QC v2 or committees (§10).
 - **"Identity revocations respected without delay":** effective from the next block, never mid-round (§8). Immediate mid-round removal would break safety.
+
+---
+
+## 15. Owner decisions of 2026-11-06 and open items for review
+
+**Decisions recorded in this revision:**
+
+| | Decision |
+|---|---|
+| N1 | The protocol is designated **PQ-HotStuff-2**; identifiers are unchanged until a reviewed rename. |
+| N2 | Cryptography decisions 3, 4, 5 of PR #119: backend derived from the versioned profile with explicit algorithm identifiers and no fallback; FIPS 204 ML-DSA-65 hedged signing with equivocation compared on canonical signed messages; the v2 contexts (vote, proposal, validator PoP). |
+| N3 | The standard signer is consumed by PQ-HotStuff-2 directly; there is no Tendermint wiring (PR #119 decision 1). |
+| N4 | Fresh genesis and a separate four-node development network; the existing Tendermint devnet is not migrated or modified. |
+
+**Open items this revision asks the reviewer to settle:**
+1. The timeout signing context: propose `qattice/timeout/v2` (not in the approved list).
+2. The exact `alg_id` encoding (proposed: `u16`, value 1 for ML-DSA-65 FIPS 204) and the genesis field that names the profile.
+3. Whether the `CFH1` tag should change to `CFH2` (not proposed: the context already separates it).
+4. Validator key storage for the devnet candidate (PR #119 decision 6): Phase 0 uses in-memory test keys; real key files wait for that decision and the #109 review.
+5. DIS signatures stay out of this specification (PR #119 decision 2).
