@@ -17,9 +17,12 @@
 //! the commit path and nothing more: the signer is called only inside the commit path, no method returns a raw signature, and the
 //! caller holds no way to obtain one from the store without a completed commit.
 //!
-//! **Known limitation** (see `known_limitation_*` in the tests and the design note): the file is written before the counter is
-//! advanced, and the counter holds only a number. A fenced-out writer on its own disk therefore fails at step 7 but leaves its
-//! record behind, which the counter cannot tell from the committed one. Closing this needs the counter to commit to the record.
+//! # Digest-bound commits (spec section 7.1.1)
+//! The counter holds `(value, digest)`, where the digest is the checksum that seals the record's canonical body, and every record
+//! carries the digest of the record it replaced. A commit advances from the replaced record's state to the new record's digest.
+//! On open, a file at the committed counter value must be the committed record (otherwise it is a fork and is refused), and a file
+//! one ahead must be a successor of the committed record. So a record left behind by a fenced-out writer, or a file overwritten
+//! after the commit, is refused on restart instead of being mistaken for the committed state.
 //!
 //! # What this does and does not protect
 //! * A crash at any point leaves either the old record or the new record (the temporary file is never read), and nothing has
@@ -53,7 +56,7 @@ pub const MARKER_FILE: &str = "pq_hotstuff_safety.init";
 pub const STATE_TMP: &str = "pq_hotstuff_safety.state.tmp";
 pub const MARKER_TMP: &str = "pq_hotstuff_safety.init.tmp";
 
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 /// Upper bound on a stored canonical message.
 pub const MAX_MESSAGE_LEN: usize = 4096;
 

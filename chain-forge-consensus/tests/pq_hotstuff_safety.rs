@@ -490,11 +490,13 @@ fn trailing_bytes_and_an_unsupported_version_are_refused() {
     more.push(0);
     s2.set_raw(STATE_FILE, more);
     assert!(w.open(&s2, &ctr).is_err());
-    let mut v2 = good.clone();
-    v2[4..6].copy_from_slice(&2u16.to_be_bytes());
-    let mut s3 = st.clone();
-    s3.set_raw(STATE_FILE, v2);
-    assert_eq!(open_err(&w, &s3, &ctr), OpenError::VersionUnsupported(2));
+    for bad_version in [1u16, 3] {
+        let mut v = good.clone();
+        v[4..6].copy_from_slice(&bad_version.to_be_bytes());
+        let mut s3 = st.clone();
+        s3.set_raw(STATE_FILE, v);
+        assert_eq!(open_err(&w, &s3, &ctr), OpenError::VersionUnsupported(bad_version), "version 1 (no prev_digest) and future versions are refused");
+    }
     let mut magic = good;
     magic[0] ^= 0xFF;
     let mut s4 = st.clone();
@@ -1212,7 +1214,7 @@ fn a_correctly_sealed_but_non_canonical_record_is_refused_by_the_strict_decoder(
     assert!(decode_record(&good).is_ok());
     let body = good[..good.len() - 32].to_vec();
     let profile_at = 7;
-    let hvr_flag_at = profile_at + 4 + PROFILE.len() + 4 + CHAIN.len() + 4 + 1952 + 16 + 8 + 8;
+    let hvr_flag_at = profile_at + 4 + PROFILE.len() + 4 + CHAIN.len() + 4 + 1952 + 16 + 8 + 32 + 8; // after the counter, prev_digest and epoch
     let pk_len_at = profile_at + 4 + PROFILE.len() + 4 + CHAIN.len();
     let case = |name: &str, f: &dyn Fn(&mut Vec<u8>)| {
         let mut b = body.clone();

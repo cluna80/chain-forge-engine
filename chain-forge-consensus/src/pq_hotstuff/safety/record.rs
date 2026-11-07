@@ -3,8 +3,8 @@
 //! Layout (all integers big-endian, as in the wire module; every item has exactly one valid byte string):
 //!
 //! ```text
-//! record  = "PQHS" · version u16 · state u8 (0 fresh, 1 active) · profile string · chain_id string · public_key bytes
-//!           · instance_id [16] · counter u64 · epoch u64 · hvr option<u64> · hqr option<u64>
+//! record  = "PQHS" · version u16 (= 2) · state u8 (0 fresh, 1 active) · profile string · chain_id string · public_key bytes
+//!           · instance_id [16] · counter u64 · prev_digest [32] · epoch u64 · hvr option<u64> · hqr option<u64>
 //!           · slot(vote) · slot(timeout) · slot(proposal) · SHA3-256 of everything before it
 //! slot    = 0x00 | 0x01 · round u64 · message bytes · envelope bytes      (the envelope is its canonical wire encoding)
 //! marker  = "PQHI" · version u16 · profile string · chain_id string · public_key bytes · instance_id [16] · SHA3-256
@@ -89,6 +89,7 @@ pub fn encode_record(r: &SafetyRecord) -> Result<Vec<u8>, RecordError> {
     put_public_key(&mut o, &r.public_key)?;
     o.extend_from_slice(&r.instance_id);
     put_u64(&mut o, r.counter);
+    o.extend_from_slice(&r.prev_digest);
     put_u64(&mut o, r.epoch);
     put_opt_u64(&mut o, r.hvr);
     put_opt_u64(&mut o, r.hqr);
@@ -191,7 +192,7 @@ pub fn decode_record(b: &[u8]) -> Result<SafetyRecord, RecordError> {
         public_key: r.public_key()?,
         instance_id: r.take(16)?.try_into().unwrap(),
         counter: r.u64()?,
-        prev_digest: [0; 32], // RED: not yet encoded or decoded
+        prev_digest: r.take(32)?.try_into().unwrap(),
         epoch: r.u64()?,
         hvr: r.opt_u64()?,
         hqr: r.opt_u64()?,

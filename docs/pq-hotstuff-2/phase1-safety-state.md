@@ -54,11 +54,21 @@ chain already shows participating.
   commit path; the store has no method that returns a raw signature; a signature reaches the caller only inside `Signed`, after
   the file and the counter both succeeded. Holders of the key material can still sign outside the store (spec 7.1).
 
-### Known limitation found while writing the two-store tests (needs a design decision)
-The file is written (steps 4 to 6) before the counter advance (step 7), and the counter stores only a number. A writer that has
-been fenced out, on its own disk, fails at step 7 but leaves its record behind. That record carries the counter value the new
-holder also reached, so on restart it opens as if it were the committed state, and its owner would re-send a vote that conflicts
-with one already broadcast. The same happens on a shared directory if the fenced-out writer overwrites the file after the new
-holder committed. The test `known_limitation_a_fenced_out_writer_leaves_an_uncommitted_record...` asserts this behaviour so it is
-not mistaken for protection. Closing it needs a change to the counter protocol, for example the counter also committing to a
-digest of each record (checked at open), or a reserve-then-write sequence. Neither is implemented; both change the spec.
+## Digest-bound commits (spec 7.1.1, PR #129; implemented after the owner's approval)
+The two-store tests exposed that a numeric counter cannot tell two records with the same number apart: a fenced-out writer on its
+own disk fails at the counter step but leaves its record behind, and that record looked committed on restart. The counter now holds
+`(value, digest)`:
+* the **digest** of a record is the SHA3-256 checksum already sealing its canonical encoding, so it commits to the whole record:
+  `prev_digest`, the profile, the chain, the validator key, the instance, the counter, the epoch, the floors, and every stored
+  message and signature envelope (a test changes each field and requires the digest to change);
+* each record carries `prev_digest`, the digest of the record it replaces (zero for the first), so records form a chain (format
+  version 2; version 1 files are refused);
+* a commit is `advance((n-1, d_(n-1)) -> d_n, session)`;
+* on open: file counter equal and digest equal: normal; equal counter, different digest: **fork**, refused; one ahead with
+  `prev_digest` equal to the committed digest: the durable successor, adopted by a gated compare-and-advance; one ahead with any
+  other predecessor: refused; behind or further ahead: refused as before.
+
+Tests: the two-disk conflicting-vote scenario, the shared-directory overwrite, two successors one ahead (the first restart commits,
+the second is refused), and a process that died after its file was durable while a competitor committed a different successor
+(the original fails closed even though its record is internally valid). Unchanged: a holder of the signing key can still sign
+outside the store, and the in-repository counters are test doubles.
