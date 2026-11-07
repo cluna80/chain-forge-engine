@@ -273,6 +273,9 @@ impl SharedCounter {
     pub fn calls(&self) -> Vec<(u64, u64)> { self.st.borrow().calls.clone() }
     pub fn digests(&self) -> Vec<([u8; 32], [u8; 32])> { self.st.borrow().digests.clone() }
     pub fn set_race_on_next_advance(&self) { self.st.borrow_mut().race_on_next_advance = true; }
+    /// Move the counter by a route that does not involve any store's session (an operator or a bug advancing it), leaving the
+    /// current session in place.
+    pub fn move_externally(&self, digest: [u8; 32]) { let mut st = self.st.borrow_mut(); st.state = CounterState { value: st.state.value + 1, digest }; }
 }
 
 impl MonotonicCounter for SharedCounter {

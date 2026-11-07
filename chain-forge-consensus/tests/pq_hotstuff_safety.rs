@@ -1139,6 +1139,24 @@ fn every_commit_advances_from_the_previous_records_digest_to_the_new_records_dig
 }
 
 #[test]
+fn a_store_never_adopts_a_counter_state_it_did_not_commit_even_if_the_counter_moved_under_its_own_session() {
+    // The commit compares the counter with the state THIS store last committed. If the counter moved by any route (here, outside
+    // every session), the commit must fail closed and nothing may be returned; reading the counter fresh and advancing from
+    // whatever it shows would silently adopt the foreign state and overwrite it.
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let mut s = s_init(&w, &sc);
+    do_sign_s(&mut s, &mut w.signer, K::Vote, 3).unwrap();
+    sc.move_externally([0xBB; 32]);
+    let moved = sc.state();
+    let e = do_sign_s(&mut s, &mut w.signer, K::Timeout, 3).unwrap_err();
+    assert!(matches!(e, SignError::Commit(_)), "{e:?}");
+    assert!(s.is_latched());
+    assert_eq!(sc.state(), moved, "the failed commit must not change the counter");
+    assert!(s.record().last_timeout.is_none(), "and nothing was returned or recorded");
+}
+
+#[test]
 fn a_file_at_the_committed_counter_that_is_not_the_committed_record_is_a_fork() {
     let mut w = World::new();
     let (st, ctr) = w.prior().into_parts();
