@@ -47,8 +47,6 @@ impl AlgId {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    #[error("codec not implemented")]
-    Unimplemented,
     #[error("input ended before the item was complete")]
     Truncated,
     #[error("{0} unexpected trailing byte(s) after a complete item")]

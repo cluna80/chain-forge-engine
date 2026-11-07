@@ -224,10 +224,18 @@ fn strings_are_length_prefixed_utf8_without_nul_and_at_most_255_bytes() {
 
     let good = vote().encode().unwrap();
     let len_at = TAG_VOTE.len() + 2;
-    // declared length 256 (over the limit) with enough bytes present
-    let mut b = good.clone();
-    b[len_at..len_at + 4].copy_from_slice(&256u32.to_be_bytes());
-    assert!(VoteMessage::decode(&b, ALG).is_err());
+    // a 256-byte chain_id built by hand (so every declared byte is really present) is over the limit
+    let mut b = good[..len_at].to_vec();
+    b.extend_from_slice(&256u32.to_be_bytes());
+    b.extend(std::iter::repeat(b'a').take(256));
+    b.extend_from_slice(&good[len_at + 4 + CHAIN.len()..]);
+    assert_eq!(VoteMessage::decode(&b, ALG).unwrap_err(), WireError::LengthTooLarge { what: "chain_id", len: 256 });
+    // the same message with a 255-byte chain_id is accepted, so the rejection above is the limit and nothing else
+    let mut ok = good[..len_at].to_vec();
+    ok.extend_from_slice(&255u32.to_be_bytes());
+    ok.extend(std::iter::repeat(b'a').take(255));
+    ok.extend_from_slice(&good[len_at + 4 + CHAIN.len()..]);
+    assert!(VoteMessage::decode(&ok, ALG).is_ok());
     // a length prefix far larger than the input must be an error, not a panic or a huge allocation
     let mut b = good.clone();
     b[len_at..len_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
