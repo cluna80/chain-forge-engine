@@ -1388,6 +1388,10 @@ mod tests {
 
 
 }
+/// PQ-HotStuff-2 (Phase 0, feature `pq-hotstuff`, not enabled by default). See docs/pq-hotstuff-001-spec.md.
+#[cfg(feature = "pq-hotstuff")]
+pub mod pq_hotstuff;
+
 pub mod tendermint {
     use super::*;
 

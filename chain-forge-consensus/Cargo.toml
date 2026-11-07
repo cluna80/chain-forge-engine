@@ -14,9 +14,12 @@ serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 async-trait = { workspace = true }
 tracing     = { workspace = true }
+sha3        = { workspace = true, optional = true }
 
 [features]
 real-crypto = ["chain-forge-crypto", "chain-forge-crypto/real-pqc"]
+# PQ-HotStuff-2 (docs/pq-hotstuff-001-spec.md). Phase 0: not in any default feature set; no network activates it.
+pq-hotstuff = ["dep:sha3"]
 
 [dev-dependencies]
 tokio = { workspace = true }
