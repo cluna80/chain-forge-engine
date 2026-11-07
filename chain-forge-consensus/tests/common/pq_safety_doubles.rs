@@ -275,6 +275,8 @@ impl SharedCounter {
     pub fn set_race_on_next_advance(&self) { self.st.borrow_mut().race_on_next_advance = true; }
     /// Move the counter by a route that does not involve any store's session (an operator or a bug advancing it), leaving the
     /// current session in place.
+    /// Change only the digest, leaving the value and the sessions alone.
+    pub fn change_digest_externally(&self, digest: [u8; 32]) { self.st.borrow_mut().state.digest = digest; }
     pub fn move_externally(&self, digest: [u8; 32]) { let mut st = self.st.borrow_mut(); st.state = CounterState { value: st.state.value + 1, digest }; }
 }
 
