@@ -80,7 +80,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         };
         let rb = encode_record(&rec).map_err(|e| InitError::Storage(e.to_string()))?;
         durable_replace(&mut storage, STATE_TMP, STATE_FILE, &rb).map_err(st)?;
-        counter.advance_to(1).map_err(|e| InitError::Counter(e.0))?;
+        counter.advance(0, &Session::new(0)).map_err(|e| InitError::Counter(e.0))?;
         Ok(SafetyStore { storage, counter, rec, latched: false })
     }
 
@@ -128,7 +128,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
             if behind { return Err(OpenError::StaleAgainstChain { chain: (ce, cr), record: rec.high_water() }); }
         }
 
-        if crash_window { counter.advance_to(rec.counter).map_err(|e| OpenError::Counter(e.0))?; }
+        if crash_window { counter.advance(trusted, &Session::new(0)).map_err(|e| OpenError::Counter(e.0))?; }
         // a leftover temporary file from an interrupted commit was never read; clear it (best effort)
         let _ = storage.remove(STATE_TMP);
         let _ = storage.remove(MARKER_TMP);
@@ -274,6 +274,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
     fn commit(&mut self, n: &SafetyRecord) -> Result<(), String> {
         let bytes = encode_record(n).map_err(|e| e.to_string())?;
         durable_replace(&mut self.storage, STATE_TMP, STATE_FILE, &bytes).map_err(|e| e.0)?;
-        self.counter.advance_to(n.counter).map_err(|e| e.0)
+        let t = self.counter.read().map_err(|e| e.0)?;
+        self.counter.advance(t, &Session::new(0)).map_err(|e| e.0)
     }
 }

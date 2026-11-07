@@ -146,12 +146,37 @@ pub trait Storage {
     fn remove(&mut self, name: &str) -> Result<(), StorageError>;
 }
 
+/// The identity a counter belongs to: one validator key and one initialization instance. A counter handle is constructed bound
+/// to exactly one identity and is never reused for another (spec section 7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterBinding {
+    pub public_key: Vec<u8>,
+    pub instance_id: [u8; 16],
+}
+
+/// The exclusive-writer credential: a fencing token that increases with every acquisition. Only the holder of the latest
+/// session can advance the counter (spec section 7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session { token: u64 }
+
+impl Session {
+    /// For counter backends, which issue sessions. The store never invents one.
+    pub fn new(token: u64) -> Self { Session { token } }
+    pub fn token(&self) -> u64 { self.token }
+}
+
 /// A trusted monotonic counter that the file's owner cannot roll back (hardware counter, HSM, remote witness). It must be
-/// durable, atomic and refuse to move backwards. **An ordinary file is not a valid implementation.**
+/// durable, atomic, bound to one validator instance, enforce one exclusive signing session, and refuse to move backwards.
+/// **An ordinary file is not a valid implementation**, and neither is any test double in this repository.
 pub trait MonotonicCounter {
+    /// The validator identity this counter belongs to.
+    fn binding(&self) -> &CounterBinding;
     fn read(&self) -> Result<u64, CounterError>;
-    /// Advance to `value`, which must equal the current value (idempotent) or the current value plus one.
-    fn advance_to(&mut self, value: u64) -> Result<(), CounterError>;
+    /// Become the one valid writer. Supersedes every earlier session; the backend rejects advances from those.
+    fn acquire_session(&mut self) -> Result<Session, CounterError>;
+    /// Compare-and-advance: succeeds only if the counter currently equals `expected_previous` **and** `session` is the latest
+    /// session, and then becomes `expected_previous + 1`. Otherwise it fails and changes nothing. There is no idempotent form.
+    fn advance(&mut self, expected_previous: u64, session: &Session) -> Result<(), CounterError>;
 }
 
 /// Signs one canonical message under a FIPS 204 context (hedged). Returns the raw signature bytes.
@@ -214,6 +239,8 @@ pub enum OpenError {
     CounterInconsistent { file_counter: u64, trusted_counter: u64 },
     #[error("stale: the chain shows this key signing at {chain:?}, beyond the record's {record:?}")]
     StaleAgainstChain { chain: (u64, u64), record: Option<(u64, u64)> },
+    #[error("the counter is bound to a different validator identity than the record")]
+    CounterBindingMismatch,
     #[error("{0}")]
     Storage(String),
     #[error("{0}")]
@@ -230,6 +257,8 @@ pub enum InitError {
     KeyAlreadyParticipated,
     #[error("invalid identity: {0}")]
     BadIdentity(&'static str),
+    #[error("the counter is bound to a different validator identity")]
+    CounterBindingMismatch,
     #[error("{0}")]
     Storage(String),
     #[error("{0}")]

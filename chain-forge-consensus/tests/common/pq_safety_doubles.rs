@@ -177,23 +177,100 @@ impl Storage for MemStorage {
     }
 }
 
-// ---------------------------------------------------------------- trusted counter (test double)
+// ---------------------------------------------------------------- counter test doubles (NOT trusted mechanisms)
 
+/// The identity the default test counters are bound to (the key of `TestSigner::new(1)` and the instance id the tests use).
+pub const TEST_INSTANCE: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+fn default_binding() -> CounterBinding { CounterBinding { public_key: test_public_key(1), instance_id: TEST_INSTANCE } }
+
+/// The shared state of a counter: what a remote counter service would hold.
+#[derive(Debug, Clone)]
+pub struct CounterState {
+    pub value: u64,
+    /// the token of the latest session; advances from any other session are refused
+    pub current_token: u64,
+    next_token: u64,
+    /// the (expected_previous, session token) of every `advance` attempted, in order, successful or not
+    pub calls: Vec<(u64, u64)>,
+    /// simulate another writer advancing the counter just before the next `advance` is evaluated
+    pub race_on_next_advance: bool,
+}
+
+fn strict_advance(st: &mut CounterState, faults: &Shared, expected_previous: u64, session: &Session) -> Result<(), CounterError> {
+    tick(faults, "counter").map_err(CounterError)?;
+    st.calls.push((expected_previous, session.token()));
+    if st.race_on_next_advance { st.race_on_next_advance = false; st.value += 1; }
+    if session.token() != st.current_token {
+        return Err(CounterError(format!("session {} is not the current session {}", session.token(), st.current_token)));
+    }
+    if st.value != expected_previous {
+        return Err(CounterError(format!("the counter is {} but the caller expected {expected_previous}", st.value)));
+    }
+    st.value += 1;
+    Ok(())
+}
+
+/// A private in-memory counter: cloning copies its state. Strict compare-and-advance with a fencing session. For tests only.
 #[derive(Clone)]
-pub struct TestCounter { pub value: u64, pub faults: Shared }
+pub struct TestCounter { pub value: u64, pub faults: Shared, binding: CounterBinding, st: CounterState }
 
 impl TestCounter {
-    pub fn new(faults: Shared) -> Self { TestCounter { value: 0, faults } }
-    pub fn with_value(value: u64, faults: Shared) -> Self { TestCounter { value, faults } }
+    pub fn new(faults: Shared) -> Self { Self::with_value(0, faults) }
+    pub fn with_value(value: u64, faults: Shared) -> Self { Self::bound(value, faults, default_binding()) }
+    pub fn bound(value: u64, faults: Shared, binding: CounterBinding) -> Self {
+        TestCounter { value, faults, binding, st: CounterState { value, current_token: 0, next_token: 1, calls: vec![], race_on_next_advance: false } }
+    }
+    pub fn calls(&self) -> Vec<(u64, u64)> { self.st.calls.clone() }
+    pub fn set_race_on_next_advance(&mut self) { self.st.race_on_next_advance = true; }
 }
 
 impl MonotonicCounter for TestCounter {
-    fn read(&self) -> Result<u64, CounterError> { Ok(self.value) }
-    fn advance_to(&mut self, v: u64) -> Result<(), CounterError> {
-        tick(&self.faults, "counter").map_err(CounterError)?;
-        if v != self.value && v != self.value + 1 { return Err(CounterError(format!("cannot move from {} to {v}", self.value))); }
-        self.value = v;
-        Ok(())
+    fn binding(&self) -> &CounterBinding { &self.binding }
+    fn read(&self) -> Result<u64, CounterError> { Ok(self.st.value) }
+    fn acquire_session(&mut self) -> Result<Session, CounterError> {
+        let t = self.st.next_token;
+        self.st.next_token += 1;
+        self.st.current_token = t;
+        Ok(Session::new(t))
+    }
+    fn advance(&mut self, expected_previous: u64, session: &Session) -> Result<(), CounterError> {
+        let r = strict_advance(&mut self.st, &self.faults, expected_previous, session);
+        self.value = self.st.value;
+        r
+    }
+}
+
+/// A counter that several stores reach through clones of one handle, like a remote counter service: all clones share one state,
+/// so a session acquired through one clone supersedes the sessions of the others.
+#[derive(Clone)]
+pub struct SharedCounter { st: Rc<RefCell<CounterState>>, pub faults: Shared, binding: CounterBinding }
+
+impl SharedCounter {
+    pub fn new(value: u64, faults: Shared) -> Self {
+        SharedCounter {
+            st: Rc::new(RefCell::new(CounterState { value, current_token: 0, next_token: 1, calls: vec![], race_on_next_advance: false })),
+            faults, binding: default_binding(),
+        }
+    }
+    pub fn value(&self) -> u64 { self.st.borrow().value }
+    pub fn calls(&self) -> Vec<(u64, u64)> { self.st.borrow().calls.clone() }
+    pub fn set_race_on_next_advance(&self) { self.st.borrow_mut().race_on_next_advance = true; }
+}
+
+impl MonotonicCounter for SharedCounter {
+    fn binding(&self) -> &CounterBinding { &self.binding }
+    fn read(&self) -> Result<u64, CounterError> { Ok(self.st.borrow().value) }
+    fn acquire_session(&mut self) -> Result<Session, CounterError> {
+        let mut st = self.st.borrow_mut();
+        let t = st.next_token;
+        st.next_token += 1;
+        st.current_token = t;
+        Ok(Session::new(t))
+    }
+    fn advance(&mut self, expected_previous: u64, session: &Session) -> Result<(), CounterError> {
+        let mut st = self.st.borrow_mut();
+        strict_advance(&mut st, &self.faults, expected_previous, session)
     }
 }
 

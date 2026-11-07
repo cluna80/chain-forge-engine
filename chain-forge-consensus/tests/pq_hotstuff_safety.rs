@@ -764,6 +764,203 @@ fn a_crash_while_initializing_never_leaves_signing_state_or_a_state_without_its_
     }
 }
 
+// ================================================================ strict compare-and-advance, sessions, recovery (spec 7.1)
+
+type SStore = SafetyStore<MemStorage, SharedCounter>;
+
+fn s_init(w: &World, sc: &SharedCounter) -> SStore {
+    SafetyStore::initialize_fresh(w.st.clone(), sc.clone(), &w.fresh_init(), &ParticipationEvidence::default()).expect("initialize")
+}
+fn s_open(w: &World, st: &MemStorage, sc: &SharedCounter) -> Result<SStore, OpenError> {
+    SafetyStore::open(st.clone(), sc.clone(), &w.expected(), &TestVerifier, &ParticipationEvidence::default())
+}
+
+#[test]
+fn the_test_counter_double_is_strict_compare_and_advance_with_a_fencing_session() {
+    let f = faults();
+    let mut c = TestCounter::new(f);
+    let s1 = c.acquire_session().unwrap();
+    assert!(c.advance(0, &s1).is_ok());
+    assert!(c.advance(0, &s1).is_err(), "advancing again from 0 must fail: there is no idempotent form");
+    assert!(c.advance(2, &s1).is_err(), "an expected value ahead of the counter must fail");
+    assert_eq!(c.read().unwrap(), 1);
+    let s2 = c.acquire_session().unwrap();
+    assert!(c.advance(1, &s1).is_err(), "a superseded session must fail even with the right expected value");
+    assert!(c.advance(1, &s2).is_ok());
+    assert_eq!(c.read().unwrap(), 2);
+}
+
+#[test]
+fn every_commit_is_a_compare_and_advance_from_the_records_previous_counter_with_the_stores_session() {
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let mut s = s_init(&w, &sc);
+    do_sign_s(&mut s, &mut w.signer, K::Vote, 3).unwrap();
+    do_sign_s(&mut s, &mut w.signer, K::Timeout, 3).unwrap();
+    do_sign_s(&mut s, &mut w.signer, K::Proposal, 3).unwrap();
+    // initialization advanced 0 -> 1, then 1 -> 2, 2 -> 3, 3 -> 4, all with the one session the store acquired
+    assert_eq!(sc.calls(), vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
+    assert_eq!(sc.value(), 4);
+    // a re-send is not a commit and does not touch the counter
+    assert!(do_sign_s(&mut s, &mut w.signer, K::Vote, 3).unwrap().resent);
+    assert_eq!(sc.calls().len(), 4);
+}
+
+fn do_sign_s(s: &mut SStore, signer: &mut TestSigner, k: K, round: u64) -> Result<Signed, SignError> {
+    match k {
+        K::Vote => s.sign_vote(&vote(1, round, 1), round - 1, signer),
+        K::Timeout => s.sign_timeout(&timeout(1, round, 1), signer),
+        K::Proposal => s.sign_proposal(1, round, &proposal(1), signer),
+    }
+}
+
+#[test]
+fn a_counter_that_has_moved_fails_the_commit_closed_and_no_signature_is_exposed() {
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let mut s = s_init(&w, &sc);
+    sc.set_race_on_next_advance(); // another writer advances the counter first
+    let e = do_sign_s(&mut s, &mut w.signer, K::Vote, 3).unwrap_err();
+    assert!(matches!(e, SignError::Commit(_)), "{e:?}");
+    assert!(s.is_latched());
+    // nothing was exposed: the record is unchanged and every later call, even the identical request, is refused
+    assert!(s.record().last_vote.is_none() && s.record().hvr.is_none());
+    assert_eq!(do_sign_s(&mut s, &mut w.signer, K::Vote, 3).unwrap_err(), SignError::Latched);
+    assert_eq!(do_sign_s(&mut s, &mut w.signer, K::Timeout, 4).unwrap_err(), SignError::Latched);
+}
+
+#[test]
+fn a_superseded_session_cannot_commit_returns_nothing_and_does_not_disturb_the_new_holder() {
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let (st, _) = s_init(&w, &sc).into_parts();
+    let mut a = s_open(&w, &st, &sc).expect("A opens"); // acquires a session
+    let mut b = s_open(&w, &st, &sc).expect("B opens"); // acquires a later one: A is superseded
+    let ea = do_sign_s(&mut a, &mut w.signer, K::Vote, 6).unwrap_err();
+    assert!(matches!(ea, SignError::Commit(_)), "the superseded store must not commit: {ea:?}");
+    assert!(a.is_latched());
+    assert!(a.record().last_vote.is_none(), "and its in-memory state must not advance");
+    assert_eq!(do_sign_s(&mut a, &mut w.signer, K::Vote, 6).unwrap_err(), SignError::Latched, "nothing is ever returned by the superseded store");
+    // the new holder is unaffected and keeps committing
+    let out = do_sign_s(&mut b, &mut w.signer, K::Vote, 6).expect("B commits");
+    assert!(!out.resent);
+    do_sign_s(&mut b, &mut w.signer, K::Timeout, 6).expect("B commits again");
+    assert_eq!(sc.value(), 3);
+}
+
+#[test]
+fn a_copy_whose_file_is_behind_the_shared_counter_cannot_open() {
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let (st, _) = s_init(&w, &sc).into_parts();
+    let mut a = s_open(&w, &st, &sc).unwrap();
+    do_sign_s(&mut a, &mut w.signer, K::Vote, 5).unwrap();
+    // the clone starts from the snapshot taken before A signed
+    assert!(matches!(s_open(&w, &st, &sc).err().unwrap(), OpenError::Rollback { file_counter: 1, trusted_counter: 2 }));
+    // and the live store still works
+    do_sign_s(&mut a, &mut w.signer, K::Timeout, 5).unwrap();
+}
+
+#[test]
+fn a_failed_open_does_not_supersede_the_running_store() {
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let (st, _) = s_init(&w, &sc).into_parts();
+    let mut a = s_open(&w, &st, &sc).unwrap();
+    do_sign_s(&mut a, &mut w.signer, K::Vote, 5).unwrap();
+    // a damaged copy, a stale copy and a mismatched copy all fail to open ...
+    let mut damaged = st.clone();
+    let mut b = damaged.raw(STATE_FILE).unwrap();
+    b[10] ^= 1;
+    damaged.set_raw(STATE_FILE, b);
+    assert!(s_open(&w, &damaged, &sc).is_err());
+    assert!(matches!(s_open(&w, &st, &sc).err().unwrap(), OpenError::Rollback { .. }));
+    // ... and none of them took the session away from the live store
+    do_sign_s(&mut a, &mut w.signer, K::Timeout, 5).expect("the running store is still the one valid writer");
+}
+
+#[test]
+fn a_counter_bound_to_another_identity_is_refused_at_initialization_and_at_open() {
+    let w = World::new();
+    let f = w.f.clone();
+    let other_key = CounterBinding { public_key: test_public_key(2), instance_id: TEST_INSTANCE };
+    let other_instance = CounterBinding { public_key: w.pk.clone(), instance_id: [0xEE; 16] };
+    for (name, binding) in [("another key", other_key), ("another instance", other_instance)] {
+        let c = TestCounter::bound(0, f.clone(), binding.clone());
+        let e = Store::initialize_fresh(MemStorage::new(f.clone()), c, &w.fresh_init(), &ParticipationEvidence::default()).err().unwrap();
+        assert_eq!(e, InitError::CounterBindingMismatch, "{name}");
+    }
+    let (st, ctr) = w.init().into_parts();
+    for (name, binding) in [
+        ("another key", CounterBinding { public_key: test_public_key(2), instance_id: TEST_INSTANCE }),
+        ("another instance", CounterBinding { public_key: w.pk.clone(), instance_id: [0xEE; 16] }),
+    ] {
+        let c = TestCounter::bound(ctr.value, f.clone(), binding);
+        assert_eq!(w.open(&st, &c).err().unwrap(), OpenError::CounterBindingMismatch, "{name}");
+    }
+    assert!(w.open(&st, &ctr).is_ok());
+}
+
+#[test]
+fn a_recovery_advance_gates_the_open_and_a_counter_failure_leaves_no_store() {
+    let mut w = World::new();
+    let (st, ctr) = w.prior().into_parts();
+    let behind = TestCounter::with_value(ctr.value - 1, w.f.clone());
+    w.reset_plan();
+    w.f.borrow_mut().crash_before = Some(0); // the counter is unreachable for the recovery advance
+    let e = w.open(&st, &behind).err().expect("no store may exist when the recovery advance fails");
+    assert!(matches!(e, OpenError::Counter(_)), "{e:?}");
+    w.reset_plan();
+    let s = w.open(&st, &behind).expect("once the counter is reachable the same open succeeds");
+    assert_eq!(s.into_parts().1.value, ctr.value);
+}
+
+#[test]
+fn a_recovery_advance_that_loses_a_race_fails_closed() {
+    let mut w = World::new();
+    let (st, ctr) = w.prior().into_parts();
+    let mut behind = TestCounter::with_value(ctr.value - 1, w.f.clone());
+    behind.set_race_on_next_advance(); // another writer advances the counter first
+    let e = w.open(&st, &behind).err().expect("must not open");
+    assert!(matches!(e, OpenError::Counter(_)), "{e:?}");
+}
+
+#[test]
+fn a_crash_during_the_recovery_advance_reopens_correctly_in_both_outcomes() {
+    let mut w = World::new();
+    let (st, ctr) = w.prior().into_parts();
+    // outcome 1: the advance did not happen: still one behind -> the same rule applies again
+    let behind = TestCounter::with_value(ctr.value - 1, w.f.clone());
+    assert_eq!(w.open(&st, &behind).unwrap().into_parts().1.value, ctr.value);
+    // outcome 2: the advance happened but the acknowledgement was lost: equal -> normal open, nothing to repeat
+    let equal = TestCounter::with_value(ctr.value, w.f.clone());
+    let s = w.open(&st, &equal).unwrap();
+    assert_eq!(s.into_parts().1.value, ctr.value);
+}
+
+#[test]
+fn known_limitation_a_fenced_out_writer_leaves_an_uncommitted_record_the_counter_cannot_tell_from_the_committed_one() {
+    // DOCUMENTED LIMIT, asserted so nobody mistakes the session fence for protection of the FILE. The commit sequence writes the
+    // file (steps 4 to 6) before the counter is advanced (step 7), so a fenced-out writer on its own disk fails at step 7 but
+    // leaves its record behind. The counter holds only a number, so that record looks valid when its owner restarts, and its
+    // owner would re-send a vote that conflicts with the one the new holder already broadcast. Closing this needs the counter
+    // to commit to the record (for example its digest) or a reserve-then-write protocol, which is a design change for review.
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let (st, _) = s_init(&w, &sc).into_parts();
+    let mut a = s_open(&w, &st, &sc).unwrap(); // A, on its own disk
+    let mut b = s_open(&w, &st, &sc).unwrap(); // B, on its own disk, supersedes A
+    let m_b = do_sign_s(&mut b, &mut w.signer, K::Vote, 6).expect("B commits and broadcasts"); // block 1
+    let e = a.sign_vote(&vote(1, 6, 2), 5, &mut w.signer).unwrap_err(); // A tries a DIFFERENT block for the same round
+    assert!(matches!(e, SignError::Commit(_)), "{e:?}");
+    let (a_disk, _) = a.into_parts();
+    // A's operator restarts it on its own disk: the file counter equals the trusted counter, so it opens as if nothing were wrong
+    let a2 = s_open(&w, &a_disk, &sc).expect("A reopens: the limitation");
+    let held = a2.record().last_vote.clone().unwrap();
+    assert_eq!(held.message, vote(1, 6, 2).encode().unwrap(), "A now holds the vote B never sent");
+    assert_ne!(held.message, m_b.message, "which conflicts with the vote B broadcast");
+}
+
 // ================================================================ golden record format (independent oracle)
 
 const FRESH_LEN_DIGEST: (usize, &str) = (2081, "a66312ba5b18fe67a0844dfe6d828db6fab3d7ee7a4f06d1768a9b9678459e4b");
