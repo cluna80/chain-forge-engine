@@ -1,0 +1,41 @@
+# Phase 1 step 1b: mutation check of the real FIPS 204 adapter (pq-hotstuff-fips204 feature)
+# Each mutant is a single edit to safety/fips204_adapter.rs or safety/mod.rs (the contexts) applied in a separate worktree, restored after each run.
+# Command per mutant: cargo test -p chain-forge-consensus --features pq-hotstuff-fips204 --test pq_hotstuff_safety_fips204
+# Not testable, so not mutated: the best-effort overwrite of the secret key in Drop (memory cannot be observed after drop).
+
+A01 verifier accepts everything: CAUGHT (3 failing)
+A02 verifier ignores the context: CAUGHT (4 failing)
+A03 verifier ignores the message: CAUGHT (4 failing)
+A04 signer ignores the context: CAUGHT (6 failing)
+A05 signer is deterministic, not hedged: CAUGHT (1 failing)
+A06 from_seed ignores the seed: CAUGHT (4 failing)
+A07 generate returns a fixed key: CAUGHT (1 failing)
+A08 Debug prints the secret key: CAUGHT (1 failing)
+A09 signer returns a truncated signature: CAUGHT (8 failing)
+A10 public_key() returns the secret key: CAUGHT (9 failing)
+A11 vote context changed: CAUGHT (4 failing)
+A12 timeout context changed: CAUGHT (2 failing)
+A13 proposal context changed: CAUGHT (2 failing)
+A14 timeouts signed in the vote context: CAUGHT (1 failing)
+A15 proposals signed in the timeout context: CAUGHT (1 failing)
+caught 15 of 15
+
+## Rerun on the final code (commit b1a66cc: the adapter on top of the digest-bound #127 head c4c2550's code)
+# The adapter code is unchanged since the first run; the test setup changed (counters bound to the real signer's key, tampered files opened as the committed record,
+# restarts via rebind_faults) and the store underneath is digest-bound. Same 15 mutants, same command, clean worktree, restored after each run.
+A01 verifier accepts everything: CAUGHT (3 failing)
+A02 verifier ignores the context: CAUGHT (4 failing)
+A03 verifier ignores the message: CAUGHT (4 failing)
+A04 signer ignores the context: CAUGHT (6 failing)
+A05 signer is deterministic, not hedged: CAUGHT (1 failing)
+A06 from_seed ignores the seed: CAUGHT (4 failing)
+A07 generate returns a fixed key: CAUGHT (1 failing)
+A08 Debug prints the secret key: CAUGHT (1 failing)
+A09 signer returns a truncated signature: CAUGHT (8 failing)
+A10 public_key() returns the secret key: CAUGHT (9 failing)
+A11 vote context changed: CAUGHT (4 failing)
+A12 timeout context changed: CAUGHT (2 failing)
+A13 proposal context changed: CAUGHT (2 failing)
+A14 timeouts signed in the vote context: CAUGHT (1 failing)
+A15 proposals signed in the timeout context: CAUGHT (1 failing)
+caught 15 of 15
