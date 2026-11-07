@@ -961,6 +961,85 @@ fn known_limitation_a_fenced_out_writer_leaves_an_uncommitted_record_the_counter
     assert_ne!(held.message, m_b.message, "which conflicts with the vote B broadcast");
 }
 
+// ================================================================ regression tests for the digest-bound counter (spec 7.1.1, PROPOSED)
+//
+// These state the behaviour the digest-bound counter must have, using only the current API so that they compile today. They are
+// `#[ignore]`d because they FAIL on the current implementation (the counter holds only a number); run them with `--ignored` to
+// see that. Each becomes a normal test when 7.1.1 is approved and implemented. `known_limitation_*` above documents the current
+// behaviour and is to be deleted at the same time.
+
+const PENDING: &str = "fails until the digest-bound counter (spec 7.1.1, PR #129) is implemented";
+
+/// Two writers on their own disks from one committed record; B (the later session) commits `m_B` for round 6; A, fenced out,
+/// tries a different vote for the same round and fails at the counter. Returns (A's disk, the shared counter, m_B, m_A).
+fn two_disk_fork(w: &mut World) -> (MemStorage, SharedCounter, Vec<u8>, Vec<u8>) {
+    let sc = SharedCounter::new(0, w.f.clone());
+    let (st, _) = s_init(w, &sc).into_parts();
+    let mut a = s_open(w, &st, &sc).unwrap();
+    let mut b = s_open(w, &st, &sc).unwrap();
+    let m_b = do_sign_s(&mut b, &mut w.signer, K::Vote, 6).unwrap().message;
+    assert!(matches!(a.sign_vote(&vote(1, 6, 2), 5, &mut w.signer).unwrap_err(), SignError::Commit(_)));
+    let (a_disk, _) = a.into_parts();
+    (a_disk, sc, m_b, vote(1, 6, 2).encode().unwrap())
+}
+
+#[test]
+#[ignore = "fails until the digest-bound counter (spec 7.1.1, PR #129) is implemented"]
+fn two_disks_a_fenced_out_writers_restart_is_refused_so_it_can_never_send_a_vote_that_conflicts_with_the_committed_one() {
+    let _ = PENDING;
+    let mut w = World::new();
+    let (a_disk, sc, m_b, _m_a) = two_disk_fork(&mut w);
+    match s_open(&w, &a_disk, &sc) {
+        Err(_) => {}
+        Ok(a2) => panic!("A reopened holding {:?} although B broadcast a different vote ({} bytes) for the same round",
+            a2.record().last_vote.as_ref().map(|v| v.round), m_b.len()),
+    }
+}
+
+#[test]
+#[ignore = "fails until the digest-bound counter (spec 7.1.1, PR #129) is implemented"]
+fn a_state_file_overwritten_after_the_commit_by_a_fenced_out_writer_is_refused_on_the_new_holders_restart() {
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let (st, _) = s_init(&w, &sc).into_parts();
+    let mut a = s_open(&w, &st, &sc).unwrap();
+    let mut b = s_open(&w, &st, &sc).unwrap();
+    do_sign_s(&mut b, &mut w.signer, K::Vote, 6).unwrap(); // B commits and broadcasts
+    assert!(a.sign_vote(&vote(1, 6, 2), 5, &mut w.signer).is_err()); // A is fenced out but its file write happened on its disk
+    let (a_disk, _) = a.into_parts();
+    let (mut b_disk, _) = b.into_parts();
+    // on a shared directory, A's late write lands on top of B's committed file
+    b_disk.set_raw(STATE_FILE, a_disk.raw(STATE_FILE).unwrap());
+    assert!(s_open(&w, &b_disk, &sc).is_err(), "B must not restart on a record that is not the one it committed");
+}
+
+#[test]
+#[ignore = "fails until the digest-bound counter (spec 7.1.1, PR #129) is implemented"]
+fn two_files_one_ahead_the_first_restart_commits_and_the_second_is_refused() {
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let (st, _) = s_init(&w, &sc).into_parts();
+    let mut a = s_open(&w, &st, &sc).unwrap();
+    let mut b = s_open(&w, &st, &sc).unwrap();
+    // B writes its file durably and dies before the counter advance: nothing was returned
+    w.reset_plan();
+    w.f.borrow_mut().crash_before = Some(4);
+    assert!(b.sign_vote(&vote(1, 6, 1), 5, &mut w.signer).is_err());
+    // A (fenced out) also writes its file for the same round and fails at the counter: nothing was returned either
+    w.reset_plan();
+    assert!(a.sign_vote(&vote(1, 6, 2), 5, &mut w.signer).is_err());
+    let (a_disk, _) = a.into_parts();
+    let (b_disk, _) = b.into_parts();
+    w.reset_plan();
+    assert_eq!(sc.value(), 1, "the counter never advanced");
+    // each disk now holds a valid successor of the committed record; whichever restarts first commits it ...
+    let first = s_open(&w, &b_disk, &sc).expect("the first restart commits its successor");
+    assert_eq!(sc.value(), 2);
+    // ... and the other, whose record is not the committed one, is refused
+    assert!(s_open(&w, &a_disk, &sc).is_err(), "the second restart holds a vote that conflicts with the committed one");
+    drop(first);
+}
+
 // ================================================================ golden record format (independent oracle)
 
 const FRESH_LEN_DIGEST: (usize, &str) = (2081, "a66312ba5b18fe67a0844dfe6d828db6fab3d7ee7a4f06d1768a9b9678459e4b");
