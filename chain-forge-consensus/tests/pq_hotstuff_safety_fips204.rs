@@ -34,12 +34,24 @@ fn signer(seed: u8) -> Fips204Signer { Fips204Signer::from_seed(&[seed; 32]) }
 fn init(signer: &Fips204Signer) -> Store {
     let f = faults();
     let init = FreshInit { protocol_profile: PROFILE, chain_id: CHAIN, public_key: signer.public_key(), instance_id: ID, epoch: 1 };
-    SafetyStore::initialize_fresh(MemStorage::new(f.clone()), TestCounter::new(f), &init, &ParticipationEvidence::default()).expect("initialize")
+    // the counter is bound to this signer's key and this instance, as a real counter would be
+    let counter = TestCounter::bound(CounterState::INITIAL, f.clone(), CounterBinding { public_key: signer.public_key().to_vec(), instance_id: ID });
+    SafetyStore::initialize_fresh(MemStorage::new(f), counter, &init, &ParticipationEvidence::default()).expect("initialize")
 }
 
 fn open(st: &MemStorage, ctr: &TestCounter, pk: &[u8]) -> Result<Store, OpenError> {
     let exp = Expected { protocol_profile: PROFILE, chain_id: CHAIN, public_key: pk };
     SafetyStore::open(st.clone(), ctr.clone(), &exp, &Fips204Verifier, &ParticipationEvidence::default())
+}
+
+/// Open as if this (possibly tampered) state file were the committed record, so that the real verifier is tested on its own and
+/// not pre-empted by the digest check.
+fn open_as_committed(st: &MemStorage, pk: &[u8]) -> Result<Store, OpenError> {
+    let b = st.raw(STATE_FILE).expect("state file");
+    let r = decode_record(&b).expect("decode");
+    let state = CounterState { value: r.counter, digest: b[b.len() - 32..].try_into().unwrap() };
+    let c = TestCounter::bound(state, faults(), CounterBinding { public_key: pk.to_vec(), instance_id: ID });
+    open(st, &c, pk)
 }
 
 /// a store with a vote, a timeout and a proposal signed at round 5
@@ -131,14 +143,14 @@ fn real_signing_is_hedged_two_signatures_over_one_message_differ_and_both_verify
 fn a_tampered_stored_signature_is_refused_on_open_by_the_real_verifier() {
     let mut s0 = signer(1);
     let pk = s0.public_key().to_vec();
-    let (st, ctr) = prior(&mut s0).into_parts();
+    let (st, _ctr) = prior(&mut s0).into_parts();
     for which in ["vote", "timeout", "proposal"] {
         let mut r = decode_record(&st.raw(STATE_FILE).unwrap()).unwrap();
         let item = match which { "vote" => r.last_vote.as_mut(), "timeout" => r.last_timeout.as_mut(), _ => r.last_proposal.as_mut() }.unwrap();
         item.envelope.signature[1000] ^= 1;
         let mut st2 = st.clone();
         st2.set_raw(STATE_FILE, encode_record(&r).unwrap());
-        assert_eq!(open(&st2, &ctr, &pk).err().unwrap(), OpenError::BadSignature { kind: match which { "vote" => "vote", "timeout" => "timeout", _ => "proposal" } }, "{which}");
+        assert_eq!(open_as_committed(&st2, &pk).err().unwrap(), OpenError::BadSignature { kind: match which { "vote" => "vote", "timeout" => "timeout", _ => "proposal" } }, "{which}");
     }
 }
 
@@ -146,13 +158,13 @@ fn a_tampered_stored_signature_is_refused_on_open_by_the_real_verifier() {
 fn a_garbage_signature_and_a_signature_from_another_key_or_domain_are_refused_on_open() {
     let mut s0 = signer(1);
     let pk = s0.public_key().to_vec();
-    let (st, ctr) = prior(&mut s0).into_parts();
+    let (st, _ctr) = prior(&mut s0).into_parts();
     let swap = |f: &dyn Fn(&mut SafetyRecord)| {
         let mut r = decode_record(&st.raw(STATE_FILE).unwrap()).unwrap();
         f(&mut r);
         let mut st2 = st.clone();
         st2.set_raw(STATE_FILE, encode_record(&r).unwrap());
-        open(&st2, &ctr, &pk).err().unwrap()
+        open_as_committed(&st2, &pk).err().unwrap()
     };
     let garbage: Vec<u8> = (0..3309).map(|i| (i % 251) as u8).collect();
     assert_eq!(swap(&|r| r.last_vote.as_mut().unwrap().envelope.signature = garbage.clone()), OpenError::BadSignature { kind: "vote" });
@@ -226,7 +238,7 @@ fn a_crash_at_any_step_with_real_signatures_reopens_and_never_allows_a_second_vo
         let (st, ctr) = s.into_parts();
         for (n, o) in st.crash_outcomes(1009).iter().enumerate() {
             let ctx = format!("crash before op {crash_before} / outcome {n}");
-            let c = TestCounter::with_value(ctr.value, o.faults.clone());
+            let c = ctr.rebind_faults(o.faults.clone());
             let mut s2 = open(o, &c, &pk).unwrap_or_else(|e| panic!("{ctx}: does not reopen: {e}"));
             let durable = s2.record().last_vote.clone().unwrap();
             if durable.round == 6 {
