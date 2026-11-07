@@ -205,7 +205,7 @@ At expected Qattice sizes the quadratic view change is a rare-path cost. Commit 
 ## 7. Persistence and restart
 
 - **Safety state:** `{epoch, profile, hvr, hqr, last_signed}` is written atomically to `persist/pq_hotstuff_safety.json` **before** any vote or timeout leaves the node. This is the same write-before-broadcast discipline as the Tendermint `SignGuard`. If the file is present but unreadable, the node refuses to sign (fail closed).
-- **Exact signed message and envelope (crash safety).** `last_signed` is not a summary. It stores, for the last vote or timeout, the **canonical message bytes (§3.2) and the complete signature envelope (`alg_id`, length, signature bytes)**, plus the message type and round. Order of operations, with no step skipped or reordered: (1) check the §5 rules against the persisted state; (2) build the canonical message; (3) sign it (hedged, §3.1); (4) write the updated safety state **including that exact message and envelope** to a temporary file, `fsync` it, rename it over the old file, and `fsync` the directory; (5) only then send. The same rule covers proposals the node signs as leader.
+- **Exact signed message and envelope (crash safety).** `last_signed` is not a summary. It stores, for the last vote or timeout, the **canonical message bytes (§3.2) and the complete signature envelope (`alg_id`, length, signature bytes)**, plus the message type and round. Order of operations, with no step skipped or reordered: (1) check the §5 rules against the persisted state; (2) build the canonical message; (3) sign it (hedged, §3.1); (4) write the updated safety state **including that exact message and envelope** to a temporary file, `fsync` it, rename it over the old file, and `fsync` the directory; (4b) advance the trusted monotonic counter (§7.1); (5) only then send. The same rule covers proposals the node signs as leader.
   - *Crash before step 4 completes:* the signature never left the process, so nothing is on the network; the old state is intact and the node may sign again. *Crash after step 4, before or during step 5:* on restart the node re-sends the stored message and envelope **byte-for-byte**. It never re-signs that message and never signs a different message of the same type in that round.
   - *On load:* the record must pass an integrity check; the message must decode under §3.2 and re-encode to identical bytes; the envelope must carry the profile's `alg_id`, the exact length, and a signature that verifies over the stored message under the node's own key and the right context. The stored profile must equal the chain's profile. Any failure, a torn or empty file, or a failed RNG at step 3, makes the node refuse to sign (fail closed); it never repairs a record by re-signing.
   - Required tests: a fault injected at every step (before, during and after each write, `fsync` and rename) never yields two different signed messages for one (type, round), never a re-sign of a persisted message, and never a send before step 4.
@@ -218,6 +218,59 @@ At expected Qattice sizes the quadratic view change is a rare-path cost. Commit 
   - *Required tests (negative unless stated):* start with the file deleted after prior signing, with the file truncated to 0 bytes, torn at every offset, with `instance_id` or profile mismatched, and with an old backup restored: in each case no signature is produced and no new file is created. A fresh validator with explicit initialization signs normally (positive) and its `fresh` state is distinguishable from every damaged state. A key that already appears in committed participation cannot be initialized fresh. Mutation tests that treat absence as `fresh`, or skip the `fresh` to `active` transition, must fail a test. Phase 0 exercises all of this against an in-memory storage abstraction with injected failures; no key or state file is written to disk.
 - **Block store:** the uncommitted blocks on the path from the highest committed block to the highest QC, plus that QC and the highest TC. On restart these are reloaded and the node resumes from round `max(hqr, highest TC round) + 1`.
 - **Engine interface:** the `ConsensusEngine` lock hooks (`lock_state` / `restore_lock_state`) currently take a Tendermint-shaped `LockState`. They become a versioned enum `EngineSafetyState::{Tendermint(LockState), PqHotStuff(PqSafetyState)}`, with a serde tag so existing data dirs keep loading.
+
+### 7.1 Trusted monotonic counter and rollback detection (PROPOSED amendment, owner review pending)
+
+**Status.** Proposed on 2026-11-07 and implemented in draft PR #127 (`chain-forge-consensus`, `pq_hotstuff::safety`). Not a decision until the owner approves this section.
+
+**Two different problems.** Crash recovery (an interrupted write) is solved by the atomic replace in §7. *Rollback* is different: an older but perfectly valid safety-state file restored from a backup, a snapshot revert or a cloned virtual machine. The file cannot detect this about itself, because the old file is internally consistent. A validator that signs from a rolled-back file can sign a message that conflicts with one it already broadcast, which is slashable equivocation. Only a record kept *outside the reach of whoever can restore the file* can detect it. That is the trusted counter. The checksum on the file detects corruption; it does not authenticate.
+
+**Interface.** `read() -> u64` and `advance(expected_previous) -> Result`. The record carries a `counter` field; every committed write increases it by exactly one, and the counter is advanced to match **after** the file is durable and **before** the signature is returned (step 4b).
+
+**Properties a counter must have** (each is a requirement on the backend, not something the safety code can check):
+1. **Durable:** survives power loss, process crash and reboot of the validator host.
+2. **Atomic and compare-and-advance:** `advance(expected_previous)` succeeds only if the counter currently equals `expected_previous`, then becomes `expected_previous + 1`; otherwise it fails and changes nothing. It never succeeds for two callers with the same `expected_previous`. (This also stops two live copies of one validator from both progressing.)
+3. **Monotonic and unresettable from the validator host:** there is no decrement and no reset reachable by the validator process, by the host's operating-system users, or by anyone who can restore the safety-state file or its backups. A reset, if it exists at all, needs a separate owner-controlled authority and is treated as key loss (below).
+4. **Bound to one validator instance** (public key and `instance_id`): created at initialization with value 0 and never reused for another key or instance.
+5. **Authenticated:** only that validator's signing path can advance it.
+6. **Honest failures:** an unavailable or failing counter returns an error; it never reports success it did not achieve.
+
+Acceptable families, not chosen by this document: a hardware or TPM non-volatile monotonic counter, an HSM, a remote witness with replicated durable storage. **Not acceptable:** a file or database on the validator host, anything the host's users can overwrite or restore, and the in-repository `TestCounter` (an in-memory test double with no durability and no protection).
+
+**Rules at open** (file counter `f`, trusted counter `t`):
+
+| Condition | Meaning | Action |
+|---|---|---|
+| `f == t` | normal | open |
+| `f == t + 1` | the file is durable but the counter advance did not happen; nothing from this record was ever returned or sent | open, then complete the advance (only after every other check passes) |
+| `f < t` | rollback, or storage that lost data it had acknowledged | refuse (fail closed) |
+| `f > t + 1` | counter reset or replaced, or a forged file | refuse (fail closed) |
+| counter unreadable | | refuse to sign; the node may run as a non-signing observer |
+
+**What happens when the counter advances and the file write fails.** By construction this cannot happen in the normal order: the counter advances only after the file and its directory entry are durable (steps 4 to 6). Every other interleaving is covered:
+
+| Event | Durable state afterwards | Outcome |
+|---|---|---|
+| failure or crash before the rename is durable (steps 4 to 6) | old file, old counter | nothing was returned; continue normally; a different message for that round may still be signed |
+| file durable, counter advance fails or the process dies (step 4b) | `f == t + 1` | nothing was returned; open completes the advance; the message is now durable, so a conflicting one for that round is refused (conservative) |
+| counter advance succeeds, the acknowledgement is lost | `f == t` | normal; nothing to repeat |
+| **storage acknowledged `fsync` but lost the data** (lying disk, write cache, power loss) | `f < t` | open reports rollback and **fails closed**; a loss of liveness, not of safety; recover by key rotation |
+| counter reset, replaced or unreachable | `f > t + 1`, or unreadable | fail closed; the same key is never re-initialized (initialization requires counter 0, no marker or state, and no chain participation); rotate the key (PQ-VAL-003) |
+| a snapshot revert or a cloned machine | file older than the counter | refused on open; two live copies cannot both advance (compare-and-advance) |
+
+**How counter state survives restarts.** It lives in the counter backend, not in the safety directory, so restoring or deleting the safety directory does not touch it. On open, the counter is read first and compared with the file as above; initialization creates the counter at 0 and refuses a counter that is not 0.
+
+**Complementary checks, not replacements:** the chain-evidence staleness rule (§7, "Stale file") and the fresh-initialization refusal stay in force; the counter adds detection that does not depend on the chain.
+
+**Operational acceptance requirements** (before any validator runs on a real network; these are not satisfied by the unit tests):
+1. A production counter backend, with a written threat model, independently reviewed, and tested against reset, rollback, replacement and two-live-copies attempts on that backend.
+2. **Storage durability acceptance on the target hardware, operating system and filesystem:** repeated hard power-loss (or equivalent hard stop with write caches enabled) during signing, showing no torn state file and no `f < t` anomaly. On NTFS this includes establishing what the directory flush actually guarantees. The Windows unit runs show only that the calls succeed.
+3. A backup and restore rule: a backup of the safety directory must never be restored onto a live key; restoring is key rotation.
+4. Monitoring and an operator procedure for the rollback, inconsistent-counter and unreadable-counter errors.
+
+**What the tests established and did not** (PR #127): in an in-memory model every crash point and every post-crash state reopens and never allows two messages for one round; a restored old file is refused when the counter is separate, and a test asserts that with the file *and* the counter both restored the rollback is invisible. They do not establish durability on any real disk or filesystem, and `TestCounter` proves nothing about a real counter.
+
+**Required changes to PR #127 once this section is approved** (found while writing this section): (1) the counter trait must be compare-and-advance, `advance(expected_previous)`, not "advance to the current value or the current value plus one": the current idempotent form lets two live copies sharing one counter both succeed; the lost-acknowledgement case does not need idempotence, as the table shows; (2) the counter handle must be constructed bound to one instance; (3) documentation and tests that call the double a "trusted counter" must say it is not.
 
 ---
 
@@ -365,5 +418,7 @@ These keep the locked direction. They make two claims precise:
 | N17 (2026-11-07) | Consensus separation: Qattice will ultimately use PQ-HotStuff-2 as its exclusive production consensus engine, conditional on the safety, persistence, four-node devnet, adversarial and independent-review gates; Tendermint remains the Qattice devnet baseline until then, stays selectable in Chain Forge for other blockchains, is not removed, disabled or modified now, and no existing network is migrated automatically. Removal from Qattice's configuration needs separate approval (§1). |
 
 **Confirmed in the final review (2026-11-07), now reflected in the text:** N11 all canonical integers are big-endian, including `alg_id`; N12 the tags `CFH1|blockid|` and `CFH1|pop|` are approved and `CFH1` is retained; N13 the `cryptography.protocol_profile` design is kept and its documented compatibility tests are required; N14 Phase 0 uses in-memory test keys only; N15 the block identifier commits to all consensus-critical proposal fields with negative substitution tests (§3.2 rules 6 and 7); N16 a missing safety-state file never resets signing history and a fresh validator has an explicit initialization state (§7).
+
+**Proposed, awaiting owner decision (2026-11-07):** §7.1, the trusted monotonic counter as a required security interface, with the failure matrix and the operational acceptance requirements (production counter backend; storage durability acceptance on the target platform). Open choices for the owner: the counter backend family; whether a remote witness is acceptable; the operator policy after a rollback error (key rotation is the only recovery specified).
 
 **Still blocked:** Phase 2 persistent validator key handling. It waits for the independent review of PR #109 and separate owner approval (§8.1). No other specification question is open in this revision; the next gate is owner approval of this text before any implementation.
