@@ -162,6 +162,15 @@ fn initialization_is_refused_when_the_trusted_counter_shows_the_identity_was_use
 }
 
 #[test]
+fn initialization_is_refused_for_a_counter_at_zero_that_already_holds_a_digest() {
+    let w = World::new();
+    let c = TestCounter::with_state(CounterState { value: 0, digest: [7; 32] }, w.f.clone());
+    let e = Store::initialize_fresh(w.st.clone(), c, &w.fresh_init(), &ParticipationEvidence::default()).err().unwrap();
+    assert!(matches!(e, InitError::Counter(_)), "{e:?}");
+    assert!(w.st.is_empty(), "nothing may be written");
+}
+
+#[test]
 fn a_key_that_already_participated_cannot_be_initialized_fresh() {
     let w = World::new();
     let e = Store::initialize_fresh(w.st.clone(), w.ctr.clone(), &w.fresh_init(), &ParticipationEvidence { highest_signed: Some((1, 0)) }).err().unwrap();
