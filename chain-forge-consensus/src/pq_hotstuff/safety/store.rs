@@ -33,6 +33,8 @@ pub struct SafetyStore<S: Storage, C: MonotonicCounter> {
     storage: S,
     counter: C,
     rec: SafetyRecord,
+    /// The exclusive-writer credential, acquired once all validation has passed and presented on every counter advance.
+    session: Session,
     /// Set by any failure after which memory may no longer match what is durable. A latched store refuses everything.
     latched: bool,
 }
@@ -59,6 +61,8 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         if init.public_key.len() != MLDSA65_PUBLIC_KEY_LEN { return Err(InitError::BadIdentity("public key length")); }
         if !name_ok(init.protocol_profile) { return Err(InitError::BadIdentity("protocol profile")); }
         if !name_ok(init.chain_id) { return Err(InitError::BadIdentity("chain id")); }
+        let wanted = CounterBinding { public_key: init.public_key.to_vec(), instance_id: init.instance_id };
+        if counter.binding() != &wanted { return Err(InitError::CounterBindingMismatch); }
         let st = |e: StorageError| InitError::Storage(e.0);
         if storage.read(STATE_FILE).map_err(st)?.is_some() || storage.read(MARKER_FILE).map_err(st)?.is_some() {
             return Err(InitError::AlreadyInitialized);
@@ -67,6 +71,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         if c != 0 { return Err(InitError::CounterNotZero(c)); }
         if evidence.highest_signed.is_some() { return Err(InitError::KeyAlreadyParticipated); }
 
+        let session = counter.acquire_session().map_err(|e| InitError::Counter(e.0))?;
         let marker = Marker {
             protocol_profile: init.protocol_profile.into(), chain_id: init.chain_id.into(),
             public_key: init.public_key.to_vec(), instance_id: init.instance_id,
@@ -80,8 +85,8 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         };
         let rb = encode_record(&rec).map_err(|e| InitError::Storage(e.to_string()))?;
         durable_replace(&mut storage, STATE_TMP, STATE_FILE, &rb).map_err(st)?;
-        counter.advance(0, &Session::new(0)).map_err(|e| InitError::Counter(e.0))?;
-        Ok(SafetyStore { storage, counter, rec, latched: false })
+        counter.advance(0, &session).map_err(|e| InitError::Counter(e.0))?;
+        Ok(SafetyStore { storage, counter, rec, session, latched: false })
     }
 
     /// Open an existing validator's safety state, or refuse. Never creates or repairs anything: any missing, damaged, stale,
@@ -107,6 +112,9 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
             || marker.public_key != rec.public_key || marker.instance_id != rec.instance_id {
             return Err(OpenError::InstanceMismatch);
         }
+        if counter.binding() != &(CounterBinding { public_key: rec.public_key.clone(), instance_id: rec.instance_id }) {
+            return Err(OpenError::CounterBindingMismatch);
+        }
 
         // rollback: classify against the trusted counter now, but complete the counter only after everything else checks out
         let trusted = counter.read().map_err(|e| OpenError::Counter(e.0))?;
@@ -128,11 +136,15 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
             if behind { return Err(OpenError::StaleAgainstChain { chain: (ce, cr), record: rec.high_water() }); }
         }
 
-        if crash_window { counter.advance(trusted, &Session::new(0)).map_err(|e| OpenError::Counter(e.0))?; }
+        // Everything has been validated. Only now does this store become the one valid writer (a failed open must never
+        // supersede the store that is running), and only then is an outstanding advance completed. The completion is a
+        // compare-and-advance from the value just read: if another writer moved the counter, it fails and nothing opens.
+        let session = counter.acquire_session().map_err(|e| OpenError::Counter(e.0))?;
+        if crash_window { counter.advance(trusted, &session).map_err(|e| OpenError::Counter(e.0))?; }
         // a leftover temporary file from an interrupted commit was never read; clear it (best effort)
         let _ = storage.remove(STATE_TMP);
         let _ = storage.remove(MARKER_TMP);
-        Ok(SafetyStore { storage, counter, rec, latched: false })
+        Ok(SafetyStore { storage, counter, rec, session, latched: false })
     }
 
     /// Internal consistency of a decoded record, and verification of every stored signature.
@@ -274,7 +286,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
     fn commit(&mut self, n: &SafetyRecord) -> Result<(), String> {
         let bytes = encode_record(n).map_err(|e| e.to_string())?;
         durable_replace(&mut self.storage, STATE_TMP, STATE_FILE, &bytes).map_err(|e| e.0)?;
-        let t = self.counter.read().map_err(|e| e.0)?;
-        self.counter.advance(t, &Session::new(0)).map_err(|e| e.0)
+        // compare-and-advance from this record's own previous counter, with this store's session; never from a fresh read
+        self.counter.advance(self.rec.counter, &self.session).map_err(|e| e.0)
     }
 }

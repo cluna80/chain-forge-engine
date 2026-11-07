@@ -7,8 +7,19 @@
 //! # Commit sequence (a new signature is returned to the caller only after step 7)
 //! 1. check the persisted state (floors, one message per round) -> 2. build the canonical message (wire, spec 3.2) ->
 //! 3. sign (hedged) -> 4. write the new record to a temporary file -> 5. `fsync` it -> 6. rename it over the state file and
-//! `fsync` the directory -> 7. advance the trusted monotonic counter to the record's counter. Only then is the signed item
-//! returned; sending it is the caller's next step.
+//! `fsync` the directory -> 7. **compare-and-advance** the trusted monotonic counter from the record's previous counter, presenting
+//! the store's exclusive-writer [`Session`]. Only then is the signed item returned; sending it is the caller's next step.
+//!
+//! # Sessions (spec section 7.1)
+//! A store becomes the one valid writer by acquiring a [`Session`] from the counter, and only after every validation in `open` has
+//! passed (a failed open never supersedes the running store). Every counter advance presents that session; the counter refuses
+//! stale ones, and the store then latches and returns nothing. A successful advance is permission to return *that* signature from
+//! the commit path and nothing more: the signer is called only inside the commit path, no method returns a raw signature, and the
+//! caller holds no way to obtain one from the store without a completed commit.
+//!
+//! **Known limitation** (see `known_limitation_*` in the tests and the design note): the file is written before the counter is
+//! advanced, and the counter holds only a number. A fenced-out writer on its own disk therefore fails at step 7 but leaves its
+//! record behind, which the counter cannot tell from the committed one. Closing this needs the counter to commit to the record.
 //!
 //! # What this does and does not protect
 //! * A crash at any point leaves either the old record or the new record (the temporary file is never read), and nothing has

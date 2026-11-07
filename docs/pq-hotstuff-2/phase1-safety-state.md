@@ -38,3 +38,27 @@ chain already shows participating.
 * The fault model (every post-crash state: unsynced writes absent, torn at sampled offsets, or complete; unsynced renames applied
   or not) is a model, run in memory; the filesystem tests show only that the real directory behaves.
 * Multi-process locking of the directory is out of scope here.
+
+## Strict compare-and-advance, sessions and binding (spec 7.1, PR #129; added after the owner's review)
+* The counter trait is `binding()`, `read()`, `acquire_session()` and `advance(expected_previous, session)`. `advance` is a strict
+  compare-and-advance: it succeeds only if the counter equals `expected_previous` and the session is the latest; there is no
+  idempotent form (the lost-acknowledgement case does not need one: afterwards the file and the counter are equal).
+* **Binding.** A counter handle belongs to one validator key and one instance. Initialization and `open` refuse a counter bound
+  to anything else.
+* **Sessions.** `initialize_fresh` and `open` acquire a session only after all validation has passed, so a failed open (damaged,
+  stale, rolled back, mismatched) never takes the session from the running store. A superseded store is refused by the counter at
+  its next commit, latches, and returns nothing.
+* **Recovery advance** (`file == trusted + 1`): a compare-and-advance from the value just read, run after validation and before
+  the store exists. If it fails, including because another writer moved the counter, `open` returns an error and no store.
+* **A successful advance is not a licence to expose a signature by another route.** The signer is called only inside the single
+  commit path; the store has no method that returns a raw signature; a signature reaches the caller only inside `Signed`, after
+  the file and the counter both succeeded. Holders of the key material can still sign outside the store (spec 7.1).
+
+### Known limitation found while writing the two-store tests (needs a design decision)
+The file is written (steps 4 to 6) before the counter advance (step 7), and the counter stores only a number. A writer that has
+been fenced out, on its own disk, fails at step 7 but leaves its record behind. That record carries the counter value the new
+holder also reached, so on restart it opens as if it were the committed state, and its owner would re-send a vote that conflicts
+with one already broadcast. The same happens on a shared directory if the fenced-out writer overwrites the file after the new
+holder committed. The test `known_limitation_a_fenced_out_writer_leaves_an_uncommitted_record...` asserts this behaviour so it is
+not mistaken for protection. Closing it needs a change to the counter protocol, for example the counter also committing to a
+digest of each record (checked at open), or a reserve-then-write sequence. Neither is implemented; both change the spec.
