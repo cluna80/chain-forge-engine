@@ -1,0 +1,28 @@
+# Phase 0 step 1: mutation check of the canonical codec (pq-hotstuff feature)
+# Each mutant is a single edit to chain-forge-consensus/src/pq_hotstuff/wire; the file is restored after each run.
+# Command per mutant: cargo test --locked -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_wire
+# Disclosure: M17 first SURVIVED (a wrong tag of the right length was only caught indirectly); the test
+# a_wrong_tag_of_the_right_length_is_rejected_for_every_tagged_item was added and M17 is then caught.
+# M20 first did not compile (a mistake in the mutant); it was rewritten and then caught.
+
+M01 put_u16 little-endian: CAUGHT (9 failing)
+M02 put_u64 little-endian: CAUGHT (5 failing)
+M03 vote omits alg_id: CAUGHT (6 failing)
+M04 trailing bytes accepted: CAUGHT (2 failing)
+M05 option flag accepts any non-zero: CAUGHT (1 failing)
+M06 bitmap pad bits not checked: CAUGHT (1 failing)
+M07 decoder accepts NUL in strings: CAUGHT (1 failing)
+M08 encoder has no string length limit: CAUGHT (1 failing)
+M09 decoder has no string length limit: CAUGHT (1 failing)
+M10 alg_id 0 accepted: CAUGHT (1 failing)
+M11 encoder does not check exact lengths: CAUGHT (1 failing)
+M12 decoder does not check exact lengths: CAUGHT (1 failing)
+M13 block_id input omits protocol_profile: CAUGHT (8 failing)
+M14 absent tc writes nothing: CAUGHT (6 failing)
+M15 block_id hashes without the tag: CAUGHT (1 failing)
+M16 bitmap least-significant-bit first: CAUGHT (2 failing)
+M18 vote swaps block_id and parent_id: CAUGHT (3 failing)
+M19 string length prefix is u16: CAUGHT (9 failing)
+M17 tag mismatch accepted: CAUGHT (1 failing) (after the added test / corrected mutant)
+M20 invalid UTF-8 accepted: CAUGHT (1 failing) (after the added test / corrected mutant)
+caught 20 of 20 (18 on the first run, M17 and M20 on the rerun)

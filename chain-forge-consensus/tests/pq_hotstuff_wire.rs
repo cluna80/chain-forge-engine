@@ -185,6 +185,21 @@ fn a_message_of_one_type_never_decodes_as_another() {
 }
 
 #[test]
+fn a_wrong_tag_of_the_right_length_is_rejected_for_every_tagged_item() {
+    let tagged: Vec<(&str, Vec<u8>, usize, fn(&[u8]) -> Result<(), WireError>)> =
+        all_items().into_iter().filter(|(n, ..)| !matches!(*n, "envelope" | "keyreg")).collect();
+    assert_eq!(tagged.len(), 6);
+    for (name, bytes, tag_len, chk) in tagged {
+        // the tag is the first `tag_len` bytes (alg_id starts right after it)
+        for i in 0..tag_len {
+            let mut b = bytes.clone();
+            b[i] ^= 0x01;
+            assert_eq!(chk(&b).unwrap_err(), WireError::BadTag, "{name}: tag byte {i} flipped");
+        }
+    }
+}
+
+#[test]
 fn tags_are_distinct_and_prefix_free() {
     for (i, a) in ALL_TAGS.iter().enumerate() {
         for (j, b) in ALL_TAGS.iter().enumerate() {
