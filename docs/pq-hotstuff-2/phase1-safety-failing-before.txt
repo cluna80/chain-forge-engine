@@ -1,0 +1,50 @@
+# Phase 1 step 1 (safety-state persistence): failing-before evidence
+# Tests-first commit: the record codec and the store are stubs returning Unimplemented; the traits, types, errors and FsStorage are final.
+# Command: cargo test -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_safety
+# The tests that pass here only exercise things that are real in this commit (the real filesystem name checks).
+
+test a_counter_inconsistent_by_more_than_one_is_refused ... FAILED
+test a_different_message_for_a_round_already_signed_is_refused_even_after_a_restart ... FAILED
+test a_crash_or_an_io_error_at_any_step_never_allows_two_messages_for_one_round ... FAILED
+test a_crash_while_initializing_never_leaves_signing_state_or_a_state_without_its_marker ... FAILED
+test a_key_that_already_participated_cannot_be_initialized_fresh ... FAILED
+test a_leftover_temporary_file_is_ignored_and_cleared ... FAILED
+test a_lower_epoch_is_refused_and_a_higher_epoch_starts_clean ... FAILED
+test a_file_one_ahead_of_the_counter_is_the_crash_window_and_completes_the_counter ... FAILED
+test a_malformed_signature_from_the_signer_is_refused_and_latches ... FAILED
+test a_missing_state_file_with_a_marker_fails_closed_and_creates_nothing ... FAILED
+test a_marker_that_does_not_match_the_state_is_refused ... FAILED
+test a_record_older_than_the_chain_shows_is_stale_and_a_fresh_one_for_a_participating_key_too ... FAILED
+test a_restart_re_sends_the_stored_signature_byte_for_byte_and_never_re_signs ... FAILED
+test a_record_that_belongs_to_another_profile_chain_key_or_instance_is_refused ... FAILED
+test a_restored_old_backup_is_detected_through_the_trusted_counter ... FAILED
+test a_round_below_one_already_signed_is_refused ... FAILED
+test a_signer_failure_latches_the_store_and_writes_nothing ... FAILED
+test a_single_flipped_bit_at_any_offset_never_opens ... FAILED
+test a_state_file_without_the_marker_fails_closed ... FAILED
+test a_storage_or_counter_failure_at_any_step_latches_the_store ... FAILED
+test a_stored_message_must_be_canonical_belong_to_this_chain_and_match_its_round ... FAILED
+test a_stored_signature_that_does_not_verify_is_refused_even_with_a_valid_checksum ... FAILED
+test a_timeout_at_a_higher_round_raises_the_floor_for_votes_and_timeouts ... FAILED
+test a_vote_then_a_timeout_in_the_same_round_is_allowed_but_not_the_reverse ... FAILED
+test an_empty_or_truncated_state_file_never_opens_at_any_length ... FAILED
+test an_internally_inconsistent_record_is_refused ... FAILED
+test both_files_gone_is_no_state_and_a_fresh_start_is_still_refused_by_the_counter ... FAILED
+test fs_open_on_an_empty_directory_creates_nothing_and_a_damaged_file_fails_closed ... FAILED
+test fs_a_leftover_temporary_file_is_removed_and_names_cannot_escape_the_directory ... FAILED
+test hedged_signing_really_differs_so_a_re_sign_would_be_visible ... FAILED
+test fs_sign_reopen_and_re_send_are_byte_identical_on_a_real_directory ... FAILED
+test initialization_is_explicit_and_the_fresh_state_is_distinguishable ... FAILED
+test initialization_is_refused_when_state_or_a_marker_already_exists ... FAILED
+test initialization_is_refused_when_the_trusted_counter_shows_the_identity_was_used ... FAILED
+test initialization_rejects_a_malformed_identity ... FAILED
+test open_never_creates_state ... FAILED
+test rollback_is_not_detectable_if_the_counter_is_rolled_back_too_so_an_ordinary_file_proves_nothing ... FAILED
+test the_record_and_marker_formats_match_the_independent_oracle ... FAILED
+test the_commit_order_is_write_sync_rename_sync_dir_then_counter ... FAILED
+test the_exact_canonical_message_and_envelope_are_persisted_for_every_kind ... FAILED
+test the_first_signature_moves_fresh_to_active_in_the_same_commit ... FAILED
+test the_vote_floor_hvr_and_the_lock_hqr_only_move_up ... FAILED
+test the_record_codec_round_trips_and_is_deterministic ... FAILED
+test trailing_bytes_and_an_unsupported_version_are_refused ... FAILED
+test result: FAILED. 0 passed; 44 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s

@@ -1,0 +1,267 @@
+//! Crash-safe safety-state persistence for PQ-HotStuff-2 (spec section 7, Phase 1 step 1).
+//!
+//! A validator must never sign two conflicting messages, even across crashes, restarts, interrupted writes and damaged or
+//! restored state. This module keeps, durably and before anything can be broadcast, the last vote, timeout and proposal it
+//! signed (the exact canonical message and the exact signature envelope) together with the round floors.
+//!
+//! # Commit sequence (a new signature is returned to the caller only after step 7)
+//! 1. check the persisted state (floors, one message per round) -> 2. build the canonical message (wire, spec 3.2) ->
+//! 3. sign (hedged) -> 4. write the new record to a temporary file -> 5. `fsync` it -> 6. rename it over the state file and
+//! `fsync` the directory -> 7. advance the trusted monotonic counter to the record's counter. Only then is the signed item
+//! returned; sending it is the caller's next step.
+//!
+//! # What this does and does not protect
+//! * A crash at any point leaves either the old record or the new record (the temporary file is never read), and nothing has
+//!   been sent for an uncommitted record. After a restart the stored message is re-sent byte-for-byte and never re-signed.
+//! * **Rollback.** An ordinary file cannot tell a restored old backup from the current file, and this module does not claim
+//!   it can. Rollback is detected only through the [`MonotonicCounter`], which must be a trusted mechanism outside the file's
+//!   reach (hardware counter, HSM, remote witness). The counter implementations in this repository's tests are test doubles.
+//!   Without a trusted counter, a restored backup is undetectable; with one, an older file is rejected.
+//! * The record carries an integrity checksum, not an authentication tag: someone who can write the file can forge it. The
+//!   stored signatures are verified on load, so the stored *messages* cannot be forged without the validator's key.
+//! * Keys: none are stored or handled here. Signing goes through the [`ConsensusSigner`] trait; production validator key
+//!   storage is out of scope (blocked on the independent review of PR #109).
+mod fs;
+mod record;
+mod store;
+
+pub use fs::FsStorage;
+pub use record::{decode_marker, decode_record, encode_marker, encode_record, Marker};
+pub use store::{FreshInit, SafetyStore, Signed};
+
+use super::wire::{SignatureEnvelope, WireError};
+
+/// FIPS 204 contexts (domain separation) for the three things a validator signs here.
+pub const CTX_VOTE: &[u8] = b"qattice/vote/v2";
+pub const CTX_TIMEOUT: &[u8] = b"qattice/timeout/v2";
+pub const CTX_PROPOSAL: &[u8] = b"qattice/proposal/v2";
+
+/// File names inside the safety directory.
+pub const STATE_FILE: &str = "pq_hotstuff_safety.state";
+pub const MARKER_FILE: &str = "pq_hotstuff_safety.init";
+pub const STATE_TMP: &str = "pq_hotstuff_safety.state.tmp";
+pub const MARKER_TMP: &str = "pq_hotstuff_safety.init.tmp";
+
+pub const FORMAT_VERSION: u16 = 1;
+/// Upper bound on a stored canonical message.
+pub const MAX_MESSAGE_LEN: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind { Vote, Timeout, Proposal }
+
+impl Kind {
+    pub fn context(self) -> &'static [u8] {
+        match self { Kind::Vote => CTX_VOTE, Kind::Timeout => CTX_TIMEOUT, Kind::Proposal => CTX_PROPOSAL }
+    }
+    pub fn name(self) -> &'static str {
+        match self { Kind::Vote => "vote", Kind::Timeout => "timeout", Kind::Proposal => "proposal" }
+    }
+}
+
+/// The last thing signed of one kind: the exact canonical message and the exact signature envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedItem {
+    pub round: u64,
+    pub message: Vec<u8>,
+    pub envelope: SignatureEnvelope,
+}
+
+/// `Fresh`: explicitly initialized, nothing signed yet. `Active`: at least one signature has been produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State { Fresh, Active }
+
+/// The persisted safety state (spec section 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyRecord {
+    pub state: State,
+    pub protocol_profile: String,
+    pub chain_id: String,
+    pub public_key: Vec<u8>,
+    pub instance_id: [u8; 16],
+    /// Monotonic write counter; equals the trusted counter after a completed commit.
+    pub counter: u64,
+    pub epoch: u64,
+    /// Highest round at which a vote or timeout was signed in `epoch` (`None` = none yet).
+    pub hvr: Option<u64>,
+    /// Highest QC round this validator has voted on (the lock).
+    pub hqr: Option<u64>,
+    pub last_vote: Option<SignedItem>,
+    pub last_timeout: Option<SignedItem>,
+    pub last_proposal: Option<SignedItem>,
+}
+
+impl SafetyRecord {
+    pub fn slot(&self, kind: Kind) -> Option<&SignedItem> {
+        match kind { Kind::Vote => self.last_vote.as_ref(), Kind::Timeout => self.last_timeout.as_ref(), Kind::Proposal => self.last_proposal.as_ref() }
+    }
+
+    /// The highest `(epoch, round)` this record shows the key has signed at, if any.
+    pub fn high_water(&self) -> Option<(u64, u64)> {
+        let r = [self.hvr, self.last_proposal.as_ref().map(|p| p.round)].into_iter().flatten().max()?;
+        Some((self.epoch, r))
+    }
+}
+
+/// What the chain already shows about this key (committed participation). Used to refuse a stale record and to refuse
+/// "fresh" initialization of a key that has already participated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParticipationEvidence {
+    /// Highest `(epoch, round)` at which this key appears in committed QCs, TCs, vote evidence or participation records.
+    pub highest_signed: Option<(u64, u64)>,
+}
+
+/// The identity the caller expects the record to belong to.
+#[derive(Debug, Clone, Copy)]
+pub struct Expected<'a> {
+    pub protocol_profile: &'a str,
+    pub chain_id: &'a str,
+    pub public_key: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("storage: {0}")]
+pub struct StorageError(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("monotonic counter: {0}")]
+pub struct CounterError(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("signer: {0}")]
+pub struct SignerError(pub String);
+
+/// Durable storage, exposed as the individual steps so that every step can be fault-injected and its durability reasoned about.
+pub trait Storage {
+    /// `Ok(None)` if the file does not exist.
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, StorageError>;
+    /// Create or truncate `name` and write `data`. Not durable until [`Storage::sync_file`].
+    fn write_tmp(&mut self, name: &str, data: &[u8]) -> Result<(), StorageError>;
+    /// Make the contents of `name` durable.
+    fn sync_file(&mut self, name: &str) -> Result<(), StorageError>;
+    /// Atomically replace `to` with `from`. Not durable until [`Storage::sync_dir`].
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), StorageError>;
+    /// Make directory entries (creations, renames) durable.
+    fn sync_dir(&mut self) -> Result<(), StorageError>;
+    /// Remove `name` if present (used only to clear a stale temporary file).
+    fn remove(&mut self, name: &str) -> Result<(), StorageError>;
+}
+
+/// A trusted monotonic counter that the file's owner cannot roll back (hardware counter, HSM, remote witness). It must be
+/// durable, atomic and refuse to move backwards. **An ordinary file is not a valid implementation.**
+pub trait MonotonicCounter {
+    fn read(&self) -> Result<u64, CounterError>;
+    /// Advance to `value`, which must equal the current value (idempotent) or the current value plus one.
+    fn advance_to(&mut self, value: u64) -> Result<(), CounterError>;
+}
+
+/// Signs one canonical message under a FIPS 204 context (hedged). Returns the raw signature bytes.
+pub trait ConsensusSigner {
+    fn public_key(&self) -> &[u8];
+    fn sign(&mut self, context: &[u8], message: &[u8]) -> Result<Vec<u8>, SignerError>;
+}
+
+/// Verifies a raw signature under a FIPS 204 context.
+pub trait ConsensusVerifier {
+    fn verify(&self, public_key: &[u8], context: &[u8], message: &[u8], signature: &[u8]) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecordError {
+    #[error("not implemented")]
+    Unimplemented,
+    #[error("truncated")]
+    Truncated,
+    #[error("{0} trailing byte(s)")]
+    Trailing(usize),
+    #[error("bad magic")]
+    BadMagic,
+    #[error("unsupported format version {0}")]
+    Version(u16),
+    #[error("checksum mismatch")]
+    BadChecksum,
+    #[error("non-canonical field: {0}")]
+    BadField(&'static str),
+    #[error("{what}: {len} bytes exceeds the limit")]
+    TooLarge { what: &'static str, len: usize },
+    #[error("wire: {0}")]
+    Wire(#[from] WireError),
+}
+
+/// Why a validator's safety state could not be opened. Every variant means: do not sign (an observer may keep running).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OpenError {
+    #[error("not implemented")]
+    Unimplemented,
+    #[error("no safety state exists (open never creates one; initialization is explicit)")]
+    NoState,
+    #[error("an initialization marker exists but the state file is missing")]
+    MarkerWithoutState,
+    #[error("a state file exists but the initialization marker is missing")]
+    StateWithoutMarker,
+    #[error("damaged or non-canonical state: {0}")]
+    Damaged(String),
+    #[error("unsupported format version {0}")]
+    VersionUnsupported(u16),
+    #[error("the record belongs to a different protocol profile")]
+    ProfileMismatch,
+    #[error("the record belongs to a different chain")]
+    ChainMismatch,
+    #[error("the record belongs to a different validator key")]
+    KeyMismatch,
+    #[error("the state file and the initialization marker do not belong together")]
+    InstanceMismatch,
+    #[error("a stored {kind} signature does not verify")]
+    BadSignature { kind: &'static str },
+    #[error("rollback: the state file is at counter {file_counter} but the trusted counter is {trusted_counter}")]
+    Rollback { file_counter: u64, trusted_counter: u64 },
+    #[error("counter inconsistency: file {file_counter}, trusted {trusted_counter}")]
+    CounterInconsistent { file_counter: u64, trusted_counter: u64 },
+    #[error("stale: the chain shows this key signing at {chain:?}, beyond the record's {record:?}")]
+    StaleAgainstChain { chain: (u64, u64), record: Option<(u64, u64)> },
+    #[error("{0}")]
+    Storage(String),
+    #[error("{0}")]
+    Counter(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InitError {
+    #[error("not implemented")]
+    Unimplemented,
+    #[error("safety state or an initialization marker already exists; a key is initialized once")]
+    AlreadyInitialized,
+    #[error("the trusted counter is {0}, so this identity has been used before")]
+    CounterNotZero(u64),
+    #[error("this key already appears in committed participation; it cannot be initialized fresh")]
+    KeyAlreadyParticipated,
+    #[error("invalid identity: {0}")]
+    BadIdentity(&'static str),
+    #[error("{0}")]
+    Storage(String),
+    #[error("{0}")]
+    Counter(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SignError {
+    #[error("not implemented")]
+    Unimplemented,
+    #[error("the store is latched after a failure and refuses to sign; restart and reopen")]
+    Latched,
+    #[error("epoch {requested} is below the recorded epoch {record}")]
+    EpochRegression { record: u64, requested: u64 },
+    #[error("a different {kind} was already signed for round {round}")]
+    ConflictingMessage { kind: &'static str, round: u64 },
+    #[error("a {kind} for round {signed} was already signed, so round {requested} is below it")]
+    RoundBelowSigned { kind: &'static str, signed: u64, requested: u64 },
+    #[error("{kind} at round {round} violates the persisted floor {floor}")]
+    FloorViolation { kind: &'static str, round: u64, floor: u64 },
+    #[error("{0}")]
+    Wire(#[from] WireError),
+    #[error("{0}")]
+    Signer(String),
+    #[error("the signer returned {0} bytes, not a valid signature")]
+    BadSignatureLength(usize),
+    #[error("commit failed: {0}")]
+    Commit(String),
+}
