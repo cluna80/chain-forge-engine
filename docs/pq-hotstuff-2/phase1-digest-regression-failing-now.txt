@@ -1,0 +1,15 @@
+# Regression tests for the digest-bound counter (spec 7.1.1, PROPOSED in PR #129): failure on the CURRENT implementation
+# These three tests are #[ignore]d on purpose; they state the required behaviour and fail until 7.1.1 is approved and implemented.
+# Command: cargo test -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_safety -- --ignored
+# Each failure is the equivocation scenario: a record that is not the committed one is accepted on restart.
+
+test two_files_one_ahead_the_first_restart_commits_and_the_second_is_refused ... FAILED
+test two_disks_a_fenced_out_writers_restart_is_refused_so_it_can_never_send_a_vote_that_conflicts_with_the_committed_one ... FAILED
+test a_state_file_overwritten_after_the_commit_by_a_fenced_out_writer_is_refused_on_the_new_holders_restart ... FAILED
+thread 'two_files_one_ahead_the_first_restart_commits_and_the_second_is_refused' (20280) panicked at chain-forge-consensus/tests/pq_hotstuff_safety.rs:1039:5:
+the second restart holds a vote that conflicts with the committed one
+thread 'two_disks_a_fenced_out_writers_restart_is_refused_so_it_can_never_send_a_vote_that_conflicts_with_the_committed_one' (20279) panicked at chain-forge-consensus/tests/pq_hotstuff_safety.rs:994:19:
+A reopened holding Some(6) although B broadcast a different vote (121 bytes) for the same round
+thread 'a_state_file_overwritten_after_the_commit_by_a_fenced_out_writer_is_refused_on_the_new_holders_restart' (20278) panicked at chain-forge-consensus/tests/pq_hotstuff_safety.rs:1013:5:
+B must not restart on a record that is not the one it committed
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.26s

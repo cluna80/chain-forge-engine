@@ -1,0 +1,29 @@
+# Counter-overflow hardening of PR #127: mutation check of the commit / open / digest rules and the new checked arithmetic, run against commit 2bd7011
+# 19 single-edit mutants applied in a separate clean worktree and restored after each run. Command per mutant:
+#   cargo test -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_safety   (76 tests)
+# Selected: the rules the change touches (S03 S04 S16 S17 S20, N01 N02 N03 N04 N07, D01 D02 D04 D07 D09) plus four new overflow mutants:
+#   O1 open: the checked addition replaced by a wrapping one;  O2 open: exhaustion silently treated as 'no next value';
+#   O3 signing: the checked addition replaced by a saturating one;  O4 signing: exhaustion reported only AFTER the signer was called.
+# The full 62-mutant matrix for the digest-bound store (phase1-digest-mutation-results.txt) is the authoritative record for every other rule; those rules are unchanged.
+# Result: 19 of 19 caught, no survivor.
+
+S03 counter advanced before the file is durable: CAUGHT (62 failing)
+S04 counter never advanced: CAUGHT (28 failing)
+S16 rollback accepted: CAUGHT (4 failing)
+S17 any file ahead of the counter treated as the crash window: CAUGHT (2 failing)
+S20 staleness against the chain not checked: CAUGHT (1 failing)
+N01 commit uses a fresh counter read as the expected state: CAUGHT (2 failing)
+N02 every commit acquires a fresh session (defeats fencing): CAUGHT (3 failing)
+N03 open acquires a session at the start, before validating (a failed open supersedes the running store): CAUGHT (4 failing)
+N04 recovery advance result ignored: CAUGHT (2 failing)
+N07 recovery advance uses the file counter as the expected value: CAUGHT (8 failing)
+D01 a file at the committed counter that is not the committed record is accepted (no fork check): CAUGHT (5 failing)
+D02 commit ignores the digest of the replaced record: CAUGHT (1 failing)
+D04 a one-ahead file need not be a successor of the committed record: CAUGHT (1 failing)
+D07 the recovery advance commits the wrong digest: CAUGHT (1 failing)
+D09 the fork check compares prev_digest instead of the file digest: CAUGHT (32 failing)
+O1 open: the checked addition is replaced by a wrapping one (no explicit error): CAUGHT (2 failing)
+O2 open: exhaustion is silently treated as 'no next value': CAUGHT (2 failing)
+O3 signing: the checked addition is replaced by a saturating one: CAUGHT (1 failing)
+O4 signing: exhaustion is reported only after the signer was called: CAUGHT (1 failing)
+caught 19 of 19
