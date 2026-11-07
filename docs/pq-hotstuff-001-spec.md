@@ -225,7 +225,7 @@ At expected Qattice sizes the quadratic view change is a rare-path cost. Commit 
 
 **Two different problems.** Crash recovery (an interrupted write) is solved by the atomic replace in §7. *Rollback* is different: an older but perfectly valid safety-state file restored from a backup, a snapshot revert or a cloned virtual machine. The file cannot detect this about itself, because the old file is internally consistent. A validator that signs from a rolled-back file can sign a message that conflicts with one it already broadcast, which is slashable equivocation. Only a record kept *outside the reach of whoever can restore the file* can detect it. That is the trusted counter. The checksum on the file detects corruption; it does not authenticate.
 
-**Interface.** `read() -> u64` and `advance(expected_previous) -> Result`. The record carries a `counter` field; every committed write increases it by exactly one, and the counter is advanced to match **after** the file is durable and **before** the signature is returned (step 4b).
+**Interface.** `read() -> u64`, `acquire_session() -> Session` and `advance(expected_previous, session) -> Result`. The session is the exclusive-writer credential of the signing-session requirement below. The record carries a `counter` field; every committed write increases it by exactly one, and the counter is advanced to match **after** the file is durable and **before** the signature is returned (step 4b).
 
 **Properties a counter must have** (each is a requirement on the backend, not something the safety code can check):
 1. **Durable:** survives power loss, process crash and reboot of the validator host.
@@ -234,6 +234,7 @@ At expected Qattice sizes the quadratic view change is a rare-path cost. Commit 
 4. **Bound to one validator instance** (public key and `instance_id`): created at initialization with value 0 and never reused for another key or instance.
 5. **Authenticated:** only that validator's signing path can advance it.
 6. **Honest failures:** an unavailable or failing counter returns an error; it never reports success it did not achieve.
+7. **Exclusive writer:** at most one signing session per validator identity is valid at any time, and this is enforced by the backend on **every** `advance`, not only checked when the node starts (see "Duplicated validators" below).
 
 Acceptable families, not chosen by this document: a hardware or TPM non-volatile monotonic counter, an HSM, a remote witness with replicated durable storage. **Not acceptable:** a file or database on the validator host, anything the host's users can overwrite or restore, and the in-repository `TestCounter` (an in-memory test double with no durability and no protection).
 
@@ -242,10 +243,15 @@ Acceptable families, not chosen by this document: a hardware or TPM non-volatile
 | Condition | Meaning | Action |
 |---|---|---|
 | `f == t` | normal | open |
-| `f == t + 1` | the file is durable but the counter advance did not happen; nothing from this record was ever returned or sent | open, then complete the advance (only after every other check passes) |
+| `f == t + 1` | the file is durable but the counter advance did not happen; nothing from this record was ever returned or sent | complete the advance with `advance(t, session)` (only after every other check passes); the node is not open, and returns and broadcasts nothing, until that call succeeds |
 | `f < t` | rollback, or storage that lost data it had acknowledged | refuse (fail closed) |
 | `f > t + 1` | counter reset or replaced, or a forged file | refuse (fail closed) |
 | counter unreadable | | refuse to sign; the node may run as a non-signing observer |
+
+**Recovery advance (`f == t + 1`).** Completing the outstanding advance is itself a compare-and-advance and follows the same rules as a normal commit:
+1. **No signature is returned or broadcast, and no signing session is considered open, until the recovery advance has succeeded.** A failure of the call leaves the node not open and non-signing.
+2. **It is `advance(t, session)`, never an unconditional set.** If another process advanced the same counter in the meantime, the call fails because the counter is no longer `t`. The node must treat that as a **fail-closed** event (it is evidence of a second writer or of a stale file), must not assume the advance succeeded, must not retry with a new expected value on its own, and must not sign. Re-reading the counter and restarting the open sequence from the beginning is allowed; it will then find `f < t` and refuse.
+3. **A crash during the recovery advance is safe because the state is re-derived, not remembered:** after the crash the counter is either still `t` (the same rule applies again) or already `f` (the normal `f == t` case). No recovery step is repeated blindly.
 
 **What happens when the counter advances and the file write fails.** By construction this cannot happen in the normal order: the counter advances only after the file and its directory entry are durable (steps 4 to 6). Every other interleaving is covered:
 
@@ -256,9 +262,23 @@ Acceptable families, not chosen by this document: a hardware or TPM non-volatile
 | counter advance succeeds, the acknowledgement is lost | `f == t` | normal; nothing to repeat |
 | **storage acknowledged `fsync` but lost the data** (lying disk, write cache, power loss) | `f < t` | open reports rollback and **fails closed**; a loss of liveness, not of safety; recover by key rotation |
 | counter reset, replaced or unreachable | `f > t + 1`, or unreadable | fail closed; the same key is never re-initialized (initialization requires counter 0, no marker or state, and no chain participation); rotate the key (PQ-VAL-003) |
-| a snapshot revert or a cloned machine | file older than the counter | refused on open; two live copies cannot both advance (compare-and-advance) |
+| a snapshot revert or a cloned machine | file older than the counter | refused on open; a stale copy cannot commit (its expected value is behind); see "Duplicated validators" for what this does not cover |
+
+**Duplicated validators: what is and is not guaranteed.** Compare-and-advance, with `expected_previous` taken from the record's own previous counter, gives these guarantees: two processes cannot both commit the same counter value, and a copy of the safety state that is behind the counter can never commit again (its advance fails and the store latches; on restart `f < t` refuses it). Two processes can therefore only take turns if they share one consistent safety state, in which case they behave as one validator. **It does not guarantee:**
+1. **A signature is never computed by a stale or duplicate process.** In the commit sequence the signature is computed (step 3) before the counter is advanced (step 4b). A process that is paused and resumed, or a clone, can compute a valid signature over a conflicting message and then fail to commit it. The safety code discards that signature (it is never returned), but the signing key was used.
+2. **Anyone holding the key material can sign outside the store.** The store protects against software and operator mistakes (rollback, restore, clone, restart). It does not stop an operator or an attacker who has copied the signing key from signing arbitrary messages directly. Deterrence there is slashing, and prevention is hardware.
+
+**Production requirement: an exclusive signing session, enforced on every signing operation.** A production deployment must provide at least one of:
+1. **A hardware-enforced exclusive signing session:** the signing key is non-exportable and lives in the same trusted boundary as the counter (HSM, TPM or secure enclave), which signs only when its own monotonic state matches, so a clone cannot obtain a signature at all; or
+2. **A fenced single-writer lease tied to the validator identity:** acquiring the lease returns a **fencing token** that increases monotonically across holders; every `advance` presents the token; the backend rejects any token lower than the highest it has seen and any token whose lease has been superseded. The lease must be enforced by the backend **on every signing operation, not merely checked at startup**, must not depend on the validator host's clock for correctness, and a process that loses or cannot confirm its lease latches and stops signing. The lease is bound to the validator's public key and `instance_id`.
+
+This matters most for a network of personhood-weighted validator identities, where one human's duplicated validator is both a safety risk and an identity-integrity risk. Neither mechanism is implemented or reviewed yet; until one is, no backend is production-ready.
 
 **How counter state survives restarts.** It lives in the counter backend, not in the safety directory, so restoring or deleting the safety directory does not touch it. On open, the counter is read first and compared with the file as above; initialization creates the counter at 0 and refuses a counter that is not 0.
+
+**Backend direction (initial target, non-binding).** The interface stays technology-neutral. The first private implementation should target a **remotely enforced, authenticated counter with fencing and replicated durable state**, because it provides atomic compare-and-advance, exclusive-writer fencing and durability together. A TPM or HSM implementation remains an alternative and must meet the same requirements: strict atomicity, rollback resistance, identity binding and exclusive-writer enforcement. **No backend may be called production-ready until it has been independently reviewed.**
+
+**Recovery policy.** Fail closed. The only recovery authorized from a confirmed rollback, an inconsistent counter, a lost counter or a duplicated validator is **key rotation** (PQ-VAL-003) to a new key with a new counter and an explicit fresh initialization. The counter interface has no reset, decrement or set operation; if a backend offers one, it must be disabled for validator instances. An operator cannot reset a counter and continue signing with the same key.
 
 **Complementary checks, not replacements:** the chain-evidence staleness rule (§7, "Stale file") and the fresh-initialization refusal stay in force; the counter adds detection that does not depend on the chain.
 
@@ -270,7 +290,13 @@ Acceptable families, not chosen by this document: a hardware or TPM non-volatile
 
 **What the tests established and did not** (PR #127): in an in-memory model every crash point and every post-crash state reopens and never allows two messages for one round; a restored old file is refused when the counter is separate, and a test asserts that with the file *and* the counter both restored the rollback is invisible. They do not establish durability on any real disk or filesystem, and `TestCounter` proves nothing about a real counter.
 
-**Required changes to PR #127 once this section is approved** (found while writing this section): (1) the counter trait must be compare-and-advance, `advance(expected_previous)`, not "advance to the current value or the current value plus one": the current idempotent form lets two live copies sharing one counter both succeed; the lost-acknowledgement case does not need idempotence, as the table shows; (2) the counter handle must be constructed bound to one instance; (3) documentation and tests that call the double a "trusted counter" must say it is not.
+**Required changes to PR #127 once this section is approved** (found while writing this section and in the owner's review):
+1. The counter trait becomes compare-and-advance, `advance(expected_previous, session)`, not "advance to the current value or the current value plus one": the current idempotent form lets two live copies sharing one counter both succeed, and the lost-acknowledgement case does not need idempotence.
+2. The recovery advance on open (`f == t + 1`) uses the same call, does not open the store or return anything until it succeeds, and fails closed if the counter is no longer `t`. Regression tests: a recovery advance that loses a race; a crash during the recovery advance (both outcomes reopen correctly); no signing before the advance has succeeded.
+3. A session (fencing token) is acquired when the store opens and presented on every advance; a stale session is rejected and latches the store. Regression tests with two stores sharing one simulated counter: a stale store cannot commit; a store whose session was superseded latches and stops; the superseded store never returns a signature; the new holder is unaffected.
+4. The counter handle is constructed bound to one validator instance.
+5. Documentation and tests that call the double a "trusted counter" must say it is not, and the test double must implement the strict semantics.
+6. Fresh Linux and Windows validation of the changed implementation.
 
 ---
 
@@ -419,6 +445,6 @@ These keep the locked direction. They make two claims precise:
 
 **Confirmed in the final review (2026-11-07), now reflected in the text:** N11 all canonical integers are big-endian, including `alg_id`; N12 the tags `CFH1|blockid|` and `CFH1|pop|` are approved and `CFH1` is retained; N13 the `cryptography.protocol_profile` design is kept and its documented compatibility tests are required; N14 Phase 0 uses in-memory test keys only; N15 the block identifier commits to all consensus-critical proposal fields with negative substitution tests (§3.2 rules 6 and 7); N16 a missing safety-state file never resets signing history and a fresh validator has an explicit initialization state (§7).
 
-**Proposed, awaiting owner decision (2026-11-07):** §7.1, the trusted monotonic counter as a required security interface, with the failure matrix and the operational acceptance requirements (production counter backend; storage durability acceptance on the target platform). Open choices for the owner: the counter backend family; whether a remote witness is acceptable; the operator policy after a rollback error (key rotation is the only recovery specified).
+**Proposed, awaiting owner decision (2026-11-07):** §7.1, the trusted monotonic counter as a required security interface, with the failure matrix and the operational acceptance requirements (production counter backend; storage durability acceptance on the target platform). Owner conditions of 2026-11-07, now written into §7.1: the recovery advance returns and broadcasts nothing until it succeeds and fails closed on a concurrent advance; duplicated validators need an exclusive signing session (hardware-enforced, or a fenced lease enforced on every signing operation); key rotation is the only authorized recovery; the first private backend targets a remotely enforced, authenticated, fenced, replicated counter; no backend is production-ready before independent review. Open choices for the owner: the specific backend and operator of the first private implementation; the lease duration and renewal policy.
 
 **Still blocked:** Phase 2 persistent validator key handling. It waits for the independent review of PR #109 and separate owner approval (§8.1). No other specification question is open in this revision; the next gate is owner approval of this text before any implementation.
