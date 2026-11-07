@@ -1,0 +1,51 @@
+# Phase 1 step 1: mutation check of the safety-state persistence layer (pq-hotstuff feature)
+# Each mutant is a single edit to chain-forge-consensus/src/pq_hotstuff/safety/{store,record}.rs applied in a separate worktree;
+# the file is restored after each run. Command per mutant: cargo test -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_safety
+#
+# Disclosure: three mutants SURVIVED the first run (S27, S36, S39). All three were weaknesses in my tests, not in the code:
+#   S27 was masked by the separate 'fresh must be at counter 1' check; S36 and S39 were refused by byte misalignment in my crafted
+#   records rather than by the length rules. New tests isolate each rule; the three are then caught.
+# One earlier attempt was stopped because it edited the working tree; it was rerun in a separate worktree.
+# Equivalent mutant noted, not run: making a timeout take 'max(hvr, round)' as plain 'round' cannot change behaviour, because the
+# floor already guarantees round >= hvr.
+
+S01 no fsync of the temp file before rename: CAUGHT (4 failing)
+S02 no directory fsync after rename: CAUGHT (4 failing)
+S03 counter advanced before the file is durable: CAUGHT (2 failing)
+S04 counter never advanced: CAUGHT (15 failing)
+S05 re-send signs again instead of returning the stored signature: CAUGHT (4 failing)
+S06 a different message for the same round is re-sent as if identical: CAUGHT (3 failing)
+S07 round-below-signed check removed: CAUGHT (1 failing)
+S08 vote floor off by one: CAUGHT (1 failing)
+S09 timeout floor off by one: CAUGHT (1 failing)
+S10 epoch regression allowed: CAUGHT (1 failing)
+S11 commit failure does not latch: CAUGHT (1 failing)
+S12 signer failure does not latch: CAUGHT (1 failing)
+S13 signature length not checked: CAUGHT (1 failing)
+S14 lock round (hqr) not updated by a vote: CAUGHT (15 failing)
+S15 marker/state instance check removed: CAUGHT (2 failing)
+S16 rollback accepted: CAUGHT (2 failing)
+S17 any file ahead of the counter treated as the crash window: CAUGHT (1 failing)
+S18 stored signatures not verified on open: CAUGHT (1 failing)
+S19 profile mismatch ignored: CAUGHT (1 failing)
+S20 staleness against the chain not checked: CAUGHT (1 failing)
+S21 fresh init ignores chain participation: CAUGHT (1 failing)
+S22 fresh init ignores the trusted counter: CAUGHT (2 failing)
+S23 no marker written at initialization: CAUGHT (30 failing)
+S24 leftover temp file not cleared: CAUGHT (2 failing)
+S25 signer key not checked against the record: CAUGHT (1 failing)
+S26 a new epoch keeps the old epoch's timeout and proposal: CAUGHT (1 failing)
+S28 hvr below a signed round tolerated: CAUGHT (1 failing)
+S29 round/message-round agreement not checked: CAUGHT (1 failing)
+S30 an active record may have nothing signed: CAUGHT (1 failing)
+S31 checksum not verified: CAUGHT (1 failing)
+S32 trailing bytes inside the body accepted: CAUGHT (1 failing)
+S33 unknown state byte accepted: CAUGHT (1 failing)
+S34 any non-zero option flag accepted (hvr/hqr): CAUGHT (1 failing)
+S35 NUL in a string accepted: CAUGHT (1 failing)
+S37 version not checked: CAUGHT (1 failing)
+S38 hvr not persisted: CAUGHT (16 failing)
+S27 a fresh record may carry signed items: CAUGHT (1 failing) (after the strengthened tests; first run: SURVIVED)
+S36 public key length not checked on decode: CAUGHT (1 failing) (after the strengthened tests; first run: SURVIVED)
+S39 string length limit not enforced on decode: CAUGHT (1 failing) (after the strengthened tests; first run: SURVIVED)
+caught 39 of 39 (36 on the first run, S27 S36 S39 after the strengthened tests)
