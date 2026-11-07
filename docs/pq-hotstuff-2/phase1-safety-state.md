@@ -38,3 +38,37 @@ chain already shows participating.
 * The fault model (every post-crash state: unsynced writes absent, torn at sampled offsets, or complete; unsynced renames applied
   or not) is a model, run in memory; the filesystem tests show only that the real directory behaves.
 * Multi-process locking of the directory is out of scope here.
+
+## Strict compare-and-advance, sessions and binding (spec 7.1, PR #129; added after the owner's review)
+* The counter trait is `binding()`, `read()`, `acquire_session()` and `advance(expected_previous, session)`. `advance` is a strict
+  compare-and-advance: it succeeds only if the counter equals `expected_previous` and the session is the latest; there is no
+  idempotent form (the lost-acknowledgement case does not need one: afterwards the file and the counter are equal).
+* **Binding.** A counter handle belongs to one validator key and one instance. Initialization and `open` refuse a counter bound
+  to anything else.
+* **Sessions.** `initialize_fresh` and `open` acquire a session only after all validation has passed, so a failed open (damaged,
+  stale, rolled back, mismatched) never takes the session from the running store. A superseded store is refused by the counter at
+  its next commit, latches, and returns nothing.
+* **Recovery advance** (`file == trusted + 1`): a compare-and-advance from the value just read, run after validation and before
+  the store exists. If it fails, including because another writer moved the counter, `open` returns an error and no store.
+* **A successful advance is not a licence to expose a signature by another route.** The signer is called only inside the single
+  commit path; the store has no method that returns a raw signature; a signature reaches the caller only inside `Signed`, after
+  the file and the counter both succeeded. Holders of the key material can still sign outside the store (spec 7.1).
+
+## Digest-bound commits (spec 7.1.1, PR #129; implemented after the owner's approval)
+The two-store tests exposed that a numeric counter cannot tell two records with the same number apart: a fenced-out writer on its
+own disk fails at the counter step but leaves its record behind, and that record looked committed on restart. The counter now holds
+`(value, digest)`:
+* the **digest** of a record is the SHA3-256 checksum already sealing its canonical encoding, so it commits to the whole record:
+  `prev_digest`, the profile, the chain, the validator key, the instance, the counter, the epoch, the floors, and every stored
+  message and signature envelope (a test changes each field and requires the digest to change);
+* each record carries `prev_digest`, the digest of the record it replaces (zero for the first), so records form a chain (format
+  version 2; version 1 files are refused);
+* a commit is `advance((n-1, d_(n-1)) -> d_n, session)`;
+* on open: file counter equal and digest equal: normal; equal counter, different digest: **fork**, refused; one ahead with
+  `prev_digest` equal to the committed digest: the durable successor, adopted by a gated compare-and-advance; one ahead with any
+  other predecessor: refused; behind or further ahead: refused as before.
+
+Tests: the two-disk conflicting-vote scenario, the shared-directory overwrite, two successors one ahead (the first restart commits,
+the second is refused), and a process that died after its file was durable while a competitor committed a different successor
+(the original fails closed even though its record is internally valid). Unchanged: a holder of the signing key can still sign
+outside the store, and the in-repository counters are test doubles.

@@ -7,8 +7,22 @@
 //! # Commit sequence (a new signature is returned to the caller only after step 7)
 //! 1. check the persisted state (floors, one message per round) -> 2. build the canonical message (wire, spec 3.2) ->
 //! 3. sign (hedged) -> 4. write the new record to a temporary file -> 5. `fsync` it -> 6. rename it over the state file and
-//! `fsync` the directory -> 7. advance the trusted monotonic counter to the record's counter. Only then is the signed item
-//! returned; sending it is the caller's next step.
+//! `fsync` the directory -> 7. **compare-and-advance** the trusted monotonic counter from the record's previous counter, presenting
+//! the store's exclusive-writer [`Session`]. Only then is the signed item returned; sending it is the caller's next step.
+//!
+//! # Sessions (spec section 7.1)
+//! A store becomes the one valid writer by acquiring a [`Session`] from the counter, and only after every validation in `open` has
+//! passed (a failed open never supersedes the running store). Every counter advance presents that session; the counter refuses
+//! stale ones, and the store then latches and returns nothing. A successful advance is permission to return *that* signature from
+//! the commit path and nothing more: the signer is called only inside the commit path, no method returns a raw signature, and the
+//! caller holds no way to obtain one from the store without a completed commit.
+//!
+//! # Digest-bound commits (spec section 7.1.1)
+//! The counter holds `(value, digest)`, where the digest is the checksum that seals the record's canonical body, and every record
+//! carries the digest of the record it replaced. A commit advances from the replaced record's state to the new record's digest.
+//! On open, a file at the committed counter value must be the committed record (otherwise it is a fork and is refused), and a file
+//! one ahead must be a successor of the committed record. So a record left behind by a fenced-out writer, or a file overwritten
+//! after the commit, is refused on restart instead of being mistaken for the committed state.
 //!
 //! # What this does and does not protect
 //! * A crash at any point leaves either the old record or the new record (the temporary file is never read), and nothing has
@@ -46,7 +60,7 @@ pub const MARKER_FILE: &str = "pq_hotstuff_safety.init";
 pub const STATE_TMP: &str = "pq_hotstuff_safety.state.tmp";
 pub const MARKER_TMP: &str = "pq_hotstuff_safety.init.tmp";
 
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 /// Upper bound on a stored canonical message.
 pub const MAX_MESSAGE_LEN: usize = 4096;
 
@@ -84,6 +98,8 @@ pub struct SafetyRecord {
     pub instance_id: [u8; 16],
     /// Monotonic write counter; equals the trusted counter after a completed commit.
     pub counter: u64,
+    /// The digest of the record this one replaced (all zero for the first record); chains the records (spec 7.1.1).
+    pub prev_digest: [u8; 32],
     pub epoch: u64,
     /// Highest round at which a vote or timeout was signed in `epoch` (`None` = none yet).
     pub hvr: Option<u64>,
@@ -95,6 +111,12 @@ pub struct SafetyRecord {
 }
 
 impl SafetyRecord {
+    /// The digest the trusted counter commits to for this record: the checksum sealing its canonical encoding.
+    pub fn digest(&self) -> Result<[u8; 32], RecordError> {
+        let b = encode_record(self)?;
+        Ok(b[b.len() - 32..].try_into().unwrap())
+    }
+
     pub fn slot(&self, kind: Kind) -> Option<&SignedItem> {
         match kind { Kind::Vote => self.last_vote.as_ref(), Kind::Timeout => self.last_timeout.as_ref(), Kind::Proposal => self.last_proposal.as_ref() }
     }
@@ -150,12 +172,51 @@ pub trait Storage {
     fn remove(&mut self, name: &str) -> Result<(), StorageError>;
 }
 
+/// The identity a counter belongs to: one validator key and one initialization instance. A counter handle is constructed bound
+/// to exactly one identity and is never reused for another (spec section 7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterBinding {
+    pub public_key: Vec<u8>,
+    pub instance_id: [u8; 16],
+}
+
+/// What a counter holds: how many records have been committed and the digest of the latest one (spec 7.1.1). The digest is the
+/// SHA3-256 checksum that seals the record's canonical body, so it commits to the whole record, including its predecessor's digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterState {
+    pub value: u64,
+    pub digest: [u8; 32],
+}
+
+impl CounterState {
+    /// A counter that has never been advanced.
+    pub const INITIAL: CounterState = CounterState { value: 0, digest: [0; 32] };
+}
+
+/// The exclusive-writer credential: a fencing token that increases with every acquisition. Only the holder of the latest
+/// session can advance the counter (spec section 7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session { token: u64 }
+
+impl Session {
+    /// For counter backends, which issue sessions. The store never invents one.
+    pub fn new(token: u64) -> Self { Session { token } }
+    pub fn token(&self) -> u64 { self.token }
+}
+
 /// A trusted monotonic counter that the file's owner cannot roll back (hardware counter, HSM, remote witness). It must be
-/// durable, atomic and refuse to move backwards. **An ordinary file is not a valid implementation.**
+/// durable, atomic, bound to one validator instance, enforce one exclusive signing session, and refuse to move backwards.
+/// **An ordinary file is not a valid implementation**, and neither is any test double in this repository.
 pub trait MonotonicCounter {
-    fn read(&self) -> Result<u64, CounterError>;
-    /// Advance to `value`, which must equal the current value (idempotent) or the current value plus one.
-    fn advance_to(&mut self, value: u64) -> Result<(), CounterError>;
+    /// The validator identity this counter belongs to.
+    fn binding(&self) -> &CounterBinding;
+    fn read(&self) -> Result<CounterState, CounterError>;
+    /// Become the one valid writer. Supersedes every earlier session; the backend rejects advances from those.
+    fn acquire_session(&mut self) -> Result<Session, CounterError>;
+    /// Compare-and-advance: succeeds only if the counter's current state equals `expected` (value **and** digest) and `session`
+    /// is the latest session, and then becomes `(expected.value + 1, new_digest)`. Otherwise it fails and changes nothing.
+    /// There is no idempotent form.
+    fn advance(&mut self, expected: &CounterState, new_digest: [u8; 32], session: &Session) -> Result<(), CounterError>;
 }
 
 /// Signs one canonical message under a FIPS 204 context (hedged). Returns the raw signature bytes.
@@ -214,10 +275,16 @@ pub enum OpenError {
     BadSignature { kind: &'static str },
     #[error("rollback: the state file is at counter {file_counter} but the trusted counter is {trusted_counter}")]
     Rollback { file_counter: u64, trusted_counter: u64 },
+    #[error("fork: the file is at the committed counter {counter} but is not the committed record")]
+    Fork { counter: u64 },
+    #[error("the file is one ahead of the counter {counter} but is a successor of a record other than the committed one")]
+    SuccessorOfAnotherRecord { counter: u64 },
     #[error("counter inconsistency: file {file_counter}, trusted {trusted_counter}")]
     CounterInconsistent { file_counter: u64, trusted_counter: u64 },
     #[error("stale: the chain shows this key signing at {chain:?}, beyond the record's {record:?}")]
     StaleAgainstChain { chain: (u64, u64), record: Option<(u64, u64)> },
+    #[error("the counter is bound to a different validator identity than the record")]
+    CounterBindingMismatch,
     #[error("{0}")]
     Storage(String),
     #[error("{0}")]
@@ -234,6 +301,8 @@ pub enum InitError {
     KeyAlreadyParticipated,
     #[error("invalid identity: {0}")]
     BadIdentity(&'static str),
+    #[error("the counter is bound to a different validator identity")]
+    CounterBindingMismatch,
     #[error("{0}")]
     Storage(String),
     #[error("{0}")]
