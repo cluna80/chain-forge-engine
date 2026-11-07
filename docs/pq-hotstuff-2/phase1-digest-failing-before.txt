@@ -1,0 +1,76 @@
+# Phase 1 step 1d (digest-bound counter commits; spec 7.1.1, PR #129): failing-before evidence
+# Tests-first commit: the counter trait (CounterState, digest-bound advance), SafetyRecord.prev_digest, the new error variants, the doubles and the tests are final;
+# the codec still emits format version 1 without prev_digest and the store passes zero digests (the previous behaviour).
+# Command: cargo test -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_safety
+# 11 tests fail: the three regression tests that used to be #[ignore]d, your added crash-then-competing-successor test, digest coverage,
+# the record chain, the digest-bound commit log, fork, wrong-predecessor, the recovery advance's digests, and the v2 golden vectors.
+
+test a_counter_bound_to_another_identity_is_refused_at_initialization_and_at_open ... ok
+test a_counter_that_has_moved_fails_the_commit_closed_and_no_signature_is_exposed ... ok
+test a_copy_whose_file_is_behind_the_shared_counter_cannot_open ... ok
+test a_correctly_sealed_but_non_canonical_record_is_refused_by_the_strict_decoder ... ok
+test a_crash_while_initializing_never_leaves_signing_state_or_a_state_without_its_marker ... ok
+test a_counter_inconsistent_by_more_than_one_is_refused ... ok
+test a_failed_open_does_not_supersede_the_running_store ... ok
+test a_different_message_for_a_round_already_signed_is_refused_even_after_a_restart ... ok
+test a_file_one_ahead_must_be_the_successor_of_the_committed_record ... FAILED
+test a_crash_during_the_recovery_advance_reopens_correctly_in_both_outcomes ... ok
+test a_key_that_already_participated_cannot_be_initialized_fresh ... ok
+test a_file_at_the_committed_counter_that_is_not_the_committed_record_is_a_fork ... FAILED
+test a_leftover_temporary_file_is_ignored_and_cleared ... ok
+test a_lower_epoch_is_refused_and_a_higher_epoch_starts_clean ... ok
+test a_malformed_signature_from_the_signer_is_refused_and_latches ... ok
+test a_file_one_ahead_of_the_counter_is_the_crash_window_and_completes_the_counter ... ok
+test a_marker_that_does_not_match_the_state_is_refused ... ok
+test a_missing_state_file_with_a_marker_fails_closed_and_creates_nothing ... ok
+test a_process_that_died_after_its_file_was_durable_fails_closed_when_a_competitor_committed_a_different_successor ... FAILED
+test a_record_that_belongs_to_another_profile_chain_key_or_instance_is_refused ... ok
+test a_recovery_advance_gates_the_open_and_a_counter_failure_leaves_no_store ... ok
+test a_record_older_than_the_chain_shows_is_stale_and_a_fresh_one_for_a_participating_key_too ... ok
+test a_recovery_advance_that_loses_a_race_fails_closed ... ok
+test a_restart_re_sends_the_stored_signature_byte_for_byte_and_never_re_signs ... ok
+test a_round_below_one_already_signed_is_refused ... ok
+test a_restored_old_backup_is_detected_through_the_trusted_counter ... ok
+test a_signer_failure_latches_the_store_and_writes_nothing ... ok
+test a_signer_holding_a_different_key_is_refused_without_writing_or_latching ... ok
+test a_state_file_overwritten_after_the_commit_by_a_fenced_out_writer_is_refused_on_the_new_holders_restart ... FAILED
+test a_state_file_without_the_marker_fails_closed ... ok
+test a_stored_message_must_be_canonical_belong_to_this_chain_and_match_its_round ... ok
+test a_stored_signature_that_does_not_verify_is_refused_even_with_a_valid_checksum ... ok
+test a_superseded_session_cannot_commit_returns_nothing_and_does_not_disturb_the_new_holder ... ok
+test a_timeout_at_a_higher_round_raises_the_floor_for_votes_and_timeouts ... ok
+test a_timeout_below_the_round_already_voted_in_is_refused_by_the_floor ... ok
+test a_vote_then_a_timeout_in_the_same_round_is_allowed_but_not_the_reverse ... ok
+test a_storage_or_counter_failure_at_any_step_latches_the_store ... ok
+test an_internally_inconsistent_record_is_refused ... ok
+test both_files_gone_is_no_state_and_a_fresh_start_is_still_refused_by_the_counter ... ok
+test each_rule_for_a_fresh_record_is_enforced_on_its_own ... ok
+test every_commit_advances_from_the_previous_records_digest_to_the_new_records_digest ... FAILED
+test every_commit_is_a_compare_and_advance_from_the_records_previous_counter_with_the_stores_session ... ok
+test fs_a_leftover_temporary_file_is_removed_and_names_cannot_escape_the_directory ... ok
+test fs_open_on_an_empty_directory_creates_nothing_and_a_damaged_file_fails_closed ... ok
+test fs_sign_reopen_and_re_send_are_byte_identical_on_a_real_directory ... ok
+test hedged_signing_really_differs_so_a_re_sign_would_be_visible ... ok
+test initialization_is_explicit_and_the_fresh_state_is_distinguishable ... ok
+test initialization_is_refused_when_state_or_a_marker_already_exists ... ok
+test initialization_is_refused_when_the_trusted_counter_shows_the_identity_was_used ... ok
+test initialization_rejects_a_malformed_identity ... ok
+test open_never_creates_state ... ok
+test records_form_a_chain_each_prev_digest_is_the_digest_of_the_record_it_replaced ... FAILED
+test rollback_is_not_detectable_if_the_counter_is_rolled_back_too_so_an_ordinary_file_proves_nothing ... ok
+test the_commit_order_is_write_sync_rename_sync_dir_then_counter ... ok
+test the_digest_covers_the_complete_canonical_record ... FAILED
+test the_exact_canonical_message_and_envelope_are_persisted_for_every_kind ... ok
+test the_first_signature_moves_fresh_to_active_in_the_same_commit ... ok
+test the_record_and_marker_formats_match_the_independent_oracle ... FAILED
+test the_record_codec_round_trips_and_is_deterministic ... ok
+test the_recovery_advance_commits_the_file_digest_from_the_committed_state ... FAILED
+test the_test_counter_double_is_strict_compare_and_advance_on_value_and_digest_with_a_fencing_session ... ok
+test the_vote_floor_hvr_and_the_lock_hqr_only_move_up ... ok
+test trailing_bytes_and_an_unsupported_version_are_refused ... ok
+test two_disks_a_fenced_out_writers_restart_is_refused_so_it_can_never_send_a_vote_that_conflicts_with_the_committed_one ... FAILED
+test two_files_one_ahead_the_first_restart_commits_and_the_second_is_refused ... FAILED
+test an_empty_or_truncated_state_file_never_opens_at_any_length ... ok
+test a_crash_or_an_io_error_at_any_step_never_allows_two_messages_for_one_round ... ok
+test a_single_flipped_bit_at_any_offset_never_opens ... ok
+test result: FAILED. 57 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 34.33s

@@ -68,7 +68,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
             return Err(InitError::AlreadyInitialized);
         }
         let c = counter.read().map_err(|e| InitError::Counter(e.0))?;
-        if c != 0 { return Err(InitError::CounterNotZero(c)); }
+        if c.value != 0 { return Err(InitError::CounterNotZero(c.value)); }
         if evidence.highest_signed.is_some() { return Err(InitError::KeyAlreadyParticipated); }
 
         let session = counter.acquire_session().map_err(|e| InitError::Counter(e.0))?;
@@ -80,12 +80,12 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         durable_replace(&mut storage, MARKER_TMP, MARKER_FILE, &mb).map_err(st)?;
         let rec = SafetyRecord {
             state: State::Fresh, protocol_profile: init.protocol_profile.into(), chain_id: init.chain_id.into(),
-            public_key: init.public_key.to_vec(), instance_id: init.instance_id, counter: 1, epoch: init.epoch,
+            public_key: init.public_key.to_vec(), instance_id: init.instance_id, counter: 1, prev_digest: [0; 32], epoch: init.epoch,
             hvr: None, hqr: None, last_vote: None, last_timeout: None, last_proposal: None,
         };
         let rb = encode_record(&rec).map_err(|e| InitError::Storage(e.to_string()))?;
         durable_replace(&mut storage, STATE_TMP, STATE_FILE, &rb).map_err(st)?;
-        counter.advance(0, &session).map_err(|e| InitError::Counter(e.0))?;
+        counter.advance(&CounterState::INITIAL, [0; 32], &session).map_err(|e| InitError::Counter(e.0))?;
         Ok(SafetyStore { storage, counter, rec, session, latched: false })
     }
 
@@ -118,14 +118,14 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
 
         // rollback: classify against the trusted counter now, but complete the counter only after everything else checks out
         let trusted = counter.read().map_err(|e| OpenError::Counter(e.0))?;
-        let crash_window = if rec.counter == trusted {
+        let crash_window = if rec.counter == trusted.value {
             false
-        } else if rec.counter == trusted + 1 {
+        } else if rec.counter == trusted.value + 1 {
             true // the file is durable, the counter advance did not happen: nothing from this record was ever returned
-        } else if rec.counter < trusted {
-            return Err(OpenError::Rollback { file_counter: rec.counter, trusted_counter: trusted });
+        } else if rec.counter < trusted.value {
+            return Err(OpenError::Rollback { file_counter: rec.counter, trusted_counter: trusted.value });
         } else {
-            return Err(OpenError::CounterInconsistent { file_counter: rec.counter, trusted_counter: trusted });
+            return Err(OpenError::CounterInconsistent { file_counter: rec.counter, trusted_counter: trusted.value });
         };
 
         Self::verify_content(&rec, expected, verifier)?;
@@ -140,7 +140,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         // supersede the store that is running), and only then is an outstanding advance completed. The completion is a
         // compare-and-advance from the value just read: if another writer moved the counter, it fails and nothing opens.
         let session = counter.acquire_session().map_err(|e| OpenError::Counter(e.0))?;
-        if crash_window { counter.advance(trusted, &session).map_err(|e| OpenError::Counter(e.0))?; }
+        if crash_window { counter.advance(&trusted, [0; 32], &session).map_err(|e| OpenError::Counter(e.0))?; }
         // a leftover temporary file from an interrupted commit was never read; clear it (best effort)
         let _ = storage.remove(STATE_TMP);
         let _ = storage.remove(MARKER_TMP);
@@ -287,6 +287,6 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         let bytes = encode_record(n).map_err(|e| e.to_string())?;
         durable_replace(&mut self.storage, STATE_TMP, STATE_FILE, &bytes).map_err(|e| e.0)?;
         // compare-and-advance from this record's own previous counter, with this store's session; never from a fresh read
-        self.counter.advance(self.rec.counter, &self.session).map_err(|e| e.0)
+        self.counter.advance(&CounterState { value: self.rec.counter, digest: [0; 32] }, [0; 32], &self.session).map_err(|e| e.0)
     }
 }

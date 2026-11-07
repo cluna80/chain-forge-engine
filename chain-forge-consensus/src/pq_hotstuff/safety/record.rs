@@ -191,6 +191,7 @@ pub fn decode_record(b: &[u8]) -> Result<SafetyRecord, RecordError> {
         public_key: r.public_key()?,
         instance_id: r.take(16)?.try_into().unwrap(),
         counter: r.u64()?,
+        prev_digest: [0; 32], // RED: not yet encoded or decoded
         epoch: r.u64()?,
         hvr: r.opt_u64()?,
         hqr: r.opt_u64()?,
