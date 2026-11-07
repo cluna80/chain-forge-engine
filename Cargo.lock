@@ -789,6 +789,7 @@ dependencies = [
  "chain-forge-vca-pq",
  "serde",
  "serde_json",
+ "sha3",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

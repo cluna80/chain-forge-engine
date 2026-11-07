@@ -1,0 +1,29 @@
+# Phase 0 step 1 (canonical serialization): failing-before evidence
+# Tests-first commit: the codec is a stub that returns WireError::Unimplemented; the types, constants and error enum are final.
+# Command: cargo test --locked -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_wire
+# The one passing test checks the tag constants (final in this commit).
+
+test a_message_of_one_type_never_decodes_as_another ... FAILED
+test a_bitmap_with_a_set_padding_bit_a_wrong_byte_count_or_trailing_bytes_is_rejected ... FAILED
+test a_variable_field_split_differently_gives_different_bytes ... FAILED
+test alg_id_zero_and_unknown_values_are_rejected_before_anything_else ... FAILED
+test bitmap_is_a_bit_count_then_msb_first_bytes_with_zero_padding ... FAILED
+test encoding_is_deterministic ... FAILED
+test block_id_is_sha3_256_of_the_canonical_input_and_matches_the_oracle ... FAILED
+test bitmaps_round_trip_for_every_length_up_to_40 ... FAILED
+test every_field_of_a_timeout_and_a_block_signing_message_changes_the_bytes ... FAILED
+test every_field_of_a_vote_changes_the_bytes ... FAILED
+test every_field_of_block_id_input_changes_the_input_and_the_block_id ... FAILED
+test every_field_of_the_pop_message_changes_the_bytes ... FAILED
+test every_item_round_trips_and_re_encodes_to_identical_bytes ... FAILED
+test every_proper_prefix_of_every_item_is_rejected ... FAILED
+test golden_long_items_match_the_oracle_length_and_digest ... FAILED
+test golden_short_items_match_the_independent_oracle_byte_for_byte ... FAILED
+test strings_are_length_prefixed_utf8_without_nul_and_at_most_255_bytes ... FAILED
+test tags_are_distinct_and_prefix_free ... ok
+test integers_are_big_endian_and_alg_id_is_two_bytes ... FAILED
+test key_and_signature_lengths_for_alg_1_are_exact ... FAILED
+test the_same_proposal_under_a_different_profile_has_a_different_block_id ... FAILED
+test trailing_bytes_after_a_complete_item_are_rejected ... FAILED
+test the_option_flag_must_be_exactly_zero_or_one ... FAILED
+test result: FAILED. 1 passed; 22 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
