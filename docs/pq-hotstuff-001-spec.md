@@ -284,6 +284,45 @@ This matters most for a network of personhood-weighted validator identities, whe
 
 **Recovery policy.** Fail closed. The only recovery authorized from a confirmed rollback, an inconsistent counter, a lost counter or a duplicated validator is **key rotation** (PQ-VAL-003) to a new key with a new counter and an explicit fresh initialization. The counter interface has no reset, decrement or set operation; if a backend offers one, it must be disabled for validator instances. An operator cannot reset a counter and continue signing with the same key.
 
+### 7.1.1 Digest-bound counter commits (PROPOSED amendment, owner review pending; not approved for implementation)
+
+**The gap this closes.** The commit sequence writes the state file (steps 4 to 6) before the counter advances (step 4b), and a counter that stores only a number cannot tell two different records with the same counter value apart. Found while writing the two-store tests for PR #127 and asserted there by `known_limitation_a_fenced_out_writer_leaves_an_uncommitted_record_the_counter_cannot_tell_from_the_committed_one`:
+1. Writers A and B are both open on the same committed record (counter `t`); B acquires a later session, so A is fenced out.
+2. B commits and broadcasts vote `m_B` for round `r` (counter `t + 1`).
+3. A, on its own disk, signs a *different* vote `m_A` for the same round. It writes its file (counter `t + 1`) and then fails at the counter advance. Nothing is returned, but the record stays on A's disk.
+4. A is restarted on its own disk. Its file counter equals the trusted counter, so it opens as if committed, holds `m_A`, and would re-send a vote that conflicts with the one B broadcast: slashable equivocation.
+
+The same happens on a shared directory if the fenced-out writer overwrites the file after the new holder committed.
+
+**The amendment.** The counter commits to *which record* each value belongs to, not only to the value.
+1. **Counter state** is `(value, digest)`. The initial state is `(0, 0x00 x 32)`. `read()` returns both.
+2. **Record digest.** The digest of a record is the SHA3-256 checksum already carried by its encoding (the 32 bytes that seal the record's canonical body). The body therefore must contain everything the digest should bind: the record gains a field `prev_digest`, the digest of the record it replaces (`0x00 x 32` for the first record), so records form a chain.
+3. **Commit.** Step 4b becomes `advance(expected = (n - 1, d_(n-1)), new_digest = d_n, session)`: it succeeds only if the counter's current state equals `expected` exactly (value **and** digest) and the session is the latest, and then becomes `(n, d_n)`. Otherwise it fails and changes nothing.
+4. **Open rules** (file counter `f`, file digest `d_f`, file `prev_digest` `p_f`; counter `(t, d_t)`):
+
+| Condition | Meaning | Action |
+|---|---|---|
+| `f == t` and `d_f == d_t` | normal | open |
+| `f == t` and `d_f != d_t` | **a fork: a record with the committed counter value that is not the committed record** (a fenced-out writer's leftover, or a file overwritten after the commit) | refuse (fail closed) |
+| `f == t + 1` and `p_f == d_t` | the file is a durable successor of the committed record; its advance did not happen; nothing from it was ever returned or sent | complete with `advance((t, d_t), d_f, session)`, as in 7.1 (gated, fail closed if the counter moved) |
+| `f == t + 1` and `p_f != d_t` | a successor of some other record | refuse |
+| `f < t` | rollback | refuse |
+| `f > t + 1` | counter reset or forged file | refuse |
+
+**Crash and fork behavior.**
+1. *Crash between file and counter (the 7.1 window).* Unchanged: the file is a successor of the committed record, the recovery advance commits it, and nothing was returned before.
+2. *Two writers' files both one ahead (A fenced out, B crashed before its advance).* Both are valid successors of `(t, d_t)`, and **neither signature was ever returned**, so either may be committed. Whichever restarts first completes the advance; the other, on its next open, finds `f == t` with a different digest and is refused. No conflicting message is ever broadcast, because only a committed record's signature is returned.
+3. *Fenced-out leftover after the new holder committed (the scenario above).* A's restart finds `d_f != d_t` and refuses. Recovery is key rotation, as for every fail-closed case.
+4. *Overwrite after commit on a shared directory.* B's restart finds `d_f != d_t` and refuses; B's own committed record is lost to the file, so B also rotates its key (fail closed, not unsafe).
+
+**Restart validation.** `open` performs, in this order: identity and binding checks; the table above; content verification and chain-evidence staleness; only then session acquisition and any recovery advance. A failed open still never supersedes the running store.
+
+**Cost and compatibility.** The counter backend stores 32 more bytes and must treat the `(value, digest)` pair atomically. The record format gains `prev_digest` and moves to format version 2 (PR #127 is unmerged, so no deployed state exists). The digest reveals nothing about the record's contents beyond a hash of it.
+
+**What it does not change.** It does not stop a holder of the signing key from signing outside the store, and it does not make a lease a signing control (7.1); it only makes the *state* a fenced-out writer leaves behind unusable.
+
+**Required tests once approved** (each must fail on the current implementation): the two-disk scenario above is refused on A's restart; the shared-directory overwrite is refused on B's restart; both files one ahead: the first restart commits, the second is refused, and no conflicting message was ever returned; the recovery advance with `p_f != d_t` is refused; mutants that drop the digest comparison, compare only the value, drop `prev_digest` from the body, or accept `p_f != d_t` are caught. The record format golden vectors are regenerated from the independent oracle.
+
 **Complementary checks, not replacements:** the chain-evidence staleness rule (§7, "Stale file") and the fresh-initialization refusal stay in force; the counter adds detection that does not depend on the chain.
 
 **Operational acceptance requirements** (before any validator runs on a real network; these are not satisfied by the unit tests):
@@ -294,13 +333,14 @@ This matters most for a network of personhood-weighted validator identities, whe
 
 **What the tests established and did not** (PR #127): in an in-memory model every crash point and every post-crash state reopens and never allows two messages for one round; a restored old file is refused when the counter is separate, and a test asserts that with the file *and* the counter both restored the rollback is invisible. They do not establish durability on any real disk or filesystem, and `TestCounter` proves nothing about a real counter.
 
-**Required changes to PR #127 once this section is approved** (found while writing this section and in the owner's review):
+**Required changes to PR #127 once this section is approved** (found while writing this section and in the owner's review). Items 1 to 6 are the compare-and-advance and session work; the digest-bound commits of 7.1.1 are a further, separately approved change (item 7):
 1. The counter trait becomes compare-and-advance, `advance(expected_previous, session)`, not "advance to the current value or the current value plus one": the current idempotent form lets two live copies sharing one counter both succeed, and the lost-acknowledgement case does not need idempotence.
 2. The recovery advance on open (`f == t + 1`) uses the same call, does not open the store or return anything until it succeeds, and fails closed if the counter is no longer `t`. Regression tests: a recovery advance that loses a race; a crash during the recovery advance (both outcomes reopen correctly); no signing before the advance has succeeded.
 3. A session (fencing token) is acquired when the store opens and presented on every advance; a stale session is rejected and latches the store. Regression tests with two stores sharing one simulated counter: a stale store cannot commit; a store whose session was superseded latches and stops; the superseded store never returns a signature; the new holder is unaffected.
 4. The counter handle is constructed bound to one validator instance.
 5. Documentation and tests that call the double a "trusted counter" must say it is not, and the test double must implement the strict semantics.
 6. Fresh Linux and Windows validation of the changed implementation.
+7. If 7.1.1 is approved: the digest-bound counter state, `prev_digest` in the record (format version 2), the open rules and the required tests of 7.1.1, and regenerated golden vectors; then fresh Linux and Windows validation again.
 
 ---
 
@@ -449,6 +489,6 @@ These keep the locked direction. They make two claims precise:
 
 **Confirmed in the final review (2026-11-07), now reflected in the text:** N11 all canonical integers are big-endian, including `alg_id`; N12 the tags `CFH1|blockid|` and `CFH1|pop|` are approved and `CFH1` is retained; N13 the `cryptography.protocol_profile` design is kept and its documented compatibility tests are required; N14 Phase 0 uses in-memory test keys only; N15 the block identifier commits to all consensus-critical proposal fields with negative substitution tests (§3.2 rules 6 and 7); N16 a missing safety-state file never resets signing history and a fresh validator has an explicit initialization state (§7).
 
-**Proposed, awaiting owner decision (2026-11-07):** §7.1, the trusted monotonic counter as a required security interface, with the failure matrix and the operational acceptance requirements (production counter backend; storage durability acceptance on the target platform). Owner conditions of 2026-11-07, now written into §7.1: the recovery advance returns and broadcasts nothing until it succeeds and fails closed on a concurrent advance; duplicated validators need an exclusive signing session (hardware-enforced, or a fenced lease enforced on every signing operation); key rotation is the only authorized recovery; the first private backend targets a remotely enforced, authenticated, fenced, replicated counter; no backend is production-ready before independent review. Recommended by the owner's review (not yet an approved decision): accept §7.1 as the design basis with the limit of option 2 retained; the first backend is a remotely operated, authenticated, replicated, fenced counter **for the private prototype only**; renewable server-enforced leases with monotonically increasing fencing tokens, duration to be set by failure and latency testing; fail closed and key rotation for rollback recovery, with no counter reset for the same key. This is enough to proceed with updating PR #127's tests and interface once the specification direction is approved; it is **not** enough to declare the production validator security architecture complete. Open choices for the owner: the operator and deployment of the prototype backend; whether and when a trusted signing boundary (option 1) becomes a requirement for a public network.
+**Proposed, awaiting owner decision (2026-11-07):** §7.1, the trusted monotonic counter as a required security interface, with the failure matrix and the operational acceptance requirements (production counter backend; storage durability acceptance on the target platform). Owner conditions of 2026-11-07, now written into §7.1: the recovery advance returns and broadcasts nothing until it succeeds and fails closed on a concurrent advance; duplicated validators need an exclusive signing session (hardware-enforced, or a fenced lease enforced on every signing operation); key rotation is the only authorized recovery; the first private backend targets a remotely enforced, authenticated, fenced, replicated counter; no backend is production-ready before independent review. Recommended by the owner's review (not yet an approved decision): accept §7.1 as the design basis with the limit of option 2 retained; the first backend is a remotely operated, authenticated, replicated, fenced counter **for the private prototype only**; renewable server-enforced leases with monotonically increasing fencing tokens, duration to be set by failure and latency testing; fail closed and key rotation for rollback recovery, with no counter reset for the same key. This is enough to proceed with updating PR #127's tests and interface once the specification direction is approved; it is **not** enough to declare the production validator security architecture complete. Proposed in 7.1.1 (development of the specification approved by the owner as a proposed amendment; implementation and merge not approved): digest-bound counter commits that close the fenced-out-writer residue. Open choices for the owner: the operator and deployment of the prototype backend; whether and when a trusted signing boundary (option 1) becomes a requirement for a public network.
 
 **Still blocked:** Phase 2 persistent validator key handling. It waits for the independent review of PR #109 and separate owner approval (§8.1). No other specification question is open in this revision; the next gate is owner approval of this text before any implementation.
