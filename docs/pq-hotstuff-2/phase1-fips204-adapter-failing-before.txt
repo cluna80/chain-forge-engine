@@ -1,0 +1,17 @@
+# Phase 1 step 1b (real FIPS 204 adapter): failing-before evidence
+# Tests-first commit: Fips204Signer/Fips204Verifier are stubs (sign fails, verify rejects, keys empty); the traits and the store are final.
+# Command: cargo test -p chain-forge-consensus --features pq-hotstuff-fips204 --test pq_hotstuff_safety_fips204
+# Only the test that checks the context constants passes: it needs nothing from the adapter.
+
+test a_garbage_signature_and_a_signature_from_another_key_or_domain_are_refused_on_open ... FAILED
+test a_crash_at_any_step_with_real_signatures_reopens_and_never_allows_a_second_vote_for_the_round ... FAILED
+test a_store_reopened_with_the_real_verifier_accepts_real_signatures_and_re_sends_them_byte_for_byte ... FAILED
+test a_tampered_stored_signature_is_refused_on_open_by_the_real_verifier ... FAILED
+test signatures_through_the_store_are_real_fips_204_signatures_in_the_right_context ... FAILED
+test the_crate_contexts_are_exactly_the_approved_strings ... ok
+test real_signing_is_hedged_two_signatures_over_one_message_differ_and_both_verify ... FAILED
+test the_signer_debug_output_never_contains_key_material ... FAILED
+test the_store_refuses_a_real_signer_whose_key_is_not_the_records_key ... FAILED
+test the_verifier_never_panics_on_malformed_input_and_rejects_it ... FAILED
+test keys_are_real_ml_dsa_65_sizes_and_come_from_the_seed_deterministically ... FAILED
+test result: FAILED. 1 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s

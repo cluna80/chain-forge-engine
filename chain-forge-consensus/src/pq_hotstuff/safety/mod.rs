@@ -21,10 +21,14 @@
 //!   stored signatures are verified on load, so the stored *messages* cannot be forged without the validator's key.
 //! * Keys: none are stored or handled here. Signing goes through the [`ConsensusSigner`] trait; production validator key
 //!   storage is out of scope (blocked on the independent review of PR #109).
+#[cfg(feature = "pq-hotstuff-fips204")]
+mod fips204_adapter;
 mod fs;
 mod record;
 mod store;
 
+#[cfg(feature = "pq-hotstuff-fips204")]
+pub use fips204_adapter::{Fips204Signer, Fips204Verifier};
 pub use fs::FsStorage;
 pub use record::{decode_marker, decode_record, encode_marker, encode_record, Marker};
 pub use store::{FreshInit, SafetyStore, Signed};
