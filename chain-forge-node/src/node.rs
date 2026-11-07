@@ -17598,4 +17598,38 @@ mod p02a_gaps {
         assert!(crate::api::f1_nonce_rejected(cached, 2), "replay of an already-committed nonce is rejected at ingress after restart");
         assert!(!crate::api::f1_nonce_rejected(cached, 3), "the next valid nonce is accepted");
     }
+
+    // ── H0-4: a committed transaction replayed after a restart changes nothing ──
+    #[tokio::test]
+    async fn h0_4_committed_tx_replayed_after_restart_changes_no_state() {
+        let dir = tmp("h04-restart");
+        let tx0 = Transaction::transfer("h04-r0", "qcb1alice", "qcb1bob", "uqcb", 7, 0);
+        {
+            let mut n = Node::new(GENESIS, Some("qcb1alice".into())).await.unwrap();
+            n.set_data_dir(dir.to_path_buf()).unwrap();
+            assert!(n.submit_tx(tx0.clone()));
+            n.propose_block(chain_forge_consensus::BlockHash("0000000000000000".into())).await.unwrap();
+            n.persist_state().unwrap();
+        }
+        let (mut n, r) = restart(&dir).await;
+        assert!(r.is_restored(), "{r:?}");
+        let before = (
+            n.state.get_account("qcb1alice").unwrap().nonce,
+            n.state.get_account("qcb1alice").unwrap().balance_of("uqcb"),
+            n.state.get_account("qcb1bob").unwrap().balance_of("uqcb"),
+        );
+        assert_eq!(before.0, 1, "precondition: the transfer committed");
+        // The replay reaches the mempool (Node::submit_tx does not check nonces) and is proposed.
+        let mut replay = tx0.clone();
+        replay.id = "h04-r0-again".into(); // a different id so the committed-id check cannot hide the nonce rule
+        assert!(n.submit_tx(replay));
+        n.propose_block(chain_forge_consensus::BlockHash("1111111111111111".into())).await.unwrap();
+        let after = (
+            n.state.get_account("qcb1alice").unwrap().nonce,
+            n.state.get_account("qcb1alice").unwrap().balance_of("uqcb"),
+            n.state.get_account("qcb1bob").unwrap().balance_of("uqcb"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(after, before, "a replayed nonce must change no balance and no nonce");
+    }
 }
