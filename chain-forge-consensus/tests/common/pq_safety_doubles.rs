@@ -1,6 +1,6 @@
 //! Test doubles for the PQ-HotStuff-2 safety-state tests. They are NOT trusted mechanisms:
 //! * `MemStorage` models volatile vs durable state and enumerates every post-crash outcome.
-//! * `TestCounter` is an in-memory counter standing in for a trusted monotonic counter.
+//! * `TestCounter` is an in-memory counter standing in for the trusted monotonic counter a deployment would need; it is not one.
 //! * `TestSigner` / `TestVerifier` are a hedged test scheme with exact FIPS 204 ML-DSA-65 sizes (not a real signature).
 #![allow(dead_code)]
 use chain_forge_consensus::pq_hotstuff::safety::*;

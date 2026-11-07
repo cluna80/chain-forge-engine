@@ -1,5 +1,6 @@
 //! PQ-HotStuff-2 safety-state persistence (spec section 7, Phase 1 step 1): fail-closed opening, exact message and envelope
-//! persistence, crash and fault injection at every step, rollback detection through a trusted counter.
+//! persistence, crash and fault injection at every step, rollback detection through a separate counter (a test double here; the
+//! counter a deployment relies on must be a trusted mechanism, spec 7.1).
 //!
 //! The doubles in tests/common/pq_safety_doubles.rs are NOT trusted mechanisms. The golden record digests come from an
 //! independent oracle (tests/vectors/gen_pq_hotstuff_safety_vectors.py).
@@ -85,7 +86,7 @@ impl World {
 
 fn open_err(w: &World, st: &MemStorage, ctr: &TestCounter) -> OpenError { w.open(st, ctr).err().expect("must not open") }
 
-/// The counter state a trusted counter would hold if the state file in `st` were the latest committed record.
+/// The counter state a counter would hold if the state file in `st` were the latest committed record.
 fn committed_state(st: &MemStorage) -> CounterState {
     let b = st.raw(STATE_FILE).expect("state file");
     let r = decode_record(&b).expect("decode");
@@ -150,8 +151,8 @@ fn initialization_is_refused_when_state_or_a_marker_already_exists() {
 }
 
 #[test]
-fn initialization_is_refused_when_the_trusted_counter_shows_the_identity_was_used() {
-    // both files deleted after use: the file side shows nothing, the trusted counter still remembers
+fn initialization_is_refused_when_the_separate_counter_shows_the_identity_was_used() {
+    // both files deleted after use: the file side shows nothing, the separate counter still remembers
     let mut w = World::new();
     let (_, ctr) = w.prior().into_parts();
     assert!(ctr.value > 0);
@@ -607,7 +608,7 @@ fn an_internally_inconsistent_record_is_refused() {
 
 #[test]
 fn each_rule_for_a_fresh_record_is_enforced_on_its_own() {
-    // The trusted counter is set to 1 and the record's counter to 1 so that the counter rules pass and only the rule under
+    // The test counter is set to 1 and the record's counter to 1 so that the counter rules pass and only the rule under
     // test can reject the record.
     let mut w = World::new();
     let (st, _ctr) = w.prior().into_parts();
@@ -643,7 +644,7 @@ fn a_leftover_temporary_file_is_ignored_and_cleared() {
 // ================================================================ rollback, staleness, the counter
 
 #[test]
-fn a_restored_old_backup_is_detected_through_the_trusted_counter() {
+fn a_restored_old_backup_is_detected_through_a_separate_counter() {
     let mut w = World::new();
     let (st, ctr) = w.prior().into_parts();
     let backup = st.files(); // the operator's backup, taken at counter 4
@@ -651,7 +652,7 @@ fn a_restored_old_backup_is_detected_through_the_trusted_counter() {
     do_sign(&mut s, &mut w.signer, K::Vote, 1, 6, 1).unwrap();
     let (mut st, ctr) = s.into_parts();
     assert_eq!(ctr.value, 5);
-    st.restore(backup); // yesterday's files come back; the trusted counter cannot be restored
+    st.restore(backup); // yesterday's files come back; the separate counter cannot be restored
     assert_eq!(open_err(&w, &st, &ctr), OpenError::Rollback { file_counter: 4, trusted_counter: 5 });
 }
 
@@ -668,7 +669,7 @@ fn rollback_is_not_detectable_if_the_counter_is_rolled_back_too_so_an_ordinary_f
     let (mut st, _) = s.into_parts();
     st.restore(backup);
     let untrusted = TestCounter::with_state(old_state, w.f.clone()); // restored together with the file
-    let s2 = w.open(&st, &untrusted).expect("opens: the rollback is invisible without a trusted counter");
+    let s2 = w.open(&st, &untrusted).expect("opens: the rollback is invisible without a counter outside the attacker's reach");
     assert_eq!(s2.record().hvr, Some(5), "stale: the vote at round 6 is forgotten");
 }
 
