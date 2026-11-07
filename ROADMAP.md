@@ -1,5 +1,36 @@
 # Qattice — Public Testnet Alpha: ML-DSA-65 + PQ-HotStuff Launch Plan
 
+
+## PQ-HotStuff-2 implementation status — 2026-11-06 (newest status; documentation-only)
+
+> **Status supersession, not gate completion.** This section updates the November 5 snapshot below. Older tables and evidence are retained as historical records. This roadmap edit changes no consensus code, authorizes no deployment, and marks no QAT release gate complete.
+
+### Confirmed merges and current work
+
+| Item | Evidence / decision | Status |
+|---|---|---|
+| **PR #124 — protocol specification** | Merged as `259b1b97038facf72e905da67f53dccd917e90e3`; `docs/pq-hotstuff-001-spec.md` specifies PQ-HotStuff-2, FIPS 204 ML-DSA-65 profile, canonical signing, crash-safe persistence and phase gates. | **Merged specification; no consensus activation** |
+| **PR #125 — Phase 0 wire formats** | Merged as `37199329e3ec0afb1c69e8f02261ea2ba39469a1`, resulting tree `ac08ff6306b2ccaef8e8197de29e0543937c1f1a`. Feature-gated canonical wire encoding/decoding only. Owner-reported Windows at head `f10cbd41e6eee02163605506a75d2421ac2b3f61`: `pq_hotstuff_wire` 24/24, default consensus library 98/98; Linux mutation evidence: 20/20 targeted mutants caught. | **Merged, inactive by default; QAT-06 not complete** |
+| **Phase 1 persistence (§7)** | Owner authorized **development and testing**, based on the verified #125 merge. New draft PR required; in-memory keys only; tests-first, crash/restart and fault-injection coverage, durable write-before-send, fail-closed recovery, explicit fresh-validator initialization and rollback protection. | **Authorized to develop; not implemented or merged by this approval; QAT-07 not complete** |
+| **BlockPayload and QC/TC serialization** | Additional normative layouts required before block and certificate hashing/integration. Separate documentation-only draft PR for review. | **Pending specification** |
+| **Phase 2 private-key handling** | Persistent validator key storage requires independent review of PR #109 and separate owner approval. | **Blocked** |
+
+### Consensus separation — Qattice versus Chain Forge
+
+- **Qattice** is the sovereign Layer-1 blockchain built using the **Chain Forge** blockchain creation engine. Qattice's intended **exclusive production consensus** is **PQ-HotStuff-2**, conditional on completed safety, persistence, four-node devnet, adversarial testing and independent review gates.
+- **Tendermint remains the current private Qattice devnet/regression baseline.** No existing network is automatically migrated. Removing Tendermint from Qattice's configuration requires a later, separate owner decision after acceptance gates pass.
+- **Chain Forge retains Tendermint as a selectable consensus option for other blockchain developers.** This Qattice-specific deployment direction does not authorize removing or modifying the shared Tendermint implementation or changing the separate Chain Forge repository.
+- PQ-HotStuff-2 is built behind an explicit non-default feature. The initial Qattice public testnet is planned with a **fresh PQ-HotStuff-2 genesis**, not a Tendermint public alpha. Neither network activation nor public deployment is authorized.
+
+### Gate interpretation and next checks
+
+- **QAT-06 / PQHS-P0:** canonical wire-format work is merged, but consensus safety rules, two-chain commit, pacemaker, adversarial simulations and other Phase 0 acceptance criteria remain to be demonstrated. **Gate open.**
+- **QAT-07 / PQHS-P1:** persistence work is authorized but must pass its own tests, fault injection, mutation checks, Windows confirmation and review; validator membership, personhood power caps, revocation and rotation also remain in scope. **Gate open.**
+- **QAT-08–QAT-11:** private PQ-HotStuff-2 devnet, independent review, transport security and public-alpha release gates remain pending. No launch readiness claim.
+- **Change control:** each implementation PR is a separate review/merge decision; do not merge, activate, change Tendermint defaults or write production validator key files without separate approval. Preserve exact commit/tree and Windows evidence for each acceptance claim.
+
+---
+
 ## Status refresh — 2026-11-05 (verified against GitHub; append-only)
 
 > **Documentation only.** This section was added on top of the roadmap in draft PR #96 and removes nothing. Earlier text, including the status column of the gate table below it, is kept as historical evidence of what was true when it was written; where it differs from this section, **this section is the current status**. It marks **no gate complete**. No production code, merge or deployment is authorized by it. The locked PQ-HotStuff direction (D1–D5, `docs/pq-hotstuff-001-spec.md`) is unchanged.
