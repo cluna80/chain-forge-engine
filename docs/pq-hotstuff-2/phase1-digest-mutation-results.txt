@@ -1,0 +1,89 @@
+# Phase 1 step 1 (final): mutation check of the safety store with digest-bound commits (spec 7.1.1), 62 mutants
+# Run against commit b6ce17f (the digest-bound code), single edits applied in a separate worktree and restored after each run.
+# Command per mutant: cargo test -p chain-forge-consensus --features pq-hotstuff --test pq_hotstuff_safety
+#
+# First run: 60 of 62 caught. Two SURVIVED, both weaknesses in my tests, disclosed:
+#  D02 (the commit takes the digest from a fresh counter read): the external-move test changed value and digest together, so the value check masked it.
+#      New test: a_store_never_adopts_a_counter_digest_it_did_not_commit_even_if_the_value_is_unchanged.
+#  D11 (a zero counter that holds a digest is accepted at initialization): five tests asserted 'nothing was written' on the ORIGINAL storage object,
+#      which the store never touches because it receives a clone, so those assertions could not fail. They now inspect the operation log.
+# N01 (fresh counter read as the expected state), which survived the earlier sessions matrix, is caught here by a_store_never_adopts_a_counter_state_it_did_not_commit...
+# Rerun after the test changes (commit c40ede7, tests only): the two survivors and four neighbouring mutants, 6 of 6 caught (listed after the first run).
+# Process note: an earlier launch of this matrix was disturbed (the runner survived the death of its wait loop and I moved the worktree's checkout under it);
+# every result from that launch was discarded and the whole matrix was rerun from a clean worktree.
+
+## first run (b6ce17f)
+S01 no fsync of the temp file before rename: CAUGHT (6 failing)
+S02 no directory fsync after rename: CAUGHT (6 failing)
+S03 counter advanced before the file is durable: CAUGHT (56 failing)
+S04 counter never advanced: CAUGHT (26 failing)
+S05 re-send signs again instead of returning the stored signature: CAUGHT (5 failing)
+S06 a different message for the same round is re-sent as if identical: CAUGHT (3 failing)
+S07 round-below-signed check removed: CAUGHT (1 failing)
+S08 vote floor off by one: CAUGHT (1 failing)
+S09 timeout floor off by one: CAUGHT (1 failing)
+S10 epoch regression allowed: CAUGHT (1 failing)
+S11 commit failure does not latch: CAUGHT (4 failing)
+S12 signer failure does not latch: CAUGHT (1 failing)
+S13 signature length not checked: CAUGHT (1 failing)
+S14 lock round (hqr) not updated by a vote: CAUGHT (25 failing)
+S15 marker/state instance check removed: CAUGHT (2 failing)
+S16 rollback accepted: CAUGHT (4 failing)
+S17 any file ahead of the counter treated as the crash window: CAUGHT (1 failing)
+S18 stored signatures not verified on open: CAUGHT (1 failing)
+S19 profile mismatch ignored: CAUGHT (1 failing)
+S20 staleness against the chain not checked: CAUGHT (1 failing)
+S21 fresh init ignores chain participation: CAUGHT (1 failing)
+S22 fresh init ignores the trusted counter: CAUGHT (2 failing)
+S23 no marker written at initialization: CAUGHT (46 failing)
+S24 leftover temp file not cleared: CAUGHT (2 failing)
+S25 signer key not checked against the record: CAUGHT (1 failing)
+S26 a new epoch keeps the old epoch's timeout and proposal: CAUGHT (1 failing)
+S27 a fresh record may carry signed items: CAUGHT (1 failing)
+S28 hvr below a signed round tolerated: CAUGHT (1 failing)
+S29 round/message-round agreement not checked: CAUGHT (1 failing)
+S30 an active record may have nothing signed: CAUGHT (1 failing)
+S31 checksum not verified: CAUGHT (1 failing)
+S32 trailing bytes inside the body accepted: CAUGHT (1 failing)
+S33 unknown state byte accepted: CAUGHT (1 failing)
+S34 any non-zero option flag accepted (hvr/hqr): CAUGHT (1 failing)
+S35 NUL in a string accepted: CAUGHT (1 failing)
+S36 public key length not checked on decode: CAUGHT (1 failing)
+S37 version not checked: CAUGHT (1 failing)
+S38 hvr not persisted: CAUGHT (27 failing)
+S39 string length limit not enforced on decode: CAUGHT (1 failing)
+N01 commit uses a fresh counter read as the expected state: CAUGHT (1 failing)
+N02 every commit acquires a fresh session (defeats fencing): CAUGHT (3 failing)
+N03 open acquires a session at the start, before validating (a failed open supersedes the running store): CAUGHT (2 failing)
+N04 recovery advance result ignored: CAUGHT (2 failing)
+N05 counter binding not checked at open: CAUGHT (1 failing)
+N06 counter binding not checked at initialization: CAUGHT (1 failing)
+N07 recovery advance uses the file counter as the expected value: CAUGHT (7 failing)
+N08 initialization advance expects 1 instead of 0: CAUGHT (64 failing)
+N09 initialization does not acquire a session: CAUGHT (1 failing)
+N10 open does not acquire a session: CAUGHT (11 failing)
+D01 a file at the committed counter that is not the committed record is accepted (no fork check): CAUGHT (5 failing)
+D02 commit ignores the digest of the replaced record: SURVIVED
+D03 the new record's digest is not committed to the counter: CAUGHT (48 failing)
+D04 a one-ahead file need not be a successor of the committed record: CAUGHT (1 failing)
+D05 records are not chained (prev_digest stays zero): CAUGHT (3 failing)
+D06 prev_digest is not written into the sealed body: CAUGHT (43 failing)
+D07 the recovery advance commits the wrong digest: CAUGHT (1 failing)
+D08 the store forgets its record digest after a commit: CAUGHT (43 failing)
+D09 the fork check compares prev_digest instead of the file digest: CAUGHT (31 failing)
+D10 initialization commits the zero digest: CAUGHT (60 failing)
+D11 initialization accepts a zero counter that holds a digest: SURVIVED
+D12 the open digest is taken from the wrong bytes (the counter field instead of the checksum): CAUGHT (32 failing)
+D13 the format version is not checked (version 1 files accepted): CAUGHT (1 failing)
+caught 60 of 62
+
+## rerun after the test changes (c40ede7)
+S21 fresh init ignores chain participation: CAUGHT (1 failing)
+S22 fresh init ignores the trusted counter: CAUGHT (2 failing)
+N01 commit uses a fresh counter read as the expected state: CAUGHT (2 failing)
+D02 commit ignores the digest of the replaced record: CAUGHT (1 failing)
+D10 initialization commits the zero digest: CAUGHT (61 failing)
+D11 initialization accepts a zero counter that holds a digest: CAUGHT (1 failing)
+caught 6 of 6
+
+summary: 62 of 62 caught after the two survivors were fixed (60 on the first run, D02 and D11 on the rerun)
