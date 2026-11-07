@@ -70,6 +70,8 @@ fn keys_are_real_ml_dsa_65_sizes_and_come_from_the_seed_deterministically() {
     let g = Fips204Signer::generate().expect("OS RNG");
     assert_eq!(g.public_key().len(), 1952);
     assert_ne!(g.public_key(), a.public_key());
+    let g2 = Fips204Signer::generate().expect("OS RNG");
+    assert_ne!(g.public_key(), g2.public_key(), "two generated keys must differ");
 }
 
 #[test]
