@@ -216,7 +216,8 @@ fn strict_advance(st: &mut CounterInner, faults: &Shared, expected: &CounterStat
     if st.state != *expected {
         return Err(CounterError(format!("the counter is at {} but the caller expected {}", st.state.value, expected.value)));
     }
-    st.state = CounterState { value: expected.value + 1, digest: new_digest };
+    let next = expected.value.checked_add(1).ok_or_else(|| CounterError("the counter cannot advance past u64::MAX".into()))?;
+    st.state = CounterState { value: next, digest: new_digest };
     Ok(())
 }
 
@@ -270,6 +271,8 @@ impl SharedCounter {
     }
     pub fn value(&self) -> u64 { self.st.borrow().state.value }
     pub fn state(&self) -> CounterState { self.st.borrow().state }
+    /// The token of the latest session ever issued (0 if no store has acquired one).
+    pub fn session_token(&self) -> u64 { self.st.borrow().current_token }
     pub fn calls(&self) -> Vec<(u64, u64)> { self.st.borrow().calls.clone() }
     pub fn digests(&self) -> Vec<([u8; 32], [u8; 32])> { self.st.borrow().digests.clone() }
     pub fn set_race_on_next_advance(&self) { self.st.borrow_mut().race_on_next_advance = true; }

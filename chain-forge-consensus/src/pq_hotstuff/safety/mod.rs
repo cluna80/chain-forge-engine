@@ -271,6 +271,8 @@ pub enum OpenError {
     BadSignature { kind: &'static str },
     #[error("rollback: the state file is at counter {file_counter} but the trusted counter is {trusted_counter}")]
     Rollback { file_counter: u64, trusted_counter: u64 },
+    #[error("the counter is at {value}, the largest representable value, so no further record can ever be committed; rotate the key")]
+    CounterExhausted { value: u64 },
     #[error("fork: the file is at the committed counter {counter} but is not the committed record")]
     Fork { counter: u64 },
     #[error("the file is one ahead of the counter {counter} but is a successor of a record other than the committed one")]
@@ -309,6 +311,8 @@ pub enum InitError {
 pub enum SignError {
     #[error("the store is latched after a failure and refuses to sign; restart and reopen")]
     Latched,
+    #[error("the record counter is at its largest value, so no further record can be committed and nothing was signed; rotate the key")]
+    CounterExhausted,
     #[error("epoch {requested} is below the recorded epoch {record}")]
     EpochRegression { record: u64, requested: u64 },
     #[error("a different {kind} was already signed for round {round}")]
