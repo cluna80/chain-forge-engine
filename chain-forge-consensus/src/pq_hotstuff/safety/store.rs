@@ -123,11 +123,14 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
         // rollback: classify against the trusted counter now, but complete the counter only after everything else checks out
         let trusted = counter.read().map_err(|e| OpenError::Counter(e.0))?;
         let file_digest: [u8; 32] = state_bytes[state_bytes.len() - 32..].try_into().unwrap();
+        // The rule table needs "the committed value plus one". At u64::MAX that value does not exist, and no further record can ever
+        // be committed, so refuse explicitly (fail closed) before anything is touched.
+        let next_counter = trusted.value.checked_add(1).ok_or(OpenError::CounterExhausted { value: trusted.value })?;
         let crash_window = if rec.counter == trusted.value {
             // the committed counter value: the file must be the committed record, not merely a record with the same number
             if file_digest != trusted.digest { return Err(OpenError::Fork { counter: rec.counter }); }
             false
-        } else if rec.counter == trusted.value + 1 {
+        } else if rec.counter == next_counter {
             // the file is durable, the counter advance did not happen: nothing from this record was ever returned. It may be
             // adopted only if it is a successor of the committed record.
             if rec.prev_digest != trusted.digest { return Err(OpenError::SuccessorOfAnotherRecord { counter: rec.counter }); }
@@ -253,6 +256,10 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
             _ => {}
         }
 
+        // The record this signature would be committed in has counter + 1. If that does not exist, nothing may be signed: refuse
+        // before the signer is called, write nothing and touch no counter. (A re-send above does not need a new record.)
+        let next_counter = self.rec.counter.checked_add(1).ok_or(SignError::CounterExhausted)?;
+
         // sign (hedged). A failed signer, including a failed RNG, latches the store: fail closed.
         let signature = match signer.sign(kind.context(), &message) {
             Ok(s) => s,
@@ -273,7 +280,7 @@ impl<S: Storage, C: MonotonicCounter> SafetyStore<S, C> {
             n.last_proposal = None;
         }
         n.state = State::Active;
-        n.counter += 1;
+        n.counter = next_counter;
         match kind {
             Kind::Vote => {
                 n.hvr = Some(round);
