@@ -133,7 +133,7 @@ fn open_never_creates_state() {
     let w = World::new();
     let st = MemStorage::new(w.f.clone());
     assert_eq!(open_err(&w, &st, &w.ctr), OpenError::NoState);
-    assert!(st.is_empty(), "open must not write anything");
+    assert!(w.f.borrow().log.is_empty(), "open must not perform any write, fsync, rename or counter operation");
     assert_eq!(w.f.borrow().ops, 0);
 }
 
@@ -156,9 +156,10 @@ fn initialization_is_refused_when_the_trusted_counter_shows_the_identity_was_use
     let (_, ctr) = w.prior().into_parts();
     assert!(ctr.value > 0);
     let empty = MemStorage::new(w.f.clone());
+    w.reset_plan(); // forget the operations that built the prior state
     let e = Store::initialize_fresh(empty.clone(), ctr.clone(), &w.fresh_init(), &ParticipationEvidence::default()).err().unwrap();
     assert_eq!(e, InitError::CounterNotZero(ctr.value));
-    assert!(empty.is_empty());
+    assert!(w.f.borrow().log.is_empty(), "a refused initialization must perform no write, fsync, rename or counter operation");
 }
 
 #[test]
@@ -167,7 +168,7 @@ fn initialization_is_refused_for_a_counter_at_zero_that_already_holds_a_digest()
     let c = TestCounter::with_state(CounterState { value: 0, digest: [7; 32] }, w.f.clone());
     let e = Store::initialize_fresh(w.st.clone(), c, &w.fresh_init(), &ParticipationEvidence::default()).err().unwrap();
     assert!(matches!(e, InitError::Counter(_)), "{e:?}");
-    assert!(w.st.is_empty(), "nothing may be written");
+    assert!(w.f.borrow().log.is_empty(), "nothing may be written: not a file, not a counter operation");
 }
 
 #[test]
@@ -175,7 +176,7 @@ fn a_key_that_already_participated_cannot_be_initialized_fresh() {
     let w = World::new();
     let e = Store::initialize_fresh(w.st.clone(), w.ctr.clone(), &w.fresh_init(), &ParticipationEvidence { highest_signed: Some((1, 0)) }).err().unwrap();
     assert_eq!(e, InitError::KeyAlreadyParticipated);
-    assert!(w.st.is_empty());
+    assert!(w.f.borrow().log.is_empty(), "nothing may be written");
 }
 
 #[test]
@@ -186,7 +187,7 @@ fn initialization_rejects_a_malformed_identity() {
     assert!(matches!(Store::initialize_fresh(w.st.clone(), w.ctr.clone(), &bad_key, &ParticipationEvidence::default()), Err(InitError::BadIdentity(_))));
     let bad_profile = FreshInit { protocol_profile: "", ..w.fresh_init() };
     assert!(matches!(Store::initialize_fresh(w.st.clone(), w.ctr.clone(), &bad_profile, &ParticipationEvidence::default()), Err(InitError::BadIdentity(_))));
-    assert!(w.st.is_empty());
+    assert!(w.f.borrow().log.is_empty(), "nothing may be written");
 }
 
 // ================================================================ exact persistence and byte-for-byte re-send
@@ -1154,6 +1155,23 @@ fn a_store_never_adopts_a_counter_state_it_did_not_commit_even_if_the_counter_mo
     assert!(s.is_latched());
     assert_eq!(sc.state(), moved, "the failed commit must not change the counter");
     assert!(s.record().last_timeout.is_none(), "and nothing was returned or recorded");
+}
+
+#[test]
+fn a_store_never_adopts_a_counter_digest_it_did_not_commit_even_if_the_value_is_unchanged() {
+    // Only the digest differs: the counter still shows the value this store last committed. The commit must compare the digest
+    // too; taking the digest from a fresh read would let a different record at the same number be silently overwritten.
+    let mut w = World::new();
+    let sc = SharedCounter::new(0, w.f.clone());
+    let mut s = s_init(&w, &sc);
+    do_sign_s(&mut s, &mut w.signer, K::Vote, 3).unwrap();
+    sc.change_digest_externally([0xCC; 32]);
+    let moved = sc.state();
+    let e = do_sign_s(&mut s, &mut w.signer, K::Timeout, 3).unwrap_err();
+    assert!(matches!(e, SignError::Commit(_)), "{e:?}");
+    assert!(s.is_latched());
+    assert_eq!(sc.state(), moved, "the failed commit must not change the counter");
+    assert!(s.record().last_timeout.is_none());
 }
 
 #[test]
