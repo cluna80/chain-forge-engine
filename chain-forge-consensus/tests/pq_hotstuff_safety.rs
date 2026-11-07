@@ -577,6 +577,31 @@ fn an_internally_inconsistent_record_is_refused() {
 }
 
 #[test]
+fn each_rule_for_a_fresh_record_is_enforced_on_its_own() {
+    // The trusted counter is set to 1 and the record's counter to 1 so that the counter rules pass and only the rule under
+    // test can reject the record.
+    let mut w = World::new();
+    let (st, ctr) = w.prior().into_parts();
+    let at_one = TestCounter::with_value(1, ctr.faults.clone());
+    let fresh = |f: &dyn Fn(&mut SafetyRecord)| rewrite(&st, |r| { r.state = State::Fresh; r.counter = 1; f(r) });
+    // a fresh record that still carries signed items (each slot on its own)
+    assert!(matches!(open_err(&w, &fresh(&|r| { r.last_timeout = None; r.last_proposal = None; r.hvr = None; r.hqr = None; }), &at_one), OpenError::Damaged(_)), "a vote");
+    assert!(matches!(open_err(&w, &fresh(&|r| { r.last_vote = None; r.last_proposal = None; r.hvr = None; r.hqr = None; }), &at_one), OpenError::Damaged(_)), "a timeout");
+    assert!(matches!(open_err(&w, &fresh(&|r| { r.last_vote = None; r.last_timeout = None; r.hvr = None; r.hqr = None; }), &at_one), OpenError::Damaged(_)), "a proposal");
+    // a fresh record with a round floor but nothing signed
+    let none = |r: &mut SafetyRecord| { r.last_vote = None; r.last_timeout = None; r.last_proposal = None; };
+    assert!(matches!(open_err(&w, &fresh(&|r| { none(r); r.hvr = Some(3); r.hqr = None; }), &at_one), OpenError::Damaged(_)), "hvr set");
+    assert!(matches!(open_err(&w, &fresh(&|r| { none(r); r.hvr = None; r.hqr = Some(3); }), &at_one), OpenError::Damaged(_)), "hqr set");
+    // the clean fresh record at counter 1 is accepted, so the refusals above are the rules and nothing else
+    assert!(w.open(&fresh(&|r| { none(r); r.hvr = None; r.hqr = None; }), &at_one).is_ok());
+    // and a fresh record at the wrong counter is refused even when otherwise clean
+    let at_two = TestCounter::with_value(2, ctr.faults.clone());
+    let wrong = rewrite(&st, |r| { r.state = State::Fresh; r.counter = 2; none(r); r.hvr = None; r.hqr = None; });
+    assert!(matches!(open_err(&w, &wrong, &at_two), OpenError::Damaged(_)));
+    let _ = &mut w;
+}
+
+#[test]
 fn a_leftover_temporary_file_is_ignored_and_cleared() {
     let mut w = World::new();
     let (mut st, ctr) = w.prior().into_parts();
@@ -804,6 +829,26 @@ fn a_correctly_sealed_but_non_canonical_record_is_refused_by_the_strict_decoder(
     case("an invalid option flag on hvr", &|b| b[hvr_flag_at] = 2);
     case("a public key of the wrong length", &|b| b[pk_len_at..pk_len_at + 4].copy_from_slice(&1951u32.to_be_bytes()));
     case("invalid UTF-8 in the chain id", &|b| b[profile_at + 4 + PROFILE.len() + 4] = 0xFF);
+    // Lengths that are wrong while every byte is consistent with them, so only the length rule can refuse the record.
+    let pk_start = pk_len_at + 4;
+    let mut short_key = body[..pk_start + 1951].to_vec();
+    short_key[pk_len_at..pk_len_at + 4].copy_from_slice(&1951u32.to_be_bytes());
+    short_key.extend_from_slice(&body[pk_start + 1952..]);
+    assert!(decode_record(&reseal(short_key)).is_err(), "a consistently encoded 1951-byte public key");
+    let mut long_key = body[..pk_start + 1952].to_vec();
+    long_key[pk_len_at..pk_len_at + 4].copy_from_slice(&1953u32.to_be_bytes());
+    long_key.push(0);
+    long_key.extend_from_slice(&body[pk_start + 1952..]);
+    assert!(decode_record(&reseal(long_key)).is_err(), "a consistently encoded 1953-byte public key");
+    let rebuild = |name_len: usize| {
+        let mut b = body[..profile_at].to_vec();
+        b.extend_from_slice(&(name_len as u32).to_be_bytes());
+        b.extend(std::iter::repeat(b'a').take(name_len));
+        b.extend_from_slice(&body[profile_at + 4 + PROFILE.len()..]);
+        reseal(b)
+    };
+    assert!(decode_record(&rebuild(255)).is_ok(), "a consistently encoded 255-byte profile is within the limit");
+    assert!(decode_record(&rebuild(256)).is_err(), "a consistently encoded 256-byte profile is over the limit");
     // the marker is held to the same standard
     let m = st.raw(MARKER_FILE).unwrap();
     assert!(decode_marker(&m).is_ok());
