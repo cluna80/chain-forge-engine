@@ -23,6 +23,13 @@ No consensus code is borrowed. The safety rules below follow the published two-c
 
 **Tendermint scope (owner, 2026-11-07).** The PQ-HotStuff-2 workstream makes **no change** to the Tendermint implementation or to the existing Tendermint devnet, and adds no Tendermint wiring. This statement concerns this workstream only. It does not supersede, authorize or forbid test-only research on Tendermint that is independently approved under PR #119 (for example a test-only signer integration); any such research is governed by that PR and its own approvals, and it must not change this engine's design or schedule.
 
+**Consensus separation: Qattice versus Chain Forge (owner, 2026-11-07).** Chain Forge is the blockchain creation engine and keeps a modular consensus library; Qattice is one blockchain built with it.
+- **Qattice** will ultimately replace Tendermint with PQ-HotStuff-2 as its **exclusive production consensus engine**. This is a Qattice-specific configuration and deployment decision.
+- **Chain Forge** keeps Tendermint as an independently selectable engine for developers building other blockchains. Removing Tendermint from Qattice's configuration is not a removal from the Chain Forge codebase, and nothing in this workstream removes, disables or modifies Tendermint.
+- **Current state:** Tendermint remains Qattice's devnet baseline until PQ-HotStuff-2 passes the gates below. No existing Qattice network is migrated automatically.
+- **Conditions for the transition:** PQ-HotStuff-2 must first pass the safety, persistence, four-node devnet, adversarial testing and independent security-review gates of §12. Removing Tendermint from Qattice's configuration then requires a **separate owner approval** after successful testing.
+- **Shared APIs stay modular:** the `ConsensusEngine` interface, the engine safety-state type and the genesis schema must stay engine-agnostic and must not be hard-coded to Qattice's choice (§11).
+
 ---
 
 ## 2. Model and assumptions
@@ -275,6 +282,7 @@ Recommendation: specify the QC as a versioned type now (`QuorumCert::V1 | V2`), 
 - **Selection:** `consensus.bft_variant: "pq-hotstuff"`. The engine is **feature-gated**: it is compiled only with an explicit Cargo feature that is not in any default feature set (name proposed: `pq-hotstuff`), and a default build refuses the value. Startup also refuses it unless the genesis profile selects the FIPS 204 backend (§3.1); the label `validator_scheme: "ml-dsa-65"` is not sufficient because on existing chains it means the pre-standard backend. No classical path. Until the §12 Phase 2 gate passes, it is devnet-only, enforced by the same check as gate 2.
 - **Engine:** a new module `chain-forge-consensus/src/pq_hotstuff/`. It implements `ConsensusEngine` with `drives_own_votes() = true`, and drives the node through the existing `ConsensusAction` / `next_action` / `on_step_timeout` / `gossip_messages` hooks. It gains new actions: `SendVoteTo(leader)` and `BroadcastTimeout`.
 - **Reused unchanged:** the *structure* of key registration, PoP, activation and rotation (PQ-VAL-001/2/3, with the §3.1 identifiers and contexts); payload validation; block-hash agreement; state-root binding; committed-evidence slashing. Signing and verification go through the FIPS 204 signer interface, not `sign_consensus` / `verify_consensus` on the pre-standard backend.
+- **Modularity:** shared Chain Forge interfaces (`ConsensusEngine`, `EngineSafetyState`, the genesis `consensus` and `cryptography` sections, engine selection by `consensus.bft_variant`) stay generic, so Tendermint and PQ-HotStuff-2 are selected independently per chain. Qattice-specific choices (this engine, the FIPS 204 profile, personhood weighting) live in the chain's genesis and deployment configuration, never in shared code paths. Adding PQ-HotStuff-2 must not change Tendermint behaviour for any chain that selects it.
 - **Other chains:** the engine takes the power function as input. Personhood weighting is mandatory in **Qattice's** genesis profile, where startup refuses `pq-hotstuff` without `personhood_weighted: true`. Another Chain Forge chain can supply stake or equal weights.
 
 ---
@@ -314,7 +322,7 @@ Each gate follows the project rule: failing tests first, then mutation checks, t
 **Phase 4 — mainnet genesis**
 - A fresh genesis: PQ-HotStuff, ML-DSA from block 0, the D2 ceiling and QC format, no devnet state.
 
-The Tendermint devnet stays the default until Phase 2 passes on Windows. Phase 2 uses a **fresh genesis and a separate four-node development network** with newly generated keys; the existing Tendermint devnet is not migrated or modified. Retiring Tendermint for any network is a separate owner decision after the Phase 2 gate and independent review.
+The Tendermint devnet stays the default until Phase 2 passes on Windows. Phase 2 uses a **fresh genesis and a separate four-node development network** with newly generated keys; the existing Tendermint devnet is not migrated or modified. Removing Tendermint from Qattice's configuration is a separate owner decision after PQ-HotStuff-2 passes its gates and independent review (§1); Tendermint stays available in Chain Forge for other chains in all cases.
 
 **Restrictions on all PQ-HotStuff-2 work (owner, 2026-11-06):** no default consensus change; no network activation; no mainnet change; no automatic signature downgrade or fallback; no change to the existing Tendermint implementation; no production validator key-file change; no merge without separate owner approval. Each implementation PR must carry tests, reviewable changes and documented Windows results before merge approval.
 
@@ -354,6 +362,7 @@ These keep the locked direction. They make two claims precise:
 | N8 (2026-11-07) | The `CFH1` domain tag is retained. No automatic compatibility or signature fallback. |
 | N9 (2026-11-07) | Phase 0 uses in-memory keys. Persistent validator key storage stays blocked pending the independent review of PR #109. |
 | N10 (2026-11-07) | DIS remains a separate P4 workstream and is not part of this specification. |
+| N17 (2026-11-07) | Consensus separation: Qattice will ultimately use PQ-HotStuff-2 as its exclusive production consensus engine, conditional on the safety, persistence, four-node devnet, adversarial and independent-review gates; Tendermint remains the Qattice devnet baseline until then, stays selectable in Chain Forge for other blockchains, is not removed, disabled or modified now, and no existing network is migrated automatically. Removal from Qattice's configuration needs separate approval (§1). |
 
 **Confirmed in the final review (2026-11-07), now reflected in the text:** N11 all canonical integers are big-endian, including `alg_id`; N12 the tags `CFH1|blockid|` and `CFH1|pop|` are approved and `CFH1` is retained; N13 the `cryptography.protocol_profile` design is kept and its documented compatibility tests are required; N14 Phase 0 uses in-memory test keys only; N15 the block identifier commits to all consensus-critical proposal fields with negative substitution tests (§3.2 rules 6 and 7); N16 a missing safety-state file never resets signing history and a fresh validator has an explicit initialization state (§7).
 
