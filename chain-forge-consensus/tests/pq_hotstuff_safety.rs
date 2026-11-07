@@ -278,6 +278,34 @@ fn a_timeout_at_a_higher_round_raises_the_floor_for_votes_and_timeouts() {
 }
 
 #[test]
+fn a_timeout_below_the_round_already_voted_in_is_refused_by_the_floor() {
+    let mut w = World::new();
+    let mut s = w.init();
+    do_sign(&mut s, &mut w.signer, K::Vote, 1, 9, 1).unwrap();
+    let e = do_sign(&mut s, &mut w.signer, K::Timeout, 1, 8, 1).unwrap_err();
+    assert_eq!(e, SignError::FloorViolation { kind: "timeout", round: 8, floor: 9 });
+    do_sign(&mut s, &mut w.signer, K::Timeout, 1, 9, 1).expect("the same round is allowed after a vote");
+}
+
+#[test]
+fn a_signer_holding_a_different_key_is_refused_without_writing_or_latching() {
+    let mut w = World::new();
+    let mut s = w.prior();
+    let ops = w.f.borrow().ops;
+    let mut other = TestSigner::new(2);
+    let e = do_sign(&mut s, &mut other, K::Vote, 1, 6, 1).unwrap_err();
+    assert_eq!(e, SignError::IdentityMismatch("signer key"));
+    assert_eq!(other.calls, 0, "the foreign signer must not be asked to sign");
+    assert_eq!(w.f.borrow().ops, ops, "nothing may be written");
+    assert!(!s.is_latched());
+    do_sign(&mut s, &mut w.signer, K::Vote, 1, 6, 1).expect("the right signer still works");
+    // a message for another chain is refused too
+    let mut m = vote(1, 7, 1);
+    m.chain_id = "other-chain".into();
+    assert_eq!(s.sign_vote(&m, 6, &mut w.signer).unwrap_err(), SignError::IdentityMismatch("chain id"));
+}
+
+#[test]
 fn the_vote_floor_hvr_and_the_lock_hqr_only_move_up() {
     let mut w = World::new();
     let mut s = w.init();
@@ -631,7 +659,9 @@ fn a_record_older_than_the_chain_shows_is_stale_and_a_fresh_one_for_a_participat
 #[derive(Default)]
 struct Net { sent: Vec<(K, u64, Vec<u8>, Vec<u8>)> }
 
-const CRASH_STRIDE: usize = 97;
+// Torn-write offsets sampled per crash point (plus 0, 1, len-1, len). The exhaustive every-offset checks are in the
+// truncation and bit-flip tests, on the file `open` actually reads; a torn temporary file is never read.
+const CRASH_STRIDE: usize = 1009;
 
 #[test]
 fn a_crash_or_an_io_error_at_any_step_never_allows_two_messages_for_one_round() {
@@ -744,6 +774,42 @@ fn the_record_codec_round_trips_and_is_deterministic() {
     assert_eq!(encode_record(&rec).unwrap(), encode_record(&rec).unwrap());
     let m = st.raw(MARKER_FILE).unwrap();
     assert_eq!(encode_marker(&decode_marker(&m).unwrap()).unwrap(), m);
+}
+
+fn reseal(mut body: Vec<u8>) -> Vec<u8> {
+    let sum = Sha3_256::digest(&body);
+    body.extend_from_slice(&sum);
+    body
+}
+
+#[test]
+fn a_correctly_sealed_but_non_canonical_record_is_refused_by_the_strict_decoder() {
+    let mut w = World::new();
+    let (st, _) = w.prior().into_parts();
+    let good = st.raw(STATE_FILE).unwrap();
+    assert!(decode_record(&good).is_ok());
+    let body = good[..good.len() - 32].to_vec();
+    let profile_at = 7;
+    let hvr_flag_at = profile_at + 4 + PROFILE.len() + 4 + CHAIN.len() + 4 + 1952 + 16 + 8 + 8;
+    let pk_len_at = profile_at + 4 + PROFILE.len() + 4 + CHAIN.len();
+    let case = |name: &str, f: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = body.clone();
+        f(&mut b);
+        assert!(decode_record(&reseal(b)).is_err(), "{name} must be refused even with a valid checksum");
+    };
+    case("a trailing byte inside the sealed body", &|b| b.push(0));
+    case("an unknown state byte", &|b| b[6] = 2);
+    case("a NUL inside the profile string", &|b| b[profile_at + 4] = 0);
+    case("a profile string longer than 255 bytes", &|b| b[profile_at..profile_at + 4].copy_from_slice(&256u32.to_be_bytes()));
+    case("an invalid option flag on hvr", &|b| b[hvr_flag_at] = 2);
+    case("a public key of the wrong length", &|b| b[pk_len_at..pk_len_at + 4].copy_from_slice(&1951u32.to_be_bytes()));
+    case("invalid UTF-8 in the chain id", &|b| b[profile_at + 4 + PROFILE.len() + 4] = 0xFF);
+    // the marker is held to the same standard
+    let m = st.raw(MARKER_FILE).unwrap();
+    assert!(decode_marker(&m).is_ok());
+    let mut mb = m[..m.len() - 32].to_vec();
+    mb.push(0);
+    assert!(decode_marker(&reseal(mb)).is_err(), "a trailing byte inside the sealed marker");
 }
 
 // ================================================================ real filesystem

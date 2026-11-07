@@ -167,8 +167,6 @@ pub trait ConsensusVerifier {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
-    #[error("not implemented")]
-    Unimplemented,
     #[error("truncated")]
     Truncated,
     #[error("{0} trailing byte(s)")]
@@ -190,8 +188,6 @@ pub enum RecordError {
 /// Why a validator's safety state could not be opened. Every variant means: do not sign (an observer may keep running).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OpenError {
-    #[error("not implemented")]
-    Unimplemented,
     #[error("no safety state exists (open never creates one; initialization is explicit)")]
     NoState,
     #[error("an initialization marker exists but the state file is missing")]
@@ -226,8 +222,6 @@ pub enum OpenError {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InitError {
-    #[error("not implemented")]
-    Unimplemented,
     #[error("safety state or an initialization marker already exists; a key is initialized once")]
     AlreadyInitialized,
     #[error("the trusted counter is {0}, so this identity has been used before")]
@@ -244,8 +238,6 @@ pub enum InitError {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SignError {
-    #[error("not implemented")]
-    Unimplemented,
     #[error("the store is latched after a failure and refuses to sign; restart and reopen")]
     Latched,
     #[error("epoch {requested} is below the recorded epoch {record}")]
@@ -258,6 +250,8 @@ pub enum SignError {
     FloorViolation { kind: &'static str, round: u64, floor: u64 },
     #[error("{0}")]
     Wire(#[from] WireError),
+    #[error("the request does not match this validator: {0}")]
+    IdentityMismatch(&'static str),
     #[error("{0}")]
     Signer(String),
     #[error("the signer returned {0} bytes, not a valid signature")]
